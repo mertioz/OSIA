@@ -8,6 +8,14 @@ import json
 import re
 import subprocess
 import os
+import shutil
+import stat
+import fnmatch
+import signal
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from datetime import datetime
+
+import psutil
 from openai import OpenAI
 
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
@@ -33,12 +41,39 @@ DEFAULT_LANG = detect_system_lang()
 # Response cleaning rules (shared across languages)
 # ---------------------------------------------------------------------------
 
-CLEAN_RESPONSE_RULES = """IMPORTANT RULES FOR RESPONSES:
-- Never mention tool names, function names, or technical steps in your spoken response.
-- Never say things like 'I will use bash' or 'calling tool' or '#tool_call'.
-- Just speak the result naturally and concisely, like a human assistant would.
-- Maximum 2-3 sentences in spoken responses unless more detail is explicitly requested.
-- If you performed an action, just say what you did, not how."""
+CLEAN_RESPONSE_RULES = """STRICT RESPONSE RULES — NEVER VIOLATE:
+
+1. MAXIMUM 1-2 SHORT SENTENCES. Be direct. No explanations unless explicitly asked.
+
+2. NEVER mention ANY tool name, function name, or internal action. This includes (non-exhaustive):
+   bash, run_command, navigate, click, fill, read_page, open_application, open_new_tab,
+   take_screenshot, write_file, read_file, edit_file_lines, set_volume, browser, terminal,
+   shell, headless, selector, JSON, function, command, script, API.
+
+3. NEVER use phrases like:
+   "I'll use the X tool", "I'm going to use", "Let me call", "Using the browser",
+   "I'll open the browser", "I'll run the command", "calling X", "executing X",
+   "with the X tool". Same in French: "Je vais utiliser", "J'utilise l'outil",
+   "Avec le navigateur", "J'appelle", "J'exécute".
+
+4. Speak ONLY as a human assistant would speak to another human. Say WHAT you did,
+   NEVER HOW. The user does not know and does not need to know that tools exist.
+
+5. GOOD examples:
+   - "C'est ouvert."
+   - "Voilà."
+   - "J'ai ouvert la page."
+   - "Fait."
+   - "Spotify est lancé."
+   - "Done." / "Opened." / "Here you go."
+
+6. FORBIDDEN examples (NEVER produce anything like these):
+   - "I'll use the browser tool to navigate to google.com."
+   - "I'm calling the open_application function."
+   - "Je vais utiliser l'outil navigate pour ouvrir la page."
+   - "J'utilise bash pour exécuter cette commande."
+
+Any response that violates rules 2-4 is broken and unacceptable."""
 
 # ---------------------------------------------------------------------------
 # System prompt — dynamic per language
@@ -57,21 +92,48 @@ System & shell:
 - run_command: Run any shell command and return its output. Usage: {{"tool": "run_command", "command": "<command>"}}
 - open_application: Launch an application by name. Usage: {{"tool": "open_application", "name": "<app_name>"}}
 - take_screenshot: Capture the desktop to /tmp/screenshot.png and return the path. Usage: {{"tool": "take_screenshot"}}
+- get_system_info: Snapshot of CPU, RAM and disk usage. Usage: {{"tool": "get_system_info"}}
+- list_running_processes: Top processes by CPU/memory. Usage: {{"tool": "list_running_processes", "limit": 20}}
+- kill_process: Kill a process by PID (int) or name (substring match). Usage: {{"tool": "kill_process", "name_or_pid": "<pid_or_name>"}}
+- set_volume: Set system volume to 0-100 percent. Usage: {{"tool": "set_volume", "level": 50}}
+- get_clipboard: Return the current clipboard contents. Usage: {{"tool": "get_clipboard"}}
+- set_clipboard: Put text on the clipboard. Usage: {{"tool": "set_clipboard", "text": "<text>"}}
 
 Files:
 - read_file: Read a file. Usage: {{"tool": "read_file", "path": "<path>"}}
 - write_file: Write to a file. Usage: {{"tool": "write_file", "path": "<path>", "content": "<content>"}}
 - list_files: List files in a directory. Usage: {{"tool": "list_files", "path": "<path>"}}
 - delete_file: Delete a file. Usage: {{"tool": "delete_file", "path": "<path>"}}
+- create_directory: Create a folder (and any missing parents). Usage: {{"tool": "create_directory", "path": "<path>"}}
+- delete_directory: Delete a folder. Pass recursive=true to remove non-empty dirs. Usage: {{"tool": "delete_directory", "path": "<path>", "recursive": false}}
+- rename_file: Rename or move a file or folder. Usage: {{"tool": "rename_file", "old_path": "<old>", "new_path": "<new>"}}
+- copy_file: Copy a file. Usage: {{"tool": "copy_file", "src": "<src>", "dst": "<dst>"}}
+- get_file_info: Size, permissions, owner, and timestamps. Usage: {{"tool": "get_file_info", "path": "<path>"}}
+- search_files: Recursively find files by glob pattern. Usage: {{"tool": "search_files", "directory": "<dir>", "pattern": "*.py"}}
 
-Browser:
-- navigate: Open a URL in the browser. Usage: {{"tool": "navigate", "url": "<url>"}}
+Code editor:
+- open_in_editor: Open a file in the user's preferred editor (VS Code, gedit, kate…). Usage: {{"tool": "open_in_editor", "path": "<path>"}}
+- edit_file_lines: Replace a range of lines (1-indexed, inclusive) in a file. Usage: {{"tool": "edit_file_lines", "path": "<path>", "start_line": 10, "end_line": 12, "new_content": "<replacement>"}}
+
+Browser (drives a REAL visible Chromium browser via CDP — same page the user sees; cookies/sessions persist):
+- navigate: Go to a URL in the real browser. Launches Brave/Chromium with remote debugging on first use. Usage: {{"tool": "navigate", "url": "<url>"}}
 - click: Click an element by CSS selector. Usage: {{"tool": "click", "selector": "<css_selector>"}}
-- fill: Type into an input field. Usage: {{"tool": "fill", "selector": "<css_selector>", "value": "<text>"}}
-- read_page: Get all visible text from the current page. Usage: {{"tool": "read_page"}}
+- find_and_click: Click the first element whose visible text matches. Use when you don't know the selector but can see the label. Usage: {{"tool": "find_and_click", "text": "<visible_text>"}}
+- fill: Set the value of an input field in one shot (no keystroke events). Usage: {{"tool": "fill", "selector": "<css_selector>", "value": "<text>"}}
+- type_text: Focus an element and type character-by-character via the keyboard. Use for search boxes / JS-heavy forms. Usage: {{"tool": "type_text", "selector": "<css_selector>", "text": "<text>"}}
+- press_key: Press a single keyboard key on the active page (Enter, Escape, Tab, ArrowDown, Backspace, "Control+A", …). Usage: {{"tool": "press_key", "key": "Enter"}}
+- read_page: Visible text of the current page (truncated). Usage: {{"tool": "read_page"}}
+- get_page_text: Full visible text of the page (higher cap than read_page). Usage: {{"tool": "get_page_text"}}
+- wait_for_load: Wait for the page to finish loading (network idle, up to 15s). Usage: {{"tool": "wait_for_load"}}
+- get_current_url: Return the URL of the active page. Usage: {{"tool": "get_current_url"}}
+- scroll: Scroll by a pixel amount in a direction. Usage: {{"tool": "scroll", "direction": "down", "amount": 600}}
+- scroll_down: Scroll down by one viewport (or by ``amount`` pixels). Usage: {{"tool": "scroll_down"}}
+- go_back: Navigate back in history. Usage: {{"tool": "go_back"}}
+- go_forward: Navigate forward in history. Usage: {{"tool": "go_forward"}}
+- open_new_tab: Open a URL in a new tab and switch to it. Usage: {{"tool": "open_new_tab", "url": "<url>"}}
 
 ## How to Use Tools
-When you need to use a tool, FIRST output one short sentence telling the user what you're about to do (e.g. "Opening Spotify.", "Let me check.", "Reading that file."). This sentence is streamed and spoken to the user in parallel with the tool running, so it hides the tool's execution latency. THEN output a JSON tool call wrapped in <tool_call> tags:
+When you need to use a tool, FIRST output ONE very short natural sentence (max 5-6 words) — like a human would say aloud. Examples: "Opening Spotify.", "One moment.", "Sure.", "Got it.". This sentence is spoken to the user while the tool runs. NEVER name the tool, the function, or the technical action. THEN output a JSON tool call wrapped in <tool_call> tags:
 
 Opening Spotify.
 <tool_call>
@@ -79,18 +141,21 @@ Opening Spotify.
 </tool_call>
 
 You may issue multiple tool calls in sequence. After each tool call, you will receive the tool output.
-After you have all information needed, provide your final answer as plain text WITHOUT <tool_call> tags.
+After you have all information needed, provide your final answer as plain text WITHOUT <tool_call> tags. The final answer MUST be 1-2 short sentences, natural, no tool names.
 
 ## Browser Usage
-When asked to browse the web: first navigate to a URL, then optionally click, fill, or read_page.
-Use simple CSS selectors like 'input[name="q"]', 'button', 'textarea', etc.
+When asked to browse the web, open a page, search something, look something up online, etc., you MUST always use the appropriate browser action — never guess or describe what you would do.
 
 {CLEAN_RESPONSE_RULES}
 
+## Tool Result Honesty (ABSOLUTE RULE)
+ABSOLUTE RULE: Never say you performed an action without having received a confirmation from the tool. If the tool returns an error, say so honestly. Never invent or assume the result of an action.
+RÈGLE ABSOLUE: Ne jamais dire que tu as effectué une action sans avoir reçu une confirmation de l'outil. Si l'outil retourne une erreur, dis-le honnêtement. Ne jamais inventer ou supposer le résultat d'une action.
+
 ## Rules
-- Be concise and direct — your responses will be spoken via TTS.
-- Always use tools when you need to access the system — never guess.
-- When you are done, give a clear final answer without any <tool_call> blocks.
+- Responses are spoken via TTS. Keep them ULTRA short: 1-2 sentences max.
+- Always use tools when an action is requested — never just describe what you would do.
+- When you are done, give a final answer of 1-2 sentences with NO <tool_call> blocks and NO tool/function names.
 - Use absolute paths when reading/writing files."""
 
 SYSTEM_PROMPT_FR = f"""Tu es OSIA, un assistant IA. Réponds en français par défaut.
@@ -106,21 +171,48 @@ Système & shell :
 - run_command : Exécuter n'importe quelle commande shell et retourner sa sortie. Usage : {{"tool": "run_command", "command": "<commande>"}}
 - open_application : Lancer une application par son nom. Usage : {{"tool": "open_application", "name": "<nom_app>"}}
 - take_screenshot : Capturer le bureau vers /tmp/screenshot.png et retourner le chemin. Usage : {{"tool": "take_screenshot"}}
+- get_system_info : Aperçu de l'utilisation CPU, RAM et disque. Usage : {{"tool": "get_system_info"}}
+- list_running_processes : Top des processus par CPU/mémoire. Usage : {{"tool": "list_running_processes", "limit": 20}}
+- kill_process : Tuer un processus par PID (entier) ou nom (sous-chaîne). Usage : {{"tool": "kill_process", "name_or_pid": "<pid_ou_nom>"}}
+- set_volume : Régler le volume système entre 0 et 100. Usage : {{"tool": "set_volume", "level": 50}}
+- get_clipboard : Retourner le contenu actuel du presse-papiers. Usage : {{"tool": "get_clipboard"}}
+- set_clipboard : Mettre du texte dans le presse-papiers. Usage : {{"tool": "set_clipboard", "text": "<texte>"}}
 
 Fichiers :
 - read_file : Lire un fichier. Usage : {{"tool": "read_file", "path": "<chemin>"}}
 - write_file : Écrire dans un fichier. Usage : {{"tool": "write_file", "path": "<chemin>", "content": "<contenu>"}}
 - list_files : Lister les fichiers d'un répertoire. Usage : {{"tool": "list_files", "path": "<chemin>"}}
 - delete_file : Supprimer un fichier. Usage : {{"tool": "delete_file", "path": "<chemin>"}}
+- create_directory : Créer un dossier (et les parents manquants). Usage : {{"tool": "create_directory", "path": "<chemin>"}}
+- delete_directory : Supprimer un dossier. recursive=true pour supprimer un dossier non vide. Usage : {{"tool": "delete_directory", "path": "<chemin>", "recursive": false}}
+- rename_file : Renommer ou déplacer un fichier ou dossier. Usage : {{"tool": "rename_file", "old_path": "<ancien>", "new_path": "<nouveau>"}}
+- copy_file : Copier un fichier. Usage : {{"tool": "copy_file", "src": "<src>", "dst": "<dst>"}}
+- get_file_info : Taille, permissions, propriétaire et dates. Usage : {{"tool": "get_file_info", "path": "<chemin>"}}
+- search_files : Rechercher des fichiers récursivement par motif glob. Usage : {{"tool": "search_files", "directory": "<dossier>", "pattern": "*.py"}}
 
-Navigateur :
-- navigate : Ouvrir une URL dans le navigateur. Usage : {{"tool": "navigate", "url": "<url>"}}
+Éditeur de code :
+- open_in_editor : Ouvrir un fichier dans l'éditeur préféré de l'utilisateur (VS Code, gedit, kate…). Usage : {{"tool": "open_in_editor", "path": "<chemin>"}}
+- edit_file_lines : Remplacer une plage de lignes (1-indexé, inclus) dans un fichier. Usage : {{"tool": "edit_file_lines", "path": "<chemin>", "start_line": 10, "end_line": 12, "new_content": "<remplacement>"}}
+
+Navigateur (pilote le VRAI navigateur Chromium visible via CDP — la page que voit l'utilisateur ; les cookies/sessions persistent) :
+- navigate : Aller à une URL dans le vrai navigateur. Lance Brave/Chromium avec le port de debug au premier appel. Usage : {{"tool": "navigate", "url": "<url>"}}
 - click : Cliquer sur un élément par sélecteur CSS. Usage : {{"tool": "click", "selector": "<selecteur_css>"}}
-- fill : Remplir un champ de saisie. Usage : {{"tool": "fill", "selector": "<selecteur_css>", "value": "<texte>"}}
-- read_page : Obtenir tout le texte visible de la page actuelle. Usage : {{"tool": "read_page"}}
+- find_and_click : Cliquer sur le premier élément dont le texte visible correspond. À utiliser quand tu ne connais pas le sélecteur mais que tu vois le libellé. Usage : {{"tool": "find_and_click", "text": "<texte_visible>"}}
+- fill : Définir la valeur d'un champ en une fois (sans événements clavier). Usage : {{"tool": "fill", "selector": "<selecteur_css>", "value": "<texte>"}}
+- type_text : Focaliser un élément et taper caractère par caractère via le clavier. Pour les champs de recherche / formulaires JS. Usage : {{"tool": "type_text", "selector": "<selecteur_css>", "text": "<texte>"}}
+- press_key : Appuyer sur une touche du clavier sur la page active (Enter, Escape, Tab, ArrowDown, Backspace, « Control+A »…). Usage : {{"tool": "press_key", "key": "Enter"}}
+- read_page : Texte visible de la page actuelle (tronqué). Usage : {{"tool": "read_page"}}
+- get_page_text : Texte visible complet de la page (limite plus haute que read_page). Usage : {{"tool": "get_page_text"}}
+- wait_for_load : Attendre la fin du chargement de la page (réseau au repos, jusqu'à 15s). Usage : {{"tool": "wait_for_load"}}
+- get_current_url : Retourner l'URL de la page active. Usage : {{"tool": "get_current_url"}}
+- scroll : Faire défiler d'un nombre de pixels dans une direction. Usage : {{"tool": "scroll", "direction": "down", "amount": 600}}
+- scroll_down : Descendre d'une hauteur d'écran (ou de ``amount`` pixels). Usage : {{"tool": "scroll_down"}}
+- go_back : Reculer dans l'historique. Usage : {{"tool": "go_back"}}
+- go_forward : Avancer dans l'historique. Usage : {{"tool": "go_forward"}}
+- open_new_tab : Ouvrir une URL dans un nouvel onglet et basculer dessus. Usage : {{"tool": "open_new_tab", "url": "<url>"}}
 
 ## Comment utiliser les outils
-Quand tu as besoin d'un outil, produit D'ABORD une phrase courte annonçant l'action à l'utilisateur (ex : « J'ouvre Spotify. », « Je regarde. », « Je lis le fichier. »). Cette phrase est lue à l'utilisateur pendant que l'outil s'exécute, masquant ainsi sa latence. ENSUITE, produit l'appel d'outil JSON dans des balises <tool_call> :
+Quand tu as besoin d'un outil, produit D'ABORD UNE phrase très courte (5-6 mots max), comme un humain le dirait à l'oral. Exemples : « J'ouvre Spotify. », « Un instant. », « D'accord. », « C'est parti. ». Cette phrase est lue à l'utilisateur pendant que l'outil s'exécute. NE NOMME JAMAIS l'outil, la fonction, ou l'action technique. ENSUITE, produit l'appel d'outil JSON dans des balises <tool_call> :
 
 J'ouvre Spotify.
 <tool_call>
@@ -128,18 +220,20 @@ J'ouvre Spotify.
 </tool_call>
 
 Tu peux faire plusieurs appels d'outils à la suite. Après chaque appel, tu recevras le résultat.
-Quand tu as toutes les informations nécessaires, donne ta réponse finale en texte simple SANS balises <tool_call>.
+Quand tu as toutes les informations nécessaires, donne ta réponse finale en texte simple SANS balises <tool_call>. La réponse finale DOIT faire 1 ou 2 phrases courtes, naturelles, sans aucun nom d'outil.
 
 ## Navigation web
-Quand on te demande de naviguer sur le web : d'abord naviguer vers une URL, puis éventuellement cliquer, remplir ou lire la page.
-Utilise des sélecteurs CSS simples comme 'input[name="q"]', 'button', 'textarea', etc.
+Quand on te demande de naviguer sur le web, d'ouvrir une page, de chercher quelque chose en ligne, etc., tu DOIS toujours utiliser l'action navigateur appropriée — ne jamais deviner ni décrire ce que tu ferais.
 
 {CLEAN_RESPONSE_RULES}
 
+## Honnêteté des résultats d'outils (RÈGLE ABSOLUE)
+RÈGLE ABSOLUE: Ne jamais dire que tu as effectué une action sans avoir reçu une confirmation de l'outil. Si l'outil retourne une erreur, dis-le honnêtement. Ne jamais inventer ou supposer le résultat d'une action.
+
 ## Règles
-- Sois concis et direct — tes réponses seront lues à voix haute par TTS.
-- Utilise toujours les outils quand tu as besoin d'accéder au système — ne devine jamais.
-- Quand tu as fini, donne une réponse finale claire sans aucun bloc <tool_call>.
+- Les réponses sont lues par TTS. Garde-les ULTRA courtes : 1 à 2 phrases max.
+- Utilise toujours les outils quand une action est demandée — ne jamais juste décrire ce que tu ferais.
+- Quand tu as fini, donne une réponse finale de 1 à 2 phrases SANS bloc <tool_call> et SANS nom d'outil/fonction.
 - Utilise des chemins absolus pour lire/écrire des fichiers."""
 
 
@@ -363,18 +457,397 @@ def tool_take_screenshot() -> str:
         return f"ERROR taking screenshot: {e}"
 
 
+# ── Path helper (new tools only — existing tools keep their inline form) ───
+
+_PROJECT_DIR = "/home/OSIA/code/osia-project"
+
+
+def _abs(path: str) -> str:
+    """Resolve a possibly-relative path against the project directory."""
+    return path if path.startswith("/") else os.path.join(_PROJECT_DIR, path)
+
+
+# ── File-system tools ──────────────────────────────────────────────────────
+
+def tool_create_directory(path: str) -> str:
+    """Create a directory (and any missing parents)."""
+    path = _abs(path)
+    try:
+        os.makedirs(path, exist_ok=True)
+        return f"Created directory: {path}"
+    except Exception as e:
+        return f"ERROR creating directory {path}: {e}"
+
+
+def tool_delete_directory(path: str, recursive: bool = False) -> str:
+    """Delete a directory. With ``recursive=True`` also removes contents;
+    otherwise the directory must be empty.
+    """
+    path = _abs(path)
+    try:
+        if recursive:
+            shutil.rmtree(path)
+            return f"Recursively deleted directory: {path}"
+        os.rmdir(path)
+        return f"Deleted (empty) directory: {path}"
+    except FileNotFoundError:
+        return f"ERROR: {path} does not exist"
+    except OSError as e:
+        return f"ERROR deleting {path}: {e} (use recursive=true to remove non-empty dirs)"
+    except Exception as e:
+        return f"ERROR deleting {path}: {e}"
+
+
+def tool_rename_file(old_path: str, new_path: str) -> str:
+    """Rename or move a file or directory."""
+    src = _abs(old_path)
+    dst = _abs(new_path)
+    try:
+        os.rename(src, dst)
+        return f"Renamed: {src} -> {dst}"
+    except Exception as e:
+        return f"ERROR renaming {src} -> {dst}: {e}"
+
+
+def tool_copy_file(src: str, dst: str) -> str:
+    """Copy a file. If ``dst`` is an existing directory, the file is
+    copied into it preserving the source filename.
+    """
+    src_abs = _abs(src)
+    dst_abs = _abs(dst)
+    try:
+        result = shutil.copy2(src_abs, dst_abs)
+        return f"Copied: {src_abs} -> {result}"
+    except IsADirectoryError:
+        return f"ERROR: source {src_abs} is a directory; this tool copies files only"
+    except Exception as e:
+        return f"ERROR copying {src_abs} -> {dst_abs}: {e}"
+
+
+def tool_get_file_info(path: str) -> str:
+    """Return size, permissions, ownership, and timestamps for a file or directory."""
+    path = _abs(path)
+    try:
+        st = os.stat(path)
+        kind = (
+            "directory" if stat.S_ISDIR(st.st_mode)
+            else "symlink" if stat.S_ISLNK(st.st_mode)
+            else "file"
+        )
+        mode = stat.filemode(st.st_mode)
+        size = st.st_size
+        mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        ctime = datetime.fromtimestamp(st.st_ctime).strftime("%Y-%m-%d %H:%M:%S")
+        atime = datetime.fromtimestamp(st.st_atime).strftime("%Y-%m-%d %H:%M:%S")
+        return (
+            f"path:        {path}\n"
+            f"type:        {kind}\n"
+            f"size:        {size} bytes\n"
+            f"permissions: {mode} ({oct(st.st_mode & 0o777)})\n"
+            f"owner uid:   {st.st_uid}\n"
+            f"group gid:   {st.st_gid}\n"
+            f"modified:    {mtime}\n"
+            f"changed:     {ctime}\n"
+            f"accessed:    {atime}"
+        )
+    except FileNotFoundError:
+        return f"ERROR: {path} does not exist"
+    except Exception as e:
+        return f"ERROR getting info for {path}: {e}"
+
+
+def tool_search_files(directory: str, pattern: str) -> str:
+    """Recursively find files in ``directory`` whose name matches ``pattern``
+    (glob syntax, e.g. ``*.py``, ``test_*.txt``). Returns up to 200 hits.
+    """
+    directory = _abs(directory)
+    if not os.path.isdir(directory):
+        return f"ERROR: {directory} is not a directory"
+    matches: list[str] = []
+    try:
+        for root, _dirs, files in os.walk(directory):
+            for name in files:
+                if fnmatch.fnmatch(name, pattern):
+                    matches.append(os.path.join(root, name))
+                    if len(matches) >= 200:
+                        break
+            if len(matches) >= 200:
+                break
+    except Exception as e:
+        return f"ERROR searching {directory}: {e}"
+    if not matches:
+        return f"(no files matching {pattern!r} under {directory})"
+    suffix = "\n... [TRUNCATED at 200 hits]" if len(matches) >= 200 else ""
+    return "\n".join(matches) + suffix
+
+
+# ── Code-editor tools ──────────────────────────────────────────────────────
+
+_EDITOR_CANDIDATES = ["code", "codium", "code-oss", "gedit", "kate", "xed", "nano"]
+
+
+def _detect_editor() -> str | None:
+    for name in _EDITOR_CANDIDATES:
+        path = shutil.which(name)
+        if path:
+            return path
+    return shutil.which("xdg-open")
+
+
+def tool_open_in_editor(path: str) -> str:
+    """Open a file in the user's preferred editor (VS Code, gedit, kate,
+    xed, nano…). Falls back to ``xdg-open``.
+    """
+    path = _abs(path)
+    editor = _detect_editor()
+    if not editor:
+        return "ERROR: no known editor or xdg-open available"
+    try:
+        subprocess.Popen(
+            [editor, path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return f"Opened {path} in {os.path.basename(editor)}"
+    except Exception as e:
+        return f"ERROR opening {path} in {editor}: {e}"
+
+
+def tool_edit_file_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
+    """Replace lines ``start_line`` through ``end_line`` (1-indexed,
+    inclusive) in ``path`` with ``new_content``. The replacement may have
+    a different number of lines than the original range.
+    """
+    path = _abs(path)
+    try:
+        start = int(start_line)
+        end = int(end_line)
+    except (TypeError, ValueError):
+        return f"ERROR: start_line and end_line must be integers"
+    if start < 1 or end < start:
+        return f"ERROR: invalid range start_line={start}, end_line={end}"
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+    except Exception as e:
+        return f"ERROR reading {path}: {e}"
+    if start > len(lines):
+        return f"ERROR: start_line {start} is past end of file ({len(lines)} lines)"
+    end = min(end, len(lines))
+    replacement = new_content if new_content.endswith("\n") else new_content + "\n"
+    new_lines = lines[:start - 1] + [replacement] + lines[end:]
+    try:
+        with open(path, "w") as f:
+            f.writelines(new_lines)
+    except Exception as e:
+        return f"ERROR writing {path}: {e}"
+    return f"Replaced lines {start}-{end} of {path} ({end - start + 1} -> {replacement.count(chr(10))} lines)"
+
+
+# ── System tools ───────────────────────────────────────────────────────────
+
+def tool_get_system_info() -> str:
+    """Return a snapshot of CPU, RAM and disk usage."""
+    try:
+        cpu_pct = psutil.cpu_percent(interval=0.3)
+        cores = psutil.cpu_count(logical=True)
+        load1, load5, load15 = os.getloadavg()
+        vm = psutil.virtual_memory()
+        du = psutil.disk_usage("/")
+        uname = os.uname()
+        return (
+            f"host:    {uname.nodename} ({uname.sysname} {uname.release})\n"
+            f"cpu:     {cpu_pct:.1f}% across {cores} cores  (load 1/5/15: {load1:.2f} / {load5:.2f} / {load15:.2f})\n"
+            f"memory:  {vm.used / 1024**3:.1f} / {vm.total / 1024**3:.1f} GiB used ({vm.percent:.0f}%)\n"
+            f"disk /:  {du.used / 1024**3:.1f} / {du.total / 1024**3:.1f} GiB used ({du.percent:.0f}%)"
+        )
+    except Exception as e:
+        return f"ERROR collecting system info: {e}"
+
+
+def tool_list_running_processes(limit: int = 20) -> str:
+    """List the top processes by CPU then memory usage. ``limit`` caps the
+    number of entries returned (default 20).
+    """
+    try:
+        limit = max(1, int(limit))
+    except (TypeError, ValueError):
+        limit = 20
+    procs = []
+    for p in psutil.process_iter(["pid", "name", "username", "memory_percent"]):
+        try:
+            info = p.info
+            info["cpu_percent"] = p.cpu_percent(interval=None)
+            procs.append(info)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    # Prime cpu_percent — first call returns 0.0 for everything.
+    psutil.cpu_percent(interval=0.2)
+    for p in psutil.process_iter():
+        try:
+            for entry in procs:
+                if entry["pid"] == p.pid:
+                    entry["cpu_percent"] = p.cpu_percent(interval=None)
+                    break
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    procs.sort(key=lambda x: (x.get("cpu_percent") or 0.0, x.get("memory_percent") or 0.0), reverse=True)
+    procs = procs[:limit]
+    header = f"{'PID':>7}  {'CPU%':>5}  {'MEM%':>5}  {'USER':<12}  NAME"
+    rows = [header]
+    for p in procs:
+        rows.append(
+            f"{p['pid']:>7}  {p.get('cpu_percent') or 0:>5.1f}  "
+            f"{p.get('memory_percent') or 0:>5.1f}  "
+            f"{(p.get('username') or '-')[:12]:<12}  {p.get('name') or '-'}"
+        )
+    return "\n".join(rows)
+
+
+def tool_kill_process(name_or_pid) -> str:
+    """Terminate a process by PID (int or numeric string) or by process
+    name (substring match). Sends SIGTERM. Returns a summary of what was
+    killed.
+    """
+    target = str(name_or_pid).strip()
+    if not target:
+        return "ERROR: no PID or name given"
+    if target.isdigit():
+        pid = int(target)
+        try:
+            p = psutil.Process(pid)
+            name = p.name()
+            p.terminate()
+            return f"Sent SIGTERM to PID {pid} ({name})"
+        except psutil.NoSuchProcess:
+            return f"ERROR: no process with PID {pid}"
+        except psutil.AccessDenied:
+            return f"ERROR: permission denied killing PID {pid}"
+        except Exception as e:
+            return f"ERROR killing PID {pid}: {e}"
+    killed = []
+    failed = []
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            if target.lower() in (p.info["name"] or "").lower():
+                p.terminate()
+                killed.append(f"{p.info['pid']} ({p.info['name']})")
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.AccessDenied:
+            failed.append(f"{p.info['pid']} ({p.info['name']})")
+    if not killed and not failed:
+        return f"No processes matched name {target!r}"
+    parts = []
+    if killed:
+        parts.append(f"Killed {len(killed)}: " + ", ".join(killed))
+    if failed:
+        parts.append(f"Permission denied for {len(failed)}: " + ", ".join(failed))
+    return " | ".join(parts)
+
+
+def tool_set_volume(level) -> str:
+    """Set system volume to ``level`` percent (0-100) on the default sink
+    via pactl (works on PulseAudio and PipeWire).
+    """
+    try:
+        pct = int(level)
+    except (TypeError, ValueError):
+        return f"ERROR: level must be an integer 0-100, got {level!r}"
+    pct = max(0, min(100, pct))
+    try:
+        result = subprocess.run(
+            ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{pct}%"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return f"ERROR setting volume: {result.stderr.strip() or 'pactl failed'}"
+        return f"Volume set to {pct}%"
+    except FileNotFoundError:
+        return "ERROR: pactl is not installed"
+    except Exception as e:
+        return f"ERROR setting volume: {e}"
+
+
+def _clipboard_backend() -> tuple[list[str], list[str]] | None:
+    """Pick (read_cmd, write_cmd) based on what's available. Prefers
+    Wayland (wl-paste/wl-copy) and falls back to xclip / xsel for X11.
+    """
+    if shutil.which("wl-paste") and shutil.which("wl-copy"):
+        return (["wl-paste", "--no-newline"], ["wl-copy"])
+    if shutil.which("xclip"):
+        return (["xclip", "-selection", "clipboard", "-o"],
+                ["xclip", "-selection", "clipboard", "-i"])
+    if shutil.which("xsel"):
+        return (["xsel", "--clipboard", "--output"],
+                ["xsel", "--clipboard", "--input"])
+    return None
+
+
+def tool_get_clipboard() -> str:
+    """Return the current clipboard text."""
+    backend = _clipboard_backend()
+    if backend is None:
+        return "ERROR: no clipboard backend (install wl-clipboard, xclip, or xsel)"
+    read_cmd, _ = backend
+    try:
+        result = subprocess.run(read_cmd, capture_output=True, text=True, timeout=3)
+        if result.returncode != 0:
+            return f"ERROR reading clipboard: {result.stderr.strip() or read_cmd[0] + ' failed'}"
+        text = result.stdout
+        if len(text) > 4000:
+            text = text[:4000] + "\n... [TRUNCATED]"
+        return text if text else "(clipboard is empty)"
+    except Exception as e:
+        return f"ERROR reading clipboard: {e}"
+
+
+def tool_set_clipboard(text: str) -> str:
+    """Place ``text`` on the clipboard."""
+    backend = _clipboard_backend()
+    if backend is None:
+        return "ERROR: no clipboard backend (install wl-clipboard, xclip, or xsel)"
+    _, write_cmd = backend
+    try:
+        result = subprocess.run(
+            write_cmd, input=text, capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode != 0:
+            return f"ERROR writing clipboard: {result.stderr.strip() or write_cmd[0] + ' failed'}"
+        return f"Copied {len(text)} chars to clipboard"
+    except Exception as e:
+        return f"ERROR writing clipboard: {e}"
+
+
 # Browser tools are imported lazily to avoid startup overhead
 _browser_tools = None
 
 def _get_browser_tools():
     global _browser_tools
     if _browser_tools is None:
-        from osia.tools.browser import navigate, click, fill, read_page
+        from osia.tools.browser import (
+            navigate, click, fill, read_page,
+            get_current_url, scroll, go_back, go_forward, open_new_tab,
+            find_and_click, wait_for_load, get_page_text, scroll_down,
+            type_text, press_key,
+        )
         _browser_tools = {
             "navigate": navigate,
             "click": click,
             "fill": fill,
             "read_page": read_page,
+            "get_current_url": get_current_url,
+            "scroll": scroll,
+            "go_back": go_back,
+            "go_forward": go_forward,
+            "open_new_tab": open_new_tab,
+            "find_and_click": find_and_click,
+            "wait_for_load": wait_for_load,
+            "get_page_text": get_page_text,
+            "scroll_down": scroll_down,
+            "type_text": type_text,
+            "press_key": press_key,
         }
     return _browser_tools
 
@@ -391,21 +864,143 @@ def tool_fill(selector: str, value: str) -> str:
 def tool_read_page() -> str:
     return _get_browser_tools()["read_page"]()
 
+def tool_get_current_url() -> str:
+    return _get_browser_tools()["get_current_url"]()
+
+def tool_scroll(direction: str = "down", amount: int = 600) -> str:
+    return _get_browser_tools()["scroll"](direction, amount)
+
+def tool_go_back() -> str:
+    return _get_browser_tools()["go_back"]()
+
+def tool_go_forward() -> str:
+    return _get_browser_tools()["go_forward"]()
+
+def tool_open_new_tab(url: str) -> str:
+    return _get_browser_tools()["open_new_tab"](url)
+
+def tool_find_and_click(text: str) -> str:
+    return _get_browser_tools()["find_and_click"](text)
+
+def tool_wait_for_load() -> str:
+    return _get_browser_tools()["wait_for_load"]()
+
+def tool_get_page_text() -> str:
+    return _get_browser_tools()["get_page_text"]()
+
+def tool_scroll_down(amount: int | None = None) -> str:
+    return _get_browser_tools()["scroll_down"](amount)
+
+def tool_type_text(selector: str, text: str) -> str:
+    return _get_browser_tools()["type_text"](selector, text)
+
+def tool_press_key(key: str) -> str:
+    return _get_browser_tools()["press_key"](key)
+
 
 TOOL_MAP = {
+    # Shell & launchers
     "bash": tool_bash,
     "run_command": tool_run_command,
+    "open_application": tool_open_application,
+    "take_screenshot": tool_take_screenshot,
+    # Files
     "read_file": tool_read_file,
     "write_file": tool_write_file,
     "list_files": tool_list_files,
     "delete_file": tool_delete_file,
-    "open_application": tool_open_application,
-    "take_screenshot": tool_take_screenshot,
+    "create_directory": tool_create_directory,
+    "delete_directory": tool_delete_directory,
+    "rename_file": tool_rename_file,
+    "copy_file": tool_copy_file,
+    "get_file_info": tool_get_file_info,
+    "search_files": tool_search_files,
+    # Code editor
+    "open_in_editor": tool_open_in_editor,
+    "edit_file_lines": tool_edit_file_lines,
+    # System
+    "get_system_info": tool_get_system_info,
+    "list_running_processes": tool_list_running_processes,
+    "kill_process": tool_kill_process,
+    "set_volume": tool_set_volume,
+    "get_clipboard": tool_get_clipboard,
+    "set_clipboard": tool_set_clipboard,
+    # Browser
     "navigate": tool_navigate,
     "click": tool_click,
     "fill": tool_fill,
     "read_page": tool_read_page,
+    "get_current_url": tool_get_current_url,
+    "scroll": tool_scroll,
+    "go_back": tool_go_back,
+    "go_forward": tool_go_forward,
+    "open_new_tab": tool_open_new_tab,
+    "find_and_click": tool_find_and_click,
+    "wait_for_load": tool_wait_for_load,
+    "get_page_text": tool_get_page_text,
+    "scroll_down": tool_scroll_down,
+    "type_text": tool_type_text,
+    "press_key": tool_press_key,
 }
+
+
+# ---------------------------------------------------------------------------
+# Tool execution: hard wall-clock timeout + retry-once-on-error
+# ---------------------------------------------------------------------------
+
+TOOL_TIMEOUT_SECONDS = 30
+_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="osia-tool")
+
+_ERROR_PREFIXES = ("ERROR", "ERREUR", "[ERROR]", "[ERREUR]")
+
+
+def _is_tool_error(result) -> bool:
+    """A tool result is treated as a failure when it's empty/whitespace
+    or its first non-blank token begins with ERROR/ERREUR (with or
+    without brackets). Sentinels like ``(no output)`` or ``(empty
+    directory)`` are *not* errors — they're legitimate empty signals.
+    """
+    if not isinstance(result, str):
+        return False
+    s = result.strip()
+    if not s:
+        return True
+    upper = s.upper()
+    return any(upper.startswith(p) for p in _ERROR_PREFIXES)
+
+
+def _execute_tool_once(tool_name: str, kwargs: dict) -> str:
+    """Run one tool with a 30 s wall-clock timeout. Returns the
+    stringified result, or a clear [ERREUR] line on timeout/exception
+    so the model can read the failure back and report it honestly.
+    Submitting through a ThreadPoolExecutor means the surrounding agent
+    loop can never be wedged by a stuck synchronous tool.
+    """
+    fn = TOOL_MAP[tool_name]
+    try:
+        fut = _TOOL_EXECUTOR.submit(fn, **kwargs)
+        return str(fut.result(timeout=TOOL_TIMEOUT_SECONDS))
+    except FutureTimeoutError:
+        return (
+            f"[ERREUR] L'outil '{tool_name}' n'a pas répondu après "
+            f"{TOOL_TIMEOUT_SECONDS}s (timeout). L'action n'a pas été confirmée."
+        )
+    except Exception as e:
+        return f"[ERREUR] '{tool_name}' a échoué: {e}"
+
+
+def _execute_tool_with_retry(tool_name: str, kwargs: dict) -> tuple[str, bool]:
+    """Execute a tool and retry exactly once if the first attempt
+    reports an error (or returns empty). Returns ``(result, is_error)``
+    where ``is_error`` reflects the *final* attempt — callers use it to
+    decide whether to keep dispatching the rest of a tool-call batch.
+    """
+    result = _execute_tool_once(tool_name, kwargs)
+    if _is_tool_error(result):
+        preview = result.replace("\n", " ")[:120]
+        print(f"[OSIA Agent] ↻ retry tool: {tool_name} (first attempt: {preview!r})")
+        result = _execute_tool_once(tool_name, kwargs)
+    return result, _is_tool_error(result)
 
 
 def parse_tool_calls(text: str) -> list:
@@ -497,24 +1092,39 @@ class OSIAAgent:
             speakable = ""
         return speakable
 
-    def _stream_with_sentences(self, on_sentence) -> str:
+    def _stream_with_sentences(self, on_sentence, max_tokens: int | None = None,
+                               on_first_token=None) -> str:
         """Stream a chat completion, emitting each complete sentence to
         ``on_sentence`` as it arrives. Returns the full accumulated content
         so the outer loop can still detect tool calls.
 
         Anything inside a ``<tool_call>...</tool_call>`` block is buffered
         but never emitted — we don't want to speak tool markup.
+
+        If ``on_first_token`` is provided it is invoked (once per call)
+        the first time a non-empty content delta arrives from the model.
+        Useful for latency profiling.
         """
-        stream = self.client.chat.completions.create(
-            model=self.model,
-            messages=self.messages,
-            stream=True,
-        )
+        create_kwargs = {
+            "model": self.model,
+            "messages": self.messages,
+            "stream": True,
+        }
+        if max_tokens is not None:
+            create_kwargs["max_tokens"] = max_tokens
+        stream = self.client.chat.completions.create(**create_kwargs)
 
         full = ""
         pending = ""       # raw text not yet routed to speakable/tool
         speakable = ""     # awaiting a sentence-ending punctuation char
         in_tool_call = False
+        # Once True, the model has committed to a tool this round. Anything
+        # it says afterwards is ungrounded (the tool hasn't actually run
+        # yet) — we still feed it into `full` so the outer loop sees the
+        # tool_call markup, but we MUST NOT speak it. The next round, run
+        # after the real tool result is fed back, produces the spoken reply.
+        tool_call_seen = False
+        first_token_fired = False
 
         for chunk in stream:
             try:
@@ -523,6 +1133,13 @@ class OSIAAgent:
                 delta = ""
             if not delta:
                 continue
+            if not first_token_fired:
+                first_token_fired = True
+                if on_first_token is not None:
+                    try:
+                        on_first_token()
+                    except Exception:
+                        pass
             full += delta
             pending += delta
 
@@ -536,6 +1153,13 @@ class OSIAAgent:
                     pending = pending[close + len("</tool_call>"):]
                     in_tool_call = False
                     continue
+
+                if tool_call_seen:
+                    # Post-tool_call prose this round — keep it in `full`
+                    # but never speak it; the model can't yet know what
+                    # the tool returned.
+                    pending = ""
+                    break
 
                 open_idx = pending.find("<tool_call>")
                 if open_idx == -1:
@@ -551,35 +1175,60 @@ class OSIAAgent:
                 speakable += pending[:open_idx]
                 pending = pending[open_idx + len("<tool_call>"):]
                 in_tool_call = True
+                tool_call_seen = True
                 speakable = self._emit_sentences(
                     speakable, on_sentence, flush=True,
                 )
 
-        # End of stream — final flush of anything still pending.
-        if not in_tool_call:
+        # End of stream — only flush the tail if this round produced no
+        # tool call at all. If a tool call was seen, anything still in
+        # `speakable`/`pending` is ungrounded follow-up text.
+        if not in_tool_call and not tool_call_seen:
             speakable += pending
             self._emit_sentences(speakable, on_sentence, flush=True)
 
         return full
 
-    def run(self, user_input: str, max_tool_rounds: int = 10, on_sentence=None) -> str:
+    def run(self, user_input: str, max_tool_rounds: int = 10, on_sentence=None,
+            history: list | None = None, max_tokens: int | None = 512,
+            on_first_token=None) -> str:
         """Run the agent loop: send user input, handle tool calls, return final response.
 
         If ``on_sentence`` is provided, the API call is streamed and the
         callback is invoked with each complete sentence (cleaned) as soon
         as it arrives. Sentences that fall inside a ``<tool_call>`` block
         are skipped so tool markup is never spoken.
+
+        If ``history`` is provided, it replaces the agent's internal
+        conversation history (excluding the system prompt) for this run.
+        After the call, callers can read ``self.messages[1:]`` to retrieve
+        the updated history (system prompt is at index 0).
+
+        ``max_tokens`` caps the response length of each round (default
+        512, sized for short conversational replies). Pass ``None`` to
+        leave it unset.
         """
+        if history is not None:
+            self.messages = [{"role": "system", "content": get_system_prompt(self.lang)}] + list(history)
         self.messages.append({"role": "user", "content": user_input})
 
         for round_num in range(max_tool_rounds):
             if on_sentence is not None:
-                content = self._stream_with_sentences(on_sentence)
-            else:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=self.messages,
+                # on_first_token only fires the first time a delta arrives
+                # in this round. The server-side flag dedupes across rounds.
+                content = self._stream_with_sentences(
+                    on_sentence,
+                    max_tokens=max_tokens,
+                    on_first_token=on_first_token,
                 )
+            else:
+                create_kwargs = {
+                    "model": self.model,
+                    "messages": self.messages,
+                }
+                if max_tokens is not None:
+                    create_kwargs["max_tokens"] = max_tokens
+                response = self.client.chat.completions.create(**create_kwargs)
                 content = response.choices[0].message.content or ""
 
             # Check for tool calls
@@ -593,16 +1242,55 @@ class OSIAAgent:
                 # Add assistant message with the tool call
                 self.messages.append({"role": "assistant", "content": content})
 
-                # Execute each tool and collect results
+                # Execute tools SEQUENTIALLY — each one completes (or
+                # times out / errors) before the next starts. If any tool
+                # ultimately errors (even after the retry), stop the batch
+                # so the model sees the failure on the next round and can
+                # report it honestly instead of plowing into more actions
+                # that depended on the failed one.
                 tool_results = []
-                for tc in tool_calls:
+                for i, tc in enumerate(tool_calls):
                     tool_name = tc.get("tool", "")
-                    if tool_name in TOOL_MAP:
-                        kwargs = {k: v for k, v in tc.items() if k != "tool"}
-                        result = TOOL_MAP[tool_name](**kwargs)
-                    else:
-                        result = f"Unknown tool: {tool_name}"
-                    tool_results.append(f"Tool {tool_name} result:\n{result}")
+                    if tool_name not in TOOL_MAP:
+                        print(
+                            f"[OSIA Agent] ✗ unknown tool requested: {tool_name!r} "
+                            f"(known tools: {len(TOOL_MAP)})"
+                        )
+                        tool_results.append(
+                            f"Tool {tool_name} result:\n[ERREUR] outil inconnu: {tool_name}"
+                        )
+                        # Treat unknown tool as a hard error: stop the batch.
+                        remaining = tool_calls[i + 1:]
+                        if remaining:
+                            print(
+                                f"[OSIA Agent] ⏸ skipping {len(remaining)} follow-up "
+                                f"tool call(s) after unknown-tool error"
+                            )
+                        break
+
+                    kwargs = {k: v for k, v in tc.items() if k != "tool"}
+                    kwargs_preview = {
+                        k: (v[:80] + "…" if isinstance(v, str) and len(v) > 80 else v)
+                        for k, v in kwargs.items()
+                    }
+                    print(f"[OSIA Agent] ▶ tool: {tool_name}({kwargs_preview})")
+                    result, is_error = _execute_tool_with_retry(tool_name, kwargs)
+                    result_str = str(result)
+                    status = "✗ error" if is_error else "✓ ok"
+                    print(
+                        f"[OSIA Agent] ◀ tool: {tool_name} → "
+                        f"{len(result_str)} chars [{status}]"
+                    )
+                    tool_results.append(f"Tool {tool_name} result:\n{result_str}")
+                    if is_error:
+                        remaining = tool_calls[i + 1:]
+                        if remaining:
+                            names = [t.get("tool", "?") for t in remaining]
+                            print(
+                                f"[OSIA Agent] ⏸ skipping {len(remaining)} "
+                                f"follow-up tool call(s) after error: {names}"
+                            )
+                        break
 
                 # Feed tool results back
                 feedback = "\n\n".join(tool_results)

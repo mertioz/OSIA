@@ -27,6 +27,40 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from osia.agent import OSIAAgent, DEFAULT_LANG, get_system_prompt
+from osia import conversations
+
+
+def _persist_agent_delta(conv_id, agent, prev_history_len):
+    """Persist messages added to ``agent.messages`` during the most recent
+    ``agent.run()`` call. ``prev_history_len`` is the length of the
+    non-system message list (``agent.messages[1:]``) before that call.
+
+    Errors are logged but never raised — persistence must never crash
+    the interactive loop.
+    """
+    if not conv_id:
+        return
+    try:
+        new_msgs = agent.messages[1:][prev_history_len:]
+        for m in new_msgs:
+            conversations.add_message(
+                conv_id, m.get("role"), m.get("content", ""),
+            )
+    except Exception as e:
+        print(f"[OSIA] failed to persist conversation: {e}")
+
+
+def _persist_exchange(conv_id, user_text, assistant_text):
+    """Persist a stateless single-turn exchange (used by voice_mode,
+    which currently calls run_agent() without keeping history).
+    """
+    if not conv_id:
+        return
+    try:
+        conversations.add_message(conv_id, "user", user_text)
+        conversations.add_message(conv_id, "assistant", assistant_text or "")
+    except Exception as e:
+        print(f"[OSIA] failed to persist conversation: {e}")
 
 
 # ── Ctrl+Space hotkey fallback ──────────────────────────────────────────────
@@ -72,10 +106,12 @@ def _start_ctrl_space_listener(callback):
 def text_mode():
     """Interactive text-based chat with OSIA."""
     agent = OSIAAgent()
+    active_conv = conversations.create_conversation()
     print("=" * 60)
     print("  OSIA — Local AI Voice Assistant (text mode)")
     print(f"  Language: {DEFAULT_LANG.upper()}")
     print("  Type 'exit' or 'quit' to stop, 'reset' to clear history")
+    print(f"  Conversation: {active_conv['id']}")
     print("=" * 60)
 
     while True:
@@ -94,13 +130,16 @@ def text_mode():
 
         if user_input.lower() == "reset":
             agent.reset()
-            print("[Conversation history cleared]")
+            active_conv = conversations.create_conversation()
+            print(f"[New conversation: {active_conv['id']}]")
             continue
 
+        prev_history_len = len(agent.messages) - 1  # skip system prompt
         print("\nOSIA is thinking...", flush=True)
         try:
             response = agent.run(user_input)
             print(f"\nOSIA: {response}")
+            _persist_agent_delta(active_conv["id"], agent, prev_history_len)
         except Exception as e:
             print(f"\n[ERROR] {e}")
 
@@ -111,9 +150,11 @@ def voice_mode():
     from osia.voice.tts import speak
     from osia.agent import run_agent, clean_response
 
+    active_conv = conversations.create_conversation()
     print("=" * 60)
     print("  OSIA — Voice Mode")
     print(f"  Language: {DEFAULT_LANG.upper()}")
+    print(f"  Conversation: {active_conv['id']}")
     print("=" * 60)
 
     while True:
@@ -141,6 +182,7 @@ def voice_mode():
         response = clean_response(response)
         print(f"💬 OSIA: {response}")
 
+        _persist_exchange(active_conv["id"], user_text, response)
         speak(response)
 
 
@@ -186,6 +228,12 @@ def wake_mode():
 
     # Current agent instance
     agent = OSIAAgent()
+
+    # Active conversation — every wake-word interaction is persisted to
+    # this file under ~/.osia/conversations/. A fresh conversation is
+    # created each time wake mode starts.
+    active_conv = conversations.create_conversation()
+    print(f"  Conversation: {active_conv['id']}")
 
     # Restore last-selected model if it's still available.
     settings = load_settings()
@@ -253,11 +301,15 @@ def wake_mode():
                         except Exception as e:
                             print(f"⚠️  Smart routing failed: {e}")
 
+                prev_history_len = len(agent.messages) - 1  # skip system prompt
                 try:
                     # Stream sentences to TTS as the model produces them, so
                     # OSIA starts speaking within ~1s of the first chunk
                     # instead of waiting for the entire response.
                     agent.run(user_text, on_sentence=speak_streaming)
+                    _persist_agent_delta(
+                        active_conv["id"], agent, prev_history_len,
+                    )
                 except Exception as e:
                     bridge.response_ready_signal.emit(f"Error: {e}")
             finally:

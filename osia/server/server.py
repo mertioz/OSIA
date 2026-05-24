@@ -4,16 +4,27 @@ OSIA Mobile Server — FastAPI application with a WebSocket endpoint (/ws).
 
 Protocol (JSON over WebSocket, port 8765):
   Client → Server:
-    {"type": "auth",   "token": "..."}
-    {"type": "text",   "content": "..."}
-    {"type": "audio",  "format": "wav", "data": "<base64>"}
+    {"type": "auth",                 "token": "..."}
+    {"type": "text",                 "content": "..."}
+    {"type": "audio",                "format": "wav", "data": "<base64>"}
+    {"type": "list_conversations"}
+    {"type": "load_conversation",    "id": "..."}
+    {"type": "new_conversation"}
+    {"type": "delete_conversation",  "id": "..."}
   Server → Client:
-    {"type": "transcript", "content": "..."}
-    {"type": "response",   "content": "..."}
-    {"type": "audio",      "format": "mp3", "data": "<base64>"}
-    {"type": "status",     "content": "thinking|done|error"}
+    {"type": "transcript",           "content": "..."}
+    {"type": "response_chunk",       "content": "..."}        # streamed sentence-by-sentence
+    {"type": "response",             "content": "..."}        # final assembled reply
+    {"type": "audio",                "format": "mp3", "data": "<base64>"}
+    {"type": "status",               "content": "thinking|done|error"}
+    {"type": "conversations",        "items": [{id,title,created_at,updated_at,message_count}, ...]}
+    {"type": "conversation_history", "id": "...", "title": "...",
+                                     "messages": [{"role": "user|assistant", "content": "..."}]}
+    {"type": "conversation_deleted", "id": "...", "success": true|false}
+    {"type": "active_conversation",  "id": "...", "title": "..."}
 """
 
+import asyncio
 import base64
 import io
 import json
@@ -21,12 +32,15 @@ import os
 import secrets
 import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+from osia import conversations
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -207,6 +221,34 @@ def decode_base64_wav(b64_data: str) -> tuple[np.ndarray, int]:
 app = FastAPI(title="OSIA Mobile Server", version="1.0.0")
 
 
+@app.on_event("startup")
+async def _warm_models() -> None:
+    """Pre-load slow models in the background at server startup so the
+    first real audio request doesn't pay their cold-start cost.
+
+    faster-whisper's ``WhisperModel`` is module-level cached in
+    ``osia.voice.stt`` — calling ``_get_model()`` once here means every
+    subsequent ``transcribe()`` call (including the very first user
+    request) reuses the already-loaded model in memory.
+    """
+    async def _warm() -> None:
+        try:
+            from osia.voice.stt import _get_model, MODEL_SIZE
+            print(f"[OSIA Server] Warming faster-whisper '{MODEL_SIZE}'...")
+            t0 = time.perf_counter()
+            await asyncio.to_thread(_get_model)
+            elapsed = (time.perf_counter() - t0) * 1000
+            print(f"[OSIA Server] Whisper '{MODEL_SIZE}' loaded in {elapsed:.0f}ms")
+        except Exception as e:
+            print(
+                f"[OSIA Server] Whisper warm-up failed "
+                f"(will lazy-load on first request): {e}"
+            )
+
+    # Run in the background so /health responds immediately during warm-up.
+    asyncio.create_task(_warm())
+
+
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "osia-mobile-server"}
@@ -221,6 +263,13 @@ async def health():
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     authenticated = False
+    # Per-session state.
+    # ``session_history`` is the OpenAI-format message list (sans system
+    # prompt) handed to the agent each turn. ``active_conv_id`` is the
+    # conversation file currently being written to. Both reset on
+    # disconnect (function returns => GC).
+    session_history: list = []
+    active_conv_id: str | None = None
 
     try:
         async for raw_msg in ws.iter_text():
@@ -237,8 +286,16 @@ async def websocket_endpoint(ws: WebSocket):
                 token = msg.get("token", "")
                 if token == MOBILE_TOKEN:
                     authenticated = True
+                    session_history = []
+                    active_conv_id = None
                     await ws.send_json({"type": "status", "content": "done"})
                     print("[OSIA Server] Mobile client authenticated.")
+                    # Send the full conversation list right away so the
+                    # client can render the sidebar without a follow-up call.
+                    await ws.send_json({
+                        "type": "conversations",
+                        "items": conversations.list_conversations(),
+                    })
                 else:
                     await ws.send_json({"type": "status", "content": "error"})
                     await ws.close(code=4001, reason="Invalid token")
@@ -251,12 +308,78 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.close(code=4001, reason="Not authenticated")
                 return
 
+            # --- Conversation management ---
+            if msg_type == "list_conversations":
+                await ws.send_json({
+                    "type": "conversations",
+                    "items": conversations.list_conversations(),
+                })
+                continue
+
+            if msg_type == "new_conversation":
+                # Reset session history, create a fresh conversation, and
+                # promote it to active. Notify the client with BOTH the
+                # active-conversation pointer AND the refreshed sidebar
+                # list (so the new entry shows up immediately).
+                session_history = []
+                conv = conversations.create_conversation()
+                active_conv_id = conv["id"]
+                print(
+                    f"[OSIA Server] New conversation: {active_conv_id} "
+                    f"(title={conv['title']!r})"
+                )
+                await ws.send_json({
+                    "type": "active_conversation",
+                    "id": conv["id"],
+                    "title": conv["title"],
+                })
+                await ws.send_json({
+                    "type": "conversations",
+                    "items": conversations.list_conversations(),
+                })
+                continue
+
+            if msg_type == "load_conversation":
+                conv_id = msg.get("id", "")
+                conv = conversations.get_conversation(conv_id)
+                if conv is None:
+                    await ws.send_json({
+                        "type": "status",
+                        "content": "error",
+                        "message": f"conversation {conv_id!r} not found",
+                    })
+                    continue
+                active_conv_id = conv_id
+                session_history = list(conv.get("messages") or [])
+                await ws.send_json({
+                    "type": "conversation_history",
+                    "id": conv_id,
+                    "title": conv.get("title"),
+                    "messages": _displayable_history(session_history),
+                })
+                continue
+
+            if msg_type == "delete_conversation":
+                conv_id = msg.get("id", "")
+                ok = conversations.delete_conversation(conv_id)
+                if active_conv_id == conv_id:
+                    active_conv_id = None
+                    session_history = []
+                await ws.send_json({
+                    "type": "conversation_deleted",
+                    "id": conv_id,
+                    "success": ok,
+                })
+                continue
+
             # --- Text message ---
             if msg_type == "text":
                 user_text = msg.get("content", "").strip()
                 if not user_text:
                     continue
-                await _handle_text(ws, user_text)
+                session_history, active_conv_id = await _run_agent_and_respond(
+                    ws, user_text, session_history, active_conv_id,
+                )
 
             # --- Audio message ---
             elif msg_type == "audio":
@@ -264,13 +387,16 @@ async def websocket_endpoint(ws: WebSocket):
                 audio_format = msg.get("format", "wav")
                 if not b64_data:
                     continue
-                await _handle_audio(ws, b64_data, audio_format)
+                session_history, active_conv_id = await _handle_audio(
+                    ws, b64_data, audio_format,
+                    session_history, active_conv_id,
+                )
 
             else:
                 await ws.send_json({"type": "status", "content": "error"})
 
     except WebSocketDisconnect:
-        print("[OSIA Server] Client disconnected.")
+        print("[OSIA Server] Client disconnected. Resetting session state.")
     except Exception as e:
         print(f"[OSIA Server] Unexpected error: {e}")
         traceback.print_exc()
@@ -278,89 +404,338 @@ async def websocket_endpoint(ws: WebSocket):
             await ws.send_json({"type": "status", "content": "error"})
         except Exception:
             pass
+    finally:
+        # State is local to this function; on return it is garbage-collected.
+        session_history = []
+        active_conv_id = None
+
+
+# ---------------------------------------------------------------------------
+# Latency profiling helper
+# ---------------------------------------------------------------------------
+def _ts(t0: float, label: str, extra: str = "") -> None:
+    """Log a single latency milestone relative to ``t0`` (perf_counter
+    seconds). Lines are prefixed with ``[OSIA Latency]`` so they're
+    easy to grep. Safe to call from a worker thread (``print`` is
+    threadsafe in CPython).
+    """
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    tail = f"  {extra}" if extra else ""
+    print(f"[OSIA Latency] +{elapsed_ms:6.0f}ms  {label}{tail}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Persistence helper
+# ---------------------------------------------------------------------------
+def _displayable_history(history: list) -> list[dict]:
+    """Project the stored OpenAI-format history into the shape the mobile
+    client renders: only user / assistant turns with real text. Drops
+    tool-call envelopes, tool-result echoes, and empty assistant frames
+    that exist only to carry ``tool_calls``.
+    """
+    out: list[dict] = []
+    for msg in history:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        raw = msg.get("content")
+        if isinstance(raw, list):
+            # OpenAI vision-style content parts: pick text fragments.
+            text = "".join(
+                str(p.get("text", "")) for p in raw if isinstance(p, dict)
+            )
+        elif raw is None:
+            text = ""
+        else:
+            text = str(raw)
+        text = text.strip()
+        if not text:
+            continue
+        if role == "user" and text.lstrip().startswith("<tool_result>"):
+            continue
+        out.append({"role": role, "content": text})
+    return out
+
+
+def _persist_new_messages(conv_id: str | None, full_history: list,
+                          prev_len: int) -> None:
+    """Append messages added since the last turn to the conversation file.
+
+    ``full_history`` is the agent's post-run message list (sans system
+    prompt), ``prev_len`` is its length before the turn started.
+    """
+    if conv_id is None:
+        return
+    for msg in full_history[prev_len:]:
+        try:
+            conversations.add_message(
+                conv_id, msg.get("role"), msg.get("content", ""),
+            )
+        except Exception as e:
+            print(f"[OSIA Server] failed to persist message: {e}")
 
 
 # ---------------------------------------------------------------------------
 # Message handlers
 # ---------------------------------------------------------------------------
-async def _handle_text(ws: WebSocket, text: str):
-    """Process a text command: run the agent, send response + TTS audio."""
-    from osia.agent import OSIAAgent
+async def _run_agent_and_respond(ws: WebSocket, text: str, history: list,
+                                 active_conv_id: str | None,
+                                 *, t0: float | None = None) -> tuple[list, str]:
+    """Run the agent with the given conversation history, persist the
+    new turn, stream the spoken response sentence-by-sentence, then send
+    the assembled reply + TTS audio.
 
-    # Status: thinking
+    Returns ``(updated_history, active_conv_id)``. If no conversation
+    was active a new one is created (with a smart keyword title seeded
+    from ``text``) so every interaction lives in a persisted file.
+
+    ``t0`` is a ``time.perf_counter()`` reference for latency logging.
+    The audio path passes its own t0 (set when the audio frame arrived)
+    so the logs measure end-to-end latency including STT; the text path
+    omits it and the function creates its own.
+    """
+    # Import lazily so the module loads quickly, but capture TOOL_MAP
+    # here too so the debug log proves it's reachable from this context.
+    from osia.agent import OSIAAgent, TOOL_MAP
+
+    if t0 is None:
+        t0 = time.perf_counter()
+        _ts(t0, "text received", f"({len(text)} chars: {text[:60]!r})")
+
+    # Auto-create a conversation on the FIRST message of the session,
+    # seeded with a smart keyword title so the sidebar reads naturally
+    # right away. Also push a refreshed conversation list so any
+    # subscribed UI updates immediately.
+    if active_conv_id is None:
+        seed_title = conversations.smart_title(text)
+        conv = conversations.create_conversation(title=seed_title)
+        active_conv_id = conv["id"]
+        await ws.send_json({
+            "type": "active_conversation",
+            "id": conv["id"],
+            "title": conv["title"],
+        })
+        await ws.send_json({
+            "type": "conversations",
+            "items": conversations.list_conversations(),
+        })
+
+    prev_len = len(history)
+
+    # Status: thinking (single small send before the agent kicks off —
+    # cheap, fire-and-forget effectively, mobile uses it for UI state).
     await ws.send_json({"type": "status", "content": "thinking"})
 
-    try:
-        # Run the agent
-        agent = OSIAAgent()
-        response_text = agent.run(text)
+    # ── Streaming plumbing ────────────────────────────────────────────
+    # The agent runs in a worker thread (so it doesn't block the event
+    # loop). Each completed sentence fires `on_sentence`, which schedules
+    # an asyncio.Queue.put on the event loop. A local sender task drains
+    # the queue and pushes each sentence to the WebSocket as a
+    # `response_chunk` message — the first chunk lands as soon as the
+    # model produces its first sentence.
+    loop = asyncio.get_running_loop()
+    chunk_queue: asyncio.Queue = asyncio.Queue()
+    pending_puts: list = []
+    _SENTINEL = object()
+    # Single-element lists let the inner closures mutate the flag
+    # without `nonlocal` gymnastics across threads.
+    first_token_logged = [False]
+    first_chunk_sent_logged = [False]
 
-        if not response_text:
-            response_text = "Désolé, je n'ai pas pu traiter votre demande."
+    def on_first_token() -> None:
+        # Called from the agent worker thread the moment the first
+        # non-empty delta arrives back from the LLM.
+        if not first_token_logged[0]:
+            first_token_logged[0] = True
+            _ts(t0, "first model token received")
 
-        # Send the text response
-        await ws.send_json({"type": "response", "content": response_text})
-
-        # Synthesize to MP3 and send
+    def on_sentence(sentence: str) -> None:
+        if not sentence:
+            return
         try:
-            mp3_bytes = synthesize_to_mp3_bytes(response_text)
-            mp3_b64 = base64.b64encode(mp3_bytes).decode("ascii")
-            await ws.send_json({
-                "type": "audio",
-                "format": "mp3",
-                "data": mp3_b64,
-            })
+            fut = asyncio.run_coroutine_threadsafe(
+                chunk_queue.put(sentence), loop,
+            )
+            pending_puts.append(fut)
         except Exception as e:
-            print(f"[OSIA Server] TTS synthesis failed: {e}")
-            traceback.print_exc()
+            print(f"[OSIA Server] on_sentence dispatch failed: {e}")
 
-        # Status: done
-        await ws.send_json({"type": "status", "content": "done"})
+    async def sender() -> None:
+        while True:
+            item = await chunk_queue.get()
+            if item is _SENTINEL:
+                return
+            if not first_chunk_sent_logged[0]:
+                first_chunk_sent_logged[0] = True
+                _ts(t0, "first response_chunk sent to mobile",
+                    f"({len(item)} chars: {item[:60]!r})")
+            try:
+                await ws.send_json({"type": "response_chunk", "content": item})
+            except Exception as e:
+                print(f"[OSIA Server] response_chunk send failed: {e}")
+                return
 
+    sender_task = asyncio.create_task(sender())
+
+    try:
+        agent = OSIAAgent()
+        _ts(t0, "agent.run started",
+            f"(model={agent.model}, provider={agent.provider}, "
+            f"history={len(history)} msgs, TOOL_MAP={len(TOOL_MAP)} tools, "
+            f"streaming=on, max_tokens=512)")
+        # Off-thread so the event loop stays free to flush response_chunks.
+        response_text = await asyncio.to_thread(
+            agent.run, text,
+            history=history,
+            on_sentence=on_sentence,
+            on_first_token=on_first_token,
+            max_tokens=512,
+        )
     except Exception as e:
         print(f"[OSIA Server] Agent error: {e}")
         traceback.print_exc()
+        # Drain any in-flight puts and shut the sender down cleanly.
+        for fut in pending_puts:
+            try:
+                await asyncio.wrap_future(fut)
+            except Exception:
+                pass
+        await chunk_queue.put(_SENTINEL)
+        await sender_task
         await ws.send_json({"type": "response", "content": f"Erreur: {e}"})
         await ws.send_json({"type": "status", "content": "error"})
+        return history, active_conv_id
+
+    # Wait for every scheduled put to actually land in the queue before
+    # signalling end-of-stream — otherwise the sentinel could overtake
+    # the last sentence and the sender would close early.
+    for fut in pending_puts:
+        try:
+            await asyncio.wrap_future(fut)
+        except Exception:
+            pass
+    await chunk_queue.put(_SENTINEL)
+    await sender_task
+
+    # Pull the updated history back out of the agent (excluding the
+    # system prompt at index 0) so the next request keeps context.
+    new_history = list(agent.messages[1:])
+
+    # Tool-call counter for debug logging.
+    new_msgs = new_history[prev_len:]
+    tool_call_count = sum(
+        str(m.get("content", "")).count("<tool_call>")
+        for m in new_msgs if m.get("role") == "assistant"
+    )
+    _ts(t0, "agent.run done",
+        f"(rounds={sum(1 for m in new_msgs if m.get('role') == 'assistant')}, "
+        f"tool_calls={tool_call_count}, "
+        f"reply_chars={len(response_text or '')})")
+
+    # Persist everything added during this turn (user msg, any
+    # assistant/tool rounds, final assistant reply).
+    _persist_new_messages(active_conv_id, new_history, prev_len)
+
+    if not response_text:
+        response_text = "Désolé, je n'ai pas pu traiter votre demande."
+
+    # Send the canonical full text once (clients that don't track chunks
+    # can rely on this; clients that do can ignore it).
+    await ws.send_json({"type": "response", "content": response_text})
+
+    # Synthesize TTS off-thread so the event loop keeps serving.
+    try:
+        mp3_bytes = await asyncio.to_thread(synthesize_to_mp3_bytes, response_text)
+        mp3_b64 = base64.b64encode(mp3_bytes).decode("ascii")
+        await ws.send_json({
+            "type": "audio",
+            "format": "mp3",
+            "data": mp3_b64,
+        })
+        _ts(t0, "first audio chunk sent to mobile", f"({len(mp3_bytes)} bytes)")
+    except Exception as e:
+        print(f"[OSIA Server] TTS synthesis failed: {e}")
+        traceback.print_exc()
+
+    await ws.send_json({"type": "status", "content": "done"})
+    _ts(t0, "request complete")
+    return new_history, active_conv_id
 
 
-async def _handle_audio(ws: WebSocket, b64_data: str, audio_format: str):
-    """Process an audio command: transcribe, then treat as text."""
+async def _handle_audio(ws: WebSocket, b64_data: str, audio_format: str,
+                        history: list,
+                        active_conv_id: str | None) -> tuple[list, str | None]:
+    """Process an audio command: transcribe, then run the agent on the
+    transcript using the SAME path as text commands (so tools execute
+    identically and the transcript ends up in the same conversation).
+
+    Latency-optimized:
+      * Whisper inference runs off-thread (``asyncio.to_thread``) so
+        the event loop keeps serving other clients during STT.
+      * The ``transcript`` message is fired with ``asyncio.create_task``
+        WITHOUT awaiting, so the agent starts in parallel with the
+        WebSocket send — mobile receives the transcript while the LLM
+        is already warming up.
+    """
     from osia.voice.stt import transcribe, WHISPER_SAMPLE_RATE, resample_audio
+
+    t0 = time.perf_counter()
+    _ts(t0, "audio received", f"({len(b64_data)} b64 chars, format={audio_format})")
 
     # Status: thinking
     await ws.send_json({"type": "status", "content": "thinking"})
 
     try:
-        # Decode and transcribe
+        # Decode and resample
         audio, sr = decode_base64_wav(b64_data)
         if audio.size == 0 or float(np.max(np.abs(audio))) < 0.01:
             await ws.send_json({"type": "transcript", "content": ""})
             await ws.send_json({"type": "status", "content": "done"})
-            return
+            _ts(t0, "silent audio — short-circuit done")
+            return history, active_conv_id
 
-        # Resample to 16kHz if needed
         if sr != WHISPER_SAMPLE_RATE:
             audio = resample_audio(audio, sr, WHISPER_SAMPLE_RATE)
             sr = WHISPER_SAMPLE_RATE
 
-        # Transcribe
-        transcript = transcribe(audio, sample_rate=sr)
-
-        # Send transcript back
-        await ws.send_json({"type": "transcript", "content": transcript})
+        # Whisper inference off-thread (sync, CPU-bound).
+        transcript = await asyncio.to_thread(transcribe, audio, sample_rate=sr)
+        _ts(t0, "transcription done",
+            f"({len(transcript)} chars: {transcript[:60]!r})")
 
         if not transcript.strip():
+            await ws.send_json({"type": "transcript", "content": ""})
             await ws.send_json({"type": "status", "content": "done"})
-            return
+            return history, active_conv_id
 
-        # Now process as text (the transcript becomes the user input)
-        await _handle_text(ws, transcript)
+        # Fire transcript send in parallel with the agent start — don't
+        # await it. The send is just an enqueue onto the WebSocket's
+        # outgoing buffer, so it lands long before the agent's first
+        # response_chunk, but starting the agent immediately saves the
+        # ~1-50 ms a real-network round-trip would otherwise cost.
+        transcript_send = asyncio.create_task(
+            ws.send_json({"type": "transcript", "content": transcript})
+        )
+
+        try:
+            return await _run_agent_and_respond(
+                ws, transcript, history, active_conv_id, t0=t0,
+            )
+        finally:
+            # Make sure the transcript frame finished going out before
+            # this handler returns (almost certainly already done by now).
+            try:
+                await transcript_send
+            except Exception as e:
+                print(f"[OSIA Server] transcript send failed: {e}")
 
     except Exception as e:
         print(f"[OSIA Server] Audio processing error: {e}")
         traceback.print_exc()
         await ws.send_json({"type": "status", "content": "error"})
+        return history, active_conv_id
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,8 @@ Phase 3: listen_for_command() with retry loop — keeps listening until
          a meaningful command (3+ words) is received.
 """
 
+import re
+
 import sounddevice as sd
 import numpy as np
 from scipy.signal import resample as scipy_resample
@@ -153,19 +155,105 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
     return scipy_resample(audio, num_samples).astype(np.float32)
 
 
+# ── French phonetic post-correction ────────────────────────────────────────
+# Whisper-small frequently confuses the /ʒ/ phoneme in French, mishearing
+# "j'ai" as "gai/gay/geai/gué", "je" as "ge", and "jeune" as "geune". The
+# corrections below target patterns where the misheard form would be very
+# unusual French — typically a "g…" word standing where a verb or pronoun
+# is grammatically required. They DO NOT touch the same words in contexts
+# where the literal form is plausible (e.g. "un homme gai", "les gens").
+
+# Words that almost always follow "j'ai" — past participles, common nouns,
+# adjectives describing states. Used as a right-context anchor.
+_POST_JAI = (
+    r"(?:un|une|des|le|la|les|l'|mon|ma|mes|"
+    r"été|fait|vu|dit|pris|trouvé|reçu|compris|oublié|perdu|gagné|"
+    r"mangé|bu|appris|écrit|lu|entendu|"
+    r"besoin|envie|peur|faim|soif|froid|chaud|mal|hâte|raison|tort|"
+    r"l'impression|l'habitude)"
+)
+
+# Verbs/auxiliaries that almost always follow "je" — used to disambiguate
+# "ge" → "je" without touching real words starting with "ge" (geste, gens,
+# général, génial, etc., none of which are verbs in this position).
+_POST_JE = (
+    r"(?:suis|vais|veux|peux|dois|sais|crois|pense|fais|prends|cherche|"
+    r"voudrais|aimerais|préfère|comprends|connais|trouve|vois|sens|"
+    r"l'ai|t'ai|m'en|n'ai|n'arrive)"
+)
+
+# Each entry is (compiled pattern, replacement). Patterns are
+# case-insensitive and use lookaheads for context so the replacement is
+# always exactly the misheard word — the substitution preserves the
+# original first-character capitalization.
+FRENCH_CORRECTIONS: list[tuple[re.Pattern, str]] = [
+    # j'ai misheard as gai / gay / geai / gué, when followed by a typical
+    # post-"j'ai" word
+    (re.compile(rf"\b(?:gai|gay|geai|gué)\b(?=\s+{_POST_JAI}\b)", re.IGNORECASE), "j'ai"),
+    # je misheard as "ge" before a typical post-"je" verb
+    (re.compile(rf"\bge\b(?=\s+{_POST_JE}\b)", re.IGNORECASE), "je"),
+    # jeune / jeunes misheard as geune / geunes (no real French word)
+    (re.compile(r"\bgeune\b", re.IGNORECASE), "jeune"),
+    (re.compile(r"\bgeunes\b", re.IGNORECASE), "jeunes"),
+    # déjà misheard as déga (no real French word)
+    (re.compile(r"\bdéga\b", re.IGNORECASE), "déjà"),
+    # j'aime / j'aimerais misheard as gaime / gaimerais (no real French word)
+    (re.compile(r"\bgaime\b", re.IGNORECASE), "j'aime"),
+    (re.compile(r"\bgaimerais\b", re.IGNORECASE), "j'aimerais"),
+    # j'y misheard as gît — the verb gésir form is extremely rare in
+    # voice commands, so correct only when followed by a verb of motion.
+    (re.compile(r"\bgît\b(?=\s+(?:vais|suis|pense|crois|tiens)\b)", re.IGNORECASE), "j'y"),
+]
+
+
+def _apply_french_corrections(text: str) -> str:
+    """Run all ``FRENCH_CORRECTIONS`` over ``text`` in order, preserving
+    the original first-character capitalization of each replaced span.
+    """
+    def make_repl(replacement: str):
+        def repl(match: re.Match) -> str:
+            if match.group(0)[:1].isupper():
+                return replacement[:1].upper() + replacement[1:]
+            return replacement
+        return repl
+
+    for pattern, replacement in FRENCH_CORRECTIONS:
+        text = pattern.sub(make_repl(replacement), text)
+    return text
+
+
 def transcribe(audio: np.ndarray, sample_rate: int = DEVICE_SAMPLE_RATE,
                language: str = None, model_size: str = None) -> str:
     """Transcribe audio samples to text using faster-whisper.
     Audio is expected at the device sample rate and will be resampled to 16kHz.
-    language=None enables auto-detection (supports fr + en).
+    language=None enables auto-detection (supports fr + en). When the
+    detected language is French, a post-correction pass fixes common
+    Whisper /ʒ/ confusions (j'ai vs gai/gay, je vs ge, …).
     """
     model = _get_model()
     # Resample to 16kHz for Whisper
     audio_16k = resample_audio(audio, sample_rate, WHISPER_SAMPLE_RATE)
-    segments, info = model.transcribe(audio_16k, beam_size=5, language=language,
-                                       initial_prompt="Assistant vocal, commandes en français et anglais.")
-    text = " ".join(segment.text for segment in segments)
-    return text.strip()
+    # The initial_prompt is conditioning text — it biases decoding without
+    # being transcribed. Listing common French words that exercise the J/G
+    # /ʒ/ distinction nudges Whisper toward the right spellings.
+    initial_prompt = (
+        "Assistant vocal, commandes en français et en anglais. "
+        "L'utilisateur dit souvent : j'ai besoin de, j'ai vu, j'ai oublié, "
+        "j'aimerais, je veux, je vais, je pense que, je cherche. "
+        "Mots fréquents avec j ou g doux : jamais, jardin, jeune, journée, "
+        "déjà, déjeuner, juste, joli, jour, jouer, "
+        "général, genre, gens, geste, girafe, gérer, génial. "
+        "Distinguer « j'ai » (passé composé) de « gai » (joyeux) et "
+        "« geai » (l'oiseau)."
+    )
+    segments, info = model.transcribe(
+        audio_16k, beam_size=5, language=language,
+        initial_prompt=initial_prompt,
+    )
+    text = " ".join(segment.text for segment in segments).strip()
+    if getattr(info, "language", None) == "fr":
+        text = _apply_french_corrections(text)
+    return text
 
 
 def listen(duration: int = RECORD_SECONDS) -> str:
