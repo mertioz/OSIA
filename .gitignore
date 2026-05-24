@@ -6,3 +6,4 @@ __pycache__/
 osia/wake_training/positive/
 osia/wake_training/negative/
 .env
+build_osia.py
