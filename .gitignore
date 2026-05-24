@@ -1,0 +1,8 @@
+venv/
+config/api_keys.json
+__pycache__/
+*.pyc
+*.pkl
+osia/wake_training/positive/
+osia/wake_training/negative/
+.env

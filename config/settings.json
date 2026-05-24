@@ -1,0 +1,7 @@
+{
+  "smart_routing": false,
+  "selected_model": "deepseek-v4-flash",
+  "tts_provider": "openai",
+  "tts_voice": "marin",
+  "parler_voice_description": null
+}

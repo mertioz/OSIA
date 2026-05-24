@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile osia/gui/wake_screen.py osia/main.py)"
+    ]
+  }
+}
