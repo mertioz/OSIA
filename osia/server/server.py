@@ -69,6 +69,41 @@ def load_or_create_token() -> str:
 MOBILE_TOKEN = load_or_create_token()
 
 
+def _log_active_model() -> None:
+    """Resolve the active model from settings and print a banner so it's
+    obvious in the server logs which provider/model is actually loaded.
+    """
+    try:
+        from osia.config import load_settings
+        from osia.agent import MODEL as DEFAULT_MODEL
+
+        settings = load_settings()
+        selected = settings.get("selected_model")
+        if selected:
+            try:
+                from osia.models import provider_for_model
+                provider = provider_for_model(selected)
+            except Exception:
+                provider = "unknown"
+            model = selected
+            source = "settings.json (selected_model)"
+        else:
+            model = DEFAULT_MODEL
+            provider = "ollama"
+            source = "agent default (no selected_model in settings)"
+
+        print("=" * 70)
+        print(f"[OSIA Server] Active model: {model}")
+        print(f"[OSIA Server] Provider:     {provider}")
+        print(f"[OSIA Server] Source:       {source}")
+        print("=" * 70)
+    except Exception as e:
+        print(f"[OSIA Server] Could not resolve active model: {e}")
+
+
+_log_active_model()
+
+
 # ---------------------------------------------------------------------------
 # TTS → mp3 bytes (synthesis without playback)
 # ---------------------------------------------------------------------------
@@ -430,8 +465,9 @@ def _ts(t0: float, label: str, extra: str = "") -> None:
 def _displayable_history(history: list) -> list[dict]:
     """Project the stored OpenAI-format history into the shape the mobile
     client renders: only user / assistant turns with real text. Drops
-    tool-call envelopes, tool-result echoes, and empty assistant frames
-    that exist only to carry ``tool_calls``.
+    tool-call envelopes, tool-result echoes, empty assistant frames
+    that exist only to carry ``tool_calls``, and any message that looks
+    like leaked system-prompt content.
     """
     out: list[dict] = []
     for msg in history:
@@ -454,6 +490,12 @@ def _displayable_history(history: list) -> list[dict]:
         if not text:
             continue
         if role == "user" and text.lstrip().startswith("<tool_result>"):
+            continue
+        # Defence-in-depth: drop anything that looks like the system
+        # prompt leaked into the conversation history.
+        if "RÈGLES ABSOLUES" in text or "ABSOLUTE RULES" in text:
+            continue
+        if text.lstrip().startswith("##"):
             continue
         out.append({"role": role, "content": text})
     return out
@@ -580,18 +622,43 @@ async def _run_agent_and_respond(ws: WebSocket, text: str, history: list,
     sender_task = asyncio.create_task(sender())
 
     try:
+        from osia.config import load_settings
+
         agent = OSIAAgent()
+        selected_model = load_settings().get("selected_model")
+        if selected_model:
+            try:
+                agent.set_model(selected_model)
+            except Exception as e:
+                print(
+                    f"[OSIA Server] set_model({selected_model!r}) failed, "
+                    f"falling back to default {agent.model!r}: {e}"
+                )
+        print(
+            f"[OSIA Server] ▶ agent.run history check: "
+            f"len(session_history)={len(history)} before agent.run()"
+        )
+        if history:
+            tail_preview = [
+                {
+                    "role": m.get("role"),
+                    "content": (str(m.get("content", ""))[:80] + "…")
+                    if len(str(m.get("content", ""))) > 80
+                    else str(m.get("content", "")),
+                }
+                for m in history[-2:]
+            ]
+            print(f"[OSIA Server]   last 2 history items: {tail_preview}")
         _ts(t0, "agent.run started",
             f"(model={agent.model}, provider={agent.provider}, "
             f"history={len(history)} msgs, TOOL_MAP={len(TOOL_MAP)} tools, "
-            f"streaming=on, max_tokens=512)")
+            f"streaming=on, max_tokens=model-default)")
         # Off-thread so the event loop stays free to flush response_chunks.
         response_text = await asyncio.to_thread(
             agent.run, text,
             history=history,
             on_sentence=on_sentence,
             on_first_token=on_first_token,
-            max_tokens=512,
         )
     except Exception as e:
         print(f"[OSIA Server] Agent error: {e}")
@@ -619,9 +686,11 @@ async def _run_agent_and_respond(ws: WebSocket, text: str, history: list,
     await chunk_queue.put(_SENTINEL)
     await sender_task
 
-    # Pull the updated history back out of the agent (excluding the
-    # system prompt at index 0) so the next request keeps context.
-    new_history = list(agent.messages[1:])
+    # Pull the updated history back out of the agent so the next request
+    # keeps context. Use exported_history() — it strips the system prompt
+    # at index 0 AND defensively filters any system-prompt-looking frame,
+    # so the system prompt cannot leak into the conversation history.
+    new_history = agent.exported_history()
 
     # Tool-call counter for debug logging.
     new_msgs = new_history[prev_len:]
@@ -637,6 +706,21 @@ async def _run_agent_and_respond(ws: WebSocket, text: str, history: list,
     # Persist everything added during this turn (user msg, any
     # assistant/tool rounds, final assistant reply).
     _persist_new_messages(active_conv_id, new_history, prev_len)
+    print(
+        f"[OSIA Server] ◀ post-persist history check: "
+        f"len(session_history)={len(new_history)} after _persist_new_messages()"
+    )
+    if new_history:
+        tail_preview = [
+            {
+                "role": m.get("role"),
+                "content": (str(m.get("content", ""))[:80] + "…")
+                if len(str(m.get("content", ""))) > 80
+                else str(m.get("content", "")),
+            }
+            for m in new_history[-2:]
+        ]
+        print(f"[OSIA Server]   last 2 history items: {tail_preview}")
 
     if not response_text:
         response_text = "Désolé, je n'ai pas pu traiter votre demande."

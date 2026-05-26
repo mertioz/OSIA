@@ -196,6 +196,7 @@ def wake_mode():
 
     from osia.gui.wake_screen import (
         WakeScreen, ModelSelector, SettingsButton, SettingsPanel,
+        ConversationControls,
     )
     from osia.voice.wake import WakeWordDetector, verifier_available
     from osia.voice.stt import listen, listen_for_command
@@ -219,12 +220,15 @@ def wake_mode():
     model_selector = ModelSelector()
     settings_button = SettingsButton()
     settings_panel = SettingsPanel()
+    conversation_controls = ConversationControls()
 
     # Fade companions in/out together with the wake screen.
     wake_screen.fade_in_started.connect(model_selector.fade_in)
     wake_screen.fade_in_started.connect(settings_button.fade_in)
+    wake_screen.fade_in_started.connect(conversation_controls.fade_in)
     wake_screen.fade_out_started.connect(model_selector.fade_out)
     wake_screen.fade_out_started.connect(settings_button.fade_out)
+    wake_screen.fade_out_started.connect(conversation_controls.fade_out)
 
     # Current agent instance
     agent = OSIAAgent()
@@ -349,6 +353,22 @@ def wake_mode():
         settings_panel.raise_()
         settings_panel.activateWindow()
 
+    def handle_new_conversation():
+        nonlocal active_conv
+        agent.reset()
+        active_conv = conversations.create_conversation()
+        print(f"🆕 New conversation: {active_conv['id']}")
+
+    def handle_delete_conversation():
+        nonlocal active_conv
+        old_id = active_conv["id"] if active_conv else None
+        if old_id:
+            ok = conversations.delete_conversation(old_id)
+            print(f"🗑  Deleted conversation {old_id}: {'ok' if ok else 'not found'}")
+        agent.reset()
+        active_conv = conversations.create_conversation()
+        print(f"🆕 New conversation: {active_conv['id']}")
+
     def handle_remote_models(remote):
         model_selector.refresh_models(remote_models=remote)
 
@@ -360,6 +380,8 @@ def wake_mode():
     settings_button.clicked.connect(handle_settings_button_click)
     settings_panel.smart_routing_toggled.connect(handle_smart_toggled)
     settings_panel.api_keys_saved.connect(handle_keys_saved)
+    conversation_controls.new_conversation.connect(handle_new_conversation)
+    conversation_controls.delete_conversation.connect(handle_delete_conversation)
 
     # Kick off remote model discovery at startup.
     discover_models_async(

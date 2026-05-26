@@ -1,0 +1,13 @@
+[Unit]
+Description=OSIA Mobile Server
+After=network.target
+
+[Service]
+User=OSIA
+WorkingDirectory=/home/OSIA/code/osia-project
+ExecStart=/home/OSIA/code/osia-project/venv/bin/python osia/server/run_server.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

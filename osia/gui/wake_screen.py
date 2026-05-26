@@ -24,6 +24,12 @@ from osia.models import (
 from osia.config import (
     load_api_keys, save_api_keys, load_settings, set_setting, set_api_key,
 )
+from osia.utils.systemd_manager import (
+    is_service_enabled, enable_service, disable_service, get_service_status,
+)
+
+
+STARTUP_SERVICES = ("osia-server.service", "osia-tunnel.service")
 
 
 # ── Fade helper ──────────────────────────────────────────────────────────
@@ -130,11 +136,11 @@ class WakeScreen(FadeWindow):
             self._timer.stop()
 
     def set_state(self, state: str):
-        """'listening' -> white dots, 'thinking' -> orange dots."""
+        """'listening' -> white dots, 'thinking' -> violet dots."""
         if state == "listening":
             self._dot_color = (255, 255, 255)
         elif state == "thinking":
-            self._dot_color = (255, 165, 0)
+            self._dot_color = (196, 181, 245)  # #c4b5f5
         self.update()
 
     def _animate(self):
@@ -353,6 +359,92 @@ class SettingsButton(FadeWindow):
         self.raise_()
 
 
+# ── Conversation controls (new / delete) ────────────────────────────────
+
+class ConversationControls(FadeWindow):
+    """Top-center conversation management bar with two buttons:
+    'Nouvelle conversation' and 'Supprimer la conversation'.
+
+    Fades in/out together with the wake screen and matches the existing
+    dark glassmorphism look with a violet accent for the conversation
+    actions, so it reads as a distinct group from the model selector /
+    settings gear.
+    """
+
+    new_conversation = pyqtSignal()
+    delete_conversation = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("OSIA Conversation")
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Must receive clicks — WakeScreen above is transparent for events,
+        # but this widget is not.
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+
+        self.setFixedSize(380, 40)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        self._new_btn = QPushButton("✚  Nouvelle conversation", self)
+        self._new_btn.setObjectName("newConvBtn")
+        self._new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._new_btn.clicked.connect(self.new_conversation.emit)
+
+        self._delete_btn = QPushButton("🗑  Supprimer", self)
+        self._delete_btn.setObjectName("deleteConvBtn")
+        self._delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._delete_btn.clicked.connect(self.delete_conversation.emit)
+
+        row.addWidget(self._new_btn, 1)
+        row.addWidget(self._delete_btn, 0)
+
+        self.setStyleSheet("""
+            QPushButton#newConvBtn, QPushButton#deleteConvBtn {
+                background: rgba(15, 15, 15, 200);
+                color: #ffffff;
+                border: 1px solid rgba(167, 139, 250, 0.30);
+                border-radius: 18px;
+                padding: 6px 14px;
+                font-size: 12px;
+            }
+            QPushButton#newConvBtn:hover, QPushButton#deleteConvBtn:hover {
+                background: rgba(40, 28, 70, 220);
+                border: 1px solid rgba(167, 139, 250, 0.65);
+                color: #d4c5ff;
+            }
+            QPushButton#newConvBtn:pressed, QPushButton#deleteConvBtn:pressed {
+                background: rgba(80, 50, 140, 230);
+            }
+            QPushButton#deleteConvBtn {
+                /* slightly tighter so the trash button doesn't dominate */
+                padding: 6px 12px;
+            }
+        """)
+
+        self.setWindowOpacity(0.0)
+        self.hide()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        screen = self.screen() or QApplication.primaryScreen()
+        geo = screen.availableGeometry()
+        self.move(
+            geo.x() + (geo.width() - self.width()) // 2,
+            geo.y() + 20,
+        )
+        # WakeScreen is also stays-on-top; raise above it to receive clicks.
+        self.raise_()
+
+
 # ── Settings panel ──────────────────────────────────────────────────────
 
 class SettingsPanel(QWidget):
@@ -439,6 +531,9 @@ class SettingsPanel(QWidget):
         scroll_layout = QVBoxLayout(container)
         scroll_layout.setContentsMargins(0, 0, 8, 0)
         scroll_layout.setSpacing(14)
+
+        # Startup (systemd services) section
+        scroll_layout.addWidget(self._build_startup_section())
 
         # Voice section (TTS provider + voice)
         scroll_layout.addWidget(self._build_voice_section())
@@ -638,6 +733,111 @@ class SettingsPanel(QWidget):
             sibling.setText(text)
             sibling.blockSignals(False)
 
+    def _build_startup_section(self) -> QWidget:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        header = QLabel("Démarrage")
+        header.setObjectName("sectionTitle")
+        layout.addWidget(header)
+
+        sub = QLabel(
+            "Lancer le serveur mobile et le tunnel Cloudflare au démarrage "
+            "du système."
+        )
+        sub.setObjectName("sectionModels")
+        sub.setWordWrap(True)
+        layout.addWidget(sub)
+
+        # One toggle row per service. Each row owns: label, status dot, toggle.
+        # Each entry: (unit_name, display_label, dot_attr, toggle_attr)
+        self._startup_refresh_guard = False
+        self._startup_rows: list[tuple[str, QLabel, QCheckBox]] = []
+
+        rows = [
+            (STARTUP_SERVICES[0], "Serveur mobile"),
+            (STARTUP_SERVICES[1], "Tunnel Cloudflare"),
+        ]
+        for unit, display in rows:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+
+            label = QLabel(display)
+            label.setObjectName("startupLabel")
+            dot = self._make_status_dot()
+            toggle = QCheckBox()
+            toggle.setObjectName("smartToggle")
+            toggle.stateChanged.connect(
+                lambda _s, u=unit, t=toggle: self._on_startup_toggle_changed(u, t)
+            )
+
+            row.addWidget(label)
+            row.addStretch()
+            row.addWidget(dot)
+            row.addWidget(toggle)
+            layout.addLayout(row)
+
+            self._startup_rows.append((unit, dot, toggle))
+
+        # Refresh timer — only ticks while the panel is visible.
+        self._startup_timer = QTimer(self)
+        self._startup_timer.setInterval(5000)
+        self._startup_timer.timeout.connect(self._refresh_startup_status)
+
+        return wrap
+
+    def _make_status_dot(self) -> QLabel:
+        dot = QLabel()
+        dot.setObjectName("statusDot")
+        dot.setFixedSize(10, 10)
+        dot.setProperty("state", "stopped")
+        return dot
+
+    def _set_dot_state(self, dot: QLabel, state: str) -> None:
+        """state ∈ {'running','stopped','error'}."""
+        if dot.property("state") == state:
+            return
+        dot.setProperty("state", state)
+        # Force a style re-evaluation since we drive color via the property.
+        dot.style().unpolish(dot)
+        dot.style().polish(dot)
+
+    def _refresh_startup_status(self):
+        # Toggle reflects whether the unit is enabled at boot; dot reflects
+        # its current runtime state.
+        self._startup_refresh_guard = True
+        for unit, dot, toggle in self._startup_rows:
+            self._set_dot_state(dot, get_service_status(unit))
+            enabled = is_service_enabled(unit)
+            if toggle.isChecked() != enabled:
+                toggle.setChecked(enabled)
+        self._startup_refresh_guard = False
+
+    def _on_startup_toggle_changed(self, unit: str, toggle: QCheckBox):
+        if self._startup_refresh_guard:
+            return
+        checked = toggle.isChecked()
+        op = enable_service if checked else disable_service
+        # The panel is FramelessWindowHint | WindowStaysOnTopHint, which
+        # covers the pkexec polkit dialog. Hide ourselves while pkexec runs
+        # so the auth prompt is reachable, then come back.
+        self.hide()
+        QApplication.processEvents()
+        try:
+            ok = op(unit)
+        finally:
+            self.show()
+        if not ok:
+            # pkexec was cancelled or systemctl failed — snap the toggle
+            # back to whatever the real state is.
+            self._startup_refresh_guard = True
+            toggle.setChecked(not checked)
+            self._startup_refresh_guard = False
+        self._refresh_startup_status()
+
     def _build_ollama_section(self) -> QWidget:
         wrap = QFrame()
         wrap.setObjectName("section")
@@ -780,6 +980,27 @@ class SettingsPanel(QWidget):
             QPushButton#saveBtn:pressed {
                 background: rgba(255, 255, 255, 0.25);
             }
+            QLabel#startupLabel {
+                font-size: 12px;
+                color: rgba(255, 255, 255, 0.85);
+            }
+            QLabel#statusText {
+                font-size: 11px;
+                color: rgba(255, 255, 255, 0.6);
+            }
+            QLabel#statusDot {
+                border-radius: 5px;
+                background: rgba(180, 180, 180, 0.4);
+            }
+            QLabel#statusDot[state="running"] {
+                background: rgb(100, 200, 120);
+            }
+            QLabel#statusDot[state="stopped"] {
+                background: rgb(220, 80, 80);
+            }
+            QLabel#statusDot[state="error"] {
+                background: rgb(220, 160, 60);
+            }
             QCheckBox#smartToggle::indicator {
                 width: 36px;
                 height: 20px;
@@ -850,6 +1071,12 @@ class SettingsPanel(QWidget):
         self.activateWindow()
         # Refresh state every time it opens (keys may have changed externally).
         self._load_state()
+        self._refresh_startup_status()
+        self._startup_timer.start()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._startup_timer.stop()
 
     # ── Handlers ────────────────────────────────────────────────────────
 
@@ -891,13 +1118,18 @@ if __name__ == "__main__":
     ms = ModelSelector()
     sb = SettingsButton()
     sp = SettingsPanel()
+    cc = ConversationControls()
 
     ws.fade_in_started.connect(ms.fade_in)
     ws.fade_in_started.connect(sb.fade_in)
+    ws.fade_in_started.connect(cc.fade_in)
     ws.fade_out_started.connect(ms.fade_out)
     ws.fade_out_started.connect(sb.fade_out)
+    ws.fade_out_started.connect(cc.fade_out)
 
     sb.clicked.connect(sp.show)
+    cc.new_conversation.connect(lambda: print("new conversation"))
+    cc.delete_conversation.connect(lambda: print("delete conversation"))
 
     ws.show_wake()
     QTimer.singleShot(3000, ws.hide_wake)

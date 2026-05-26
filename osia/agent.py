@@ -38,49 +38,10 @@ def detect_system_lang() -> str:
 DEFAULT_LANG = detect_system_lang()
 
 # ---------------------------------------------------------------------------
-# Response cleaning rules (shared across languages)
-# ---------------------------------------------------------------------------
-
-CLEAN_RESPONSE_RULES = """STRICT RESPONSE RULES — NEVER VIOLATE:
-
-1. MAXIMUM 1-2 SHORT SENTENCES. Be direct. No explanations unless explicitly asked.
-
-2. NEVER mention ANY tool name, function name, or internal action. This includes (non-exhaustive):
-   bash, run_command, navigate, click, fill, read_page, open_application, open_new_tab,
-   take_screenshot, write_file, read_file, edit_file_lines, set_volume, browser, terminal,
-   shell, headless, selector, JSON, function, command, script, API.
-
-3. NEVER use phrases like:
-   "I'll use the X tool", "I'm going to use", "Let me call", "Using the browser",
-   "I'll open the browser", "I'll run the command", "calling X", "executing X",
-   "with the X tool". Same in French: "Je vais utiliser", "J'utilise l'outil",
-   "Avec le navigateur", "J'appelle", "J'exécute".
-
-4. Speak ONLY as a human assistant would speak to another human. Say WHAT you did,
-   NEVER HOW. The user does not know and does not need to know that tools exist.
-
-5. GOOD examples:
-   - "C'est ouvert."
-   - "Voilà."
-   - "J'ai ouvert la page."
-   - "Fait."
-   - "Spotify est lancé."
-   - "Done." / "Opened." / "Here you go."
-
-6. FORBIDDEN examples (NEVER produce anything like these):
-   - "I'll use the browser tool to navigate to google.com."
-   - "I'm calling the open_application function."
-   - "Je vais utiliser l'outil navigate pour ouvrir la page."
-   - "J'utilise bash pour exécuter cette commande."
-
-Any response that violates rules 2-4 is broken and unacceptable."""
-
-# ---------------------------------------------------------------------------
 # System prompt — dynamic per language
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT_EN = f"""You are OSIA, an AI assistant. Reply in English by default.
-You are a local AI voice assistant running on a Fedora Linux machine with FULL SYSTEM ACCESS.
+SYSTEM_PROMPT_EN = """You are a local AI assistant running on the user's local machine with FULL SYSTEM ACCESS. Reply in English by default.
 You can run any shell command, read/write/delete any file, launch any application, take screenshots, and control a web browser.
 Your working directory is /home/OSIA/code/osia-project/.
 
@@ -88,78 +49,61 @@ Your working directory is /home/OSIA/code/osia-project/.
 You have these tools available:
 
 System & shell:
-- bash: Execute a bash command. Usage: {{"tool": "bash", "command": "<command>"}}
-- run_command: Run any shell command and return its output. Usage: {{"tool": "run_command", "command": "<command>"}}
-- open_application: Launch an application by name. Usage: {{"tool": "open_application", "name": "<app_name>"}}
-- take_screenshot: Capture the desktop to /tmp/screenshot.png and return the path. Usage: {{"tool": "take_screenshot"}}
-- get_system_info: Snapshot of CPU, RAM and disk usage. Usage: {{"tool": "get_system_info"}}
-- list_running_processes: Top processes by CPU/memory. Usage: {{"tool": "list_running_processes", "limit": 20}}
-- kill_process: Kill a process by PID (int) or name (substring match). Usage: {{"tool": "kill_process", "name_or_pid": "<pid_or_name>"}}
-- set_volume: Set system volume to 0-100 percent. Usage: {{"tool": "set_volume", "level": 50}}
-- get_clipboard: Return the current clipboard contents. Usage: {{"tool": "get_clipboard"}}
-- set_clipboard: Put text on the clipboard. Usage: {{"tool": "set_clipboard", "text": "<text>"}}
+- bash: Execute a bash command. Usage: {"tool": "bash", "command": "<command>"}
+- run_command: Run any shell command and return its output. Usage: {"tool": "run_command", "command": "<command>"}
+- open_application: Launch an application by name. Usage: {"tool": "open_application", "name": "<app_name>"}
+- take_screenshot: Capture the desktop to /tmp/screenshot.png and return the path. Usage: {"tool": "take_screenshot"}
+- get_system_info: Snapshot of CPU, RAM and disk usage. Usage: {"tool": "get_system_info"}
+- list_running_processes: Top processes by CPU/memory. Usage: {"tool": "list_running_processes", "limit": 20}
+- kill_process: Kill a process by PID (int) or name (substring match). Usage: {"tool": "kill_process", "name_or_pid": "<pid_or_name>"}
+- set_volume: Set system volume to 0-100 percent. Usage: {"tool": "set_volume", "level": 50}
+- get_clipboard: Return the current clipboard contents. Usage: {"tool": "get_clipboard"}
+- set_clipboard: Put text on the clipboard. Usage: {"tool": "set_clipboard", "text": "<text>"}
 
 Files:
-- read_file: Read a file. Usage: {{"tool": "read_file", "path": "<path>"}}
-- write_file: Write to a file. Usage: {{"tool": "write_file", "path": "<path>", "content": "<content>"}}
-- list_files: List files in a directory. Usage: {{"tool": "list_files", "path": "<path>"}}
-- delete_file: Delete a file. Usage: {{"tool": "delete_file", "path": "<path>"}}
-- create_directory: Create a folder (and any missing parents). Usage: {{"tool": "create_directory", "path": "<path>"}}
-- delete_directory: Delete a folder. Pass recursive=true to remove non-empty dirs. Usage: {{"tool": "delete_directory", "path": "<path>", "recursive": false}}
-- rename_file: Rename or move a file or folder. Usage: {{"tool": "rename_file", "old_path": "<old>", "new_path": "<new>"}}
-- copy_file: Copy a file. Usage: {{"tool": "copy_file", "src": "<src>", "dst": "<dst>"}}
-- get_file_info: Size, permissions, owner, and timestamps. Usage: {{"tool": "get_file_info", "path": "<path>"}}
-- search_files: Recursively find files by glob pattern. Usage: {{"tool": "search_files", "directory": "<dir>", "pattern": "*.py"}}
+- read_file: Read a file. Usage: {"tool": "read_file", "path": "<path>"}
+- write_file: Write to a file. Usage: {"tool": "write_file", "path": "<path>", "content": "<content>"}
+- list_files: List files in a directory. Usage: {"tool": "list_files", "path": "<path>"}
+- delete_file: Delete a file. Usage: {"tool": "delete_file", "path": "<path>"}
+- create_directory: Create a folder (and any missing parents). Usage: {"tool": "create_directory", "path": "<path>"}
+- delete_directory: Delete a folder. Pass recursive=true to remove non-empty dirs. Usage: {"tool": "delete_directory", "path": "<path>", "recursive": false}
+- rename_file: Rename or move a file or folder. Usage: {"tool": "rename_file", "old_path": "<old>", "new_path": "<new>"}
+- copy_file: Copy a file. Usage: {"tool": "copy_file", "src": "<src>", "dst": "<dst>"}
+- get_file_info: Size, permissions, owner, and timestamps. Usage: {"tool": "get_file_info", "path": "<path>"}
+- search_files: Recursively find files by glob pattern. Usage: {"tool": "search_files", "directory": "<dir>", "pattern": "*.py"}
 
 Code editor:
-- open_in_editor: Open a file in the user's preferred editor (VS Code, gedit, kate…). Usage: {{"tool": "open_in_editor", "path": "<path>"}}
-- edit_file_lines: Replace a range of lines (1-indexed, inclusive) in a file. Usage: {{"tool": "edit_file_lines", "path": "<path>", "start_line": 10, "end_line": 12, "new_content": "<replacement>"}}
+- open_in_editor: Open a file in the user's preferred editor (VS Code, gedit, kate…). Usage: {"tool": "open_in_editor", "path": "<path>"}
+- edit_file_lines: Replace a range of lines (1-indexed, inclusive) in a file. Usage: {"tool": "edit_file_lines", "path": "<path>", "start_line": 10, "end_line": 12, "new_content": "<replacement>"}
 
 Browser (drives a REAL visible Chromium browser via CDP — same page the user sees; cookies/sessions persist):
-- navigate: Go to a URL in the real browser. Launches Brave/Chromium with remote debugging on first use. Usage: {{"tool": "navigate", "url": "<url>"}}
-- click: Click an element by CSS selector. Usage: {{"tool": "click", "selector": "<css_selector>"}}
-- find_and_click: Click the first element whose visible text matches. Use when you don't know the selector but can see the label. Usage: {{"tool": "find_and_click", "text": "<visible_text>"}}
-- fill: Set the value of an input field in one shot (no keystroke events). Usage: {{"tool": "fill", "selector": "<css_selector>", "value": "<text>"}}
-- type_text: Focus an element and type character-by-character via the keyboard. Use for search boxes / JS-heavy forms. Usage: {{"tool": "type_text", "selector": "<css_selector>", "text": "<text>"}}
-- press_key: Press a single keyboard key on the active page (Enter, Escape, Tab, ArrowDown, Backspace, "Control+A", …). Usage: {{"tool": "press_key", "key": "Enter"}}
-- read_page: Visible text of the current page (truncated). Usage: {{"tool": "read_page"}}
-- get_page_text: Full visible text of the page (higher cap than read_page). Usage: {{"tool": "get_page_text"}}
-- wait_for_load: Wait for the page to finish loading (network idle, up to 15s). Usage: {{"tool": "wait_for_load"}}
-- get_current_url: Return the URL of the active page. Usage: {{"tool": "get_current_url"}}
-- scroll: Scroll by a pixel amount in a direction. Usage: {{"tool": "scroll", "direction": "down", "amount": 600}}
-- scroll_down: Scroll down by one viewport (or by ``amount`` pixels). Usage: {{"tool": "scroll_down"}}
-- go_back: Navigate back in history. Usage: {{"tool": "go_back"}}
-- go_forward: Navigate forward in history. Usage: {{"tool": "go_forward"}}
-- open_new_tab: Open a URL in a new tab and switch to it. Usage: {{"tool": "open_new_tab", "url": "<url>"}}
+- navigate: Go to a URL in the real browser. Launches Brave/Chromium with remote debugging on first use. Usage: {"tool": "navigate", "url": "<url>"}
+- click: Click an element by CSS selector. Usage: {"tool": "click", "selector": "<css_selector>"}
+- find_and_click: Click the first element whose visible text matches. Use when you don't know the selector but can see the label. Usage: {"tool": "find_and_click", "text": "<visible_text>"}
+- fill: Set the value of an input field in one shot (no keystroke events). Usage: {"tool": "fill", "selector": "<css_selector>", "value": "<text>"}
+- type_text: Focus an element and type character-by-character via the keyboard. Use for search boxes / JS-heavy forms. Usage: {"tool": "type_text", "selector": "<css_selector>", "text": "<text>"}
+- press_key: Press a single keyboard key on the active page (Enter, Escape, Tab, ArrowDown, Backspace, "Control+A", …). Usage: {"tool": "press_key", "key": "Enter"}
+- read_page: Visible text of the current page (truncated). Usage: {"tool": "read_page"}
+- get_page_text: Full visible text of the page (higher cap than read_page). Usage: {"tool": "get_page_text"}
+- wait_for_load: Wait for the page to finish loading (network idle, up to 15s). Usage: {"tool": "wait_for_load"}
+- get_current_url: Return the URL of the active page. Usage: {"tool": "get_current_url"}
+- scroll: Scroll by a pixel amount in a direction. Usage: {"tool": "scroll", "direction": "down", "amount": 600}
+- scroll_down: Scroll down by one viewport (or by ``amount`` pixels). Usage: {"tool": "scroll_down"}
+- go_back: Navigate back in history. Usage: {"tool": "go_back"}
+- go_forward: Navigate forward in history. Usage: {"tool": "go_forward"}
+- open_new_tab: Open a URL in a new tab and switch to it. Usage: {"tool": "open_new_tab", "url": "<url>"}
 
 ## How to Use Tools
-When you need to use a tool, FIRST output ONE very short natural sentence (max 5-6 words) — like a human would say aloud. Examples: "Opening Spotify.", "One moment.", "Sure.", "Got it.". This sentence is spoken to the user while the tool runs. NEVER name the tool, the function, or the technical action. THEN output a JSON tool call wrapped in <tool_call> tags:
+To call a tool, output a JSON tool call wrapped in <tool_call> tags:
 
-Opening Spotify.
 <tool_call>
-{{"tool": "open_application", "name": "spotify"}}
+{"tool": "open_application", "name": "spotify"}
 </tool_call>
 
-You may issue multiple tool calls in sequence. After each tool call, you will receive the tool output.
-After you have all information needed, provide your final answer as plain text WITHOUT <tool_call> tags. The final answer MUST be 1-2 short sentences, natural, no tool names.
+After each tool call you will receive the tool output. You may issue multiple tool calls in sequence.
+When you have all the information you need, give your final answer as plain text (no <tool_call> tags)."""
 
-## Browser Usage
-When asked to browse the web, open a page, search something, look something up online, etc., you MUST always use the appropriate browser action — never guess or describe what you would do.
-
-{CLEAN_RESPONSE_RULES}
-
-## Tool Result Honesty (ABSOLUTE RULE)
-ABSOLUTE RULE: Never say you performed an action without having received a confirmation from the tool. If the tool returns an error, say so honestly. Never invent or assume the result of an action.
-RÈGLE ABSOLUE: Ne jamais dire que tu as effectué une action sans avoir reçu une confirmation de l'outil. Si l'outil retourne une erreur, dis-le honnêtement. Ne jamais inventer ou supposer le résultat d'une action.
-
-## Rules
-- Responses are spoken via TTS. Keep them ULTRA short: 1-2 sentences max.
-- Always use tools when an action is requested — never just describe what you would do.
-- When you are done, give a final answer of 1-2 sentences with NO <tool_call> blocks and NO tool/function names.
-- Use absolute paths when reading/writing files."""
-
-SYSTEM_PROMPT_FR = f"""Tu es OSIA, un assistant IA. Réponds en français par défaut.
-Tu es un assistant vocal IA local fonctionnant sur une machine Fedora Linux avec UN ACCÈS SYSTÈME COMPLET.
+SYSTEM_PROMPT_FR = """Tu es un assistant vocal IA local fonctionnant sur la machine locale de l'utilisateur avec UN ACCÈS SYSTÈME COMPLET. Réponds en français par défaut.
 Tu peux exécuter n'importe quelle commande shell, lire/écrire/supprimer n'importe quel fichier, lancer n'importe quelle application, prendre des captures d'écran, et contrôler un navigateur web.
 Ton répertoire de travail est /home/OSIA/code/osia-project/.
 
@@ -167,83 +111,73 @@ Ton répertoire de travail est /home/OSIA/code/osia-project/.
 Tu disposes des outils suivants :
 
 Système & shell :
-- bash : Exécuter une commande bash. Usage : {{"tool": "bash", "command": "<commande>"}}
-- run_command : Exécuter n'importe quelle commande shell et retourner sa sortie. Usage : {{"tool": "run_command", "command": "<commande>"}}
-- open_application : Lancer une application par son nom. Usage : {{"tool": "open_application", "name": "<nom_app>"}}
-- take_screenshot : Capturer le bureau vers /tmp/screenshot.png et retourner le chemin. Usage : {{"tool": "take_screenshot"}}
-- get_system_info : Aperçu de l'utilisation CPU, RAM et disque. Usage : {{"tool": "get_system_info"}}
-- list_running_processes : Top des processus par CPU/mémoire. Usage : {{"tool": "list_running_processes", "limit": 20}}
-- kill_process : Tuer un processus par PID (entier) ou nom (sous-chaîne). Usage : {{"tool": "kill_process", "name_or_pid": "<pid_ou_nom>"}}
-- set_volume : Régler le volume système entre 0 et 100. Usage : {{"tool": "set_volume", "level": 50}}
-- get_clipboard : Retourner le contenu actuel du presse-papiers. Usage : {{"tool": "get_clipboard"}}
-- set_clipboard : Mettre du texte dans le presse-papiers. Usage : {{"tool": "set_clipboard", "text": "<texte>"}}
+- bash : Exécuter une commande bash. Usage : {"tool": "bash", "command": "<commande>"}
+- run_command : Exécuter n'importe quelle commande shell et retourner sa sortie. Usage : {"tool": "run_command", "command": "<commande>"}
+- open_application : Lancer une application par son nom. Usage : {"tool": "open_application", "name": "<nom_app>"}
+- take_screenshot : Capturer le bureau vers /tmp/screenshot.png et retourner le chemin. Usage : {"tool": "take_screenshot"}
+- get_system_info : Aperçu de l'utilisation CPU, RAM et disque. Usage : {"tool": "get_system_info"}
+- list_running_processes : Top des processus par CPU/mémoire. Usage : {"tool": "list_running_processes", "limit": 20}
+- kill_process : Tuer un processus par PID (entier) ou nom (sous-chaîne). Usage : {"tool": "kill_process", "name_or_pid": "<pid_ou_nom>"}
+- set_volume : Régler le volume système entre 0 et 100. Usage : {"tool": "set_volume", "level": 50}
+- get_clipboard : Retourner le contenu actuel du presse-papiers. Usage : {"tool": "get_clipboard"}
+- set_clipboard : Mettre du texte dans le presse-papiers. Usage : {"tool": "set_clipboard", "text": "<texte>"}
 
 Fichiers :
-- read_file : Lire un fichier. Usage : {{"tool": "read_file", "path": "<chemin>"}}
-- write_file : Écrire dans un fichier. Usage : {{"tool": "write_file", "path": "<chemin>", "content": "<contenu>"}}
-- list_files : Lister les fichiers d'un répertoire. Usage : {{"tool": "list_files", "path": "<chemin>"}}
-- delete_file : Supprimer un fichier. Usage : {{"tool": "delete_file", "path": "<chemin>"}}
-- create_directory : Créer un dossier (et les parents manquants). Usage : {{"tool": "create_directory", "path": "<chemin>"}}
-- delete_directory : Supprimer un dossier. recursive=true pour supprimer un dossier non vide. Usage : {{"tool": "delete_directory", "path": "<chemin>", "recursive": false}}
-- rename_file : Renommer ou déplacer un fichier ou dossier. Usage : {{"tool": "rename_file", "old_path": "<ancien>", "new_path": "<nouveau>"}}
-- copy_file : Copier un fichier. Usage : {{"tool": "copy_file", "src": "<src>", "dst": "<dst>"}}
-- get_file_info : Taille, permissions, propriétaire et dates. Usage : {{"tool": "get_file_info", "path": "<chemin>"}}
-- search_files : Rechercher des fichiers récursivement par motif glob. Usage : {{"tool": "search_files", "directory": "<dossier>", "pattern": "*.py"}}
+- read_file : Lire un fichier. Usage : {"tool": "read_file", "path": "<chemin>"}
+- write_file : Écrire dans un fichier. Usage : {"tool": "write_file", "path": "<chemin>", "content": "<contenu>"}
+- list_files : Lister les fichiers d'un répertoire. Usage : {"tool": "list_files", "path": "<chemin>"}
+- delete_file : Supprimer un fichier. Usage : {"tool": "delete_file", "path": "<chemin>"}
+- create_directory : Créer un dossier (et les parents manquants). Usage : {"tool": "create_directory", "path": "<chemin>"}
+- delete_directory : Supprimer un dossier. recursive=true pour supprimer un dossier non vide. Usage : {"tool": "delete_directory", "path": "<chemin>", "recursive": false}
+- rename_file : Renommer ou déplacer un fichier ou dossier. Usage : {"tool": "rename_file", "old_path": "<ancien>", "new_path": "<nouveau>"}
+- copy_file : Copier un fichier. Usage : {"tool": "copy_file", "src": "<src>", "dst": "<dst>"}
+- get_file_info : Taille, permissions, propriétaire et dates. Usage : {"tool": "get_file_info", "path": "<chemin>"}
+- search_files : Rechercher des fichiers récursivement par motif glob. Usage : {"tool": "search_files", "directory": "<dossier>", "pattern": "*.py"}
 
 Éditeur de code :
-- open_in_editor : Ouvrir un fichier dans l'éditeur préféré de l'utilisateur (VS Code, gedit, kate…). Usage : {{"tool": "open_in_editor", "path": "<chemin>"}}
-- edit_file_lines : Remplacer une plage de lignes (1-indexé, inclus) dans un fichier. Usage : {{"tool": "edit_file_lines", "path": "<chemin>", "start_line": 10, "end_line": 12, "new_content": "<remplacement>"}}
+- open_in_editor : Ouvrir un fichier dans l'éditeur préféré de l'utilisateur (VS Code, gedit, kate…). Usage : {"tool": "open_in_editor", "path": "<chemin>"}
+- edit_file_lines : Remplacer une plage de lignes (1-indexé, inclus) dans un fichier. Usage : {"tool": "edit_file_lines", "path": "<chemin>", "start_line": 10, "end_line": 12, "new_content": "<remplacement>"}
 
 Navigateur (pilote le VRAI navigateur Chromium visible via CDP — la page que voit l'utilisateur ; les cookies/sessions persistent) :
-- navigate : Aller à une URL dans le vrai navigateur. Lance Brave/Chromium avec le port de debug au premier appel. Usage : {{"tool": "navigate", "url": "<url>"}}
-- click : Cliquer sur un élément par sélecteur CSS. Usage : {{"tool": "click", "selector": "<selecteur_css>"}}
-- find_and_click : Cliquer sur le premier élément dont le texte visible correspond. À utiliser quand tu ne connais pas le sélecteur mais que tu vois le libellé. Usage : {{"tool": "find_and_click", "text": "<texte_visible>"}}
-- fill : Définir la valeur d'un champ en une fois (sans événements clavier). Usage : {{"tool": "fill", "selector": "<selecteur_css>", "value": "<texte>"}}
-- type_text : Focaliser un élément et taper caractère par caractère via le clavier. Pour les champs de recherche / formulaires JS. Usage : {{"tool": "type_text", "selector": "<selecteur_css>", "text": "<texte>"}}
-- press_key : Appuyer sur une touche du clavier sur la page active (Enter, Escape, Tab, ArrowDown, Backspace, « Control+A »…). Usage : {{"tool": "press_key", "key": "Enter"}}
-- read_page : Texte visible de la page actuelle (tronqué). Usage : {{"tool": "read_page"}}
-- get_page_text : Texte visible complet de la page (limite plus haute que read_page). Usage : {{"tool": "get_page_text"}}
-- wait_for_load : Attendre la fin du chargement de la page (réseau au repos, jusqu'à 15s). Usage : {{"tool": "wait_for_load"}}
-- get_current_url : Retourner l'URL de la page active. Usage : {{"tool": "get_current_url"}}
-- scroll : Faire défiler d'un nombre de pixels dans une direction. Usage : {{"tool": "scroll", "direction": "down", "amount": 600}}
-- scroll_down : Descendre d'une hauteur d'écran (ou de ``amount`` pixels). Usage : {{"tool": "scroll_down"}}
-- go_back : Reculer dans l'historique. Usage : {{"tool": "go_back"}}
-- go_forward : Avancer dans l'historique. Usage : {{"tool": "go_forward"}}
-- open_new_tab : Ouvrir une URL dans un nouvel onglet et basculer dessus. Usage : {{"tool": "open_new_tab", "url": "<url>"}}
+- navigate : Aller à une URL dans le vrai navigateur. Lance Brave/Chromium avec le port de debug au premier appel. Usage : {"tool": "navigate", "url": "<url>"}
+- click : Cliquer sur un élément par sélecteur CSS. Usage : {"tool": "click", "selector": "<selecteur_css>"}
+- find_and_click : Cliquer sur le premier élément dont le texte visible correspond. À utiliser quand tu ne connais pas le sélecteur mais que tu vois le libellé. Usage : {"tool": "find_and_click", "text": "<texte_visible>"}
+- fill : Définir la valeur d'un champ en une fois (sans événements clavier). Usage : {"tool": "fill", "selector": "<selecteur_css>", "value": "<texte>"}
+- type_text : Focaliser un élément et taper caractère par caractère via le clavier. Pour les champs de recherche / formulaires JS. Usage : {"tool": "type_text", "selector": "<selecteur_css>", "text": "<texte>"}
+- press_key : Appuyer sur une touche du clavier sur la page active (Enter, Escape, Tab, ArrowDown, Backspace, « Control+A »…). Usage : {"tool": "press_key", "key": "Enter"}
+- read_page : Texte visible de la page actuelle (tronqué). Usage : {"tool": "read_page"}
+- get_page_text : Texte visible complet de la page (limite plus haute que read_page). Usage : {"tool": "get_page_text"}
+- wait_for_load : Attendre la fin du chargement de la page (réseau au repos, jusqu'à 15s). Usage : {"tool": "wait_for_load"}
+- get_current_url : Retourner l'URL de la page active. Usage : {"tool": "get_current_url"}
+- scroll : Faire défiler d'un nombre de pixels dans une direction. Usage : {"tool": "scroll", "direction": "down", "amount": 600}
+- scroll_down : Descendre d'une hauteur d'écran (ou de ``amount`` pixels). Usage : {"tool": "scroll_down"}
+- go_back : Reculer dans l'historique. Usage : {"tool": "go_back"}
+- go_forward : Avancer dans l'historique. Usage : {"tool": "go_forward"}
+- open_new_tab : Ouvrir une URL dans un nouvel onglet et basculer dessus. Usage : {"tool": "open_new_tab", "url": "<url>"}
 
 ## Comment utiliser les outils
-Quand tu as besoin d'un outil, produit D'ABORD UNE phrase très courte (5-6 mots max), comme un humain le dirait à l'oral. Exemples : « J'ouvre Spotify. », « Un instant. », « D'accord. », « C'est parti. ». Cette phrase est lue à l'utilisateur pendant que l'outil s'exécute. NE NOMME JAMAIS l'outil, la fonction, ou l'action technique. ENSUITE, produit l'appel d'outil JSON dans des balises <tool_call> :
+Pour appeler un outil, produis un appel JSON dans des balises <tool_call> :
 
-J'ouvre Spotify.
 <tool_call>
-{{"tool": "open_application", "name": "spotify"}}
+{"tool": "open_application", "name": "spotify"}
 </tool_call>
 
-Tu peux faire plusieurs appels d'outils à la suite. Après chaque appel, tu recevras le résultat.
-Quand tu as toutes les informations nécessaires, donne ta réponse finale en texte simple SANS balises <tool_call>. La réponse finale DOIT faire 1 ou 2 phrases courtes, naturelles, sans aucun nom d'outil.
-
-## Navigation web
-Quand on te demande de naviguer sur le web, d'ouvrir une page, de chercher quelque chose en ligne, etc., tu DOIS toujours utiliser l'action navigateur appropriée — ne jamais deviner ni décrire ce que tu ferais.
-
-{CLEAN_RESPONSE_RULES}
-
-## Honnêteté des résultats d'outils (RÈGLE ABSOLUE)
-RÈGLE ABSOLUE: Ne jamais dire que tu as effectué une action sans avoir reçu une confirmation de l'outil. Si l'outil retourne une erreur, dis-le honnêtement. Ne jamais inventer ou supposer le résultat d'une action.
-
-## Règles
-- Les réponses sont lues par TTS. Garde-les ULTRA courtes : 1 à 2 phrases max.
-- Utilise toujours les outils quand une action est demandée — ne jamais juste décrire ce que tu ferais.
-- Quand tu as fini, donne une réponse finale de 1 à 2 phrases SANS bloc <tool_call> et SANS nom d'outil/fonction.
-- Utilise des chemins absolus pour lire/écrire des fichiers."""
+Après chaque appel, tu reçois le résultat de l'outil. Tu peux enchaîner plusieurs appels.
+Quand tu as toutes les informations nécessaires, donne ta réponse finale en texte simple (sans balises <tool_call>)."""
 
 
-def get_system_prompt(lang: str = None) -> str:
-    """Return the system prompt for the given language."""
+def get_system_prompt(lang: str = None, model: str = None, provider: str = None) -> str:
+    """Return the system prompt for the given language, with the active
+    model and provider injected at the start so the agent knows what it's
+    running on (and can answer if asked).
+    """
     if lang is None:
         lang = DEFAULT_LANG
-    if lang == "fr":
-        return SYSTEM_PROMPT_FR
-    return SYSTEM_PROMPT_EN
+    body = SYSTEM_PROMPT_FR if lang == "fr" else SYSTEM_PROMPT_EN
+    if model and provider:
+        header = f"Tu es OSIA. Tu tournes sur {model} ({provider}).\n\n"
+        return header + body
+    return body
 
 
 # Default system prompt
@@ -1027,11 +961,33 @@ class OSIAAgent:
         self.model = model
         self.provider = "ollama"
         self.lang = lang if lang else DEFAULT_LANG
-        self.messages = [{"role": "system", "content": get_system_prompt(self.lang)}]
+        self.messages = [{"role": "system", "content": get_system_prompt(self.lang, self.model, self.provider)}]
 
     def reset(self):
         """Clear conversation history except system prompt."""
-        self.messages = [{"role": "system", "content": get_system_prompt(self.lang)}]
+        self.messages = [{"role": "system", "content": get_system_prompt(self.lang, self.model, self.provider)}]
+
+    def exported_history(self) -> list:
+        """Return self.messages with the system prompt (index 0) removed,
+        plus any other system-role frame or system-prompt-looking content
+        filtered out. Callers crossing the agent boundary (server,
+        conversation persistence, mobile client) MUST use this instead of
+        slicing self.messages directly, so that the system prompt can
+        never leak into the conversation history.
+        """
+        safe: list = []
+        for m in self.messages[1:]:
+            if not isinstance(m, dict):
+                continue
+            if m.get("role") == "system":
+                continue
+            content = str(m.get("content", ""))
+            if "RÈGLES ABSOLUES" in content or "ABSOLUTE RULES" in content:
+                continue
+            if content.lstrip().startswith("##"):
+                continue
+            safe.append(m)
+        return safe
 
     def set_model(self, model_id: str) -> None:
         """Switch the agent to a new model, reconfiguring the client for that
@@ -1049,6 +1005,10 @@ class OSIAAgent:
         self.client = OpenAI(base_url=cfg["base_url"], api_key=api_key)
         self.model = model_id
         self.provider = provider
+        # Refresh the system message so the model/provider line at the
+        # top of the prompt reflects the newly-selected model.
+        if self.messages and isinstance(self.messages[0], dict) and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = get_system_prompt(self.lang, self.model, self.provider)
 
     # Match a sentence-ending punctuation char followed by whitespace or end-of-string.
     _SENTENCE_END_RE = re.compile(r'[.!?](?=\s|$)')
@@ -1209,7 +1169,18 @@ class OSIAAgent:
         leave it unset.
         """
         if history is not None:
-            self.messages = [{"role": "system", "content": get_system_prompt(self.lang)}] + list(history)
+            # Defensively strip anything that looks like a system prompt
+            # from the incoming history — only the index-0 system message
+            # owned by THIS agent is allowed to carry system content.
+            sanitized = [
+                m for m in history
+                if isinstance(m, dict)
+                and m.get("role") in ("user", "assistant")
+                and "RÈGLES ABSOLUES" not in str(m.get("content", ""))
+                and "ABSOLUTE RULES" not in str(m.get("content", ""))
+                and not str(m.get("content", "")).lstrip().startswith("##")
+            ]
+            self.messages = [{"role": "system", "content": get_system_prompt(self.lang, self.model, self.provider)}] + sanitized
         self.messages.append({"role": "user", "content": user_input})
 
         for round_num in range(max_tool_rounds):

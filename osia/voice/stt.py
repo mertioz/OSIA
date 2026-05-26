@@ -234,20 +234,20 @@ def transcribe(audio: np.ndarray, sample_rate: int = DEVICE_SAMPLE_RATE,
     # Resample to 16kHz for Whisper
     audio_16k = resample_audio(audio, sample_rate, WHISPER_SAMPLE_RATE)
     # The initial_prompt is conditioning text — it biases decoding without
-    # being transcribed. Listing common French words that exercise the J/G
-    # /ʒ/ distinction nudges Whisper toward the right spellings.
+    # being transcribed. Short command examples across all supported
+    # languages help Whisper lock onto brief utterances.
     initial_prompt = (
-        "Assistant vocal, commandes en français et en anglais. "
-        "L'utilisateur dit souvent : j'ai besoin de, j'ai vu, j'ai oublié, "
-        "j'aimerais, je veux, je vais, je pense que, je cherche. "
-        "Mots fréquents avec j ou g doux : jamais, jardin, jeune, journée, "
-        "déjà, déjeuner, juste, joli, jour, jouer, "
-        "général, genre, gens, geste, girafe, gérer, génial. "
-        "Distinguer « j'ai » (passé composé) de « gai » (joyeux) et "
-        "« geai » (l'oiseau)."
+        "Ouvre Brave. Va sur YouTube. Quel temps fait-il ? Ouvre Spotify. "
+        "Nouvelle conversation. Prends une capture d'écran. "
+        "Open Brave. Go to YouTube. What's the weather? Open Spotify. "
+        "New conversation. Take a screenshot. "
+        "打开浏览器。播放音乐。天气怎么样？ "
+        "ブラウザを開く。音楽を再生する。新しい会話。 "
+        "Öffne Brave. Geh zu YouTube. Wie ist das Wetter? "
+        "Abre Brave. Ve a YouTube. ¿Qué tiempo hace?"
     )
     segments, info = model.transcribe(
-        audio_16k, beam_size=5, language=language,
+        audio_16k, beam_size=5, best_of=5, language=language,
         initial_prompt=initial_prompt,
     )
     text = " ".join(segment.text for segment in segments).strip()

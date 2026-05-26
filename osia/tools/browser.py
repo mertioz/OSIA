@@ -30,7 +30,7 @@ from playwright.sync_api import sync_playwright
 
 CDP_PORT = 9222
 CDP_URL = f"http://localhost:{CDP_PORT}"
-OSIA_PROFILE_DIR = os.path.expanduser("~/.osia/browser-profile")
+OSIA_PROFILE_DIR = "/home/OSIA/.osia/brave-profile"
 
 # Chromium-based browsers, ordered by preference. Firefox is intentionally
 # omitted — it does not speak CDP on --remote-debugging-port.
@@ -74,12 +74,12 @@ def _detect_chromium_browser() -> str | None:
 
 
 def _launch_cdp_browser() -> tuple[bool, str]:
-    """Spawn the user's preferred Chromium browser with the CDP flag.
+    """Spawn Brave (or another Chromium browser if Brave isn't installed)
+    against OSIA's dedicated profile at ``/home/OSIA/.osia/brave-profile``.
 
-    Uses a dedicated user-data-dir under ``~/.osia/browser-profile`` so
-    OSIA's CDP instance does not conflict with any other browser window
-    the user may already have open, but still persists cookies/sessions
-    between OSIA invocations.
+    The dedicated profile keeps OSIA's cookies, sessions, and history
+    isolated from — and persistent across restarts independently of —
+    the user's personal Brave instance.
 
     Returns ``(success, message)``.
     """
@@ -92,11 +92,10 @@ def _launch_cdp_browser() -> tuple[bool, str]:
     os.makedirs(OSIA_PROFILE_DIR, exist_ok=True)
     cmd = [
         browser,
-        f"--remote-debugging-port={CDP_PORT}",
         f"--user-data-dir={OSIA_PROFILE_DIR}",
+        f"--remote-debugging-port={CDP_PORT}",
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-features=ChromeWhatsNewUI",
     ]
     try:
         subprocess.Popen(
