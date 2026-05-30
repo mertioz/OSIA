@@ -53,19 +53,26 @@ API_PROVIDERS = ("anthropic", "openai", "deepseek", "google", "xai")
 
 HARDCODED_MODELS = [
     # Anthropic
-    {"id": "claude-opus-4-7",     "label": "Claude Opus 4.7",     "provider": "anthropic", "tier": "best"},
-    {"id": "claude-sonnet-4-6",   "label": "Claude Sonnet 4.6",   "provider": "anthropic", "tier": "mid"},
-    {"id": "claude-haiku-4-5",    "label": "Claude Haiku 4.5",    "provider": "anthropic", "tier": "light"},
+    {"id": "claude-opus-4-8",            "label": "Claude Opus 4.8",     "provider": "anthropic", "tier": "best"},
+    {"id": "claude-opus-4-7",            "label": "Claude Opus 4.7",     "provider": "anthropic", "tier": "best"},
+    {"id": "claude-opus-4-6",            "label": "Claude Opus 4.6",     "provider": "anthropic", "tier": "best"},
+    {"id": "claude-sonnet-4-6",          "label": "Claude Sonnet 4.6",   "provider": "anthropic", "tier": "mid"},
+    {"id": "claude-haiku-4-5-20251001",  "label": "Claude Haiku 4.5",    "provider": "anthropic", "tier": "light"},
     # OpenAI
     {"id": "gpt-5.5",             "label": "GPT-5.5",             "provider": "openai",    "tier": "best"},
-    {"id": "gpt-5.4",             "label": "GPT-5.4",             "provider": "openai",    "tier": "mid"},
-    {"id": "gpt-4o",              "label": "GPT-4o",              "provider": "openai",    "tier": "light"},
+    {"id": "gpt-5.4",             "label": "GPT-5.4",             "provider": "openai",    "tier": "best"},
+    {"id": "gpt-5.4-mini",        "label": "GPT-5.4 Mini",        "provider": "openai",    "tier": "mid"},
+    {"id": "gpt-4.1",             "label": "GPT-4.1",             "provider": "openai",    "tier": "mid"},
+    {"id": "gpt-4.1-mini",        "label": "GPT-4.1 Mini",        "provider": "openai",    "tier": "light"},
+    {"id": "gpt-4.1-nano",        "label": "GPT-4.1 Nano",        "provider": "openai",    "tier": "light"},
     # DeepSeek
     {"id": "deepseek-v4-pro",     "label": "DeepSeek V4 Pro",     "provider": "deepseek",  "tier": "best"},
     {"id": "deepseek-v4-flash",   "label": "DeepSeek V4 Flash",   "provider": "deepseek",  "tier": "light"},
     # Google
-    {"id": "gemini-3.1-pro",      "label": "Gemini 3.1 Pro",      "provider": "google",    "tier": "best"},
-    {"id": "gemini-3.1-flash",    "label": "Gemini 3.1 Flash",    "provider": "google",    "tier": "light"},
+    {"id": "gemini-3.1-pro",        "label": "Gemini 3.1 Pro",        "provider": "google", "tier": "best"},
+    {"id": "gemini-2.5-pro",        "label": "Gemini 2.5 Pro",        "provider": "google", "tier": "mid"},
+    {"id": "gemini-2.5-flash",      "label": "Gemini 2.5 Flash",      "provider": "google", "tier": "light"},
+    {"id": "gemini-2.5-flash-lite", "label": "Gemini 2.5 Flash Lite", "provider": "google", "tier": "light"},
     # xAI
     {"id": "grok-3",              "label": "Grok 3",              "provider": "xai",       "tier": "mid"},
     {"id": "grok-3-mini",         "label": "Grok 3 Mini",         "provider": "xai",       "tier": "light"},
@@ -229,16 +236,16 @@ def classify_complexity(prompt: str) -> str:
 
 # Preference order for complex / simple tasks.
 COMPLEX_PREFERENCE = [
-    ("claude-opus-4-7",     "anthropic"),
+    ("claude-opus-4-8",     "anthropic"),
     ("gpt-5.5",             "openai"),
     ("deepseek-v4-pro",     "deepseek"),
 ]
 
 SIMPLE_API_FALLBACK = [
-    ("claude-haiku-4-5",    "anthropic"),
-    ("gpt-4o",              "openai"),
-    ("deepseek-v4-flash",   "deepseek"),
-    ("gemini-3.1-flash",    "google"),
+    ("claude-haiku-4-5-20251001", "anthropic"),
+    ("gpt-4.1-mini",              "openai"),
+    ("deepseek-v4-flash",         "deepseek"),
+    ("gemini-2.5-flash",          "google"),
 ]
 
 

@@ -11,6 +11,9 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "load_conversation",    "id": "..."}
     {"type": "new_conversation"}
     {"type": "delete_conversation",  "id": "..."}
+    {"type": "get_models"}
+    {"type": "set_model",            "model": "..."}
+    {"type": "file",                 "filename": "...", "data": "<base64>"}
   Server → Client:
     {"type": "transcript",           "content": "..."}
     {"type": "response_chunk",       "content": "..."}        # streamed sentence-by-sentence
@@ -22,6 +25,8 @@ Protocol (JSON over WebSocket, port 8765):
                                      "messages": [{"role": "user|assistant", "content": "..."}]}
     {"type": "conversation_deleted", "id": "...", "success": true|false}
     {"type": "active_conversation",  "id": "...", "title": "..."}
+    {"type": "models_list",          "models": [{id,label,provider,tier}, ...], "current": "..."}
+    {"type": "file_received",        "filename": "...", "path": "...", "success": true|false}
 """
 
 import asyncio
@@ -48,6 +53,23 @@ from osia import conversations
 PROJECT_DIR = Path("/home/OSIA/code/osia-project")
 CONFIG_DIR = PROJECT_DIR / "config"
 TOKEN_FILE = CONFIG_DIR / "mobile_token.txt"
+UPLOAD_DIR = Path("/tmp/osia_uploads")
+
+# Image extensions that should trigger DeepSeek Vision automatically.
+_IMAGE_MIME = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "gif": "image/gif",
+    "webp": "image/webp",
+}
+
+
+def _image_mime_for(path: Path) -> str | None:
+    """Return the image MIME type for ``path`` based on extension, or
+    None if the extension isn't a recognised image format.
+    """
+    return _IMAGE_MIME.get(path.suffix.lower().lstrip("."))
 
 # ---------------------------------------------------------------------------
 # Token management
@@ -305,6 +327,9 @@ async def websocket_endpoint(ws: WebSocket):
     # disconnect (function returns => GC).
     session_history: list = []
     active_conv_id: str | None = None
+    # Files uploaded by the client that haven't been consumed by a turn yet.
+    # The next text/audio turn consumes and clears this list.
+    pending_files: list[str] = []
 
     try:
         async for raw_msg in ws.iter_text():
@@ -407,11 +432,104 @@ async def websocket_endpoint(ws: WebSocket):
                 })
                 continue
 
+            # --- Models ---
+            if msg_type == "get_models":
+                try:
+                    from osia.models import get_all_models
+                    from osia.config import load_settings
+                    models = get_all_models()
+                    current = load_settings().get("selected_model")
+                except Exception as e:
+                    print(f"[OSIA Server] get_models failed: {e}")
+                    models, current = [], None
+                await ws.send_json({
+                    "type": "models_list",
+                    "models": models,
+                    "current": current,
+                })
+                continue
+
+            if msg_type == "set_model":
+                model_id = (msg.get("model") or "").strip()
+                if not model_id:
+                    await ws.send_json({"type": "status", "content": "error"})
+                    continue
+                try:
+                    from osia.config import set_setting
+                    set_setting("selected_model", model_id)
+                    print(f"[OSIA Server] selected_model -> {model_id!r}")
+                    await ws.send_json({"type": "status", "content": "done"})
+                except Exception as e:
+                    print(f"[OSIA Server] set_model({model_id!r}) failed: {e}")
+                    await ws.send_json({"type": "status", "content": "error"})
+                continue
+
+            # --- File upload ---
+            if msg_type == "file":
+                filename = (msg.get("filename") or "upload.bin").strip()
+                b64_data = msg.get("data", "")
+                if not b64_data:
+                    await ws.send_json({
+                        "type": "file_received",
+                        "filename": filename,
+                        "path": "",
+                        "success": False,
+                    })
+                    continue
+                try:
+                    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+                    # Sanitize: keep basename only, prefix with timestamp to avoid clobbering.
+                    safe_name = os.path.basename(filename) or "upload.bin"
+                    target = UPLOAD_DIR / f"{int(time.time() * 1000)}_{safe_name}"
+                    target.write_bytes(base64.b64decode(b64_data))
+                    image_mime = _image_mime_for(target)
+                    if image_mime is None:
+                        # Non-image: queue for the next text/audio turn.
+                        pending_files.append(str(target))
+                    print(
+                        f"[OSIA Server] file received: {safe_name!r} -> {target} "
+                        f"({target.stat().st_size} bytes)"
+                    )
+                    await ws.send_json({
+                        "type": "file_received",
+                        "filename": safe_name,
+                        "path": str(target),
+                        "success": True,
+                    })
+                    if image_mime is not None:
+                        # Image: re-read from disk, base64-encode, and trigger
+                        # the agent immediately with a DeepSeek Vision message
+                        # so the model can actually see and analyze the image.
+                        img_b64 = base64.b64encode(target.read_bytes()).decode("ascii")
+                        vision_content = [{
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{image_mime};base64,{img_b64}",
+                            },
+                        }]
+                        print(
+                            f"[OSIA Server] image upload — triggering vision agent "
+                            f"({image_mime}, {len(img_b64)} b64 chars)"
+                        )
+                        session_history, active_conv_id = await _run_agent_and_respond(
+                            ws, vision_content, session_history, active_conv_id,
+                        )
+                except Exception as e:
+                    print(f"[OSIA Server] file upload failed: {e}")
+                    await ws.send_json({
+                        "type": "file_received",
+                        "filename": filename,
+                        "path": "",
+                        "success": False,
+                    })
+                continue
+
             # --- Text message ---
             if msg_type == "text":
                 user_text = msg.get("content", "").strip()
                 if not user_text:
                     continue
+                user_text = _consume_pending_files(user_text, pending_files)
                 session_history, active_conv_id = await _run_agent_and_respond(
                     ws, user_text, session_history, active_conv_id,
                 )
@@ -425,6 +543,7 @@ async def websocket_endpoint(ws: WebSocket):
                 session_history, active_conv_id = await _handle_audio(
                     ws, b64_data, audio_format,
                     session_history, active_conv_id,
+                    pending_files=pending_files,
                 )
 
             else:
@@ -501,6 +620,53 @@ def _displayable_history(history: list) -> list[dict]:
     return out
 
 
+def _tail_not_sent(full: str, sent: str) -> str:
+    """Return the portion of ``full`` that hasn't been delivered yet.
+
+    ``sent`` is the concatenation of every response_chunk we've already
+    pushed to the client. Normalised whitespace comparison because chunk
+    boundaries and the cleaned final text may differ in spacing.
+
+    If the full response is already fully covered by what was sent we
+    return ``""``. Otherwise we return the suffix of ``full`` starting
+    from the first word that wasn't streamed.
+    """
+    if not full:
+        return ""
+    norm_sent = " ".join(sent.split()) if sent else ""
+    norm_full = " ".join(full.split())
+    if not norm_full or norm_full in norm_sent:
+        return ""
+    full_words = full.split()
+    # Find the longest prefix of `full` that already appears in `sent`.
+    matched = 0
+    for i in range(1, len(full_words) + 1):
+        prefix = " ".join(full_words[:i])
+        if prefix in norm_sent:
+            matched = i
+        else:
+            # Once a prefix stops matching, the rest is the tail. Walking
+            # further would only shrink the candidate.
+            break
+    tail = " ".join(full_words[matched:]).strip()
+    return tail
+
+
+def _consume_pending_files(user_text: str, pending_files: list[str]) -> str:
+    """Prepend any pending uploaded file paths to ``user_text`` so the agent
+    sees them as part of the next user turn, then clear the list.
+
+    The injected block is plain text — the agent can read those files with
+    its existing filesystem tools.
+    """
+    if not pending_files:
+        return user_text
+    paths = list(pending_files)
+    pending_files.clear()
+    bullets = "\n".join(f"- {p}" for p in paths)
+    return f"[Fichiers joints disponibles localement :\n{bullets}\n]\n\n{user_text}"
+
+
 def _persist_new_messages(conv_id: str | None, full_history: list,
                           prev_len: int) -> None:
     """Append messages added since the last turn to the conversation file.
@@ -522,7 +688,7 @@ def _persist_new_messages(conv_id: str | None, full_history: list,
 # ---------------------------------------------------------------------------
 # Message handlers
 # ---------------------------------------------------------------------------
-async def _run_agent_and_respond(ws: WebSocket, text: str, history: list,
+async def _run_agent_and_respond(ws: WebSocket, text, history: list,
                                  active_conv_id: str | None,
                                  *, t0: float | None = None) -> tuple[list, str]:
     """Run the agent with the given conversation history, persist the
@@ -544,7 +710,10 @@ async def _run_agent_and_respond(ws: WebSocket, text: str, history: list,
 
     if t0 is None:
         t0 = time.perf_counter()
-        _ts(t0, "text received", f"({len(text)} chars: {text[:60]!r})")
+        if isinstance(text, str):
+            _ts(t0, "text received", f"({len(text)} chars: {text[:60]!r})")
+        else:
+            _ts(t0, "vision content received", f"({len(text)} parts)")
 
     # Auto-create a conversation on the FIRST message of the session,
     # seeded with a smart keyword title so the sidebar reads naturally
@@ -585,6 +754,9 @@ async def _run_agent_and_respond(ws: WebSocket, text: str, history: list,
     # without `nonlocal` gymnastics across threads.
     first_token_logged = [False]
     first_chunk_sent_logged = [False]
+    # Track everything we've actually streamed to the client so we can
+    # detect a missing tail at the end of the run.
+    sent_chunks: list[str] = []
 
     def on_first_token() -> None:
         # Called from the agent worker thread the moment the first
@@ -615,6 +787,7 @@ async def _run_agent_and_respond(ws: WebSocket, text: str, history: list,
                     f"({len(item)} chars: {item[:60]!r})")
             try:
                 await ws.send_json({"type": "response_chunk", "content": item})
+                sent_chunks.append(item)
             except Exception as e:
                 print(f"[OSIA Server] response_chunk send failed: {e}")
                 return
@@ -686,6 +859,26 @@ async def _run_agent_and_respond(ws: WebSocket, text: str, history: list,
     await chunk_queue.put(_SENTINEL)
     await sender_task
 
+    # Explicit tail flush: if the agent's final response_text has content
+    # that wasn't streamed as a chunk (race in the streaming flush path,
+    # short tail under the early-flush threshold, …), emit the missing
+    # tail as one last response_chunk so the client never loses the end
+    # of a reply.
+    if response_text:
+        from osia.agent import clean_response
+        sent_concat = "".join(sent_chunks)
+        cleaned_full = clean_response(response_text).strip()
+        if cleaned_full:
+            tail = _tail_not_sent(cleaned_full, sent_concat)
+            if tail:
+                try:
+                    await ws.send_json({"type": "response_chunk", "content": tail})
+                    sent_chunks.append(tail)
+                    _ts(t0, "tail response_chunk flushed",
+                        f"({len(tail)} chars: {tail[:60]!r})")
+                except Exception as e:
+                    print(f"[OSIA Server] tail response_chunk send failed: {e}")
+
     # Pull the updated history back out of the agent so the next request
     # keeps context. Use exported_history() — it strips the system prompt
     # at index 0 AND defensively filters any system-prompt-looking frame,
@@ -743,6 +936,9 @@ async def _run_agent_and_respond(ws: WebSocket, text: str, history: list,
         print(f"[OSIA Server] TTS synthesis failed: {e}")
         traceback.print_exc()
 
+    # Brief settle so any chunks still in flight on the WebSocket land
+    # before the client sees `done` and tears down the streaming UI.
+    await asyncio.sleep(0.2)
     await ws.send_json({"type": "status", "content": "done"})
     _ts(t0, "request complete")
     return new_history, active_conv_id
@@ -750,7 +946,8 @@ async def _run_agent_and_respond(ws: WebSocket, text: str, history: list,
 
 async def _handle_audio(ws: WebSocket, b64_data: str, audio_format: str,
                         history: list,
-                        active_conv_id: str | None) -> tuple[list, str | None]:
+                        active_conv_id: str | None,
+                        *, pending_files: list[str] | None = None) -> tuple[list, str | None]:
     """Process an audio command: transcribe, then run the agent on the
     transcript using the SAME path as text commands (so tools execute
     identically and the transcript ends up in the same conversation).
@@ -803,9 +1000,13 @@ async def _handle_audio(ws: WebSocket, b64_data: str, audio_format: str,
             ws.send_json({"type": "transcript", "content": transcript})
         )
 
+        agent_input = transcript
+        if pending_files:
+            agent_input = _consume_pending_files(agent_input, pending_files)
+
         try:
             return await _run_agent_and_respond(
-                ws, transcript, history, active_conv_id, t0=t0,
+                ws, agent_input, history, active_conv_id, t0=t0,
             )
         finally:
             # Make sure the transcript frame finished going out before

@@ -1,6 +1,6 @@
 {
   "smart_routing": false,
-  "selected_model": "deepseek-v4-flash",
+  "selected_model": "claude-haiku-4-5",
   "tts_provider": "openai",
   "tts_voice": "marin",
   "parler_voice_description": null

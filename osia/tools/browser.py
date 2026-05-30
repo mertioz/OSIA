@@ -17,6 +17,7 @@ this flag, so CDP requires a Chromium-based browser (Brave, Chromium,
 Chrome). If none is installed we surface a clear error.
 """
 
+import base64
 import os
 import shutil
 import socket
@@ -155,6 +156,28 @@ def _ensure_browser():
     return _page
 
 
+# ── Screenshot helper ──────────────────────────────────────────────────────
+
+def _screenshot_b64(page) -> str | None:
+    """Capture a viewport PNG of ``page`` and return it as a base64 string.
+    Returns ``None`` on failure so callers can degrade gracefully — a
+    missing screenshot must never break a successful navigation tool.
+    """
+    try:
+        png = page.screenshot(type="png", full_page=False)
+        return base64.b64encode(png).decode("ascii")
+    except Exception as e:
+        print(f"[OSIA Browser] screenshot capture failed: {e}")
+        return None
+
+
+def _result(text: str, page) -> dict:
+    """Standard success envelope for navigation tools: text + screenshot
+    so the agent can see the post-action page state.
+    """
+    return {"text": text, "screenshot": _screenshot_b64(page)}
+
+
 # ── URL helper ─────────────────────────────────────────────────────────────
 
 def _normalize_url(url: str) -> str:
@@ -165,10 +188,11 @@ def _normalize_url(url: str) -> str:
 
 # ── Existing tools (now backed by the real browser via CDP) ────────────────
 
-def navigate(url: str) -> str:
+def navigate(url: str):
     """Navigate the real browser to ``url``. Launches Brave/Chromium with
     ``--remote-debugging-port=9222`` if not already running, then drives
-    the page via CDP.
+    the page via CDP. Returns ``{"text": ..., "screenshot": ...}`` on
+    success so the agent can visually verify the page that loaded.
     """
     url = _normalize_url(url)
     with _lock:
@@ -179,18 +203,20 @@ def navigate(url: str) -> str:
                 page.bring_to_front()
             except Exception:
                 pass
-            return f"Navigated to: {page.url}"
+            return _result(f"Navigated to: {page.url}", page)
         except Exception as e:
             return f"ERROR navigating to {url}: {e}"
 
 
-def click(selector: str) -> str:
-    """Click an element matching a CSS selector."""
+def click(selector: str):
+    """Click an element matching a CSS selector. Returns a screenshot of
+    the post-click state so the agent can confirm the click landed.
+    """
     with _lock:
         try:
             page = _ensure_browser()
             page.click(selector, timeout=5000)
-            return f"Clicked element: {selector}"
+            return _result(f"Clicked element: {selector}", page)
         except Exception as e:
             return f"ERROR clicking {selector}: {e}"
 
@@ -252,28 +278,32 @@ def scroll(direction: str = "down", amount: int = 600) -> str:
             return f"ERROR scrolling: {e}"
 
 
-def go_back() -> str:
-    """Navigate back in the active page's history."""
+def go_back():
+    """Navigate back in the active page's history. Returns a screenshot
+    of the resulting page state.
+    """
     with _lock:
         try:
             page = _ensure_browser()
             response = page.go_back(timeout=5000)
             if response is None:
-                return "No previous page in history."
-            return f"Went back to: {page.url}"
+                return _result("No previous page in history.", page)
+            return _result(f"Went back to: {page.url}", page)
         except Exception as e:
             return f"ERROR going back: {e}"
 
 
-def go_forward() -> str:
-    """Navigate forward in the active page's history."""
+def go_forward():
+    """Navigate forward in the active page's history. Returns a screenshot
+    of the resulting page state.
+    """
     with _lock:
         try:
             page = _ensure_browser()
             response = page.go_forward(timeout=5000)
             if response is None:
-                return "No forward page in history."
-            return f"Went forward to: {page.url}"
+                return _result("No forward page in history.", page)
+            return _result(f"Went forward to: {page.url}", page)
         except Exception as e:
             return f"ERROR going forward: {e}"
 
@@ -299,12 +329,13 @@ def open_new_tab(url: str) -> str:
 
 # ── New tools ──────────────────────────────────────────────────────────────
 
-def find_and_click(text: str) -> str:
+def find_and_click(text: str):
     """Find the first visible element whose text matches ``text`` and click it.
 
     Uses Playwright's text locator, which matches button labels, links,
     list items, etc. — handy when you don't know the CSS selector but
-    can see the label on the page.
+    can see the label on the page. Returns a screenshot so the agent
+    can verify the right element was clicked.
     """
     if not text:
         return "ERROR find_and_click: text is required"
@@ -313,7 +344,7 @@ def find_and_click(text: str) -> str:
             page = _ensure_browser()
             locator = page.get_by_text(text, exact=False).first
             locator.click(timeout=5000)
-            return f"Clicked element with text: {text!r}"
+            return _result(f"Clicked element with text: {text!r}", page)
         except Exception as e:
             return f"ERROR clicking element with text {text!r}: {e}"
 

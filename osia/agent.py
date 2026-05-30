@@ -786,10 +786,10 @@ def _get_browser_tools():
     return _browser_tools
 
 
-def tool_navigate(url: str) -> str:
+def tool_navigate(url: str):
     return _get_browser_tools()["navigate"](url)
 
-def tool_click(selector: str) -> str:
+def tool_click(selector: str):
     return _get_browser_tools()["click"](selector)
 
 def tool_fill(selector: str, value: str) -> str:
@@ -804,16 +804,16 @@ def tool_get_current_url() -> str:
 def tool_scroll(direction: str = "down", amount: int = 600) -> str:
     return _get_browser_tools()["scroll"](direction, amount)
 
-def tool_go_back() -> str:
+def tool_go_back():
     return _get_browser_tools()["go_back"]()
 
-def tool_go_forward() -> str:
+def tool_go_forward():
     return _get_browser_tools()["go_forward"]()
 
 def tool_open_new_tab(url: str) -> str:
     return _get_browser_tools()["open_new_tab"](url)
 
-def tool_find_and_click(text: str) -> str:
+def tool_find_and_click(text: str):
     return _get_browser_tools()["find_and_click"](text)
 
 def tool_wait_for_load() -> str:
@@ -888,32 +888,48 @@ _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="osia-tool
 _ERROR_PREFIXES = ("ERROR", "ERREUR", "[ERROR]", "[ERREUR]")
 
 
+def _result_text(result) -> str:
+    """Extract the text part of a tool result. Browser navigation tools
+    return ``{"text": ..., "screenshot": ...}``; everything else returns
+    a plain string.
+    """
+    if isinstance(result, dict):
+        return str(result.get("text", ""))
+    return str(result) if result is not None else ""
+
+
 def _is_tool_error(result) -> bool:
-    """A tool result is treated as a failure when it's empty/whitespace
+    """A tool result is treated as a failure when its text is empty/whitespace
     or its first non-blank token begins with ERROR/ERREUR (with or
     without brackets). Sentinels like ``(no output)`` or ``(empty
     directory)`` are *not* errors — they're legitimate empty signals.
+    Browser tools return a dict with a ``text`` field; we inspect that.
     """
-    if not isinstance(result, str):
-        return False
-    s = result.strip()
+    text = _result_text(result)
+    s = text.strip()
     if not s:
-        return True
+        # Dicts carrying a screenshot but no text are still valid signals.
+        return not (isinstance(result, dict) and result.get("screenshot"))
     upper = s.upper()
     return any(upper.startswith(p) for p in _ERROR_PREFIXES)
 
 
-def _execute_tool_once(tool_name: str, kwargs: dict) -> str:
-    """Run one tool with a 30 s wall-clock timeout. Returns the
-    stringified result, or a clear [ERREUR] line on timeout/exception
-    so the model can read the failure back and report it honestly.
-    Submitting through a ThreadPoolExecutor means the surrounding agent
-    loop can never be wedged by a stuck synchronous tool.
+def _execute_tool_once(tool_name: str, kwargs: dict):
+    """Run one tool with a 30 s wall-clock timeout. Returns the result
+    (a string, or a ``{"text", "screenshot"}`` dict for navigation
+    tools), or a clear [ERREUR] line on timeout/exception so the model
+    can read the failure back and report it honestly. Submitting through
+    a ThreadPoolExecutor means the surrounding agent loop can never be
+    wedged by a stuck synchronous tool.
     """
     fn = TOOL_MAP[tool_name]
     try:
         fut = _TOOL_EXECUTOR.submit(fn, **kwargs)
-        return str(fut.result(timeout=TOOL_TIMEOUT_SECONDS))
+        result = fut.result(timeout=TOOL_TIMEOUT_SECONDS)
+        # Preserve dict results (browser tools) so screenshots survive.
+        if isinstance(result, dict):
+            return result
+        return str(result)
     except FutureTimeoutError:
         return (
             f"[ERREUR] L'outil '{tool_name}' n'a pas répondu après "
@@ -923,7 +939,7 @@ def _execute_tool_once(tool_name: str, kwargs: dict) -> str:
         return f"[ERREUR] '{tool_name}' a échoué: {e}"
 
 
-def _execute_tool_with_retry(tool_name: str, kwargs: dict) -> tuple[str, bool]:
+def _execute_tool_with_retry(tool_name: str, kwargs: dict):
     """Execute a tool and retry exactly once if the first attempt
     reports an error (or returns empty). Returns ``(result, is_error)``
     where ``is_error`` reflects the *final* attempt — callers use it to
@@ -931,7 +947,7 @@ def _execute_tool_with_retry(tool_name: str, kwargs: dict) -> tuple[str, bool]:
     """
     result = _execute_tool_once(tool_name, kwargs)
     if _is_tool_error(result):
-        preview = result.replace("\n", " ")[:120]
+        preview = _result_text(result).replace("\n", " ")[:120]
         print(f"[OSIA Agent] ↻ retry tool: {tool_name} (first attempt: {preview!r})")
         result = _execute_tool_once(tool_name, kwargs)
     return result, _is_tool_error(result)
@@ -999,10 +1015,30 @@ class OSIAAgent:
         provider = provider_for_model(model_id)
         cfg = PROVIDERS.get(provider, PROVIDERS["ollama"])
         api_key = get_api_key(provider) if provider != "ollama" else "ollama"
+
+        # If no API key is configured, fall back to an OAuth bearer token
+        # if one is available for this provider (Anthropic only).
+        default_headers: dict[str, str] | None = None
+        if not api_key:
+            try:
+                from osia.auth.oauth import get_token, PROVIDERS as OAUTH_PROVIDERS
+                if provider in OAUTH_PROVIDERS:
+                    token = get_token(provider)
+                    if token:
+                        api_key = token
+                        if provider == "anthropic":
+                            default_headers = {"anthropic-beta": "oauth-2025-04-20"}
+            except Exception:
+                pass
+
         if not api_key:
             api_key = "ollama"  # placeholder; request will likely 401 if used
 
-        self.client = OpenAI(base_url=cfg["base_url"], api_key=api_key)
+        self.client = OpenAI(
+            base_url=cfg["base_url"],
+            api_key=api_key,
+            default_headers=default_headers,
+        )
         self.model = model_id
         self.provider = provider
         # Refresh the system message so the model/provider line at the
@@ -1220,6 +1256,7 @@ class OSIAAgent:
                 # report it honestly instead of plowing into more actions
                 # that depended on the failed one.
                 tool_results = []
+                tool_screenshots: list[str] = []
                 for i, tc in enumerate(tool_calls):
                     tool_name = tc.get("tool", "")
                     if tool_name not in TOOL_MAP:
@@ -1246,13 +1283,23 @@ class OSIAAgent:
                     }
                     print(f"[OSIA Agent] ▶ tool: {tool_name}({kwargs_preview})")
                     result, is_error = _execute_tool_with_retry(tool_name, kwargs)
-                    result_str = str(result)
+                    text_part = _result_text(result)
+                    screenshot = (
+                        result.get("screenshot")
+                        if isinstance(result, dict) else None
+                    )
                     status = "✗ error" if is_error else "✓ ok"
+                    extra = (
+                        f" +screenshot({len(screenshot)} b64 chars)"
+                        if screenshot else ""
+                    )
                     print(
                         f"[OSIA Agent] ◀ tool: {tool_name} → "
-                        f"{len(result_str)} chars [{status}]"
+                        f"{len(text_part)} chars [{status}]{extra}"
                     )
-                    tool_results.append(f"Tool {tool_name} result:\n{result_str}")
+                    tool_results.append(f"Tool {tool_name} result:\n{text_part}")
+                    if screenshot:
+                        tool_screenshots.append(screenshot)
                     if is_error:
                         remaining = tool_calls[i + 1:]
                         if remaining:
@@ -1263,12 +1310,27 @@ class OSIAAgent:
                             )
                         break
 
-                # Feed tool results back
+                # Feed tool results back. When a browser tool returned a
+                # screenshot, attach it as a vision part so the model can
+                # SEE the current page state and pick the right next
+                # action (instead of guessing selectors blindly).
                 feedback = "\n\n".join(tool_results)
-                self.messages.append({
-                    "role": "user",
-                    "content": f"<tool_result>\n{feedback}\n</tool_result>\nPlease continue with your response based on these results."
-                })
+                feedback_text = (
+                    f"<tool_result>\n{feedback}\n</tool_result>\n"
+                    "Please continue with your response based on these results."
+                )
+                if tool_screenshots:
+                    content_parts: list = [{"type": "text", "text": feedback_text}]
+                    for shot in tool_screenshots:
+                        content_parts.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{shot}",
+                            },
+                        })
+                    self.messages.append({"role": "user", "content": content_parts})
+                else:
+                    self.messages.append({"role": "user", "content": feedback_text})
                 continue
 
             # No tool call — final response

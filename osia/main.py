@@ -187,67 +187,54 @@ def voice_mode():
 
 
 def wake_mode():
-    """Wake word mode: continuous listening for wake word with wake screen GUI.
-    Falls back to Ctrl+Space if no verifier model is available.
-    This is the primary GUI mode — NO floating overlay, only wake screen.
+    """Wake word mode: continuous listening for wake word, driven by the
+    Dynamic Island GUI. Falls back to Ctrl+Space if no verifier model is
+    available.
     """
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtCore import QObject, pyqtSignal
 
-    from osia.gui.wake_screen import (
-        WakeScreen, ModelSelector, SettingsButton, SettingsPanel,
-        ConversationControls,
-    )
+    from osia.gui.dynamic_island import DynamicIsland
+    from osia.gui.main_popup import MainPopup
     from osia.voice.wake import WakeWordDetector, verifier_available
-    from osia.voice.stt import listen, listen_for_command
+    from osia.voice.stt import listen_for_command
     from osia.voice.tts import speak, speak_streaming, stop as tts_stop
     from osia.agent import clean_response
-    from osia.config import load_settings, get_setting
+    from osia.config import load_settings, set_setting
     from osia.models import select_model, discover_models_async
 
     class Bridge(QObject):
         wake_detected = pyqtSignal()
-        response_ready_signal = pyqtSignal(str)
-        status_signal = pyqtSignal(str)
         remote_models_signal = pyqtSignal(list)
+        # Update the chat with a (role, text) pair from a worker thread.
+        chat_message = pyqtSignal(str, str)
+        # Drive the island's visual state from a worker thread.
+        island_state = pyqtSignal(str)
 
     bridge = Bridge()
 
     app = QApplication(sys.argv)
     app.setApplicationName("OSIA")
 
-    wake_screen = WakeScreen()
-    model_selector = ModelSelector()
-    settings_button = SettingsButton()
-    settings_panel = SettingsPanel()
-    conversation_controls = ConversationControls()
+    island = DynamicIsland()
+    popup = MainPopup()
 
-    # Fade companions in/out together with the wake screen.
-    wake_screen.fade_in_started.connect(model_selector.fade_in)
-    wake_screen.fade_in_started.connect(settings_button.fade_in)
-    wake_screen.fade_in_started.connect(conversation_controls.fade_in)
-    wake_screen.fade_out_started.connect(model_selector.fade_out)
-    wake_screen.fade_out_started.connect(settings_button.fade_out)
-    wake_screen.fade_out_started.connect(conversation_controls.fade_out)
+    # Toggle the popup when the island is clicked.
+    island.clicked.connect(popup.toggle)
 
-    # Current agent instance
+    # Agent + active conversation state
     agent = OSIAAgent()
-
-    # Active conversation — every wake-word interaction is persisted to
-    # this file under ~/.osia/conversations/. A fresh conversation is
-    # created each time wake mode starts.
     active_conv = conversations.create_conversation()
     print(f"  Conversation: {active_conv['id']}")
 
-    # Restore last-selected model if it's still available.
     settings = load_settings()
     initial_model = settings.get("selected_model")
     if initial_model:
         try:
             agent.set_model(initial_model)
-            model_selector.set_current_model(initial_model)
         except Exception:
             pass
+    popup.set_current_model(agent.model)
 
     smart_routing = bool(settings.get("smart_routing", False))
 
@@ -255,86 +242,160 @@ def wake_mode():
     def on_wake():
         bridge.wake_detected.emit()
 
-    model_available = verifier_available()
     detector = None
     stop_hotkey = None
-
-    if model_available:
+    if verifier_available():
         detector = WakeWordDetector(callback=on_wake)
     else:
         print("⚠️  No wake model found. Using Ctrl+Space to trigger OSIA.")
         stop_hotkey = _start_ctrl_space_listener(on_wake)
 
-    # Serialises wake handling so that a duplicate detection on the same
-    # utterance (or an overlapping intentional trigger) can't spawn a second
-    # STT+agent session on top of one already running. Held for the entire
-    # lifetime of the process() worker, not just handle_wake itself.
-    wake_handler_lock = threading.Lock()
+    # Serialises voice + text handling so two requests don't run in parallel.
+    handler_lock = threading.Lock()
 
-    # --- Connect signals ---
+    # ── Agent run helpers ────────────────────────────────────────────────
+
+    def _run_agent(user_text: str, *, voice_response: bool) -> None:
+        """Run the agent in the current thread, persist + mirror the result.
+
+        Caller must hold ``handler_lock`` and have already echoed the
+        user's text into the popup. ``voice_response`` controls whether
+        sentences are streamed to TTS as they arrive.
+        """
+        if smart_routing:
+            chosen = select_model(user_text, fallback_model=agent.model)
+            if chosen != agent.model:
+                try:
+                    agent.set_model(chosen)
+                    print(f"🧠 Smart-routed to: {chosen}")
+                except Exception as e:
+                    print(f"⚠️  Smart routing failed: {e}")
+
+        prev_history_len = len(agent.messages) - 1  # skip system prompt
+        bridge.island_state.emit("thinking")
+
+        def on_first_token(*_a, **_kw):
+            if voice_response:
+                bridge.island_state.emit("speaking")
+
+        try:
+            on_sentence = speak_streaming if voice_response else None
+            reply = agent.run(
+                user_text,
+                on_sentence=on_sentence,
+                on_first_token=on_first_token,
+            )
+            _persist_agent_delta(
+                active_conv["id"], agent, prev_history_len,
+            )
+            display = clean_response(reply or "")
+            if display:
+                bridge.chat_message.emit("assistant", display)
+        except Exception as e:
+            err = f"Error: {e}"
+            bridge.chat_message.emit("assistant", err)
+            if voice_response:
+                threading.Thread(target=lambda: speak(err), daemon=True).start()
+        finally:
+            bridge.island_state.emit("idle")
+
+    # ── Wake handler (voice path) ────────────────────────────────────────
+
     def handle_wake():
-        if not wake_handler_lock.acquire(blocking=False):
+        if not handler_lock.acquire(blocking=False):
             print("⚠️  Wake fired while a handler is already running — ignored.")
             return
-        # Interrupt any in-flight TTS so the user can speak over OSIA.
-        # The wake detector runs continuously (never paused during playback).
         tts_stop()
-        wake_screen.set_state("listening")
-        wake_screen.show_wake()
+        bridge.island_state.emit("listening")
 
         def process():
             try:
                 user_text = listen_for_command(max_retries=3)
-
                 if not user_text:
-                    wake_screen.hide_wake()
+                    bridge.island_state.emit("idle")
                     speak("Je n'ai pas compris, répétez.")
                     return
-
                 print(f"📝 You said: {user_text}")
-                wake_screen.set_state("thinking")
-                wake_screen.hide_wake()
-
-                # Smart routing: pick a model per-prompt if enabled.
-                if smart_routing:
-                    chosen = select_model(user_text, fallback_model=agent.model)
-                    if chosen != agent.model:
-                        try:
-                            agent.set_model(chosen)
-                            print(f"🧠 Smart-routed to: {chosen}")
-                        except Exception as e:
-                            print(f"⚠️  Smart routing failed: {e}")
-
-                prev_history_len = len(agent.messages) - 1  # skip system prompt
-                try:
-                    # Stream sentences to TTS as the model produces them, so
-                    # OSIA starts speaking within ~1s of the first chunk
-                    # instead of waiting for the entire response.
-                    agent.run(user_text, on_sentence=speak_streaming)
-                    _persist_agent_delta(
-                        active_conv["id"], agent, prev_history_len,
-                    )
-                except Exception as e:
-                    bridge.response_ready_signal.emit(f"Error: {e}")
+                bridge.chat_message.emit("user", user_text)
+                _run_agent(user_text, voice_response=True)
             finally:
-                wake_handler_lock.release()
+                handler_lock.release()
 
         threading.Thread(target=process, daemon=True).start()
 
-    def handle_response(text):
-        threading.Thread(target=lambda: speak(text), daemon=True).start()
+    # ── Text handler (typed message in popup) ────────────────────────────
 
-    def handle_status(status):
-        pass
+    def handle_send_text(text: str):
+        if not handler_lock.acquire(blocking=False):
+            print("⚠️  Send fired while a handler is running — ignored.")
+            return
+        tts_stop()
+        bridge.chat_message.emit("user", text)
 
-    def handle_model_change(model):
+        def process():
+            try:
+                _run_agent(text, voice_response=False)
+            finally:
+                handler_lock.release()
+
+        threading.Thread(target=process, daemon=True).start()
+
+    # ── Popup chat / message wiring ─────────────────────────────────────
+
+    def handle_chat_message(role: str, text: str):
+        popup.append_message(role, text)
+
+    def handle_island_state(state: str):
+        island.set_state(state)
+
+    # ── Conversation management ──────────────────────────────────────────
+
+    def handle_new_conversation():
+        nonlocal active_conv
+        agent.reset()
+        active_conv = conversations.create_conversation()
+        popup.set_messages([])
+        popup.refresh_conversations(active_conv["id"])
+        print(f"🆕 New conversation: {active_conv['id']}")
+
+    def handle_open_conversation(conv_id: str):
+        nonlocal active_conv
+        conv = conversations.get_conversation(conv_id)
+        if not conv:
+            return
+        agent.reset()
+        msgs = conv.get("messages") or []
+        # Seed the agent with history so the next turn keeps context.
+        agent.messages = [agent.messages[0]] + [
+            {"role": m["role"], "content": m.get("content", "")}
+            for m in msgs
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+        ]
+        active_conv = conv
+        popup.set_messages(msgs)
+        popup.refresh_conversations(active_conv["id"])
+        print(f"📂 Loaded conversation: {conv_id}")
+
+    def handle_delete_conversation(conv_id: str):
+        nonlocal active_conv
+        ok = conversations.delete_conversation(conv_id)
+        print(f"🗑  Deleted conversation {conv_id}: {'ok' if ok else 'not found'}")
+        if active_conv and conv_id == active_conv.get("id"):
+            agent.reset()
+            active_conv = conversations.create_conversation()
+            popup.set_messages([])
+        popup.refresh_conversations(active_conv["id"] if active_conv else None)
+
+    # ── Model + settings wiring ─────────────────────────────────────────
+
+    def handle_model_change(model: str):
         try:
             agent.set_model(model)
         except Exception as e:
             print(f"⚠️  Could not switch model: {e}")
             return
-        from osia.config import set_setting
         set_setting("selected_model", model)
+        popup.set_current_model(model)
         print(f"🔄 Model changed to: {model} (provider: {agent.provider})")
 
     def handle_smart_toggled(enabled: bool):
@@ -343,47 +404,36 @@ def wake_mode():
         print(f"🧠 Smart routing: {'ON' if enabled else 'OFF'}")
 
     def handle_keys_saved(_keys):
-        # Re-discover remote models when keys change.
         discover_models_async(
             lambda remote: bridge.remote_models_signal.emit(remote)
         )
 
-    def handle_settings_button_click():
-        settings_panel.show()
-        settings_panel.raise_()
-        settings_panel.activateWindow()
-
-    def handle_new_conversation():
-        nonlocal active_conv
-        agent.reset()
-        active_conv = conversations.create_conversation()
-        print(f"🆕 New conversation: {active_conv['id']}")
-
-    def handle_delete_conversation():
-        nonlocal active_conv
-        old_id = active_conv["id"] if active_conv else None
-        if old_id:
-            ok = conversations.delete_conversation(old_id)
-            print(f"🗑  Deleted conversation {old_id}: {'ok' if ok else 'not found'}")
-        agent.reset()
-        active_conv = conversations.create_conversation()
-        print(f"🆕 New conversation: {active_conv['id']}")
-
     def handle_remote_models(remote):
-        model_selector.refresh_models(remote_models=remote)
+        popup.set_remote_models(remote)
+
+    def handle_pick_file(path: str):
+        # Surface the attachment as a user message so the agent can react.
+        msg = f"[File attached: {path}]"
+        handle_send_text(msg)
+
+    # ── Signal wiring ───────────────────────────────────────────────────
 
     bridge.wake_detected.connect(handle_wake)
-    bridge.response_ready_signal.connect(handle_response)
-    bridge.status_signal.connect(handle_status)
+    bridge.chat_message.connect(handle_chat_message)
+    bridge.island_state.connect(handle_island_state)
     bridge.remote_models_signal.connect(handle_remote_models)
-    model_selector.model_changed.connect(handle_model_change)
-    settings_button.clicked.connect(handle_settings_button_click)
-    settings_panel.smart_routing_toggled.connect(handle_smart_toggled)
-    settings_panel.api_keys_saved.connect(handle_keys_saved)
-    conversation_controls.new_conversation.connect(handle_new_conversation)
-    conversation_controls.delete_conversation.connect(handle_delete_conversation)
 
-    # Kick off remote model discovery at startup.
+    popup.send_text.connect(handle_send_text)
+    popup.pick_file.connect(handle_pick_file)
+    popup.new_conversation.connect(handle_new_conversation)
+    popup.open_conversation.connect(handle_open_conversation)
+    popup.delete_conversation.connect(handle_delete_conversation)
+    popup.model_changed.connect(handle_model_change)
+    popup.smart_routing_toggled.connect(handle_smart_toggled)
+    popup.api_keys_saved.connect(handle_keys_saved)
+
+    # Initial population
+    popup.refresh_conversations(active_conv["id"])
     discover_models_async(
         lambda remote: bridge.remote_models_signal.emit(remote)
     )
@@ -395,7 +445,7 @@ def wake_mode():
         trigger_label = "Press Ctrl+Space to activate"
 
     print("=" * 60)
-    print("  OSIA — Wake Mode")
+    print("  OSIA — Wake Mode (Dynamic Island)")
     print(f"  Language: {DEFAULT_LANG.upper()}")
     print(f"  Smart routing: {'ON' if smart_routing else 'OFF'}")
     print(f"  {trigger_label}")
