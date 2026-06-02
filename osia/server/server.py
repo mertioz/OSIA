@@ -14,6 +14,7 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "get_models"}
     {"type": "set_model",            "model": "..."}
     {"type": "file",                 "filename": "...", "data": "<base64>"}
+    {"type": "speak",                "text": "..."}      # read text aloud on the PC
   Server → Client:
     {"type": "transcript",           "content": "..."}
     {"type": "response_chunk",       "content": "..."}        # streamed sentence-by-sentence
@@ -481,6 +482,28 @@ async def websocket_endpoint(ws: WebSocket):
                     await ws.send_json({"type": "status", "content": "done"})
                 except Exception as e:
                     print(f"[OSIA Server] set_model({model_id!r}) failed: {e}")
+                    await ws.send_json({"type": "status", "content": "error"})
+                continue
+
+            # --- Speak on demand (TTS playback on the PC) ---
+            if msg_type == "speak":
+                speak_text = (msg.get("text") or "").strip()
+                if not speak_text:
+                    await ws.send_json({"type": "status", "content": "error"})
+                    continue
+                try:
+                    from osia.voice.tts import speak
+                    print(
+                        f"[OSIA Server] speak request "
+                        f"({len(speak_text)} chars: {speak_text[:60]!r})"
+                    )
+                    # Non-blocking: playback runs on a TTS daemon thread so
+                    # the WebSocket loop keeps serving messages (e.g. another
+                    # speak request) while the PC is still talking.
+                    speak(speak_text, block=False)
+                    await ws.send_json({"type": "status", "content": "done"})
+                except Exception as e:
+                    print(f"[OSIA Server] speak failed: {e}")
                     await ws.send_json({"type": "status", "content": "error"})
                 continue
 
