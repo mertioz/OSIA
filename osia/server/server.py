@@ -14,12 +14,12 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "get_models"}
     {"type": "set_model",            "model": "..."}
     {"type": "file",                 "filename": "...", "data": "<base64>"}
-    {"type": "speak",                "text": "..."}      # read text aloud on the PC
+    {"type": "speak",                "text": "..."}      # synthesize text → audio frame sent back to the phone
   Server → Client:
     {"type": "transcript",           "content": "..."}
     {"type": "response_chunk",       "content": "..."}        # streamed sentence-by-sentence
     {"type": "response",             "content": "..."}        # final assembled reply
-    {"type": "audio",                "format": "mp3", "data": "<base64>"}
+    {"type": "audio",                "format": "mp3", "data": "<base64>", "source": "response|speak"}
     {"type": "status",               "content": "thinking|done|error"}
     {"type": "conversations",        "items": [{id,title,created_at,updated_at,message_count}, ...]}
     {"type": "conversation_history", "id": "...", "title": "...",
@@ -485,26 +485,45 @@ async def websocket_endpoint(ws: WebSocket):
                     await ws.send_json({"type": "status", "content": "error"})
                 continue
 
-            # --- Speak on demand (TTS playback on the PC) ---
+            # --- Speak on demand (read-aloud button on the phone) ---
+            # Synthesize the text to MP3 and send it BACK to the phone as an
+            # audio frame — the phone plays it. This is NOT PC-speaker
+            # playback: the button lives on the phone, so the voice must
+            # come out of the phone.
             if msg_type == "speak":
                 speak_text = (msg.get("text") or "").strip()
                 if not speak_text:
-                    await ws.send_json({"type": "status", "content": "error"})
                     continue
+                print(
+                    f"[OSIA Server] speak request "
+                    f"({len(speak_text)} chars: {speak_text[:60]!r})"
+                )
                 try:
-                    from osia.voice.tts import speak
-                    print(
-                        f"[OSIA Server] speak request "
-                        f"({len(speak_text)} chars: {speak_text[:60]!r})"
+                    # Off-thread so the event loop keeps serving while the
+                    # TTS provider synthesizes.
+                    mp3_bytes = await asyncio.to_thread(
+                        synthesize_to_mp3_bytes, speak_text,
                     )
-                    # Non-blocking: playback runs on a TTS daemon thread so
-                    # the WebSocket loop keeps serving messages (e.g. another
-                    # speak request) while the PC is still talking.
-                    speak(speak_text, block=False)
-                    await ws.send_json({"type": "status", "content": "done"})
+                    mp3_b64 = base64.b64encode(mp3_bytes).decode("ascii")
+                    # source="speak" tells the client this audio was
+                    # explicitly requested, so it plays even when the
+                    # auto-TTS preference is off.
+                    await ws.send_json({
+                        "type": "audio",
+                        "format": "mp3",
+                        "data": mp3_b64,
+                        "source": "speak",
+                    })
+                    print(
+                        f"[OSIA Server] speak audio sent to mobile "
+                        f"({len(mp3_bytes)} bytes)"
+                    )
                 except Exception as e:
+                    # No status frame here: speak is not a turn, and a
+                    # status error/done would wrongly tear down the
+                    # streaming UI of any in-flight response.
                     print(f"[OSIA Server] speak failed: {e}")
-                    await ws.send_json({"type": "status", "content": "error"})
+                    traceback.print_exc()
                 continue
 
             # --- File upload ---
@@ -1056,10 +1075,13 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
             flush=True,
         )
         mp3_b64 = base64.b64encode(mp3_bytes).decode("ascii")
+        # source="response" → the client only auto-plays this when its
+        # auto-TTS preference is on.
         await ws.send_json({
             "type": "audio",
             "format": "mp3",
             "data": mp3_b64,
+            "source": "response",
         })
         _ts(t0, "first audio chunk sent to mobile", f"({len(mp3_bytes)} bytes)")
     except Exception as e:
