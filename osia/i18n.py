@@ -93,6 +93,45 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Kein Schlüssel erforderlich",
         "es": "No se requiere clave",
     },
+    # — Free-tier info badges (model panel grid + settings provider cards) —
+    "google_freetier_info": {
+        "en": "Google offers a free tier of 1500 req/day. ⚠️ In free mode, your "
+              "data may be used by Google for model training. Enable billing "
+              "for full privacy (paid, but private).",
+        "fr": "Google offre un niveau gratuit de 1500 req/jour. ⚠️ En mode "
+              "gratuit, vos données peuvent être utilisées par Google pour "
+              "entraîner ses modèles. Activez la facturation pour une "
+              "confidentialité totale (payant, mais privé).",
+        "zh": "Google 提供每天 1500 次请求的免费额度。⚠️ 在免费模式下，您的数据"
+              "可能被 Google 用于模型训练。启用计费以获得完全隐私（付费，但私密）。",
+        "ja": "Google は1日1500リクエストの無料枠を提供しています。⚠️ 無料モード"
+              "では、データが Google のモデル学習に使用される場合があります。完全な"
+              "プライバシーのためには課金を有効にしてください（有料ですが、プライベートです）。",
+        "de": "Google bietet ein kostenloses Kontingent von 1500 Anfragen/Tag. "
+              "⚠️ Im kostenlosen Modus können Ihre Daten von Google für das "
+              "Modelltraining verwendet werden. Aktivieren Sie die Abrechnung "
+              "für vollständige Privatsphäre (kostenpflichtig, aber privat).",
+        "es": "Google ofrece un nivel gratuito de 1500 solicitudes/día. ⚠️ En "
+              "modo gratuito, Google puede usar tus datos para entrenar sus "
+              "modelos. Activa la facturación para privacidad total (de pago, "
+              "pero privado).",
+    },
+    "groq_freetier_info": {
+        "en": "Groq offers a free tier with generous rate limits, ideal for "
+              "testing. Limits are lower than paid usage.",
+        "fr": "Groq offre un niveau gratuit avec des limites de débit "
+              "généreuses, idéal pour tester. Les limites sont inférieures à "
+              "celles de l'usage payant.",
+        "zh": "Groq 提供速率限制宽松的免费额度，非常适合测试。其限制低于付费使用。",
+        "ja": "Groq は寛大なレート制限の無料枠を提供しており、テストに最適です。"
+              "制限は有料利用よりも低くなっています。",
+        "de": "Groq bietet ein kostenloses Kontingent mit großzügigen "
+              "Ratenlimits, ideal zum Testen. Die Limits sind niedriger als bei "
+              "kostenpflichtiger Nutzung.",
+        "es": "Groq ofrece un nivel gratuito con límites de uso generosos, "
+              "ideal para pruebas. Los límites son inferiores a los del uso de "
+              "pago.",
+    },
     # — Language selector (part of the foundation) —
     "settings.language": {
         "en": "Language",

@@ -78,6 +78,7 @@ PROVIDER_KEY_URLS = {
     "google":    "https://aistudio.google.com/apikey",
     "deepseek":  "https://platform.deepseek.com/api_keys",
     "xai":       "https://console.x.ai",
+    "groq":      "https://console.groq.com/keys",
 }
 
 # Per-provider accent colors used for the dot indicators on the model panel
@@ -88,7 +89,16 @@ PROVIDER_COLORS = {
     "deepseek":  "#4d6bfe",   # DeepSeek blue
     "google":    "#4285f4",   # Google blue
     "xai":       "#cfcfcf",   # xAI light
+    "groq":      "#f55036",   # Groq orange
     "ollama":    "#69c88c",   # Local green
+}
+
+# Providers with a free tier worth calling out — provider key → i18n key of
+# the tooltip shown by the "!" info badge next to the provider's name in the
+# model panel grid and the settings provider card.
+FREETIER_INFO_KEYS = {
+    "google": "google_freetier_info",
+    "groq":   "groq_freetier_info",
 }
 
 
@@ -453,6 +463,29 @@ class _ModelRow(QFrame):
         row.addWidget(btn)
 
 
+class _InfoBadge(QLabel):
+    """Small violet "!" circle (14px) showing a free-tier info tooltip.
+
+    Used next to the provider name on the model panel grid cards and the
+    settings provider cards for providers listed in ``FREETIER_INFO_KEYS``.
+    The tooltip text is translated via i18n and re-translated in place when
+    the UI language changes.
+    """
+
+    def __init__(self, i18n_key: str):
+        super().__init__("!")
+        self.setObjectName("infoBadge")
+        self.setFixedSize(14, 14)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._i18n_key = i18n_key
+        self._retranslate()
+        i18n.add_listener(self._retranslate)
+        self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
+
+    def _retranslate(self) -> None:
+        self.setToolTip(i18n.t(self._i18n_key))
+
+
 class _ProviderGridCard(QFrame):
     """A provider tile in the model panel's first-level grid.
 
@@ -482,6 +515,10 @@ class _ProviderGridCard(QFrame):
         name.setObjectName("provGridName")
         top.addWidget(dot)
         top.addWidget(name)
+        # Free-tier "!" info badge for providers that have one (Google, Groq).
+        freetier_key = FREETIER_INFO_KEYS.get(provider)
+        if freetier_key:
+            top.addWidget(_InfoBadge(freetier_key))
         top.addStretch()
         lay.addLayout(top)
 
@@ -509,7 +546,7 @@ class _ModelPanel(QWidget):
 
     model_changed = pyqtSignal(str)
 
-    PROVIDER_ORDER = ("anthropic", "openai", "deepseek", "google", "xai", "ollama")
+    PROVIDER_ORDER = ("anthropic", "openai", "deepseek", "google", "xai", "groq", "ollama")
 
     def __init__(self):
         super().__init__()
@@ -595,12 +632,21 @@ class _ModelPanel(QWidget):
         for m in models:
             counts[m["provider"]] = counts.get(m["provider"], 0) + 1
 
+        # Only show providers that are actually usable: local (Ollama) or
+        # with a saved API key. Unconfigured providers stay reachable from
+        # the Settings panel, where their key can be added.
+        keys = load_api_keys()
+        configured = [
+            p for p in self.PROVIDER_ORDER
+            if p == "ollama" or keys.get(p)
+        ]
+
         grid_host = QWidget()
         grid = QGridLayout(grid_host)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(8)
         cols = 2
-        for i, provider in enumerate(self.PROVIDER_ORDER):
+        for i, provider in enumerate(configured):
             card = _ProviderGridCard(
                 provider,
                 PROVIDER_COLORS.get(provider, "#c4b5f5"),
@@ -709,6 +755,10 @@ class _ProviderCard(QFrame):
 
         key_row.addWidget(self._status_dot)
         key_row.addWidget(name)
+        # Free-tier "!" info badge for providers that have one (Google, Groq).
+        freetier_key = FREETIER_INFO_KEYS.get(provider)
+        if freetier_key:
+            key_row.addWidget(_InfoBadge(freetier_key))
         key_row.addWidget(self._key_input, 1)
         key_row.addWidget(self._save_btn)
         layout.addLayout(key_row)
@@ -1013,7 +1063,7 @@ class _SettingsPanel(QWidget):
         return wrap
 
     # Order in which providers appear in the "Choose provider" menu.
-    _PROVIDER_MENU_ORDER = ("anthropic", "openai", "deepseek", "google", "xai", "ollama")
+    _PROVIDER_MENU_ORDER = ("anthropic", "openai", "deepseek", "google", "xai", "groq", "ollama")
 
     def _build_ai_providers_section(self) -> QFrame:
         wrap = QFrame()
@@ -1926,6 +1976,14 @@ class MainPopup(QWidget):
             QLabel#providerSub {
                 font-size: 11px;
                 color: #8b7fb5;
+            }
+            QLabel#infoBadge {
+                background: rgba(196, 181, 245, 0.18);
+                border: 1px solid #c4b5f5;
+                border-radius: 7px;
+                color: #c4b5f5;
+                font-size: 9px;
+                font-weight: 700;
             }
 
             QPushButton#ghostBtn {

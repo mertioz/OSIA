@@ -39,6 +39,11 @@ PROVIDERS = {
         "base_url": "https://api.x.ai/v1",
         "models_endpoint": "https://api.x.ai/v1/models",
     },
+    "groq": {
+        "name": "Groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        "models_endpoint": "https://api.groq.com/openai/v1/models",
+    },
     "ollama": {
         "name": "Local (Ollama)",
         "base_url": "http://localhost:11434/v1",
@@ -47,7 +52,7 @@ PROVIDERS = {
 }
 
 # Providers that take an API key (ollama doesn't).
-API_PROVIDERS = ("anthropic", "openai", "deepseek", "google", "xai")
+API_PROVIDERS = ("anthropic", "openai", "deepseek", "google", "xai", "groq")
 
 # ── Hardcoded models (2026) ───────────────────────────────────────────────
 
@@ -76,6 +81,14 @@ HARDCODED_MODELS = [
     # xAI
     {"id": "grok-3",              "label": "Grok 3",              "provider": "xai",       "tier": "mid"},
     {"id": "grok-3-mini",         "label": "Grok 3 Mini",         "provider": "xai",       "tier": "light"},
+    # Groq — ids must match Groq's /models API exactly (some are namespaced).
+    {"id": "meta-llama/llama-4-scout-17b-16e-instruct", "label": "Llama 4 Scout 17B",       "provider": "groq", "tier": "mid"},
+    {"id": "llama-3.3-70b-versatile",                   "label": "Llama 3.3 70B Versatile", "provider": "groq", "tier": "mid"},
+    {"id": "llama-3.1-8b-instant",                      "label": "Llama 3.1 8B Instant",    "provider": "groq", "tier": "light"},
+    {"id": "qwen/qwen3-32b",                            "label": "Qwen 3 32B",              "provider": "groq", "tier": "mid"},
+    {"id": "openai/gpt-oss-120b",                       "label": "GPT-OSS 120B",            "provider": "groq", "tier": "best"},
+    {"id": "openai/gpt-oss-20b",                        "label": "GPT-OSS 20B",             "provider": "groq", "tier": "light"},
+    {"id": "moonshotai/kimi-k2-instruct",               "label": "Kimi K2",                 "provider": "groq", "tier": "best"},
 ]
 
 
@@ -283,6 +296,14 @@ def provider_for_model(model_id: str, models: list | None = None) -> str:
     lower = model_id.lower()
     if "claude" in lower:
         return "anthropic"
+    # Groq-hosted models — the exact-match loop above resolves the hardcoded
+    # entries; these patterns catch remote-discovered Groq ids. Checked before
+    # the generic "gpt" match so "openai/gpt-oss-*" routes to Groq, not OpenAI.
+    if (lower.startswith(("meta-llama/", "moonshotai/", "qwen/", "groq/", "playai/"))
+            or "gpt-oss" in lower
+            or "kimi" in lower
+            or lower.endswith(("-versatile", "-instant"))):
+        return "groq"
     if "gpt" in lower or lower.startswith("o1") or lower.startswith("o3"):
         return "openai"
     if "deepseek" in lower:

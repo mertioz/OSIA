@@ -1007,7 +1007,7 @@ class OSIAAgent:
 
     def set_model(self, model_id: str) -> None:
         """Switch the agent to a new model, reconfiguring the client for that
-        model's provider (Anthropic, OpenAI, DeepSeek, Google, xAI, Ollama).
+        model's provider (Anthropic, OpenAI, DeepSeek, Google, xAI, Groq, Ollama).
         """
         from osia.models import provider_for_model, PROVIDERS
         from osia.config import get_api_key
@@ -1021,7 +1021,8 @@ class OSIAAgent:
 
         # Every provider authenticates with its own API key. Anthropic uses
         # its standard endpoint with the ``x-api-key`` header; all other
-        # providers use Bearer auth, which the OpenAI client derives from
+        # providers (OpenAI, DeepSeek, Google, xAI, Groq) are OpenAI-compatible
+        # and use Bearer auth, which the OpenAI client derives from
         # ``api_key`` automatically.
         default_headers: dict[str, str] | None = None
         if provider == "anthropic":
