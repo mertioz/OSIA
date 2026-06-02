@@ -20,6 +20,8 @@ DEFAULT_SETTINGS = {
     "tts_provider": "local",   # one of: "local", "openai", "google"
     "tts_voice": None,         # provider-specific voice id; None = provider default
     "language": "en",          # UI language; one of osia.i18n.LANGUAGES
+    "island_x": None,          # last dragged capsule position; None = top-centre
+    "island_y": None,
 }
 
 

@@ -107,12 +107,13 @@ def _start_ctrl_space_listener(callback):
 def text_mode():
     """Interactive text-based chat with OSIA."""
     agent = OSIAAgent()
-    active_conv = conversations.create_conversation()
+    # No conversation is auto-created — one is created lazily when the
+    # first message is sent, so the stored list never fills with empties.
+    active_conv = None
     print("=" * 60)
     print("  OSIA — Local AI Voice Assistant (text mode)")
     print(f"  Language: {DEFAULT_LANG.upper()}")
     print("  Type 'exit' or 'quit' to stop, 'reset' to clear history")
-    print(f"  Conversation: {active_conv['id']}")
     print("=" * 60)
 
     while True:
@@ -131,9 +132,14 @@ def text_mode():
 
         if user_input.lower() == "reset":
             agent.reset()
+            active_conv = None
+            print("[History cleared — next message starts a new conversation]")
+            continue
+
+        # First message of this conversation — create it now, never earlier.
+        if active_conv is None:
             active_conv = conversations.create_conversation()
             print(f"[New conversation: {active_conv['id']}]")
-            continue
 
         prev_history_len = len(agent.messages) - 1  # skip system prompt
         print("\nOSIA is thinking...", flush=True)
@@ -151,11 +157,12 @@ def voice_mode():
     from osia.voice.tts import speak
     from osia.agent import run_agent, clean_response
 
-    active_conv = conversations.create_conversation()
+    # No conversation is auto-created — one is created lazily when the
+    # first spoken command arrives.
+    active_conv = None
     print("=" * 60)
     print("  OSIA — Voice Mode")
     print(f"  Language: {DEFAULT_LANG.upper()}")
-    print(f"  Conversation: {active_conv['id']}")
     print("=" * 60)
 
     while True:
@@ -177,6 +184,11 @@ def voice_mode():
             continue
 
         print(f"📝 You said: {user_text}")
+
+        # First message — create the conversation now, never earlier.
+        if active_conv is None:
+            active_conv = conversations.create_conversation()
+            print(f"[New conversation: {active_conv['id']}]")
 
         print("🤔 Thinking...")
         response = run_agent(user_text)
@@ -211,6 +223,8 @@ def wake_mode():
         chat_message = pyqtSignal(str, str)
         # Drive the island's visual state from a worker thread.
         island_state = pyqtSignal(str)
+        # Refresh the conversations panel (new active id) from a worker thread.
+        conversations_changed = pyqtSignal(str)
 
     bridge = Bridge()
 
@@ -220,13 +234,16 @@ def wake_mode():
     island = DynamicIsland()
     popup = MainPopup()
 
-    # Toggle the popup when the island is clicked.
+    # Toggle the popup when the island is clicked; the popup opens below
+    # the capsule's current (possibly dragged) position.
+    popup.set_anchor(island)
     island.clicked.connect(popup.toggle)
 
-    # Agent + active conversation state
+    # Agent + active conversation state. No conversation is auto-created:
+    # one is created only when the user clicks "New chat" or sends a first
+    # message, so the list can legitimately be (and stay) empty.
     agent = OSIAAgent()
-    active_conv = conversations.create_conversation()
-    print(f"  Conversation: {active_conv['id']}")
+    active_conv = None
 
     settings = load_settings()
     initial_model = settings.get("selected_model")
@@ -264,6 +281,16 @@ def wake_mode():
         user's text into the popup. ``voice_response`` controls whether
         sentences are streamed to TTS as they arrive.
         """
+        nonlocal active_conv
+
+        # No active conversation (fresh start, or the last one was deleted)
+        # — this first message creates it. Panel refresh goes through the
+        # bridge: this runs on a worker thread, never touch Qt directly.
+        if active_conv is None:
+            active_conv = conversations.create_conversation()
+            bridge.conversations_changed.emit(active_conv["id"])
+            print(f"🆕 New conversation: {active_conv['id']}")
+
         if smart_routing:
             chosen = select_model(user_text, fallback_model=agent.model)
             if chosen != agent.model:
@@ -384,7 +411,10 @@ def wake_mode():
         print(f"🗑  Deleted conversation {conv_id}: {'ok' if ok else 'not found'}")
         if active_conv and conv_id == active_conv.get("id"):
             agent.reset()
-            active_conv = conversations.create_conversation()
+            # Do NOT auto-create a replacement — the list may go (and stay)
+            # empty. A new conversation is created only when the user clicks
+            # "New chat" or sends a first message.
+            active_conv = None
             try:
                 popup.set_messages([])
             except RuntimeError:
@@ -429,6 +459,7 @@ def wake_mode():
     bridge.chat_message.connect(handle_chat_message)
     bridge.island_state.connect(handle_island_state)
     bridge.remote_models_signal.connect(handle_remote_models)
+    bridge.conversations_changed.connect(popup.refresh_conversations)
 
     popup.send_text.connect(handle_send_text)
     popup.pick_file.connect(handle_pick_file)
@@ -439,8 +470,9 @@ def wake_mode():
     popup.smart_routing_toggled.connect(handle_smart_toggled)
     popup.api_keys_saved.connect(handle_keys_saved)
 
-    # Initial population
-    popup.refresh_conversations(active_conv["id"])
+    # Initial population — no active conversation yet; the panel shows the
+    # stored list (or its "No conversations" placeholder when empty).
+    popup.refresh_conversations(None)
     discover_models_async(
         lambda remote: bridge.remote_models_signal.emit(remote)
     )

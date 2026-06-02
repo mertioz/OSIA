@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 """
-OSIA Dynamic Island — small floating capsule centered at the top of the
-screen, inspired by iOS's Dynamic Island.
+OSIA Dynamic Island — small floating capsule inspired by iOS's Dynamic
+Island. It starts centered at the top of the screen, can be dragged
+anywhere, and restores its last dragged position on the next launch
+(persisted as ``island_x`` / ``island_y`` in ``config/settings.json``).
 
 The capsule has four visual states:
 
 * ``idle``      — tiny, semi-transparent, waiting.
 * ``listening`` — centred mic glyph + 3 concentric violet pulse rings.
-* ``thinking``  — three violet dots rotating clockwise around the corners
-                  of a square (L-shape choreography, 4th corner always empty).
+* ``thinking``  — seven violet dots bobbing in a sine wave that travels
+                  from left to right across the capsule centre.
 * ``speaking``  — bouncing waveform bars.
 
 The window itself is frameless / always-on-top / not in the taskbar.
 ``WA_TranslucentBackground`` keeps the corners outside the capsule
 click-through; only the painted capsule actually receives mouse events.
-A single click on the capsule emits ``clicked`` (used to toggle the
-:class:`osia.gui.main_popup.MainPopup`).
+A click on the capsule (press + release without dragging) emits
+``clicked`` (used to toggle the :class:`osia.gui.main_popup.MainPopup`);
+press + move drags the capsule instead.
 """
 
 import math
 
 from PyQt6.QtCore import (
-    Qt, QTimer, QRectF, QPointF, pyqtSignal, QPropertyAnimation, QEasingCurve,
-    QVariantAnimation,
+    Qt, QTimer, QRect, QRectF, QPointF, pyqtSignal, QPropertyAnimation,
+    QEasingCurve, QVariantAnimation,
 )
 from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont, QPen
 from PyQt6.QtWidgets import QApplication, QWidget
@@ -46,14 +49,15 @@ LAUNCH_W = 60
 LAUNCH_H = 20
 LAUNCH_MS = 600
 
-# Thinking animation — L-shape choreography. Three dots occupy three corners
-# of a square (top-left, top-right, bottom-left); each cycle every dot hops
-# one position clockwise (bottom-left → top-left → top-right → bottom-left)
-# with sine easing. The 4th corner (bottom-right) stays empty, creating the
-# rotation illusion.
-THINK_CYCLE_MS = 600     # duration of one hop
-THINK_SQUARE_HALF = 7.0  # half side-length of the corner square (px)
-THINK_DOT_R = 3.0        # dot radius → 6px diameter
+# Thinking animation — traveling wave. Seven dots sit on a horizontal line
+# through the capsule centre; each dot oscillates vertically on a sine wave
+# with a per-dot phase offset, so the crest glides smoothly left → right.
+THINK_DOT_COUNT = 7
+THINK_DOT_R = 2.5               # dot radius → 5px diameter
+THINK_DOT_SPACING = 12.0        # px between adjacent dot centres
+THINK_WAVE_AMP = 8.0            # px of vertical travel
+THINK_WAVE_PERIOD_MS = 800      # one full oscillation per dot
+THINK_WAVE_PHASE = math.pi / 3  # phase shift between adjacent dots (60°)
 
 VALID_STATES = ("idle", "listening", "thinking", "speaking")
 
@@ -86,6 +90,13 @@ class DynamicIsland(QWidget):
         # 0.0 → 1.0 launch-expand progress; starts collapsed.
         self._launch_t = 0.0
 
+        # Drag state — a press inside the capsule may become either a click
+        # (emit ``clicked`` on release) or a drag (move the window). None /
+        # False when no press is in progress.
+        self._drag_offset = None
+        self._press_global = None
+        self._dragging = False
+
         # Opacity is animated on state changes so the transitions feel smooth.
         self._opacity_anim = QPropertyAnimation(self, b"windowOpacity")
         self._opacity_anim.setDuration(220)
@@ -105,7 +116,7 @@ class DynamicIsland(QWidget):
         self._timer.start()
 
         self.setWindowOpacity(IDLE_OPACITY)
-        self._position_at_top()
+        self._restore_position()
         self.show()
         self._launch_anim.start()
 
@@ -139,9 +150,46 @@ class DynamicIsland(QWidget):
         y = geo.y() + 8
         self.move(x, y)
 
+    # ── Position persistence ──────────────────────────────────────────────
+
+    def _restore_position(self) -> None:
+        """Move to the last saved position (``island_x``/``island_y`` in
+        settings), falling back to top-centre when nothing is saved or the
+        saved point is no longer on any connected screen (monitor unplugged,
+        resolution change).
+        """
+        try:
+            # Lazy import so the module stays importable standalone
+            # (self-test below) even without the project on sys.path.
+            from osia.config import load_settings
+            settings = load_settings()
+            x, y = settings.get("island_x"), settings.get("island_y")
+        except Exception:
+            x = y = None
+        if x is None or y is None:
+            self._position_at_top()
+            return
+        rect = QRect(int(x), int(y), self.width(), self.height())
+        for screen in QApplication.screens():
+            if screen.availableGeometry().intersects(rect):
+                self.move(rect.topLeft())
+                return
+        self._position_at_top()
+
+    def _save_position(self) -> None:
+        """Persist the capsule position so the next launch restores it."""
+        try:
+            from osia.config import load_settings, save_settings
+            settings = load_settings()
+            settings["island_x"] = self.x()
+            settings["island_y"] = self.y()
+            save_settings(settings)
+        except Exception as e:
+            print(f"[DynamicIsland] failed to save position: {e}")
+
     def showEvent(self, event):
         super().showEvent(event)
-        self._position_at_top()
+        self._restore_position()
         self.raise_()
 
     def _tick(self) -> None:
@@ -157,18 +205,59 @@ class DynamicIsland(QWidget):
         self._launch_t = float(value)
         self.update()
 
-    # ── Click handling ────────────────────────────────────────────────────
+    # ── Click / drag handling ─────────────────────────────────────────────
+    # A press inside the capsule starts a potential click OR drag; the two
+    # are disambiguated by movement: past the platform drag threshold the
+    # press becomes a drag (move the window, save the position on release),
+    # otherwise the release emits ``clicked``.
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            # Only react if the click is inside the painted capsule —
+            # Only react if the press is inside the painted capsule —
             # everything outside the rounded rect should feel click-through.
             path = self._capsule_path()
             if path.contains(event.position()):
-                self.clicked.emit()
+                self._press_global = event.globalPosition().toPoint()
+                self._drag_offset = (
+                    self._press_global - self.frameGeometry().topLeft()
+                )
+                self._dragging = False
                 event.accept()
                 return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._drag_offset is not None
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            global_pos = event.globalPosition().toPoint()
+            # Hand jitter on a click must not count as a drag — only start
+            # dragging past the platform drag-distance threshold.
+            if (not self._dragging
+                    and (global_pos - self._press_global).manhattanLength()
+                    < QApplication.startDragDistance()):
+                event.accept()
+                return
+            self._dragging = True
+            self.move(global_pos - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._drag_offset is not None):
+            was_drag = self._dragging
+            self._drag_offset = None
+            self._press_global = None
+            self._dragging = False
+            if was_drag:
+                self._save_position()
+            else:
+                # Plain click (no drag) — toggle the popup.
+                self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     # ── Painting ──────────────────────────────────────────────────────────
 
@@ -290,41 +379,30 @@ class DynamicIsland(QWidget):
         p.drawPath(base)
 
     def _paint_thinking(self, p: QPainter) -> None:
-        """Three violet dots in an L-shape clockwise rotation.
+        """Seven violet dots bobbing in a traveling sine wave.
 
-        The dots occupy three corners of a square — top-left, top-right and
-        bottom-left — and every ~600ms cycle each dot glides one position
-        clockwise along the path bottom-left → top-left → top-right →
-        bottom-left, with sine (ease-in-out) easing. The fourth corner
-        (bottom-right) is never occupied, which reads as a continuous
-        rotation illusion.
+        The dots are evenly spaced on a horizontal line through the capsule
+        centre and each one oscillates vertically:
+
+            y_offset = amplitude * sin(2π * t / period - i * phase_shift)
+
+        The per-dot phase shift makes the crest travel smoothly from left
+        to right, which reads as a fluid, organic wave.
         """
         cx = self.width() / 2
         cy = self.height() / 2
 
-        d = THINK_SQUARE_HALF
-        # Corner positions in clockwise hop order: BL → TL → TR → (BL).
-        corners = (
-            (cx - d, cy + d),   # bottom-left
-            (cx - d, cy - d),   # top-left
-            (cx + d, cy - d),   # top-right
-        )
-
-        # Which hop we're on, and the eased progress within it.
-        step = self._anim_ms // THINK_CYCLE_MS
-        progress = (self._anim_ms % THINK_CYCLE_MS) / THINK_CYCLE_MS
-        # Sine ease-in-out: zero velocity at both ends of each hop.
-        eased = 0.5 - 0.5 * math.cos(math.pi * progress)
+        n = THINK_DOT_COUNT
+        start_x = cx - (n - 1) * THINK_DOT_SPACING / 2
+        omega_t = 2 * math.pi * self._anim_ms / THINK_WAVE_PERIOD_MS
 
         p.setPen(Qt.PenStyle.NoPen)
         color = QColor(ACCENT)              # #c4b5f5
         color.setAlpha(235)
         p.setBrush(color)
-        for i in range(3):
-            x0, y0 = corners[(i + step) % 3]
-            x1, y1 = corners[(i + step + 1) % 3]
-            x = x0 + (x1 - x0) * eased
-            y = y0 + (y1 - y0) * eased
+        for i in range(n):
+            x = start_x + i * THINK_DOT_SPACING
+            y = cy + THINK_WAVE_AMP * math.sin(omega_t - i * THINK_WAVE_PHASE)
             p.drawEllipse(QPointF(x, y), THINK_DOT_R, THINK_DOT_R)
 
     def _paint_speaking(self, p: QPainter) -> None:

@@ -1070,6 +1070,17 @@ def _provider_supports_vision(provider: str, model: str) -> bool:
     return False
 
 
+# Mandatory instruction prepended to every navigation tool result (navigate,
+# click, find_and_click) that carries a page screenshot the model will
+# actually receive (vision-capable provider). Forces the model to ground its
+# next action in what the page really shows instead of guessing selectors.
+SCREENSHOT_ANALYSIS_INSTRUCTION = (
+    "IMPORTANT: Analyze the screenshot carefully before taking any action. "
+    "Identify the exact position of buttons, links, and elements visible on "
+    "screen. Base your next action on what you actually see in the image."
+)
+
+
 # ---------------------------------------------------------------------------
 # Universal tool-call parser — all providers
 # ---------------------------------------------------------------------------
@@ -1845,7 +1856,14 @@ class OSIAAgent:
                         f"[OSIA Agent] ◀ tool: {tool_name} → "
                         f"{len(text_part)} chars [{status}]{extra}"
                     )
-                    tool_results.append(f"Tool {tool_name} result:\n{text_part}")
+                    result_entry = f"Tool {tool_name} result:\n{text_part}"
+                    # Force screenshot analysis: navigation tool results
+                    # (navigate, click, find_and_click) carrying a screenshot
+                    # the model will actually see get a mandatory
+                    # analyze-before-acting instruction prepended.
+                    if screenshot and _provider_supports_vision(self.provider, self.model):
+                        result_entry = f"{SCREENSHOT_ANALYSIS_INSTRUCTION}\n\n{result_entry}"
+                    tool_results.append(result_entry)
                     if screenshot:
                         tool_screenshots.append(screenshot)
                     if is_error:

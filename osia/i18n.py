@@ -132,6 +132,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
               "ideal para pruebas. Los límites son inferiores a los del uso de "
               "pago.",
     },
+    # — Conversations panel —
+    "conversations.empty": {
+        "en": "No conversations",
+        "fr": "Aucune conversation",
+        "zh": "暂无对话",
+        "ja": "会話はありません",
+        "de": "Keine Unterhaltungen",
+        "es": "No hay conversaciones",
+    },
     # — Language selector (part of the foundation) —
     "settings.language": {
         "en": "Language",

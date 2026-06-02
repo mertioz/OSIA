@@ -82,7 +82,6 @@ HARDCODED_MODELS = [
     {"id": "grok-3",              "label": "Grok 3",              "provider": "xai",       "tier": "mid"},
     {"id": "grok-3-mini",         "label": "Grok 3 Mini",         "provider": "xai",       "tier": "light"},
     # Groq — ids must match Groq's /models API exactly (some are namespaced).
-    {"id": "meta-llama/llama-4-scout-17b-16e-instruct", "label": "Llama 4 Scout 17B",       "provider": "groq", "tier": "mid"},
     {"id": "llama-3.3-70b-versatile",                   "label": "Llama 3.3 70B Versatile", "provider": "groq", "tier": "mid"},
     {"id": "llama-3.1-8b-instant",                      "label": "Llama 3.1 8B Instant",    "provider": "groq", "tier": "light"},
     {"id": "qwen/qwen3-32b",                            "label": "Qwen 3 32B",              "provider": "groq", "tier": "mid"},
@@ -90,6 +89,15 @@ HARDCODED_MODELS = [
     {"id": "openai/gpt-oss-20b",                        "label": "GPT-OSS 20B",             "provider": "groq", "tier": "light"},
     {"id": "moonshotai/kimi-k2-instruct",               "label": "Kimi K2",                 "provider": "groq", "tier": "best"},
 ]
+
+# Vision-capable models kept OUT of the chat selector — referenced internally
+# for future multimodal use (screenshot analysis, image understanding) only.
+# Llama 4 Scout: vision-only, unreliable for tool calls.
+VISION_MODELS = [
+    {"id": "meta-llama/llama-4-scout-17b-16e-instruct", "label": "Llama 4 Scout 17B", "provider": "groq", "tier": "mid"},
+]
+
+_VISION_ONLY_IDS = frozenset(m["id"] for m in VISION_MODELS)
 
 
 # ── Local Ollama discovery ────────────────────────────────────────────────
@@ -166,6 +174,9 @@ def fetch_remote_models(provider: str, api_key: str, timeout: float = 5.0) -> li
             mid = mid[len("models/"):]
         # Groq's endpoint mixes chat with non-chat models — keep chat only.
         if provider == "groq" and any(p in mid.lower() for p in GROQ_NON_CHAT_PATTERNS):
+            continue
+        # Vision-only models (see VISION_MODELS) never appear in the selector.
+        if mid in _VISION_ONLY_IDS:
             continue
         out.append({
             "id": mid,

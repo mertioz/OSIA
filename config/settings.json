@@ -1,8 +1,10 @@
 {
   "smart_routing": false,
-  "selected_model": "qwen/qwen3-32b",
+  "selected_model": "gemini-2.5-pro",
   "tts_provider": "openai",
-  "tts_voice": "marin",
+  "tts_voice": "sage",
   "language": "fr",
+  "island_x": 709,
+  "island_y": 935,
   "parler_voice_description": null
 }

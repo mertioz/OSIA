@@ -460,10 +460,16 @@ class _ConversationsPanel(QWidget):
                 w.deleteLater()
         items = conversations.list_conversations()
         if not items:
-            placeholder = QLabel("No conversations yet.")
+            # An empty list is a valid state — never auto-create here. A new
+            # conversation is created only when the user clicks "New chat"
+            # or sends a first message.
+            placeholder = QLabel(i18n.t("conversations.empty"))
             placeholder.setObjectName("panelEmpty")
             placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._host_layout.insertWidget(0, placeholder)
+            # Stretch above + the host's trailing stretch below keep the
+            # label vertically centered in the panel.
+            self._host_layout.insertStretch(0, 1)
+            self._host_layout.insertWidget(1, placeholder)
             return
         for i, conv in enumerate(items):
             row = _ConvRow(conv, is_active=(conv.get("id") == self._active_id))
@@ -1522,6 +1528,14 @@ class MainPopup(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedSize(POPUP_W, POPUP_H)
 
+        # The Dynamic Island capsule the popup anchors to (set_anchor) —
+        # when set, the popup opens just below the capsule's CURRENT
+        # position instead of a fixed screen coordinate.
+        self._anchor: QWidget | None = None
+        # Drag state — presses that no child widget consumed land on the
+        # popup itself and move the whole window.
+        self._drag_offset = None
+
         # Soft shadow
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(60)
@@ -1598,9 +1612,40 @@ class MainPopup(QWidget):
 
     # ── Window placement ──────────────────────────────────────────────────
 
+    def set_anchor(self, widget: QWidget) -> None:
+        """Set the widget (the Dynamic Island capsule) the popup opens under.
+
+        The capsule is draggable, so its geometry is re-read on every
+        :meth:`toggle` — the popup always opens below wherever the capsule
+        currently is.
+        """
+        self._anchor = widget
+
     def anchor_below_island(self, island_geom_bottom_y: int = 60) -> None:
         screen = self.screen() or QApplication.primaryScreen()
         geo = screen.availableGeometry()
+
+        if self._anchor is not None:
+            # Follow the capsule's current position: horizontally centred
+            # under it, just below it — on the capsule's screen. When there
+            # isn't enough room below (capsule dragged near the bottom), the
+            # popup flips above the capsule instead of covering it; the final
+            # clamp keeps it fully visible in every case.
+            island_geo = self._anchor.frameGeometry()
+            island_screen = self._anchor.screen()
+            if island_screen is not None:
+                geo = island_screen.availableGeometry()
+            x = island_geo.center().x() - self.width() // 2
+            y = island_geo.bottom() + 10
+            if (y + self.height() > geo.y() + geo.height()
+                    and island_geo.top() - 10 - self.height() >= geo.y()):
+                y = island_geo.top() - 10 - self.height()
+            x = max(geo.x(), min(x, geo.x() + geo.width() - self.width()))
+            y = max(geo.y(), min(y, geo.y() + geo.height() - self.height()))
+            self.move(x, y)
+            return
+
+        # No anchor — legacy fixed placement at the top-centre of the screen.
         x = geo.x() + (geo.width() - self.width()) // 2
         y = geo.y() + max(island_geom_bottom_y, 60)
         self.move(x, y)
@@ -1661,6 +1706,33 @@ class MainPopup(QWidget):
         self.model_changed.emit(model_id)
         # Show the new selection state immediately.
         self._models.set_current(model_id)
+
+    # ── Dragging ──────────────────────────────────────────────────────────
+    # Buttons, inputs and list rows accept their own mouse presses, so any
+    # press that reaches the popup itself is on an "empty" area — dragging
+    # there moves the whole window (same pattern as _SettingsPanel).
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = (
+                event.globalPosition().toPoint()
+                - self.frameGeometry().topLeft()
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._drag_offset is not None
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
 
     # ── Painting ──────────────────────────────────────────────────────────
 
