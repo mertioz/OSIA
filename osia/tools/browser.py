@@ -14,7 +14,9 @@ runs, so logins survive between conversations.
 
 Note on Firefox: Firefox does NOT support the Chrome DevTools Protocol on
 this flag, so CDP requires a Chromium-based browser (Brave, Chromium,
-Chrome). If none is installed we surface a clear error.
+Chrome, Opera, Edge). Firefox can still be launched as a plain application
+via ``open_browser``. If no CDP-capable browser is installed we surface a
+clear error.
 """
 
 import base64
@@ -36,18 +38,37 @@ OSIA_PROFILE_DIR = "/home/OSIA/.osia/brave-profile"
 # Browser candidates, ordered by preference. Brave is tried first: the
 # /usr/bin wrapper scripts are preferred over the raw /opt/brave.com/brave/brave
 # binary, which can die with a fatal error when launched directly on some
-# installs. Absolute paths are checked with os.path.exists(); bare names are
-# resolved against $PATH with shutil.which(). Firefox is intentionally
-# omitted — it does not speak CDP on --remote-debugging-port.
+# installs. Each name is resolved against /usr/bin/, /snap/bin/, and $PATH
+# (via shutil.which()) by ``_find_binary``; absolute paths are checked with
+# os.path.exists().
 _BROWSER_CANDIDATES = [
-    "/usr/bin/brave-browser",
-    "/usr/bin/brave",
-    "/opt/brave.com/brave/brave",
     "brave-browser",
     "brave",
-    "chromium-browser", "chromium",
-    "google-chrome", "chrome",
+    "/opt/brave.com/brave/brave",
+    "chromium-browser",
+    "chromium",
+    "google-chrome",
+    "google-chrome-stable",
+    "firefox",
+    "opera",
+    "microsoft-edge",
 ]
+
+# Map common user-facing browser names ("open Firefox", "open Chrome") to
+# the binary candidates to try for that browser, in preference order.
+_BROWSER_NAME_MAP = {
+    "brave": ["brave-browser", "brave", "/opt/brave.com/brave/brave"],
+    "chrome": ["google-chrome", "google-chrome-stable", "chrome"],
+    "chromium": ["chromium-browser", "chromium"],
+    "firefox": ["firefox", "firefox-esr"],
+    "opera": ["opera"],
+    "edge": ["microsoft-edge", "microsoft-edge-stable", "msedge"],
+}
+
+# Browsers that can NOT be driven over the Chrome DevTools Protocol
+# (non-Chromium engines). They can still be launched as plain applications
+# via ``open_browser`` but are skipped for CDP automation.
+_NON_CDP_BROWSERS = {"firefox", "firefox-esr"}
 
 
 # ── Module state ───────────────────────────────────────────────────────────
@@ -70,21 +91,54 @@ def _is_cdp_alive() -> bool:
         return False
 
 
+def _find_binary(name: str) -> str | None:
+    """Resolve a browser binary name (or absolute path) to an executable path.
+
+    Bare names are checked in ``/usr/bin/`` and ``/snap/bin/`` first, then
+    against ``$PATH`` with ``shutil.which()``. Absolute paths are checked
+    with ``os.path.exists()``.
+    """
+    if os.path.isabs(name):
+        return name if os.path.exists(name) else None
+    for directory in ("/usr/bin", "/snap/bin"):
+        path = os.path.join(directory, name)
+        if os.path.exists(path):
+            return path
+    return shutil.which(name)
+
+
+def resolve_browser_name(name: str) -> str | None:
+    """Map a user-facing browser name ("firefox", "chrome", "edge", …) to
+    the path of an installed binary, or ``None`` if that browser isn't
+    installed.
+
+    Falls back to treating ``name`` as a raw binary name, so e.g.
+    "google-chrome-stable" also resolves.
+    """
+    key = (name or "").strip().lower()
+    if not key:
+        return None
+    candidates = _BROWSER_NAME_MAP.get(key, [key])
+    for candidate in candidates:
+        path = _find_binary(candidate)
+        if path:
+            return path
+    return None
+
+
 def _detect_chromium_browser() -> str | None:
-    """Return the path of the first installed browser from
+    """Return the path of the first installed CDP-capable browser from
     ``_BROWSER_CANDIDATES``, or ``None`` if none are installed.
 
-    Absolute-path candidates are checked with ``os.path.exists()``;
-    bare names are resolved against ``$PATH`` with ``shutil.which()``.
+    Non-Chromium browsers (Firefox) are skipped — they cannot be driven
+    over the Chrome DevTools Protocol.
     """
     for candidate in _BROWSER_CANDIDATES:
-        if os.path.isabs(candidate):
-            if os.path.exists(candidate):
-                return candidate
-        else:
-            path = shutil.which(candidate)
-            if path:
-                return path
+        if os.path.basename(candidate) in _NON_CDP_BROWSERS:
+            continue
+        path = _find_binary(candidate)
+        if path:
+            return path
     return None
 
 
@@ -101,8 +155,8 @@ def _launch_cdp_browser() -> tuple[bool, str]:
     browser = _detect_chromium_browser()
     if not browser:
         return False, (
-            "Brave browser not found — install brave-browser, chromium, "
-            "or google-chrome (Firefox does not support CDP)"
+            "No CDP-capable browser found — install brave-browser, chromium, "
+            "google-chrome, opera, or microsoft-edge (Firefox does not support CDP)"
         )
     os.makedirs(OSIA_PROFILE_DIR, exist_ok=True)
     cmd = [
@@ -320,6 +374,38 @@ def go_forward():
             return _result(f"Went forward to: {page.url}", page)
         except Exception as e:
             return f"ERROR going forward: {e}"
+
+
+def open_browser(name: str, url: str | None = None) -> str:
+    """Open a specific browser by user-facing name (firefox, chrome,
+    chromium, opera, edge, brave), optionally at ``url``.
+
+    Unlike ``navigate``, this launches the named browser as a regular
+    application — it works for any installed browser, including Firefox,
+    which cannot be driven over CDP. Use it when the user asks to open a
+    *specific* browser ("open Firefox", "open Chrome").
+    """
+    binary = resolve_browser_name(name)
+    if not binary:
+        known = ", ".join(sorted(_BROWSER_NAME_MAP))
+        return (
+            f"ERROR: browser {name!r} is not installed "
+            f"(known browsers: {known})"
+        )
+    cmd = [binary]
+    if url:
+        cmd.append(_normalize_url(url))
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        return f"ERROR launching {binary}: {e}"
+    suffix = f" at {_normalize_url(url)}" if url else ""
+    return f"Opened {os.path.basename(binary)}{suffix}"
 
 
 def open_new_tab(url: str) -> str:

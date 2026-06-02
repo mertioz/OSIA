@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from osia.agent import OSIAAgent, DEFAULT_LANG, get_system_prompt
 from osia import conversations
+from osia.tools import verify_tools
 
 
 def _persist_agent_delta(conv_id, agent, prev_history_len):
@@ -469,6 +470,14 @@ def wake_mode():
 
 
 def main():
+    # One-time tool health check: logs which tool categories (bash, file
+    # read, browser) are usable so missing dependencies show up at startup
+    # instead of failing mid-conversation. Must never block startup.
+    try:
+        verify_tools()
+    except Exception as e:
+        print(f"[OSIA] tool health check failed: {e}")
+
     if "--text" in sys.argv:
         text_mode()
     elif "--voice" in sys.argv:

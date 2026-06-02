@@ -92,6 +92,7 @@ Browser (drives a REAL visible Chromium browser via CDP — same page the user s
 - go_back: Navigate back in history. Usage: {"tool": "go_back"}
 - go_forward: Navigate forward in history. Usage: {"tool": "go_forward"}
 - open_new_tab: Open a URL in a new tab and switch to it. Usage: {"tool": "open_new_tab", "url": "<url>"}
+- open_browser: Open a SPECIFIC browser by name (firefox, chrome, chromium, opera, edge, brave), optionally at a URL. Use when the user asks for a particular browser ("open Firefox"). Usage: {"tool": "open_browser", "name": "firefox", "url": "<optional_url>"}
 
 ## How to Use Tools
 To call a tool, output a JSON tool call wrapped in <tool_call> tags:
@@ -154,6 +155,7 @@ Navigateur (pilote le VRAI navigateur Chromium visible via CDP — la page que v
 - go_back : Reculer dans l'historique. Usage : {"tool": "go_back"}
 - go_forward : Avancer dans l'historique. Usage : {"tool": "go_forward"}
 - open_new_tab : Ouvrir une URL dans un nouvel onglet et basculer dessus. Usage : {"tool": "open_new_tab", "url": "<url>"}
+- open_browser : Ouvrir un navigateur PRÉCIS par son nom (firefox, chrome, chromium, opera, edge, brave), éventuellement sur une URL. À utiliser quand l'utilisateur demande un navigateur particulier (« ouvre Firefox »). Usage : {"tool": "open_browser", "name": "firefox", "url": "<url_optionnelle>"}
 
 ## Comment utiliser les outils
 Pour appeler un outil, produis un appel JSON dans des balises <tool_call> :
@@ -203,6 +205,23 @@ _UNCLOSED_THINK_PATTERN = re.compile(r'<think(?:ing)?>.*$', re.DOTALL)
 _RAW_TOOL_TAG_PATTERN = re.compile(
     r'</?(?:tool_call|tool_result|function_calls|thinking|think|tool)>'
 )
+# Llama-family special tokens that Llama 4 Scout cites as literal text:
+# <|python_tag|>, <|eot_id|>, <|start_header_id|>, <|end_header_id|>,
+# <|eom_id|>, … A header block (<|start_header_id|>role<|end_header_id|>)
+# is stripped whole — the role name between the tokens is markup too. The
+# generic pattern then removes ANY remaining <|...|> token so new/unknown
+# special tokens never reach the user.
+_LLAMA_HEADER_BLOCK_PATTERN = re.compile(
+    r'<\|start_header_id\|>.*?<\|end_header_id\|>', re.DOTALL
+)
+# <|python_tag|> marks Llama tool-call payload: everything from the tag to
+# the next <|eot_id|>/<|eom_id|> (or end of text) is code/JSON the model
+# meant to execute — like a <tool_call> block, it is stripped whole so the
+# raw payload never reaches the user.
+_LLAMA_PYTHON_TAG_BLOCK_PATTERN = re.compile(
+    r'<\|python_tag\|>.*?(?:<\|eo[tm]_id\|>|$)', re.DOTALL
+)
+_LLAMA_SPECIAL_TOKEN_PATTERN = re.compile(r'<\|[^<>|]*\|>')
 # Full tool blocks — tags AND the JSON/result payload between them. Some
 # models echo entire <tool_call>{"tool": ...}</tool_call> blocks as literal
 # text; stripping only the tags would leave the raw JSON visible to the user.
@@ -238,7 +257,11 @@ def strip_raw_tool_tags(text: str) -> str:
        models echo full tool-call blocks as literal text.
     2. An unclosed ``<tool_call>…`` running to the end of the text
        (stream truncation).
-    3. Any remaining orphan tags: <tool_call>, </tool_call>, <tool>,
+    3. Llama-family special tokens (Llama 4 Scout): header blocks
+       ``<|start_header_id|>…<|end_header_id|>`` including the role name,
+       ``<|python_tag|>…<|eot_id|>`` blocks including the tool payload,
+       then any other ``<|...|>`` token (<|eot_id|>, <|eom_id|>, …).
+    4. Any remaining orphan tags: <tool_call>, </tool_call>, <tool>,
        </tool>, <function_calls>, </function_calls>, …
     """
     if not text:
@@ -246,6 +269,9 @@ def strip_raw_tool_tags(text: str) -> str:
     for pattern in _TOOL_BLOCK_PATTERNS:
         text = pattern.sub('', text)
     text = _UNCLOSED_TOOL_CALL_PATTERN.sub('', text)
+    text = _LLAMA_HEADER_BLOCK_PATTERN.sub('', text)
+    text = _LLAMA_PYTHON_TAG_BLOCK_PATTERN.sub('', text)
+    text = _LLAMA_SPECIAL_TOKEN_PATTERN.sub('', text)
     return _RAW_TOOL_TAG_PATTERN.sub('', text)
 
 
@@ -832,7 +858,7 @@ def _get_browser_tools():
             navigate, click, fill, read_page,
             get_current_url, scroll, go_back, go_forward, open_new_tab,
             find_and_click, wait_for_load, get_page_text, scroll_down,
-            type_text, press_key,
+            type_text, press_key, open_browser,
         )
         _browser_tools = {
             "navigate": navigate,
@@ -850,6 +876,7 @@ def _get_browser_tools():
             "scroll_down": scroll_down,
             "type_text": type_text,
             "press_key": press_key,
+            "open_browser": open_browser,
         }
     return _browser_tools
 
@@ -899,6 +926,9 @@ def tool_type_text(selector: str, text: str) -> str:
 def tool_press_key(key: str) -> str:
     return _get_browser_tools()["press_key"](key)
 
+def tool_open_browser(name: str, url: str | None = None) -> str:
+    return _get_browser_tools()["open_browser"](name, url)
+
 
 TOOL_MAP = {
     # Shell & launchers
@@ -943,6 +973,7 @@ TOOL_MAP = {
     "scroll_down": tool_scroll_down,
     "type_text": tool_type_text,
     "press_key": tool_press_key,
+    "open_browser": tool_open_browser,
 }
 
 
@@ -1039,22 +1070,331 @@ def _provider_supports_vision(provider: str, model: str) -> bool:
     return False
 
 
-def parse_tool_calls(text: str) -> list:
-    """Extract tool calls from <tool_call>...</tool_call> blocks."""
-    pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
-    matches = re.findall(pattern, text, re.DOTALL)
-    calls = []
-    for m in matches:
+# ---------------------------------------------------------------------------
+# Universal tool-call parser — all providers
+# ---------------------------------------------------------------------------
+
+# Per-provider tool-call format, used to route parsing in
+# ``_extract_tool_calls``. "native" providers return structured
+# ``message.tool_calls`` (OpenAI-style function calling); "xml" providers
+# (Groq's Llama/Qwen) emit ``<tool_call>{...}</tool_call>`` blocks as text.
+# Whichever format the provider prefers is tried first; the other is always
+# tried as a fallback, because the system prompt teaches the XML format to
+# every provider.
+TOOL_FORMAT = {
+    "openai": "native",
+    "anthropic": "native",
+    "google": "native",
+    "deepseek": "native",
+    "xai": "native",
+    "groq": "xml",
+    "ollama": "native",
+}
+
+
+def _extract_json_object(raw: str) -> str | None:
+    """Return the first balanced ``{...}`` object in ``raw`` (string-aware),
+    or ``None`` if no balanced object exists (e.g. truncated payload).
+    """
+    start = raw.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(start, len(raw)):
+        c = raw[i]
+        if escaped:
+            escaped = False
+            continue
+        if c == "\\":
+            escaped = in_str
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return raw[start:i + 1]
+    return None
+
+
+def _parse_tool_json(raw: str) -> dict | None:
+    """Parse one tool-call JSON payload into ``{"tool": name, **kwargs}``.
+
+    Accepts every shape models actually produce:
+    - flat:     {"tool": "bash", "command": "ls"}
+    - nested:   {"tool": "bash", "parameters": {"command": "ls"}}
+                {"name": "bash", "arguments": {"command": "ls"}}
+    - native:   {"function": {"name": "bash", "arguments": "{...}"}}
+    - payloads with trailing prose, or truncated by max_tokens (repaired
+      via balanced-brace extraction / closing-brace completion).
+
+    Returns ``None`` when no tool name can be recovered.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+
+    data = None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Repair 1: extract the first balanced {...} (drops trailing prose).
+        candidate = _extract_json_object(raw)
+        if candidate:
+            try:
+                data = json.loads(candidate)
+            except json.JSONDecodeError:
+                data = None
+        # Repair 2: truncated payload — try completing the JSON.
+        if data is None:
+            for suffix in ('"}', '"}}', "}", "}}"):
+                try:
+                    data = json.loads(raw + suffix)
+                    break
+                except json.JSONDecodeError:
+                    continue
+    if not isinstance(data, dict):
+        return None
+
+    kwargs: dict = {}
+    if isinstance(data.get("function"), dict):
+        # OpenAI-native-style nesting cited as text.
+        fn = data["function"]
+        name = fn.get("name")
+        raw_params = fn.get("arguments") or fn.get("parameters") or {}
+    else:
+        # Tool name: "tool" wins; "function"/"name" only when "tool" is
+        # absent ("name" can legitimately be an argument of the call, e.g.
+        # open_application / open_browser).
+        name, name_key = None, None
+        for key in ("tool", "function", "name"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                name, name_key = value, key
+                break
+        if name is None:
+            return None
+        raw_params = data.get("parameters") or data.get("arguments") or {}
+        kwargs = {
+            k: v for k, v in data.items()
+            if k not in (name_key, "parameters", "arguments")
+        }
+
+    if not name or not isinstance(name, str):
+        return None
+    # Native "arguments" may itself be a JSON-encoded string.
+    if isinstance(raw_params, str):
         try:
-            calls.append(json.loads(m))
+            raw_params = json.loads(raw_params)
         except json.JSONDecodeError:
-            pass
+            raw_params = {}
+    if isinstance(raw_params, dict):
+        kwargs.update(raw_params)
+    return {"tool": name, **kwargs}
+
+
+def _parse_xml_tool_calls(text: str) -> list:
+    """Parse ``<tool_call>{...}</tool_call>`` blocks (Groq Llama/Qwen
+    format) from text, including an unclosed trailing block left by
+    max_tokens truncation.
+    """
+    if not text:
+        return []
+    calls = []
+    closed_end = 0
+    for m in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL):
+        call = _parse_tool_json(m.group(1))
+        if call:
+            calls.append(call)
+        closed_end = m.end()
+    # Unclosed trailing block — only look after the last closed block so
+    # nothing is parsed twice.
+    m = re.search(r"<tool_call>\s*(\{.*)$", text[closed_end:], re.DOTALL)
+    if m:
+        call = _parse_tool_json(m.group(1))
+        if call:
+            calls.append(call)
     return calls
+
+
+def _parse_native_tool_calls(message) -> list:
+    """Convert native structured tool calls (``message.tool_calls`` —
+    OpenAI/Anthropic/DeepSeek/Google/Ollama/xAI OpenAI-compatible APIs)
+    into ``{"tool": name, **kwargs}`` dicts. Returns ``[]`` when the
+    message carries no structured calls.
+    """
+    if message is None:
+        return []
+    tool_calls = getattr(message, "tool_calls", None)
+    if not tool_calls and isinstance(message, dict):
+        tool_calls = message.get("tool_calls")
+    if not tool_calls:
+        return []
+    calls = []
+    for tc in tool_calls:
+        fn = getattr(tc, "function", None)
+        if fn is None and isinstance(tc, dict):
+            fn = tc.get("function")
+        if fn is None:
+            continue
+        name = getattr(fn, "name", None)
+        args = getattr(fn, "arguments", None)
+        if isinstance(fn, dict):
+            name = name or fn.get("name")
+            args = args if args is not None else fn.get("arguments")
+        if not name:
+            continue
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        calls.append({"tool": name, **(args if isinstance(args, dict) else {})})
+    return calls
+
+
+def _extract_tool_calls(text: str, message=None, provider: str = None) -> list:
+    """Universal tool-call parser — handles every provider format.
+
+    Returns a list of ``{"tool": name, **kwargs}`` dicts ready for
+    ``TOOL_MAP`` dispatch, in execution order.
+
+    Formats handled:
+    1. Native structured tool calls (``message.tool_calls`` — OpenAI,
+       Anthropic, DeepSeek, Google, Ollama, xAI).
+    2. XML ``<tool_call>{...}</tool_call>`` text blocks (Groq Llama/Qwen),
+       flat or nested-``parameters`` JSON, including truncated blocks.
+    3. Llama special tokens (``<|python_tag|>…``): NEVER executed — they
+       are stripped from the final output only (``strip_raw_tool_tags``).
+    4. Plain-text descriptions of actions ("I'll open Brave now"): nothing
+       is extracted — the text is passed as-is to the user, never executed.
+
+    ``TOOL_FORMAT[provider]`` decides which format is tried first; the
+    other always serves as fallback.
+    """
+    fmt = TOOL_FORMAT.get((provider or "").lower(), "native")
+    native_calls = _parse_native_tool_calls(message)
+    xml_calls = _parse_xml_tool_calls(text or "")
+    if fmt == "xml":
+        return xml_calls or native_calls
+    return native_calls or xml_calls
+
+
+def parse_tool_calls(text: str) -> list:
+    """Extract tool calls from <tool_call>...</tool_call> blocks.
+
+    Backwards-compatible wrapper around the universal XML parser; prefer
+    ``_extract_tool_calls`` which also handles native structured calls.
+    """
+    return _parse_xml_tool_calls(text)
 
 
 def has_tool_call(text: str) -> bool:
     """Check if text contains a <tool_call> block."""
     return bool(re.search(r"<tool_call>", text))
+
+
+def has_tool_markup(text: str) -> bool:
+    """Check if text contains anything that LOOKS like a tool invocation —
+    a ``<tool_call>`` tag or a Llama ``<|python_tag|>`` payload — whether
+    or not it parses into an executable call. Used for fallback-honesty
+    warnings when nothing executable was extracted.
+    """
+    if not text:
+        return False
+    return bool(re.search(r"<tool_call>|<\|python_tag\|>", text))
+
+
+# Phrases by which a model claims it already performed an action that only a
+# tool could perform. Some models (especially Llama 4 Scout) hallucinate:
+# they SAY they executed a tool but never emit a <tool_call> block — the
+# "result" they describe is invented. English and French, past-tense action
+# verbs that map onto tool effects (opened, launched, executed, navigated…).
+_TOOL_CLAIM_PATTERNS = [
+    # "I opened…", "I've launched…", "I have just executed…", "I ran…"
+    re.compile(
+        r"\bI(?:'ve| have)?\s+(?:just\s+)?(?:successfully\s+)?"
+        r"(?:opened|launched|executed|navigated|clicked|created|deleted|"
+        r"wrote|written|killed|copied|renamed|moved|filled|typed|pressed|"
+        r"scrolled|took|taken|ran(?!\s+into))\b",
+        re.IGNORECASE,
+    ),
+    # "The command has been executed", "the file was created", "is now open"
+    re.compile(
+        r"\b(?:has|have|was|were) been (?:opened|launched|executed|run|"
+        r"created|deleted|written|killed|copied|renamed|moved|completed)\b"
+        r"|\b(?:was|were) (?:opened|launched|executed|run|created|deleted|"
+        r"written|killed|copied|renamed|moved|completed)\b"
+        r"|\bis now (?:open(?:ed)?|running|launched|playing)\b",
+        re.IGNORECASE,
+    ),
+    # "J'ai ouvert…", "j'ai lancé…", "j'ai exécuté…"
+    re.compile(
+        r"\bj'ai\s+(?:ouvert|lancé|exécuté|navigué|cliqué|créé|supprimé|"
+        r"écrit|tué|copié|renommé|déplacé|rempli|tapé|pris)\b",
+        re.IGNORECASE,
+    ),
+    # "a été ouvert", "ont été supprimés", "est maintenant ouvert"
+    re.compile(
+        r"\b(?:a|ont) été (?:ouvert|lancé|exécuté|créé|supprimé|écrit|tué|"
+        r"copié|renommé|déplacé)"
+        r"|\best maintenant (?:ouvert|lancé|en cours)\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+def claims_tool_execution(text: str) -> bool:
+    """Heuristic: does ``text`` claim that an action/tool was already
+    performed? Used to catch models that describe the result of a tool
+    they never actually called.
+    """
+    if not text:
+        return False
+    return any(p.search(text) for p in _TOOL_CLAIM_PATTERNS)
+
+
+# Phrases announcing an action the model is ABOUT to do ("I'll open Brave
+# now", "je vais ouvrir…"). When such an announcement arrives with no
+# structured tool call, nothing will actually happen — fallback honesty
+# requires logging a warning and never pretending it was done.
+_TOOL_INTENT_PATTERNS = [
+    re.compile(
+        r"\b(?:I(?:'ll| will|'m going to| am going to)|let me)\s+(?:now\s+)?"
+        r"(?:open|launch|execute|run|navigate|click|create|delete|write|"
+        r"kill|copy|rename|move|fill|type|press|scroll|take|search|start)\b",
+        re.IGNORECASE,
+    ),
+    # "Je vais ouvrir…", "je vais lancer…"
+    re.compile(
+        r"\bje vais\s+(?:ouvrir|lancer|exécuter|naviguer|cliquer|créer|"
+        r"supprimer|écrire|tuer|copier|renommer|déplacer|remplir|taper|"
+        r"prendre|chercher|démarrer)\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+def describes_tool_use(text: str) -> bool:
+    """Heuristic: does ``text`` describe tool use in prose — either claiming
+    an action already happened (``claims_tool_execution``) or announcing
+    one is about to happen ("I'll open Brave now")?
+
+    A response for which this is True but which carries no structured tool
+    call must never be executed nor presented as done.
+    """
+    if not text:
+        return False
+    if claims_tool_execution(text):
+        return True
+    return any(p.search(text) for p in _TOOL_INTENT_PATTERNS)
 
 
 class OSIAAgent:
@@ -1317,6 +1657,13 @@ class OSIAAgent:
             on_first_token=None) -> str:
         """Run the agent loop: send user input, handle tool calls, return final response.
 
+        Each round runs the tool pipeline in strict order: ``<think>``
+        blocks are stripped first, tool calls are parsed with the universal
+        parser (native structured calls + XML blocks, routed per provider
+        via ``TOOL_FORMAT``) and executed BEFORE any tag stripping, and raw
+        tool markup is stripped only from the final text once all execution
+        decisions are done.
+
         If ``on_sentence`` is provided, the API call is streamed and the
         callback is invoked with each complete sentence (cleaned) as soon
         as it arrives. Sentences that fall inside a ``<tool_call>`` or
@@ -1351,11 +1698,19 @@ class OSIAAgent:
             self.messages = [{"role": "system", "content": get_system_prompt(self.lang, self.model, self.provider)}] + sanitized
         self.messages.append({"role": "user", "content": user_input})
 
+        # Hallucinated-tool-claim guard (Llama 4 Scout & co): tracks whether
+        # any tool ACTUALLY ran this turn, and whether the one allowed
+        # "you never called the tool" retry has been spent.
+        any_tool_executed = False
+        hallucination_retry_used = False
+
         for round_num in range(max_tool_rounds):
             try:
                 if on_sentence is not None:
                     # on_first_token only fires the first time a delta arrives
                     # in this round. The server-side flag dedupes across rounds.
+                    # Streaming aggregates text only — no native message object.
+                    message = None
                     content = self._stream_with_sentences(
                         on_sentence,
                         max_tokens=max_tokens,
@@ -1369,7 +1724,10 @@ class OSIAAgent:
                     if max_tokens is not None:
                         create_kwargs["max_tokens"] = max_tokens
                     response = self.client.chat.completions.create(**create_kwargs)
-                    content = response.choices[0].message.content or ""
+                    # Keep the message object: native providers may return
+                    # structured tool calls on it (message.tool_calls).
+                    message = response.choices[0].message
+                    content = message.content or ""
             except Exception as e:
                 # Surface the full 429 response so we can tell a real rate
                 # limit apart from an auth problem masquerading as one.
@@ -1398,25 +1756,45 @@ class OSIAAgent:
                         pass
                 raise
 
-            # Strip internal reasoning blocks (<think>…</think>) BEFORE tool
-            # parsing, history, and the returned response — a tool call only
-            # deliberated inside reasoning must not be executed, and the user
-            # must never see chain-of-thought.
+            # ── Tool-call pipeline ──────────────────────────────────────
+            # The order below is load-bearing:
+            #   1. strip <think> blocks (reasoning never contains real
+            #      tool calls; deliberated-only calls must not run)
+            #   2. parse tool calls — BEFORE any tag stripping, otherwise
+            #      real calls would be destroyed before execution
+            #   3. execute the parsed calls
+            #   4. fallback honesty on unexecutable descriptions
+            #   5. strip raw tool tags ONLY on the final text
+            # ────────────────────────────────────────────────────────────
+
+            # STEP 1 — strip internal reasoning blocks (<think>…</think>)
+            # FIRST: the user must never see chain-of-thought, and a tool
+            # call only deliberated inside reasoning must not be executed.
             content = strip_reasoning_blocks(content)
 
-            # Check for tool calls
-            if has_tool_call(content):
-                tool_calls = parse_tool_calls(content)
+            # STEP 2 — parse tool calls with the universal parser (native
+            # structured calls + XML blocks, routed per provider via
+            # TOOL_FORMAT). The content is still un-stripped here.
+            tool_calls = _extract_tool_calls(
+                content, message=message, provider=self.provider,
+            )
 
-                if not tool_calls:
-                    # <tool_call> markup present but no parseable call —
-                    # treat as a final response, minus the raw tags.
-                    content = strip_raw_tool_tags(content)
-                    self.messages.append({"role": "assistant", "content": content})
-                    return content
-
-                # Add assistant message with the tool call
-                self.messages.append({"role": "assistant", "content": content})
+            # STEP 3 — execute the parsed tool calls.
+            if tool_calls:
+                # Record the assistant turn. Native structured calls can
+                # arrive with empty text content — serialize them as XML
+                # blocks so the model sees what it called on the next round
+                # (display paths strip these blocks before rendering).
+                assistant_record = content
+                if not has_tool_call(assistant_record):
+                    blocks = "\n".join(
+                        f"<tool_call>\n{json.dumps(tc, ensure_ascii=False)}\n</tool_call>"
+                        for tc in tool_calls
+                    )
+                    assistant_record = (
+                        f"{content}\n{blocks}".strip() if content.strip() else blocks
+                    )
+                self.messages.append({"role": "assistant", "content": assistant_record})
 
                 # Execute tools SEQUENTIALLY — each one completes (or
                 # times out / errors) before the next starts. If any tool
@@ -1452,6 +1830,7 @@ class OSIAAgent:
                     }
                     print(f"[OSIA Agent] ▶ tool: {tool_name}({kwargs_preview})")
                     result, is_error = _execute_tool_with_retry(tool_name, kwargs)
+                    any_tool_executed = True
                     text_part = _result_text(result)
                     screenshot = (
                         result.get("screenshot")
@@ -1511,9 +1890,52 @@ class OSIAAgent:
                     self.messages.append({"role": "user", "content": feedback_text})
                 continue
 
-            # No tool call — final response. Strip any raw tool/function
-            # XML tags the model cited as literal text (Groq Llama/Qwen)
-            # so they never reach the user, mobile history, or TTS.
+            # No structured tool call — candidate final response.
+            #
+            # STEP 4 — fallback honesty. Nothing was executed this round.
+            # If the model nevertheless emitted unparseable tool markup
+            # (malformed/truncated <tool_call>, a <|python_tag|> payload —
+            # never executed by design), or described an action in prose
+            # ("I'll open Brave now" / "I've opened Firefox"), do NOT
+            # execute anything and do NOT let it pass as done: log a
+            # warning and retry ONCE with an explicit instruction to emit
+            # a real structured tool call.
+            described = has_tool_markup(content) or describes_tool_use(content)
+            if not any_tool_executed and described:
+                print(
+                    "[WARN] Model described tool use without structured call "
+                    "— skipping execution."
+                    f" (model={self.model!r}, provider={self.provider!r})"
+                )
+                if not hallucination_retry_used:
+                    hallucination_retry_used = True
+                    print(
+                        "[OSIA Agent] ↻ retrying with explicit tool-call instruction"
+                    )
+                    self.messages.append({"role": "assistant", "content": content})
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "Your previous reply described a tool action, but it "
+                            "contained no valid structured tool call, so NOTHING was "
+                            "actually executed. Never describe results you have not "
+                            "obtained. If the task requires a tool, emit the "
+                            "<tool_call> JSON block now (format: <tool_call>"
+                            '{"tool": "<name>", ...}</tool_call>); otherwise answer '
+                            "plainly without claiming any action was performed."
+                        ),
+                    })
+                    continue
+                print(
+                    "[OSIA Agent] ✗ unbacked tool description repeated after the "
+                    "retry — returning the text as-is"
+                )
+
+            # STEP 5 — final response. ONLY NOW strip raw tool/function XML
+            # tags and Llama special tokens cited as literal text (Groq
+            # Llama/Qwen, Llama 4 Scout) — all execution decisions are done,
+            # so anything left is markup the user must never see in mobile,
+            # history, or TTS.
             content = strip_raw_tool_tags(content)
             self.messages.append({"role": "assistant", "content": content})
             return content
