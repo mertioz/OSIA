@@ -203,6 +203,16 @@ _UNCLOSED_THINK_PATTERN = re.compile(r'<think(?:ing)?>.*$', re.DOTALL)
 _RAW_TOOL_TAG_PATTERN = re.compile(
     r'</?(?:tool_call|tool_result|function_calls|thinking|think|tool)>'
 )
+# Full tool blocks — tags AND the JSON/result payload between them. Some
+# models echo entire <tool_call>{"tool": ...}</tool_call> blocks as literal
+# text; stripping only the tags would leave the raw JSON visible to the user.
+_TOOL_BLOCK_PATTERNS = [
+    re.compile(r'<tool_call>.*?</tool_call>', re.DOTALL),
+    re.compile(r'<tool_result>.*?</tool_result>', re.DOTALL),
+]
+# An unclosed <tool_call> (stream cut off / max_tokens truncation): everything
+# from the opening tag to the end of the text is tool markup.
+_UNCLOSED_TOOL_CALL_PATTERN = re.compile(r'<tool_call>.*$', re.DOTALL)
 
 
 def strip_reasoning_blocks(text: str) -> str:
@@ -220,15 +230,22 @@ def strip_reasoning_blocks(text: str) -> str:
 
 
 def strip_raw_tool_tags(text: str) -> str:
-    """Remove raw tool/function XML tags cited as literal text: <tool_call>,
-    </tool_call>, <tool>, </tool>, <function_calls>, </function_calls>, …
+    """Remove raw tool/function XML markup cited as literal text.
 
-    This strips the *tags only* — call it after any block-level removal
-    (e.g. ``<tool_call>…</tool_call>`` with its JSON payload) so block
-    contents don't survive tag stripping.
+    Strips, in order:
+    1. Entire ``<tool_call>…</tool_call>`` / ``<tool_result>…</tool_result>``
+       blocks INCLUDING the JSON/result payload between the tags — some
+       models echo full tool-call blocks as literal text.
+    2. An unclosed ``<tool_call>…`` running to the end of the text
+       (stream truncation).
+    3. Any remaining orphan tags: <tool_call>, </tool_call>, <tool>,
+       </tool>, <function_calls>, </function_calls>, …
     """
     if not text:
         return text
+    for pattern in _TOOL_BLOCK_PATTERNS:
+        text = pattern.sub('', text)
+    text = _UNCLOSED_TOOL_CALL_PATTERN.sub('', text)
     return _RAW_TOOL_TAG_PATTERN.sub('', text)
 
 
@@ -1004,6 +1021,24 @@ def _execute_tool_with_retry(tool_name: str, kwargs: dict):
     return result, _is_tool_error(result)
 
 
+def _provider_supports_vision(provider: str, model: str) -> bool:
+    """Return True only for models that accept OpenAI vision-style content
+    arrays (list of ``{"type": "text"|"image_url", ...}`` parts) in message
+    content: Gemini and GPT-4o variants.
+
+    Every other provider/model (DeepSeek, Groq Llama/Qwen, xAI, Ollama, …)
+    only accepts plain strings as message content — sending a list raises
+    ``400 messages[N].content must be a string`` and cuts the response.
+    """
+    provider_l = (provider or "").lower()
+    model_l = (model or "").lower()
+    if provider_l == "google" or "gemini" in model_l:
+        return True
+    if "gpt-4o" in model_l:
+        return True
+    return False
+
+
 def parse_tool_calls(text: str) -> list:
     """Extract tool calls from <tool_call>...</tool_call> blocks."""
     pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
@@ -1445,15 +1480,19 @@ class OSIAAgent:
                         break
 
                 # Feed tool results back. When a browser tool returned a
-                # screenshot, attach it as a vision part so the model can
-                # SEE the current page state and pick the right next
-                # action (instead of guessing selectors blindly).
+                # screenshot AND the active model supports vision content,
+                # attach it as a vision part so the model can SEE the
+                # current page state and pick the right next action
+                # (instead of guessing selectors blindly). Non-vision
+                # models (DeepSeek, Groq Llama/Qwen, …) only accept plain
+                # strings as message content — sending a parts list causes
+                # a 400 error — so they get the text part only.
                 feedback = "\n\n".join(tool_results)
                 feedback_text = (
                     f"<tool_result>\n{feedback}\n</tool_result>\n"
                     "Please continue with your response based on these results."
                 )
-                if tool_screenshots:
+                if tool_screenshots and _provider_supports_vision(self.provider, self.model):
                     content_parts: list = [{"type": "text", "text": feedback_text}]
                     for shot in tool_screenshots:
                         content_parts.append({
@@ -1464,6 +1503,11 @@ class OSIAAgent:
                         })
                     self.messages.append({"role": "user", "content": content_parts})
                 else:
+                    if tool_screenshots:
+                        print(
+                            f"[OSIA Agent] ⚠ dropping {len(tool_screenshots)} screenshot(s): "
+                            f"model {self.model!r} ({self.provider}) doesn't support vision content"
+                        )
                     self.messages.append({"role": "user", "content": feedback_text})
                 continue
 

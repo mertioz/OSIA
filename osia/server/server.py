@@ -610,6 +610,14 @@ def _displayable_history(history: list) -> list[dict]:
             continue
         if role == "user" and text.lstrip().startswith("<tool_result>"):
             continue
+        # Strip raw <tool_call>…</tool_call> blocks (tags + JSON payload)
+        # from assistant turns — intermediate tool-call rounds live in the
+        # stored history but must never render on mobile.
+        if role == "assistant":
+            from osia.agent import strip_raw_tool_tags
+            text = strip_raw_tool_tags(text).strip()
+            if not text:
+                continue
         # Defence-in-depth: drop anything that looks like the system
         # prompt leaked into the conversation history.
         if "RÈGLES ABSOLUES" in text or "ABSOLUTE RULES" in text:
@@ -777,10 +785,17 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
             print(f"[OSIA Server] on_sentence dispatch failed: {e}")
 
     async def sender() -> None:
+        from osia.agent import strip_raw_tool_tags
         while True:
             item = await chunk_queue.get()
             if item is _SENTINEL:
                 return
+            # Last line of defence: strip any <tool_call>…</tool_call>
+            # blocks (including JSON payload) before the chunk reaches
+            # the mobile client.
+            item = strip_raw_tool_tags(item).strip()
+            if not item:
+                continue
             if not first_chunk_sent_logged[0]:
                 first_chunk_sent_logged[0] = True
                 _ts(t0, "first response_chunk sent to mobile",
@@ -858,6 +873,14 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
             pass
     await chunk_queue.put(_SENTINEL)
     await sender_task
+
+    # Strip any raw <tool_call>…</tool_call> blocks (tags AND JSON payload)
+    # that survived the agent's own cleaning. This runs BEFORE the tail
+    # flush, the final `response` message, and TTS synthesis — tool markup
+    # must never reach the mobile client or be spoken.
+    if response_text:
+        from osia.agent import strip_raw_tool_tags
+        response_text = strip_raw_tool_tags(response_text).strip()
 
     # Explicit tail flush: if the agent's final response_text has content
     # that wasn't streamed as a chunk (race in the streaming flush path,

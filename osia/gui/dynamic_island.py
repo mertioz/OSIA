@@ -7,7 +7,8 @@ The capsule has four visual states:
 
 * ``idle``      — tiny, semi-transparent, waiting.
 * ``listening`` — centred mic glyph + 3 concentric violet pulse rings.
-* ``thinking``  — three violet dots in a fluid triangle rotation.
+* ``thinking``  — three violet dots rotating clockwise around the corners
+                  of a square (L-shape choreography, 4th corner always empty).
 * ``speaking``  — bouncing waveform bars.
 
 The window itself is frameless / always-on-top / not in the taskbar.
@@ -45,6 +46,15 @@ LAUNCH_W = 60
 LAUNCH_H = 20
 LAUNCH_MS = 600
 
+# Thinking animation — L-shape choreography. Three dots occupy three corners
+# of a square (top-left, top-right, bottom-left); each cycle every dot hops
+# one position clockwise (bottom-left → top-left → top-right → bottom-left)
+# with sine easing. The 4th corner (bottom-right) stays empty, creating the
+# rotation illusion.
+THINK_CYCLE_MS = 600     # duration of one hop
+THINK_SQUARE_HALF = 7.0  # half side-length of the corner square (px)
+THINK_DOT_R = 3.0        # dot radius → 6px diameter
+
 VALID_STATES = ("idle", "listening", "thinking", "speaking")
 
 
@@ -70,6 +80,9 @@ class DynamicIsland(QWidget):
         # Animation state
         self._state = "idle"
         self._phase = 0.0
+        # Milliseconds elapsed in the current state — drives time-based
+        # animations (thinking dots). Reset on every state change.
+        self._anim_ms = 0
         # 0.0 → 1.0 launch-expand progress; starts collapsed.
         self._launch_t = 0.0
 
@@ -106,6 +119,7 @@ class DynamicIsland(QWidget):
             return
         self._state = state
         self._phase = 0.0
+        self._anim_ms = 0
         target = IDLE_OPACITY if state == "idle" else ACTIVE_OPACITY
         self._opacity_anim.stop()
         self._opacity_anim.setStartValue(self.windowOpacity())
@@ -134,6 +148,7 @@ class DynamicIsland(QWidget):
         self._phase += 0.10
         if self._phase > 2 * math.pi:
             self._phase -= 2 * math.pi
+        self._anim_ms += self._timer.interval()
         # No need to repaint idle very often, but at 30 FPS the cost is
         # negligible and we avoid having to stop/start the timer.
         self.update()
@@ -275,32 +290,42 @@ class DynamicIsland(QWidget):
         p.drawPath(base)
 
     def _paint_thinking(self, p: QPainter) -> None:
-        """Three violet dots in a fluid triangle rotation.
+        """Three violet dots in an L-shape clockwise rotation.
 
-        The dots sit on the vertices of an equilateral triangle and the whole
-        triangle slowly rotates, so dot 1 sweeps up-right, dot 2 down, and dot
-        3 up-left, each gliding into the next's place — a continuous,
-        choreographed swap rather than a simple bounce.
+        The dots occupy three corners of a square — top-left, top-right and
+        bottom-left — and every ~600ms cycle each dot glides one position
+        clockwise along the path bottom-left → top-left → top-right →
+        bottom-left, with sine (ease-in-out) easing. The fourth corner
+        (bottom-right) is never occupied, which reads as a continuous
+        rotation illusion.
         """
         cx = self.width() / 2
         cy = self.height() / 2
 
-        orbit = 9.0        # triangle "radius" — distance of each dot from centre
-        base_r = 4.0       # dot radius
-        spin = self._phase * 1.1   # shared rotation of the whole triangle
+        d = THINK_SQUARE_HALF
+        # Corner positions in clockwise hop order: BL → TL → TR → (BL).
+        corners = (
+            (cx - d, cy + d),   # bottom-left
+            (cx - d, cy - d),   # top-left
+            (cx + d, cy - d),   # top-right
+        )
+
+        # Which hop we're on, and the eased progress within it.
+        step = self._anim_ms // THINK_CYCLE_MS
+        progress = (self._anim_ms % THINK_CYCLE_MS) / THINK_CYCLE_MS
+        # Sine ease-in-out: zero velocity at both ends of each hop.
+        eased = 0.5 - 0.5 * math.cos(math.pi * progress)
 
         p.setPen(Qt.PenStyle.NoPen)
+        color = QColor(ACCENT)              # #c4b5f5
+        color.setAlpha(235)
+        p.setBrush(color)
         for i in range(3):
-            # Evenly spaced vertices, rotating together; start pointing up.
-            angle = spin + i * (2 * math.pi / 3) - math.pi / 2
-            x = cx + orbit * math.cos(angle)
-            y = cy + orbit * math.sin(angle)
-            # Gentle size breathing keeps the motion feeling alive.
-            r = base_r + 0.7 * math.sin(spin + i * (2 * math.pi / 3))
-            color = QColor(ACCENT)          # #c4b5f5
-            color.setAlpha(235)
-            p.setBrush(color)
-            p.drawEllipse(QPointF(x, y), r, r)
+            x0, y0 = corners[(i + step) % 3]
+            x1, y1 = corners[(i + step + 1) % 3]
+            x = x0 + (x1 - x0) * eased
+            y = y0 + (y1 - y0) * eased
+            p.drawEllipse(QPointF(x, y), THINK_DOT_R, THINK_DOT_R)
 
     def _paint_speaking(self, p: QPainter) -> None:
         """Symmetric waveform of bars bouncing at independent frequencies."""
