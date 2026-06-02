@@ -1,7 +1,8 @@
 {
   "smart_routing": false,
-  "selected_model": "claude-opus-4-8",
+  "selected_model": "llama3.2:3b",
   "tts_provider": "openai",
-  "tts_voice": "fable",
+  "tts_voice": "nova",
+  "language": "en",
   "parler_voice_description": null
 }

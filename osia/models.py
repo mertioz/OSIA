@@ -118,6 +118,18 @@ def get_ollama_models() -> list:
 
 # ── Remote model discovery ────────────────────────────────────────────────
 
+# Groq hosts STT/TTS/safety/routing models on the same /models endpoint —
+# only chat models belong in the selector.
+GROQ_NON_CHAT_PATTERNS = (
+    "whisper",    # STT → Whisper Providers section
+    "orpheus",    # TTS → Voice Providers section
+    "playai",     # TTS
+    "-tts",       # TTS
+    "guard",      # safety/moderation (prompt-guard, llama-guard, gpt-oss-safeguard)
+    "compound",   # Groq routing systems
+)
+
+
 def fetch_remote_models(provider: str, api_key: str, timeout: float = 5.0) -> list:
     """Query a provider's /models endpoint. Returns [] on any failure."""
     if not api_key:
@@ -152,6 +164,9 @@ def fetch_remote_models(provider: str, api_key: str, timeout: float = 5.0) -> li
         # Google's API prefixes names with "models/" — strip it.
         if mid.startswith("models/"):
             mid = mid[len("models/"):]
+        # Groq's endpoint mixes chat with non-chat models — keep chat only.
+        if provider == "groq" and any(p in mid.lower() for p in GROQ_NON_CHAT_PATTERNS):
+            continue
         out.append({
             "id": mid,
             "label": item.get("display_name") or mid,
