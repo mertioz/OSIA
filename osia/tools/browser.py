@@ -33,10 +33,18 @@ CDP_PORT = 9222
 CDP_URL = f"http://localhost:{CDP_PORT}"
 OSIA_PROFILE_DIR = "/home/OSIA/.osia/brave-profile"
 
-# Chromium-based browsers, ordered by preference. Firefox is intentionally
+# Browser candidates, ordered by preference. Brave is tried first: the
+# /usr/bin wrapper scripts are preferred over the raw /opt/brave.com/brave/brave
+# binary, which can die with a fatal error when launched directly on some
+# installs. Absolute paths are checked with os.path.exists(); bare names are
+# resolved against $PATH with shutil.which(). Firefox is intentionally
 # omitted — it does not speak CDP on --remote-debugging-port.
 _BROWSER_CANDIDATES = [
-    "brave-browser", "brave",
+    "/usr/bin/brave-browser",
+    "/usr/bin/brave",
+    "/opt/brave.com/brave/brave",
+    "brave-browser",
+    "brave",
     "chromium-browser", "chromium",
     "google-chrome", "chrome",
 ]
@@ -63,14 +71,20 @@ def _is_cdp_alive() -> bool:
 
 
 def _detect_chromium_browser() -> str | None:
-    """Return the absolute path of the first installed Chromium-based
-    browser from ``_BROWSER_CANDIDATES``, or ``None`` if none are
-    installed.
+    """Return the path of the first installed browser from
+    ``_BROWSER_CANDIDATES``, or ``None`` if none are installed.
+
+    Absolute-path candidates are checked with ``os.path.exists()``;
+    bare names are resolved against ``$PATH`` with ``shutil.which()``.
     """
-    for name in _BROWSER_CANDIDATES:
-        path = shutil.which(name)
-        if path:
-            return path
+    for candidate in _BROWSER_CANDIDATES:
+        if os.path.isabs(candidate):
+            if os.path.exists(candidate):
+                return candidate
+        else:
+            path = shutil.which(candidate)
+            if path:
+                return path
     return None
 
 
@@ -87,8 +101,8 @@ def _launch_cdp_browser() -> tuple[bool, str]:
     browser = _detect_chromium_browser()
     if not browser:
         return False, (
-            "no Chromium-based browser found — install brave-browser, "
-            "chromium, or google-chrome (Firefox does not support CDP)"
+            "Brave browser not found — install brave-browser, chromium, "
+            "or google-chrome (Firefox does not support CDP)"
         )
     os.makedirs(OSIA_PROFILE_DIR, exist_ok=True)
     cmd = [

@@ -188,10 +188,56 @@ SYSTEM_PROMPT = get_system_prompt()
 # PHASE 4: Response cleaning
 # ---------------------------------------------------------------------------
 
+# Internal reasoning blocks emitted by some models (Qwen 3 32B, DeepSeek-R1…).
+# Their content is chain-of-thought — the user must never see or hear it.
+_THINK_BLOCK_PATTERNS = [
+    re.compile(r'<think>.*?</think>', re.DOTALL),
+    re.compile(r'<thinking>.*?</thinking>', re.DOTALL),
+]
+# An unclosed reasoning block (stream cut off / max_tokens truncation):
+# everything from the opening tag to the end of the text is reasoning.
+_UNCLOSED_THINK_PATTERN = re.compile(r'<think(?:ing)?>.*$', re.DOTALL)
+# Raw tool/function XML tags that some models (Groq's Llama/Qwen) output as
+# literal text in their responses instead of real tool calls. Longest
+# alternatives first so e.g. "tool_call" is never half-matched as "tool".
+_RAW_TOOL_TAG_PATTERN = re.compile(
+    r'</?(?:tool_call|tool_result|function_calls|thinking|think|tool)>'
+)
+
+
+def strip_reasoning_blocks(text: str) -> str:
+    """Remove <think>…</think> / <thinking>…</thinking> reasoning blocks.
+
+    An unclosed block (truncated response) is stripped to the end of the
+    text, and orphaned closing tags are removed by ``strip_raw_tool_tags``.
+    """
+    if not text:
+        return text
+    for pattern in _THINK_BLOCK_PATTERNS:
+        text = pattern.sub('', text)
+    text = _UNCLOSED_THINK_PATTERN.sub('', text)
+    return text
+
+
+def strip_raw_tool_tags(text: str) -> str:
+    """Remove raw tool/function XML tags cited as literal text: <tool_call>,
+    </tool_call>, <tool>, </tool>, <function_calls>, </function_calls>, …
+
+    This strips the *tags only* — call it after any block-level removal
+    (e.g. ``<tool_call>…</tool_call>`` with its JSON payload) so block
+    contents don't survive tag stripping.
+    """
+    if not text:
+        return text
+    return _RAW_TOOL_TAG_PATTERN.sub('', text)
+
+
 def clean_response(text: str) -> str:
     """Post-process agent response to remove tool mentions, markdown, and code.
 
     - Removes <tool_call> and <tool_result> blocks first
+    - Removes <think>/<thinking> internal reasoning blocks
+    - Strips raw tool/function XML tags cited as literal text
     - Removes lines that are PURELY tool-related (contain only tool syntax)
     - Removes markdown: **, *, #, `, ---
     - Removes lines that are clearly code (contain { } or =>)
@@ -203,6 +249,11 @@ def clean_response(text: str) -> str:
     # Step 1: Remove <tool_call> and <tool_result> blocks entirely
     text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL)
     text = re.sub(r'<tool_result>.*?</tool_result>', '', text, flags=re.DOTALL)
+
+    # Step 1b: Remove internal reasoning blocks, then strip any raw
+    # tool/function tags the model output as literal text.
+    text = strip_reasoning_blocks(text)
+    text = strip_raw_tool_tags(text)
 
     # Step 2: Remove tool-mentioning phrases from within lines
     # These regexes catch common patterns where the model talks about using tools
@@ -1059,6 +1110,13 @@ class OSIAAgent:
             except (IndexError, AttributeError):
                 yield ""
 
+    # Reasoning-block tag pairs (Qwen 3, DeepSeek-R1, …). Text between them
+    # is internal chain-of-thought — kept in `full` but never spoken.
+    _THINK_TAG_PAIRS = (
+        ("<think>", "</think>"),
+        ("<thinking>", "</thinking>"),
+    )
+
     # Match a sentence-ending punctuation char followed by whitespace or end-of-string.
     _SENTENCE_END_RE = re.compile(r'[.!?](?=\s|$)')
     # Secondary break points used for early flush — commas, semicolons,
@@ -1108,7 +1166,10 @@ class OSIAAgent:
         so the outer loop can still detect tool calls.
 
         Anything inside a ``<tool_call>...</tool_call>`` block is buffered
-        but never emitted — we don't want to speak tool markup.
+        but never emitted — we don't want to speak tool markup. The same
+        goes for ``<think>...</think>`` / ``<thinking>...</thinking>``
+        reasoning blocks (Qwen 3, DeepSeek-R1, …): they are kept in the
+        returned content but never spoken or streamed to the user.
 
         If ``on_first_token`` is provided it is invoked (once per call)
         the first time a non-empty content delta arrives from the model.
@@ -1118,6 +1179,7 @@ class OSIAAgent:
         pending = ""       # raw text not yet routed to speakable/tool
         speakable = ""     # awaiting a sentence-ending punctuation char
         in_tool_call = False
+        think_close = None  # closing tag of the reasoning block we're inside, if any
         # Once True, the model has committed to a tool this round. Anything
         # it says afterwards is ungrounded (the tool hasn't actually run
         # yet) — we still feed it into `full` so the outer loop sees the
@@ -1139,7 +1201,7 @@ class OSIAAgent:
             full += delta
             pending += delta
 
-            # Walk through pending, splitting at <tool_call>/</tool_call> markers.
+            # Walk through pending, splitting at <tool_call> / <think> markers.
             while pending:
                 if in_tool_call:
                     close = pending.find("</tool_call>")
@@ -1150,6 +1212,18 @@ class OSIAAgent:
                     in_tool_call = False
                     continue
 
+                if think_close is not None:
+                    # Inside a <think>/<thinking> block — discard the
+                    # reasoning, holding back a tail in case the closing
+                    # tag is split across chunks.
+                    close = pending.find(think_close)
+                    if close == -1:
+                        pending = pending[-(len(think_close) - 1):]
+                        break
+                    pending = pending[close + len(think_close):]
+                    think_close = None
+                    continue
+
                 if tool_call_seen:
                     # Post-tool_call prose this round — keep it in `full`
                     # but never speak it; the model can't yet know what
@@ -1157,19 +1231,35 @@ class OSIAAgent:
                     pending = ""
                     break
 
-                open_idx = pending.find("<tool_call>")
-                if open_idx == -1:
+                # Locate the earliest special tag in the buffer.
+                tool_idx = pending.find("<tool_call>")
+                think_idx, think_open, think_end = -1, None, None
+                for open_tag, close_tag in self._THINK_TAG_PAIRS:
+                    idx = pending.find(open_tag)
+                    if idx != -1 and (think_idx == -1 or idx < think_idx):
+                        think_idx, think_open, think_end = idx, open_tag, close_tag
+
+                if tool_idx == -1 and think_idx == -1:
                     # Hold back the last few chars in case they're the start of
-                    # a partial "<tool_call>" tag that's split across chunks.
+                    # a partial "<tool_call>"/"<thinking>" tag split across chunks.
                     safe = max(0, len(pending) - 10)
                     speakable += pending[:safe]
                     pending = pending[safe:]
                     speakable = self._emit_sentences(speakable, on_sentence)
                     break
 
+                if think_idx != -1 and (tool_idx == -1 or think_idx < tool_idx):
+                    # Reasoning block: speak what precedes it, then suppress
+                    # everything until the matching closing tag.
+                    speakable += pending[:think_idx]
+                    pending = pending[think_idx + len(think_open):]
+                    think_close = think_end
+                    speakable = self._emit_sentences(speakable, on_sentence)
+                    continue
+
                 # Flush text up to the tag, then enter tool-call mode.
-                speakable += pending[:open_idx]
-                pending = pending[open_idx + len("<tool_call>"):]
+                speakable += pending[:tool_idx]
+                pending = pending[tool_idx + len("<tool_call>"):]
                 in_tool_call = True
                 tool_call_seen = True
                 speakable = self._emit_sentences(
@@ -1177,9 +1267,11 @@ class OSIAAgent:
                 )
 
         # End of stream — only flush the tail if this round produced no
-        # tool call at all. If a tool call was seen, anything still in
-        # `speakable`/`pending` is ungrounded follow-up text.
-        if not in_tool_call and not tool_call_seen:
+        # tool call at all and we're not still inside a reasoning block.
+        # If a tool call was seen, anything still in `speakable`/`pending`
+        # is ungrounded follow-up text; if a reasoning block never closed,
+        # the leftovers are chain-of-thought.
+        if not in_tool_call and not tool_call_seen and think_close is None:
             speakable += pending
             self._emit_sentences(speakable, on_sentence, flush=True)
 
@@ -1192,8 +1284,13 @@ class OSIAAgent:
 
         If ``on_sentence`` is provided, the API call is streamed and the
         callback is invoked with each complete sentence (cleaned) as soon
-        as it arrives. Sentences that fall inside a ``<tool_call>`` block
-        are skipped so tool markup is never spoken.
+        as it arrives. Sentences that fall inside a ``<tool_call>`` or
+        ``<think>``/``<thinking>`` block are skipped so tool markup and
+        internal reasoning are never spoken.
+
+        The returned response (and the assistant messages stored in
+        history) has reasoning blocks and raw tool XML tags stripped —
+        the user must never see them in mobile or hear them in TTS.
 
         If ``history`` is provided, it replaces the agent's internal
         conversation history (excluding the system prompt) for this run.
@@ -1266,11 +1363,20 @@ class OSIAAgent:
                         pass
                 raise
 
+            # Strip internal reasoning blocks (<think>…</think>) BEFORE tool
+            # parsing, history, and the returned response — a tool call only
+            # deliberated inside reasoning must not be executed, and the user
+            # must never see chain-of-thought.
+            content = strip_reasoning_blocks(content)
+
             # Check for tool calls
             if has_tool_call(content):
                 tool_calls = parse_tool_calls(content)
 
                 if not tool_calls:
+                    # <tool_call> markup present but no parseable call —
+                    # treat as a final response, minus the raw tags.
+                    content = strip_raw_tool_tags(content)
                     self.messages.append({"role": "assistant", "content": content})
                     return content
 
@@ -1361,7 +1467,10 @@ class OSIAAgent:
                     self.messages.append({"role": "user", "content": feedback_text})
                 continue
 
-            # No tool call — final response
+            # No tool call — final response. Strip any raw tool/function
+            # XML tags the model cited as literal text (Groq Llama/Qwen)
+            # so they never reach the user, mobile history, or TTS.
+            content = strip_raw_tool_tags(content)
             self.messages.append({"role": "assistant", "content": content})
             return content
 
