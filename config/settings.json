@@ -4,7 +4,7 @@
   "tts_provider": "openai",
   "tts_voice": "marin",
   "language": "fr",
-  "island_x": 295,
-  "island_y": 730,
+  "island_x": 770,
+  "island_y": 53,
   "parler_voice_description": null
 }

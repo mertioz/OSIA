@@ -1197,6 +1197,11 @@ def _parse_tool_json(raw: str) -> dict | None:
     - payloads with trailing prose, or truncated by max_tokens (repaired
       via balanced-brace extraction / closing-brace completion).
 
+    No size limit — payloads of any length parse (a full HTML file in a
+    write_file call, …). All parsing is ``strict=False`` so literal
+    newlines/tabs inside string values (how models actually emit
+    multi-line file content) are accepted instead of rejected.
+
     Returns ``None`` when no tool name can be recovered.
     """
     raw = (raw or "").strip()
@@ -1205,20 +1210,20 @@ def _parse_tool_json(raw: str) -> dict | None:
 
     data = None
     try:
-        data = json.loads(raw)
+        data = json.loads(raw, strict=False)
     except json.JSONDecodeError:
         # Repair 1: extract the first balanced {...} (drops trailing prose).
         candidate = _extract_json_object(raw)
         if candidate:
             try:
-                data = json.loads(candidate)
+                data = json.loads(candidate, strict=False)
             except json.JSONDecodeError:
                 data = None
         # Repair 2: truncated payload — try completing the JSON.
         if data is None:
             for suffix in ('"}', '"}}', "}", "}}"):
                 try:
-                    data = json.loads(raw + suffix)
+                    data = json.loads(raw + suffix, strict=False)
                     break
                 except json.JSONDecodeError:
                     continue
@@ -1254,7 +1259,7 @@ def _parse_tool_json(raw: str) -> dict | None:
     # Native "arguments" may itself be a JSON-encoded string.
     if isinstance(raw_params, str):
         try:
-            raw_params = json.loads(raw_params)
+            raw_params = json.loads(raw_params, strict=False)
         except json.JSONDecodeError:
             raw_params = {}
     if isinstance(raw_params, dict):
@@ -1266,23 +1271,37 @@ def _parse_xml_tool_calls(text: str) -> list:
     """Parse ``<tool_call>{...}</tool_call>`` blocks (Groq Llama/Qwen
     format) from text, including an unclosed trailing block left by
     max_tokens truncation.
+
+    Tag boundaries are located with plain string search and the payload
+    between them is sliced out wholesale, then handed to
+    ``_parse_tool_json`` (``json.loads`` + repair logic) — no regex, so
+    arbitrarily large payloads (a full HTML file in a write_file call,
+    nested braces, multi-line content…) parse without any pattern-size or
+    backtracking limit.
     """
     if not text:
         return []
     calls = []
-    closed_end = 0
-    for m in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL):
-        call = _parse_tool_json(m.group(1))
+    open_tag, close_tag = "<tool_call>", "</tool_call>"
+    pos = 0
+    while True:
+        start = text.find(open_tag, pos)
+        if start == -1:
+            break
+        payload_start = start + len(open_tag)
+        end = text.find(close_tag, payload_start)
+        if end == -1:
+            # Unclosed trailing block (max_tokens truncation): everything
+            # after the opening tag is the payload — _parse_tool_json's
+            # repair logic completes the truncated JSON.
+            call = _parse_tool_json(text[payload_start:])
+            if call:
+                calls.append(call)
+            break
+        call = _parse_tool_json(text[payload_start:end])
         if call:
             calls.append(call)
-        closed_end = m.end()
-    # Unclosed trailing block — only look after the last closed block so
-    # nothing is parsed twice.
-    m = re.search(r"<tool_call>\s*(\{.*)$", text[closed_end:], re.DOTALL)
-    if m:
-        call = _parse_tool_json(m.group(1))
-        if call:
-            calls.append(call)
+        pos = end + len(close_tag)
     return calls
 
 
@@ -1358,18 +1377,25 @@ def _parse_bare_json_tool_calls(text: str) -> list:
     (any prose can quote tool JSON, and the system prompt itself contains
     inline ``Usage: {"tool": ...}`` examples the model may echo). A
     candidate object is only accepted as a call when ALL of:
-    1. it parses as valid JSON on its own (no repairs/completions);
+    1. ``_parse_tool_json`` recovers a call from it — ``json.loads`` plus
+       the repair logic (balanced-brace extraction, truncation completion,
+       literal newlines in strings), so arbitrarily large payloads and
+       payloads cut by max_tokens are not lost;
     2. it carries a literal ``"tool"`` key whose value exactly matches a
        key in ``KNOWN_TOOL_NAMES`` (``"name"``/``"function"`` aliases are
-       NOT accepted for this format);
+       NOT accepted for this format — both passes anchor on a literal
+       ``"tool"`` key);
     3. it is isolated from prose: nothing but whitespace around it on its
        own line(s) (``_is_isolated_span``).
 
     Two passes, deduped by span:
     1. Flat objects via ``_BARE_JSON_TOOL_PATTERN``.
-    2. Nested-``parameters`` payloads the flat regex can't span: anchor at
-       the ``{`` preceding each ``"tool"`` key and extract the balanced
-       object from there.
+    2. Nested-``parameters`` / large / truncated payloads the flat regex
+       can't span: anchor at the ``{`` preceding each ``"tool"`` key and
+       extract the balanced object from there (balanced-brace walk — no
+       regex size limit); a payload with no balanced close (max_tokens
+       truncation) runs to the end of the text and is repaired by
+       ``_parse_tool_json``.
     """
     if not text or '"tool"' not in text:
         return []
@@ -1379,13 +1405,8 @@ def _parse_bare_json_tool_calls(text: str) -> list:
         # Rule 3 — the object must stand alone, not sit inside a sentence.
         if not _is_isolated_span(text, start, end):
             return
-        # Rules 1+2 — strict parse, literal "tool" key naming a known tool.
-        try:
-            data = json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            return
-        if not isinstance(data, dict) or data.get("tool") not in KNOWN_TOOL_NAMES:
-            return
+        # Rules 1+2 — parse (with large-payload/truncation repairs) and
+        # require the literal "tool" key to name a known tool.
         call = _parse_tool_json(raw)
         if not call or call.get("tool") not in KNOWN_TOOL_NAMES:
             return
@@ -1398,7 +1419,7 @@ def _parse_bare_json_tool_calls(text: str) -> list:
     for m in _BARE_JSON_TOOL_PATTERN.finditer(text):
         _try_add(m.group(0), m.start(), m.end())
 
-    # Pass 2 — nested payloads via anchored balanced-brace extraction.
+    # Pass 2 — nested/large payloads via anchored balanced-brace extraction.
     for m in re.finditer(r'"tool"\s*:\s*"', text):
         start = text.rfind("{", 0, m.start())
         if start == -1:
@@ -1406,6 +1427,11 @@ def _parse_bare_json_tool_calls(text: str) -> list:
         candidate = _extract_json_object(text[start:])
         if candidate:
             _try_add(candidate, start, start + len(candidate))
+        else:
+            # No balanced close — payload truncated by max_tokens. Hand
+            # everything from the anchor to the end of the text to
+            # _parse_tool_json's repair logic (closing-brace completion).
+            _try_add(text[start:], start, len(text))
 
     found.sort(key=lambda item: item[0])
     return [call for _, _, call in found]
@@ -1547,13 +1573,14 @@ def _extract_tool_calls(text: str, message=None, provider: str = None) -> list:
                     normalized.
     2. xml        — ``<tool_call>{...}</tool_call>`` text blocks (Groq
                     Llama/Qwen), flat or nested-``parameters`` JSON,
-                    including blocks truncated by max_tokens.
+                    any payload size, including blocks truncated by
+                    max_tokens.
     3. bare       — bare JSON objects in plain text:
-                    ``{"tool": "name", ...}``. Strict: valid JSON only,
-                    literal ``"tool"`` key naming a tool in
-                    ``KNOWN_TOOL_NAMES``, isolated on its own line, AND
-                    the surrounding text must not read as a normal
-                    conversational answer — prose JSON is never executed.
+                    ``{"tool": "name", ...}``. Strict: literal ``"tool"``
+                    key naming a tool in ``KNOWN_TOOL_NAMES``, isolated
+                    on its own line, AND the surrounding text must not
+                    read as a normal conversational answer — prose JSON
+                    is never executed.
     4. python_tag — Llama special tokens:
                     ``<|python_tag|>{...}<|eot_id|>``.
 
