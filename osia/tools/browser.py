@@ -12,11 +12,18 @@ then Playwright connects via ``connect_over_cdp("http://localhost:9222")``.
 The OSIA-managed profile persists cookies / sessions / extensions across
 runs, so logins survive between conversations.
 
-Note on Firefox: Firefox does NOT support the Chrome DevTools Protocol on
-this flag, so CDP requires a Chromium-based browser (Brave, Chromium,
-Chrome, Opera, Edge). Firefox can still be launched as a plain application
-via ``open_browser``. If no CDP-capable browser is installed we surface a
-clear error.
+Note on Firefox: Firefox does NOT support the Chrome DevTools Protocol, so
+it is driven over *WebDriver BiDi* instead. When the user asks for Firefox
+(``open_browser("firefox")``), OSIA launches the system Firefox through
+Playwright (``firefox.launch_persistent_context`` with
+``channel="moz-firefox"``) against a persistent OSIA profile at
+``/home/OSIA/.osia/firefox-profile``, so cookies / logins survive between
+OSIA uses. The Playwright Page API is identical for both protocols, so every
+page tool (navigate, click, find_and_click, scroll, screenshot, …) works
+transparently regardless of which backend is active; ``_active_browser_type``
+records the current one ("cdp" for Chromium browsers, "bidi" for Firefox).
+If no CDP-capable browser is installed we fall back to Firefox BiDi, and if
+neither is available we surface a clear error.
 """
 
 import base64
@@ -33,7 +40,12 @@ from playwright.sync_api import sync_playwright
 
 CDP_PORT = 9222
 CDP_URL = f"http://localhost:{CDP_PORT}"
-OSIA_PROFILE_DIR = "/home/OSIA/.osia/brave-profile"
+
+# Every browser OSIA launches gets a dedicated profile under ~/.osia/ so it
+# never touches (or opens a window in) the user's personal browser profiles.
+OSIA_DATA_DIR = "/home/OSIA/.osia"
+OSIA_PROFILE_DIR = f"{OSIA_DATA_DIR}/brave-profile"          # CDP (Brave/Chromium)
+FIREFOX_PROFILE_DIR = f"{OSIA_DATA_DIR}/firefox-profile"     # Firefox (non-CDP)
 
 # Browser candidates, ordered by preference. Brave is tried first: the
 # /usr/bin wrapper scripts are preferred over the raw /opt/brave.com/brave/brave
@@ -66,17 +78,22 @@ _BROWSER_NAME_MAP = {
 }
 
 # Browsers that can NOT be driven over the Chrome DevTools Protocol
-# (non-Chromium engines). They can still be launched as plain applications
-# via ``open_browser`` but are skipped for CDP automation.
+# (non-Chromium engines). They are skipped for CDP automation; Firefox is
+# instead driven over WebDriver BiDi (see ``_ensure_firefox_bidi``).
 _NON_CDP_BROWSERS = {"firefox", "firefox-esr"}
 
 
 # ── Module state ───────────────────────────────────────────────────────────
 
 _playwright = None
-_browser = None        # Playwright Browser (CDP-connected)
-_context = None        # Playwright BrowserContext (the existing one from CDP)
+_browser = None        # Playwright Browser (CDP-connected Chromium, or BiDi-launched Firefox)
+_context = None        # Playwright BrowserContext
 _page = None           # Active Playwright Page
+# Which protocol the page tools are currently driving:
+#   "cdp"  -> Chromium-based browser connected over the Chrome DevTools Protocol
+#   "bidi" -> Firefox launched through Playwright over WebDriver BiDi
+#   None   -> no browser connected yet (next tool call picks one)
+_active_browser_type = None
 _lock = threading.Lock()
 
 
@@ -126,6 +143,45 @@ def resolve_browser_name(name: str) -> str | None:
     return None
 
 
+def _canonical_browser_name(binary: str) -> str:
+    """Map a resolved binary path back to its user-facing name:
+    "/usr/bin/google-chrome" -> "chrome", "/usr/bin/firefox-esr" -> "firefox".
+    Falls back to the binary's basename for unknown browsers.
+    """
+    base = os.path.basename(binary)
+    for canonical, candidates in _BROWSER_NAME_MAP.items():
+        if any(os.path.basename(c) == base for c in candidates):
+            return canonical
+    return base
+
+
+def _profile_args(binary: str) -> list[str]:
+    """Return the CLI flags that point ``binary`` at a dedicated OSIA profile,
+    creating the profile directory if needed.
+
+    This is what keeps every browser OSIA launches isolated from the user's
+    personal profiles:
+
+    - Firefox  -> ``--profile <dir> --no-remote`` (a profile *path*, not a name;
+      ``--no-remote`` stops it from handing the URL to an already-running
+      personal Firefox instance)
+    - Brave    -> the same ``--user-data-dir`` profile the CDP path uses, so
+      logins are shared whether Brave was opened for automation or by name
+    - Other Chromium-based browsers (chrome, chromium, opera, edge) ->
+      ``--user-data-dir ~/.osia/browser-profile-<name>``
+    """
+    name = _canonical_browser_name(binary)
+    if name == "firefox":
+        os.makedirs(FIREFOX_PROFILE_DIR, exist_ok=True)
+        return ["--profile", FIREFOX_PROFILE_DIR, "--no-remote"]
+    if name == "brave":
+        os.makedirs(OSIA_PROFILE_DIR, exist_ok=True)
+        return [f"--user-data-dir={OSIA_PROFILE_DIR}"]
+    profile_dir = f"{OSIA_DATA_DIR}/browser-profile-{name}"
+    os.makedirs(profile_dir, exist_ok=True)
+    return [f"--user-data-dir={profile_dir}"]
+
+
 def _detect_chromium_browser() -> str | None:
     """Return the path of the first installed CDP-capable browser from
     ``_BROWSER_CANDIDATES``, or ``None`` if none are installed.
@@ -136,6 +192,20 @@ def _detect_chromium_browser() -> str | None:
     for candidate in _BROWSER_CANDIDATES:
         if os.path.basename(candidate) in _NON_CDP_BROWSERS:
             continue
+        path = _find_binary(candidate)
+        if path:
+            return path
+    return None
+
+
+def _detect_firefox() -> str | None:
+    """Return the path of the installed Firefox binary, or ``None`` if
+    Firefox isn't installed.
+
+    Checks /usr/bin/firefox, /snap/bin/firefox, and $PATH (shutil.which),
+    for both "firefox" and "firefox-esr" (via ``_find_binary``).
+    """
+    for candidate in _BROWSER_NAME_MAP["firefox"]:
         path = _find_binary(candidate)
         if path:
             return path
@@ -166,6 +236,13 @@ def _launch_cdp_browser() -> tuple[bool, str]:
         "--no-first-run",
         "--no-default-browser-check",
     ]
+    # Hard guarantee: a CDP browser must NEVER start in the user's personal
+    # profile. If the flag is ever dropped from cmd, fail loudly here instead
+    # of silently hijacking (and remote-debug-exposing) the user's profile.
+    assert f"--user-data-dir={OSIA_PROFILE_DIR}" in cmd, (
+        "refusing to launch CDP browser without --user-data-dir pointing at "
+        f"the OSIA profile ({OSIA_PROFILE_DIR})"
+    )
     try:
         subprocess.Popen(
             cmd,
@@ -188,19 +265,50 @@ def _launch_cdp_browser() -> tuple[bool, str]:
 
 
 def _ensure_browser():
-    """Ensure the CDP browser is running, connect Playwright if needed,
-    and return an active Page. Recovers transparently if the previously
-    cached page was closed (e.g. the user closed the tab).
+    """Ensure the active automated browser is running and return an active
+    Page. Recovers transparently if the previously cached page was closed
+    (e.g. the user closed the tab).
+
+    Dispatches on ``_active_browser_type``:
+      - "bidi"        -> Firefox launched through Playwright (WebDriver BiDi)
+      - "cdp" / None  -> Chromium browser connected over CDP (the default);
+                         if no CDP-capable browser exists but Firefox does,
+                         falls back to Firefox over BiDi.
+
+    The returned Page exposes the same Playwright API for both backends, so
+    every page tool works regardless of which browser type is active.
     """
-    global _playwright, _browser, _context, _page
+    global _page
 
     # Fast path: existing page is still alive.
     if _page is not None:
         try:
             _ = _page.url  # raises if the page was closed
-            return _page
+            if not _page.is_closed():
+                return _page
+            _page = None  # fall through to reconnect / re-acquire
         except Exception:
             _page = None  # fall through to reconnect / re-acquire
+
+    if _active_browser_type == "bidi":
+        return _ensure_firefox_bidi()
+    if (
+        _active_browser_type is None
+        and not _is_cdp_alive()
+        and _detect_chromium_browser() is None
+        and _detect_firefox() is not None
+    ):
+        # No CDP browser running or installed, but Firefox is available:
+        # drive Firefox over WebDriver BiDi instead of erroring out.
+        return _ensure_firefox_bidi()
+    return _ensure_cdp_browser()
+
+
+def _ensure_cdp_browser():
+    """Ensure the CDP browser is running, connect Playwright if needed,
+    and return an active Page.
+    """
+    global _playwright, _browser, _context, _page, _active_browser_type
 
     # Make sure a CDP-enabled browser process is running.
     if not _is_cdp_alive():
@@ -221,7 +329,87 @@ def _ensure_browser():
     # Reuse an existing page if there is one; otherwise open a fresh tab.
     pages = _context.pages
     _page = pages[-1] if pages else _context.new_page()
+    _active_browser_type = "cdp"
     return _page
+
+
+# ── Firefox over WebDriver BiDi ────────────────────────────────────────────
+
+def _is_bidi_alive() -> bool:
+    """Return True if the BiDi-launched Firefox is still running and connected."""
+    if _browser is not None:
+        try:
+            return _browser.is_connected()
+        except Exception:
+            return False
+    if _context is not None:
+        try:
+            _ = _context.pages  # raises once the context is closed
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _ensure_firefox_bidi():
+    """Ensure the Playwright-launched Firefox (WebDriver BiDi) is running and
+    return an active Page. (Re)launches Firefox if it isn't running or was
+    closed by the user.
+    """
+    global _playwright, _browser, _context, _page, _active_browser_type
+
+    if _playwright is None:
+        _playwright = sync_playwright().start()
+
+    if not _is_bidi_alive():
+        firefox = _detect_firefox()
+        if not firefox:
+            raise RuntimeError(
+                "Firefox is not installed — looked for 'firefox'/'firefox-esr' "
+                "in /usr/bin, /snap/bin, and $PATH"
+            )
+        os.makedirs(FIREFOX_PROFILE_DIR, exist_ok=True)
+        # launch_persistent_context() is Playwright's supported way to run
+        # Firefox with `--profile <dir>` (passing --profile via args= is
+        # rejected by Playwright), so cookies / logins persist between OSIA
+        # uses. channel="moz-firefox" selects the WebDriver BiDi protocol
+        # against the stock system Firefox resolved by _detect_firefox()
+        # instead of Playwright's bundled (Juggler-patched) build.
+        _context = _playwright.firefox.launch_persistent_context(
+            FIREFOX_PROFILE_DIR,
+            headless=False,
+            channel="moz-firefox",
+            executable_path=firefox,
+        )
+        _browser = _context.browser  # may be None on older Playwright versions
+        _active_browser_type = "bidi"
+
+    # Reuse an existing page if there is one; otherwise open a fresh tab.
+    pages = _context.pages
+    _page = pages[-1] if pages else _context.new_page()
+    return _page
+
+
+def _disconnect_active_browser():
+    """Drop the current Playwright browser connection and reset the
+    automation state. Must be called while holding ``_lock``.
+
+    For a CDP connection this only disconnects — the Chromium browser keeps
+    running. For a BiDi-launched Firefox this quits the browser (OSIA owns
+    that process); its cookies / sessions persist in the OSIA Firefox profile.
+    """
+    global _browser, _context, _page, _active_browser_type
+    try:
+        if _browser is not None:
+            _browser.close()
+        elif _context is not None:
+            _context.close()
+    except Exception:
+        pass
+    _browser = None
+    _context = None
+    _page = None
+    _active_browser_type = None
 
 
 # ── Screenshot helper ──────────────────────────────────────────────────────
@@ -244,6 +432,21 @@ def _result(text: str, page) -> dict:
     so the agent can see the post-action page state.
     """
     return {"text": text, "screenshot": _screenshot_b64(page)}
+
+
+def _page_url(page) -> str:
+    """Return the page's current URL.
+
+    On the BiDi backend ``page.url`` goes stale after a history traversal
+    (Firefox doesn't emit the navigation events Playwright uses to track
+    those), so ask the page itself. On CDP this is exactly ``page.url``.
+    """
+    if _active_browser_type == "bidi":
+        try:
+            return page.evaluate("location.href")
+        except Exception:
+            pass
+    return page.url
 
 
 # ── URL helper ─────────────────────────────────────────────────────────────
@@ -271,7 +474,7 @@ def navigate(url: str):
                 page.bring_to_front()
             except Exception:
                 pass
-            return _result(f"Navigated to: {page.url}", page)
+            return _result(f"Navigated to: {_page_url(page)}", page)
         except Exception as e:
             return f"ERROR navigating to {url}: {e}"
 
@@ -322,7 +525,7 @@ def get_current_url() -> str:
     with _lock:
         try:
             page = _ensure_browser()
-            return f"Current URL: {page.url}"
+            return f"Current URL: {_page_url(page)}"
         except Exception as e:
             return f"ERROR reading current URL: {e}"
 
@@ -346,6 +549,31 @@ def scroll(direction: str = "down", amount: int = 600) -> str:
             return f"ERROR scrolling: {e}"
 
 
+def _bidi_history_step(page, delta: int) -> str | None:
+    """History navigation for the BiDi backend.
+
+    Firefox over BiDi performs history traversals but doesn't emit the
+    navigation events Playwright waits for, so ``page.go_back()`` /
+    ``page.go_forward()`` time out. Drive history from page JS instead and
+    poll ``location.href`` until it changes.
+
+    Returns the new URL, or ``None`` if the URL never changed (no history
+    entry in that direction).
+    """
+    before = page.evaluate("location.href")
+    page.evaluate("history.back()" if delta < 0 else "history.forward()")
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        time.sleep(0.2)
+        try:
+            current = page.evaluate("location.href")
+        except Exception:
+            continue  # document mid-swap; retry
+        if current != before:
+            return current
+    return None
+
+
 def go_back():
     """Navigate back in the active page's history. Returns a screenshot
     of the resulting page state.
@@ -353,6 +581,11 @@ def go_back():
     with _lock:
         try:
             page = _ensure_browser()
+            if _active_browser_type == "bidi":
+                url = _bidi_history_step(page, -1)
+                if url is None:
+                    return _result("No previous page in history.", page)
+                return _result(f"Went back to: {url}", page)
             response = page.go_back(timeout=5000)
             if response is None:
                 return _result("No previous page in history.", page)
@@ -368,6 +601,11 @@ def go_forward():
     with _lock:
         try:
             page = _ensure_browser()
+            if _active_browser_type == "bidi":
+                url = _bidi_history_step(page, 1)
+                if url is None:
+                    return _result("No forward page in history.", page)
+                return _result(f"Went forward to: {url}", page)
             response = page.go_forward(timeout=5000)
             if response is None:
                 return _result("No forward page in history.", page)
@@ -376,14 +614,64 @@ def go_forward():
             return f"ERROR going forward: {e}"
 
 
-def open_browser(name: str, url: str | None = None) -> str:
+def _open_firefox_bidi(url: str | None):
+    """Launch (or reuse) the BiDi-driven Firefox, optionally navigate to
+    ``url``, and make Firefox the active automated browser so every page
+    tool drives it from now on.
+
+    Returns the tool result on success, or ``None`` if the BiDi launch
+    failed (the caller then falls back to a plain application launch).
+    """
+    with _lock:
+        try:
+            # Hand off from CDP if it was active; the Chromium browser keeps
+            # running, we just stop driving it.
+            if _active_browser_type == "cdp":
+                _disconnect_active_browser()
+            page = _ensure_firefox_bidi()
+        except Exception as e:
+            print(f"[OSIA Browser] Firefox BiDi launch failed: {e}")
+            # Reset so the page tools don't keep retrying a broken BiDi setup.
+            _disconnect_active_browser()
+            return None
+
+        # Firefox is up and driven over BiDi. From here on, a navigation
+        # failure is reported but does NOT invalidate the launch — the
+        # window stays open and the page tools keep driving it.
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        if not url:
+            return _result("Opened Firefox (driven over WebDriver BiDi)", page)
+        try:
+            page.goto(_normalize_url(url), wait_until="domcontentloaded", timeout=20000)
+            return _result(
+                f"Opened Firefox (driven over WebDriver BiDi) at {page.url}", page
+            )
+        except Exception as e:
+            return _result(
+                f"Opened Firefox (driven over WebDriver BiDi) but navigating "
+                f"to {url!r} failed: {e}",
+                page,
+            )
+
+
+def open_browser(name: str, url: str | None = None):
     """Open a specific browser by user-facing name (firefox, chrome,
     chromium, opera, edge, brave), optionally at ``url``.
 
-    Unlike ``navigate``, this launches the named browser as a regular
-    application — it works for any installed browser, including Firefox,
-    which cannot be driven over CDP. Use it when the user asks to open a
-    *specific* browser ("open Firefox", "open Chrome").
+    Firefox is launched through Playwright over WebDriver BiDi and becomes
+    the active automated browser — all page tools (navigate, click,
+    find_and_click, scroll, …) drive it transparently, exactly as they drive
+    a CDP browser. If the BiDi launch fails, Firefox is opened as a plain
+    application instead.
+
+    Other browsers are launched as regular applications. Use this tool when
+    the user asks to open a *specific* browser ("open Firefox", "open Chrome").
+
+    Every browser is launched against a dedicated OSIA profile (see
+    ``_profile_args``), never the user's personal profile.
     """
     binary = resolve_browser_name(name)
     if not binary:
@@ -392,7 +680,22 @@ def open_browser(name: str, url: str | None = None) -> str:
             f"ERROR: browser {name!r} is not installed "
             f"(known browsers: {known})"
         )
-    cmd = [binary]
+
+    bidi_note = ""
+    if _canonical_browser_name(binary) == "firefox":
+        result = _open_firefox_bidi(url)
+        if result is not None:
+            return result
+        # BiDi failed — fall through to the plain application launch below.
+        bidi_note = " (WebDriver BiDi unavailable — page tools cannot drive this window)"
+    elif _active_browser_type == "bidi":
+        # Switching from Firefox to a Chromium browser: close the OSIA-owned
+        # Firefox (its sessions persist in the profile) so the next page tool
+        # reconnects over CDP instead of relaunching Firefox.
+        with _lock:
+            _disconnect_active_browser()
+
+    cmd = [binary, *_profile_args(binary)]
     if url:
         cmd.append(_normalize_url(url))
     try:
@@ -405,7 +708,7 @@ def open_browser(name: str, url: str | None = None) -> str:
     except Exception as e:
         return f"ERROR launching {binary}: {e}"
     suffix = f" at {_normalize_url(url)}" if url else ""
-    return f"Opened {os.path.basename(binary)}{suffix}"
+    return f"Opened {os.path.basename(binary)}{suffix}{bidi_note}"
 
 
 def open_new_tab(url: str) -> str:
@@ -455,7 +758,7 @@ def wait_for_load() -> str:
         try:
             page = _ensure_browser()
             page.wait_for_load_state("networkidle", timeout=15000)
-            return f"Page loaded: {page.url}"
+            return f"Page loaded: {_page_url(page)}"
         except Exception as e:
             return f"ERROR waiting for load: {e}"
 
@@ -535,16 +838,16 @@ def press_key(key: str) -> str:
 # ── Shutdown ───────────────────────────────────────────────────────────────
 
 def close_browser():
-    """Disconnect Playwright from the real browser. Does NOT kill the
-    browser process itself — the user's real Brave window keeps running.
+    """Disconnect Playwright from the automated browser.
+
+    For CDP (Chromium) this just disconnects — the user's real Brave window
+    keeps running. For BiDi (Firefox) the browser process is owned by OSIA,
+    so this quits Firefox; its cookies / sessions persist in the OSIA
+    Firefox profile.
     """
-    global _playwright, _browser, _context, _page
+    global _playwright
     with _lock:
-        try:
-            if _browser is not None:
-                _browser.close()  # for CDP this just disconnects
-        except Exception:
-            pass
+        _disconnect_active_browser()
         try:
             if _playwright is not None:
                 _playwright.stop()
@@ -552,6 +855,3 @@ def close_browser():
             pass
         finally:
             _playwright = None
-            _browser = None
-            _context = None
-            _page = None

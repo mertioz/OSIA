@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
 )
 
 from osia import conversations
+from osia.agent import strip_tool_artifacts
 from osia.models import (
     PROVIDERS, API_PROVIDERS, get_all_models,
 )
@@ -136,6 +137,30 @@ def _is_deleted(widget) -> bool:
         except TypeError:
             pass
     return False
+
+
+def _display_text(content) -> str:
+    """Reduce a stored message content to its displayable text.
+
+    Returns "" when the message must not be rendered at all:
+    - internal tool-result feedback (a string starting with
+      ``<tool_result>``, or a vision content-parts list),
+    - content that is empty once every tool artifact (``<tool_call>``
+      blocks, bare ``{"tool": ...}`` JSON, reasoning blocks, Llama special
+      tokens) is stripped.
+
+    An empty message rendered as a bubble shows up as a phantom thin
+    violet line in the chat — callers MUST skip messages that come back
+    empty here.
+    """
+    if content is None:
+        return ""
+    # Vision tool feedback stores content as a list of parts — internal.
+    if not isinstance(content, str):
+        return ""
+    if content.lstrip().startswith("<tool_result>"):
+        return ""
+    return strip_tool_artifacts(content)
 
 
 # ── Message bubble ──────────────────────────────────────────────────────────
@@ -264,27 +289,33 @@ class _ChatPage(QWidget):
 
     def set_messages(self, messages: list[dict]) -> None:
         self.clear_messages()
-        # Drop the empty placeholder if there's anything to show.
-        renderable = [
-            m for m in messages
-            if m.get("role") in ("user", "assistant")
-            and not str(m.get("content", "")).lstrip().startswith("<tool_result>")
-        ]
+        # Keep only real user/assistant turns with visible text once tool
+        # artifacts (tool_call blocks, bare {"tool": ...} JSON, reasoning
+        # blocks…) are stripped. Messages that come back empty are dropped
+        # entirely — an empty bubble renders as a phantom thin violet line.
+        renderable = []
+        for m in messages:
+            if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+                continue
+            text = _display_text(m.get("content"))
+            if text:
+                renderable.append((m["role"], text))
         if not renderable:
             return
         try:
             if not _is_deleted(self._empty):
                 self._empty.hide()
-            for m in renderable:
-                self._append_bubble(m["role"], m.get("content", ""))
+            for role, text in renderable:
+                self._append_bubble(role, text)
             QTimer.singleShot(0, self._scroll_to_bottom)
         except RuntimeError:
             pass
 
     def append_message(self, role: str, text: str) -> None:
+        # Strip tool artifacts before display; skip the message entirely if
+        # nothing visible remains (empty bubble = phantom violet line).
+        text = _display_text(text)
         if not text:
-            return
-        if str(text).lstrip().startswith("<tool_result>"):
             return
         self._empty.hide()
         self._append_bubble(role, text)
@@ -300,6 +331,11 @@ class _ChatPage(QWidget):
         return label
 
     def _append_bubble(self, role: str, text: str) -> None:
+        # Defense in depth: never create a bubble (or its wrapper row
+        # widget) for empty text — a blank QFrame collapses into a thin
+        # violet line in the chat.
+        if not text or not str(text).strip():
+            return
         bubble = _Bubble(role, text)
         align = (Qt.AlignmentFlag.AlignRight if role == "user"
                  else Qt.AlignmentFlag.AlignLeft)

@@ -24,6 +24,9 @@ from osia.config import get_api_key, get_setting
 # Make langdetect deterministic
 DetectorFactory.seed = 0
 
+# Playback rate applied to every TTS provider (1.0 = provider default).
+TTS_SPEED = 1.2
+
 # ── Voice catalogues ───────────────────────────────────────────────────────
 
 OPENAI_VOICES = [
@@ -54,7 +57,7 @@ LANG_CODE = "a"          # American English (Kokoro default)
 KOKORO_VOICE_EN = "af_sky"
 KOKORO_VOICE_FR = "ff_siwis"
 KOKORO_SR = 24000
-KOKORO_SPEED = 1.1
+KOKORO_SPEED = TTS_SPEED  # also imported by osia.server.server
 
 _kokoro_pipelines = {}
 
@@ -119,6 +122,7 @@ def speak_openai(text: str, voice: str | None = None, block: bool = True) -> boo
                 "input": text,
                 "voice": voice,
                 "response_format": "wav",
+                "speed": TTS_SPEED,
             },
             timeout=60,
         )
@@ -178,6 +182,7 @@ def speak_google(text: str, voice: str | None = None, block: bool = True) -> boo
         )
         audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=TTS_SPEED,
         )
         response = client.synthesize_speech(
             input=synthesis_input, voice=voice_params, audio_config=audio_config,

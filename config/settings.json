@@ -1,10 +1,10 @@
 {
   "smart_routing": false,
-  "selected_model": "gemini-2.5-pro",
+  "selected_model": "deepseek-v4-flash",
   "tts_provider": "openai",
-  "tts_voice": "sage",
+  "tts_voice": "marin",
   "language": "fr",
-  "island_x": 709,
-  "island_y": 935,
+  "island_x": 728,
+  "island_y": 927,
   "parler_voice_description": null
 }

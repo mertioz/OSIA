@@ -76,8 +76,8 @@ Code editor:
 - open_in_editor: Open a file in the user's preferred editor (VS Code, gedit, kate…). Usage: {"tool": "open_in_editor", "path": "<path>"}
 - edit_file_lines: Replace a range of lines (1-indexed, inclusive) in a file. Usage: {"tool": "edit_file_lines", "path": "<path>", "start_line": 10, "end_line": 12, "new_content": "<replacement>"}
 
-Browser (drives a REAL visible Chromium browser via CDP — same page the user sees; cookies/sessions persist):
-- navigate: Go to a URL in the real browser. Launches Brave/Chromium with remote debugging on first use. Usage: {"tool": "navigate", "url": "<url>"}
+Browser (drives a REAL visible browser — Chromium/Brave via CDP, or Firefox via WebDriver BiDi — same page the user sees; cookies/sessions persist):
+- navigate: Go to a URL in the real browser. Launches Brave/Chromium with remote debugging on first use (falls back to Firefox over BiDi if no Chromium browser is installed). Usage: {"tool": "navigate", "url": "<url>"}
 - click: Click an element by CSS selector. Usage: {"tool": "click", "selector": "<css_selector>"}
 - find_and_click: Click the first element whose visible text matches. Use when you don't know the selector but can see the label. Usage: {"tool": "find_and_click", "text": "<visible_text>"}
 - fill: Set the value of an input field in one shot (no keystroke events). Usage: {"tool": "fill", "selector": "<css_selector>", "value": "<text>"}
@@ -92,7 +92,7 @@ Browser (drives a REAL visible Chromium browser via CDP — same page the user s
 - go_back: Navigate back in history. Usage: {"tool": "go_back"}
 - go_forward: Navigate forward in history. Usage: {"tool": "go_forward"}
 - open_new_tab: Open a URL in a new tab and switch to it. Usage: {"tool": "open_new_tab", "url": "<url>"}
-- open_browser: Open a SPECIFIC browser by name (firefox, chrome, chromium, opera, edge, brave), optionally at a URL. Use when the user asks for a particular browser ("open Firefox"). Usage: {"tool": "open_browser", "name": "firefox", "url": "<optional_url>"}
+- open_browser: Open a SPECIFIC browser by name (firefox, chrome, chromium, opera, edge, brave), optionally at a URL. Use when the user asks for a particular browser ("open Firefox"). Firefox is FULLY supported for automation via WebDriver BiDi: after opening it, all browser tools (navigate, click, fill, type_text, read_page, screenshots, …) work inside Firefox exactly like Brave/Chrome. Usage: {"tool": "open_browser", "name": "firefox", "url": "<optional_url>"}
 
 ## How to Use Tools
 To call a tool, output a JSON tool call wrapped in <tool_call> tags:
@@ -139,8 +139,8 @@ Fichiers :
 - open_in_editor : Ouvrir un fichier dans l'éditeur préféré de l'utilisateur (VS Code, gedit, kate…). Usage : {"tool": "open_in_editor", "path": "<chemin>"}
 - edit_file_lines : Remplacer une plage de lignes (1-indexé, inclus) dans un fichier. Usage : {"tool": "edit_file_lines", "path": "<chemin>", "start_line": 10, "end_line": 12, "new_content": "<remplacement>"}
 
-Navigateur (pilote le VRAI navigateur Chromium visible via CDP — la page que voit l'utilisateur ; les cookies/sessions persistent) :
-- navigate : Aller à une URL dans le vrai navigateur. Lance Brave/Chromium avec le port de debug au premier appel. Usage : {"tool": "navigate", "url": "<url>"}
+Navigateur (pilote le VRAI navigateur visible — Chromium/Brave via CDP, ou Firefox via WebDriver BiDi — la page que voit l'utilisateur ; les cookies/sessions persistent) :
+- navigate : Aller à une URL dans le vrai navigateur. Lance Brave/Chromium avec le port de debug au premier appel (bascule sur Firefox via BiDi si aucun navigateur Chromium n'est installé). Usage : {"tool": "navigate", "url": "<url>"}
 - click : Cliquer sur un élément par sélecteur CSS. Usage : {"tool": "click", "selector": "<selecteur_css>"}
 - find_and_click : Cliquer sur le premier élément dont le texte visible correspond. À utiliser quand tu ne connais pas le sélecteur mais que tu vois le libellé. Usage : {"tool": "find_and_click", "text": "<texte_visible>"}
 - fill : Définir la valeur d'un champ en une fois (sans événements clavier). Usage : {"tool": "fill", "selector": "<selecteur_css>", "value": "<texte>"}
@@ -155,7 +155,7 @@ Navigateur (pilote le VRAI navigateur Chromium visible via CDP — la page que v
 - go_back : Reculer dans l'historique. Usage : {"tool": "go_back"}
 - go_forward : Avancer dans l'historique. Usage : {"tool": "go_forward"}
 - open_new_tab : Ouvrir une URL dans un nouvel onglet et basculer dessus. Usage : {"tool": "open_new_tab", "url": "<url>"}
-- open_browser : Ouvrir un navigateur PRÉCIS par son nom (firefox, chrome, chromium, opera, edge, brave), éventuellement sur une URL. À utiliser quand l'utilisateur demande un navigateur particulier (« ouvre Firefox »). Usage : {"tool": "open_browser", "name": "firefox", "url": "<url_optionnelle>"}
+- open_browser : Ouvrir un navigateur PRÉCIS par son nom (firefox, chrome, chromium, opera, edge, brave), éventuellement sur une URL. À utiliser quand l'utilisateur demande un navigateur particulier (« ouvre Firefox »). Firefox est ENTIÈREMENT pris en charge pour l'automatisation via WebDriver BiDi : après l'avoir ouvert, tous les outils navigateur (navigate, click, fill, type_text, read_page, captures d'écran…) fonctionnent dans Firefox exactement comme avec Brave/Chrome. Usage : {"tool": "open_browser", "name": "firefox", "url": "<url_optionnelle>"}
 
 ## Comment utiliser les outils
 Pour appeler un outil, produis un appel JSON dans des balises <tool_call> :
@@ -926,7 +926,9 @@ def tool_type_text(selector: str, text: str) -> str:
 def tool_press_key(key: str) -> str:
     return _get_browser_tools()["press_key"](key)
 
-def tool_open_browser(name: str, url: str | None = None) -> str:
+def tool_open_browser(name: str, url: str | None = None):
+    # Returns a dict (text + screenshot) when Firefox is opened over BiDi,
+    # a plain string for regular application launches.
     return _get_browser_tools()["open_browser"](name, url)
 
 
@@ -975,6 +977,11 @@ TOOL_MAP = {
     "press_key": tool_press_key,
     "open_browser": tool_open_browser,
 }
+
+# Known tool names — bare-JSON candidates (priority 3 of the universal
+# parser) are validated against this set so arbitrary JSON the model shows
+# in prose (code examples, config snippets…) is never executed as a tool.
+KNOWN_TOOL_NAMES = set(TOOL_MAP.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -1082,25 +1089,23 @@ SCREENSHOT_ANALYSIS_INSTRUCTION = (
 
 
 # ---------------------------------------------------------------------------
-# Universal tool-call parser — all providers
+# Universal tool-call parser — all providers, all formats
 # ---------------------------------------------------------------------------
 
-# Per-provider tool-call format, used to route parsing in
-# ``_extract_tool_calls``. "native" providers return structured
-# ``message.tool_calls`` (OpenAI-style function calling); "xml" providers
-# (Groq's Llama/Qwen) emit ``<tool_call>{...}</tool_call>`` blocks as text.
-# Whichever format the provider prefers is tried first; the other is always
-# tried as a fallback, because the system prompt teaches the XML format to
-# every provider.
-TOOL_FORMAT = {
-    "openai": "native",
-    "anthropic": "native",
-    "google": "native",
-    "deepseek": "native",
-    "xai": "native",
-    "groq": "xml",
-    "ollama": "native",
-}
+# Bare JSON tool-call object cited directly in prose (no wrapping tags):
+# {"tool": "name", "param": "value"}. Matches flat (non-nested) objects;
+# nested-``parameters`` payloads are recovered by the anchored balanced-brace
+# pass in ``_parse_bare_json_tool_calls``.
+_BARE_JSON_TOOL_PATTERN = re.compile(
+    r'\{[^{}]*?"tool"\s*:\s*"[^"]+?"[^{}]*?\}', re.DOTALL
+)
+
+# Llama-family python-tag payload: <|python_tag|>{...}<|eot_id|>. The JSON
+# between the special tokens is a tool call (same shapes as the XML format);
+# an unterminated payload (max_tokens truncation) runs to end of text.
+_PYTHON_TAG_CALL_PATTERN = re.compile(
+    r'<\|python_tag\|>\s*(.*?)\s*(?:<\|eo[tm]_id\|>|$)', re.DOTALL
+)
 
 
 def _extract_json_object(raw: str) -> str | None:
@@ -1133,6 +1138,45 @@ def _extract_json_object(raw: str) -> str | None:
             if depth == 0:
                 return raw[start:i + 1]
     return None
+
+
+def _is_isolated_span(text: str, start: int, end: int) -> bool:
+    """True when ``text[start:end]`` stands alone on its line(s): nothing
+    but whitespace before it on its first line and after it on its last
+    line.
+
+    Bare ``{"tool": ...}`` JSON only counts as a tool call / tool markup
+    when isolated like this. JSON embedded inside a sentence (the system
+    prompt's own ``Usage: {"tool": "bash", ...}`` examples, the model
+    quoting or explaining the format…) is prose and must never be executed
+    or stripped.
+    """
+    line_start = text.rfind("\n", 0, start) + 1
+    if text[line_start:start].strip():
+        return False
+    line_end = text.find("\n", end)
+    if line_end == -1:
+        line_end = len(text)
+    return not text[end:line_end].strip()
+
+
+# A "full sentence" of prose: a letter starting a clause of 10+ characters
+# that ends with sentence punctuation. Used to tell a conversational answer
+# apart from a tool-call preamble.
+_PROSE_SENTENCE_PATTERN = re.compile(
+    r"[A-Za-zÀ-ÿ][^.!?\n]{10,}[.!?](?:\s|$)"
+)
+
+
+def _reads_as_prose(text: str) -> bool:
+    """Heuristic: does ``text`` read like a normal conversational response
+    rather than a tool-call preamble? Two or more full sentences qualify.
+
+    A single short preamble ("I'll check that now.") followed by a tool
+    call is NOT prose; a multi-sentence answer that happens to quote tool
+    JSON is.
+    """
+    return len(_PROSE_SENTENCE_PATTERN.findall(text or "")) >= 2
 
 
 def _parse_tool_json(raw: str) -> dict | None:
@@ -1236,20 +1280,26 @@ def _parse_xml_tool_calls(text: str) -> list:
 
 
 def _parse_native_tool_calls(message) -> list:
-    """Convert native structured tool calls (``message.tool_calls`` —
-    OpenAI/Anthropic/DeepSeek/Google/Ollama/xAI OpenAI-compatible APIs)
-    into ``{"tool": name, **kwargs}`` dicts. Returns ``[]`` when the
-    message carries no structured calls.
+    """Convert native structured tool calls into ``{"tool": name, **kwargs}``
+    dicts. Returns ``[]`` when the message carries no structured calls.
+
+    Handles both shapes the SDKs produce:
+    - ``message.tool_calls`` (OpenAI/Anthropic/DeepSeek/Google/Ollama/xAI
+      OpenAI-compatible APIs) — function-calling entries;
+    - content blocks with ``type="tool_use"`` (Anthropic Messages API) —
+      blocks carrying ``name`` + ``input``.
+
+    Both are already parsed by the SDK; this only normalizes them.
     """
     if message is None:
         return []
+    calls = []
+
+    # Shape 1: OpenAI-style message.tool_calls.
     tool_calls = getattr(message, "tool_calls", None)
     if not tool_calls and isinstance(message, dict):
         tool_calls = message.get("tool_calls")
-    if not tool_calls:
-        return []
-    calls = []
-    for tc in tool_calls:
+    for tc in tool_calls or []:
         fn = getattr(tc, "function", None)
         if fn is None and isinstance(tc, dict):
             fn = tc.get("function")
@@ -1268,34 +1318,234 @@ def _parse_native_tool_calls(message) -> list:
             except json.JSONDecodeError:
                 args = {}
         calls.append({"tool": name, **(args if isinstance(args, dict) else {})})
+
+    # Shape 2: Anthropic-style content blocks with type="tool_use".
+    content = getattr(message, "content", None)
+    if content is None and isinstance(message, dict):
+        content = message.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                btype, name, args = block.get("type"), block.get("name"), block.get("input")
+            else:
+                btype = getattr(block, "type", None)
+                name = getattr(block, "name", None)
+                args = getattr(block, "input", None)
+            if btype != "tool_use" or not name:
+                continue
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            calls.append({"tool": name, **(args if isinstance(args, dict) else {})})
+
     return calls
 
 
+def _parse_bare_json_tool_calls(text: str) -> list:
+    """Parse bare JSON tool-call objects cited directly in text (no
+    wrapping tags): ``{"tool": "name", "param": "value"}``.
+
+    STRICT BY DESIGN — bare JSON is the most false-positive-prone format
+    (any prose can quote tool JSON, and the system prompt itself contains
+    inline ``Usage: {"tool": ...}`` examples the model may echo). A
+    candidate object is only accepted as a call when ALL of:
+    1. it parses as valid JSON on its own (no repairs/completions);
+    2. it carries a literal ``"tool"`` key whose value exactly matches a
+       key in ``KNOWN_TOOL_NAMES`` (``"name"``/``"function"`` aliases are
+       NOT accepted for this format);
+    3. it is isolated from prose: nothing but whitespace around it on its
+       own line(s) (``_is_isolated_span``).
+
+    Two passes, deduped by span:
+    1. Flat objects via ``_BARE_JSON_TOOL_PATTERN``.
+    2. Nested-``parameters`` payloads the flat regex can't span: anchor at
+       the ``{`` preceding each ``"tool"`` key and extract the balanced
+       object from there.
+    """
+    if not text or '"tool"' not in text:
+        return []
+    found: list[tuple[int, int, dict]] = []
+
+    def _try_add(raw: str, start: int, end: int) -> None:
+        # Rule 3 — the object must stand alone, not sit inside a sentence.
+        if not _is_isolated_span(text, start, end):
+            return
+        # Rules 1+2 — strict parse, literal "tool" key naming a known tool.
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return
+        if not isinstance(data, dict) or data.get("tool") not in KNOWN_TOOL_NAMES:
+            return
+        call = _parse_tool_json(raw)
+        if not call or call.get("tool") not in KNOWN_TOOL_NAMES:
+            return
+        for s, e, _ in found:
+            if start < e and end > s:  # overlaps an already-captured span
+                return
+        found.append((start, end, call))
+
+    # Pass 1 — flat bare objects.
+    for m in _BARE_JSON_TOOL_PATTERN.finditer(text):
+        _try_add(m.group(0), m.start(), m.end())
+
+    # Pass 2 — nested payloads via anchored balanced-brace extraction.
+    for m in re.finditer(r'"tool"\s*:\s*"', text):
+        start = text.rfind("{", 0, m.start())
+        if start == -1:
+            continue
+        candidate = _extract_json_object(text[start:])
+        if candidate:
+            _try_add(candidate, start, start + len(candidate))
+
+    found.sort(key=lambda item: item[0])
+    return [call for _, _, call in found]
+
+
+def _parse_python_tag_tool_calls(text: str) -> list:
+    """Parse Llama-family ``<|python_tag|>{...}<|eot_id|>`` payloads
+    (Llama 4 Scout & co) into tool calls. The JSON between the special
+    tokens accepts the same shapes as the XML format, including payloads
+    truncated by max_tokens.
+    """
+    if not text or "<|python_tag|>" not in text:
+        return []
+    calls = []
+    for m in _PYTHON_TAG_CALL_PATTERN.finditer(text):
+        call = _parse_tool_json(m.group(1))
+        if call:
+            calls.append(call)
+    return calls
+
+
+def strip_bare_tool_json(text: str) -> str:
+    """Remove bare ``{"tool": ...}`` JSON tool-call objects from display
+    text. Only objects naming a KNOWN tool AND isolated on their own
+    line(s) are removed — JSON the model legitimately shows the user
+    inside prose (code examples, usage explanations, config snippets…)
+    stays. Mirrors the strictness of ``_parse_bare_json_tool_calls`` so
+    display stripping can never eat parts of a normal answer.
+    """
+    if not text or '"tool"' not in text:
+        return text
+    spans: list[tuple[int, int]] = []
+    for m in re.finditer(r'"tool"\s*:\s*"([^"]+)"', text):
+        if m.group(1) not in KNOWN_TOOL_NAMES:
+            continue
+        start = text.rfind("{", 0, m.start())
+        if start == -1:
+            continue
+        candidate = _extract_json_object(text[start:])
+        # A truncated (never-balanced) object runs to the end of the text.
+        end = start + len(candidate) if candidate else len(text)
+        # Same isolation rule as the parser: an object embedded in a
+        # sentence is prose the user should see, not markup to strip.
+        if not _is_isolated_span(text, start, end):
+            continue
+        spans.append((start, end))
+    if not spans:
+        return text
+    # Merge overlapping spans, then cut them out.
+    spans.sort()
+    merged = [spans[0]]
+    for s, e in spans[1:]:
+        if s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(e, merged[-1][1]))
+        else:
+            merged.append((s, e))
+    parts = []
+    prev = 0
+    for s, e in merged:
+        parts.append(text[prev:s])
+        prev = e
+    parts.append(text[prev:])
+    return "".join(parts)
+
+
+def strip_tool_artifacts(text: str) -> str:
+    """One-stop display cleaner: remove every kind of tool/reasoning markup
+    a model can leak into visible text — reasoning blocks, ``<tool_call>``/
+    ``<tool_result>`` blocks, Llama special tokens, orphan tags, bare
+    ``{"tool": ...}`` JSON objects, and the tool-result feedback
+    instruction. Display surfaces (GUI chat bubbles, history rendering)
+    call this before showing a message; a message that comes back empty
+    must not be rendered at all.
+    """
+    if not text:
+        return ""
+    text = strip_reasoning_blocks(text)
+    text = strip_raw_tool_tags(text)
+    text = strip_bare_tool_json(text)
+    text = text.replace(
+        "Please continue with your response based on these results.", ""
+    )
+    return text.strip()
+
+
 def _extract_tool_calls(text: str, message=None, provider: str = None) -> list:
-    """Universal tool-call parser — handles every provider format.
+    """Universal tool-call parser — single entry point for every provider
+    and every format models actually emit.
+
+    Formats are tried in strict priority order; parsing STOPS at the first
+    format that yields at least one valid call:
+
+    1. native     — structured ``message.tool_calls`` or content blocks
+                    with ``type="tool_use"`` (OpenAI/Anthropic/DeepSeek/
+                    Google/xAI/Ollama). Already parsed by the SDK, just
+                    normalized.
+    2. xml        — ``<tool_call>{...}</tool_call>`` text blocks (Groq
+                    Llama/Qwen), flat or nested-``parameters`` JSON,
+                    including blocks truncated by max_tokens.
+    3. bare       — bare JSON objects in plain text:
+                    ``{"tool": "name", ...}``. Strict: valid JSON only,
+                    literal ``"tool"`` key naming a tool in
+                    ``KNOWN_TOOL_NAMES``, isolated on its own line, AND
+                    the surrounding text must not read as a normal
+                    conversational answer — prose JSON is never executed.
+    4. python_tag — Llama special tokens:
+                    ``<|python_tag|>{...}<|eot_id|>``.
+
+    Plain-text descriptions of actions ("I'll open Brave now") never yield
+    calls — fallback honesty in ``run()`` handles those.
 
     Returns a list of ``{"tool": name, **kwargs}`` dicts ready for
-    ``TOOL_MAP`` dispatch, in execution order.
+    ``TOOL_MAP`` dispatch, in emission order.
 
-    Formats handled:
-    1. Native structured tool calls (``message.tool_calls`` — OpenAI,
-       Anthropic, DeepSeek, Google, Ollama, xAI).
-    2. XML ``<tool_call>{...}</tool_call>`` text blocks (Groq Llama/Qwen),
-       flat or nested-``parameters`` JSON, including truncated blocks.
-    3. Llama special tokens (``<|python_tag|>…``): NEVER executed — they
-       are stripped from the final output only (``strip_raw_tool_tags``).
-    4. Plain-text descriptions of actions ("I'll open Brave now"): nothing
-       is extracted — the text is passed as-is to the user, never executed.
-
-    ``TOOL_FORMAT[provider]`` decides which format is tried first; the
-    other always serves as fallback.
+    IMPORTANT: must be called on the UN-stripped model output — stripping
+    tool markup before parsing destroys the calls. Residual markup is
+    stripped from display text only after execution (see ``run``).
     """
-    fmt = TOOL_FORMAT.get((provider or "").lower(), "native")
-    native_calls = _parse_native_tool_calls(message)
-    xml_calls = _parse_xml_tool_calls(text or "")
-    if fmt == "xml":
-        return xml_calls or native_calls
-    return native_calls or xml_calls
+    candidates = (
+        ("native", lambda: _parse_native_tool_calls(message)),
+        ("xml", lambda: _parse_xml_tool_calls(text or "")),
+        ("bare", lambda: _parse_bare_json_tool_calls(text or "")),
+        ("python_tag", lambda: _parse_python_tag_tool_calls(text or "")),
+    )
+    for fmt, parse in candidates:
+        calls = parse()
+        if not calls:
+            continue
+        # Safety bypass for the false-positive-prone bare format. Reaching
+        # it means native and xml found nothing, so the only evidence of a
+        # tool call is loose JSON in plain text. If what remains of the
+        # text after removing that JSON reads like a normal conversational
+        # answer (full sentences of prose), the JSON is almost certainly
+        # quoted/illustrative — return it as text instead of executing it.
+        if fmt == "bare" and _reads_as_prose(strip_bare_tool_json(text or "")):
+            print(
+                "[TOOL PARSER] bare JSON ignored: surrounding text reads as "
+                f"prose, treating as normal response (provider={provider or '?'})"
+            )
+            continue
+        names = ", ".join(c.get("tool", "?") for c in calls)
+        print(
+            f"[TOOL PARSER] format={fmt}, tool={names} "
+            f"({len(calls)} call(s), provider={provider or '?'})"
+        )
+        return calls
+    return []
 
 
 def parse_tool_calls(text: str) -> list:
@@ -1314,13 +1564,37 @@ def has_tool_call(text: str) -> bool:
 
 def has_tool_markup(text: str) -> bool:
     """Check if text contains anything that LOOKS like a tool invocation —
-    a ``<tool_call>`` tag or a Llama ``<|python_tag|>`` payload — whether
-    or not it parses into an executable call. Used for fallback-honesty
-    warnings when nothing executable was extracted.
+    a ``<tool_call>`` tag, a Llama ``<|python_tag|>`` payload, or a bare
+    JSON object naming a known tool — whether or not it parses into an
+    executable call. Used for fallback-honesty warnings when nothing
+    executable was extracted.
+
+    Mirrors the strictness of ``_parse_bare_json_tool_calls`` for the bare
+    format: a ``"tool": "name"`` fragment embedded inside prose (the model
+    quoting or explaining the call format) is NOT markup — only fragments
+    sitting on a line of their own (a malformed/truncated attempt at a
+    real call) count. Otherwise normal answers that mention tool JSON
+    would trigger the fallback-honesty retry.
     """
     if not text:
         return False
-    return bool(re.search(r"<tool_call>|<\|python_tag\|>", text))
+    if re.search(r"<tool_call>|<\|python_tag\|>", text):
+        return True
+    # Bare JSON naming a known tool (malformed beyond repair if it reached
+    # this check — parseable ones are executed by the universal parser).
+    for m in re.finditer(r'"tool"\s*:\s*"([^"]+)"', text):
+        if m.group(1) not in KNOWN_TOOL_NAMES:
+            continue
+        # Only count it as markup when the fragment's line is JSON-shaped
+        # (starts with "{" or a quoted key), not a sentence quoting JSON.
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_end = text.find("\n", m.end())
+        if line_end == -1:
+            line_end = len(text)
+        line = text[line_start:line_end].strip()
+        if line.startswith("{") or line.startswith('"'):
+            return True
+    return False
 
 
 # Phrases by which a model claims it already performed an action that only a
@@ -1670,10 +1944,10 @@ class OSIAAgent:
 
         Each round runs the tool pipeline in strict order: ``<think>``
         blocks are stripped first, tool calls are parsed with the universal
-        parser (native structured calls + XML blocks, routed per provider
-        via ``TOOL_FORMAT``) and executed BEFORE any tag stripping, and raw
-        tool markup is stripped only from the final text once all execution
-        decisions are done.
+        parser (native structured calls, XML blocks, bare JSON, Llama
+        python-tag payloads — tried in that priority order) and executed
+        BEFORE any tag stripping, and raw tool markup is stripped only from
+        the final text once all execution decisions are done.
 
         If ``on_sentence`` is provided, the API call is streamed and the
         callback is invoked with each complete sentence (cleaned) as soon
@@ -1784,26 +2058,35 @@ class OSIAAgent:
             content = strip_reasoning_blocks(content)
 
             # STEP 2 — parse tool calls with the universal parser (native
-            # structured calls + XML blocks, routed per provider via
-            # TOOL_FORMAT). The content is still un-stripped here.
+            # structured calls → XML blocks → bare JSON → python-tag, in
+            # priority order). The content is still un-stripped here:
+            # stripping before parsing would destroy the calls.
             tool_calls = _extract_tool_calls(
                 content, message=message, provider=self.provider,
+            )
+            print(
+                f"[DEBUG] tool_calls found: {len(tool_calls)}, "
+                f"text: {repr(content[:100])}"
             )
 
             # STEP 3 — execute the parsed tool calls.
             if tool_calls:
-                # Record the assistant turn. Native structured calls can
-                # arrive with empty text content — serialize them as XML
-                # blocks so the model sees what it called on the next round
-                # (display paths strip these blocks before rendering).
+                # Record the assistant turn. Calls that didn't arrive as
+                # XML blocks (native/bare/python_tag) are serialized as
+                # canonical <tool_call> blocks so the model sees what it
+                # called on the next round; the raw bare-JSON/python-tag
+                # payload is stripped from the recorded prose so history
+                # never carries the same call twice (display paths strip
+                # these blocks before rendering).
                 assistant_record = content
                 if not has_tool_call(assistant_record):
+                    prose = strip_bare_tool_json(strip_raw_tool_tags(content)).strip()
                     blocks = "\n".join(
                         f"<tool_call>\n{json.dumps(tc, ensure_ascii=False)}\n</tool_call>"
                         for tc in tool_calls
                     )
                     assistant_record = (
-                        f"{content}\n{blocks}".strip() if content.strip() else blocks
+                        f"{prose}\n{blocks}".strip() if prose else blocks
                     )
                 self.messages.append({"role": "assistant", "content": assistant_record})
 
@@ -1908,16 +2191,16 @@ class OSIAAgent:
                     self.messages.append({"role": "user", "content": feedback_text})
                 continue
 
-            # No structured tool call — candidate final response.
+            # No tool call in any format — candidate final response.
             #
             # STEP 4 — fallback honesty. Nothing was executed this round.
             # If the model nevertheless emitted unparseable tool markup
-            # (malformed/truncated <tool_call>, a <|python_tag|> payload —
-            # never executed by design), or described an action in prose
-            # ("I'll open Brave now" / "I've opened Firefox"), do NOT
-            # execute anything and do NOT let it pass as done: log a
-            # warning and retry ONCE with an explicit instruction to emit
-            # a real structured tool call.
+            # (malformed/truncated <tool_call>, <|python_tag|> payload, or
+            # bare {"tool": ...} JSON too broken to repair), or described
+            # an action in prose ("I'll open Brave now" / "I've opened
+            # Firefox"), do NOT execute anything and do NOT let it pass as
+            # done: log a warning and retry ONCE with an explicit
+            # instruction to emit a real structured tool call.
             described = has_tool_markup(content) or describes_tool_use(content)
             if not any_tool_executed and described:
                 print(
@@ -1950,11 +2233,12 @@ class OSIAAgent:
                 )
 
             # STEP 5 — final response. ONLY NOW strip raw tool/function XML
-            # tags and Llama special tokens cited as literal text (Groq
-            # Llama/Qwen, Llama 4 Scout) — all execution decisions are done,
-            # so anything left is markup the user must never see in mobile,
-            # history, or TTS.
+            # tags, Llama special tokens, and residual bare {"tool": ...}
+            # JSON cited as literal text (Groq Llama/Qwen, Llama 4 Scout) —
+            # all execution decisions are done, so anything left is markup
+            # the user must never see in mobile, history, or TTS.
             content = strip_raw_tool_tags(content)
+            content = strip_bare_tool_json(content)
             self.messages.append({"role": "assistant", "content": content})
             return content
 
