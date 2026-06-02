@@ -196,7 +196,9 @@ def voice_mode():
         print(f"💬 OSIA: {response}")
 
         _persist_exchange(active_conv["id"], user_text, response)
+        print(f"[TTS] main.voice_mode: calling speak() ({len(response)} chars)", flush=True)
         speak(response)
+        print("[TTS] main.voice_mode: speak() returned", flush=True)
 
 
 def wake_mode():
@@ -309,11 +311,28 @@ def wake_mode():
 
         try:
             on_sentence = speak_streaming if voice_response else None
+            if voice_response:
+                print(
+                    "[TTS] main.wake_mode: streaming TTS wired for this turn "
+                    "(sentences go to speak_streaming)",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[TTS] main.wake_mode: TTS disabled for this turn (text-only)",
+                    flush=True,
+                )
             reply = agent.run(
                 user_text,
                 on_sentence=on_sentence,
                 on_first_token=on_first_token,
             )
+            if voice_response:
+                print(
+                    f"[TTS] main.wake_mode: agent.run() returned "
+                    f"({len(reply or '')} chars) — sentences were streamed during the run",
+                    flush=True,
+                )
             _persist_agent_delta(
                 active_conv["id"], agent, prev_history_len,
             )
@@ -324,6 +343,7 @@ def wake_mode():
             err = f"Error: {e}"
             bridge.chat_message.emit("assistant", err)
             if voice_response:
+                print(f"[TTS] main.wake_mode: speaking error message: {err[:80]!r}", flush=True)
                 threading.Thread(target=lambda: speak(err), daemon=True).start()
         finally:
             bridge.island_state.emit("idle")

@@ -12,6 +12,7 @@ import shutil
 import stat
 import fnmatch
 import signal
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
 
@@ -20,6 +21,12 @@ from openai import OpenAI
 
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 MODEL = "llama3"
+
+# Response length cap sent on every model call. 32768 is a safe maximum
+# accepted across all supported providers (Ollama, Groq, DeepSeek,
+# Anthropic, OpenAI, …) — large enough that no model is ever meaningfully
+# token-limited or truncated mid-answer.
+MAX_RESPONSE_TOKENS = 32768
 
 # ---------------------------------------------------------------------------
 # Language detection (Phase 1)
@@ -77,7 +84,7 @@ Code editor:
 - edit_file_lines: Replace a range of lines (1-indexed, inclusive) in a file. Usage: {"tool": "edit_file_lines", "path": "<path>", "start_line": 10, "end_line": 12, "new_content": "<replacement>"}
 
 Browser (drives a REAL visible browser — Chromium/Brave via CDP, or Firefox via WebDriver BiDi — same page the user sees; cookies/sessions persist):
-- navigate: Go to a URL in the real browser. Launches Brave/Chromium with remote debugging on first use (falls back to Firefox over BiDi if no Chromium browser is installed). Usage: {"tool": "navigate", "url": "<url>"}
+- navigate: Go to a URL in the real browser. Launches Brave/Chromium with remote debugging on first use (falls back to Firefox over BiDi if no Chromium browser is installed). Automatically waits for the page DOM to be ready — never wait manually after navigating. Usage: {"tool": "navigate", "url": "<url>"}
 - click: Click an element by CSS selector. Usage: {"tool": "click", "selector": "<css_selector>"}
 - find_and_click: Click the first element whose visible text matches. Use when you don't know the selector but can see the label. Usage: {"tool": "find_and_click", "text": "<visible_text>"}
 - fill: Set the value of an input field in one shot (no keystroke events). Usage: {"tool": "fill", "selector": "<css_selector>", "value": "<text>"}
@@ -85,7 +92,6 @@ Browser (drives a REAL visible browser — Chromium/Brave via CDP, or Firefox vi
 - press_key: Press a single keyboard key on the active page (Enter, Escape, Tab, ArrowDown, Backspace, "Control+A", …). Usage: {"tool": "press_key", "key": "Enter"}
 - read_page: Visible text of the current page (truncated). Usage: {"tool": "read_page"}
 - get_page_text: Full visible text of the page (higher cap than read_page). Usage: {"tool": "get_page_text"}
-- wait_for_load: Wait for the page to finish loading (network idle, up to 15s). Usage: {"tool": "wait_for_load"}
 - get_current_url: Return the URL of the active page. Usage: {"tool": "get_current_url"}
 - scroll: Scroll by a pixel amount in a direction. Usage: {"tool": "scroll", "direction": "down", "amount": 600}
 - scroll_down: Scroll down by one viewport (or by ``amount`` pixels). Usage: {"tool": "scroll_down"}
@@ -102,7 +108,8 @@ To call a tool, output a JSON tool call wrapped in <tool_call> tags:
 </tool_call>
 
 After each tool call you will receive the tool output. You may issue multiple tool calls in sequence.
-When you have all the information you need, give your final answer as plain text (no <tool_call> tags)."""
+When you have all the information you need, give your final answer as plain text (no <tool_call> tags).
+When all tools are done, you MUST write a complete final answer based on everything you found — never end your turn with only tool calls, tool markup, or an empty reply."""
 
 SYSTEM_PROMPT_FR = """Tu es un assistant vocal IA local fonctionnant sur la machine locale de l'utilisateur avec UN ACCÈS SYSTÈME COMPLET. Réponds en français par défaut.
 Tu peux exécuter n'importe quelle commande shell, lire/écrire/supprimer n'importe quel fichier, lancer n'importe quelle application, prendre des captures d'écran, et contrôler un navigateur web.
@@ -140,7 +147,7 @@ Fichiers :
 - edit_file_lines : Remplacer une plage de lignes (1-indexé, inclus) dans un fichier. Usage : {"tool": "edit_file_lines", "path": "<chemin>", "start_line": 10, "end_line": 12, "new_content": "<remplacement>"}
 
 Navigateur (pilote le VRAI navigateur visible — Chromium/Brave via CDP, ou Firefox via WebDriver BiDi — la page que voit l'utilisateur ; les cookies/sessions persistent) :
-- navigate : Aller à une URL dans le vrai navigateur. Lance Brave/Chromium avec le port de debug au premier appel (bascule sur Firefox via BiDi si aucun navigateur Chromium n'est installé). Usage : {"tool": "navigate", "url": "<url>"}
+- navigate : Aller à une URL dans le vrai navigateur. Lance Brave/Chromium avec le port de debug au premier appel (bascule sur Firefox via BiDi si aucun navigateur Chromium n'est installé). Attend automatiquement que le DOM de la page soit prêt — ne jamais attendre manuellement après une navigation. Usage : {"tool": "navigate", "url": "<url>"}
 - click : Cliquer sur un élément par sélecteur CSS. Usage : {"tool": "click", "selector": "<selecteur_css>"}
 - find_and_click : Cliquer sur le premier élément dont le texte visible correspond. À utiliser quand tu ne connais pas le sélecteur mais que tu vois le libellé. Usage : {"tool": "find_and_click", "text": "<texte_visible>"}
 - fill : Définir la valeur d'un champ en une fois (sans événements clavier). Usage : {"tool": "fill", "selector": "<selecteur_css>", "value": "<texte>"}
@@ -148,7 +155,6 @@ Navigateur (pilote le VRAI navigateur visible — Chromium/Brave via CDP, ou Fir
 - press_key : Appuyer sur une touche du clavier sur la page active (Enter, Escape, Tab, ArrowDown, Backspace, « Control+A »…). Usage : {"tool": "press_key", "key": "Enter"}
 - read_page : Texte visible de la page actuelle (tronqué). Usage : {"tool": "read_page"}
 - get_page_text : Texte visible complet de la page (limite plus haute que read_page). Usage : {"tool": "get_page_text"}
-- wait_for_load : Attendre la fin du chargement de la page (réseau au repos, jusqu'à 15s). Usage : {"tool": "wait_for_load"}
 - get_current_url : Retourner l'URL de la page active. Usage : {"tool": "get_current_url"}
 - scroll : Faire défiler d'un nombre de pixels dans une direction. Usage : {"tool": "scroll", "direction": "down", "amount": 600}
 - scroll_down : Descendre d'une hauteur d'écran (ou de ``amount`` pixels). Usage : {"tool": "scroll_down"}
@@ -165,7 +171,8 @@ Pour appeler un outil, produis un appel JSON dans des balises <tool_call> :
 </tool_call>
 
 Après chaque appel, tu reçois le résultat de l'outil. Tu peux enchaîner plusieurs appels.
-Quand tu as toutes les informations nécessaires, donne ta réponse finale en texte simple (sans balises <tool_call>)."""
+Quand tu as toutes les informations nécessaires, donne ta réponse finale en texte simple (sans balises <tool_call>).
+Quand tous les outils ont terminé, tu DOIS écrire une réponse finale complète basée sur tout ce que tu as trouvé — ne termine jamais ton tour avec seulement des appels d'outils, du balisage d'outil ou une réponse vide."""
 
 
 def get_system_prompt(lang: str = None, model: str = None, provider: str = None) -> str:
@@ -1464,6 +1471,32 @@ def strip_bare_tool_json(text: str) -> str:
     return "".join(parts)
 
 
+def _looks_like_pure_markup(text: str) -> bool:
+    """True when ``text`` is genuinely tool/reasoning markup that display
+    surfaces must hide entirely: a reasoning block (closed or truncated),
+    a ``<tool_call>``/``<tool_result>`` block, a Llama special-token
+    payload, bare ``{"tool": ...}`` JSON, or the tool-result feedback
+    instruction. Used by ``strip_tool_artifacts`` to tell "correctly hidden
+    markup" apart from "normal response wrongly stripped to empty".
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True
+    # Reasoning or tool blocks (closed or truncated) at the start.
+    if re.match(r'^<(?:think(?:ing)?|tool_call|tool_result)>', stripped):
+        return True
+    # Llama special tokens at the start (<|python_tag|>, <|start_header_id|>, …).
+    if stripped.startswith("<|"):
+        return True
+    # Bare {"tool": ...} JSON naming a known tool, on its own line.
+    if has_tool_markup(stripped):
+        return True
+    # The tool-result feedback instruction echoed alone.
+    if stripped.startswith("Please continue with your response"):
+        return True
+    return False
+
+
 def strip_tool_artifacts(text: str) -> str:
     """One-stop display cleaner: remove every kind of tool/reasoning markup
     a model can leak into visible text — reasoning blocks, ``<tool_call>``/
@@ -1472,14 +1505,31 @@ def strip_tool_artifacts(text: str) -> str:
     instruction. Display surfaces (GUI chat bubbles, history rendering)
     call this before showing a message; a message that comes back empty
     must not be rendered at all.
+
+    Guard: stripping must never turn a normal response into an invisible
+    message. If the cleaned text is empty but the raw text was not, and the
+    raw text doesn't actually look like pure tool/reasoning markup, a
+    warning is logged and the raw text is returned instead of "".
     """
     if not text:
         return ""
-    text = strip_reasoning_blocks(text)
-    text = strip_raw_tool_tags(text)
-    text = strip_bare_tool_json(text)
-    text = text.replace(
+    cleaned = strip_reasoning_blocks(text)
+    cleaned = strip_raw_tool_tags(cleaned)
+    cleaned = strip_bare_tool_json(cleaned)
+    cleaned = cleaned.replace(
         "Please continue with your response based on these results.", ""
+    ).strip()
+    if cleaned or not text.strip():
+        return cleaned
+    # Stripping emptied a non-empty message. That is correct for real
+    # markup (intermediate tool-call rounds, reasoning blocks, tool-result
+    # echoes — those must stay hidden or they render as raw JSON/phantom
+    # bubbles), but a normal response must never vanish.
+    if _looks_like_pure_markup(text):
+        return ""
+    print(
+        "[WARN] strip_tool_artifacts: stripping emptied a non-markup message "
+        f"— returning raw text instead ({text.strip()[:120]!r})"
     )
     return text.strip()
 
@@ -1682,6 +1732,285 @@ def describes_tool_use(text: str) -> bool:
     return any(p.search(text) for p in _TOOL_INTENT_PATTERNS)
 
 
+# ---------------------------------------------------------------------------
+# Anti-loop protection — smart detectors instead of a hard tool-call cap
+# ---------------------------------------------------------------------------
+
+# Same tool called with the exact same parameters this many times in a row.
+REPEAT_CALL_LIMIT = 5
+# This many consecutive tool calls all returning errors.
+ERROR_STREAK_LIMIT = 8
+# A cycle of identical (tool, params) calls — e.g. navigate→read_page→
+# navigate→read_page… — repeated more than this many times means no progress.
+STALL_CYCLE_REPEATS = 3
+# Longest cycle length (in tool calls) the stall detector looks for.
+STALL_MAX_CYCLE_LEN = 4
+# Wall-clock budget for a single agent turn (model calls + tool execution).
+TURN_TIME_LIMIT_SECONDS = 180.0
+
+
+class _AntiLoopGuard:
+    """Watches the tool-calling loop for signs it stopped making progress.
+
+    Replaces the old hard ``max_tool_rounds`` cap: the agent is never cut
+    off just for making many tool calls — only when one of these
+    detectors trips:
+
+    - **repetition**: the same tool called with the exact same parameters
+      ``REPEAT_CALL_LIMIT`` times in a row
+    - **error streak**: ``ERROR_STREAK_LIMIT`` consecutive tool calls all
+      returned errors
+    - **stall**: the same sequence of (tool, params) calls (cycle length
+      2..``STALL_MAX_CYCLE_LEN``) repeated more than ``STALL_CYCLE_REPEATS``
+      times — identical calls each cycle means no progress
+    - **time limit**: the whole turn exceeded ``TURN_TIME_LIMIT_SECONDS``
+
+    Every executed tool call must be reported through :meth:`record`. When
+    a detector trips, :attr:`stop_reason` (for the user-facing summary) and
+    :attr:`model_notice` (the message told to the model) are set, and the
+    agent loop is expected to stop calling tools and wrap up with a summary
+    (see ``OSIAAgent._finish_anti_loop_stop``).
+    """
+
+    def __init__(self, lang: str = "fr"):
+        self.lang = lang
+        self.started_at = time.monotonic()
+        # Executed calls as (tool_name, canonical-params-JSON) fingerprints.
+        self.calls: list[tuple[str, str]] = []
+        # Human-readable log of every executed action: (label, succeeded).
+        self.actions: list[tuple[str, bool]] = []
+        self.consecutive_errors = 0
+        self.recent_failures: list[str] = []
+        # Set by the first detector that trips.
+        self.stop_reason: str | None = None
+        self.model_notice: str | None = None
+
+    @property
+    def tripped(self) -> bool:
+        return self.stop_reason is not None
+
+    # -- recording ----------------------------------------------------------
+
+    def record(self, tool_name: str, kwargs: dict, result_text: str,
+               is_error: bool) -> bool:
+        """Record one executed tool call, then run every detector.
+        Returns True when a detector tripped (the loop must stop).
+        """
+        fingerprint = json.dumps(
+            kwargs, sort_keys=True, ensure_ascii=False, default=str,
+        )
+        self.calls.append((tool_name, fingerprint))
+
+        args_preview = ", ".join(
+            f"{k}={str(v)[:40]}" for k, v in kwargs.items()
+        )
+        self.actions.append((f"{tool_name}({args_preview})", not is_error))
+
+        if is_error:
+            self.consecutive_errors += 1
+            failure = result_text.strip().replace("\n", " ")[:160]
+            self.recent_failures.append(f"{tool_name}: {failure}")
+            self.recent_failures = self.recent_failures[-ERROR_STREAK_LIMIT:]
+        else:
+            self.consecutive_errors = 0
+            self.recent_failures = []
+
+        return (
+            self._check_repetition()
+            or self._check_error_streak()
+            or self._check_stall()
+            or self.check_time()
+        )
+
+    # -- detectors ----------------------------------------------------------
+
+    def _trip(self, detector: str, reason_fr: str, reason_en: str,
+              notice_fr: str, notice_en: str) -> bool:
+        """Latch the first tripped detector's reason/notice in the agent's
+        language. Always returns True so detectors can ``return self._trip(…)``.
+        """
+        tool = self.calls[-1][0] if self.calls else "(none)"
+        print(f"[ANTI-LOOP] detector={detector}, tool={tool}, stopping")
+        if self.lang == "fr":
+            self.stop_reason, self.model_notice = reason_fr, notice_fr
+        else:
+            self.stop_reason, self.model_notice = reason_en, notice_en
+        return True
+
+    def _check_repetition(self) -> bool:
+        """Same tool, exact same parameters, REPEAT_CALL_LIMIT times in a row."""
+        if len(self.calls) < REPEAT_CALL_LIMIT:
+            return False
+        tail = self.calls[-REPEAT_CALL_LIMIT:]
+        if len(set(tail)) != 1:
+            return False
+        tool_name = tail[0][0]
+        return self._trip(
+            detector="repetition",
+            reason_fr=(
+                f"la même action ({tool_name}) a déjà été tentée "
+                f"{REPEAT_CALL_LIMIT} fois de suite sans succès"
+            ),
+            reason_en=(
+                f"the same action ({tool_name}) was already attempted "
+                f"{REPEAT_CALL_LIMIT} times in a row without success"
+            ),
+            notice_fr=(
+                f"Cette action a déjà été tentée {REPEAT_CALL_LIMIT} fois "
+                "sans succès, essaie une approche différente."
+            ),
+            notice_en=(
+                f"This action has already been attempted {REPEAT_CALL_LIMIT} "
+                "times without success, try a different approach."
+            ),
+        )
+
+    def _check_error_streak(self) -> bool:
+        """ERROR_STREAK_LIMIT consecutive tool calls all returned errors."""
+        if self.consecutive_errors < ERROR_STREAK_LIMIT:
+            return False
+        failures = "; ".join(self.recent_failures)
+        return self._trip(
+            detector="error_streak",
+            reason_fr=(
+                f"les {ERROR_STREAK_LIMIT} derniers appels d'outils ont tous "
+                f"échoué ({failures})"
+            ),
+            reason_en=(
+                f"the last {ERROR_STREAK_LIMIT} tool calls all failed "
+                f"({failures})"
+            ),
+            notice_fr=(
+                f"Les {ERROR_STREAK_LIMIT} derniers appels d'outils ont tous "
+                f"échoué : {failures}"
+            ),
+            notice_en=(
+                f"The last {ERROR_STREAK_LIMIT} tool calls all failed: "
+                f"{failures}"
+            ),
+        )
+
+    def _check_stall(self) -> bool:
+        """The same sequence of calls cycling with no progress — e.g.
+        navigate→read_page→navigate→read_page… repeated more than
+        STALL_CYCLE_REPEATS times with identical parameters each cycle.
+        (Single-call cycles are handled by the repetition detector.)
+        """
+        min_repeats = STALL_CYCLE_REPEATS + 1
+        for period in range(2, STALL_MAX_CYCLE_LEN + 1):
+            window = period * min_repeats
+            if len(self.calls) < window:
+                continue
+            tail = self.calls[-window:]
+            cycle = tail[:period]
+            if all(tail[i] == cycle[i % period] for i in range(window)):
+                names = "→".join(name for name, _ in cycle)
+                return self._trip(
+                    detector="stall",
+                    reason_fr=(
+                        f"je répétais la même séquence d'actions ({names}) "
+                        "sans progresser"
+                    ),
+                    reason_en=(
+                        f"I kept repeating the same sequence of actions "
+                        f"({names}) without making progress"
+                    ),
+                    notice_fr=(
+                        f"Tu as répété la séquence {names} plus de "
+                        f"{STALL_CYCLE_REPEATS} fois sans aucun progrès, "
+                        "essaie une approche différente."
+                    ),
+                    notice_en=(
+                        f"You repeated the sequence {names} more than "
+                        f"{STALL_CYCLE_REPEATS} times with no progress, "
+                        "try a different approach."
+                    ),
+                )
+        return False
+
+    def check_time(self) -> bool:
+        """The whole turn exceeded TURN_TIME_LIMIT_SECONDS of wall-clock time.
+        Safe to call at any point in the loop, not just from ``record``.
+        """
+        if self.tripped:
+            return True
+        if time.monotonic() - self.started_at <= TURN_TIME_LIMIT_SECONDS:
+            return False
+        minutes = int(TURN_TIME_LIMIT_SECONDS // 60)
+        return self._trip(
+            detector="time_limit",
+            reason_fr=(
+                f"la limite de temps de {minutes} minutes pour un seul tour "
+                "a été atteinte"
+            ),
+            reason_en=(
+                f"the {minutes}-minute time limit for a single turn was reached"
+            ),
+            notice_fr=f"Ce tour a dépassé la limite de {minutes} minutes.",
+            notice_en=f"This turn exceeded the {minutes}-minute time limit.",
+        )
+
+    # -- summaries -----------------------------------------------------------
+
+    def action_log(self) -> str:
+        """Bullet list of every executed action with its outcome."""
+        if not self.actions:
+            return "- (aucune action)" if self.lang == "fr" else "- (no actions)"
+        return "\n".join(
+            f"- {label} {'✓' if ok else '✗'}" for label, ok in self.actions
+        )
+
+    def stop_instruction(self) -> str:
+        """Message fed to the model when a detector trips: the detector's
+        notice, the action log, and an order to stop calling tools and
+        answer with the required summary format.
+        """
+        n = len(self.actions)
+        log = self.action_log()
+        if self.lang == "fr":
+            return (
+                f"[PROTECTION ANTI-BOUCLE] {self.model_notice}\n\n"
+                f"ARRÊTE d'appeler des outils maintenant. Tu as effectué "
+                f"{n} action(s) :\n{log}\n\n"
+                "Donne ta réponse finale à l'utilisateur en suivant exactement "
+                "ce format :\n"
+                f'"J\'ai effectué {n} actions. Voici ce que j\'ai accompli : '
+                "[liste courte de ce qui a été fait]. Je me suis arrêté car "
+                f'{self.stop_reason}. Que souhaitez-vous que je fasse ?"\n'
+                "N'appelle AUCUN outil dans cette réponse."
+            )
+        return (
+            f"[ANTI-LOOP PROTECTION] {self.model_notice}\n\n"
+            f"STOP calling tools now. You performed {n} action(s):\n{log}\n\n"
+            "Give your final answer to the user following exactly this "
+            "format:\n"
+            f'"I performed {n} actions. Here is what I accomplished: '
+            "[short list of what was done]. I stopped because "
+            f'{self.stop_reason}. What would you like me to do?"\n'
+            "Do NOT call ANY tool in this response."
+        )
+
+    def fallback_summary(self) -> str:
+        """Deterministic user-facing summary in the required format, used
+        when the final summary model call fails or only emits tool markup.
+        """
+        n = len(self.actions)
+        log = self.action_log()
+        if self.lang == "fr":
+            return (
+                f"J'ai effectué {n} actions. Voici ce que j'ai accompli :\n"
+                f"{log}\n\n"
+                f"Je me suis arrêté car {self.stop_reason}. "
+                "Que souhaitez-vous que je fasse ?"
+            )
+        return (
+            f"I performed {n} actions. Here is what I accomplished:\n"
+            f"{log}\n\n"
+            f"I stopped because {self.stop_reason}. "
+            "What would you like me to do?"
+        )
+
+
 class OSIAAgent:
     def __init__(self, model: str = MODEL, base_url: str = OLLAMA_BASE_URL, lang: str = None):
         self.client = OpenAI(base_url=base_url, api_key="ollama")
@@ -1752,17 +2081,19 @@ class OSIAAgent:
             self.messages[0]["content"] = get_system_prompt(self.lang, self.model, self.provider)
         print(f"[DEBUG] provider: {self.provider}, model: {self.model}")
 
-    def _stream_deltas(self, max_tokens: int | None):
+    def _stream_deltas(self):
         """Yield text deltas from the OpenAI-compatible chat-completions
         stream, abstracting it so the sentence-splitting loop stays simple.
+
+        Responses are never token-limited: every call sends the
+        provider-safe maximum (``MAX_RESPONSE_TOKENS``).
         """
         create_kwargs = {
             "model": self.model,
             "messages": self.messages,
             "stream": True,
+            "max_tokens": MAX_RESPONSE_TOKENS,
         }
-        if max_tokens is not None:
-            create_kwargs["max_tokens"] = max_tokens
         stream = self.client.chat.completions.create(**create_kwargs)
         for chunk in stream:
             try:
@@ -1819,8 +2150,7 @@ class OSIAAgent:
             speakable = ""
         return speakable
 
-    def _stream_with_sentences(self, on_sentence, max_tokens: int | None = None,
-                               on_first_token=None) -> str:
+    def _stream_with_sentences(self, on_sentence, on_first_token=None) -> str:
         """Stream a chat completion, emitting each complete sentence to
         ``on_sentence`` as it arrives. Returns the full accumulated content
         so the outer loop can still detect tool calls.
@@ -1848,7 +2178,7 @@ class OSIAAgent:
         tool_call_seen = False
         first_token_fired = False
 
-        for delta in self._stream_deltas(max_tokens):
+        for delta in self._stream_deltas():
             if not delta:
                 continue
             if not first_token_fired:
@@ -1937,8 +2267,89 @@ class OSIAAgent:
 
         return full
 
-    def run(self, user_input: str, max_tool_rounds: int = 10, on_sentence=None,
-            history: list | None = None, max_tokens: int | None = 512,
+    def _finish_anti_loop_stop(self, guard: _AntiLoopGuard, on_sentence=None,
+                               on_first_token=None) -> str:
+        """Wrap up a turn stopped by the anti-loop guard.
+
+        The stop instruction (detector notice + action log + summary format)
+        has already been appended to ``self.messages``; this makes ONE final
+        model call to produce the user-facing summary. Tool calls in that
+        response are never executed — only stripped. If the call fails or
+        the response is empty once tool markup is removed, falls back to a
+        deterministic summary built from the guard's action log so the user
+        always gets the "J'ai effectué N actions…" report.
+        """
+        print(
+            f"[OSIA Agent] ⛔ anti-loop stop after {len(guard.actions)} "
+            f"tool call(s): {guard.stop_reason}"
+        )
+        content = ""
+        try:
+            if on_sentence is not None:
+                content = self._stream_with_sentences(
+                    on_sentence, on_first_token=on_first_token,
+                )
+            else:
+                create_kwargs = {
+                    "model": self.model,
+                    "messages": self.messages,
+                    "max_tokens": MAX_RESPONSE_TOKENS,
+                }
+                response = self.client.chat.completions.create(**create_kwargs)
+                content = response.choices[0].message.content or ""
+            # Same final-text pipeline as a normal response: strip reasoning
+            # first, then every form of tool markup (nothing gets executed).
+            content = strip_reasoning_blocks(content)
+            content = strip_raw_tool_tags(content)
+            content = strip_bare_tool_json(content).strip()
+        except Exception as e:
+            print(f"[OSIA Agent] ✗ anti-loop summary call failed: {e}")
+            content = ""
+
+        if not content:
+            # Model couldn't produce a usable summary — use the deterministic
+            # one, and speak it too in streaming mode (nothing was emitted).
+            content = guard.fallback_summary()
+            if on_sentence is not None:
+                try:
+                    on_sentence(clean_response(content))
+                except Exception:
+                    pass
+
+        self.messages.append({"role": "assistant", "content": content})
+        return content
+
+    def _empty_response_fallback(self, guard: _AntiLoopGuard) -> str:
+        """Deterministic user-facing reply for when the model's final answer
+        is empty once tool/reasoning markup is stripped (even after the
+        empty-response retry). Reports executed actions when there are any,
+        so the user knows what actually happened this turn.
+        """
+        n = len(guard.actions)
+        if n:
+            if self.lang == "fr":
+                return (
+                    f"J'ai exécuté {n} action(s) :\n{guard.action_log()}\n\n"
+                    "Mais je n'ai pas réussi à formuler une réponse finale. "
+                    "Que souhaitez-vous que je fasse ?"
+                )
+            return (
+                f"I executed {n} action(s):\n{guard.action_log()}\n\n"
+                "But I couldn't produce a final response. "
+                "What would you like me to do?"
+            )
+        if self.lang == "fr":
+            return (
+                "Désolé, je n'ai pas réussi à formuler une réponse. "
+                "Pouvez-vous reformuler votre demande ?"
+            )
+        return (
+            "Sorry, I couldn't produce a response. "
+            "Could you rephrase your request?"
+        )
+
+    def run(self, user_input: str, max_tool_rounds: int | None = None, on_sentence=None,
+            history: list | None = None, max_tokens: int | None = None,
             on_first_token=None) -> str:
         """Run the agent loop: send user input, handle tool calls, return final response.
 
@@ -1964,9 +2375,18 @@ class OSIAAgent:
         After the call, callers can read ``self.messages[1:]`` to retrieve
         the updated history (system prompt is at index 0).
 
-        ``max_tokens`` caps the response length of each round (default
-        512, sized for short conversational replies). Pass ``None`` to
-        leave it unset.
+        ``max_tokens`` is DEPRECATED and ignored. Responses are never
+        token-limited: every model call sends the provider-safe maximum
+        (``MAX_RESPONSE_TOKENS`` = 32768) so no reply is ever truncated
+        mid-answer, regardless of what callers pass here.
+
+        ``max_tool_rounds`` is DEPRECATED and ignored. The hard cap on
+        tool rounds was replaced by smart anti-loop detection
+        (``_AntiLoopGuard``): the agent is never cut off just for making
+        many tool calls — only when it repeats the exact same call, hits
+        a streak of errors, cycles through the same call sequence with no
+        progress, or exceeds the per-turn time budget. In those cases it
+        stops gracefully and returns a summary of what was done.
         """
         if history is not None:
             # Defensively strip anything that looks like a system prompt
@@ -1988,8 +2408,17 @@ class OSIAAgent:
         # "you never called the tool" retry has been spent.
         any_tool_executed = False
         hallucination_retry_used = False
+        # Empty-response guard: whether the one allowed "your reply was
+        # empty after stripping markup" retry has been spent.
+        empty_retry_used = False
 
-        for round_num in range(max_tool_rounds):
+        # Smart anti-loop protection (replaces the old hard round cap):
+        # repetition, error-streak, stall and turn-time detectors. The loop
+        # below runs for as many rounds as the model needs — it is only
+        # stopped when the guard says no progress is being made.
+        guard = _AntiLoopGuard(lang=self.lang)
+
+        while True:
             try:
                 if on_sentence is not None:
                     # on_first_token only fires the first time a delta arrives
@@ -1998,16 +2427,14 @@ class OSIAAgent:
                     message = None
                     content = self._stream_with_sentences(
                         on_sentence,
-                        max_tokens=max_tokens,
                         on_first_token=on_first_token,
                     )
                 else:
                     create_kwargs = {
                         "model": self.model,
                         "messages": self.messages,
+                        "max_tokens": MAX_RESPONSE_TOKENS,
                     }
-                    if max_tokens is not None:
-                        create_kwargs["max_tokens"] = max_tokens
                     response = self.client.chat.completions.create(**create_kwargs)
                     # Keep the message object: native providers may return
                     # structured tool calls on it (message.tool_calls).
@@ -2052,6 +2479,11 @@ class OSIAAgent:
             #   5. strip raw tool tags ONLY on the final text
             # ────────────────────────────────────────────────────────────
 
+            # Keep the un-stripped model output for the empty-response
+            # guard at STEP 5: if stripping reduces the final reply to
+            # nothing, this is what the model actually said.
+            raw_round_output = content
+
             # STEP 1 — strip internal reasoning blocks (<think>…</think>)
             # FIRST: the user must never see chain-of-thought, and a tool
             # call only deliberated inside reasoning must not be executed.
@@ -2090,6 +2522,25 @@ class OSIAAgent:
                     )
                 self.messages.append({"role": "assistant", "content": assistant_record})
 
+                # Anti-loop: don't even start the batch if the turn has
+                # already blown through its time budget (the model call
+                # itself may have pushed it over). The pending tool calls
+                # are NOT executed — the stop instruction says so.
+                if guard.check_time():
+                    notice = (
+                        "Les appels d'outils ci-dessus n'ont PAS été exécutés."
+                        if self.lang == "fr"
+                        else "The tool calls above were NOT executed."
+                    )
+                    self.messages.append({
+                        "role": "user",
+                        "content": f"{notice}\n\n{guard.stop_instruction()}",
+                    })
+                    return self._finish_anti_loop_stop(
+                        guard, on_sentence=on_sentence,
+                        on_first_token=on_first_token,
+                    )
+
                 # Execute tools SEQUENTIALLY — each one completes (or
                 # times out / errors) before the next starts. If any tool
                 # ultimately errors (even after the retry), stop the batch
@@ -2107,6 +2558,14 @@ class OSIAAgent:
                         )
                         tool_results.append(
                             f"Tool {tool_name} result:\n[ERREUR] outil inconnu: {tool_name}"
+                        )
+                        # Unknown-tool requests count toward the anti-loop
+                        # detectors too (repetition / error streak).
+                        guard.record(
+                            tool_name,
+                            {k: v for k, v in tc.items() if k != "tool"},
+                            f"[ERREUR] outil inconnu: {tool_name}",
+                            True,
                         )
                         # Treat unknown tool as a hard error: stop the batch.
                         remaining = tool_calls[i + 1:]
@@ -2149,6 +2608,17 @@ class OSIAAgent:
                     tool_results.append(result_entry)
                     if screenshot:
                         tool_screenshots.append(screenshot)
+                    # Anti-loop: record the executed call and run every
+                    # detector (repetition, error streak, stall, time).
+                    if guard.record(tool_name, kwargs, text_part, is_error):
+                        remaining = tool_calls[i + 1:]
+                        if remaining:
+                            names = [t.get("tool", "?") for t in remaining]
+                            print(
+                                f"[OSIA Agent] ⏸ anti-loop tripped — skipping "
+                                f"{len(remaining)} follow-up tool call(s): {names}"
+                            )
+                        break
                     if is_error:
                         remaining = tool_calls[i + 1:]
                         if remaining:
@@ -2168,10 +2638,41 @@ class OSIAAgent:
                 # strings as message content — sending a parts list causes
                 # a 400 error — so they get the text part only.
                 feedback = "\n\n".join(tool_results)
+                # Final-synthesis instruction: after the tool results come
+                # back, the model must either chain another tool call or
+                # write its complete final answer — never end the turn with
+                # nothing (the "je n'ai pas réussi à formuler une réponse
+                # finale" fallback).
+                if self.lang == "fr":
+                    synthesis_instruction = (
+                        "Tous les outils ont terminé. Écris maintenant ta "
+                        "réponse finale complète en te basant sur tout ce que "
+                        "tu as trouvé. (Si tu as encore besoin d'informations "
+                        "pour terminer la tâche, appelle un autre outil à la "
+                        "place — sinon, réponds en texte simple, sans aucune "
+                        "balise <tool_call>.)"
+                    )
+                else:
+                    synthesis_instruction = (
+                        "All tools are done. Write your complete final answer "
+                        "now based on everything you found. (If you still need "
+                        "more information to finish the task, call another tool "
+                        "instead — otherwise answer in plain text, with no "
+                        "<tool_call> tags.)"
+                    )
                 feedback_text = (
                     f"<tool_result>\n{feedback}\n</tool_result>\n"
-                    "Please continue with your response based on these results."
+                    f"{synthesis_instruction}"
                 )
+                # Anti-loop stop: replace the "please continue" instruction
+                # with the stop instruction (detector notice + action log +
+                # summary format) in the SAME user message, so providers
+                # never see two consecutive user turns.
+                if guard.tripped:
+                    feedback_text = (
+                        f"<tool_result>\n{feedback}\n</tool_result>\n\n"
+                        f"{guard.stop_instruction()}"
+                    )
                 if tool_screenshots and _provider_supports_vision(self.provider, self.model):
                     content_parts: list = [{"type": "text", "text": feedback_text}]
                     for shot in tool_screenshots:
@@ -2189,6 +2690,13 @@ class OSIAAgent:
                             f"model {self.model!r} ({self.provider}) doesn't support vision content"
                         )
                     self.messages.append({"role": "user", "content": feedback_text})
+                # Anti-loop stop: no more tool rounds — produce the final
+                # summary of what was done and why the agent stopped.
+                if guard.tripped:
+                    return self._finish_anti_loop_stop(
+                        guard, on_sentence=on_sentence,
+                        on_first_token=on_first_token,
+                    )
                 continue
 
             # No tool call in any format — candidate final response.
@@ -2238,11 +2746,70 @@ class OSIAAgent:
             # all execution decisions are done, so anything left is markup
             # the user must never see in mobile, history, or TTS.
             content = strip_raw_tool_tags(content)
-            content = strip_bare_tool_json(content)
+            content = strip_bare_tool_json(content).strip()
+
+            # Empty-response guard: stripping must never turn a model reply
+            # into silence. Typical causes: a <think> block truncated by
+            # max_tokens (the unclosed-tag pattern strips it to end-of-text)
+            # or a reply that was nothing but echoed tool markup. Returning
+            # "" here would mean an empty bubble, an empty mobile reply, and
+            # no TTS — instead retry once asking for a plain-text answer,
+            # then fall back to a deterministic reply.
+            if not content:
+                print(
+                    "[WARN] final response empty after stripping "
+                    f"(raw round output was {len(raw_round_output)} chars: "
+                    f"{raw_round_output[:120]!r}, "
+                    f"tools_executed={len(guard.actions)}, "
+                    f"empty_retry_used={empty_retry_used})"
+                )
+                if not empty_retry_used:
+                    empty_retry_used = True
+                    print(
+                        "[OSIA Agent] ↻ retrying with explicit "
+                        "plain-text-answer instruction"
+                    )
+                    # Record what the model actually emitted (display paths
+                    # strip this markup from history), then ask for a real
+                    # answer. Never append an empty assistant frame — some
+                    # providers reject it.
+                    self.messages.append({
+                        "role": "assistant",
+                        "content": raw_round_output if raw_round_output.strip() else "…",
+                    })
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "Ta réponse précédente était vide une fois le "
+                            "balisage retiré (bloc <think> non fermé ou "
+                            "balises d'outils). Tous les outils ont terminé. "
+                            "Écris maintenant ta réponse finale complète en "
+                            "te basant sur tout ce que tu as trouvé, en "
+                            "texte simple, sans bloc <think> ni balise "
+                            "<tool_call>."
+                            if self.lang == "fr" else
+                            "Your previous reply was empty once markup was "
+                            "removed (an unterminated <think> block or tool "
+                            "tags). All tools are done. Write your complete "
+                            "final answer now based on everything you found, "
+                            "in plain text, with no <think> block and no "
+                            "<tool_call> tags."
+                        ),
+                    })
+                    continue
+                # Retry also produced nothing usable — deterministic
+                # fallback so the user always gets a reply and TTS always
+                # has text to speak. In streaming mode nothing was emitted
+                # this round, so speak the fallback too.
+                content = self._empty_response_fallback(guard)
+                if on_sentence is not None:
+                    try:
+                        on_sentence(clean_response(content))
+                    except Exception:
+                        pass
+
             self.messages.append({"role": "assistant", "content": content})
             return content
-
-        return "I've reached the maximum number of tool calls without a final answer."
 
 
 def run_agent(user_input: str, model: str = MODEL, lang: str = None) -> str:

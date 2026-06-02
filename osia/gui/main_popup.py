@@ -152,6 +152,11 @@ def _display_text(content) -> str:
     An empty message rendered as a bubble shows up as a phantom thin
     violet line in the chat — callers MUST skip messages that come back
     empty here.
+
+    Guard against over-stripping: ``strip_tool_artifacts`` returns the raw
+    text (and logs a warning) when stripping would empty a message that
+    doesn't actually look like tool/reasoning markup — a normal response
+    must never silently vanish from the chat.
     """
     if content is None:
         return ""

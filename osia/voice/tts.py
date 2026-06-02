@@ -25,7 +25,41 @@ from osia.config import get_api_key, get_setting
 DetectorFactory.seed = 0
 
 # Playback rate applied to every TTS provider (1.0 = provider default).
+# Verified 2026-06-02: Kokoro and OpenAI (gpt-4o-mini-tts) both synthesize
+# correctly at 1.2 — revert to 1.0 if a provider starts rejecting it.
 TTS_SPEED = 1.2
+
+# ── Debug logging ──────────────────────────────────────────────────────────
+# Every stage of the TTS pipeline prints a [TTS] line so a silent assistant
+# can be traced to the exact stage that broke: dispatch, synthesis, or
+# audio playback.
+TTS_DEBUG = True
+
+_audio_device_logged = False
+
+
+def _debug(msg: str) -> None:
+    if TTS_DEBUG:
+        print(f"[TTS] {msg}", flush=True)
+
+
+def _log_audio_device() -> None:
+    """Log the configured audio output device (once per process) so a
+    missing/misconfigured sound device shows up in the logs immediately.
+    """
+    global _audio_device_logged
+    if _audio_device_logged:
+        return
+    _audio_device_logged = True
+    try:
+        out = sd.query_devices(kind="output")
+        _debug(
+            f"audio output device: {out['name']!r} @ "
+            f"{out['default_samplerate']:.0f}Hz "
+            f"(default in/out indices: {sd.default.device})"
+        )
+    except Exception as e:
+        _debug(f"⚠️ audio output device query FAILED: {e}")
 
 # ── Voice catalogues ───────────────────────────────────────────────────────
 
@@ -84,15 +118,30 @@ def speak_kokoro(text: str, block: bool = True) -> bool:
         lang_code = "f" if lang == "fr" else "a"
         voice = KOKORO_VOICE_FR if lang == "fr" else KOKORO_VOICE_EN
         pipeline = _get_kokoro_pipeline(lang_code)
+        _debug(
+            f"kokoro: synthesis start (voice={voice}, speed={KOKORO_SPEED}, "
+            f"{len(text)} chars)"
+        )
         segments = []
         for _, _, audio in pipeline(text, voice=voice, speed=KOKORO_SPEED):
             if audio is not None:
                 segments.append(audio)
         if not segments:
+            _debug("kokoro: synthesis produced NO audio segments")
             return False
-        sd.play(np.concatenate(segments), samplerate=KOKORO_SR)
+        samples = np.concatenate(segments)
+        _debug(
+            f"kokoro: synthesis done ({len(samples)} samples, "
+            f"{len(samples) / KOKORO_SR:.2f}s)"
+        )
+        _log_audio_device()
+        _debug("kokoro: playback start")
+        sd.play(samples, samplerate=KOKORO_SR)
         if block:
             sd.wait()
+            _debug("kokoro: playback finished")
+        else:
+            _debug("kokoro: playback started (non-blocking)")
         return True
     except Exception as e:
         print(f"⚠️  Kokoro synthesis failed: {e}")
@@ -114,6 +163,10 @@ def speak_openai(text: str, voice: str | None = None, block: bool = True) -> boo
         voice = PROVIDER_DEFAULT_VOICE["openai"]
 
     try:
+        _debug(
+            f"openai: synthesis start (voice={voice}, speed={TTS_SPEED}, "
+            f"{len(text)} chars)"
+        )
         r = requests.post(
             "https://api.openai.com/v1/audio/speech",
             headers={"Authorization": f"Bearer {api_key}"},
@@ -128,9 +181,15 @@ def speak_openai(text: str, voice: str | None = None, block: bool = True) -> boo
         )
         r.raise_for_status()
         audio, sr = sf.read(io.BytesIO(r.content), dtype="float32", always_2d=False)
+        _debug(f"openai: synthesis done ({len(audio)} samples @ {sr}Hz)")
+        _log_audio_device()
+        _debug("openai: playback start")
         sd.play(audio, samplerate=sr)
         if block:
             sd.wait()
+            _debug("openai: playback finished")
+        else:
+            _debug("openai: playback started (non-blocking)")
         return True
     except Exception as e:
         print(f"⚠️  OpenAI TTS failed: {e}")
@@ -176,6 +235,10 @@ def speak_google(text: str, voice: str | None = None, block: bool = True) -> boo
 
     try:
         from google.cloud import texttospeech
+        _debug(
+            f"google: synthesis start (voice={voice}, speed={TTS_SPEED}, "
+            f"{len(text)} chars)"
+        )
         synthesis_input = texttospeech.SynthesisInput(text=text)
         voice_params = texttospeech.VoiceSelectionParams(
             language_code=language_code, name=voice,
@@ -188,9 +251,15 @@ def speak_google(text: str, voice: str | None = None, block: bool = True) -> boo
             input=synthesis_input, voice=voice_params, audio_config=audio_config,
         )
         audio, sr = sf.read(io.BytesIO(response.audio_content), dtype="float32", always_2d=False)
+        _debug(f"google: synthesis done ({len(audio)} samples @ {sr}Hz)")
+        _log_audio_device()
+        _debug("google: playback start")
         sd.play(audio, samplerate=sr)
         if block:
             sd.wait()
+            _debug("google: playback finished")
+        else:
+            _debug("google: playback started (non-blocking)")
         return True
     except Exception as e:
         print(f"⚠️  Google TTS failed: {e}")
@@ -208,16 +277,22 @@ def _speak_blocking(text: str):
     """One synthesis pass through the dispatcher. Used by both the public
     ``speak`` entrypoint and the streaming worker."""
     provider = get_active_tts_provider()
+    _debug(f"_speak_blocking: dispatch start (provider={provider!r})")
 
     if provider == "openai" and get_api_key("openai"):
         if speak_openai(text, block=True):
+            _debug("_speak_blocking: dispatch done (openai)")
             return
+        _debug("_speak_blocking: openai FAILED — falling back to kokoro")
     elif provider == "google" and get_api_key("google"):
         if speak_google(text, block=True):
+            _debug("_speak_blocking: dispatch done (google)")
             return
+        _debug("_speak_blocking: google FAILED — falling back to kokoro")
 
     # Local provider — and the fallback when a cloud provider fails.
-    speak_kokoro(text, block=True)
+    ok = speak_kokoro(text, block=True)
+    _debug(f"_speak_blocking: dispatch done (kokoro, success={ok})")
 
 
 def speak(text: str, block: bool = True):
@@ -228,10 +303,13 @@ def speak(text: str, block: bool = True):
     effect without a restart.
     """
     if not text or not text.strip():
+        _debug("speak() called with empty text — nothing to do")
         return
+    _debug(f"speak() called (block={block}, {len(text)} chars)")
     print(f"🔊 Speaking: {text[:80]}{'...' if len(text) > 80 else ''}")
     if block:
         _speak_blocking(text)
+        _debug("speak() returned")
     else:
         threading.Thread(
             target=_speak_blocking, args=(text,), daemon=True,
@@ -267,7 +345,12 @@ def _stream_worker():
             return
         epoch, text = item
         if epoch != _current_epoch():
-            continue  # stale — a stop() happened after this was enqueued
+            # stale — a stop() happened after this was enqueued
+            _debug(
+                f"stream worker: DROPPING stale sentence "
+                f"(epoch {epoch} != current {_current_epoch()}): {text[:60]!r}"
+            )
+            continue
         try:
             print(f"🔊 Speaking: {text[:80]}{'...' if len(text) > 80 else ''}")
             _speak_blocking(text)
@@ -282,9 +365,12 @@ def speak_streaming(text: str):
     """
     global _stream_thread
     if not text or not text.strip():
+        _debug("speak_streaming() called with empty text — nothing to queue")
         return
+    _debug(f"speak_streaming() queued ({len(text)} chars): {text[:60]!r}")
     with _stream_lock:
         if _stream_thread is None or not _stream_thread.is_alive():
+            _debug("speak_streaming(): starting stream worker thread")
             _stream_thread = threading.Thread(
                 target=_stream_worker, daemon=True, name="osia-tts-stream",
             )
@@ -307,11 +393,16 @@ def stop() -> None:
     global _tts_epoch
     with _tts_epoch_lock:
         _tts_epoch += 1
+    _debug(f"stop() called — epoch bumped to {_tts_epoch}, draining queue")
+    drained = 0
     while True:
         try:
             _stream_queue.get_nowait()
+            drained += 1
         except queue.Empty:
             break
+    if drained:
+        _debug(f"stop(): drained {drained} pending sentence(s)")
     try:
         sd.stop()
     except Exception as e:

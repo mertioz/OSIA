@@ -34,7 +34,12 @@ import subprocess
 import threading
 import time
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
+
+# Timeout exceptions that mean "the page is just slow" — never a hard failure.
+# Playwright's TimeoutError is caught alongside the builtin for safety across
+# Playwright versions (newer versions subclass the builtin, older don't).
+_TIMEOUT_ERRORS = (PlaywrightTimeoutError, TimeoutError)
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
@@ -95,6 +100,11 @@ _page = None           # Active Playwright Page
 #   None   -> no browser connected yet (next tool call picks one)
 _active_browser_type = None
 _lock = threading.Lock()
+# Launch-in-flight flags. They prevent the race where two tool calls (e.g.
+# the agent calling open_browser twice in one batch) both see "no browser
+# running" before the first launch finishes, and each spawn a window.
+_cdp_launching = False
+_firefox_launching = False
 
 
 # ── CDP lifecycle ──────────────────────────────────────────────────────────
@@ -212,9 +222,28 @@ def _detect_firefox() -> str | None:
     return None
 
 
-def _launch_cdp_browser() -> tuple[bool, str]:
+def _wait_for_cdp(timeout: float) -> bool:
+    """Poll until a CDP debugger responds on ``CDP_PORT`` or ``timeout`` elapses."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _is_cdp_alive():
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _launch_cdp_browser(binary: str | None = None) -> tuple[bool, str]:
     """Spawn Brave (or another Chromium browser if Brave isn't installed)
     against OSIA's dedicated profile at ``/home/OSIA/.osia/brave-profile``.
+
+    NEVER launches a second instance: if a CDP debugger already responds on
+    ``CDP_PORT`` the existing window is reused, and if another launch is
+    already in flight (``_cdp_launching``) this call waits for that launch
+    instead of spawning its own process.
+
+    ``binary`` optionally forces a specific Chromium binary (used by
+    ``open_browser`` when the user asks for a browser by name); by default
+    the first installed candidate is used.
 
     The dedicated profile keeps OSIA's cookies, sessions, and history
     isolated from — and persistent across restarts independently of —
@@ -222,7 +251,23 @@ def _launch_cdp_browser() -> tuple[bool, str]:
 
     Returns ``(success, message)``.
     """
-    browser = _detect_chromium_browser()
+    global _cdp_launching
+
+    # Reuse: a CDP browser is already up — never open a second window.
+    if _is_cdp_alive():
+        return True, f"reusing CDP browser already running on port {CDP_PORT}"
+
+    # Another call is already launching — wait for its debugger to come
+    # online instead of racing it with a second process.
+    if _cdp_launching:
+        if _wait_for_cdp(15.0):
+            return True, f"reusing CDP browser launched by a concurrent call on port {CDP_PORT}"
+        return False, (
+            f"another CDP launch was in progress but the debugger never came "
+            f"online on port {CDP_PORT}"
+        )
+
+    browser = binary or _detect_chromium_browser()
     if not browser:
         return False, (
             "No CDP-capable browser found — install brave-browser, chromium, "
@@ -243,25 +288,26 @@ def _launch_cdp_browser() -> tuple[bool, str]:
         "refusing to launch CDP browser without --user-data-dir pointing at "
         f"the OSIA profile ({OSIA_PROFILE_DIR})"
     )
+    _cdp_launching = True
     try:
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except Exception as e:
-        return False, f"failed to launch {browser}: {e}"
+        try:
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as e:
+            return False, f"failed to launch {browser}: {e}"
 
-    # Poll for the debugger socket — Chromium typically needs ~0.5-2s.
-    deadline = time.time() + 10.0
-    while time.time() < deadline:
-        if _is_cdp_alive():
+        # Poll for the debugger socket — Chromium typically needs ~0.5-2s.
+        if _wait_for_cdp(10.0):
             return True, f"launched {os.path.basename(browser)} with CDP on port {CDP_PORT}"
-        time.sleep(0.2)
-    return False, (
-        f"launched {browser} but CDP did not come online on port {CDP_PORT} within 10s"
-    )
+        return False, (
+            f"launched {browser} but CDP did not come online on port {CDP_PORT} within 10s"
+        )
+    finally:
+        _cdp_launching = False
 
 
 def _ensure_browser():
@@ -336,16 +382,22 @@ def _ensure_cdp_browser():
 # ── Firefox over WebDriver BiDi ────────────────────────────────────────────
 
 def _is_bidi_alive() -> bool:
-    """Return True if the BiDi-launched Firefox is still running and connected."""
-    if _browser is not None:
-        try:
-            return _browser.is_connected()
-        except Exception:
-            return False
+    """Return True if the BiDi-launched Firefox is still running and connected.
+
+    The context check comes first: ``launch_persistent_context()`` may hand
+    back a ``Browser`` whose ``is_connected()`` is unreliable (or ``None``)
+    on some Playwright versions, and treating a live Firefox as dead is what
+    causes duplicate windows.
+    """
     if _context is not None:
         try:
             _ = _context.pages  # raises once the context is closed
             return True
+        except Exception:
+            pass
+    if _browser is not None:
+        try:
+            return _browser.is_connected()
         except Exception:
             return False
     return False
@@ -355,13 +407,40 @@ def _ensure_firefox_bidi():
     """Ensure the Playwright-launched Firefox (WebDriver BiDi) is running and
     return an active Page. (Re)launches Firefox if it isn't running or was
     closed by the user.
+
+    NEVER launches a second instance: if Firefox is already open and
+    controlled (``_active_browser_type == "bidi"`` and the context is alive)
+    the existing window is reused, and if another launch is already in
+    flight (``_firefox_launching``) this call waits for it instead of
+    spawning its own Firefox process.
     """
     global _playwright, _browser, _context, _page, _active_browser_type
+    global _firefox_launching
 
     if _playwright is None:
         _playwright = sync_playwright().start()
 
+    # Reuse: Firefox is already open and controlled over BiDi.
+    if _active_browser_type == "bidi" and _is_bidi_alive():
+        pages = _context.pages
+        _page = pages[-1] if pages else _context.new_page()
+        return _page
+
     if not _is_bidi_alive():
+        # Another call is already launching Firefox — wait for it to finish
+        # rather than racing it with a second window.
+        if _firefox_launching:
+            deadline = time.time() + 30.0
+            while time.time() < deadline and _firefox_launching:
+                time.sleep(0.2)
+            if _is_bidi_alive():
+                pages = _context.pages
+                _page = pages[-1] if pages else _context.new_page()
+                return _page
+            raise RuntimeError(
+                "another Firefox BiDi launch was in progress but never came online"
+            )
+
         firefox = _detect_firefox()
         if not firefox:
             raise RuntimeError(
@@ -369,20 +448,24 @@ def _ensure_firefox_bidi():
                 "in /usr/bin, /snap/bin, and $PATH"
             )
         os.makedirs(FIREFOX_PROFILE_DIR, exist_ok=True)
-        # launch_persistent_context() is Playwright's supported way to run
-        # Firefox with `--profile <dir>` (passing --profile via args= is
-        # rejected by Playwright), so cookies / logins persist between OSIA
-        # uses. channel="moz-firefox" selects the WebDriver BiDi protocol
-        # against the stock system Firefox resolved by _detect_firefox()
-        # instead of Playwright's bundled (Juggler-patched) build.
-        _context = _playwright.firefox.launch_persistent_context(
-            FIREFOX_PROFILE_DIR,
-            headless=False,
-            channel="moz-firefox",
-            executable_path=firefox,
-        )
-        _browser = _context.browser  # may be None on older Playwright versions
-        _active_browser_type = "bidi"
+        _firefox_launching = True
+        try:
+            # launch_persistent_context() is Playwright's supported way to run
+            # Firefox with `--profile <dir>` (passing --profile via args= is
+            # rejected by Playwright), so cookies / logins persist between OSIA
+            # uses. channel="moz-firefox" selects the WebDriver BiDi protocol
+            # against the stock system Firefox resolved by _detect_firefox()
+            # instead of Playwright's bundled (Juggler-patched) build.
+            _context = _playwright.firefox.launch_persistent_context(
+                FIREFOX_PROFILE_DIR,
+                headless=False,
+                channel="moz-firefox",
+                executable_path=firefox,
+            )
+            _browser = _context.browser  # may be None on older Playwright versions
+            _active_browser_type = "bidi"
+        finally:
+            _firefox_launching = False
 
     # Reuse an existing page if there is one; otherwise open a fresh tab.
     pages = _context.pages
@@ -464,19 +547,42 @@ def navigate(url: str):
     ``--remote-debugging-port=9222`` if not already running, then drives
     the page via CDP. Returns ``{"text": ..., "screenshot": ...}`` on
     success so the agent can visually verify the page that loaded.
+
+    The navigation waits only until it commits (response received), then
+    gives the DOM a short window (3s) to become ready. A slow page is NOT
+    an error and never blocks the agent: the result is returned right away
+    and the page keeps loading in the background, so there is no need to
+    call ``wait_for_load()`` after navigating.
     """
     url = _normalize_url(url)
     with _lock:
         try:
             page = _ensure_browser()
-            page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            try:
-                page.bring_to_front()
-            except Exception:
-                pass
-            return _result(f"Navigated to: {_page_url(page)}", page)
         except Exception as e:
             return f"ERROR navigating to {url}: {e}"
+        try:
+            page.goto(url, wait_until="commit", timeout=10000)
+        except _TIMEOUT_ERRORS:
+            # Slow server — the navigation keeps going in the browser.
+            return _result(
+                f"Navigated to: {_page_url(page)} (still loading — "
+                "page may still be loading resources)",
+                page,
+            )
+        except Exception as e:
+            return f"ERROR navigating to {url}: {e}"
+        # Built-in short wait so the agent never has to wait manually after
+        # navigate: up to 3s for the DOM, then continue regardless.
+        note = ""
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=3000)
+        except Exception:
+            note = " (DOM still loading — page may still be loading resources)"
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        return _result(f"Navigated to: {_page_url(page)}{note}", page)
 
 
 def click(selector: str):
@@ -657,6 +763,55 @@ def _open_firefox_bidi(url: str | None):
             )
 
 
+def _open_cdp_browser(binary: str, url: str | None):
+    """Open (or reuse) a CDP-driven Chromium browser, optionally navigate to
+    ``url``, and make it the active automated browser.
+
+    If a CDP browser is already alive on port ``CDP_PORT`` the existing
+    window is reused — a second window is NEVER opened. Otherwise ``binary``
+    is launched with remote debugging enabled so this window (and not a
+    later duplicate) is the one every page tool drives.
+
+    Returns the tool result on success, or ``None`` if the CDP launch or
+    connection failed (the caller then falls back to a plain application
+    launch).
+    """
+    with _lock:
+        reused = _is_cdp_alive()
+        try:
+            # Hand off from BiDi if Firefox was active: close the OSIA-owned
+            # Firefox (its sessions persist in the profile) so the page tools
+            # drive the Chromium window from now on.
+            if _active_browser_type == "bidi":
+                _disconnect_active_browser()
+            if not reused:
+                ok, msg = _launch_cdp_browser(binary)
+                if not ok:
+                    print(f"[OSIA Browser] CDP launch failed: {msg}")
+                    return None
+            page = _ensure_cdp_browser()
+        except Exception as e:
+            print(f"[OSIA Browser] CDP connect failed: {e}")
+            return None
+
+        label = _canonical_browser_name(binary)
+        verb = "Reusing existing" if reused else "Opened"
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        if not url:
+            return _result(f"{verb} {label} window (CDP on port {CDP_PORT})", page)
+        try:
+            page.goto(_normalize_url(url), wait_until="domcontentloaded", timeout=20000)
+            return _result(f"{verb} {label} window at {_page_url(page)}", page)
+        except Exception as e:
+            return _result(
+                f"{verb} {label} window but navigating to {url!r} failed: {e}",
+                page,
+            )
+
+
 def open_browser(name: str, url: str | None = None):
     """Open a specific browser by user-facing name (firefox, chrome,
     chromium, opera, edge, brave), optionally at ``url``.
@@ -667,8 +822,14 @@ def open_browser(name: str, url: str | None = None):
     a CDP browser. If the BiDi launch fails, Firefox is opened as a plain
     application instead.
 
-    Other browsers are launched as regular applications. Use this tool when
-    the user asks to open a *specific* browser ("open Firefox", "open Chrome").
+    Chromium-based browsers (brave, chrome, chromium, opera, edge) are
+    driven over CDP: if a CDP window is already running it is REUSED (never
+    a second window); otherwise the browser is launched with remote
+    debugging enabled so the page tools can drive it. Only if the CDP path
+    fails entirely is the browser opened as a plain application.
+
+    Use this tool when the user asks to open a *specific* browser
+    ("open Firefox", "open Chrome").
 
     Every browser is launched against a dedicated OSIA profile (see
     ``_profile_args``), never the user's personal profile.
@@ -688,12 +849,14 @@ def open_browser(name: str, url: str | None = None):
             return result
         # BiDi failed — fall through to the plain application launch below.
         bidi_note = " (WebDriver BiDi unavailable — page tools cannot drive this window)"
-    elif _active_browser_type == "bidi":
-        # Switching from Firefox to a Chromium browser: close the OSIA-owned
-        # Firefox (its sessions persist in the profile) so the next page tool
-        # reconnects over CDP instead of relaunching Firefox.
-        with _lock:
-            _disconnect_active_browser()
+    else:
+        # CDP-capable browser: reuse the existing CDP window or launch one
+        # with remote debugging enabled. Never opens a duplicate window.
+        result = _open_cdp_browser(binary, url)
+        if result is not None:
+            return result
+        # CDP failed — fall through to the plain application launch below.
+        bidi_note = " (CDP unavailable — page tools cannot drive this window)"
 
     cmd = [binary, *_profile_args(binary)]
     if url:
@@ -753,12 +916,29 @@ def find_and_click(text: str):
 
 
 def wait_for_load() -> str:
-    """Wait for the active page to finish loading (network idle, up to 15s)."""
+    """Wait for the active page's DOM to be ready (domcontentloaded, max 8s).
+
+    Uses ``domcontentloaded`` rather than ``load``/``networkidle`` so the
+    wait ends as soon as the DOM is usable, without waiting for every image,
+    script, or ad. Never blocks the agent: a timeout is success, not an
+    error — the page simply keeps loading resources in the background.
+
+    Mostly unnecessary now that ``navigate()`` waits for the DOM itself;
+    kept as a tool for pages that re-render after the initial load.
+    """
     with _lock:
         try:
             page = _ensure_browser()
-            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception as e:
+            return f"ERROR waiting for load: {e}"
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=8000)
             return f"Page loaded: {_page_url(page)}"
+        except _TIMEOUT_ERRORS:
+            return (
+                f"Page loaded (timeout): {_page_url(page)} — "
+                "page may still be loading resources"
+            )
         except Exception as e:
             return f"ERROR waiting for load: {e}"
 

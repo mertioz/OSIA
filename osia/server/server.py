@@ -245,20 +245,40 @@ def synthesize_to_mp3_bytes(text: str) -> bytes:
     from osia.config import get_api_key, get_setting
 
     provider = get_setting("tts_provider", "local") or "local"
+    print(
+        f"[TTS] synthesize_to_mp3_bytes: start "
+        f"(provider={provider!r}, {len(text)} chars)",
+        flush=True,
+    )
 
     # Try configured provider first, fall back to Kokoro
     if provider == "openai" and get_api_key("openai"):
         try:
-            return _openai_to_mp3_bytes(text)
+            mp3 = _openai_to_mp3_bytes(text)
+            print(
+                f"[TTS] synthesize_to_mp3_bytes: done via openai ({len(mp3)} bytes)",
+                flush=True,
+            )
+            return mp3
         except Exception as e:
             print(f"⚠️  OpenAI TTS failed, falling back to Kokoro: {e}")
     elif provider == "google" and get_api_key("google"):
         try:
-            return _google_to_mp3_bytes(text)
+            mp3 = _google_to_mp3_bytes(text)
+            print(
+                f"[TTS] synthesize_to_mp3_bytes: done via google ({len(mp3)} bytes)",
+                flush=True,
+            )
+            return mp3
         except Exception as e:
             print(f"⚠️  Google TTS failed, falling back to Kokoro: {e}")
 
-    return _kokoro_to_mp3_bytes(text)
+    mp3 = _kokoro_to_mp3_bytes(text)
+    print(
+        f"[TTS] synthesize_to_mp3_bytes: done via kokoro ({len(mp3)} bytes)",
+        flush=True,
+    )
+    return mp3
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +821,7 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
                 _ts(t0, "first response_chunk sent to mobile",
                     f"({len(item)} chars: {item[:60]!r})")
             try:
+                print(f"[DEBUG] sending to mobile: {repr(item[:200])}", flush=True)
                 await ws.send_json({"type": "response_chunk", "content": item})
                 sent_chunks.append(item)
             except Exception as e:
@@ -848,6 +869,10 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
             on_sentence=on_sentence,
             on_first_token=on_first_token,
         )
+        print(
+            f"[DEBUG] agent.run() returned: {repr((response_text or '')[:200])}",
+            flush=True,
+        )
     except Exception as e:
         print(f"[OSIA Server] Agent error: {e}")
         traceback.print_exc()
@@ -878,9 +903,24 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
     # that survived the agent's own cleaning. This runs BEFORE the tail
     # flush, the final `response` message, and TTS synthesis — tool markup
     # must never reach the mobile client or be spoken.
+    raw_response_text = response_text or ""
     if response_text:
         from osia.agent import strip_raw_tool_tags
         response_text = strip_raw_tool_tags(response_text).strip()
+    print(
+        f"[DEBUG] cleaned response: {repr((response_text or '')[:200])}",
+        flush=True,
+    )
+    if not response_text and raw_response_text.strip():
+        # The agent returned text but strip_raw_tool_tags() emptied it —
+        # the reply was nothing but tool markup. Surface this loudly: it
+        # means the agent-side cleaning/guards let markup through.
+        print(
+            "[WARN] agent reply stripped to empty by strip_raw_tool_tags() "
+            f"(raw was {len(raw_response_text)} chars: "
+            f"{raw_response_text[:200]!r})",
+            flush=True,
+        )
 
     # Explicit tail flush: if the agent's final response_text has content
     # that wasn't streamed as a chunk (race in the streaming flush path,
@@ -895,6 +935,7 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
             tail = _tail_not_sent(cleaned_full, sent_concat)
             if tail:
                 try:
+                    print(f"[DEBUG] sending to mobile: {repr(tail[:200])}", flush=True)
                     await ws.send_json({"type": "response_chunk", "content": tail})
                     sent_chunks.append(tail)
                     _ts(t0, "tail response_chunk flushed",
@@ -939,15 +980,58 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
         print(f"[OSIA Server]   last 2 history items: {tail_preview}")
 
     if not response_text:
-        response_text = "Désolé, je n'ai pas pu traiter votre demande."
+        # Prefer what was actually streamed to the client over a canned
+        # apology — if sentences went out as response_chunks, the final
+        # text and the TTS must match them.
+        streamed = " ".join(sent_chunks).strip()
+        if streamed:
+            print(
+                "[WARN] empty final response — falling back to the "
+                f"{len(sent_chunks)} streamed chunk(s) ({len(streamed)} chars)",
+                flush=True,
+            )
+            response_text = streamed
+        else:
+            print(
+                "[WARN] empty final response and nothing was streamed — "
+                "using the generic fallback message",
+                flush=True,
+            )
+            response_text = "Désolé, je n'ai pas pu traiter votre demande."
+            # Push the fallback as a chunk too so chunk-based clients
+            # render it instead of an empty reply.
+            try:
+                print(
+                    f"[DEBUG] sending to mobile: {repr(response_text[:200])}",
+                    flush=True,
+                )
+                await ws.send_json({
+                    "type": "response_chunk", "content": response_text,
+                })
+                sent_chunks.append(response_text)
+            except Exception as e:
+                print(f"[OSIA Server] fallback response_chunk send failed: {e}")
 
     # Send the canonical full text once (clients that don't track chunks
     # can rely on this; clients that do can ignore it).
+    print(f"[DEBUG] sending to mobile: {repr(response_text[:200])}", flush=True)
     await ws.send_json({"type": "response", "content": response_text})
 
     # Synthesize TTS off-thread so the event loop keeps serving.
     try:
-        mp3_bytes = await asyncio.to_thread(synthesize_to_mp3_bytes, response_text)
+        tts_text = response_text
+        print(f"[DEBUG] sending to TTS: {repr(tts_text[:200])}", flush=True)
+        print(
+            f"[TTS] server: calling synthesize_to_mp3_bytes() "
+            f"({len(tts_text)} chars)",
+            flush=True,
+        )
+        mp3_bytes = await asyncio.to_thread(synthesize_to_mp3_bytes, tts_text)
+        print(
+            f"[TTS] server: synthesize_to_mp3_bytes() returned "
+            f"({len(mp3_bytes)} bytes)",
+            flush=True,
+        )
         mp3_b64 = base64.b64encode(mp3_bytes).decode("ascii")
         await ws.send_json({
             "type": "audio",
