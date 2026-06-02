@@ -1,6 +1,6 @@
 {
   "smart_routing": false,
-  "selected_model": "llama3.2:3b",
+  "selected_model": "meta-llama/llama-4-scout-17b-16e-instruct",
   "tts_provider": "openai",
   "tts_voice": "nova",
   "language": "en",

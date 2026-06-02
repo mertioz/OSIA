@@ -384,7 +384,12 @@ def wake_mode():
         if active_conv and conv_id == active_conv.get("id"):
             agent.reset()
             active_conv = conversations.create_conversation()
-            popup.set_messages([])
+            try:
+                popup.set_messages([])
+            except RuntimeError:
+                # A chat widget was already deleted on the Qt side — the
+                # popup guards against this too; never crash the handler.
+                pass
         popup.refresh_conversations(active_conv["id"] if active_conv else None)
 
     # ── Model + settings wiring ─────────────────────────────────────────

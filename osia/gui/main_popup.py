@@ -48,6 +48,14 @@ from osia.utils.systemd_manager import (
 )
 from osia import i18n
 
+# sip lets us detect widgets whose C++ side has already been destroyed
+# (accessing them raises RuntimeError otherwise). It ships with PyQt6 but
+# guard the import so a missing module never breaks the GUI.
+try:
+    from PyQt6 import sip
+except ImportError:
+    sip = None
+
 
 # ── Visual constants ────────────────────────────────────────────────────────
 
@@ -114,6 +122,22 @@ def _format_time(ts: str | None) -> str:
         return ts
 
 
+def _is_deleted(widget) -> bool:
+    """True when *widget*'s underlying C++ object has been destroyed.
+
+    Qt can delete child widgets from the C++ side (e.g. while a layout is
+    cleared); the Python wrapper then raises RuntimeError on any access.
+    """
+    if widget is None:
+        return True
+    if sip is not None:
+        try:
+            return sip.isdeleted(widget)
+        except TypeError:
+            pass
+    return False
+
+
 # ── Message bubble ──────────────────────────────────────────────────────────
 
 class _Bubble(QFrame):
@@ -177,9 +201,7 @@ class _ChatPage(QWidget):
         outer.addWidget(self._scroll, 1)
 
         # Empty-state placeholder, swapped out as soon as a message arrives.
-        self._empty = QLabel("Say “OSIA” or type below to start.")
-        self._empty.setObjectName("chatEmpty")
-        self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty = self._build_empty_label()
         self._empty_idx = self._messages_layout.count() - 1
         self._messages_layout.insertWidget(self._empty_idx, self._empty)
 
@@ -218,13 +240,27 @@ class _ChatPage(QWidget):
 
     def clear_messages(self) -> None:
         # Remove every widget except the trailing stretch + empty label.
-        while self._messages_layout.count() > 1:
-            item = self._messages_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        self._empty.show()
-        self._messages_layout.insertWidget(0, self._empty)
+        # Every Qt access is guarded: widgets can already be deleted on the
+        # C++ side (e.g. when the last conversation is removed), and touching
+        # them raises RuntimeError ("wrapped C/C++ object ... deleted").
+        try:
+            while self._messages_layout.count() > 1:
+                item = self._messages_layout.takeAt(0)
+                w = item.widget()
+                # Never delete the placeholder itself — deleting it would
+                # leave self._empty wrapping a dead C++ object.
+                if w is not None and w is not self._empty:
+                    w.deleteLater()
+        except RuntimeError:
+            pass
+        if _is_deleted(self._empty):
+            # The placeholder was destroyed earlier — build a fresh one.
+            self._empty = self._build_empty_label()
+        try:
+            self._empty.show()
+            self._messages_layout.insertWidget(0, self._empty)
+        except RuntimeError:
+            pass
 
     def set_messages(self, messages: list[dict]) -> None:
         self.clear_messages()
@@ -236,10 +272,14 @@ class _ChatPage(QWidget):
         ]
         if not renderable:
             return
-        self._empty.hide()
-        for m in renderable:
-            self._append_bubble(m["role"], m.get("content", ""))
-        QTimer.singleShot(0, self._scroll_to_bottom)
+        try:
+            if not _is_deleted(self._empty):
+                self._empty.hide()
+            for m in renderable:
+                self._append_bubble(m["role"], m.get("content", ""))
+            QTimer.singleShot(0, self._scroll_to_bottom)
+        except RuntimeError:
+            pass
 
     def append_message(self, role: str, text: str) -> None:
         if not text:
@@ -251,6 +291,13 @@ class _ChatPage(QWidget):
         QTimer.singleShot(0, self._scroll_to_bottom)
 
     # ── Internals ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_empty_label() -> QLabel:
+        label = QLabel("Say “OSIA” or type below to start.")
+        label.setObjectName("chatEmpty")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        return label
 
     def _append_bubble(self, role: str, text: str) -> None:
         bubble = _Bubble(role, text)
@@ -389,6 +436,10 @@ class _ConversationsPanel(QWidget):
         )
 
         self._host = QWidget()
+        # QScrollArea.setWidget() forces autoFillBackground(True) on the host,
+        # which paints the default grey palette. Name it so the stylesheet can
+        # force it back to transparent and keep the app's dark background.
+        self._host.setObjectName("panelHost")
         self._host_layout = QVBoxLayout(self._host)
         self._host_layout.setContentsMargins(0, 0, 6, 0)
         self._host_layout.setSpacing(6)
@@ -584,6 +635,10 @@ class _ModelPanel(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self._host = QWidget()
+        # QScrollArea.setWidget() forces autoFillBackground(True) on the host,
+        # which paints the default grey palette. Name it so the stylesheet can
+        # force it back to transparent and keep the app's dark background.
+        self._host.setObjectName("panelHost")
         self._host_layout = QVBoxLayout(self._host)
         self._host_layout.setContentsMargins(0, 0, 6, 0)
         self._host_layout.setSpacing(6)
@@ -880,6 +935,9 @@ class _SettingsPanel(QWidget):
         )
 
         host = QWidget()
+        # Same as the other panels: keep the scroll host transparent so the
+        # settings page shows the app's dark background, not the grey palette.
+        host.setObjectName("panelHost")
         v = QVBoxLayout(host)
         v.setContentsMargins(0, 0, 6, 0)
         v.setSpacing(14)
@@ -1681,9 +1739,16 @@ class MainPopup(QWidget):
             }
 
             QScrollArea#chatScroll, QScrollArea#panelScroll,
-            QWidget#chatHost {
+            QWidget#chatHost, QWidget#panelHost {
                 background: transparent;
                 border: none;
+            }
+            /* The scroll-area viewport + its host pick up an opaque grey
+               palette background by default — force every layer back to
+               transparent so panels sit on the app's dark #0d0b12 glass. */
+            QScrollArea#chatScroll > QWidget > QWidget,
+            QScrollArea#panelScroll > QWidget > QWidget {
+                background: transparent;
             }
 
             /* Chat ───────────────────────────────────────────────────── */
