@@ -19,6 +19,7 @@ DEFAULT_SETTINGS = {
     "selected_model": None,
     "tts_provider": "local",   # one of: "local", "openai", "google"
     "tts_voice": None,         # provider-specific voice id; None = provider default
+    "language": "en",          # UI language; one of osia.i18n.LANGUAGES
 }
 
 

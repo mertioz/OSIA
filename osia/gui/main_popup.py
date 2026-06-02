@@ -19,7 +19,7 @@ GUI knowing about threads or persistence.
 """
 
 import math
-import threading
+import webbrowser
 from datetime import datetime
 
 from PyQt6.QtCore import (
@@ -32,13 +32,13 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QStackedWidget, QFrame, QGraphicsDropShadowEffect,
-    QSizePolicy, QFileDialog, QCheckBox, QComboBox, QDialog, QMessageBox,
-    QButtonGroup,
+    QSizePolicy, QFileDialog, QCheckBox, QComboBox,
+    QButtonGroup, QGridLayout, QMenu,
 )
 
 from osia import conversations
 from osia.models import (
-    PROVIDERS, API_PROVIDERS, HARDCODED_MODELS, get_all_models,
+    PROVIDERS, API_PROVIDERS, get_all_models,
 )
 from osia.config import (
     load_api_keys, save_api_keys, load_settings, set_setting, set_api_key,
@@ -46,7 +46,7 @@ from osia.config import (
 from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
 )
-from osia.auth import oauth as oauth_module
+from osia import i18n
 
 
 # ── Visual constants ────────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ RADIUS = 20
 # Dark, semi-transparent glassmorphism fill so the popup reads as a floating
 # glass panel rather than an opaque window. Lower alpha → more transparent;
 # a second, slightly lighter layer painted on top fakes a soft blur/frost.
-BG_COLOR = QColor(13, 11, 18, 180)
+BG_COLOR = QColor(13, 11, 18, 220)
 BG_BLUR_LAYER = QColor(26, 22, 37, 70)      # #1a1625 wash for a frosted feel
 BORDER_COLOR = QColor(196, 181, 245, 70)    # subtle violet edge
 PANEL_BG = QColor(255, 255, 255, 10)
@@ -69,6 +69,27 @@ TEXT_DIM = QColor(245, 245, 250, 150)
 DIVIDER = QColor(255, 255, 255, 18)
 
 STARTUP_SERVICES = ("osia-server.service", "osia-tunnel.service")
+
+# Official API-key pages opened by the "Get API key" → Browse button on each
+# provider's configuration card. Ollama is local and has no key page.
+PROVIDER_KEY_URLS = {
+    "anthropic": "https://console.anthropic.com/settings/keys",
+    "openai":    "https://platform.openai.com/api-keys",
+    "google":    "https://aistudio.google.com/apikey",
+    "deepseek":  "https://platform.deepseek.com/api_keys",
+    "xai":       "https://console.x.ai",
+}
+
+# Per-provider accent colors used for the dot indicators on the model panel
+# provider grid and the settings provider rows.
+PROVIDER_COLORS = {
+    "anthropic": "#d97757",   # Anthropic clay
+    "openai":    "#10a37f",   # OpenAI teal
+    "deepseek":  "#4d6bfe",   # DeepSeek blue
+    "google":    "#4285f4",   # Google blue
+    "xai":       "#cfcfcf",   # xAI light
+    "ollama":    "#69c88c",   # Local green
+}
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -279,10 +300,15 @@ class _ConvRow(QFrame):
         title_col = QVBoxLayout()
         title_col.setContentsMargins(0, 0, 0, 0)
         title_col.setSpacing(2)
-        title = QLabel(conv.get("title") or "New conversation")
+        self._full_title = conv.get("title") or "New conversation"
+        title = QLabel(self._full_title)
         title.setObjectName("convTitle")
         title.setWordWrap(False)
         title.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        # Width is ignored so a long title never widens the row; it is elided
+        # with an ellipsis (…) in resizeEvent instead of overflowing.
+        title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._title_label = title
         sub = QLabel(
             f"{conv.get('message_count', 0)} msg · "
             f"{_format_time(conv.get('updated_at'))}"
@@ -305,6 +331,16 @@ class _ConvRow(QFrame):
         row.addLayout(title_col, 1)
         row.addWidget(open_btn)
         row.addWidget(del_btn)
+
+    def resizeEvent(self, event):
+        fm = self._title_label.fontMetrics()
+        self._title_label.setText(
+            fm.elidedText(
+                self._full_title, Qt.TextElideMode.ElideRight,
+                max(0, self._title_label.width()),
+            )
+        )
+        super().resizeEvent(event)
 
 
 class _ConversationsPanel(QWidget):
@@ -338,6 +374,9 @@ class _ConversationsPanel(QWidget):
         scroll.setObjectName("panelScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
 
         self._host = QWidget()
         self._host_layout = QVBoxLayout(self._host)
@@ -414,8 +453,59 @@ class _ModelRow(QFrame):
         row.addWidget(btn)
 
 
+class _ProviderGridCard(QFrame):
+    """A provider tile in the model panel's first-level grid.
+
+    Shows a colored dot indicator, the provider name and how many models it
+    exposes. Clicking it drills into that provider's model list.
+    """
+
+    clicked = pyqtSignal(str)   # provider key
+
+    def __init__(self, provider: str, color: str, model_count: int):
+        super().__init__()
+        self.setObjectName("provGridCard")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._provider = provider
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(6)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        # Single subtle violet dot for every provider (no per-provider colour).
+        dot = QLabel()
+        dot.setFixedSize(8, 8)
+        dot.setStyleSheet("background: #c4b5f5; border-radius: 4px;")
+        name = QLabel(PROVIDERS.get(provider, {}).get("name") or provider.title())
+        name.setObjectName("provGridName")
+        top.addWidget(dot)
+        top.addWidget(name)
+        top.addStretch()
+        lay.addLayout(top)
+
+        count = QLabel(
+            f"{model_count} model{'s' if model_count != 1 else ''}"
+        )
+        count.setObjectName("provGridCount")
+        lay.addWidget(count)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._provider)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class _ModelPanel(QWidget):
-    """List of all available models, click to select."""
+    """Two-level model picker.
+
+    First level is a grid of provider cards; clicking one drills into a list
+    of that provider's models with "Use" buttons. A "← Back" button returns
+    to the provider grid.
+    """
 
     model_changed = pyqtSignal(str)
 
@@ -425,26 +515,37 @@ class _ModelPanel(QWidget):
         super().__init__()
         self._current_model: str | None = None
         self._remote: list = []
+        self._view: str | None = None   # None = provider grid, else provider key
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 12, 14, 12)
         outer.setSpacing(10)
 
         header = QHBoxLayout()
-        title = QLabel("Models")
-        title.setObjectName("panelTitle")
-        header.addWidget(title)
+        header.setSpacing(8)
+        self._back_btn = QPushButton("←  Back")
+        self._back_btn.setObjectName("backBtn")
+        self._back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._back_btn.clicked.connect(self._show_grid)
+        self._back_btn.hide()
+        self._title = QLabel("Models")
+        self._title.setObjectName("panelTitle")
+        header.addWidget(self._back_btn)
+        header.addWidget(self._title)
         header.addStretch()
         outer.addLayout(header)
 
-        sub = QLabel("Pick the model OSIA will use for new messages.")
-        sub.setObjectName("panelSub")
-        outer.addWidget(sub)
+        self._sub = QLabel("Choose a provider to see its models.")
+        self._sub.setObjectName("panelSub")
+        outer.addWidget(self._sub)
 
         scroll = QScrollArea()
         scroll.setObjectName("panelScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self._host = QWidget()
         self._host_layout = QVBoxLayout(self._host)
         self._host_layout.setContentsMargins(0, 0, 6, 0)
@@ -461,31 +562,77 @@ class _ModelPanel(QWidget):
         self._current_model = model_id
         self.refresh()
 
+    # ── Navigation ─────────────────────────────────────────────────────────
+
+    def _show_grid(self) -> None:
+        self._view = None
+        self.refresh()
+
+    def _show_provider(self, provider: str) -> None:
+        self._view = provider
+        self.refresh()
+
     def refresh(self) -> None:
         while self._host_layout.count() > 1:
             item = self._host_layout.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.deleteLater()
+        if self._view is None:
+            self._build_grid()
+        else:
+            self._build_model_list(self._view)
+
+    # ── Level 1: provider grid ──────────────────────────────────────────────
+
+    def _build_grid(self) -> None:
+        self._back_btn.hide()
+        self._title.setText("Models")
+        self._sub.setText("Choose a provider to see its models.")
+
         models = get_all_models(remote_models=self._remote)
-        models.sort(key=lambda m: (
-            self.PROVIDER_ORDER.index(m["provider"])
-            if m["provider"] in self.PROVIDER_ORDER
-            else len(self.PROVIDER_ORDER),
-            m.get("label", ""),
-        ))
-        idx = 0
-        last_provider = None
+        counts: dict[str, int] = {}
         for m in models:
-            if m["provider"] != last_provider:
-                header = QLabel(
-                    PROVIDERS.get(m["provider"], {}).get("name")
-                    or m["provider"].title()
-                )
-                header.setObjectName("modelGroup")
-                self._host_layout.insertWidget(idx, header)
-                idx += 1
-                last_provider = m["provider"]
+            counts[m["provider"]] = counts.get(m["provider"], 0) + 1
+
+        grid_host = QWidget()
+        grid = QGridLayout(grid_host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(8)
+        cols = 2
+        for i, provider in enumerate(self.PROVIDER_ORDER):
+            card = _ProviderGridCard(
+                provider,
+                PROVIDER_COLORS.get(provider, "#c4b5f5"),
+                counts.get(provider, 0),
+            )
+            card.clicked.connect(self._show_provider)
+            grid.addWidget(card, i // cols, i % cols)
+        self._host_layout.insertWidget(0, grid_host)
+
+    # ── Level 2: a provider's model list ────────────────────────────────────
+
+    def _build_model_list(self, provider: str) -> None:
+        self._back_btn.show()
+        self._title.setText(
+            PROVIDERS.get(provider, {}).get("name") or provider.title()
+        )
+        self._sub.setText("Pick the model OSIA will use for new messages.")
+
+        models = [
+            m for m in get_all_models(remote_models=self._remote)
+            if m["provider"] == provider
+        ]
+        models.sort(key=lambda m: m.get("label", ""))
+
+        if not models:
+            empty = QLabel("No models available for this provider.")
+            empty.setObjectName("panelEmpty")
+            self._host_layout.insertWidget(0, empty)
+            return
+
+        idx = 0
+        for m in models:
             row = _ModelRow(m, is_active=(m["id"] == self._current_model))
             row.selected.connect(self.model_changed.emit)
             self._host_layout.insertWidget(idx, row)
@@ -495,16 +642,16 @@ class _ModelPanel(QWidget):
 # ── Settings panel ──────────────────────────────────────────────────────────
 
 class _ProviderCard(QFrame):
-    """One AI provider in the settings page.
+    """One AI provider as a compact configuration card.
 
-    Shows the provider name, a 'Choose / Configure' toggle that reveals an
-    API-key input + Save button. The save button turns green once the key
-    is persisted.
+    A "Get API key" row at the top opens the provider's official key page in
+    the system browser. Beneath it, a row holds the colored status dot, the
+    provider name, an API-key input and a Save button (which flashes green
+    once the key is persisted). Every provider authenticates with its API
+    key only — there is no OAuth.
     """
 
     saved = pyqtSignal(str)            # provider
-    oauth_connect = pyqtSignal(str)    # provider
-    oauth_disconnect = pyqtSignal(str) # provider
 
     def __init__(self, provider: str):
         super().__init__()
@@ -513,85 +660,83 @@ class _ProviderCard(QFrame):
 
         cfg = PROVIDERS[provider]
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(8)
 
-        head_row = QHBoxLayout()
-        head_row.setSpacing(8)
-        name = QLabel(cfg["name"])
-        name.setObjectName("providerName")
+        # "Get API key" row: label + Browse button that opens the provider's
+        # official key page in the system browser.
+        key_url = PROVIDER_KEY_URLS.get(provider)
+        if key_url:
+            get_row = QHBoxLayout()
+            get_row.setSpacing(8)
+            self._get_key_label = QLabel(i18n.t("provider.get_key"))
+            self._get_key_label.setObjectName("providerSub")
+            self._browse_btn = QPushButton(i18n.t("provider.browse"))
+            self._browse_btn.setObjectName("ghostBtn")
+            self._browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._browse_btn.clicked.connect(self._on_browse)
+            get_row.addWidget(self._get_key_label)
+            get_row.addStretch()
+            get_row.addWidget(self._browse_btn)
+            layout.addLayout(get_row)
+        else:
+            self._get_key_label = None
+            self._browse_btn = None
+
+        # Compact row: dot + name + key input + Save
+        key_row = QHBoxLayout()
+        key_row.setSpacing(8)
+
         self._status_dot = QLabel()
         self._status_dot.setObjectName("statusDot")
         self._status_dot.setFixedSize(8, 8)
         self._status_dot.setProperty("state", "stopped")
 
-        self._toggle_btn = QPushButton("Configure")
-        self._toggle_btn.setObjectName("ghostBtn")
-        self._toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._toggle_btn.clicked.connect(self._toggle_body)
+        name = QLabel(cfg["name"])
+        name.setObjectName("providerName")
+        name.setMinimumWidth(72)
 
-        head_row.addWidget(self._status_dot)
-        head_row.addWidget(name)
-        head_row.addStretch()
-        head_row.addWidget(self._toggle_btn)
-        layout.addLayout(head_row)
-
-        # Body — hidden by default
-        self._body = QWidget()
-        body_layout = QVBoxLayout(self._body)
-        body_layout.setContentsMargins(0, 4, 0, 0)
-        body_layout.setSpacing(8)
-
-        models = [m for m in HARDCODED_MODELS if m["provider"] == provider]
-        if models:
-            names = QLabel(", ".join(m["label"] for m in models))
-            names.setObjectName("providerSub")
-            names.setWordWrap(True)
-            body_layout.addWidget(names)
-
-        # OAuth row (only for providers that support it)
-        if provider in oauth_module.PROVIDERS:
-            oauth_row = QHBoxLayout()
-            self._oauth_btn = QPushButton("Se connecter avec Claude")
-            self._oauth_btn.setObjectName("primaryBtn")
-            self._oauth_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            self._oauth_btn.clicked.connect(
-                lambda: self.oauth_connect.emit(self._provider)
-            )
-            self._oauth_label = QLabel("Connecté ✓")
-            self._oauth_label.setObjectName("oauthOk")
-            self._oauth_disc = QPushButton("Déconnecter")
-            self._oauth_disc.setObjectName("linkBtn")
-            self._oauth_disc.setCursor(Qt.CursorShape.PointingHandCursor)
-            self._oauth_disc.clicked.connect(
-                lambda: self.oauth_disconnect.emit(self._provider)
-            )
-            oauth_row.addWidget(self._oauth_btn)
-            oauth_row.addWidget(self._oauth_label)
-            oauth_row.addStretch()
-            oauth_row.addWidget(self._oauth_disc)
-            body_layout.addLayout(oauth_row)
-        else:
-            self._oauth_btn = None
-            self._oauth_label = None
-            self._oauth_disc = None
-
-        # API key row
-        key_row = QHBoxLayout()
         self._key_input = QLineEdit()
         self._key_input.setObjectName("keyInput")
         self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key_input.setPlaceholderText(f"{cfg['name']} API key")
-        self._save_btn = QPushButton("Save")
+        self._key_input.setPlaceholderText(
+            i18n.t("provider.key_placeholder", name=cfg["name"])
+        )
+        self._save_btn = QPushButton(i18n.t("provider.save"))
         self._save_btn.setObjectName("saveBtn")
         self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._save_btn.clicked.connect(self._on_save)
+
+        key_row.addWidget(self._status_dot)
+        key_row.addWidget(name)
         key_row.addWidget(self._key_input, 1)
         key_row.addWidget(self._save_btn)
-        body_layout.addLayout(key_row)
+        layout.addLayout(key_row)
 
-        self._body.hide()
-        layout.addWidget(self._body)
+        # Re-translate in place when the UI language changes.
+        i18n.add_listener(self._retranslate)
+        self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
+
+    def _retranslate(self) -> None:
+        cfg = PROVIDERS[self._provider]
+        if self._get_key_label is not None:
+            self._get_key_label.setText(i18n.t("provider.get_key"))
+        if self._browse_btn is not None:
+            self._browse_btn.setText(i18n.t("provider.browse"))
+        self._key_input.setPlaceholderText(
+            i18n.t("provider.key_placeholder", name=cfg["name"])
+        )
+        # Don't clobber the transient "Saved ✓" flash.
+        if not self._save_btn.property("saved"):
+            self._save_btn.setText(i18n.t("provider.save"))
+
+    def _on_browse(self) -> None:
+        url = PROVIDER_KEY_URLS.get(self._provider)
+        if url:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
 
     def set_key(self, key: str) -> None:
         self._key_input.setText(key or "")
@@ -600,37 +745,13 @@ class _ProviderCard(QFrame):
     def current_key(self) -> str:
         return self._key_input.text().strip()
 
-    def refresh_oauth(self, connected: bool) -> None:
-        if self._oauth_btn is None:
-            return
-        self._oauth_btn.setVisible(not connected)
-        self._oauth_label.setVisible(connected)
-        self._oauth_disc.setVisible(connected)
-        self._update_status_dot(force_connected=connected)
-
-    def _update_status_dot(self, force_connected: bool | None = None) -> None:
-        connected = (
-            force_connected
-            if force_connected is not None
-            else bool(self.current_key())
-        )
-        if (self._oauth_btn is not None
-                and force_connected is None
-                and oauth_module.is_connected(self._provider)):
-            connected = True
+    def _update_status_dot(self) -> None:
+        connected = bool(self.current_key())
         self._status_dot.setProperty(
             "state", "running" if connected else "stopped"
         )
         self._status_dot.style().unpolish(self._status_dot)
         self._status_dot.style().polish(self._status_dot)
-
-    def _toggle_body(self) -> None:
-        if self._body.isVisible():
-            self._body.hide()
-            self._toggle_btn.setText("Configure")
-        else:
-            self._body.show()
-            self._toggle_btn.setText("Hide")
 
     def _on_save(self) -> None:
         key = self.current_key()
@@ -643,14 +764,14 @@ class _ProviderCard(QFrame):
         self.saved.emit(self._provider)
 
     def _flash_saved(self) -> None:
-        self._save_btn.setText("Saved ✓")
+        self._save_btn.setText(i18n.t("provider.saved"))
         self._save_btn.setProperty("saved", True)
         self._save_btn.style().unpolish(self._save_btn)
         self._save_btn.style().polish(self._save_btn)
 
         def restore():
-            self._save_btn.setText("Save")
             self._save_btn.setProperty("saved", False)
+            self._save_btn.setText(i18n.t("provider.save"))
             self._save_btn.style().unpolish(self._save_btn)
             self._save_btn.style().polish(self._save_btn)
 
@@ -660,14 +781,13 @@ class _ProviderCard(QFrame):
 class _SettingsPanel(QWidget):
     """Settings page — redesigned with the 'Choose provider' card style.
 
-    Re-uses the original feature set: smart routing toggle, voice provider
-    selection, startup systemd services, and per-provider API key + OAuth.
+    Re-uses the original feature set: language selection, smart routing
+    toggle, voice provider selection, startup systemd services, and
+    per-provider API key configuration.
     """
 
     smart_routing_toggled = pyqtSignal(bool)
     api_keys_saved = pyqtSignal(dict)
-
-    _oauth_finished = pyqtSignal(str, bool, str)  # provider, ok, message
 
     _TTS_PROVIDER_LABELS = [
         ("local",  "Local (Kokoro)"),
@@ -682,9 +802,6 @@ class _SettingsPanel(QWidget):
         self._startup_refresh_guard = False
         self._startup_rows: list[tuple[str, QLabel, QCheckBox]] = []
         self._drag_pos: QPoint | None = None
-        self._oauth_dialog: QDialog | None = None
-
-        self._oauth_finished.connect(self._on_oauth_finished)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 12, 14, 12)
@@ -708,12 +825,16 @@ class _SettingsPanel(QWidget):
         scroll.setObjectName("panelScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
 
         host = QWidget()
         v = QVBoxLayout(host)
         v.setContentsMargins(0, 0, 6, 0)
         v.setSpacing(14)
 
+        v.addWidget(self._build_language_section())
         v.addWidget(self._build_smart_section())
         v.addWidget(self._build_startup_section())
         v.addWidget(self._build_voice_section())
@@ -732,6 +853,44 @@ class _SettingsPanel(QWidget):
         self._startup_timer.timeout.connect(self._refresh_startup_status)
 
     # ── Section builders ──────────────────────────────────────────────────
+
+    def _build_language_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._language_title = QLabel(i18n.t("settings.language"))
+        self._language_title.setObjectName("sectionTitle")
+        self._language_sub = QLabel(i18n.t("settings.language_sub"))
+        self._language_sub.setObjectName("sectionSub")
+        self._language_sub.setWordWrap(True)
+        l.addWidget(self._language_title)
+        l.addWidget(self._language_sub)
+
+        self._language_combo = QComboBox()
+        self._language_combo.setObjectName("voiceCombo")
+        for code, name in i18n.available_languages().items():
+            self._language_combo.addItem(name, code)
+        self._language_combo.currentIndexChanged.connect(self._on_language_changed)
+        l.addWidget(self._language_combo)
+
+        # Keep this section's own labels translated on language change.
+        i18n.add_listener(self._retranslate_language_section)
+        self.destroyed.connect(
+            lambda: i18n.remove_listener(self._retranslate_language_section)
+        )
+        return wrap
+
+    def _retranslate_language_section(self) -> None:
+        self._language_title.setText(i18n.t("settings.language"))
+        self._language_sub.setText(i18n.t("settings.language_sub"))
+
+    def _on_language_changed(self, _idx: int) -> None:
+        code = self._language_combo.currentData()
+        if code:
+            i18n.set_language(code)
 
     def _build_smart_section(self) -> QWidget:
         wrap = QFrame()
@@ -853,6 +1012,9 @@ class _SettingsPanel(QWidget):
 
         return wrap
 
+    # Order in which providers appear in the "Choose provider" menu.
+    _PROVIDER_MENU_ORDER = ("anthropic", "openai", "deepseek", "google", "xai", "ollama")
+
     def _build_ai_providers_section(self) -> QFrame:
         wrap = QFrame()
         wrap.setObjectName("section")
@@ -862,35 +1024,80 @@ class _SettingsPanel(QWidget):
 
         title = QLabel("AI providers")
         title.setObjectName("sectionTitle")
-        sub = QLabel("Configure an API key for each provider you want to use.")
+        sub = QLabel("Choose a provider and configure its API key.")
         sub.setObjectName("sectionSub")
         sub.setWordWrap(True)
         l.addWidget(title)
         l.addWidget(sub)
 
+        # Single "Choose provider" button that opens a dropdown.
+        self._choose_btn = QPushButton("Choose provider  ▾")
+        self._choose_btn.setObjectName("chooseProviderBtn")
+        self._choose_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._choose_btn.clicked.connect(self._open_provider_menu)
+        l.addWidget(self._choose_btn)
+
+        # One configuration row per API provider; only one is shown at a time.
         for provider in API_PROVIDERS:
             card = _ProviderCard(provider)
             card.saved.connect(self._on_provider_saved)
-            card.oauth_connect.connect(self._on_oauth_connect)
-            card.oauth_disconnect.connect(self._on_oauth_disconnect)
+            card.hide()
             l.addWidget(card)
             self._provider_cards[provider] = card
 
-        # Ollama is keyless — show it as info only.
-        ollama_card = QFrame()
-        ollama_card.setObjectName("providerCard")
-        ol = QVBoxLayout(ollama_card)
-        ol.setContentsMargins(14, 12, 14, 12)
+        # Ollama is keyless — show it as an info-only row.
+        self._ollama_row = QFrame()
+        self._ollama_row.setObjectName("providerCard")
+        ol = QVBoxLayout(self._ollama_row)
+        ol.setContentsMargins(12, 10, 12, 10)
         olh = QHBoxLayout()
-        olh.addWidget(QLabel("Local (Ollama)"))
+        olh.setSpacing(8)
+        ol_name = QLabel(PROVIDERS["ollama"]["name"])
+        ol_name.setObjectName("providerName")
+        olh.addWidget(ol_name)
         olh.addStretch()
-        tag = QLabel("No key required")
-        tag.setObjectName("providerSub")
-        olh.addWidget(tag)
+        self._ollama_tag = QLabel(i18n.t("provider.no_key_required"))
+        self._ollama_tag.setObjectName("providerSub")
+        i18n.add_listener(
+            lambda: self._ollama_tag.setText(i18n.t("provider.no_key_required"))
+        )
+        olh.addWidget(self._ollama_tag)
         ol.addLayout(olh)
-        l.addWidget(ollama_card)
+        self._ollama_row.hide()
+        l.addWidget(self._ollama_row)
 
+        self._visible_provider: str | None = None
         return wrap
+
+    def _open_provider_menu(self) -> None:
+        menu = QMenu(self)
+        menu.setObjectName("providerMenu")
+        for provider in self._PROVIDER_MENU_ORDER:
+            name = PROVIDERS.get(provider, {}).get("name") or provider.title()
+            act = menu.addAction(name)
+            act.triggered.connect(
+                lambda _checked=False, p=provider: self._select_provider(p)
+            )
+        menu.exec(
+            self._choose_btn.mapToGlobal(self._choose_btn.rect().bottomLeft())
+        )
+
+    def _select_provider(self, provider: str) -> None:
+        # Hide every provider row, then reveal the chosen one.
+        for card in self._provider_cards.values():
+            card.hide()
+        self._ollama_row.hide()
+
+        if provider == "ollama":
+            self._ollama_row.show()
+        else:
+            card = self._provider_cards.get(provider)
+            if card is not None:
+                card.show()
+
+        name = PROVIDERS.get(provider, {}).get("name") or provider.title()
+        self._choose_btn.setText(f"{name}  ▾")
+        self._visible_provider = provider
 
     # ── State load / save ─────────────────────────────────────────────────
 
@@ -898,10 +1105,17 @@ class _SettingsPanel(QWidget):
         keys = load_api_keys()
         for provider, card in self._provider_cards.items():
             card.set_key(keys.get(provider, ""))
-            if provider in oauth_module.PROVIDERS:
-                card.refresh_oauth(oauth_module.is_connected(provider))
 
         settings = load_settings()
+
+        lang = settings.get("language", i18n.DEFAULT_LANG) or i18n.DEFAULT_LANG
+        self._language_combo.blockSignals(True)
+        for i in range(self._language_combo.count()):
+            if self._language_combo.itemData(i) == lang:
+                self._language_combo.setCurrentIndex(i)
+                break
+        self._language_combo.blockSignals(False)
+
         self._smart_toggle.blockSignals(True)
         self._smart_toggle.setChecked(bool(settings.get("smart_routing", False)))
         self._smart_toggle.blockSignals(False)
@@ -955,99 +1169,6 @@ class _SettingsPanel(QWidget):
 
     def _on_provider_saved(self, _provider: str) -> None:
         self.api_keys_saved.emit(load_api_keys())
-
-    def _on_oauth_connect(self, provider: str) -> None:
-        try:
-            session = oauth_module.start_oauth_flow(provider)
-        except oauth_module.OAuthError as e:
-            QMessageBox.warning(self, "Connexion impossible", str(e))
-            return
-        self._prompt_oauth_code(provider, session)
-
-    def _prompt_oauth_code(self, provider: str, session) -> None:
-        """Show a non-blocking dialog asking for the pasted auth code.
-
-        Uses ``QDialog.show()`` (non-blocking) instead of ``exec()`` so the
-        user can keep interacting with the browser and other windows while
-        the code is being entered.
-        """
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Connexion Claude")
-        dialog.setObjectName("oauthDialog")
-        dialog.setModal(False)
-
-        lay = QVBoxLayout(dialog)
-        lay.setContentsMargins(16, 16, 16, 16)
-        lay.setSpacing(10)
-
-        label = QLabel(
-            "Authentifiez-vous dans le navigateur. Collez le code ici :"
-        )
-        label.setWordWrap(True)
-
-        code_input = QLineEdit()
-        code_input.setObjectName("keyInput")
-        code_input.setPlaceholderText("Code d'autorisation")
-
-        btn_row = QHBoxLayout()
-        cancel_btn = QPushButton("Annuler")
-        cancel_btn.setObjectName("ghostBtn")
-        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        ok_btn = QPushButton("Valider")
-        ok_btn.setObjectName("primaryBtn")
-        ok_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_row.addStretch()
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(ok_btn)
-
-        lay.addWidget(label)
-        lay.addWidget(code_input)
-        lay.addLayout(btn_row)
-
-        cancel_btn.clicked.connect(dialog.reject)
-        ok_btn.clicked.connect(dialog.accept)
-        code_input.returnPressed.connect(dialog.accept)
-
-        def on_finished(result: int) -> None:
-            self._oauth_dialog = None
-            if result != QDialog.DialogCode.Accepted:
-                return
-            code = code_input.text().strip()
-            if code:
-                self._complete_oauth_async(provider, session, code)
-
-        dialog.finished.connect(on_finished)
-        # Keep a reference so the non-blocking dialog isn't garbage-collected.
-        self._oauth_dialog = dialog
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-
-    def _complete_oauth_async(self, provider: str, session, code: str) -> None:
-        def worker():
-            try:
-                oauth_module.complete_oauth_flow(session, code)
-                self._oauth_finished.emit(provider, True, "")
-            except oauth_module.OAuthError as e:
-                self._oauth_finished.emit(provider, False, str(e))
-            except Exception as e:
-                self._oauth_finished.emit(provider, False, f"Erreur: {e}")
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_oauth_disconnect(self, provider: str) -> None:
-        oauth_module.revoke_token(provider)
-        card = self._provider_cards.get(provider)
-        if card is not None:
-            card.refresh_oauth(False)
-
-    def _on_oauth_finished(self, provider: str, ok: bool, message: str) -> None:
-        card = self._provider_cards.get(provider)
-        if card is not None:
-            card.refresh_oauth(oauth_module.is_connected(provider))
-        if not ok:
-            QMessageBox.warning(self, "Connexion échouée",
-                                message or "Échec de l'OAuth")
 
     def _on_startup_toggle_changed(self, unit: str, toggle: QCheckBox) -> None:
         if self._startup_refresh_guard:
@@ -1304,16 +1425,13 @@ class MainPopup(QWidget):
         outer.setContentsMargins(14, 14, 14, 14)
         outer.setSpacing(8)
 
-        # Header (title + close)
+        # Header (close button only)
         header = QHBoxLayout()
-        title = QLabel("OSIA")
-        title.setObjectName("popupTitle")
         close_btn = QPushButton("✕")
         close_btn.setObjectName("closeBtn")
         close_btn.setFixedSize(26, 26)
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.clicked.connect(self.hide)
-        header.addWidget(title)
         header.addStretch()
         header.addWidget(close_btn)
         outer.addLayout(header)
@@ -1504,10 +1622,10 @@ class MainPopup(QWidget):
             }
             QLabel#panelSub {
                 font-size: 11px;
-                color: rgba(245, 245, 250, 0.55);
+                color: #8b7fb5;
             }
             QLabel#panelEmpty {
-                color: rgba(245, 245, 250, 0.4);
+                color: #8b7fb5;
                 font-size: 12px;
                 padding: 30px 10px;
             }
@@ -1520,7 +1638,7 @@ class MainPopup(QWidget):
 
             /* Chat ───────────────────────────────────────────────────── */
             QLabel#chatEmpty {
-                color: rgba(245, 245, 250, 0.4);
+                color: #8b7fb5;
                 font-size: 12px;
                 padding: 40px 12px;
             }
@@ -1589,13 +1707,13 @@ class MainPopup(QWidget):
 
             /* Conversations list ────────────────────────────────────── */
             QFrame#convRow {
-                background: #1a1625;
-                border: 1px solid rgba(196, 181, 245, 0.14);
-                border-radius: 14px;
+                background: #0f0d16;
+                border: 1px solid rgba(196, 181, 245, 0.08);
+                border-radius: 12px;
             }
             QFrame#convRow:hover {
-                border: 1px solid rgba(196, 181, 245, 0.45);
-                background: #1f1a2c;
+                border: 1px solid rgba(196, 181, 245, 0.35);
+                background: #1a1625;
             }
             QFrame#convRow[active="true"] {
                 background: rgba(196, 181, 245, 0.16);
@@ -1608,7 +1726,7 @@ class MainPopup(QWidget):
             }
             QLabel#convSub {
                 font-size: 11px;
-                color: rgba(245, 245, 250, 0.45);
+                color: #8b7fb5;
             }
             QPushButton#convOpen {
                 background: rgba(196, 181, 245, 0.20);
@@ -1634,6 +1752,38 @@ class MainPopup(QWidget):
                 color: #ffffff;
             }
 
+            /* Model panel — provider grid ───────────────────────────── */
+            QPushButton#backBtn {
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                border-radius: 8px;
+                padding: 3px 10px;
+                font-size: 12px;
+                color: rgba(245, 245, 250, 0.85);
+            }
+            QPushButton#backBtn:hover {
+                background: rgba(196, 181, 245, 0.18);
+                border: 1px solid rgba(196, 181, 245, 0.45);
+                color: #ffffff;
+            }
+            QFrame#provGridCard {
+                background: #0f0d16;
+                border: 1px solid rgba(196, 181, 245, 0.10);
+                border-radius: 12px;
+            }
+            QFrame#provGridCard:hover {
+                border: 1px solid rgba(196, 181, 245, 0.45);
+                background: #1a1625;
+            }
+            QLabel#provGridName {
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QLabel#provGridCount {
+                font-size: 11px;
+                color: rgba(245, 245, 250, 0.45);
+            }
+
             /* Model list ────────────────────────────────────────────── */
             QLabel#modelGroup {
                 font-size: 11px;
@@ -1644,13 +1794,13 @@ class MainPopup(QWidget):
                 padding: 8px 2px 2px 2px;
             }
             QFrame#modelRow {
-                background: #1a1625;
-                border: 1px solid rgba(196, 181, 245, 0.14);
-                border-radius: 14px;
+                background: #0f0d16;
+                border: 1px solid rgba(196, 181, 245, 0.08);
+                border-radius: 12px;
             }
             QFrame#modelRow:hover {
-                border: 1px solid rgba(196, 181, 245, 0.45);
-                background: #1f1a2c;
+                border: 1px solid rgba(196, 181, 245, 0.35);
+                background: #1a1625;
             }
             QFrame#modelRow[active="true"] {
                 background: rgba(196, 181, 245, 0.16);
@@ -1668,7 +1818,7 @@ class MainPopup(QWidget):
             }
             QLabel#modelSub {
                 font-size: 10px;
-                color: rgba(245, 245, 250, 0.4);
+                color: #8b7fb5;
             }
             QPushButton#modelUse {
                 background: rgba(196, 181, 245, 0.18);
@@ -1682,16 +1832,16 @@ class MainPopup(QWidget):
                 background: rgba(196, 181, 245, 0.35);
             }
             QPushButton#modelUse:disabled {
-                background: rgba(105, 200, 140, 0.22);
-                border: 1px solid rgba(105, 200, 140, 0.5);
+                background: rgba(196, 181, 245, 0.22);
+                border: 1px solid rgba(196, 181, 245, 0.5);
                 color: rgba(245, 245, 250, 0.7);
             }
 
             /* Settings sections ─────────────────────────────────────── */
             QFrame#section {
-                background: #1a1625;
-                border: 1px solid rgba(196, 181, 245, 0.14);
-                border-radius: 16px;
+                background: #0f0d16;
+                border: 1px solid rgba(196, 181, 245, 0.08);
+                border-radius: 12px;
             }
             QFrame#section:hover {
                 border: 1px solid rgba(196, 181, 245, 0.32);
@@ -1702,7 +1852,7 @@ class MainPopup(QWidget):
             }
             QLabel#sectionSub {
                 font-size: 11px;
-                color: rgba(245, 245, 250, 0.5);
+                color: #8b7fb5;
             }
             QLabel#fieldLabel {
                 font-size: 11px;
@@ -1717,20 +1867,54 @@ class MainPopup(QWidget):
                 background: rgba(180, 180, 180, 0.4);
             }
             QLabel#statusDot[state="running"] {
-                background: rgb(105, 200, 140);
+                background: #c4b5f5;
             }
             QLabel#statusDot[state="stopped"] {
                 background: rgba(180, 180, 180, 0.4);
             }
             QLabel#statusDot[state="error"] {
-                background: rgb(220, 160, 60);
+                background: rgba(196, 181, 245, 0.55);
             }
 
-            /* Provider card (Choose / Configure) ────────────────────── */
+            /* Choose-provider button + dropdown ─────────────────────── */
+            QPushButton#chooseProviderBtn {
+                background: rgba(196, 181, 245, 0.16);
+                border: 1px solid rgba(196, 181, 245, 0.45);
+                border-radius: 10px;
+                padding: 9px 14px;
+                font-size: 13px;
+                font-weight: 600;
+                color: #f5f0ff;
+                text-align: left;
+            }
+            QPushButton#chooseProviderBtn:hover {
+                background: rgba(196, 181, 245, 0.30);
+                border: 1px solid rgba(196, 181, 245, 0.65);
+            }
+            QMenu#providerMenu {
+                background: rgb(28, 24, 36);
+                border: 1px solid rgba(196, 181, 245, 0.30);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QMenu#providerMenu::item {
+                padding: 6px 22px;
+                border-radius: 6px;
+                color: #f5f5fa;
+                font-size: 12px;
+            }
+            QMenu#providerMenu::item:selected {
+                background: rgba(196, 181, 245, 0.30);
+            }
+
+            /* Provider card (compact configuration row) ─────────────── */
             QFrame#providerCard {
-                background: #1a1625;
-                border: 1px solid rgba(196, 181, 245, 0.14);
-                border-radius: 14px;
+                background: #0f0d16;
+                border: 1px solid rgba(196, 181, 245, 0.08);
+                border-radius: 12px;
+            }
+            QFrame#providerCard:hover {
+                border: 1px solid rgba(196, 181, 245, 0.35);
             }
             QFrame#providerCard:hover {
                 border: 1px solid rgba(196, 181, 245, 0.40);
@@ -1741,12 +1925,7 @@ class MainPopup(QWidget):
             }
             QLabel#providerSub {
                 font-size: 11px;
-                color: rgba(245, 245, 250, 0.5);
-            }
-            QLabel#oauthOk {
-                color: rgb(120, 220, 140);
-                font-size: 12px;
-                font-weight: 600;
+                color: #8b7fb5;
             }
 
             QPushButton#ghostBtn {
@@ -1809,8 +1988,8 @@ class MainPopup(QWidget):
                 border: 1px solid rgba(196, 181, 245, 0.55);
             }
             QPushButton#saveBtn[saved="true"] {
-                background: rgba(105, 200, 140, 0.35);
-                border: 1px solid rgba(105, 200, 140, 0.85);
+                background: rgba(196, 181, 245, 0.35);
+                border: 1px solid rgba(196, 181, 245, 0.85);
                 color: #ffffff;
             }
 

@@ -1,7 +1,7 @@
 {
   "smart_routing": false,
-  "selected_model": "claude-haiku-4-5",
+  "selected_model": "claude-opus-4-8",
   "tts_provider": "openai",
-  "tts_voice": "marin",
+  "tts_voice": "fable",
   "parler_voice_description": null
 }

@@ -232,8 +232,9 @@ def wake_mode():
     if initial_model:
         try:
             agent.set_model(initial_model)
-        except Exception:
-            pass
+            print(f"[DEBUG] after set_model({initial_model!r}): provider = {agent.provider}")
+        except Exception as e:
+            print(f"[DEBUG] set_model({initial_model!r}) failed: {e}")
     popup.set_current_model(agent.model)
 
     smart_routing = bool(settings.get("smart_routing", False))

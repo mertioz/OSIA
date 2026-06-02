@@ -1016,23 +1016,16 @@ class OSIAAgent:
         cfg = PROVIDERS.get(provider, PROVIDERS["ollama"])
         api_key = get_api_key(provider) if provider != "ollama" else "ollama"
 
-        # If no API key is configured, fall back to an OAuth bearer token
-        # if one is available for this provider (Anthropic only).
-        default_headers: dict[str, str] | None = None
-        if not api_key:
-            try:
-                from osia.auth.oauth import get_token, PROVIDERS as OAUTH_PROVIDERS
-                if provider in OAUTH_PROVIDERS:
-                    token = get_token(provider)
-                    if token:
-                        api_key = token
-                        if provider == "anthropic":
-                            default_headers = {"anthropic-beta": "oauth-2025-04-20"}
-            except Exception:
-                pass
-
         if not api_key:
             api_key = "ollama"  # placeholder; request will likely 401 if used
+
+        # Every provider authenticates with its own API key. Anthropic uses
+        # its standard endpoint with the ``x-api-key`` header; all other
+        # providers use Bearer auth, which the OpenAI client derives from
+        # ``api_key`` automatically.
+        default_headers: dict[str, str] | None = None
+        if provider == "anthropic":
+            default_headers = {"x-api-key": api_key}
 
         self.client = OpenAI(
             base_url=cfg["base_url"],
@@ -1045,6 +1038,25 @@ class OSIAAgent:
         # top of the prompt reflects the newly-selected model.
         if self.messages and isinstance(self.messages[0], dict) and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = get_system_prompt(self.lang, self.model, self.provider)
+        print(f"[DEBUG] provider: {self.provider}, model: {self.model}")
+
+    def _stream_deltas(self, max_tokens: int | None):
+        """Yield text deltas from the OpenAI-compatible chat-completions
+        stream, abstracting it so the sentence-splitting loop stays simple.
+        """
+        create_kwargs = {
+            "model": self.model,
+            "messages": self.messages,
+            "stream": True,
+        }
+        if max_tokens is not None:
+            create_kwargs["max_tokens"] = max_tokens
+        stream = self.client.chat.completions.create(**create_kwargs)
+        for chunk in stream:
+            try:
+                yield chunk.choices[0].delta.content or ""
+            except (IndexError, AttributeError):
+                yield ""
 
     # Match a sentence-ending punctuation char followed by whitespace or end-of-string.
     _SENTENCE_END_RE = re.compile(r'[.!?](?=\s|$)')
@@ -1101,15 +1113,6 @@ class OSIAAgent:
         the first time a non-empty content delta arrives from the model.
         Useful for latency profiling.
         """
-        create_kwargs = {
-            "model": self.model,
-            "messages": self.messages,
-            "stream": True,
-        }
-        if max_tokens is not None:
-            create_kwargs["max_tokens"] = max_tokens
-        stream = self.client.chat.completions.create(**create_kwargs)
-
         full = ""
         pending = ""       # raw text not yet routed to speakable/tool
         speakable = ""     # awaiting a sentence-ending punctuation char
@@ -1122,11 +1125,7 @@ class OSIAAgent:
         tool_call_seen = False
         first_token_fired = False
 
-        for chunk in stream:
-            try:
-                delta = chunk.choices[0].delta.content or ""
-            except (IndexError, AttributeError):
-                delta = ""
+        for delta in self._stream_deltas(max_tokens):
             if not delta:
                 continue
             if not first_token_fired:
@@ -1220,23 +1219,51 @@ class OSIAAgent:
         self.messages.append({"role": "user", "content": user_input})
 
         for round_num in range(max_tool_rounds):
-            if on_sentence is not None:
-                # on_first_token only fires the first time a delta arrives
-                # in this round. The server-side flag dedupes across rounds.
-                content = self._stream_with_sentences(
-                    on_sentence,
-                    max_tokens=max_tokens,
-                    on_first_token=on_first_token,
+            try:
+                if on_sentence is not None:
+                    # on_first_token only fires the first time a delta arrives
+                    # in this round. The server-side flag dedupes across rounds.
+                    content = self._stream_with_sentences(
+                        on_sentence,
+                        max_tokens=max_tokens,
+                        on_first_token=on_first_token,
+                    )
+                else:
+                    create_kwargs = {
+                        "model": self.model,
+                        "messages": self.messages,
+                    }
+                    if max_tokens is not None:
+                        create_kwargs["max_tokens"] = max_tokens
+                    response = self.client.chat.completions.create(**create_kwargs)
+                    content = response.choices[0].message.content or ""
+            except Exception as e:
+                # Surface the full 429 response so we can tell a real rate
+                # limit apart from an auth problem masquerading as one.
+                status = (
+                    getattr(e, "status_code", None)
+                    or getattr(getattr(e, "response", None), "status_code", None)
                 )
-            else:
-                create_kwargs = {
-                    "model": self.model,
-                    "messages": self.messages,
-                }
-                if max_tokens is not None:
-                    create_kwargs["max_tokens"] = max_tokens
-                response = self.client.chat.completions.create(**create_kwargs)
-                content = response.choices[0].message.content or ""
+                if status == 429:
+                    resp = getattr(e, "response", None)
+                    body = None
+                    if resp is not None:
+                        try:
+                            body = resp.text
+                        except Exception:
+                            body = None
+                    if not body:
+                        body = getattr(e, "body", None)
+                    print(
+                        f"[DEBUG] 429 from provider={self.provider} model={self.model}"
+                    )
+                    print(f"[DEBUG] 429 response body: {body!r}")
+                    try:
+                        headers = dict(getattr(resp, "headers", {}) or {})
+                        print(f"[DEBUG] 429 response headers: {headers}")
+                    except Exception:
+                        pass
+                raise
 
             # Check for tool calls
             if has_tool_call(content):
