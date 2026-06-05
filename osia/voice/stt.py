@@ -6,12 +6,15 @@ Phase 3: listen_for_command() with retry loop — keeps listening until
          a meaningful command (3+ words) is received.
 """
 
+import io
 import re
 
 import sounddevice as sd
 import numpy as np
 from scipy.signal import resample as scipy_resample
 from faster_whisper import WhisperModel
+
+from osia.config import get_api_key, get_setting
 
 DEVICE_SAMPLE_RATE = 48000  # Hardware native rate
 WHISPER_SAMPLE_RATE = 16000
@@ -32,13 +35,29 @@ VAD_CALIBRATION_MULTIPLIER = 1.3
 VAD_THRESHOLD_CEILING = 0.05   # never let calibrated threshold exceed this
 _calibrated_silence_rms: float | None = None  # set by calibrate_ambient_threshold()
 
-# Lazy-loaded model
+# Lazy-loaded model (rebuilt when the configured local size changes)
 _model = None
+_model_size = None
 
-def _get_model():
-    global _model
-    if _model is None:
-        _model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+# ── Groq Whisper (cloud) ────────────────────────────────────────────────────
+GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_WHISPER_MODELS = ("whisper-large-v3", "whisper-large-v3-turbo")
+GROQ_DEFAULT_MODEL = "whisper-large-v3-turbo"
+
+
+def _get_model(model_size: str = None):
+    """Return a cached faster-whisper model.
+
+    The size comes from the ``stt_local_model`` setting (read fresh) unless
+    ``model_size`` is given. The cached model is rebuilt only when the
+    requested size changes, so switching local model size in settings takes
+    effect without a restart.
+    """
+    global _model, _model_size
+    size = model_size or get_setting("stt_local_model", MODEL_SIZE) or MODEL_SIZE
+    if _model is None or _model_size != size:
+        _model = WhisperModel(size, device="cpu", compute_type="int8")
+        _model_size = size
     return _model
 
 
@@ -222,15 +241,65 @@ def _apply_french_corrections(text: str) -> str:
     return text
 
 
-def transcribe(audio: np.ndarray, sample_rate: int = DEVICE_SAMPLE_RATE,
-               language: str = None, model_size: str = None) -> str:
-    """Transcribe audio samples to text using faster-whisper.
-    Audio is expected at the device sample rate and will be resampled to 16kHz.
-    language=None enables auto-detection (supports fr + en). When the
-    detected language is French, a post-correction pass fixes common
-    Whisper /ʒ/ confusions (j'ai vs gai/gay, je vs ge, …).
+def _transcribe_groq(audio_path_or_bytes, sample_rate: int = WHISPER_SAMPLE_RATE,
+                     language: str = None, model: str = None) -> str:
+    """POST audio to Groq's OpenAI-compatible Whisper endpoint and return
+    the transcribed text.
+
+    ``audio_path_or_bytes`` may be:
+      * a numpy float32 sample array — resampled to 16kHz and WAV-encoded
+        in memory,
+      * raw WAV ``bytes`` / ``bytearray`` — sent as-is,
+      * a filesystem path to an audio file — read and sent as-is.
+
+    The Groq model comes from the ``stt_groq_model`` setting unless ``model``
+    is given (validated against ``GROQ_WHISPER_MODELS``). Raises on a missing
+    key or any HTTP/network error so the caller can fall back to local.
     """
-    model = _get_model()
+    import requests
+
+    api_key = get_api_key("groq")
+    if not api_key:
+        raise RuntimeError("Groq STT: no API key configured")
+
+    model = model or get_setting("stt_groq_model", GROQ_DEFAULT_MODEL) or GROQ_DEFAULT_MODEL
+    if model not in GROQ_WHISPER_MODELS:
+        model = GROQ_DEFAULT_MODEL
+
+    # Normalize the input to WAV bytes.
+    if isinstance(audio_path_or_bytes, np.ndarray):
+        import soundfile as sf
+        audio_16k = resample_audio(audio_path_or_bytes, sample_rate, WHISPER_SAMPLE_RATE)
+        buf = io.BytesIO()
+        sf.write(buf, audio_16k, WHISPER_SAMPLE_RATE, format="WAV", subtype="PCM_16")
+        wav_bytes = buf.getvalue()
+    elif isinstance(audio_path_or_bytes, (bytes, bytearray)):
+        wav_bytes = bytes(audio_path_or_bytes)
+    else:  # treat as a filesystem path
+        with open(audio_path_or_bytes, "rb") as f:
+            wav_bytes = f.read()
+
+    data = {"model": model, "response_format": "json"}
+    if language:
+        data["language"] = language
+
+    resp = requests.post(
+        GROQ_TRANSCRIBE_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+        files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+        data=data,
+        timeout=60,
+    )
+    resp.raise_for_status()
+    print(f"[STT] transcribed via groq ({model})")
+    return (resp.json().get("text") or "").strip()
+
+
+def _transcribe_local(audio: np.ndarray, sample_rate: int = DEVICE_SAMPLE_RATE,
+                      language: str = None, model_size: str = None) -> str:
+    """Transcribe with on-device faster-whisper (``stt_local_model``)."""
+    model = _get_model(model_size)
+    print(f"[STT] transcribed via local (faster-whisper {_model_size})")
     # Resample to 16kHz for Whisper
     audio_16k = resample_audio(audio, sample_rate, WHISPER_SAMPLE_RATE)
     # The initial_prompt is conditioning text — it biases decoding without
@@ -254,6 +323,59 @@ def transcribe(audio: np.ndarray, sample_rate: int = DEVICE_SAMPLE_RATE,
     if getattr(info, "language", None) == "fr":
         text = _apply_french_corrections(text)
     return text
+
+
+def _transcribe_with(provider: str, audio: np.ndarray, sample_rate: int,
+                     language: str, model_size: str) -> str:
+    """Dispatch to a single STT engine. Raises on any failure so the caller
+    can decide whether to fall back."""
+    if provider == "groq":
+        # _transcribe_groq raises if no key is configured.
+        return _transcribe_groq(audio, sample_rate=sample_rate, language=language)
+    return _transcribe_local(audio, sample_rate=sample_rate, language=language,
+                             model_size=model_size)
+
+
+def transcribe(audio: np.ndarray, sample_rate: int = DEVICE_SAMPLE_RATE,
+               language: str = None, model_size: str = None) -> str:
+    """Transcribe audio samples to text.
+
+    The active engine is chosen fresh on every call from the ``stt_provider``
+    setting (like TTS reads ``tts_provider``), so switching it in settings
+    takes effect without a restart:
+
+      * ``groq``  -> Groq's hosted Whisper (``stt_groq_model``) via REST.
+      * ``local`` -> faster-whisper on-device (``stt_local_model``), default.
+
+    If the primary engine fails (error, missing key, timeout), OSIA falls back
+    to the provider named by the ``stt_fallback_provider`` setting (``local``,
+    ``groq``, or ``none``). When the fallback is ``none`` — or is the same
+    engine that just failed — no fallback is attempted and an empty string is
+    returned. The transition is logged as
+    ``[STT] primary <X> failed, falling back to <Y>``.
+
+    Audio is expected at the device sample rate and will be resampled to 16kHz.
+    language=None enables auto-detection (supports fr + en). When the local
+    engine detects French, a post-correction pass fixes common Whisper /ʒ/
+    confusions (j'ai vs gai/gay, je vs ge, …). The French corrections are
+    specific to faster-whisper-small and are not applied to Groq output.
+    """
+    provider = get_setting("stt_provider", "local") or "local"
+    fallback = get_setting("stt_fallback_provider", "local") or "local"
+
+    try:
+        return _transcribe_with(provider, audio, sample_rate, language, model_size)
+    except Exception as e:
+        if fallback == "none" or fallback == provider:
+            print(f"⚠️  [STT] primary {provider} failed ({e}) — no usable fallback "
+                  f"(stt_fallback_provider={fallback}); returning empty.")
+            return ""
+        print(f"[STT] primary {provider} failed ({e}), falling back to {fallback}.")
+        try:
+            return _transcribe_with(fallback, audio, sample_rate, language, model_size)
+        except Exception as e2:
+            print(f"⚠️  [STT] fallback {fallback} also failed ({e2}); returning empty.")
+            return ""
 
 
 def listen(duration: int = RECORD_SECONDS) -> str:

@@ -190,38 +190,69 @@ def _openai_to_mp3_bytes(text: str) -> bytes:
 
 
 def _google_to_mp3_bytes(text: str) -> bytes:
-    """Synthesize text with Google Cloud TTS and return mp3 bytes."""
+    """Synthesize text with Gemini TTS (REST generateContent) and return mp3 bytes.
+
+    Mirrors ``osia.voice.tts.speak_google``: Google *Cloud* TTS rejects simple
+    Gemini API keys (401, OAuth2 required), so we call the Gemini
+    generateContent endpoint, which accepts the ``x-goog-api-key`` header.
+    Audio comes back as base64 24kHz 16-bit mono PCM, which we wrap as WAV and
+    transcode to MP3 for the phone (the WebSocket protocol still ships mp3).
+    """
+    import requests
     from osia.config import get_api_key, get_setting
-    from osia.voice.tts import GOOGLE_VOICES, PROVIDER_DEFAULT_VOICE
+    from osia.voice.tts import (
+        GEMINI_TTS_MODELS, GEMINI_TTS_SR, GEMINI_VOICES, GEMINI_DEFAULT_VOICE,
+        gemini_tts_prompt,
+    )
 
     api_key = get_api_key("google")
     if not api_key:
-        raise RuntimeError("Google TTS: no API key")
+        raise RuntimeError("Google (Gemini) TTS: no API key")
 
-    from google.cloud import texttospeech
-    from google.api_core.client_options import ClientOptions
+    # A stale Cloud-style voice (e.g. "fr-FR-Neural2-A") isn't a Gemini voice,
+    # so validate against the prebuilt list and fall back to the default.
+    voice = get_setting("tts_voice") or GEMINI_DEFAULT_VOICE
+    if voice not in GEMINI_VOICES:
+        voice = GEMINI_DEFAULT_VOICE
 
-    client = texttospeech.TextToSpeechClient(
-        client_options=ClientOptions(api_key=api_key)
-    )
+    body = {
+        "contents": [{"parts": [{"text": gemini_tts_prompt(text)}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": voice}
+                }
+            },
+        },
+    }
 
-    voice = get_setting("tts_voice") or PROVIDER_DEFAULT_VOICE["google"]
-    if voice not in GOOGLE_VOICES:
-        voice = PROVIDER_DEFAULT_VOICE["google"]
-    language_code = "-".join(voice.split("-")[:2])
+    last_err = None
+    for model in GEMINI_TTS_MODELS:
+        try:
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                json=body,
+                timeout=60,
+            )
+            r.raise_for_status()
+            data = r.json()
+            # base64 PCM lives at candidates[0].content.parts[0].inlineData.data
+            b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+            pcm = base64.b64decode(b64)
+            # 24kHz 16-bit signed PCM mono -> WAV -> MP3 (matches the kokoro path)
+            samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+            wav_buf = io.BytesIO()
+            sf.write(wav_buf, samples, GEMINI_TTS_SR, format="WAV")
+            wav_buf.seek(0)
+            return _wav_to_mp3(wav_buf.read())
+        except Exception as e:
+            # Model unavailable on this tier / transient error -> try the next.
+            last_err = e
+            continue
 
-    synthesis_input = texttospeech.SynthesisInput(text=text)
-    voice_params = texttospeech.VoiceSelectionParams(
-        language_code=language_code, name=voice,
-    )
-    audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3,
-    )
-    response = client.synthesize_speech(
-        input=synthesis_input, voice=voice_params, audio_config=audio_config,
-    )
-    # Google returns MP3 directly
-    return response.audio_content
+    raise RuntimeError(f"Google (Gemini) TTS failed: {last_err}")
 
 
 def _wav_to_mp3(wav_bytes: bytes, bitrate: str = "128k") -> bytes:
@@ -352,11 +383,18 @@ async def websocket_endpoint(ws: WebSocket):
     # The next text/audio turn consumes and clears this list.
     pending_files: list[str] = []
 
+    first_message_logged = False
     try:
         async for raw_msg in ws.iter_text():
+            # DEBUG: surface the very first frame the client sends so we can
+            # see whether auth arrives as text and in the expected shape.
+            if not first_message_logged:
+                first_message_logged = True
+                print(f"[WS] first message: {repr(raw_msg)[:200]}")
             try:
                 msg = json.loads(raw_msg)
             except json.JSONDecodeError:
+                print(f"[WS] bad JSON frame (not closing): {repr(raw_msg)[:120]}")
                 await ws.send_json({"type": "status", "content": "error"})
                 continue
 
@@ -364,20 +402,50 @@ async def websocket_endpoint(ws: WebSocket):
 
             # --- Auth ---
             if msg_type == "auth":
-                token = msg.get("token", "")
-                if token == MOBILE_TOKEN:
+                raw_token = msg.get("token", "")
+                # Compare against the stored token, which is itself stripped
+                # on load — tolerate stray whitespace/newlines from clients.
+                token = raw_token.strip() if isinstance(raw_token, str) else ""
+                matched = token == MOBILE_TOKEN
+                masked = (
+                    f"{token[:4]}…{token[-4:]} (len={len(token)})"
+                    if token else "<empty>"
+                )
+                print(
+                    f"[WS] auth attempt: token={masked} "
+                    f"expected_len={len(MOBILE_TOKEN)} matches={matched}"
+                )
+                if matched:
                     authenticated = True
                     session_history = []
                     active_conv_id = None
+                    # Send the first data frames the mobile app expects right
+                    # after auth. Build the conversation list DEFENSIVELY: a
+                    # failure here must not silently tear down a freshly
+                    # authenticated socket (that looked like "open -> closed
+                    # instantly even with a valid token").
                     await ws.send_json({"type": "status", "content": "done"})
-                    print("[OSIA Server] Mobile client authenticated.")
-                    # Send the full conversation list right away so the
-                    # client can render the sidebar without a follow-up call.
+                    print("[WS] auth OK, sending: status/done")
+                    try:
+                        items = conversations.list_conversations()
+                    except Exception as e:
+                        print(
+                            "[WS] list_conversations() failed during initial "
+                            f"send, falling back to empty list: {e!r}"
+                        )
+                        traceback.print_exc()
+                        items = []
                     await ws.send_json({
                         "type": "conversations",
-                        "items": conversations.list_conversations(),
+                        "items": items,
                     })
+                    print(
+                        f"[WS] auth OK, sending: conversations "
+                        f"({len(items)} items)"
+                    )
+                    print("[OSIA Server] Mobile client authenticated.")
                 else:
+                    print("[WS] closing connection, reason: invalid token")
                     await ws.send_json({"type": "status", "content": "error"})
                     await ws.close(code=4001, reason="Invalid token")
                     return
@@ -385,6 +453,10 @@ async def websocket_endpoint(ws: WebSocket):
 
             # All other messages require authentication
             if not authenticated:
+                print(
+                    "[WS] closing connection, reason: not authenticated "
+                    f"(first msg_type={msg_type!r}, expected 'auth')"
+                )
                 await ws.send_json({"type": "status", "content": "error"})
                 await ws.close(code=4001, reason="Not authenticated")
                 return
@@ -612,8 +684,10 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "status", "content": "error"})
 
     except WebSocketDisconnect:
+        print("[WS] closing connection, reason: client disconnected (WebSocketDisconnect)")
         print("[OSIA Server] Client disconnected. Resetting session state.")
     except Exception as e:
+        print(f"[WS] closing connection, reason: unexpected exception: {e!r}")
         print(f"[OSIA Server] Unexpected error: {e}")
         traceback.print_exc()
         try:

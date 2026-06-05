@@ -24,6 +24,8 @@ DEFAULT_SETTINGS = {
     # Speech-to-text (Whisper). The active switching logic lands in Bloc 2;
     # for now the GUI only persists the user's choice.
     "stt_provider": "local",   # one of: "local" (faster-whisper), "groq"
+    # Provider OSIA falls back to when the primary STT fails (error/no key/timeout).
+    "stt_fallback_provider": "local",  # one of: "local", "groq", "none" (no fallback)
     "stt_local_model": "small",                 # faster-whisper size: "small", "medium"
     "stt_groq_model": "whisper-large-v3-turbo", # "whisper-large-v3", "whisper-large-v3-turbo"
     "language": "en",          # UI language; one of osia.i18n.LANGUAGES

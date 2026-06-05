@@ -257,6 +257,22 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "{name} (nicht heruntergeladen)",
         "es": "{name} (no descargado)",
     },
+    "settings.fallback_provider": {
+        "en": "Fallback provider",
+        "fr": "Fournisseur de secours",
+        "zh": "备用提供商",
+        "ja": "フォールバックプロバイダー",
+        "de": "Ausweich-Anbieter",
+        "es": "Proveedor de respaldo",
+    },
+    "stt.fallback_none": {
+        "en": "None",
+        "fr": "Aucun",
+        "zh": "无",
+        "ja": "なし",
+        "de": "Keine",
+        "es": "Ninguno",
+    },
     # — Shared field labels (provider / voice / model selectors) —
     "settings.active_provider": {
         "en": "Active provider",

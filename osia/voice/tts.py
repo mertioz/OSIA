@@ -3,7 +3,8 @@
 
 Provider chain (set via the ``tts_provider`` setting):
   - ``openai`` -> OpenAI ``tts-1-hd`` REST endpoint
-  - ``google`` -> Google Cloud TTS (Neural2 / WaveNet voices)
+  - ``google`` -> Gemini TTS (REST generateContent, 24kHz PCM) — uses the
+                  same Gemini API key already configured for vision/chat
   - ``local``  -> Kokoro (offline, default)
 
 When an API provider fails (missing key, network error), we fall back to
@@ -81,7 +82,7 @@ GOOGLE_VOICES = GOOGLE_FR_VOICES + GOOGLE_EN_VOICES
 
 PROVIDER_DEFAULT_VOICE = {
     "openai": "nova",
-    "google": "fr-FR-Neural2-A",
+    "google": "Kore",        # Gemini prebuilt voice (see GEMINI_VOICES below)
     "local": None,
 }
 
@@ -196,74 +197,120 @@ def speak_openai(text: str, voice: str | None = None, block: bool = True) -> boo
         return False
 
 
-# ── Google Cloud TTS ───────────────────────────────────────────────────────
+# ── Google (Gemini) TTS ────────────────────────────────────────────────────
+# Gemini TTS accepts the same simple Gemini API key already configured for
+# vision/chat (stored under the "google" provider). Google *Cloud* TTS rejected
+# that key (401, OAuth2 required), so we use the Gemini generateContent REST
+# endpoint instead. Audio comes back as base64 24kHz 16-bit signed PCM (mono).
 
-_google_client = None
+# Newest, most expressive model first; fall back if the tier lacks it.
+GEMINI_TTS_MODELS = ("gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts")
+GEMINI_TTS_SR = 24000          # Gemini TTS always returns 24kHz mono PCM
+GEMINI_DEFAULT_VOICE = "Kore"
+
+# Prebuilt Gemini TTS voices (multilingual, 70+ languages). Used to validate
+# the configured ``tts_voice`` so a stale Cloud-style voice falls back cleanly.
+GEMINI_VOICES = [
+    "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede",
+    "Callirrhoe", "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba",
+    "Despina", "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar",
+    "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi",
+    "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat",
+]
 
 
-def _get_google_client():
-    """Build a Google TTS client keyed by the saved API key."""
-    global _google_client
-    api_key = get_api_key("google")
-    if not api_key:
-        return None
-    # Rebuild if the key changed since last call.
-    if _google_client is not None and getattr(_google_client, "_osia_key", None) == api_key:
-        return _google_client
-    from google.cloud import texttospeech
-    from google.api_core.client_options import ClientOptions
-    client = texttospeech.TextToSpeechClient(
-        client_options=ClientOptions(api_key=api_key)
+def gemini_tts_prompt(text: str) -> str:
+    """Wrap ``text`` in an explicit read-verbatim instruction for Gemini TTS.
+
+    Gemini TTS sometimes interprets part of a bare input as a *style*
+    instruction and speaks an unrelated English phrase before the actual
+    (e.g. French) text. Prefixing a clear instruction makes Gemini read ONLY
+    the text, in its original language, with no preamble/translation/comment.
+    Shared by ``speak_google`` and ``osia.server.server._google_to_mp3_bytes``.
+    """
+    return (
+        "Read aloud exactly the following text, in its original language, "
+        "without adding any words, translation, or commentary:\n\n"
+        f"{text}"
     )
-    client._osia_key = api_key
-    _google_client = client
-    return client
 
 
 def speak_google(text: str, voice: str | None = None, block: bool = True) -> bool:
-    """Synthesize via Google Cloud TTS. Returns True on success."""
-    client = _get_google_client()
-    if client is None:
-        print("⚠️  Google TTS: no API key.")
+    """Synthesize via Gemini TTS (REST generateContent). Returns True on success.
+
+    Tries the newest model first, falling back to the stable preview model if
+    the user's tier rejects it. Audio is base64 24kHz 16-bit PCM mono.
+    """
+    import base64
+    import requests
+
+    api_key = get_api_key("google")
+    if not api_key:
+        print("⚠️  Google (Gemini) TTS: no API key.")
         return False
 
-    voice = voice or get_setting("tts_voice") or PROVIDER_DEFAULT_VOICE["google"]
-    if voice not in GOOGLE_VOICES:
-        voice = PROVIDER_DEFAULT_VOICE["google"]
-    # Language code is the first two segments: "fr-FR-Neural2-A" -> "fr-FR"
-    language_code = "-".join(voice.split("-")[:2])
+    # Voice is configurable via ``tts_voice``; default to Kore. A stale
+    # Cloud-style voice (e.g. "fr-FR-Neural2-A") isn't a Gemini voice, so
+    # validate against the prebuilt list and fall back to the default.
+    voice = voice or get_setting("tts_voice") or GEMINI_DEFAULT_VOICE
+    if voice not in GEMINI_VOICES:
+        voice = GEMINI_DEFAULT_VOICE
 
-    try:
-        from google.cloud import texttospeech
-        _debug(
-            f"google: synthesis start (voice={voice}, speed={TTS_SPEED}, "
-            f"{len(text)} chars)"
-        )
-        synthesis_input = texttospeech.SynthesisInput(text=text)
-        voice_params = texttospeech.VoiceSelectionParams(
-            language_code=language_code, name=voice,
-        )
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=TTS_SPEED,
-        )
-        response = client.synthesize_speech(
-            input=synthesis_input, voice=voice_params, audio_config=audio_config,
-        )
-        audio, sr = sf.read(io.BytesIO(response.audio_content), dtype="float32", always_2d=False)
-        _debug(f"google: synthesis done ({len(audio)} samples @ {sr}Hz)")
-        _log_audio_device()
-        _debug("google: playback start")
-        sd.play(audio, samplerate=sr)
-        if block:
-            sd.wait()
-            _debug("google: playback finished")
-        else:
-            _debug("google: playback started (non-blocking)")
-        return True
-    except Exception as e:
-        print(f"⚠️  Google TTS failed: {e}")
-        return False
+    # Gemini TTS has no playback-rate parameter (expressiveness is steered via
+    # prompt text / audio tags), so TTS_SPEED isn't applied here.
+    body = {
+        "contents": [{"parts": [{"text": gemini_tts_prompt(text)}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": voice}
+                }
+            },
+        },
+    }
+
+    last_err = None
+    for model in GEMINI_TTS_MODELS:
+        try:
+            _debug(
+                f"google(gemini): synthesis start (model={model}, voice={voice}, "
+                f"{len(text)} chars)"
+            )
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                json=body,
+                timeout=60,
+            )
+            r.raise_for_status()
+            data = r.json()
+            # base64 PCM lives at candidates[0].content.parts[0].inlineData.data
+            b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+            pcm = base64.b64decode(b64)
+            # 24kHz 16-bit signed PCM, mono -> float32 in [-1, 1] for sounddevice
+            samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+            _debug(
+                f"google(gemini): synthesis done (model={model}, {len(samples)} "
+                f"samples, {len(samples) / GEMINI_TTS_SR:.2f}s)"
+            )
+            _log_audio_device()
+            _debug("google(gemini): playback start")
+            sd.play(samples, samplerate=GEMINI_TTS_SR)
+            if block:
+                sd.wait()
+                _debug("google(gemini): playback finished")
+            else:
+                _debug("google(gemini): playback started (non-blocking)")
+            return True
+        except Exception as e:
+            # Model unavailable on this tier / transient error -> try the next.
+            last_err = e
+            _debug(f"google(gemini): model {model} FAILED: {e}")
+            continue
+
+    print(f"⚠️  Google (Gemini) TTS failed: {last_err}")
+    return False
 
 
 # ── Dispatcher ─────────────────────────────────────────────────────────────

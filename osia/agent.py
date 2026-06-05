@@ -4,6 +4,7 @@ OSIA Core Agent — connects to local Ollama via OpenAI-compatible API
 with a manual tool-calling loop that works with any model (llama3, etc.).
 """
 
+import ast
 import json
 import re
 import subprocess
@@ -210,7 +211,7 @@ _UNCLOSED_THINK_PATTERN = re.compile(r'<think(?:ing)?>.*$', re.DOTALL)
 # literal text in their responses instead of real tool calls. Longest
 # alternatives first so e.g. "tool_call" is never half-matched as "tool".
 _RAW_TOOL_TAG_PATTERN = re.compile(
-    r'</?(?:tool_call|tool_result|function_calls|thinking|think|tool)>'
+    r'</?(?:tool_call|tool_result|tool_code|function_calls|thinking|think|tool)>'
 )
 # Llama-family special tokens that Llama 4 Scout cites as literal text:
 # <|python_tag|>, <|eot_id|>, <|start_header_id|>, <|end_header_id|>,
@@ -235,6 +236,10 @@ _LLAMA_SPECIAL_TOKEN_PATTERN = re.compile(r'<\|[^<>|]*\|>')
 _TOOL_BLOCK_PATTERNS = [
     re.compile(r'<tool_call>.*?</tool_call>', re.DOTALL),
     re.compile(r'<tool_result>.*?</tool_result>', re.DOTALL),
+    # Gemini's Python-code tool-call format (<tool_code>print(open_browser(...))
+    # </tool_code>) — strip the whole block so the raw Python never reaches
+    # display/TTS. Parsing happens before this, in _parse_tool_code_tool_calls.
+    re.compile(r'<tool_code>.*?</tool_code>', re.DOTALL),
 ]
 # An unclosed <tool_call> (stream cut off / max_tokens truncation): everything
 # from the opening tag to the end of the text is tool markup.
@@ -1114,6 +1119,12 @@ _PYTHON_TAG_CALL_PATTERN = re.compile(
     r'<\|python_tag\|>\s*(.*?)\s*(?:<\|eo[tm]_id\|>|$)', re.DOTALL
 )
 
+# Gemini's Python-code tool-call format: a <tool_code>...</tool_code> block
+# whose body is Python like ``print(open_browser(name="brave", url="..."))``
+# instead of the <tool_call> JSON contract. Parsed with ast (never eval/exec)
+# by ``_parse_tool_code_tool_calls``.
+_TOOL_CODE_PATTERN = re.compile(r'<tool_code>(.*?)</tool_code>', re.DOTALL)
+
 
 def _extract_json_object(raw: str) -> str | None:
     """Return the first balanced ``{...}`` object in ``raw`` (string-aware),
@@ -1453,6 +1464,64 @@ def _parse_python_tag_tool_calls(text: str) -> list:
     return calls
 
 
+def _parse_tool_code_tool_calls(text: str) -> list:
+    """Parse Gemini ``<tool_code>`` blocks of Python-style tool calls into
+    ``{"tool": name, **kwargs}`` dicts.
+
+    Gemini sometimes emits a tool call as executable Python rather than the
+    ``<tool_call>`` JSON contract, e.g.::
+
+        <tool_code>
+        print(open_browser(name="brave", url="https://www.microsoft.com"))
+        </tool_code>
+
+    Each block is parsed with ``ast`` (NEVER ``eval``/``exec``). Every
+    ``Call`` node whose function name matches a tool in ``KNOWN_TOOL_NAMES``
+    becomes a call; keyword arguments are read as Python literals via
+    ``ast.literal_eval`` (falling back to the argument's source text for a
+    non-literal expression). A ``print(...)`` wrapper is ignored because
+    ``print`` is not a known tool. Blocks that don't parse as Python — or
+    name no known tool — yield nothing.
+    """
+    if not text or "<tool_code>" not in text:
+        return []
+    calls = []
+    for block in _TOOL_CODE_PATTERN.findall(text):
+        snippet = block.strip()
+        if not snippet:
+            continue
+        try:
+            tree = ast.parse(snippet)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                name = func.id
+            elif isinstance(func, ast.Attribute):
+                name = func.attr
+            else:
+                continue
+            if name not in KNOWN_TOOL_NAMES:
+                continue
+            kwargs = {}
+            for kw in node.keywords:
+                if kw.arg is None:  # **kwargs splat — no name to map onto
+                    continue
+                try:
+                    kwargs[kw.arg] = ast.literal_eval(kw.value)
+                except (ValueError, SyntaxError, TypeError):
+                    # Non-literal expression — keep its source as a string.
+                    try:
+                        kwargs[kw.arg] = ast.unparse(kw.value)
+                    except Exception:
+                        continue
+            calls.append({"tool": name, **kwargs})
+    return calls
+
+
 def strip_bare_tool_json(text: str) -> str:
     """Remove bare ``{"tool": ...}`` JSON tool-call objects from display
     text. Only objects naming a KNOWN tool AND isolated on their own
@@ -1575,13 +1644,17 @@ def _extract_tool_calls(text: str, message=None, provider: str = None) -> list:
                     Llama/Qwen), flat or nested-``parameters`` JSON,
                     any payload size, including blocks truncated by
                     max_tokens.
-    3. bare       — bare JSON objects in plain text:
+    3. tool_code  — Gemini's Python-code format:
+                    ``<tool_code>print(open_browser(name="brave", ...))
+                    </tool_code>``. Parsed with ``ast`` (never eval/exec);
+                    only calls naming a tool in ``KNOWN_TOOL_NAMES`` count.
+    4. bare       — bare JSON objects in plain text:
                     ``{"tool": "name", ...}``. Strict: literal ``"tool"``
                     key naming a tool in ``KNOWN_TOOL_NAMES``, isolated
                     on its own line, AND the surrounding text must not
                     read as a normal conversational answer — prose JSON
                     is never executed.
-    4. python_tag — Llama special tokens:
+    5. python_tag — Llama special tokens:
                     ``<|python_tag|>{...}<|eot_id|>``.
 
     Plain-text descriptions of actions ("I'll open Brave now") never yield
@@ -1597,6 +1670,7 @@ def _extract_tool_calls(text: str, message=None, provider: str = None) -> list:
     candidates = (
         ("native", lambda: _parse_native_tool_calls(message)),
         ("xml", lambda: _parse_xml_tool_calls(text or "")),
+        ("tool_code", lambda: _parse_tool_code_tool_calls(text or "")),
         ("bare", lambda: _parse_bare_json_tool_calls(text or "")),
         ("python_tag", lambda: _parse_python_tag_tool_calls(text or "")),
     )
@@ -2106,7 +2180,6 @@ class OSIAAgent:
         # top of the prompt reflects the newly-selected model.
         if self.messages and isinstance(self.messages[0], dict) and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = get_system_prompt(self.lang, self.model, self.provider)
-        print(f"[DEBUG] provider: {self.provider}, model: {self.model}")
 
     def _stream_deltas(self):
         """Yield text deltas from the OpenAI-compatible chat-completions
@@ -2182,11 +2255,12 @@ class OSIAAgent:
         ``on_sentence`` as it arrives. Returns the full accumulated content
         so the outer loop can still detect tool calls.
 
-        Anything inside a ``<tool_call>...</tool_call>`` block is buffered
-        but never emitted — we don't want to speak tool markup. The same
-        goes for ``<think>...</think>`` / ``<thinking>...</thinking>``
-        reasoning blocks (Qwen 3, DeepSeek-R1, …): they are kept in the
-        returned content but never spoken or streamed to the user.
+        Anything inside a ``<tool_call>...</tool_call>`` block (or Gemini's
+        ``<tool_code>...</tool_code>`` Python-code variant) is buffered but
+        never emitted — we don't want to speak tool markup. The same goes
+        for ``<think>...</think>`` / ``<thinking>...</thinking>`` reasoning
+        blocks (Qwen 3, DeepSeek-R1, …): they are kept in the returned
+        content but never spoken or streamed to the user.
 
         If ``on_first_token`` is provided it is invoked (once per call)
         the first time a non-empty content delta arrives from the model.
@@ -2196,6 +2270,7 @@ class OSIAAgent:
         pending = ""       # raw text not yet routed to speakable/tool
         speakable = ""     # awaiting a sentence-ending punctuation char
         in_tool_call = False
+        tool_close_tag = "</tool_call>"  # closing tag of the tool block we're in
         think_close = None  # closing tag of the reasoning block we're inside, if any
         # Once True, the model has committed to a tool this round. Anything
         # it says afterwards is ungrounded (the tool hasn't actually run
@@ -2221,11 +2296,11 @@ class OSIAAgent:
             # Walk through pending, splitting at <tool_call> / <think> markers.
             while pending:
                 if in_tool_call:
-                    close = pending.find("</tool_call>")
+                    close = pending.find(tool_close_tag)
                     if close == -1:
                         pending = ""  # still inside tool call, discard
                         break
-                    pending = pending[close + len("</tool_call>"):]
+                    pending = pending[close + len(tool_close_tag):]
                     in_tool_call = False
                     continue
 
@@ -2248,8 +2323,15 @@ class OSIAAgent:
                     pending = ""
                     break
 
-                # Locate the earliest special tag in the buffer.
+                # Locate the earliest special tag in the buffer. Both
+                # <tool_call> (Groq/Llama JSON) and <tool_code> (Gemini's
+                # Python-code format) are suppressed identically so neither
+                # the JSON nor the raw Python is ever spoken/streamed.
                 tool_idx = pending.find("<tool_call>")
+                tool_open, tool_close = "<tool_call>", "</tool_call>"
+                code_idx = pending.find("<tool_code>")
+                if code_idx != -1 and (tool_idx == -1 or code_idx < tool_idx):
+                    tool_idx, tool_open, tool_close = code_idx, "<tool_code>", "</tool_code>"
                 think_idx, think_open, think_end = -1, None, None
                 for open_tag, close_tag in self._THINK_TAG_PAIRS:
                     idx = pending.find(open_tag)
@@ -2276,8 +2358,9 @@ class OSIAAgent:
 
                 # Flush text up to the tag, then enter tool-call mode.
                 speakable += pending[:tool_idx]
-                pending = pending[tool_idx + len("<tool_call>"):]
+                pending = pending[tool_idx + len(tool_open):]
                 in_tool_call = True
+                tool_close_tag = tool_close
                 tool_call_seen = True
                 speakable = self._emit_sentences(
                     speakable, on_sentence, flush=True,
@@ -2522,10 +2605,6 @@ class OSIAAgent:
             # stripping before parsing would destroy the calls.
             tool_calls = _extract_tool_calls(
                 content, message=message, provider=self.provider,
-            )
-            print(
-                f"[DEBUG] tool_calls found: {len(tool_calls)}, "
-                f"text: {repr(content[:100])}"
             )
 
             # STEP 3 — execute the parsed tool calls.

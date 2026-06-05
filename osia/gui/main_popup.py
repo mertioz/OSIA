@@ -1260,14 +1260,12 @@ class _SettingsPanel(QWidget):
 
     def _build_voice_section(self) -> QFrame:
         from osia.voice.tts import (
-            OPENAI_VOICES, GOOGLE_FR_VOICES, GOOGLE_EN_VOICES,
-            PROVIDER_DEFAULT_VOICE,
+            OPENAI_VOICES, GEMINI_VOICES, PROVIDER_DEFAULT_VOICE,
         )
         self._openai_voices = list(OPENAI_VOICES)
-        self._google_voices = (
-            [("French — " + v, v) for v in GOOGLE_FR_VOICES]
-            + [("English — " + v, v) for v in GOOGLE_EN_VOICES]
-        )
+        # Gemini prebuilt voices are multilingual (70+ languages), so they're
+        # listed by name with no per-language split. Default is Kore.
+        self._google_voices = [(v, v) for v in GEMINI_VOICES]
         self._provider_default_voice = dict(PROVIDER_DEFAULT_VOICE)
 
         wrap = QFrame()
@@ -1393,6 +1391,42 @@ class _SettingsPanel(QWidget):
         model_row.addWidget(self._stt_model_label)
         model_row.addWidget(self._stt_model_combo, 1)
         l.addLayout(model_row)
+
+        # Fallback provider selector — the engine OSIA uses if the primary STT
+        # fails (error / no key / timeout). "None" disables fallback entirely.
+        fb_row = QHBoxLayout()
+        self._stt_fallback_label = QLabel(i18n.t("settings.fallback_provider"))
+        self._stt_fallback_label.setObjectName("fieldLabel")
+        self._stt_fallback_label.setFixedWidth(96)
+        self._stt_fallback_combo = QComboBox()
+        self._stt_fallback_combo.setObjectName("voiceCombo")
+        self._stt_fallback_combo.addItem(i18n.t("stt.local_name"), "local")
+        self._stt_fallback_combo.addItem(i18n.t("stt.groq_name"), "groq")
+        self._stt_fallback_combo.addItem(i18n.t("stt.fallback_none"), "none")
+        self._stt_fallback_combo.currentIndexChanged.connect(
+            self._on_stt_fallback_changed
+        )
+        fb_row.addWidget(self._stt_fallback_label)
+        fb_row.addWidget(self._stt_fallback_combo, 1)
+        l.addLayout(fb_row)
+
+        # Fallback model sub-option — Groq model ids when the fallback is Groq,
+        # local faster-whisper sizes when local. Wrapped in a widget so the
+        # whole row can be hidden when the fallback is "None".
+        self._stt_fallback_model_row = QWidget()
+        fb_model_row = QHBoxLayout(self._stt_fallback_model_row)
+        fb_model_row.setContentsMargins(0, 0, 0, 0)
+        self._stt_fallback_model_label = QLabel(i18n.t("settings.model"))
+        self._stt_fallback_model_label.setObjectName("fieldLabel")
+        self._stt_fallback_model_label.setFixedWidth(96)
+        self._stt_fallback_model_combo = QComboBox()
+        self._stt_fallback_model_combo.setObjectName("voiceCombo")
+        self._stt_fallback_model_combo.currentIndexChanged.connect(
+            self._on_stt_fallback_model_changed
+        )
+        fb_model_row.addWidget(self._stt_fallback_model_label)
+        fb_model_row.addWidget(self._stt_fallback_model_combo, 1)
+        l.addWidget(self._stt_fallback_model_row)
 
         # Hint that Groq STT reuses the Groq API key from Section 1.
         self._stt_groq_hint = QLabel(i18n.t("stt.groq_hint"))
@@ -1569,6 +1603,18 @@ class _SettingsPanel(QWidget):
         self._stt_provider_combo.blockSignals(False)
         self._populate_stt_model_combo(stt_provider, self._stt_selected_model(settings, stt_provider))
 
+        # Whisper fallback provider + its model sub-option
+        stt_fallback = settings.get("stt_fallback_provider", "local") or "local"
+        self._stt_fallback_combo.blockSignals(True)
+        for i in range(self._stt_fallback_combo.count()):
+            if self._stt_fallback_combo.itemData(i) == stt_fallback:
+                self._stt_fallback_combo.setCurrentIndex(i)
+                break
+        self._stt_fallback_combo.blockSignals(False)
+        self._populate_stt_fallback_model_combo(
+            stt_fallback, self._stt_selected_model(settings, stt_fallback)
+        )
+
         # Mobile token (masked)
         self._mobile_token = load_mobile_token()
         self._update_token_mask()
@@ -1648,6 +1694,40 @@ class _SettingsPanel(QWidget):
         self._stt_groq_badge.setVisible(is_groq)
         self._stt_groq_hint.setVisible(is_groq)
 
+    def _populate_stt_fallback_model_combo(self, fallback: str, selected: str | None) -> None:
+        # The fallback's model sub-option mirrors the primary one: Groq model
+        # ids when the fallback is Groq, downloaded faster-whisper sizes when
+        # local. The whole row is hidden when the fallback is "None".
+        self._stt_fallback_model_row.setVisible(fallback not in (None, "none"))
+        if fallback in (None, "none"):
+            return
+        combo = self._stt_fallback_model_combo
+        combo.blockSignals(True)
+        combo.clear()
+        if fallback == "groq":
+            for label, value in self._STT_GROQ_MODELS:
+                combo.addItem(label, value)
+        else:
+            downloaded = _downloaded_whisper_models()
+            for label, value in self._STT_LOCAL_MODELS:
+                if value in downloaded:
+                    combo.addItem(label, value)
+                else:
+                    combo.addItem(
+                        i18n.t("stt.model_not_downloaded", name=label), value
+                    )
+                    combo.model().item(combo.count() - 1).setEnabled(False)
+            if selected not in downloaded:
+                selected = next(
+                    (v for _, v in self._STT_LOCAL_MODELS if v in downloaded), None
+                )
+        if selected:
+            for i in range(combo.count()):
+                if combo.itemData(i) == selected and combo.model().item(i).isEnabled():
+                    combo.setCurrentIndex(i)
+                    break
+        combo.blockSignals(False)
+
     # ── Handlers ──────────────────────────────────────────────────────────
 
     def _on_smart_changed(self, _state) -> None:
@@ -1681,6 +1761,24 @@ class _SettingsPanel(QWidget):
             return
         provider = self._stt_provider_combo.currentData()
         key = "stt_groq_model" if provider == "groq" else "stt_local_model"
+        set_setting(key, model)
+
+    def _on_stt_fallback_changed(self, _idx: int) -> None:
+        fallback = self._stt_fallback_combo.currentData()
+        if not fallback:
+            return
+        set_setting("stt_fallback_provider", fallback)
+        selected = self._stt_selected_model(load_settings(), fallback)
+        self._populate_stt_fallback_model_combo(fallback, selected)
+
+    def _on_stt_fallback_model_changed(self, _idx: int) -> None:
+        model = self._stt_fallback_model_combo.currentData()
+        if not model:
+            return
+        fallback = self._stt_fallback_combo.currentData()
+        # Model size/id is a global per-provider setting, shared with the
+        # primary selector when both point at the same engine.
+        key = "stt_groq_model" if fallback == "groq" else "stt_local_model"
         set_setting(key, model)
 
     def _on_provider_saved(self, _provider: str) -> None:
@@ -1739,6 +1837,11 @@ class _SettingsPanel(QWidget):
         self._stt_groq_hint.setText(i18n.t("stt.groq_hint"))
         self._stt_provider_combo.setItemText(0, i18n.t("stt.local_name"))
         self._stt_provider_combo.setItemText(1, i18n.t("stt.groq_name"))
+        self._stt_fallback_label.setText(i18n.t("settings.fallback_provider"))
+        self._stt_fallback_model_label.setText(i18n.t("settings.model"))
+        self._stt_fallback_combo.setItemText(0, i18n.t("stt.local_name"))
+        self._stt_fallback_combo.setItemText(1, i18n.t("stt.groq_name"))
+        self._stt_fallback_combo.setItemText(2, i18n.t("stt.fallback_none"))
 
         self._mobile_title.setText(i18n.t("settings.mobile"))
         self._mobile_sub.setText(i18n.t("settings.mobile_sub"))
