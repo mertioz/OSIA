@@ -17,7 +17,6 @@ SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 MOBILE_TOKEN_FILE = os.path.join(CONFIG_DIR, "mobile_token.txt")
 
 DEFAULT_SETTINGS = {
-    "smart_routing": False,
     "selected_model": None,
     "tts_provider": "local",   # one of: "local", "openai", "google"
     "tts_voice": None,         # provider-specific voice id; None = provider default
@@ -29,6 +28,22 @@ DEFAULT_SETTINGS = {
     "stt_local_model": "small",                 # faster-whisper size: "small", "medium"
     "stt_groq_model": "whisper-large-v3-turbo", # "whisper-large-v3", "whisper-large-v3-turbo"
     "language": "en",          # UI language; one of osia.i18n.LANGUAGES
+    # AI task hierarchy (Bloc 3): ordered "provider:model" fallback chains per
+    # task category. Empty chains = no hierarchy → the manually selected model
+    # is used unchanged. See osia.task_router and OSIAAgent.run().
+    "ai_hierarchy": {"heavy": [], "medium": []},
+    # Master switch for the hierarchy: when False, OSIA never classifies/routes
+    # and always uses the manually selected model (the chains above are kept so
+    # they can still be configured). See OSIAAgent.run().
+    "ai_hierarchy_enabled": False,
+    # Live API voice-to-voice (Bloc 4): when enabled, OSIA streams audio to a
+    # provider's realtime/live endpoint and bypasses the local STT (Whisper)
+    # and TTS pipelines — the live endpoint handles both natively. The API key
+    # is reused from the matching AI provider (no duplicate storage). See
+    # osia.voice.live_api and osia.main.wake_mode.
+    "liveapi_enabled": False,                  # master switch
+    "liveapi_provider": "google",              # "google", "openai", "claude"
+    "liveapi_model": "gemini-3.1-flash-live",  # provider-specific live model id
     "island_x": None,          # last dragged capsule position; None = top-centre
     "island_y": None,
 }
@@ -123,9 +138,9 @@ def load_mobile_token() -> str:
 
 
 def regenerate_mobile_token() -> str:
-    """Generate a fresh 16-char mobile token, persist it (0600), and return it."""
+    """Generate a fresh 20-char mobile token, persist it (0600), and return it."""
     _ensure_config_dir()
-    token = secrets.token_hex(8)  # 16 hex chars
+    token = secrets.token_hex(10)  # 20 hex chars
     with open(MOBILE_TOKEN_FILE, "w") as f:
         f.write(token)
     try:

@@ -1056,11 +1056,10 @@ class _SettingsPanel(QWidget):
     * Section 3 — Whisper Providers (speech-to-text)
     * Mobile Connection — reveal / regenerate the mobile pairing token
 
-    Around them sit the original language selector, smart-routing toggle and
-    startup systemd services.
+    Around them sit the original language selector and startup systemd
+    services.
     """
 
-    smart_routing_toggled = pyqtSignal(bool)
     api_keys_saved = pyqtSignal(dict)
 
     # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
@@ -1082,11 +1081,52 @@ class _SettingsPanel(QWidget):
         ("large-v3", "whisper-large-v3"),
     )
 
+    # ── Live API (Bloc 4) ──────────────────────────────────────────────────
+    # Order Live API providers appear in the selector.
+    _LIVEAPI_PROVIDER_ORDER = ("google", "openai", "claude")
+    # Live API provider value -> verbatim display name (proper nouns, untranslated).
+    _LIVEAPI_PROVIDER_NAMES = {
+        "google": "Google (Gemini Live)",
+        "openai": "OpenAI Realtime API",
+        "claude": "Claude Live API",
+    }
+    # Live API provider value -> AI-provider key store entry it reuses (so the
+    # key set in "AI Providers" is shared; no duplicate storage).
+    _LIVEAPI_KEY_PROVIDER = {
+        "google": "google",
+        "openai": "openai",
+        "claude": "anthropic",
+    }
+    # Live API provider value -> selectable live/realtime models: (label, id).
+    _LIVEAPI_MODELS = {
+        "google": (
+            ("gemini-3.1-flash-live", "gemini-3.1-flash-live"),
+            ("gemini-2.5-flash-live", "gemini-2.5-flash-live"),
+        ),
+        "openai": (
+            ("gpt-realtime", "gpt-realtime"),
+            ("gpt-4o-realtime", "gpt-4o-realtime-preview"),
+            ("gpt-4o-mini-realtime", "gpt-4o-mini-realtime-preview"),
+        ),
+        "claude": (
+            ("Claude Opus 4.8 (live)", "claude-opus-4-8-live"),
+            ("Claude Sonnet 4.6 (live)", "claude-sonnet-4-6-live"),
+        ),
+    }
+    # Live API provider value -> official live/realtime documentation page,
+    # opened by the "Naviguer" button.
+    _LIVEAPI_DOCS_URLS = {
+        "google": "https://ai.google.dev/gemini-api/docs/live",
+        "openai": "https://platform.openai.com/docs/guides/realtime",
+        "claude": "https://docs.anthropic.com/en/docs/build-with-claude/streaming",
+    }
+
     def __init__(self):
         super().__init__()
 
         self._provider_cards: dict[str, _ProviderCard] = {}
         self._tts_cards: dict[str, _ProviderCard] = {}
+        self._liveapi_cards: dict[str, _ProviderCard] = {}
         self._mobile_token: str = ""
         self._startup_refresh_guard = False
         self._startup_rows: list[tuple[str, QLabel, QCheckBox]] = []
@@ -1127,10 +1167,11 @@ class _SettingsPanel(QWidget):
         v.setSpacing(14)
 
         v.addWidget(self._build_language_section())
-        v.addWidget(self._build_smart_section())
         v.addWidget(self._build_ai_providers_section())     # Section 1
         v.addWidget(self._build_voice_section())            # Section 2 (TTS)
         v.addWidget(self._build_stt_section())              # Section 3 (STT)
+        v.addWidget(self._build_liveapi_section())          # Section 4 (Live API)
+        v.addWidget(self._build_ai_hierarchy_section())     # AI Task Hierarchy
         v.addWidget(self._build_mobile_section())           # Mobile Connection
         v.addWidget(self._build_startup_section())
         v.addStretch(1)
@@ -1191,29 +1232,6 @@ class _SettingsPanel(QWidget):
         code = self._language_combo.currentData()
         if code:
             i18n.set_language(code)
-
-    def _build_smart_section(self) -> QWidget:
-        wrap = QFrame()
-        wrap.setObjectName("section")
-        l = QVBoxLayout(wrap)
-        l.setContentsMargins(14, 12, 14, 12)
-        l.setSpacing(4)
-
-        row = QHBoxLayout()
-        label = QLabel("Smart model selection")
-        label.setObjectName("sectionTitle")
-        self._smart_toggle = QCheckBox()
-        self._smart_toggle.setObjectName("smartToggle")
-        self._smart_toggle.stateChanged.connect(self._on_smart_changed)
-        row.addWidget(label)
-        row.addStretch()
-        row.addWidget(self._smart_toggle)
-        l.addLayout(row)
-
-        sub = QLabel("Auto-pick a model per prompt.")
-        sub.setObjectName("sectionSub")
-        l.addWidget(sub)
-        return wrap
 
     def _build_startup_section(self) -> QFrame:
         wrap = QFrame()
@@ -1436,6 +1454,365 @@ class _SettingsPanel(QWidget):
 
         return wrap
 
+    # ── Section 4: Live API (voice-to-voice) (Bloc 4) ──────────────────────
+    # When enabled, OSIA streams audio to a provider's realtime/live endpoint
+    # and bypasses local STT (Whisper) + TTS entirely (see osia.main.wake_mode
+    # and osia.voice.live_api). The whole configuration body stays collapsed
+    # until the master toggle is switched on. The API key is reused from the
+    # matching AI provider card — no duplicate storage.
+
+    def _build_liveapi_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._liveapi_title = QLabel(i18n.t("settings.liveapi"))
+        self._liveapi_title.setObjectName("sectionTitle")
+        self._liveapi_sub = QLabel(i18n.t("settings.liveapi_sub"))
+        self._liveapi_sub.setObjectName("sectionSub")
+        self._liveapi_sub.setWordWrap(True)
+        l.addWidget(self._liveapi_title)
+        l.addWidget(self._liveapi_sub)
+
+        # Master toggle — the configuration body below stays hidden until ON.
+        enable_row = QHBoxLayout()
+        self._liveapi_enabled_label = QLabel(i18n.t("liveapi.enabled"))
+        self._liveapi_enabled_label.setObjectName("providerName")
+        self._liveapi_enabled_toggle = QCheckBox()
+        self._liveapi_enabled_toggle.setObjectName("smartToggle")
+        self._liveapi_enabled_toggle.stateChanged.connect(
+            self._on_liveapi_enabled_changed
+        )
+        enable_row.addWidget(self._liveapi_enabled_label)
+        enable_row.addStretch()
+        enable_row.addWidget(self._liveapi_enabled_toggle)
+        l.addLayout(enable_row)
+
+        # Collapsible body — shown only when Live API is enabled.
+        self._liveapi_body = QWidget()
+        body = QVBoxLayout(self._liveapi_body)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(8)
+
+        # Provider selector (Google / OpenAI / Claude).
+        prov_row = QHBoxLayout()
+        self._liveapi_prov_label = QLabel(i18n.t("settings.active_provider"))
+        self._liveapi_prov_label.setObjectName("fieldLabel")
+        self._liveapi_prov_label.setFixedWidth(96)
+        self._liveapi_provider_combo = QComboBox()
+        self._liveapi_provider_combo.setObjectName("voiceCombo")
+        for key in self._LIVEAPI_PROVIDER_ORDER:
+            self._liveapi_provider_combo.addItem(
+                self._LIVEAPI_PROVIDER_NAMES[key], key
+            )
+        self._liveapi_provider_combo.currentIndexChanged.connect(
+            self._on_liveapi_provider_changed
+        )
+        prov_row.addWidget(self._liveapi_prov_label)
+        prov_row.addWidget(self._liveapi_provider_combo, 1)
+        body.addLayout(prov_row)
+
+        # Model selector (repopulated per provider).
+        model_row = QHBoxLayout()
+        self._liveapi_model_label = QLabel(i18n.t("settings.model"))
+        self._liveapi_model_label.setObjectName("fieldLabel")
+        self._liveapi_model_label.setFixedWidth(96)
+        self._liveapi_model_combo = QComboBox()
+        self._liveapi_model_combo.setObjectName("voiceCombo")
+        self._liveapi_model_combo.currentIndexChanged.connect(
+            self._on_liveapi_model_changed
+        )
+        model_row.addWidget(self._liveapi_model_label)
+        model_row.addWidget(self._liveapi_model_combo, 1)
+        body.addLayout(model_row)
+
+        # "Naviguer" → official live/realtime docs page for the active provider.
+        docs_row = QHBoxLayout()
+        docs_row.addStretch()
+        self._liveapi_docs_btn = QPushButton(i18n.t("provider.browse"))
+        self._liveapi_docs_btn.setObjectName("ghostBtn")
+        self._liveapi_docs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._liveapi_docs_btn.clicked.connect(self._on_liveapi_docs)
+        docs_row.addWidget(self._liveapi_docs_btn)
+        body.addLayout(docs_row)
+
+        # API-key cards — one per provider, reusing the AI provider key store
+        # (no duplicate storage). Only the active provider's card is shown.
+        for key in self._LIVEAPI_PROVIDER_ORDER:
+            card = _ProviderCard(self._LIVEAPI_KEY_PROVIDER[key])
+            card.saved.connect(self._on_provider_saved)
+            body.addWidget(card)
+            self._liveapi_cards[key] = card
+
+        # Violet info notice — STT (Whisper) + TTS are bypassed while active.
+        self._liveapi_notice = QLabel(i18n.t("liveapi.notice"))
+        self._liveapi_notice.setObjectName("liveApiNotice")
+        self._liveapi_notice.setWordWrap(True)
+        body.addWidget(self._liveapi_notice)
+
+        l.addWidget(self._liveapi_body)
+        return wrap
+
+    def _populate_liveapi_provider(self, provider: str, model: str | None) -> None:
+        """Fill the model combo for *provider* and reveal only its key card."""
+        combo = self._liveapi_model_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for label, value in self._LIVEAPI_MODELS.get(provider, ()):
+            combo.addItem(label, value)
+        # Preserve a stored model that isn't in the predefined list so it isn't
+        # silently dropped when the panel is reopened.
+        if model and not any(combo.itemData(i) == model for i in range(combo.count())):
+            combo.insertItem(0, model, model)
+        if model:
+            for i in range(combo.count()):
+                if combo.itemData(i) == model:
+                    combo.setCurrentIndex(i)
+                    break
+        combo.blockSignals(False)
+        for live_provider, card in self._liveapi_cards.items():
+            card.setVisible(live_provider == provider)
+
+    def _apply_liveapi_visibility(self) -> None:
+        self._liveapi_body.setVisible(self._liveapi_enabled_toggle.isChecked())
+
+    def _on_liveapi_enabled_changed(self, _state) -> None:
+        set_setting("liveapi_enabled", self._liveapi_enabled_toggle.isChecked())
+        self._apply_liveapi_visibility()
+
+    def _on_liveapi_provider_changed(self, _idx: int) -> None:
+        provider = self._liveapi_provider_combo.currentData()
+        if not provider:
+            return
+        set_setting("liveapi_provider", provider)
+        # Switching provider invalidates the old model id — fall back to the
+        # new provider's first model and persist it.
+        models = self._LIVEAPI_MODELS.get(provider, ())
+        default_model = models[0][1] if models else None
+        set_setting("liveapi_model", default_model)
+        self._populate_liveapi_provider(provider, default_model)
+
+    def _on_liveapi_model_changed(self, _idx: int) -> None:
+        model = self._liveapi_model_combo.currentData()
+        if model:
+            set_setting("liveapi_model", model)
+
+    def _on_liveapi_docs(self) -> None:
+        provider = self._liveapi_provider_combo.currentData()
+        url = self._LIVEAPI_DOCS_URLS.get(provider)
+        if url:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+    # ── AI Task Hierarchy (Bloc 3) ──────────────────────────────────────────
+    # Two ordered "provider:model" fallback chains (heavy / medium). The value
+    # lists in ``self._hier_values`` are the source of truth; the editable row
+    # widgets are a rendering of them. Any add/remove/reorder/selection rebuilds
+    # the lists and writes them through to ``ai_hierarchy`` in settings.json.
+
+    def _build_ai_hierarchy_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._hier_title = QLabel(i18n.t("settings.ai_hierarchy"))
+        self._hier_title.setObjectName("sectionTitle")
+        self._hier_sub = QLabel(i18n.t("settings.ai_hierarchy_sub"))
+        self._hier_sub.setObjectName("sectionSub")
+        self._hier_sub.setWordWrap(True)
+        l.addWidget(self._hier_title)
+        l.addWidget(self._hier_sub)
+
+        # Per-category editor state.
+        self._hier_values = {"heavy": [], "medium": []}
+        self._hier_hosts = {}        # cat -> QVBoxLayout holding the rows
+        self._hier_rows = {"heavy": [], "medium": []}   # cat -> [QComboBox]
+        self._hier_labels = {}       # cat -> header QLabel (for retranslate)
+        self._hier_sublabels = {}    # cat -> hint QLabel
+        self._hier_add_btns = {}     # cat -> "add" QPushButton
+
+        self._build_hier_subsection(
+            l, "heavy", "settings.hierarchy_heavy", "settings.hierarchy_heavy_sub")
+        self._build_hier_subsection(
+            l, "medium", "settings.hierarchy_medium", "settings.hierarchy_medium_sub")
+
+        # Master switch (bottom of the section): when OFF, OSIA ignores the
+        # chains above and always uses the manually selected model. The chain
+        # editors stay visible either way so they can be configured regardless.
+        enable_row = QHBoxLayout()
+        self._hier_enabled_label = QLabel(i18n.t("hierarchy.enabled"))
+        self._hier_enabled_label.setObjectName("providerName")
+        self._hier_enabled_toggle = QCheckBox()
+        self._hier_enabled_toggle.setObjectName("smartToggle")
+        self._hier_enabled_toggle.stateChanged.connect(self._on_hier_enabled_changed)
+        enable_row.addWidget(self._hier_enabled_label)
+        enable_row.addStretch()
+        enable_row.addWidget(self._hier_enabled_toggle)
+        l.addLayout(enable_row)
+
+        return wrap
+
+    def _build_hier_subsection(self, parent_layout, cat, label_key, sub_key) -> None:
+        header = QLabel(i18n.t(label_key))
+        header.setObjectName("providerName")
+        parent_layout.addWidget(header)
+
+        sub = QLabel(i18n.t(sub_key))
+        sub.setObjectName("sectionSub")
+        sub.setWordWrap(True)
+        parent_layout.addWidget(sub)
+
+        host_wrap = QWidget()
+        host = QVBoxLayout(host_wrap)
+        host.setContentsMargins(0, 0, 0, 0)
+        host.setSpacing(6)
+        self._hier_hosts[cat] = host
+        parent_layout.addWidget(host_wrap)
+
+        add_btn = QPushButton("＋ " + i18n.t("settings.hierarchy_add"))
+        add_btn.setObjectName("primaryBtn")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.clicked.connect(lambda _=False, c=cat: self._on_hier_add(c))
+        parent_layout.addWidget(add_btn, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self._hier_labels[cat] = header
+        self._hier_sublabels[cat] = sub
+        self._hier_add_btns[cat] = add_btn
+
+    def _hier_model_choices(self) -> list:
+        """Return ``[(display, "provider:model"), …]`` for configured providers
+        only (those with a saved API key, plus keyless Ollama)."""
+        keys = load_api_keys()
+        choices = []
+        for m in get_all_models():
+            provider = m["provider"]
+            if provider != "ollama" and not keys.get(provider):
+                continue
+            pname = PROVIDERS.get(provider, {}).get("name", provider)
+            choices.append((f"{pname} · {m.get('label', m['id'])}",
+                            f"{provider}:{m['id']}"))
+        choices.sort(key=lambda c: c[0].lower())
+        return choices
+
+    def _render_hier_category(self, cat: str) -> None:
+        host = self._hier_hosts.get(cat)
+        if host is None:
+            return
+        # Wipe & rebuild the rows for this category from the value list.
+        while host.count():
+            item = host.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._hier_rows[cat] = []
+
+        values = self._hier_values.get(cat, [])
+        if not values:
+            empty = QLabel(i18n.t("settings.hierarchy_empty"))
+            empty.setObjectName("providerSub")
+            empty.setWordWrap(True)
+            host.addWidget(empty)
+            return
+        for idx, value in enumerate(values):
+            host.addWidget(self._build_hier_row(cat, idx, value))
+
+    def _build_hier_row(self, cat: str, index: int, value: str) -> QWidget:
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+
+        combo = QComboBox()
+        combo.setObjectName("voiceCombo")
+        choices = self._hier_model_choices()
+        # Preserve a stored model whose provider is no longer configured by
+        # showing its raw "provider:model" value so the chain isn't silently
+        # dropped when the user opens settings.
+        if value and not any(v == value for _, v in choices):
+            combo.addItem(value, value)
+        for label, v in choices:
+            combo.addItem(label, v)
+        combo.blockSignals(True)
+        if value:
+            for i in range(combo.count()):
+                if combo.itemData(i) == value:
+                    combo.setCurrentIndex(i)
+                    break
+        combo.blockSignals(False)
+        combo.currentIndexChanged.connect(
+            lambda _i, c=cat: self._on_hier_row_changed(c)
+        )
+        h.addWidget(combo, 1)
+        self._hier_rows[cat].append(combo)
+
+        up = QPushButton("▲")
+        up.setObjectName("ghostBtn")
+        up.setFixedSize(28, 28)
+        up.setCursor(Qt.CursorShape.PointingHandCursor)
+        up.clicked.connect(lambda _=False, c=cat, i=index: self._on_hier_move(c, i, -1))
+        down = QPushButton("▼")
+        down.setObjectName("ghostBtn")
+        down.setFixedSize(28, 28)
+        down.setCursor(Qt.CursorShape.PointingHandCursor)
+        down.clicked.connect(lambda _=False, c=cat, i=index: self._on_hier_move(c, i, 1))
+        rm = QPushButton("✕")
+        rm.setObjectName("convDel")
+        rm.setFixedSize(28, 28)
+        rm.setCursor(Qt.CursorShape.PointingHandCursor)
+        rm.clicked.connect(lambda _=False, c=cat, i=index: self._on_hier_remove(c, i))
+        h.addWidget(up)
+        h.addWidget(down)
+        h.addWidget(rm)
+        return row
+
+    def _persist_hierarchy(self) -> None:
+        clean = {
+            "heavy": [v for v in self._hier_values.get("heavy", []) if v],
+            "medium": [v for v in self._hier_values.get("medium", []) if v],
+        }
+        set_setting("ai_hierarchy", clean)
+
+    def _on_hier_add(self, cat: str) -> None:
+        choices = self._hier_model_choices()
+        if not choices:
+            # No configured provider to pick from — don't seed a dead empty row.
+            return
+        self._hier_values.setdefault(cat, []).append(choices[0][1])
+        self._persist_hierarchy()
+        self._render_hier_category(cat)
+
+    def _on_hier_remove(self, cat: str, index: int) -> None:
+        values = self._hier_values.get(cat, [])
+        if 0 <= index < len(values):
+            values.pop(index)
+            self._persist_hierarchy()
+            self._render_hier_category(cat)
+
+    def _on_hier_move(self, cat: str, index: int, delta: int) -> None:
+        values = self._hier_values.get(cat, [])
+        target = index + delta
+        if 0 <= index < len(values) and 0 <= target < len(values):
+            values[index], values[target] = values[target], values[index]
+            self._persist_hierarchy()
+            self._render_hier_category(cat)
+
+    def _on_hier_row_changed(self, cat: str) -> None:
+        # Re-read the chain straight from the current row order so a selection
+        # change stays consistent with any pending reorder.
+        self._hier_values[cat] = [
+            c.currentData() for c in self._hier_rows.get(cat, []) if c.currentData()
+        ]
+        self._persist_hierarchy()
+
+    def _on_hier_enabled_changed(self, _state) -> None:
+        set_setting("ai_hierarchy_enabled", self._hier_enabled_toggle.isChecked())
+
     # ── Mobile connection (pairing token) ──────────────────────────────────
 
     def _build_mobile_section(self) -> QFrame:
@@ -1578,10 +1955,6 @@ class _SettingsPanel(QWidget):
                 break
         self._language_combo.blockSignals(False)
 
-        self._smart_toggle.blockSignals(True)
-        self._smart_toggle.setChecked(bool(settings.get("smart_routing", False)))
-        self._smart_toggle.blockSignals(False)
-
         # Voice (TTS)
         provider = settings.get("tts_provider", "local") or "local"
         voice = settings.get("tts_voice")
@@ -1615,6 +1988,43 @@ class _SettingsPanel(QWidget):
             stt_fallback, self._stt_selected_model(settings, stt_fallback)
         )
 
+        # AI task hierarchy (Bloc 3) — rebuild both fallback-chain editors.
+        hierarchy = settings.get("ai_hierarchy", {}) or {}
+        self._hier_values = {
+            "heavy": [v for v in (hierarchy.get("heavy") or [])
+                      if isinstance(v, str) and v],
+            "medium": [v for v in (hierarchy.get("medium") or [])
+                       if isinstance(v, str) and v],
+        }
+        self._render_hier_category("heavy")
+        self._render_hier_category("medium")
+        self._hier_enabled_toggle.blockSignals(True)
+        self._hier_enabled_toggle.setChecked(
+            bool(settings.get("ai_hierarchy_enabled", False)))
+        self._hier_enabled_toggle.blockSignals(False)
+
+        # Live API (Bloc 4) — provider selector, its model sub-option, master
+        # toggle, and the collapsed/expanded state of the body.
+        liveapi_provider = settings.get("liveapi_provider", "google") or "google"
+        # Coerce a stale / hand-edited provider that's no longer offered back to
+        # a known one so the combo, model list and visible key card stay in sync.
+        if liveapi_provider not in self._LIVEAPI_PROVIDER_ORDER:
+            liveapi_provider = "google"
+        self._liveapi_provider_combo.blockSignals(True)
+        for i in range(self._liveapi_provider_combo.count()):
+            if self._liveapi_provider_combo.itemData(i) == liveapi_provider:
+                self._liveapi_provider_combo.setCurrentIndex(i)
+                break
+        self._liveapi_provider_combo.blockSignals(False)
+        self._populate_liveapi_provider(
+            liveapi_provider, settings.get("liveapi_model")
+        )
+        self._liveapi_enabled_toggle.blockSignals(True)
+        self._liveapi_enabled_toggle.setChecked(
+            bool(settings.get("liveapi_enabled", False)))
+        self._liveapi_enabled_toggle.blockSignals(False)
+        self._apply_liveapi_visibility()
+
         # Mobile token (masked)
         self._mobile_token = load_mobile_token()
         self._update_token_mask()
@@ -1633,6 +2043,11 @@ class _SettingsPanel(QWidget):
             card.set_key(keys.get(provider, ""))
         for provider, card in self._tts_cards.items():
             card.set_key(keys.get(provider, ""))
+        # Live API cards are keyed by Live-API provider but reuse the matching
+        # AI provider's stored key.
+        for live_provider, card in self._liveapi_cards.items():
+            key_provider = self._LIVEAPI_KEY_PROVIDER.get(live_provider, live_provider)
+            card.set_key(keys.get(key_provider, ""))
 
     def _populate_voice_combo(self, provider: str, selected: str | None) -> None:
         combo = self._tts_voice_combo
@@ -1730,11 +2145,6 @@ class _SettingsPanel(QWidget):
 
     # ── Handlers ──────────────────────────────────────────────────────────
 
-    def _on_smart_changed(self, _state) -> None:
-        checked = self._smart_toggle.isChecked()
-        set_setting("smart_routing", checked)
-        self.smart_routing_toggled.emit(checked)
-
     def _on_tts_provider_changed(self, _idx: int) -> None:
         provider = self._tts_provider_combo.currentData()
         set_setting("tts_provider", provider)
@@ -1786,6 +2196,11 @@ class _SettingsPanel(QWidget):
         # notify the host that the key set changed.
         self._sync_all_cards_keys()
         self.api_keys_saved.emit(load_api_keys())
+        # A newly-saved key can unlock a provider — refresh the task-hierarchy
+        # dropdowns so its models become selectable without reopening settings.
+        if hasattr(self, "_hier_hosts"):
+            self._render_hier_category("heavy")
+            self._render_hier_category("medium")
 
     # ── Mobile token ──────────────────────────────────────────────────────
 
@@ -1842,6 +2257,27 @@ class _SettingsPanel(QWidget):
         self._stt_fallback_combo.setItemText(0, i18n.t("stt.local_name"))
         self._stt_fallback_combo.setItemText(1, i18n.t("stt.groq_name"))
         self._stt_fallback_combo.setItemText(2, i18n.t("stt.fallback_none"))
+
+        self._liveapi_title.setText(i18n.t("settings.liveapi"))
+        self._liveapi_sub.setText(i18n.t("settings.liveapi_sub"))
+        self._liveapi_enabled_label.setText(i18n.t("liveapi.enabled"))
+        self._liveapi_prov_label.setText(i18n.t("settings.active_provider"))
+        self._liveapi_model_label.setText(i18n.t("settings.model"))
+        self._liveapi_docs_btn.setText(i18n.t("provider.browse"))
+        self._liveapi_notice.setText(i18n.t("liveapi.notice"))
+
+        self._hier_title.setText(i18n.t("settings.ai_hierarchy"))
+        self._hier_sub.setText(i18n.t("settings.ai_hierarchy_sub"))
+        self._hier_labels["heavy"].setText(i18n.t("settings.hierarchy_heavy"))
+        self._hier_labels["medium"].setText(i18n.t("settings.hierarchy_medium"))
+        self._hier_sublabels["heavy"].setText(i18n.t("settings.hierarchy_heavy_sub"))
+        self._hier_sublabels["medium"].setText(i18n.t("settings.hierarchy_medium_sub"))
+        self._hier_enabled_label.setText(i18n.t("hierarchy.enabled"))
+        for _btn in self._hier_add_btns.values():
+            _btn.setText("＋ " + i18n.t("settings.hierarchy_add"))
+        # Rebuild the rows so the "no models" placeholder re-translates too.
+        self._render_hier_category("heavy")
+        self._render_hier_category("medium")
 
         self._mobile_title.setText(i18n.t("settings.mobile"))
         self._mobile_sub.setText(i18n.t("settings.mobile_sub"))
@@ -2074,7 +2510,6 @@ class MainPopup(QWidget):
     open_conversation = pyqtSignal(str)
     delete_conversation = pyqtSignal(str)
     model_changed = pyqtSignal(str)
-    smart_routing_toggled = pyqtSignal(bool)
     api_keys_saved = pyqtSignal(dict)
 
     # Index of the chat page in the QStackedWidget.
@@ -2154,7 +2589,6 @@ class MainPopup(QWidget):
         self._models.model_changed.connect(self._on_model_selected)
 
         self._settings = _SettingsPanel()
-        self._settings.smart_routing_toggled.connect(self.smart_routing_toggled.emit)
         self._settings.api_keys_saved.connect(self.api_keys_saved.emit)
 
         self._stack.addWidget(self._chat)
@@ -2676,6 +3110,15 @@ class MainPopup(QWidget):
             }
             QLabel#warnLabel {
                 color: #e0a23c;
+                font-size: 11px;
+            }
+            /* Live API (Bloc 4) — violet info box: STT + TTS bypassed notice */
+            QLabel#liveApiNotice {
+                background: rgba(196, 181, 245, 0.14);
+                border: 1px solid rgba(196, 181, 245, 0.45);
+                border-radius: 8px;
+                padding: 8px 10px;
+                color: #d9cffb;
                 font-size: 11px;
             }
             QFrame#dialogCard {

@@ -81,6 +81,11 @@ def load_or_create_token() -> str:
     if TOKEN_FILE.exists():
         token = TOKEN_FILE.read_text().strip()
         if token:
+            # Silently upgrade legacy 16-char tokens to 20 chars.
+            if len(token) == 16:
+                token = secrets.token_hex(10)  # 20 hex chars
+                TOKEN_FILE.write_text(token)
+                TOKEN_FILE.chmod(0o600)
             return token
     # Generate a secure random token
     token = secrets.token_hex(32)  # 64 hex chars

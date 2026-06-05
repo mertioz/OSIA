@@ -2146,14 +2146,21 @@ class OSIAAgent:
             safe.append(m)
         return safe
 
-    def set_model(self, model_id: str) -> None:
+    def set_model(self, model_id: str, provider: str | None = None) -> None:
         """Switch the agent to a new model, reconfiguring the client for that
         model's provider (Anthropic, OpenAI, DeepSeek, Google, xAI, Groq, Ollama).
+
+        ``provider`` is optional and defaults to the provider derived from the
+        model id (``provider_for_model``). Pass it explicitly to force a
+        specific provider — used by the task-hierarchy router, whose entries
+        are stored as ``"provider:model"`` and may pin a model to a provider
+        that differs from the id-based heuristic.
         """
         from osia.models import provider_for_model, PROVIDERS
         from osia.config import get_api_key
 
-        provider = provider_for_model(model_id)
+        if not provider:
+            provider = provider_for_model(model_id)
         cfg = PROVIDERS.get(provider, PROVIDERS["ollama"])
         api_key = get_api_key(provider) if provider != "ollama" else "ollama"
 
@@ -2180,6 +2187,112 @@ class OSIAAgent:
         # top of the prompt reflects the newly-selected model.
         if self.messages and isinstance(self.messages[0], dict) and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = get_system_prompt(self.lang, self.model, self.provider)
+
+    # ── Task-hierarchy routing (Bloc 3) ───────────────────────────────────
+    # Classify each turn (heavy/medium) and try an ordered fallback chain of
+    # "provider:model" entries, advancing to the next model ONLY on a
+    # technical/API error (429, 5xx, auth, timeout, connection). Normal
+    # responses and content/client errors never trigger a fallback. When no
+    # chain is configured for the task, the manually selected model is used
+    # unchanged.
+
+    @staticmethod
+    def _parse_hierarchy_entry(entry):
+        """Parse a ``"provider:model"`` (or bare ``"model"``) chain entry into
+        ``(provider_or_None, model_id)``; returns ``None`` for blanks. Model
+        ids never contain ':' (Groq ids use '/'), so one split is safe.
+        """
+        if not isinstance(entry, str):
+            return None
+        entry = entry.strip()
+        if not entry:
+            return None
+        if ":" in entry:
+            provider, model_id = entry.split(":", 1)
+            provider = provider.strip() or None
+            model_id = model_id.strip()
+        else:
+            provider, model_id = None, entry
+        if not model_id:
+            return None
+        return (provider, model_id)
+
+    def _fmt_route(self, candidate) -> str:
+        """Format a ``(provider, model_id)`` candidate as ``provider:model``."""
+        provider, model_id = candidate
+        if not provider:
+            try:
+                from osia.models import provider_for_model
+                provider = provider_for_model(model_id)
+            except Exception:
+                provider = "?"
+        return f"{provider}:{model_id}"
+
+    def _resolve_route(self, user_input: str):
+        """Classify the task and return ``(category, candidates)``.
+
+        ``candidates`` is the ordered, de-duplicated list of
+        ``(provider, model_id)`` tuples from the configured chain for that
+        category. Returns an empty list when no hierarchy is configured — the
+        caller then leaves the currently selected model untouched.
+        """
+        try:
+            from osia.task_router import classify_task
+            from osia.config import get_setting
+            category = classify_task(user_input)
+            hierarchy = get_setting("ai_hierarchy", {}) or {}
+            raw_chain = hierarchy.get(category) or []
+        except Exception:
+            return ("medium", [])
+        candidates = []
+        seen = set()
+        for entry in raw_chain:
+            parsed = self._parse_hierarchy_entry(entry)
+            if parsed is None or parsed in seen:
+                continue
+            seen.add(parsed)
+            candidates.append(parsed)
+        return (category, candidates)
+
+    @staticmethod
+    def _error_status(e):
+        """Extract an HTTP status code from an OpenAI-SDK / requests error."""
+        return (
+            getattr(e, "status_code", None)
+            or getattr(getattr(e, "response", None), "status_code", None)
+        )
+
+    def _is_technical_error(self, e, status=None) -> bool:
+        """True for transient/technical API failures that warrant a model
+        fallback: rate limits (429), server errors (5xx), auth errors
+        (401/403), request timeout (408), timeouts and connection drops.
+
+        Returns False for client/content errors (400/404/422 …) and anything
+        that is not an API/transport failure — those must NOT silently switch
+        the model.
+        """
+        if status is None:
+            status = self._error_status(e)
+        if isinstance(status, int):
+            return status == 429 or status >= 500 or status in (401, 403, 408)
+        # No HTTP status (timeouts, connection resets): classify by type/name.
+        name = type(e).__name__.lower()
+        if any(s in name for s in ("timeout", "connection", "serviceunavailable")):
+            return True
+        msg = str(e).lower()
+        return any(
+            s in msg
+            for s in ("timed out", "timeout", "connection error",
+                      "connection reset", "temporarily unavailable", "rate limit")
+        )
+
+    def _technical_error_reason(self, e, status=None) -> str:
+        """Short label for the fallback log line ('429', '503', a type name…)."""
+        if status is None:
+            status = self._error_status(e)
+        if isinstance(status, int):
+            return str(status)
+        return type(e).__name__
 
     def _stream_deltas(self):
         """Yield text deltas from the OpenAI-compatible chat-completions
@@ -2513,6 +2626,63 @@ class OSIAAgent:
             self.messages = [{"role": "system", "content": get_system_prompt(self.lang, self.model, self.provider)}] + sanitized
         self.messages.append({"role": "user", "content": user_input})
 
+        # ── Task-hierarchy routing (Bloc 3) ──────────────────────────────
+        # Classify this turn and, if a fallback chain is configured for the
+        # task category, switch to the top of the chain. The manually selected
+        # model is kept as the ultimate fallback, so an exhausted or
+        # unconfigured chain degrades cleanly to today's behavior. The except
+        # block below advances ``route_idx`` on technical/API errors only.
+        _default_route = (self.provider, self.model)
+        # Master switch: only classify the task and route through a chain when
+        # automatic task routing is enabled. When disabled, the manually
+        # selected model is always used (the configured chains are ignored).
+        from osia.config import get_setting as _get_setting
+        _hierarchy_enabled = bool(_get_setting("ai_hierarchy_enabled", False))
+        if _hierarchy_enabled:
+            _route_category, route_candidates = self._resolve_route(user_input)
+        else:
+            _route_category, route_candidates = (None, [])
+        route_idx = 0
+        if route_candidates:
+            if (_default_route not in route_candidates
+                    and (None, self.model) not in route_candidates):
+                route_candidates.append(_default_route)
+            first_provider, first_model = route_candidates[0]
+            try:
+                self.set_model(first_model, provider=first_provider)
+                route_idx = 0
+            except Exception as _route_err:
+                # set_model failed (e.g. missing key): the MANUAL model is
+                # still loaded. Point route_idx at it so the except-block
+                # fallback names the right model and never re-runs it.
+                print(f"[ROUTER] could not select {self._fmt_route(route_candidates[0])} "
+                      f"({_route_err}); keeping {self._fmt_route(_default_route)}")
+                try:
+                    route_idx = route_candidates.index(_default_route)
+                except ValueError:
+                    route_idx = 0
+            print(f"[ROUTER] task={_route_category}, "
+                  f"trying {self._fmt_route(route_candidates[route_idx])}")
+        elif _hierarchy_enabled:
+            print(f"[ROUTER] task={_route_category}, no hierarchy configured — "
+                  f"using selected model {self._fmt_route(_default_route)}")
+        else:
+            print(f"[ROUTER] automatic task routing disabled — "
+                  f"using selected model {self._fmt_route(_default_route)}")
+
+        # Streaming fallback safety: a mid-stream technical drop must NOT cause
+        # the next model to re-speak sentences already streamed to TTS/mobile.
+        # This tracks whether any sentence was emitted on the current attempt;
+        # the except block only takes the streaming fallback when nothing was
+        # emitted yet (pre-token failures: 429/401/403/connection-open).
+        _stream_emitted = {"v": False}
+        if on_sentence is not None:
+            def _on_sentence_cb(_text, _orig=on_sentence, _flag=_stream_emitted):
+                _flag["v"] = True
+                return _orig(_text)
+        else:
+            _on_sentence_cb = on_sentence
+
         # Hallucinated-tool-claim guard (Llama 4 Scout & co): tracks whether
         # any tool ACTUALLY ran this turn, and whether the one allowed
         # "you never called the tool" retry has been spent.
@@ -2535,8 +2705,9 @@ class OSIAAgent:
                     # in this round. The server-side flag dedupes across rounds.
                     # Streaming aggregates text only — no native message object.
                     message = None
+                    _stream_emitted["v"] = False  # reset per attempt
                     content = self._stream_with_sentences(
-                        on_sentence,
+                        _on_sentence_cb,
                         on_first_token=on_first_token,
                     )
                 else:
@@ -2576,6 +2747,35 @@ class OSIAAgent:
                         print(f"[DEBUG] 429 response headers: {headers}")
                     except Exception:
                         pass
+                # Task-hierarchy fallback (Bloc 3): on a technical/API error,
+                # advance to the next model in the chain and retry this turn.
+                # `self.messages` is unchanged on a failed call, so the retry
+                # re-sends a clean conversation to the next model. Non-technical
+                # errors and an exhausted chain re-raise exactly as before.
+                #
+                # Streaming guard: if sentences were ALREADY streamed to
+                # TTS/mobile this attempt (a rare mid-stream drop), re-raise
+                # instead of falling back — re-running the next model would
+                # re-speak the opening of the reply. Pre-token failures
+                # (429/401/403/connection-open) emit nothing, so fallback there
+                # stays fully effective.
+                _already_streamed = on_sentence is not None and _stream_emitted["v"]
+                if (route_idx + 1 < len(route_candidates)
+                        and self._is_technical_error(e, status)
+                        and not _already_streamed):
+                    prev = route_candidates[route_idx]
+                    nxt = route_candidates[route_idx + 1]
+                    try:
+                        self.set_model(nxt[1], provider=nxt[0])
+                    except Exception as switch_err:
+                        print(f"[ROUTER] cannot switch to {self._fmt_route(nxt)} "
+                              f"({switch_err})")
+                        raise
+                    route_idx += 1
+                    print(f"[ROUTER] {self._fmt_route(prev)} failed "
+                          f"({self._technical_error_reason(e, status)}), "
+                          f"falling back to {self._fmt_route(nxt)}")
+                    continue
                 raise
 
             # ── Tool-call pipeline ──────────────────────────────────────

@@ -218,7 +218,7 @@ def wake_mode():
     from osia.voice.tts import speak, speak_streaming, stop as tts_stop
     from osia.agent import clean_response
     from osia.config import load_settings, set_setting
-    from osia.models import select_model, discover_models_async
+    from osia.models import discover_models_async
 
     class Bridge(QObject):
         wake_detected = pyqtSignal()
@@ -269,12 +269,9 @@ def wake_mode():
     if initial_model:
         try:
             agent.set_model(initial_model)
-            print(f"[DEBUG] after set_model({initial_model!r}): provider = {agent.provider}")
         except Exception as e:
             print(f"[DEBUG] set_model({initial_model!r}) failed: {e}")
     popup.set_current_model(agent.model)
-
-    smart_routing = bool(settings.get("smart_routing", False))
 
     # --- Wake word / hotkey trigger ---
     def on_wake():
@@ -309,15 +306,6 @@ def wake_mode():
             active_conv = conversations.create_conversation()
             bridge.conversations_changed.emit(active_conv["id"])
             print(f"🆕 New conversation: {active_conv['id']}")
-
-        if smart_routing:
-            chosen = select_model(user_text, fallback_model=agent.model)
-            if chosen != agent.model:
-                try:
-                    agent.set_model(chosen)
-                    print(f"🧠 Smart-routed to: {chosen}")
-                except Exception as e:
-                    print(f"⚠️  Smart routing failed: {e}")
 
         prev_history_len = len(agent.messages) - 1  # skip system prompt
         bridge.island_state.emit("thinking")
@@ -372,6 +360,32 @@ def wake_mode():
             print("⚠️  Wake fired while a handler is already running — ignored.")
             return
         tts_stop()
+
+        # Bloc 4 — Live API voice-to-voice. When enabled, OSIA's local STT
+        # (Whisper) transcription and TTS speak steps are bypassed entirely:
+        # the provider's live/realtime endpoint streams audio in and speaks
+        # back natively. The real WebSocket streaming is a separate task —
+        # _connect_live_api() is currently a stub (see osia.voice.live_api).
+        live_settings = load_settings()
+        if live_settings.get("liveapi_enabled"):
+            provider = live_settings.get("liveapi_provider", "google") or "google"
+            model = live_settings.get("liveapi_model")
+            print(
+                f"[LIVE API] active — STT and TTS bypassed, using {provider} "
+                "live endpoint"
+            )
+
+            def live_process():
+                try:
+                    from osia.voice.live_api import _connect_live_api
+                    _connect_live_api(provider, model)
+                finally:
+                    bridge.island_state.emit("idle")
+                    handler_lock.release()
+
+            threading.Thread(target=live_process, daemon=True).start()
+            return
+
         bridge.island_state.emit("listening")
 
         def process():
@@ -472,11 +486,6 @@ def wake_mode():
         popup.set_current_model(model)
         print(f"🔄 Model changed to: {model} (provider: {agent.provider})")
 
-    def handle_smart_toggled(enabled: bool):
-        nonlocal smart_routing
-        smart_routing = enabled
-        print(f"🧠 Smart routing: {'ON' if enabled else 'OFF'}")
-
     def handle_keys_saved(_keys):
         discover_models_async(
             lambda remote: bridge.remote_models_signal.emit(remote)
@@ -504,7 +513,6 @@ def wake_mode():
     popup.open_conversation.connect(handle_open_conversation)
     popup.delete_conversation.connect(handle_delete_conversation)
     popup.model_changed.connect(handle_model_change)
-    popup.smart_routing_toggled.connect(handle_smart_toggled)
     popup.api_keys_saved.connect(handle_keys_saved)
 
     # Initial population — no active conversation yet; the panel shows the
@@ -523,7 +531,6 @@ def wake_mode():
     print("=" * 60)
     print("  OSIA — Wake Mode (Dynamic Island)")
     print(f"  Language: {DEFAULT_LANG.upper()}")
-    print(f"  Smart routing: {'ON' if smart_routing else 'OFF'}")
     print(f"  {trigger_label}")
     print("=" * 60)
 

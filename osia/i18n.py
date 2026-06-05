@@ -395,6 +395,126 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Neuer Token generiert",
         "es": "Nuevo token generado",
     },
+    # — AI Task Hierarchy (Bloc 3) —
+    "settings.ai_hierarchy": {
+        "en": "AI Task Hierarchy",
+        "fr": "Hiérarchie des tâches IA",
+        "zh": "AI 任务层级",
+        "ja": "AI タスク階層",
+        "de": "KI-Aufgabenhierarchie",
+        "es": "Jerarquía de tareas IA",
+    },
+    "settings.ai_hierarchy_sub": {
+        "en": "Ordered fallback chains. OSIA routes each task to the first "
+              "model, then down the list if it hits a technical error.",
+        "fr": "Chaînes de secours ordonnées. OSIA dirige chaque tâche vers le "
+              "premier modèle, puis descend la liste en cas d'erreur technique.",
+        "zh": "有序的备用链。OSIA 将每个任务路由到第一个模型，遇到技术错误时依次"
+              "向下尝试。",
+        "ja": "順序付きフォールバックチェーン。OSIA は各タスクを最初のモデルに振り"
+              "分け、技術的エラー時はリストを順に下ります。",
+        "de": "Geordnete Ausweichketten. OSIA leitet jede Aufgabe an das erste "
+              "Modell und geht bei einem technischen Fehler die Liste hinab.",
+        "es": "Cadenas de respaldo ordenadas. OSIA dirige cada tarea al primer "
+              "modelo y baja por la lista si encuentra un error técnico.",
+    },
+    "settings.hierarchy_heavy": {
+        "en": "Heavy tasks",
+        "fr": "Tâches lourdes",
+        "zh": "重型任务",
+        "ja": "重いタスク",
+        "de": "Schwere Aufgaben",
+        "es": "Tareas pesadas",
+    },
+    "settings.hierarchy_heavy_sub": {
+        "en": "Code, refactoring, debugging, architecture, complex reasoning.",
+        "fr": "Code, refactorisation, débogage, architecture, raisonnement complexe.",
+        "zh": "代码、重构、调试、架构、复杂推理。",
+        "ja": "コード、リファクタリング、デバッグ、設計、複雑な推論。",
+        "de": "Code, Refactoring, Debugging, Architektur, komplexes Schließen.",
+        "es": "Código, refactorización, depuración, arquitectura, razonamiento complejo.",
+    },
+    "settings.hierarchy_medium": {
+        "en": "Medium tasks",
+        "fr": "Tâches moyennes",
+        "zh": "中型任务",
+        "ja": "中程度のタスク",
+        "de": "Mittlere Aufgaben",
+        "es": "Tareas medianas",
+    },
+    "settings.hierarchy_medium_sub": {
+        "en": "Web, data gathering, email, summaries, routine tasks.",
+        "fr": "Web, collecte de données, e-mail, résumés, tâches courantes.",
+        "zh": "网页、数据收集、邮件、摘要、日常任务。",
+        "ja": "ウェブ、データ収集、メール、要約、日常的なタスク。",
+        "de": "Web, Datenerfassung, E-Mail, Zusammenfassungen, Routineaufgaben.",
+        "es": "Web, recopilación de datos, correo, resúmenes, tareas rutinarias.",
+    },
+    "settings.hierarchy_add": {
+        "en": "Add model",
+        "fr": "Ajouter un modèle",
+        "zh": "添加模型",
+        "ja": "モデルを追加",
+        "de": "Modell hinzufügen",
+        "es": "Añadir modelo",
+    },
+    "settings.hierarchy_empty": {
+        "en": "No models — uses the manually selected model.",
+        "fr": "Aucun modèle — utilise le modèle sélectionné manuellement.",
+        "zh": "无模型 — 使用手动选择的模型。",
+        "ja": "モデルなし — 手動で選択したモデルを使用します。",
+        "de": "Keine Modelle — verwendet das manuell gewählte Modell.",
+        "es": "Sin modelos — usa el modelo seleccionado manualmente.",
+    },
+    "hierarchy.enabled": {
+        "en": "Enable automatic task routing",
+        "fr": "Activer le routage automatique des tâches",
+        "zh": "启用自动任务路由",
+        "ja": "自動タスクルーティングを有効化",
+        "de": "Automatisches Aufgaben-Routing aktivieren",
+        "es": "Activar el enrutamiento automático de tareas",
+    },
+    # — Section 4: Live API (voice-to-voice) (Bloc 4) —
+    "settings.liveapi": {
+        "en": "Live API",
+        "fr": "Live API",
+        "zh": "实时 API",
+        "ja": "Live API",
+        "de": "Live-API",
+        "es": "Live API",
+    },
+    "settings.liveapi_sub": {
+        "en": "Native voice-to-voice — bypasses Whisper and TTS.",
+        "fr": "Voix-à-voix native — contourne Whisper et la synthèse vocale.",
+        "zh": "原生语音对语音 — 绕过 Whisper 和语音合成。",
+        "ja": "ネイティブな音声対音声 — Whisper と音声合成をバイパスします。",
+        "de": "Natives Sprache-zu-Sprache — umgeht Whisper und TTS.",
+        "es": "Voz a voz nativa — omite Whisper y la síntesis de voz.",
+    },
+    "liveapi.enabled": {
+        "en": "Enable Live API voice-to-voice",
+        "fr": "Activer la Live API voix-à-voix",
+        "zh": "启用实时 API 语音对语音",
+        "ja": "Live API 音声対音声を有効化",
+        "de": "Live-API Sprache-zu-Sprache aktivieren",
+        "es": "Activar Live API de voz a voz",
+    },
+    "liveapi.notice": {
+        "en": "Live API mode: STT (Whisper) and Voice Providers (TTS) are "
+              "automatically disabled when Live API is active.",
+        "fr": "Mode Live API : la transcription (Whisper) et les fournisseurs "
+              "vocaux (synthèse) sont automatiquement désactivés lorsque la "
+              "Live API est active.",
+        "zh": "实时 API 模式：当实时 API 处于活动状态时，语音转文字（Whisper）和"
+              "语音提供商（TTS）会自动禁用。",
+        "ja": "Live API モード：Live API が有効な場合、音声認識（Whisper）と音声"
+              "プロバイダー（TTS）は自動的に無効になります。",
+        "de": "Live-API-Modus: Spracherkennung (Whisper) und Sprachanbieter "
+              "(TTS) werden automatisch deaktiviert, wenn die Live-API aktiv ist.",
+        "es": "Modo Live API: la transcripción (Whisper) y los proveedores de "
+              "voz (TTS) se desactivan automáticamente cuando la Live API está "
+              "activa.",
+    },
 }
 
 
