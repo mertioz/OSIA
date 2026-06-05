@@ -2118,6 +2118,18 @@ class OSIAAgent:
         self.model = model
         self.provider = "ollama"
         self.lang = lang if lang else DEFAULT_LANG
+        # API endpoint fallback (Bloc 5) state — populated for real by
+        # set_model(); seeded here so the attributes always exist.
+        self._api_key = "ollama"
+        # API key fallback hierarchy state — the ordered keys for the current
+        # provider and the cursor into them; reset by set_model(), advanced by
+        # _activate_next_api_key() on a 429/auth error.
+        self._api_key_chain = ["ollama"]
+        self._api_key_index = 0
+        self._default_headers = None
+        self._primary_base_url = base_url
+        self._fallback_base_url = None
+        self._active_base_url = base_url
         self.messages = [{"role": "system", "content": get_system_prompt(self.lang, self.model, self.provider)}]
 
     def reset(self):
@@ -2156,13 +2168,22 @@ class OSIAAgent:
         are stored as ``"provider:model"`` and may pin a model to a provider
         that differs from the id-based heuristic.
         """
-        from osia.models import provider_for_model, PROVIDERS
-        from osia.config import get_api_key
+        from osia.models import (
+            provider_for_model, PROVIDERS,
+            endpoint_for_provider, fallback_endpoint_for_provider,
+        )
 
         if not provider:
             provider = provider_for_model(model_id)
         cfg = PROVIDERS.get(provider, PROVIDERS["ollama"])
-        api_key = get_api_key(provider) if provider != "ollama" else "ollama"
+        # API key fallback hierarchy: when the user configured an ordered key
+        # list for this provider (api_key_fallbacks), it is authoritative —
+        # key[0] is the primary used here; the rest are tried in run() on a
+        # 429/auth error. Otherwise the single saved key (api_keys.json) is
+        # used, exactly as before. Reset the per-turn key cursor to the primary.
+        self._api_key_chain = self._provider_key_chain(provider)
+        self._api_key_index = 0
+        api_key = self._api_key_chain[0] if self._api_key_chain else "ollama"
 
         if not api_key:
             api_key = "ollama"  # placeholder; request will likely 401 if used
@@ -2176,8 +2197,18 @@ class OSIAAgent:
         if provider == "anthropic":
             default_headers = {"x-api-key": api_key}
 
+        # API endpoint fallback (Bloc 5): resolve the provider's *effective*
+        # primary base_url (honouring any user override) and remember the
+        # optional fallback URL + the auth bits, so run() can rebuild the
+        # client against the fallback endpoint on a connection/timeout error.
+        self._api_key = api_key
+        self._default_headers = default_headers
+        self._primary_base_url = endpoint_for_provider(provider) or cfg["base_url"]
+        self._fallback_base_url = fallback_endpoint_for_provider(provider)
+        self._active_base_url = self._primary_base_url
+
         self.client = OpenAI(
-            base_url=cfg["base_url"],
+            base_url=self._primary_base_url,
             api_key=api_key,
             default_headers=default_headers,
         )
@@ -2187,6 +2218,71 @@ class OSIAAgent:
         # top of the prompt reflects the newly-selected model.
         if self.messages and isinstance(self.messages[0], dict) and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = get_system_prompt(self.lang, self.model, self.provider)
+
+    def _activate_fallback_endpoint(self) -> bool:
+        """Rebuild the client against the provider's fallback base_url (Bloc 5).
+
+        Returns ``True`` if a fallback URL is configured and we are not already
+        using it (so the caller can retry the request); ``False`` otherwise.
+        Same model, key and auth headers — only the endpoint changes.
+        """
+        fallback = self._fallback_base_url
+        if not fallback or self._active_base_url == fallback:
+            return False
+        self.client = OpenAI(
+            base_url=fallback,
+            api_key=self._api_key,
+            default_headers=self._default_headers,
+        )
+        self._active_base_url = fallback
+        return True
+
+    # ── API key fallback hierarchy ─────────────────────────────────────────
+    # Each provider can have an ordered list of API keys (api_key_fallbacks):
+    # key[0] is the primary, the rest are tried in turn on a 429/auth error
+    # BEFORE the AI Task Hierarchy advances to a different model.
+
+    def _provider_key_chain(self, provider: str) -> list:
+        """Ordered list of API keys to try for ``provider``.
+
+        When the user configured an ``api_key_fallbacks`` list for the provider
+        it is authoritative (key[0] = primary, the rest = fallbacks). Otherwise
+        the single saved key from ``api_keys.json`` is used. Ollama needs no
+        key. Blank entries are dropped so an empty slot never shadows a real key.
+        """
+        if provider == "ollama":
+            return ["ollama"]
+        from osia.config import get_setting, get_api_key
+        fallbacks = get_setting("api_key_fallbacks", {}) or {}
+        chain = [k.strip() for k in (fallbacks.get(provider) or [])
+                 if isinstance(k, str) and k.strip()]
+        if chain:
+            return chain
+        key = get_api_key(provider)
+        return [key] if key else []
+
+    def _activate_next_api_key(self):
+        """Advance to the next key in the current provider's fallback chain and
+        rebuild the client with it — same model, provider and endpoint, only the
+        API key (and Anthropic's ``x-api-key`` header) change.
+
+        Returns the new key's 1-based position on success (so the caller can log
+        "key1 failed, trying key2"), or ``None`` when the chain is exhausted.
+        """
+        chain = self._api_key_chain or []
+        if self._api_key_index + 1 >= len(chain):
+            return None
+        self._api_key_index += 1
+        new_key = chain[self._api_key_index]
+        self._api_key = new_key
+        if self.provider == "anthropic":
+            self._default_headers = {"x-api-key": new_key}
+        self.client = OpenAI(
+            base_url=self._active_base_url,
+            api_key=new_key,
+            default_headers=self._default_headers,
+        )
+        return self._api_key_index + 1
 
     # ── Task-hierarchy routing (Bloc 3) ───────────────────────────────────
     # Classify each turn (heavy/medium) and try an ordered fallback chain of
@@ -2692,6 +2788,11 @@ class OSIAAgent:
         # empty after stripping markup" retry has been spent.
         empty_retry_used = False
 
+        # API endpoint fallback (Bloc 5): whether the one allowed "primary
+        # endpoint failed → retry on the fallback base_url" switch has been
+        # spent this turn (prevents flapping between endpoints).
+        endpoint_fallback_tried = False
+
         # Smart anti-loop protection (replaces the old hard round cap):
         # repetition, error-streak, stall and turn-time detectors. The loop
         # below runs for as many rounds as the model needs — it is only
@@ -2760,6 +2861,42 @@ class OSIAAgent:
                 # (429/401/403/connection-open) emit nothing, so fallback there
                 # stays fully effective.
                 _already_streamed = on_sentence is not None and _stream_emitted["v"]
+
+                # API endpoint fallback (Bloc 5): a connection/timeout failure
+                # against the PRIMARY endpoint is retried once against the
+                # provider's configured fallback base_url — same model, key and
+                # headers, only the endpoint changes. Tried BEFORE the model
+                # hierarchy so a transient endpoint blip doesn't burn a model
+                # slot. Only transport-level failures (no HTTP status) qualify:
+                # a 401/403/429 is an account/key issue a mirror won't fix.
+                # Skipped once sentences were streamed (re-running would
+                # re-speak the reply's opening).
+                if (not endpoint_fallback_tried
+                        and status is None
+                        and self._is_technical_error(e, status)
+                        and not _already_streamed
+                        and self._activate_fallback_endpoint()):
+                    endpoint_fallback_tried = True
+                    print(f"[AGENT] primary endpoint for provider={self.provider} "
+                          f"failed ({self._technical_error_reason(e, status)}), "
+                          f"retrying on fallback {self._active_base_url}")
+                    continue
+
+                # API key fallback: a rate-limit (429) or auth (401/403) failure
+                # is retried with the NEXT key in this provider's
+                # api_key_fallbacks chain BEFORE the AI Task Hierarchy advances
+                # to a different model. Same model/provider/endpoint — only the
+                # key changes. Skipped once sentences were streamed (re-running
+                # would re-speak the reply's opening).
+                if status in (429, 401, 403) and not _already_streamed:
+                    _next_key_pos = self._activate_next_api_key()
+                    if _next_key_pos is not None:
+                        print(f"[API FALLBACK] {self.provider} "
+                              f"key{_next_key_pos - 1} failed "
+                              f"({self._technical_error_reason(e, status)}), "
+                              f"trying key{_next_key_pos}")
+                        continue
+
                 if (route_idx + 1 < len(route_candidates)
                         and self._is_technical_error(e, status)
                         and not _already_streamed):

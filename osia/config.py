@@ -44,6 +44,41 @@ DEFAULT_SETTINGS = {
     "liveapi_enabled": False,                  # master switch
     "liveapi_provider": "google",              # "google", "openai", "claude"
     "liveapi_model": "gemini-3.1-flash-live",  # provider-specific live model id
+    # Scheduled tasks (Bloc 5): list of cron entries. Each entry is
+    # ``{"task": <description>, "schedule": <spec>, "enabled": <bool>}``.
+    # ``schedule`` is one of "every <N> minutes|hours|days" or "at HH:MM"
+    # (daily). When a job fires, OSIA runs ``task`` through the agent exactly
+    # like a spoken command. See osia.cron.CronManager.
+    "cron_jobs": [],
+    # Heartbeat system monitoring (Bloc 5): when enabled, a background thread
+    # samples the machine every ``heartbeat_interval_minutes`` and speaks a
+    # TTS alert when a monitored metric crosses its threshold. See
+    # osia.heartbeat.HeartbeatMonitor.
+    "heartbeat_enabled": False,
+    "heartbeat_interval_minutes": 5,
+    "heartbeat_checks": {
+        # cpu/ram thresholds are "alert when usage % > threshold"; disk is
+        # "alert when free % < threshold"; network has no threshold (a failed
+        # connectivity probe is the alert).
+        "cpu": {"enabled": True, "threshold": 80},
+        "ram": {"enabled": True, "threshold": 90},
+        "disk": {"enabled": True, "threshold": 10},
+        "network": {"enabled": True},
+    },
+    # API endpoint fallback (Bloc 5): per-provider base_url overrides. This is
+    # distinct from the AI Task Hierarchy (which swaps *models*) — it only
+    # changes which API endpoint/base_url a provider talks to. Shape:
+    # ``{<provider>: {"primary": <url>, "fallback": <url>}}``. When the primary
+    # endpoint fails with a connection/timeout error, OSIA retries the same
+    # request against the fallback URL. See osia.models.endpoint_for_provider.
+    "api_fallbacks": {},
+    # API key fallback hierarchy: per-provider ordered list of API keys. The
+    # first key is the primary; the rest are tried in order when a request
+    # fails with a rate-limit (429) or auth (401/403) error, BEFORE the AI Task
+    # Hierarchy advances to a different model. Shape:
+    # ``{<provider>: ["key1", "key2", ...]}``. Empty/absent = use the single
+    # saved key (api_keys.json) unchanged. See OSIAAgent.set_model/run().
+    "api_key_fallbacks": {},
     "island_x": None,          # last dragged capsule position; None = top-centre
     "island_y": None,
 }

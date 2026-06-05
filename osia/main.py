@@ -219,6 +219,8 @@ def wake_mode():
     from osia.agent import clean_response
     from osia.config import load_settings, set_setting
     from osia.models import discover_models_async
+    from osia.cron import CronManager
+    from osia.heartbeat import HeartbeatMonitor
 
     class Bridge(QObject):
         wake_detected = pyqtSignal()
@@ -522,6 +524,74 @@ def wake_mode():
         lambda remote: bridge.remote_models_signal.emit(remote)
     )
 
+    # ── Scheduled tasks + heartbeat (Bloc 5) ─────────────────────────────
+    # Cron tasks run on a DEDICATED agent so a scheduled run never disturbs
+    # the user's active conversation/history; the reply is spoken just like a
+    # voice command. Both background threads serialise their speech with the
+    # interactive handlers through handler_lock so audio never overlaps a turn.
+    cron_agent = OSIAAgent()
+    try:
+        if initial_model:
+            cron_agent.set_model(initial_model)
+    except Exception as e:
+        print(f"[CRON] could not preset model {initial_model!r}: {e}")
+
+    def run_cron_task(task_text: str, conversation_id: str | None = None) -> None:
+        if not handler_lock.acquire(timeout=120):
+            print(f"[CRON] busy — scheduled task skipped: {task_text[:60]}")
+            return
+        try:
+            tts_stop()
+            sel = load_settings().get("selected_model")
+            if sel:
+                try:
+                    cron_agent.set_model(sel)
+                except Exception as e:
+                    print(f"[CRON] set_model({sel!r}) failed: {e}")
+            # Linked conversation (optional): load its history so context
+            # carries across scheduled runs, and append this run's exchange so
+            # the next run sees it. With none linked, each run is a fresh,
+            # one-shot turn exactly as before.
+            conv = (conversations.get_conversation(conversation_id)
+                    if conversation_id else None)
+            bridge.island_state.emit("thinking")
+            if conv is not None:
+                history = conv.get("messages") or []
+                print(f"[CRON] conversation {conversation_id}: loaded "
+                      f"{len(history)} messages for context")
+                reply = cron_agent.run(task_text, history=history)
+                _persist_exchange(conversation_id, task_text,
+                                  clean_response(reply or ""))
+            else:
+                cron_agent.reset()  # each scheduled run is a fresh, one-shot turn
+                reply = cron_agent.run(task_text)
+            display = clean_response(reply or "")
+            if display:
+                bridge.chat_message.emit("assistant", f"⏰ {display}")
+                speak(display)
+        except Exception as e:
+            print(f"[CRON] task error: {e}")
+        finally:
+            bridge.island_state.emit("idle")
+            handler_lock.release()
+
+    def heartbeat_alert(message: str) -> None:
+        # Wait briefly for any active turn to finish so the alert isn't spoken
+        # over it; if still busy, log rather than drop it silently.
+        if not handler_lock.acquire(timeout=20):
+            print(f"[HEARTBEAT] busy — alert not spoken: {message}")
+            return
+        try:
+            bridge.chat_message.emit("assistant", f"💓 {message}")
+            speak(message)
+        finally:
+            handler_lock.release()
+
+    cron_manager = CronManager(run_cron_task)
+    heartbeat_monitor = HeartbeatMonitor(heartbeat_alert)
+    cron_manager.start()
+    heartbeat_monitor.start()
+
     if detector:
         detector.start()
         trigger_label = "Say 'osia' to activate"
@@ -535,6 +605,9 @@ def wake_mode():
     print("=" * 60)
 
     def on_quit():
+        # Stop the Bloc 5 background threads cleanly before the app tears down.
+        cron_manager.stop()
+        heartbeat_monitor.stop()
         if detector:
             detector.stop()
         if stop_hotkey:

@@ -515,6 +515,413 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
               "voz (TTS) se desactivan automáticamente cuando la Live API está "
               "activa.",
     },
+    # — Scheduled Tasks / Cron (Bloc 5) —
+    "settings.cron": {
+        "en": "Scheduled Tasks",
+        "fr": "Tâches planifiées",
+        "zh": "定时任务",
+        "ja": "スケジュールされたタスク",
+        "de": "Geplante Aufgaben",
+        "es": "Tareas programadas",
+    },
+    "settings.cron_sub": {
+        "en": "Run a task automatically on a schedule. OSIA executes the "
+              "description like a spoken command.",
+        "fr": "Exécuter une tâche automatiquement selon un horaire. OSIA "
+              "exécute la description comme une commande vocale.",
+        "zh": "按计划自动运行任务。OSIA 会像执行语音命令一样执行该描述。",
+        "ja": "スケジュールに沿ってタスクを自動実行します。OSIA は説明を音声コマンド"
+              "のように実行します。",
+        "de": "Eine Aufgabe automatisch nach einem Zeitplan ausführen. OSIA "
+              "führt die Beschreibung wie einen Sprachbefehl aus.",
+        "es": "Ejecuta una tarea automáticamente según un horario. OSIA ejecuta "
+              "la descripción como un comando de voz.",
+    },
+    "cron.add": {
+        "en": "Add task",
+        "fr": "Ajouter une tâche",
+        "zh": "添加任务",
+        "ja": "タスクを追加",
+        "de": "Aufgabe hinzufügen",
+        "es": "Añadir tarea",
+    },
+    "cron.task_placeholder": {
+        "en": "What should OSIA do?",
+        "fr": "Que doit faire OSIA ?",
+        "zh": "OSIA 应该做什么？",
+        "ja": "OSIA に何をさせますか？",
+        "de": "Was soll OSIA tun?",
+        "es": "¿Qué debe hacer OSIA?",
+    },
+    "cron.empty": {
+        "en": "No scheduled tasks.",
+        "fr": "Aucune tâche planifiée.",
+        "zh": "暂无定时任务。",
+        "ja": "スケジュールされたタスクはありません。",
+        "de": "Keine geplanten Aufgaben.",
+        "es": "No hay tareas programadas.",
+    },
+    "cron.every_minutes": {
+        "en": "Every … minutes",
+        "fr": "Toutes les … minutes",
+        "zh": "每 … 分钟",
+        "ja": "… 分ごと",
+        "de": "Alle … Minuten",
+        "es": "Cada … minutos",
+    },
+    "cron.every_hours": {
+        "en": "Every … hours",
+        "fr": "Toutes les … heures",
+        "zh": "每 … 小时",
+        "ja": "… 時間ごと",
+        "de": "Alle … Stunden",
+        "es": "Cada … horas",
+    },
+    "cron.every_days": {
+        "en": "Every … days",
+        "fr": "Tous les … jours",
+        "zh": "每 … 天",
+        "ja": "… 日ごと",
+        "de": "Alle … Tage",
+        "es": "Cada … días",
+    },
+    "cron.daily_at": {
+        "en": "Daily at …",
+        "fr": "Chaque jour à …",
+        "zh": "每天 …",
+        "ja": "毎日 …",
+        "de": "Täglich um …",
+        "es": "Cada día a las …",
+    },
+    # Conversation association for scheduled tasks
+    "cron.conversation": {
+        "en": "Conversation",
+        "fr": "Conversation",
+        "zh": "对话",
+        "ja": "会話",
+        "de": "Unterhaltung",
+        "es": "Conversación",
+    },
+    "cron.conversation_none": {
+        "en": "None",
+        "fr": "Aucune",
+        "zh": "无",
+        "ja": "なし",
+        "de": "Keine",
+        "es": "Ninguna",
+    },
+    "cron.conversation_dialog_title": {
+        "en": "Link a conversation",
+        "fr": "Associer une conversation",
+        "zh": "关联对话",
+        "ja": "会話をリンク",
+        "de": "Unterhaltung verknüpfen",
+        "es": "Vincular una conversación",
+    },
+    "cron.conversation_dialog_sub": {
+        "en": "Pick a conversation to keep context across runs, or none to "
+              "start fresh each time.",
+        "fr": "Choisissez une conversation pour conserver le contexte entre les "
+              "exécutions, ou aucune pour repartir de zéro à chaque fois.",
+        "zh": "选择一个对话以在多次运行间保留上下文，或选择「无」以每次重新开始。",
+        "ja": "実行間でコンテキストを保持する会話を選択するか、「なし」で毎回最初から"
+              "開始します。",
+        "de": "Wählen Sie eine Unterhaltung, um den Kontext über Läufe hinweg zu "
+              "behalten, oder keine, um jedes Mal neu zu beginnen.",
+        "es": "Elige una conversación para mantener el contexto entre ejecuciones, "
+              "o ninguna para empezar de cero cada vez.",
+    },
+    "cron.conversation_none_option": {
+        "en": "None (new conversation each time)",
+        "fr": "Aucune (nouvelle conversation à chaque fois)",
+        "zh": "无（每次新建对话）",
+        "ja": "なし（毎回新しい会話）",
+        "de": "Keine (jedes Mal neue Unterhaltung)",
+        "es": "Ninguna (conversación nueva cada vez)",
+    },
+    "cron.conversation_empty": {
+        "en": "No conversations yet.",
+        "fr": "Aucune conversation pour l'instant.",
+        "zh": "暂无对话。",
+        "ja": "まだ会話がありません。",
+        "de": "Noch keine Unterhaltungen.",
+        "es": "Aún no hay conversaciones.",
+    },
+    # — Heartbeat / system monitoring (Bloc 5) —
+    "settings.heartbeat": {
+        "en": "Heartbeat",
+        "fr": "Surveillance système",
+        "zh": "系统监控",
+        "ja": "システム監視",
+        "de": "Systemüberwachung",
+        "es": "Monitor del sistema",
+    },
+    "settings.heartbeat_sub": {
+        "en": "Monitor system health and speak an alert when a metric crosses "
+              "its threshold.",
+        "fr": "Surveille l'état du système et émet une alerte vocale lorsqu'une "
+              "métrique dépasse son seuil.",
+        "zh": "监控系统状态，当某项指标超过阈值时发出语音警报。",
+        "ja": "システムの状態を監視し、指標がしきい値を超えたら音声で警告します。",
+        "de": "Überwacht den Systemzustand und gibt eine Sprachwarnung aus, wenn "
+              "ein Messwert seinen Schwellenwert überschreitet.",
+        "es": "Supervisa el estado del sistema y emite una alerta de voz cuando "
+              "una métrica supera su umbral.",
+    },
+    "heartbeat.enabled": {
+        "en": "Enable system monitoring",
+        "fr": "Activer la surveillance système",
+        "zh": "启用系统监控",
+        "ja": "システム監視を有効化",
+        "de": "Systemüberwachung aktivieren",
+        "es": "Activar la monitorización del sistema",
+    },
+    "heartbeat.interval": {
+        "en": "Check interval (minutes)",
+        "fr": "Intervalle de vérification (minutes)",
+        "zh": "检查间隔（分钟）",
+        "ja": "チェック間隔（分）",
+        "de": "Prüfintervall (Minuten)",
+        "es": "Intervalo de comprobación (minutos)",
+    },
+    "heartbeat.check_cpu": {
+        "en": "CPU usage",
+        "fr": "Utilisation CPU",
+        "zh": "CPU 使用率",
+        "ja": "CPU 使用率",
+        "de": "CPU-Auslastung",
+        "es": "Uso de CPU",
+    },
+    "heartbeat.check_ram": {
+        "en": "RAM usage",
+        "fr": "Utilisation RAM",
+        "zh": "内存使用率",
+        "ja": "RAM 使用率",
+        "de": "RAM-Auslastung",
+        "es": "Uso de RAM",
+    },
+    "heartbeat.check_disk": {
+        "en": "Disk space",
+        "fr": "Espace disque",
+        "zh": "磁盘空间",
+        "ja": "ディスク容量",
+        "de": "Speicherplatz",
+        "es": "Espacio en disco",
+    },
+    "heartbeat.check_network": {
+        "en": "Internet connectivity",
+        "fr": "Connectivité Internet",
+        "zh": "网络连接",
+        "ja": "インターネット接続",
+        "de": "Internetverbindung",
+        "es": "Conectividad a Internet",
+    },
+    "heartbeat.hint_usage": {
+        "en": "Alert when usage exceeds this %.",
+        "fr": "Alerte lorsque l'utilisation dépasse ce %.",
+        "zh": "使用率超过此百分比时发出警报。",
+        "ja": "使用率がこの％を超えたら警告します。",
+        "de": "Warnen, wenn die Auslastung diesen % übersteigt.",
+        "es": "Alertar cuando el uso supere este %.",
+    },
+    "heartbeat.hint_disk": {
+        "en": "Alert when free space falls below this %.",
+        "fr": "Alerte lorsque l'espace libre passe sous ce %.",
+        "zh": "可用空间低于此百分比时发出警报。",
+        "ja": "空き容量がこの％を下回ったら警告します。",
+        "de": "Warnen, wenn der freie Speicher unter diesen % fällt.",
+        "es": "Alertar cuando el espacio libre baje de este %.",
+    },
+    "heartbeat.hint_network": {
+        "en": "Alert when the connectivity check fails.",
+        "fr": "Alerte lorsque le test de connexion échoue.",
+        "zh": "连接检测失败时发出警报。",
+        "ja": "接続チェックに失敗したら警告します。",
+        "de": "Warnen, wenn die Verbindungsprüfung fehlschlägt.",
+        "es": "Alertar cuando falle la comprobación de conexión.",
+    },
+    # Spoken alert messages (TTS) — {value} is the measured percentage.
+    "heartbeat.alert_cpu": {
+        "en": "Alert: CPU usage is high, at {value} percent.",
+        "fr": "Alerte : l'utilisation du processeur est élevée, à {value} pour cent.",
+        "zh": "警报：CPU 使用率过高，已达 {value}%。",
+        "ja": "警告：CPU 使用率が高く、{value}％です。",
+        "de": "Warnung: Die CPU-Auslastung ist hoch, bei {value} Prozent.",
+        "es": "Alerta: el uso de CPU es alto, al {value} por ciento.",
+    },
+    "heartbeat.alert_ram": {
+        "en": "Alert: memory usage is high, at {value} percent.",
+        "fr": "Alerte : l'utilisation de la mémoire est élevée, à {value} pour cent.",
+        "zh": "警报：内存使用率过高，已达 {value}%。",
+        "ja": "警告：メモリ使用率が高く、{value}％です。",
+        "de": "Warnung: Die Speicherauslastung ist hoch, bei {value} Prozent.",
+        "es": "Alerta: el uso de memoria es alto, al {value} por ciento.",
+    },
+    "heartbeat.alert_disk": {
+        "en": "Alert: disk space is low, {value} percent free.",
+        "fr": "Alerte : l'espace disque est faible, {value} pour cent disponible.",
+        "zh": "警报：磁盘空间不足，仅剩 {value}% 可用。",
+        "ja": "警告：ディスク容量が少なく、空きは {value}％です。",
+        "de": "Warnung: Wenig Speicherplatz, {value} Prozent frei.",
+        "es": "Alerta: queda poco espacio en disco, {value} por ciento libre.",
+    },
+    "heartbeat.alert_network": {
+        "en": "Alert: internet connectivity appears to be down.",
+        "fr": "Alerte : la connexion Internet semble interrompue.",
+        "zh": "警报：互联网连接似乎已中断。",
+        "ja": "警告：インターネット接続が切断されているようです。",
+        "de": "Warnung: Die Internetverbindung scheint unterbrochen zu sein.",
+        "es": "Alerta: la conexión a Internet parece estar caída.",
+    },
+    # — API endpoint fallback (Bloc 5) —
+    "settings.api_fallback": {
+        "en": "API Fallback",
+        "fr": "Secours API",
+        "zh": "API 备用端点",
+        "ja": "API フォールバック",
+        "de": "API-Fallback",
+        "es": "Respaldo de API",
+    },
+    "settings.api_fallback_sub": {
+        "en": "Alternate API endpoints. If a provider's primary endpoint fails "
+              "to connect, OSIA retries the request on its fallback URL.",
+        "fr": "Points d'accès API alternatifs. Si le point d'accès principal "
+              "d'un fournisseur ne répond pas, OSIA réessaie la requête sur "
+              "l'URL de secours.",
+        "zh": "备用 API 端点。如果某个提供商的主端点无法连接，OSIA 会在其备用 URL "
+              "上重试请求。",
+        "ja": "代替 API エンドポイント。プロバイダーの主エンドポイントに接続できない"
+              "場合、OSIA はフォールバック URL でリクエストを再試行します。",
+        "de": "Alternative API-Endpunkte. Wenn der primäre Endpunkt eines "
+              "Anbieters keine Verbindung herstellt, wiederholt OSIA die "
+              "Anfrage über die Fallback-URL.",
+        "es": "Endpoints de API alternativos. Si el endpoint principal de un "
+              "proveedor no conecta, OSIA reintenta la solicitud en su URL de "
+              "respaldo.",
+    },
+    "api_fallback.primary": {
+        "en": "Primary URL",
+        "fr": "URL principale",
+        "zh": "主 URL",
+        "ja": "プライマリ URL",
+        "de": "Primäre URL",
+        "es": "URL principal",
+    },
+    "api_fallback.fallback": {
+        "en": "Fallback URL",
+        "fr": "URL de secours",
+        "zh": "备用 URL",
+        "ja": "フォールバック URL",
+        "de": "Fallback-URL",
+        "es": "URL de respaldo",
+    },
+    "api_fallback.fallback_placeholder": {
+        "en": "Optional fallback base URL",
+        "fr": "URL de base de secours (optionnel)",
+        "zh": "可选的备用基础 URL",
+        "ja": "任意のフォールバック ベース URL",
+        "de": "Optionale Fallback-Basis-URL",
+        "es": "URL base de respaldo (opcional)",
+    },
+    # — API key fallback hierarchy —
+    "settings.api_keys": {
+        "en": "API Key Fallback",
+        "fr": "Clés API de secours",
+        "zh": "API 密钥备用",
+        "ja": "API キーのフォールバック",
+        "de": "API-Schlüssel-Fallback",
+        "es": "Respaldo de claves API",
+    },
+    "settings.api_keys_sub": {
+        "en": "Add backup API keys per provider. If a key hits a rate limit or "
+              "auth error, OSIA tries the next key before switching models.",
+        "fr": "Ajoutez des clés API de secours par fournisseur. Si une clé "
+              "atteint une limite de débit ou une erreur d'authentification, "
+              "OSIA essaie la clé suivante avant de changer de modèle.",
+        "zh": "为每个提供商添加备用 API 密钥。当某个密钥触发速率限制或认证错误时，"
+              "OSIA 会先尝试下一个密钥，然后才切换模型。",
+        "ja": "プロバイダーごとに予備の API キーを追加します。キーがレート制限や認証"
+              "エラーに達すると、OSIA はモデルを切り替える前に次のキーを試します。",
+        "de": "Fügen Sie pro Anbieter Ersatz-API-Schlüssel hinzu. Erreicht ein "
+              "Schlüssel ein Ratenlimit oder einen Authentifizierungsfehler, "
+              "versucht OSIA den nächsten Schlüssel, bevor das Modell gewechselt "
+              "wird.",
+        "es": "Añade claves API de respaldo por proveedor. Si una clave alcanza "
+              "un límite de tasa o un error de autenticación, OSIA prueba la "
+              "siguiente clave antes de cambiar de modelo.",
+    },
+    "api_keys.select_provider": {
+        "en": "Select a provider to manage its keys…",
+        "fr": "Choisissez un fournisseur pour gérer ses clés…",
+        "zh": "选择一个提供商以管理其密钥…",
+        "ja": "キーを管理するプロバイダーを選択…",
+        "de": "Anbieter auswählen, um seine Schlüssel zu verwalten…",
+        "es": "Elige un proveedor para gestionar sus claves…",
+    },
+    "api_keys.no_providers": {
+        "en": "No providers configured yet — add an API key above first.",
+        "fr": "Aucun fournisseur configuré — ajoutez d'abord une clé API ci-dessus.",
+        "zh": "尚未配置任何提供商——请先在上方添加 API 密钥。",
+        "ja": "設定済みのプロバイダーがありません。まず上で API キーを追加してください。",
+        "de": "Noch keine Anbieter konfiguriert — fügen Sie zuerst oben einen "
+              "API-Schlüssel hinzu.",
+        "es": "Aún no hay proveedores configurados: añade primero una clave API "
+              "arriba.",
+    },
+    "api_keys.dialog_title": {
+        "en": "{name} API keys",
+        "fr": "Clés API {name}",
+        "zh": "{name} API 密钥",
+        "ja": "{name} API キー",
+        "de": "{name} API-Schlüssel",
+        "es": "Claves API de {name}",
+    },
+    "api_keys.dialog_sub": {
+        "en": "The first key is primary. The others are tried in order when it "
+              "fails with a rate limit or auth error.",
+        "fr": "La première clé est principale. Les autres sont essayées dans "
+              "l'ordre en cas de limite de débit ou d'erreur d'authentification.",
+        "zh": "第一个密钥为主密钥。当其触发速率限制或认证错误时，将按顺序尝试其余密钥。",
+        "ja": "最初のキーが主キーです。レート制限や認証エラーで失敗すると、残りのキーが"
+              "順番に試されます。",
+        "de": "Der erste Schlüssel ist primär. Die übrigen werden der Reihe nach "
+              "versucht, wenn er mit einem Ratenlimit oder Authentifizierungs"
+              "fehler fehlschlägt.",
+        "es": "La primera clave es la principal. Las demás se prueban en orden "
+              "cuando falla por límite de tasa o error de autenticación.",
+    },
+    "api_keys.primary": {
+        "en": "Primary",
+        "fr": "Principale",
+        "zh": "主密钥",
+        "ja": "主キー",
+        "de": "Primär",
+        "es": "Principal",
+    },
+    "api_keys.fallback_n": {
+        "en": "Fallback {n}",
+        "fr": "Secours {n}",
+        "zh": "备用 {n}",
+        "ja": "予備 {n}",
+        "de": "Fallback {n}",
+        "es": "Respaldo {n}",
+    },
+    "api_keys.key_placeholder": {
+        "en": "API key",
+        "fr": "Clé API",
+        "zh": "API 密钥",
+        "ja": "API キー",
+        "de": "API-Schlüssel",
+        "es": "Clave API",
+    },
+    "api_keys.add": {
+        "en": "Add key",
+        "fr": "Ajouter une clé",
+        "zh": "添加密钥",
+        "ja": "キーを追加",
+        "de": "Schlüssel hinzufügen",
+        "es": "Añadir clave",
+    },
 }
 
 

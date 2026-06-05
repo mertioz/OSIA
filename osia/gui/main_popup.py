@@ -44,7 +44,7 @@ from osia.models import (
 )
 from osia.config import (
     load_api_keys, save_api_keys, load_settings, set_setting, set_api_key,
-    load_mobile_token, regenerate_mobile_token,
+    get_api_key, load_mobile_token, regenerate_mobile_token,
 )
 from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
@@ -1047,6 +1047,238 @@ class _TokenDialog(QDialog):
         self.activateWindow()
 
 
+class _PopoverDialog(QDialog):
+    """Frameless, dark, always-on-top modal used as a settings popover/flyout.
+
+    Shares the premium ``dialogCard`` styling with :class:`_TokenDialog`.
+    Subclasses fill ``self._card_layout``; this base handles the window flags,
+    translucent background and the "surface above the always-on-top parent"
+    placement (anchored under a trigger widget when one is given, else centred).
+    """
+
+    def __init__(self, parent, anchor=None):
+        super().__init__(parent)
+        self._anchor = anchor
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Dialog
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setModal(True)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setObjectName("dialogCard")
+        outer.addWidget(card)
+        self._card_layout = QVBoxLayout(card)
+        self._card_layout.setContentsMargins(18, 16, 18, 16)
+        self._card_layout.setSpacing(10)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        anchor = self._anchor
+        placed = False
+        try:
+            if anchor is not None and anchor.isVisible():
+                # Flush the popover just under its trigger, left edges aligned,
+                # nudged on-screen if it would spill past the screen edge.
+                gp = anchor.mapToGlobal(QPoint(0, anchor.height() + 6))
+                screen = QGuiApplication.screenAt(gp) or QGuiApplication.primaryScreen()
+                avail = screen.availableGeometry()
+                x = min(gp.x(), avail.right() - self.width() - 8)
+                x = max(avail.left() + 8, x)
+                y = min(gp.y(), avail.bottom() - self.height() - 8)
+                self.move(x, max(avail.top() + 8, y))
+                placed = True
+        except Exception:
+            placed = False
+        if not placed:
+            parent = self.parent()
+            if parent is not None:
+                geo = parent.window().frameGeometry()
+                self.move(geo.center() - self.rect().center())
+        self.raise_()
+        self.activateWindow()
+
+
+class _ApiKeyFallbackDialog(_PopoverDialog):
+    """Popover to edit a provider's ordered API-key fallback hierarchy.
+
+    Row 1 is the primary key; the rest are tried in order on a 429/auth error
+    (see :meth:`OSIAAgent._activate_next_api_key`). Keys are masked. On close
+    the cleaned list is persisted to ``api_key_fallbacks[provider]`` in
+    settings.json (the provider entry is dropped when no key remains).
+    """
+
+    def __init__(self, parent, provider: str, provider_name: str,
+                 keys: list, anchor=None):
+        super().__init__(parent, anchor=anchor)
+        self.setObjectName("apiKeyDialog")
+        self._provider = provider
+        self._keys = [str(k) for k in keys] if keys else [""]
+
+        lay = self._card_layout
+        title = QLabel(i18n.t("api_keys.dialog_title", name=provider_name))
+        title.setObjectName("dialogTitle")
+        lay.addWidget(title)
+        sub = QLabel(i18n.t("api_keys.dialog_sub"))
+        sub.setObjectName("sectionSub")
+        sub.setWordWrap(True)
+        sub.setMaximumWidth(360)
+        lay.addWidget(sub)
+
+        host = QWidget()
+        self._rows_host = QVBoxLayout(host)
+        self._rows_host.setContentsMargins(0, 0, 0, 0)
+        self._rows_host.setSpacing(6)
+        lay.addWidget(host)
+
+        add_btn = QPushButton("＋ " + i18n.t("api_keys.add"))
+        add_btn.setObjectName("ghostBtn")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.clicked.connect(self._on_add)
+        lay.addWidget(add_btn, 0, Qt.AlignmentFlag.AlignLeft)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton(i18n.t("settings.close"))
+        close_btn.setObjectName("primaryBtn")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+
+        self._render_rows()
+
+    def _render_rows(self) -> None:
+        while self._rows_host.count():
+            item = self._rows_host.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        for i, key in enumerate(self._keys):
+            self._rows_host.addWidget(self._build_row(i, key))
+
+    def _build_row(self, index: int, key: str) -> QWidget:
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        label = QLabel(i18n.t("api_keys.primary") if index == 0
+                       else i18n.t("api_keys.fallback_n", n=index))
+        label.setObjectName("fieldLabel")
+        label.setFixedWidth(74)
+        inp = QLineEdit(key)
+        inp.setObjectName("keyInput")
+        inp.setEchoMode(QLineEdit.EchoMode.Password)
+        inp.setMinimumWidth(220)
+        inp.setPlaceholderText(i18n.t("api_keys.key_placeholder"))
+        inp.textChanged.connect(lambda txt, i=index: self._on_text(i, txt))
+        rm = QPushButton("✕")
+        rm.setObjectName("convDel")
+        rm.setFixedSize(28, 28)
+        rm.setCursor(Qt.CursorShape.PointingHandCursor)
+        rm.clicked.connect(lambda _=False, i=index: self._on_remove(i))
+        # The list must always keep at least one slot (the primary).
+        rm.setEnabled(len(self._keys) > 1)
+        h.addWidget(label)
+        h.addWidget(inp, 1)
+        h.addWidget(rm)
+        return row
+
+    def _on_text(self, index: int, txt: str) -> None:
+        if 0 <= index < len(self._keys):
+            self._keys[index] = txt
+
+    def _on_add(self) -> None:
+        self._keys.append("")
+        self._render_rows()
+
+    def _on_remove(self, index: int) -> None:
+        if 0 <= index < len(self._keys) and len(self._keys) > 1:
+            self._keys.pop(index)
+            self._render_rows()
+
+    def _persist(self) -> None:
+        cleaned = [k.strip() for k in self._keys if k and k.strip()]
+        settings = load_settings()
+        fallbacks = dict(settings.get("api_key_fallbacks", {}) or {})
+        if cleaned:
+            fallbacks[self._provider] = cleaned
+        else:
+            fallbacks.pop(self._provider, None)
+        set_setting("api_key_fallbacks", fallbacks)
+
+    def accept(self):
+        self._persist()
+        super().accept()
+
+
+class _CronConversationDialog(_PopoverDialog):
+    """Popover to link a scheduled task to an existing conversation.
+
+    Lists a "None" option plus every stored conversation by title. Choosing a
+    row sets :attr:`result_id` and accepts; Esc cancels (leaving it unchanged).
+    """
+
+    def __init__(self, parent, current_id, anchor=None):
+        super().__init__(parent, anchor=anchor)
+        self.setObjectName("convPickerDialog")
+        self.result_id = current_id
+
+        lay = self._card_layout
+        title = QLabel(i18n.t("cron.conversation_dialog_title"))
+        title.setObjectName("dialogTitle")
+        lay.addWidget(title)
+        sub = QLabel(i18n.t("cron.conversation_dialog_sub"))
+        sub.setObjectName("sectionSub")
+        sub.setWordWrap(True)
+        sub.setMaximumWidth(340)
+        lay.addWidget(sub)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setObjectName("convScroll")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setMaximumHeight(280)
+        scroll.setMinimumWidth(320)
+        body = QWidget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(4)
+
+        bl.addWidget(self._option_btn(
+            i18n.t("cron.conversation_none_option"), None, current_id))
+        convs = conversations.list_conversations()
+        if not convs:
+            empty = QLabel(i18n.t("cron.conversation_empty"))
+            empty.setObjectName("providerSub")
+            empty.setWordWrap(True)
+            bl.addWidget(empty)
+        for c in convs:
+            cid = c.get("id")
+            title_txt = c.get("title") or i18n.t("cron.conversation_none")
+            bl.addWidget(self._option_btn(title_txt, cid, current_id))
+        bl.addStretch()
+        scroll.setWidget(body)
+        lay.addWidget(scroll)
+
+    def _option_btn(self, text: str, conv_id, current_id) -> QPushButton:
+        marker = "✓  " if conv_id == current_id else "     "
+        btn = QPushButton(marker + text)
+        btn.setObjectName("convPick")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(lambda _=False, cid=conv_id: self._choose(cid))
+        return btn
+
+    def _choose(self, conv_id) -> None:
+        self.result_id = conv_id
+        self.accept()
+
+
 class _SettingsPanel(QWidget):
     """Settings page — organised into three clearly separated provider
     sections plus mobile-token management.
@@ -1172,6 +1404,9 @@ class _SettingsPanel(QWidget):
         v.addWidget(self._build_stt_section())              # Section 3 (STT)
         v.addWidget(self._build_liveapi_section())          # Section 4 (Live API)
         v.addWidget(self._build_ai_hierarchy_section())     # AI Task Hierarchy
+        v.addWidget(self._build_cron_section())             # Scheduled Tasks (Bloc 5)
+        v.addWidget(self._build_heartbeat_section())        # Heartbeat (Bloc 5)
+        v.addWidget(self._build_apikeys_section())          # API Key Fallback
         v.addWidget(self._build_mobile_section())           # Mobile Connection
         v.addWidget(self._build_startup_section())
         v.addStretch(1)
@@ -1813,6 +2048,477 @@ class _SettingsPanel(QWidget):
     def _on_hier_enabled_changed(self, _state) -> None:
         set_setting("ai_hierarchy_enabled", self._hier_enabled_toggle.isChecked())
 
+    # ── Scheduled Tasks / Cron (Bloc 5) ─────────────────────────────────────
+    # A dynamic list of cron jobs mirroring the AI-hierarchy editor: the list
+    # ``self._cron_jobs`` is the source of truth and every add / remove / edit
+    # rewrites ``cron_jobs`` in settings.json. Each job is
+    # ``{"task": str, "schedule": str, "enabled": bool}`` where ``schedule`` is
+    # the canonical string parsed by osia.cron ("every N minutes|hours|days" or
+    # "at HH:MM").
+
+    _CRON_MODES = ("minutes", "hours", "days", "daily")
+    _CRON_MODE_KEYS = {
+        "minutes": "cron.every_minutes",
+        "hours": "cron.every_hours",
+        "days": "cron.every_days",
+        "daily": "cron.daily_at",
+    }
+
+    def _build_cron_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._cron_title = QLabel(i18n.t("settings.cron"))
+        self._cron_title.setObjectName("sectionTitle")
+        self._cron_sub = QLabel(i18n.t("settings.cron_sub"))
+        self._cron_sub.setObjectName("sectionSub")
+        self._cron_sub.setWordWrap(True)
+        l.addWidget(self._cron_title)
+        l.addWidget(self._cron_sub)
+
+        # Source-of-truth job list + the layout its row widgets render into.
+        self._cron_jobs: list[dict] = []
+        host_wrap = QWidget()
+        self._cron_host = QVBoxLayout(host_wrap)
+        self._cron_host.setContentsMargins(0, 0, 0, 0)
+        self._cron_host.setSpacing(8)
+        l.addWidget(host_wrap)
+
+        self._cron_add_btn = QPushButton("＋ " + i18n.t("cron.add"))
+        self._cron_add_btn.setObjectName("primaryBtn")
+        self._cron_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cron_add_btn.clicked.connect(self._on_cron_add)
+        l.addWidget(self._cron_add_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        return wrap
+
+    def _render_cron(self) -> None:
+        # Snapshot conversation titles once per render so each row's pill can
+        # resolve its linked conversation id without re-reading the disk store.
+        try:
+            self._cron_conv_titles = {
+                c.get("id"): c.get("title")
+                for c in conversations.list_conversations()
+            }
+        except Exception:
+            self._cron_conv_titles = {}
+        host = self._cron_host
+        while host.count():
+            item = host.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        if not self._cron_jobs:
+            empty = QLabel(i18n.t("cron.empty"))
+            empty.setObjectName("providerSub")
+            empty.setWordWrap(True)
+            host.addWidget(empty)
+            return
+        for idx, job in enumerate(self._cron_jobs):
+            host.addWidget(self._build_cron_row(idx, job))
+
+    def _build_cron_row(self, index: int, job: dict) -> QWidget:
+        row = QFrame()
+        row.setObjectName("providerCard")
+        v = QVBoxLayout(row)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(6)
+
+        # Row A — task description, conversation pill + picker, enable, remove.
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        task_input = QLineEdit(job.get("task", ""))
+        task_input.setObjectName("keyInput")
+        task_input.setPlaceholderText(i18n.t("cron.task_placeholder"))
+        task_input.textChanged.connect(
+            lambda txt, i=index: self._on_cron_field(i, "task", txt, persist=False)
+        )
+        task_input.editingFinished.connect(self._persist_cron)
+        # Linked-conversation pill + chat-bubble button opening the picker.
+        pill = QLabel(self._cron_pill_text(job.get("conversation_id")))
+        pill.setObjectName("convPill")
+        bubble = QPushButton("💬")
+        bubble.setObjectName("ghostBtn")
+        bubble.setFixedSize(28, 28)
+        bubble.setCursor(Qt.CursorShape.PointingHandCursor)
+        bubble.setToolTip(i18n.t("cron.conversation"))
+        bubble.clicked.connect(
+            lambda _=False, i=index, b=bubble: self._on_cron_pick_conversation(i, b)
+        )
+        enable = QCheckBox()
+        enable.setObjectName("smartToggle")
+        enable.setChecked(bool(job.get("enabled", False)))
+        enable.stateChanged.connect(
+            lambda _s, i=index, c=enable: self._on_cron_field(i, "enabled", c.isChecked())
+        )
+        rm = QPushButton("✕")
+        rm.setObjectName("convDel")
+        rm.setFixedSize(28, 28)
+        rm.setCursor(Qt.CursorShape.PointingHandCursor)
+        rm.clicked.connect(lambda _=False, i=index: self._on_cron_remove(i))
+        top.addWidget(task_input, 1)
+        top.addWidget(pill)
+        top.addWidget(bubble)
+        top.addWidget(enable)
+        top.addWidget(rm)
+        v.addLayout(top)
+
+        # Row B — schedule mode + value (count or HH:MM).
+        mode, value = self._parse_cron_schedule(job.get("schedule", ""))
+        bottom = QHBoxLayout()
+        bottom.setSpacing(6)
+        mode_combo = QComboBox()
+        mode_combo.setObjectName("voiceCombo")
+        for m in self._CRON_MODES:
+            mode_combo.addItem(i18n.t(self._CRON_MODE_KEYS[m]), m)
+        for i in range(mode_combo.count()):
+            if mode_combo.itemData(i) == mode:
+                mode_combo.setCurrentIndex(i)
+                break
+        value_input = QLineEdit(value)
+        value_input.setObjectName("keyInput")
+        value_input.setFixedWidth(90)
+        value_input.setPlaceholderText("14:30" if mode == "daily" else "5")
+        mode_combo.currentIndexChanged.connect(
+            lambda _i, idx=index, mc=mode_combo, vi=value_input:
+                self._on_cron_schedule_changed(idx, mc, vi)
+        )
+        value_input.textChanged.connect(
+            lambda _t, idx=index, mc=mode_combo, vi=value_input:
+                self._on_cron_schedule_changed(idx, mc, vi, persist=False)
+        )
+        value_input.editingFinished.connect(self._persist_cron)
+        bottom.addWidget(mode_combo, 1)
+        bottom.addWidget(value_input)
+        v.addLayout(bottom)
+        return row
+
+    @staticmethod
+    def _parse_cron_schedule(schedule: str) -> tuple[str, str]:
+        """Split a canonical schedule string into ``(mode, value)`` for the UI."""
+        try:
+            from osia.cron import parse_schedule
+            spec = parse_schedule(schedule)
+        except Exception:
+            spec = None
+        if spec is None:
+            return ("minutes", "")
+        if spec["kind"] == "daily":
+            return ("daily", f"{spec['hour']:02d}:{spec['minute']:02d}")
+        secs = spec["seconds"]
+        if secs % 86400 == 0:
+            return ("days", str(secs // 86400))
+        if secs % 3600 == 0:
+            return ("hours", str(secs // 3600))
+        return ("minutes", str(secs // 60))
+
+    @staticmethod
+    def _compose_cron_schedule(mode: str, value: str) -> str:
+        """Build the canonical schedule string from the UI ``(mode, value)``."""
+        value = (value or "").strip()
+        if mode == "daily":
+            return f"at {value}"
+        unit = mode if mode in ("minutes", "hours", "days") else "minutes"
+        return f"every {value} {unit}"
+
+    def _on_cron_field(self, index: int, field: str, value, persist: bool = True) -> None:
+        if 0 <= index < len(self._cron_jobs):
+            self._cron_jobs[index][field] = value
+            if persist:
+                self._persist_cron()
+
+    def _on_cron_schedule_changed(self, index: int, mode_combo: QComboBox,
+                                  value_input: QLineEdit, persist: bool = True) -> None:
+        mode = mode_combo.currentData() or "minutes"
+        value_input.setPlaceholderText("14:30" if mode == "daily" else "5")
+        if 0 <= index < len(self._cron_jobs):
+            self._cron_jobs[index]["schedule"] = self._compose_cron_schedule(
+                mode, value_input.text()
+            )
+            if persist:
+                self._persist_cron()
+
+    def _on_cron_add(self) -> None:
+        self._cron_jobs.append(
+            {"task": "", "schedule": "every 30 minutes", "enabled": False,
+             "conversation_id": None}
+        )
+        self._persist_cron()
+        self._render_cron()
+
+    def _on_cron_remove(self, index: int) -> None:
+        if 0 <= index < len(self._cron_jobs):
+            self._cron_jobs.pop(index)
+            self._persist_cron()
+            self._render_cron()
+
+    def _cron_pill_text(self, conv_id) -> str:
+        """Short pill label for a cron row's linked conversation: the
+        (truncated) title, or "None" when unset or the conversation is gone."""
+        if not conv_id:
+            return i18n.t("cron.conversation_none")
+        title = (getattr(self, "_cron_conv_titles", {}) or {}).get(conv_id)
+        if not title:
+            return i18n.t("cron.conversation_none")
+        if len(title) > 18:
+            title = title[:17].rstrip() + "…"
+        return title
+
+    def _on_cron_pick_conversation(self, index: int, anchor=None) -> None:
+        if not (0 <= index < len(self._cron_jobs)):
+            return
+        current = self._cron_jobs[index].get("conversation_id")
+        dlg = _CronConversationDialog(self, current, anchor=anchor)
+        # exec() returns truthy only when a row was chosen (accept); Esc/cancel
+        # leaves the link unchanged.
+        if dlg.exec():
+            self._cron_jobs[index]["conversation_id"] = dlg.result_id
+            self._persist_cron()
+            self._render_cron()
+
+    def _persist_cron(self) -> None:
+        clean = []
+        for job in self._cron_jobs:
+            clean.append({
+                "task": (job.get("task") or "").strip(),
+                "schedule": (job.get("schedule") or "").strip(),
+                "enabled": bool(job.get("enabled", False)),
+                "conversation_id": job.get("conversation_id") or None,
+            })
+        set_setting("cron_jobs", clean)
+
+    # ── Heartbeat / system monitoring (Bloc 5) ──────────────────────────────
+    # Master toggle + collapsible body: an interval field and one row per
+    # monitored metric (CPU / RAM / disk / network). Everything writes straight
+    # through to ``heartbeat_*`` in settings.json so the background monitor
+    # (osia.heartbeat) picks the changes up on its next cycle.
+
+    _HB_METRICS = (
+        # (name, label_key, hint_key, has_threshold)
+        ("cpu", "heartbeat.check_cpu", "heartbeat.hint_usage", True),
+        ("ram", "heartbeat.check_ram", "heartbeat.hint_usage", True),
+        ("disk", "heartbeat.check_disk", "heartbeat.hint_disk", True),
+        ("network", "heartbeat.check_network", "heartbeat.hint_network", False),
+    )
+    _HB_DEFAULT_THRESHOLDS = {"cpu": 80, "ram": 90, "disk": 10}
+
+    def _build_heartbeat_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._hb_title = QLabel(i18n.t("settings.heartbeat"))
+        self._hb_title.setObjectName("sectionTitle")
+        self._hb_sub = QLabel(i18n.t("settings.heartbeat_sub"))
+        self._hb_sub.setObjectName("sectionSub")
+        self._hb_sub.setWordWrap(True)
+        l.addWidget(self._hb_title)
+        l.addWidget(self._hb_sub)
+
+        # Master toggle — the body below stays hidden until ON.
+        enable_row = QHBoxLayout()
+        self._hb_enabled_label = QLabel(i18n.t("heartbeat.enabled"))
+        self._hb_enabled_label.setObjectName("providerName")
+        self._hb_enabled_toggle = QCheckBox()
+        self._hb_enabled_toggle.setObjectName("smartToggle")
+        self._hb_enabled_toggle.stateChanged.connect(self._on_hb_enabled_changed)
+        enable_row.addWidget(self._hb_enabled_label)
+        enable_row.addStretch()
+        enable_row.addWidget(self._hb_enabled_toggle)
+        l.addLayout(enable_row)
+
+        self._hb_body = QWidget()
+        body = QVBoxLayout(self._hb_body)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(8)
+
+        # Sampling interval (minutes).
+        interval_row = QHBoxLayout()
+        self._hb_interval_label = QLabel(i18n.t("heartbeat.interval"))
+        self._hb_interval_label.setObjectName("fieldLabel")
+        self._hb_interval_input = QLineEdit()
+        self._hb_interval_input.setObjectName("keyInput")
+        self._hb_interval_input.setFixedWidth(70)
+        self._hb_interval_input.editingFinished.connect(self._on_hb_interval_changed)
+        interval_row.addWidget(self._hb_interval_label)
+        interval_row.addStretch()
+        interval_row.addWidget(self._hb_interval_input)
+        body.addLayout(interval_row)
+
+        # Per-metric rows.
+        self._hb_check_toggles: dict[str, QCheckBox] = {}
+        self._hb_threshold_inputs: dict[str, QLineEdit] = {}
+        self._hb_metric_labels: dict[str, QLabel] = {}
+        self._hb_metric_hints: dict[str, QLabel] = {}
+        for name, label_key, hint_key, has_threshold in self._HB_METRICS:
+            body.addWidget(
+                self._build_hb_metric_row(name, label_key, hint_key, has_threshold)
+            )
+
+        l.addWidget(self._hb_body)
+        return wrap
+
+    def _build_hb_metric_row(self, name: str, label_key: str, hint_key: str,
+                             has_threshold: bool) -> QWidget:
+        row = QFrame()
+        row.setObjectName("providerCard")
+        v = QVBoxLayout(row)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(4)
+
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        toggle = QCheckBox()
+        toggle.setObjectName("smartToggle")
+        toggle.stateChanged.connect(self._persist_heartbeat_checks)
+        label = QLabel(i18n.t(label_key))
+        label.setObjectName("providerName")
+        top.addWidget(toggle)
+        top.addWidget(label)
+        top.addStretch()
+        if has_threshold:
+            thr = QLineEdit()
+            thr.setObjectName("keyInput")
+            thr.setFixedWidth(56)
+            thr.editingFinished.connect(self._persist_heartbeat_checks)
+            pct = QLabel("%")
+            pct.setObjectName("providerSub")
+            top.addWidget(thr)
+            top.addWidget(pct)
+            self._hb_threshold_inputs[name] = thr
+        v.addLayout(top)
+
+        hint = QLabel(i18n.t(hint_key))
+        hint.setObjectName("sectionSub")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        self._hb_check_toggles[name] = toggle
+        self._hb_metric_labels[name] = label
+        self._hb_metric_hints[name] = hint
+        return row
+
+    def _apply_heartbeat_visibility(self) -> None:
+        self._hb_body.setVisible(self._hb_enabled_toggle.isChecked())
+
+    def _on_hb_enabled_changed(self, _state) -> None:
+        set_setting("heartbeat_enabled", self._hb_enabled_toggle.isChecked())
+        self._apply_heartbeat_visibility()
+
+    def _on_hb_interval_changed(self) -> None:
+        try:
+            minutes = max(1, int(float(self._hb_interval_input.text().strip())))
+        except (TypeError, ValueError):
+            minutes = 5
+        self._hb_interval_input.blockSignals(True)
+        self._hb_interval_input.setText(str(minutes))
+        self._hb_interval_input.blockSignals(False)
+        set_setting("heartbeat_interval_minutes", minutes)
+
+    def _persist_heartbeat_checks(self) -> None:
+        checks = {}
+        for name, toggle in self._hb_check_toggles.items():
+            entry = {"enabled": bool(toggle.isChecked())}
+            thr = self._hb_threshold_inputs.get(name)
+            if thr is not None:
+                try:
+                    entry["threshold"] = max(0, min(100, int(float(thr.text().strip()))))
+                except (TypeError, ValueError):
+                    entry["threshold"] = self._HB_DEFAULT_THRESHOLDS.get(name, 0)
+            checks[name] = entry
+        set_setting("heartbeat_checks", checks)
+
+    # ── API key fallback hierarchy ──────────────────────────────────────────
+    # A dropdown of configured providers; picking one opens a dark popover
+    # (_ApiKeyFallbackDialog) with an ordered list of masked key inputs —
+    # key1 = primary, the rest tried in order on a 429/auth error before the AI
+    # Task Hierarchy switches models. Persisted as ``api_key_fallbacks`` in
+    # settings.json. See OSIAAgent.set_model/_activate_next_api_key/run().
+
+    def _build_apikeys_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._apikeys_title = QLabel(i18n.t("settings.api_keys"))
+        self._apikeys_title.setObjectName("sectionTitle")
+        self._apikeys_sub = QLabel(i18n.t("settings.api_keys_sub"))
+        self._apikeys_sub.setObjectName("sectionSub")
+        self._apikeys_sub.setWordWrap(True)
+        l.addWidget(self._apikeys_title)
+        l.addWidget(self._apikeys_sub)
+
+        self._apikeys_combo = QComboBox()
+        self._apikeys_combo.setObjectName("voiceCombo")
+        # ``activated`` fires on user selection (even re-picking the same item),
+        # unlike ``currentIndexChanged`` — so the popover reopens every time.
+        self._apikeys_combo.activated.connect(self._on_apikeys_provider_activated)
+        l.addWidget(self._apikeys_combo)
+
+        self._apikeys_hint = QLabel(i18n.t("api_keys.no_providers"))
+        self._apikeys_hint.setObjectName("providerSub")
+        self._apikeys_hint.setWordWrap(True)
+        l.addWidget(self._apikeys_hint)
+
+        self._refresh_apikeys_providers()
+        return wrap
+
+    def _apikeys_provider_chain(self, provider: str) -> list:
+        """The saved api_key_fallbacks list for a provider (blanks dropped)."""
+        fallbacks = load_settings().get("api_key_fallbacks", {}) or {}
+        return [k for k in (fallbacks.get(provider) or [])
+                if isinstance(k, str) and k.strip()]
+
+    def _refresh_apikeys_providers(self) -> None:
+        """Rebuild the provider dropdown from the currently configured providers
+        (those with a saved key or an existing fallback list). The leading
+        placeholder keeps the combo in a neutral state; each provider item shows
+        its configured key count."""
+        combo = getattr(self, "_apikeys_combo", None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(i18n.t("api_keys.select_provider"), None)
+        keys = load_api_keys()
+        count = 0
+        for provider in self._AI_PROVIDER_ORDER:
+            chain = self._apikeys_provider_chain(provider)
+            if not keys.get(provider) and not chain:
+                continue
+            name = PROVIDERS.get(provider, {}).get("name", provider)
+            label = f"{name}  ·  {len(chain)}" if chain else name
+            combo.addItem(label, provider)
+            count += 1
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+        if hasattr(self, "_apikeys_hint"):
+            self._apikeys_hint.setVisible(count == 0)
+
+    def _on_apikeys_provider_activated(self, _index: int) -> None:
+        provider = self._apikeys_combo.currentData()
+        if not provider:
+            return
+        name = PROVIDERS.get(provider, {}).get("name", provider)
+        keys = self._apikeys_provider_chain(provider)
+        if not keys:
+            # Convenience: seed key1 with the provider's existing saved key so
+            # the primary starts in sync with the AI Providers section.
+            primary = get_api_key(provider)
+            keys = [primary] if primary else [""]
+        dlg = _ApiKeyFallbackDialog(self, provider, name, keys,
+                                    anchor=self._apikeys_combo)
+        dlg.exec()
+        # The dialog persisted on close; refresh the per-provider key counts and
+        # reset the combo to its neutral placeholder.
+        self._refresh_apikeys_providers()
+
     # ── Mobile connection (pairing token) ──────────────────────────────────
 
     def _build_mobile_section(self) -> QFrame:
@@ -2024,6 +2730,47 @@ class _SettingsPanel(QWidget):
             bool(settings.get("liveapi_enabled", False)))
         self._liveapi_enabled_toggle.blockSignals(False)
         self._apply_liveapi_visibility()
+
+        # Scheduled tasks (Bloc 5) — rebuild the cron job editor.
+        cron_jobs = settings.get("cron_jobs", []) or []
+        self._cron_jobs = [
+            {
+                "task": str(j.get("task", "")),
+                "schedule": str(j.get("schedule", "")),
+                "enabled": bool(j.get("enabled", False)),
+                "conversation_id": j.get("conversation_id") or None,
+            }
+            for j in cron_jobs if isinstance(j, dict)
+        ]
+        self._render_cron()
+
+        # Heartbeat (Bloc 5) — master toggle, interval, per-metric checks.
+        self._hb_enabled_toggle.blockSignals(True)
+        self._hb_enabled_toggle.setChecked(
+            bool(settings.get("heartbeat_enabled", False)))
+        self._hb_enabled_toggle.blockSignals(False)
+        interval = settings.get("heartbeat_interval_minutes", 5) or 5
+        self._hb_interval_input.blockSignals(True)
+        self._hb_interval_input.setText(str(interval))
+        self._hb_interval_input.blockSignals(False)
+        hb_checks = settings.get("heartbeat_checks", {}) or {}
+        for name, toggle in self._hb_check_toggles.items():
+            cfg = hb_checks.get(name) or {}
+            toggle.blockSignals(True)
+            toggle.setChecked(bool(cfg.get("enabled", False)))
+            toggle.blockSignals(False)
+            thr = self._hb_threshold_inputs.get(name)
+            if thr is not None:
+                thr.blockSignals(True)
+                thr.setText(str(cfg.get(
+                    "threshold", self._HB_DEFAULT_THRESHOLDS.get(name, 0))))
+                thr.blockSignals(False)
+        self._apply_heartbeat_visibility()
+
+        # API key fallback hierarchy — rebuild the provider dropdown (configured
+        # providers can change as keys are added/removed elsewhere). The keys
+        # themselves live behind the per-provider popover, not in this panel.
+        self._refresh_apikeys_providers()
 
         # Mobile token (masked)
         self._mobile_token = load_mobile_token()
@@ -2278,6 +3025,29 @@ class _SettingsPanel(QWidget):
         # Rebuild the rows so the "no models" placeholder re-translates too.
         self._render_hier_category("heavy")
         self._render_hier_category("medium")
+
+        # Scheduled Tasks (Bloc 5) — rebuild rows so the mode combos and the
+        # "no tasks" placeholder re-translate too.
+        self._cron_title.setText(i18n.t("settings.cron"))
+        self._cron_sub.setText(i18n.t("settings.cron_sub"))
+        self._cron_add_btn.setText("＋ " + i18n.t("cron.add"))
+        self._render_cron()
+
+        # Heartbeat (Bloc 5)
+        self._hb_title.setText(i18n.t("settings.heartbeat"))
+        self._hb_sub.setText(i18n.t("settings.heartbeat_sub"))
+        self._hb_enabled_label.setText(i18n.t("heartbeat.enabled"))
+        self._hb_interval_label.setText(i18n.t("heartbeat.interval"))
+        for _name, _label_key, _hint_key, _ht in self._HB_METRICS:
+            self._hb_metric_labels[_name].setText(i18n.t(_label_key))
+            self._hb_metric_hints[_name].setText(i18n.t(_hint_key))
+
+        # API key fallback hierarchy — title/sub/hint + rebuild the dropdown so
+        # the "Select a provider…" placeholder re-translates too.
+        self._apikeys_title.setText(i18n.t("settings.api_keys"))
+        self._apikeys_sub.setText(i18n.t("settings.api_keys_sub"))
+        self._apikeys_hint.setText(i18n.t("api_keys.no_providers"))
+        self._refresh_apikeys_providers()
 
         self._mobile_title.setText(i18n.t("settings.mobile"))
         self._mobile_sub.setText(i18n.t("settings.mobile_sub"))
@@ -3130,6 +3900,33 @@ class MainPopup(QWidget):
                 font-size: 14px;
                 font-weight: 600;
                 color: #f5f5fa;
+            }
+            /* Conversation pill on a cron row + the picker popover rows */
+            QLabel#convPill {
+                background: rgba(196, 181, 245, 0.14);
+                border: 1px solid rgba(196, 181, 245, 0.35);
+                border-radius: 9px;
+                padding: 2px 9px;
+                color: #d9cffb;
+                font-size: 10px;
+            }
+            QScrollArea#convScroll {
+                background: transparent;
+                border: none;
+            }
+            QPushButton#convPick {
+                background: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 8px;
+                padding: 7px 10px;
+                color: #f5f5fa;
+                font-size: 12px;
+                text-align: left;
+            }
+            QPushButton#convPick:hover {
+                background: rgba(196, 181, 245, 0.18);
+                border: 1px solid rgba(196, 181, 245, 0.45);
+                color: #ffffff;
             }
 
             QPushButton#ghostBtn {
