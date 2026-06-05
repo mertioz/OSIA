@@ -186,7 +186,21 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
     body = SYSTEM_PROMPT_FR if lang == "fr" else SYSTEM_PROMPT_EN
     if model and provider:
         header = f"Tu es OSIA. Tu tournes sur {model} ({provider}).\n\n"
-        return header + body
+        body = header + body
+    # Bloc 6 — prepend the user's custom personality (~/.osia/personality.md)
+    # and append any enabled skill files (~/.osia/skills/*.md). Both are
+    # optional Markdown the user edits from the "OSIA" tab; any failure here
+    # must never break prompt construction, so fall back silently.
+    try:
+        from osia import personality
+        persona = personality.load_personality().strip()
+        if persona:
+            body = persona + "\n\n" + body
+        skills = personality.load_enabled_skills_text().strip()
+        if skills:
+            body = body + "\n\n" + skills
+    except Exception:
+        pass
     return body
 
 

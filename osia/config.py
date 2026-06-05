@@ -79,6 +79,12 @@ DEFAULT_SETTINGS = {
     # ``{<provider>: ["key1", "key2", ...]}``. Empty/absent = use the single
     # saved key (api_keys.json) unchanged. See OSIAAgent.set_model/run().
     "api_key_fallbacks": {},
+    # Skills (Bloc 6): enabled/disabled flag per skill file. The skill prose
+    # itself lives as Markdown under ``~/.osia/skills/*.md``; only the on/off
+    # state is stored here. Shape: ``{"<name>.md": true}``. A skill with no
+    # recorded flag defaults to enabled. Enabled skills are appended to the
+    # system prompt — see osia.personality and osia.agent.get_system_prompt.
+    "skills_enabled": {},
     "island_x": None,          # last dragged capsule position; None = top-centre
     "island_y": None,
 }

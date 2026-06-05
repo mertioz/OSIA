@@ -34,10 +34,11 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QStackedWidget, QFrame, QGraphicsDropShadowEffect,
     QSizePolicy, QFileDialog, QCheckBox, QComboBox,
-    QButtonGroup, QGridLayout, QDialog,
+    QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog,
 )
 
 from osia import conversations
+from osia import personality
 from osia.agent import strip_tool_artifacts
 from osia.models import (
     PROVIDERS, get_all_models,
@@ -3134,6 +3135,343 @@ class _SettingsPanel(QWidget):
         return
 
 
+# ── OSIA identity panel (Bloc 6) ─────────────────────────────────────────────
+
+class _OsiaPanel(QWidget):
+    """OSIA identity page — edit the assistant's *personality* and manage its
+    *skill* files.
+
+    * Personality — a single Markdown document (``~/.osia/personality.md``)
+      shown in a multi-line editor with Save / Reset-to-default. It is
+      prepended to the system prompt at conversation start.
+    * Skills — one Markdown file per skill (``~/.osia/skills/*.md``), each with
+      an enable/disable toggle, an inline editor and a delete button. The "+"
+      button creates a new skill from a template. Enabled skills are appended
+      to the system prompt; the enabled set persists in ``settings.json``
+      (``skills_enabled``).
+
+    Persistence lives in :mod:`osia.personality`; this panel is just the editor
+    chrome. Changes take effect at the start of the next conversation, when
+    :func:`osia.agent.get_system_prompt` re-reads both from disk.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._drag_pos: QPoint | None = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setSpacing(10)
+
+        header = QHBoxLayout()
+        # "OSIA" is a proper noun — shown verbatim like the other panel titles.
+        title = QLabel("OSIA")
+        title.setObjectName("panelTitle")
+        min_btn = QPushButton("−")
+        min_btn.setObjectName("minBtn")
+        min_btn.setFixedSize(26, 26)
+        min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        min_btn.setToolTip("Minimize")
+        min_btn.clicked.connect(self.hide)
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(min_btn)
+        outer.addLayout(header)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("panelScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+        host = QWidget()
+        host.setObjectName("panelHost")
+        v = QVBoxLayout(host)
+        v.setContentsMargins(0, 0, 6, 0)
+        v.setSpacing(14)
+        v.addWidget(self._build_personality_section())
+        v.addWidget(self._build_skills_section())
+        v.addStretch(1)
+        scroll.setWidget(host)
+        outer.addWidget(scroll, 1)
+
+        # Re-translate this panel's chrome when the UI language changes.
+        i18n.add_listener(self._retranslate)
+        self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
+
+        self._load_state()
+
+    # ── Personality section ────────────────────────────────────────────────
+
+    def _build_personality_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._pers_title = QLabel(i18n.t("osia.personality"))
+        self._pers_title.setObjectName("sectionTitle")
+        self._pers_sub = QLabel(i18n.t("osia.personality_sub"))
+        self._pers_sub.setObjectName("sectionSub")
+        self._pers_sub.setWordWrap(True)
+        l.addWidget(self._pers_title)
+        l.addWidget(self._pers_sub)
+
+        self._pers_edit = QTextEdit()
+        self._pers_edit.setObjectName("mdEditor")
+        self._pers_edit.setAcceptRichText(False)
+        self._pers_edit.setMinimumHeight(150)
+        l.addWidget(self._pers_edit)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self._pers_save_btn = QPushButton(i18n.t("provider.save"))
+        self._pers_save_btn.setObjectName("saveBtn")
+        self._pers_save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._pers_save_btn.clicked.connect(self._on_personality_save)
+        self._pers_reset_btn = QPushButton(i18n.t("osia.reset_default"))
+        self._pers_reset_btn.setObjectName("ghostBtn")
+        self._pers_reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._pers_reset_btn.clicked.connect(self._on_personality_reset)
+        btn_row.addWidget(self._pers_save_btn)
+        btn_row.addWidget(self._pers_reset_btn)
+        btn_row.addStretch()
+        l.addLayout(btn_row)
+        return wrap
+
+    def _on_personality_save(self) -> None:
+        personality.save_personality(self._pers_edit.toPlainText())
+        self._flash_saved(self._pers_save_btn)
+
+    def _on_personality_reset(self) -> None:
+        text = personality.reset_personality()
+        self._pers_edit.setPlainText(text)
+        self._flash_saved(self._pers_save_btn)
+
+    def _flash_saved(self, btn: QPushButton) -> None:
+        """Flash a save button green for 1.5s (same pattern as _ProviderCard)."""
+        btn.setText(i18n.t("provider.saved"))
+        btn.setProperty("saved", True)
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
+
+        def restore(b=btn):
+            # The button may have been destroyed by a re-render in the meantime.
+            if sip is not None and sip.isdeleted(b):
+                return
+            b.setProperty("saved", False)
+            b.setText(i18n.t("provider.save"))
+            b.style().unpolish(b)
+            b.style().polish(b)
+
+        QTimer.singleShot(1500, restore)
+
+    # ── Skills section ─────────────────────────────────────────────────────
+
+    def _build_skills_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._skills_title = QLabel(i18n.t("osia.skills"))
+        self._skills_title.setObjectName("sectionTitle")
+        self._skills_sub = QLabel(i18n.t("osia.skills_sub"))
+        self._skills_sub.setObjectName("sectionSub")
+        self._skills_sub.setWordWrap(True)
+        l.addWidget(self._skills_title)
+        l.addWidget(self._skills_sub)
+
+        host_wrap = QWidget()
+        self._skills_host = QVBoxLayout(host_wrap)
+        self._skills_host.setContentsMargins(0, 0, 0, 0)
+        self._skills_host.setSpacing(8)
+        l.addWidget(host_wrap)
+
+        self._skills_add_btn = QPushButton("＋ " + i18n.t("osia.skill_add"))
+        self._skills_add_btn.setObjectName("primaryBtn")
+        self._skills_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._skills_add_btn.clicked.connect(self._on_skill_add)
+        l.addWidget(self._skills_add_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        return wrap
+
+    def _render_skills(self) -> None:
+        host = self._skills_host
+        while host.count():
+            item = host.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        skills = personality.list_skills()
+        if not skills:
+            empty = QLabel(i18n.t("osia.skills_empty"))
+            empty.setObjectName("providerSub")
+            empty.setWordWrap(True)
+            host.addWidget(empty)
+            return
+        for name in skills:
+            host.addWidget(self._build_skill_row(name))
+
+    def _build_skill_row(self, name: str) -> QWidget:
+        row = QFrame()
+        row.setObjectName("providerCard")
+        v = QVBoxLayout(row)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(6)
+
+        # Row A — filename, enable/disable toggle, edit, delete.
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        label = QLabel(name)
+        label.setObjectName("providerName")
+        enable = QCheckBox()
+        enable.setObjectName("smartToggle")
+        enable.setChecked(personality.is_skill_enabled(name))
+        enable.setToolTip(i18n.t("osia.skill_toggle"))
+        enable.stateChanged.connect(
+            lambda _s, n=name, c=enable:
+                personality.set_skill_enabled(n, c.isChecked())
+        )
+        edit_btn = QPushButton("✎")
+        edit_btn.setObjectName("ghostBtn")
+        edit_btn.setFixedSize(28, 28)
+        edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        edit_btn.setToolTip(i18n.t("osia.skill_edit"))
+        rm = QPushButton("✕")
+        rm.setObjectName("convDel")
+        rm.setFixedSize(28, 28)
+        rm.setCursor(Qt.CursorShape.PointingHandCursor)
+        rm.setToolTip(i18n.t("osia.skill_delete"))
+        rm.clicked.connect(lambda _=False, n=name: self._on_skill_delete(n))
+        top.addWidget(label, 1)
+        top.addWidget(enable)
+        top.addWidget(edit_btn)
+        top.addWidget(rm)
+        v.addLayout(top)
+
+        # Row B — inline editor, hidden until the ✎ button is clicked.
+        editor_wrap = QWidget()
+        ev = QVBoxLayout(editor_wrap)
+        ev.setContentsMargins(0, 4, 0, 0)
+        ev.setSpacing(6)
+        editor = QTextEdit()
+        editor.setObjectName("mdEditor")
+        editor.setAcceptRichText(False)
+        editor.setMinimumHeight(140)
+        editor.setPlainText(personality.read_skill(name))
+        ev.addWidget(editor)
+        ed_btns = QHBoxLayout()
+        ed_btns.setSpacing(8)
+        save_btn = QPushButton(i18n.t("provider.save"))
+        save_btn.setObjectName("saveBtn")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.clicked.connect(
+            lambda _=False, n=name, e=editor, b=save_btn:
+                self._on_skill_save(n, e, b)
+        )
+        close_btn = QPushButton(i18n.t("osia.skill_close"))
+        close_btn.setObjectName("ghostBtn")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(
+            lambda _=False, w=editor_wrap: w.setVisible(False)
+        )
+        ed_btns.addWidget(save_btn)
+        ed_btns.addWidget(close_btn)
+        ed_btns.addStretch()
+        ev.addLayout(ed_btns)
+        editor_wrap.setVisible(False)
+        v.addWidget(editor_wrap)
+
+        edit_btn.clicked.connect(
+            lambda _=False, w=editor_wrap, e=editor, n=name:
+                self._toggle_skill_editor(w, e, n)
+        )
+        return row
+
+    def _toggle_skill_editor(self, wrap: QWidget, editor: QTextEdit,
+                             name: str) -> None:
+        if wrap.isVisible():
+            wrap.setVisible(False)
+        else:
+            # Reload from disk so the editor reflects any external change.
+            editor.setPlainText(personality.read_skill(name))
+            wrap.setVisible(True)
+
+    def _on_skill_save(self, name: str, editor: QTextEdit,
+                       btn: QPushButton) -> None:
+        personality.write_skill(name, editor.toPlainText())
+        self._flash_saved(btn)
+
+    def _on_skill_add(self) -> None:
+        name, ok = QInputDialog.getText(
+            self, i18n.t("osia.skill_new_title"), i18n.t("osia.skill_new_prompt")
+        )
+        if not ok:
+            return
+        if personality.create_skill(name):
+            self._render_skills()
+
+    def _on_skill_delete(self, name: str) -> None:
+        personality.delete_skill(name)
+        self._render_skills()
+
+    # ── State ──────────────────────────────────────────────────────────────
+
+    def _load_state(self) -> None:
+        self._pers_edit.setPlainText(personality.load_personality())
+        self._render_skills()
+
+    def refresh(self) -> None:
+        """Reload personality + skills from disk — called when the tab opens."""
+        self._load_state()
+
+    def _retranslate(self) -> None:
+        self._pers_title.setText(i18n.t("osia.personality"))
+        self._pers_sub.setText(i18n.t("osia.personality_sub"))
+        if not self._pers_save_btn.property("saved"):
+            self._pers_save_btn.setText(i18n.t("provider.save"))
+        self._pers_reset_btn.setText(i18n.t("osia.reset_default"))
+        self._skills_title.setText(i18n.t("osia.skills"))
+        self._skills_sub.setText(i18n.t("osia.skills_sub"))
+        self._skills_add_btn.setText("＋ " + i18n.t("osia.skill_add"))
+        # Deliberately do NOT rebuild the skill rows here: _render_skills() is
+        # destructive (it tears down every row, collapsing any open inline
+        # editor and discarding unsaved edits). The language selector lives on
+        # the Settings page, so these rows are never visible at the moment the
+        # language changes, and they re-translate on the next refresh() (every
+        # time the OSIA tab is opened).
+
+    # ── Dragging (mirrors _SettingsPanel) ──────────────────────────────────
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = (
+                event.globalPosition().toPoint()
+                - self.window().frameGeometry().topLeft()
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._drag_pos is not None
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            self.window().move(
+                event.globalPosition().toPoint() - self._drag_pos
+            )
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+        super().mouseReleaseEvent(event)
+
+
 # ── Bottom-nav button ────────────────────────────────────────────────────────
 
 class _NavButton(QPushButton):
@@ -3145,6 +3483,7 @@ class _NavButton(QPushButton):
     * ``conv``     — a rounded speech bubble (Conversations)
     * ``models``   — a four-point sparkle/star (Models)
     * ``settings`` — a gear (Settings)
+    * ``osia``     — a person/identity silhouette (OSIA personality + skills)
 
     The active tab gets a rounded violet pill behind the icon and the icon
     itself switches to the violet accent; hover shows a softer violet wash.
@@ -3202,6 +3541,8 @@ class _NavButton(QPushButton):
             self._paint_sparkle(p, cx, cy, s, color)
         elif self._kind == "settings":
             self._paint_gear(p, cx, cy, s, color)
+        elif self._kind == "osia":
+            self._paint_person(p, cx, cy, s, color)
         p.end()
 
     # ── Icon glyphs ───────────────────────────────────────────────────────
@@ -3268,6 +3609,25 @@ class _NavButton(QPushButton):
         p.setBrush(color)
         p.drawPath(path)
 
+    def _paint_person(self, p, cx, cy, s, color) -> None:
+        """A person/identity silhouette — a head circle above a shoulders dome."""
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        # Head.
+        head_r = s * 0.21
+        head_cy = cy - s * 0.24
+        p.drawEllipse(QPointF(cx, head_cy), head_r, head_r)
+        # Shoulders — the top half of an ellipse sitting just below the head.
+        sw = s * 0.80          # shoulder width
+        sh = s * 0.64          # full ellipse height (only the top half is drawn)
+        shoulders_cy = cy + s * 0.28
+        rect = QRectF(cx - sw / 2, shoulders_cy - sh / 2, sw, sh)
+        path = QPainterPath()
+        path.moveTo(rect.left(), shoulders_cy)
+        path.arcTo(rect, 180, -180)   # left → over the top → right
+        path.closeSubpath()           # flat bottom
+        p.drawPath(path)
+
 
 # ── MainPopup ───────────────────────────────────────────────────────────────
 
@@ -3287,6 +3647,7 @@ class MainPopup(QWidget):
     PAGE_CONVS = 1
     PAGE_MODELS = 2
     PAGE_SETTINGS = 3
+    PAGE_OSIA = 4
 
     def __init__(self):
         super().__init__()
@@ -3361,10 +3722,13 @@ class MainPopup(QWidget):
         self._settings = _SettingsPanel()
         self._settings.api_keys_saved.connect(self.api_keys_saved.emit)
 
+        self._osia = _OsiaPanel()
+
         self._stack.addWidget(self._chat)
         self._stack.addWidget(self._convs)
         self._stack.addWidget(self._models)
         self._stack.addWidget(self._settings)
+        self._stack.addWidget(self._osia)
         outer.addWidget(self._stack, 1)
 
         # Bottom nav
@@ -3378,6 +3742,7 @@ class MainPopup(QWidget):
             (self.PAGE_CONVS,   "conv",     "Conversations"),
             (self.PAGE_MODELS,  "models",   "Model"),
             (self.PAGE_SETTINGS,"settings", "Settings"),
+            (self.PAGE_OSIA,    "osia",     "OSIA"),
         ]:
             btn = _NavButton(kind, tooltip)
             btn.clicked.connect(
@@ -3478,6 +3843,8 @@ class MainPopup(QWidget):
             self._convs.refresh()
         elif page_idx == self.PAGE_MODELS:
             self._models.refresh()
+        elif page_idx == self.PAGE_OSIA:
+            self._osia.refresh()
 
     def _on_new_conv(self) -> None:
         self.new_conversation.emit()
@@ -3974,6 +4341,20 @@ class MainPopup(QWidget):
                 font-size: 12px;
             }
             QLineEdit#keyInput:focus {
+                border: 1px solid rgba(196, 181, 245, 0.55);
+            }
+            /* Multi-line Markdown editor (OSIA personality + skills) ──── */
+            QTextEdit#mdEditor {
+                background: #14111c;
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 8px;
+                padding: 6px 8px;
+                color: #f5f5fa;
+                font-family: "DejaVu Sans Mono", "SF Mono", monospace;
+                font-size: 12px;
+                selection-background-color: rgba(196, 181, 245, 0.30);
+            }
+            QTextEdit#mdEditor:focus {
                 border: 1px solid rgba(196, 181, 245, 0.55);
             }
             QPushButton#saveBtn {

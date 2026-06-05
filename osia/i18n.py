@@ -922,6 +922,122 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Schlüssel hinzufügen",
         "es": "Añadir clave",
     },
+    # — OSIA tab (Bloc 6): personality + skills —
+    "osia.personality": {
+        "en": "Personality",
+        "fr": "Personnalité",
+        "zh": "个性",
+        "ja": "性格",
+        "de": "Persönlichkeit",
+        "es": "Personalidad",
+    },
+    "osia.personality_sub": {
+        "en": "Define how OSIA behaves and speaks. Prepended to the system "
+              "prompt at the start of every conversation.",
+        "fr": "Définissez le comportement et le ton d'OSIA. Ajouté au début de "
+              "l'invite système au démarrage de chaque conversation.",
+        "zh": "定义 OSIA 的行为和说话方式。在每次对话开始时添加到系统提示的开头。",
+        "ja": "OSIA の振る舞いと話し方を定義します。会話の開始時にシステム"
+              "プロンプトの先頭に追加されます。",
+        "de": "Legen Sie fest, wie sich OSIA verhält und spricht. Wird zu "
+              "Beginn jeder Unterhaltung an den Anfang des System-Prompts "
+              "gestellt.",
+        "es": "Define cómo se comporta y habla OSIA. Se añade al principio del "
+              "prompt del sistema al inicio de cada conversación.",
+    },
+    "osia.reset_default": {
+        "en": "Reset to default",
+        "fr": "Réinitialiser",
+        "zh": "恢复默认",
+        "ja": "デフォルトに戻す",
+        "de": "Zurücksetzen",
+        "es": "Restablecer",
+    },
+    "osia.skills": {
+        "en": "Skills",
+        "fr": "Compétences",
+        "zh": "技能",
+        "ja": "スキル",
+        "de": "Fähigkeiten",
+        "es": "Habilidades",
+    },
+    "osia.skills_sub": {
+        "en": "Reusable instruction files. Enabled skills are appended to the "
+              "system prompt.",
+        "fr": "Fichiers d'instructions réutilisables. Les compétences activées "
+              "sont ajoutées à l'invite système.",
+        "zh": "可重复使用的指令文件。已启用的技能会附加到系统提示中。",
+        "ja": "再利用可能な指示ファイル。有効なスキルはシステムプロンプトに"
+              "追加されます。",
+        "de": "Wiederverwendbare Anweisungsdateien. Aktivierte Fähigkeiten "
+              "werden an den System-Prompt angehängt.",
+        "es": "Archivos de instrucciones reutilizables. Las habilidades "
+              "activadas se añaden al prompt del sistema.",
+    },
+    "osia.skills_empty": {
+        "en": "No skills yet. Create one with +.",
+        "fr": "Aucune compétence. Créez-en une avec +.",
+        "zh": "暂无技能。点击 + 创建一个。",
+        "ja": "スキルがありません。+ で作成してください。",
+        "de": "Noch keine Fähigkeiten. Erstellen Sie eine mit +.",
+        "es": "Aún no hay habilidades. Crea una con +.",
+    },
+    "osia.skill_add": {
+        "en": "New skill",
+        "fr": "Nouvelle compétence",
+        "zh": "新技能",
+        "ja": "新しいスキル",
+        "de": "Neue Fähigkeit",
+        "es": "Nueva habilidad",
+    },
+    "osia.skill_edit": {
+        "en": "Edit",
+        "fr": "Modifier",
+        "zh": "编辑",
+        "ja": "編集",
+        "de": "Bearbeiten",
+        "es": "Editar",
+    },
+    "osia.skill_delete": {
+        "en": "Delete",
+        "fr": "Supprimer",
+        "zh": "删除",
+        "ja": "削除",
+        "de": "Löschen",
+        "es": "Eliminar",
+    },
+    "osia.skill_toggle": {
+        "en": "Enable or disable this skill",
+        "fr": "Activer ou désactiver cette compétence",
+        "zh": "启用或禁用此技能",
+        "ja": "このスキルを有効/無効にする",
+        "de": "Diese Fähigkeit aktivieren oder deaktivieren",
+        "es": "Activar o desactivar esta habilidad",
+    },
+    "osia.skill_close": {
+        "en": "Close",
+        "fr": "Fermer",
+        "zh": "关闭",
+        "ja": "閉じる",
+        "de": "Schließen",
+        "es": "Cerrar",
+    },
+    "osia.skill_new_title": {
+        "en": "New skill",
+        "fr": "Nouvelle compétence",
+        "zh": "新技能",
+        "ja": "新しいスキル",
+        "de": "Neue Fähigkeit",
+        "es": "Nueva habilidad",
+    },
+    "osia.skill_new_prompt": {
+        "en": "Skill name:",
+        "fr": "Nom de la compétence :",
+        "zh": "技能名称：",
+        "ja": "スキル名：",
+        "de": "Name der Fähigkeit:",
+        "es": "Nombre de la habilidad:",
+    },
 }
 
 
