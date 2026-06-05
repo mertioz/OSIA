@@ -63,3 +63,16 @@ def disable_service(name: str) -> bool:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
     return result.returncode == 0
+
+
+def restart_service(name: str) -> bool:
+    """Restart the unit (without changing its enabled state). Returns True on
+    success."""
+    try:
+        result = _run(
+            ["pkexec", "systemctl", "restart", name],
+            timeout=60.0,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    return result.returncode == 0

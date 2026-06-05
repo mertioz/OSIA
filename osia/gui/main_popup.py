@@ -21,6 +21,7 @@ GUI knowing about threads or persistence.
 import math
 import webbrowser
 from datetime import datetime
+from pathlib import Path
 
 from PyQt6.QtCore import (
     Qt, QEvent, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
@@ -33,19 +34,21 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QStackedWidget, QFrame, QGraphicsDropShadowEffect,
     QSizePolicy, QFileDialog, QCheckBox, QComboBox,
-    QButtonGroup, QGridLayout, QMenu,
+    QButtonGroup, QGridLayout, QDialog,
 )
 
 from osia import conversations
 from osia.agent import strip_tool_artifacts
 from osia.models import (
-    PROVIDERS, API_PROVIDERS, get_all_models,
+    PROVIDERS, get_all_models,
 )
 from osia.config import (
     load_api_keys, save_api_keys, load_settings, set_setting, set_api_key,
+    load_mobile_token, regenerate_mobile_token,
 )
 from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
+    restart_service,
 )
 from osia.utils.assets import LOGO_PATH
 from osia import i18n
@@ -167,6 +170,42 @@ def _display_text(content) -> str:
     if content.lstrip().startswith("<tool_result>"):
         return ""
     return strip_tool_artifacts(content)
+
+
+def _mask_token(token: str) -> str:
+    """Mask a pairing token for display, keeping only the first/last 2 chars
+    (e.g. ``02****************dk``). Short or empty tokens are masked safely.
+    """
+    if not token:
+        return "—"
+    if len(token) <= 6:
+        return token[:1] + "*" * max(1, len(token) - 1)
+    return token[:2] + "*" * (len(token) - 4) + token[-2:]
+
+
+# faster-whisper caches each model in the Hugging Face hub cache under a
+# directory named ``models--Systran--faster-whisper-<size>``. We probe it so the
+# local Whisper model selector only offers (or only enables) the sizes that are
+# actually downloaded on this machine.
+_FASTER_WHISPER_REPO_PREFIX = "models--Systran--faster-whisper-"
+
+
+def _downloaded_whisper_models() -> set[str]:
+    """Return the faster-whisper model sizes present in the local HF hub cache.
+
+    Looks for ``~/.cache/huggingface/hub/models--Systran--faster-whisper-<size>``
+    directories. Never raises — an absent or unreadable cache yields an empty
+    set, so the selector simply offers nothing as downloaded.
+    """
+    hub = Path.home() / ".cache" / "huggingface" / "hub"
+    found: set[str] = set()
+    try:
+        for entry in hub.iterdir():
+            if entry.is_dir() and entry.name.startswith(_FASTER_WHISPER_REPO_PREFIX):
+                found.add(entry.name[len(_FASTER_WHISPER_REPO_PREFIX):])
+    except OSError:
+        pass
+    return found
 
 
 # ── Message bubble ──────────────────────────────────────────────────────────
@@ -928,30 +967,127 @@ class _ProviderCard(QFrame):
             self._save_btn.style().unpolish(self._save_btn)
             self._save_btn.style().polish(self._save_btn)
 
-        QTimer.singleShot(1800, restore)
+        QTimer.singleShot(1500, restore)
+
+
+class _TokenDialog(QDialog):
+    """Small modal that reveals a mobile token in clear text until closed.
+
+    Used by both the "Show" and "Regenerate" actions in the Mobile Connection
+    section. The token is shown in a read-only, selectable field with a Copy
+    button; closing the dialog leaves the section's masked display untouched.
+    """
+
+    def __init__(self, parent, title: str, token: str):
+        super().__init__(parent)
+        self.setObjectName("tokenDialog")
+        # The parent popup is WindowStaysOnTopHint|Tool — a modal child that is
+        # not itself always-on-top can paint BEHIND it on some X11/Wayland WMs,
+        # which reads as a frozen UI (modal blocks input but the dialog hides).
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Dialog
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setModal(True)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setObjectName("dialogCard")
+        outer.addWidget(card)
+
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setSpacing(12)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("dialogTitle")
+        lay.addWidget(title_label)
+
+        self._field = QLineEdit(token)
+        self._field.setObjectName("keyInput")
+        self._field.setReadOnly(True)
+        self._field.setMinimumWidth(300)
+        self._field.setCursorPosition(0)
+        lay.addWidget(self._field)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.addStretch()
+        self._copy_btn = QPushButton(i18n.t("settings.copy"))
+        self._copy_btn.setObjectName("ghostBtn")
+        self._copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._copy_btn.clicked.connect(self._on_copy)
+        close_btn = QPushButton(i18n.t("settings.close"))
+        close_btn.setObjectName("primaryBtn")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self._copy_btn)
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+
+    def _on_copy(self) -> None:
+        QApplication.clipboard().setText(self._field.text())
+        self._copy_btn.setText(i18n.t("settings.copied"))
+        QTimer.singleShot(
+            1500, lambda: self._copy_btn.setText(i18n.t("settings.copy"))
+        )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Center over the parent window (the popup is frameless/always-on-top).
+        parent = self.parent()
+        if parent is not None:
+            geo = parent.window().frameGeometry()
+            self.move(geo.center() - self.rect().center())
+        # Guarantee the dialog surfaces above the always-on-top parent.
+        self.raise_()
+        self.activateWindow()
 
 
 class _SettingsPanel(QWidget):
-    """Settings page — redesigned with the 'Choose provider' card style.
+    """Settings page — organised into three clearly separated provider
+    sections plus mobile-token management.
 
-    Re-uses the original feature set: language selection, smart routing
-    toggle, voice provider selection, startup systemd services, and
-    per-provider API key configuration.
+    * Section 1 — AI Providers (text / chat model API keys)
+    * Section 2 — Voice Providers (text-to-speech)
+    * Section 3 — Whisper Providers (speech-to-text)
+    * Mobile Connection — reveal / regenerate the mobile pairing token
+
+    Around them sit the original language selector, smart-routing toggle and
+    startup systemd services.
     """
 
     smart_routing_toggled = pyqtSignal(bool)
     api_keys_saved = pyqtSignal(dict)
 
-    _TTS_PROVIDER_LABELS = [
-        ("local",  "Local (Kokoro)"),
-        ("openai", "OpenAI"),
-        ("google", "Google Cloud"),
-    ]
+    # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
+    # last as an info-only row).
+    _AI_PROVIDER_ORDER = ("anthropic", "openai", "google", "deepseek", "xai", "groq")
+
+    # Active TTS provider options: (settings value, combo label / i18n key).
+    _TTS_PROVIDERS = (
+        ("local",  "tts.local_option"),
+        ("openai", None),               # proper noun — shown verbatim
+        ("google", None),
+    )
+    _TTS_PROVIDER_NAMES = {"openai": "OpenAI", "google": "Google Cloud"}
+
+    # STT model sub-options per provider: (combo label, settings value).
+    _STT_LOCAL_MODELS = (("small", "small"), ("medium", "medium"))
+    _STT_GROQ_MODELS = (
+        ("large-v3-turbo", "whisper-large-v3-turbo"),
+        ("large-v3", "whisper-large-v3"),
+    )
 
     def __init__(self):
         super().__init__()
 
         self._provider_cards: dict[str, _ProviderCard] = {}
+        self._tts_cards: dict[str, _ProviderCard] = {}
+        self._mobile_token: str = ""
         self._startup_refresh_guard = False
         self._startup_rows: list[tuple[str, QLabel, QCheckBox]] = []
         self._drag_pos: QPoint | None = None
@@ -992,13 +1128,21 @@ class _SettingsPanel(QWidget):
 
         v.addWidget(self._build_language_section())
         v.addWidget(self._build_smart_section())
+        v.addWidget(self._build_ai_providers_section())     # Section 1
+        v.addWidget(self._build_voice_section())            # Section 2 (TTS)
+        v.addWidget(self._build_stt_section())              # Section 3 (STT)
+        v.addWidget(self._build_mobile_section())           # Mobile Connection
         v.addWidget(self._build_startup_section())
-        v.addWidget(self._build_voice_section())
-        v.addWidget(self._build_ai_providers_section())
         v.addStretch(1)
 
         scroll.setWidget(host)
         outer.addWidget(scroll, 1)
+
+        # Re-translate this panel's own section chrome on language change.
+        i18n.add_listener(self._retranslate_sections)
+        self.destroyed.connect(
+            lambda: i18n.remove_listener(self._retranslate_sections)
+        )
 
         self._apply_style()
         self._load_state()
@@ -1112,6 +1256,8 @@ class _SettingsPanel(QWidget):
 
         return wrap
 
+    # ── Section 2: voice providers (text-to-speech) ────────────────────────
+
     def _build_voice_section(self) -> QFrame:
         from osia.voice.tts import (
             OPENAI_VOICES, GOOGLE_FR_VOICES, GOOGLE_EN_VOICES,
@@ -1130,46 +1276,181 @@ class _SettingsPanel(QWidget):
         l.setContentsMargins(14, 12, 14, 12)
         l.setSpacing(8)
 
-        title = QLabel("Voice")
-        title.setObjectName("sectionTitle")
-        sub = QLabel("Choose how OSIA speaks. Changes apply immediately.")
-        sub.setObjectName("sectionSub")
-        sub.setWordWrap(True)
-        l.addWidget(title)
-        l.addWidget(sub)
+        self._voice_title = QLabel(i18n.t("settings.voice_providers"))
+        self._voice_title.setObjectName("sectionTitle")
+        self._voice_sub = QLabel(i18n.t("settings.voice_providers_sub"))
+        self._voice_sub.setObjectName("sectionSub")
+        self._voice_sub.setWordWrap(True)
+        l.addWidget(self._voice_title)
+        l.addWidget(self._voice_sub)
 
+        # Active provider selector.
         prov_row = QHBoxLayout()
-        prov_label = QLabel("Provider")
-        prov_label.setObjectName("fieldLabel")
-        prov_label.setFixedWidth(60)
+        self._voice_prov_label = QLabel(i18n.t("settings.active_provider"))
+        self._voice_prov_label.setObjectName("fieldLabel")
+        self._voice_prov_label.setFixedWidth(96)
         self._tts_provider_combo = QComboBox()
         self._tts_provider_combo.setObjectName("voiceCombo")
-        for key, label in self._TTS_PROVIDER_LABELS:
+        for key, i18n_key in self._TTS_PROVIDERS:
+            label = i18n.t(i18n_key) if i18n_key else self._TTS_PROVIDER_NAMES[key]
             self._tts_provider_combo.addItem(label, key)
         self._tts_provider_combo.currentIndexChanged.connect(
             self._on_tts_provider_changed
         )
-        prov_row.addWidget(prov_label)
+        prov_row.addWidget(self._voice_prov_label)
         prov_row.addWidget(self._tts_provider_combo, 1)
         l.addLayout(prov_row)
 
+        # Voice selector (hidden for the local/Kokoro provider).
         self._tts_voice_row = QWidget()
         voice_row = QHBoxLayout(self._tts_voice_row)
         voice_row.setContentsMargins(0, 0, 0, 0)
-        voice_label = QLabel("Voice")
-        voice_label.setObjectName("fieldLabel")
-        voice_label.setFixedWidth(60)
+        self._voice_voice_label = QLabel(i18n.t("settings.voice"))
+        self._voice_voice_label.setObjectName("fieldLabel")
+        self._voice_voice_label.setFixedWidth(96)
         self._tts_voice_combo = QComboBox()
         self._tts_voice_combo.setObjectName("voiceCombo")
         self._tts_voice_combo.currentIndexChanged.connect(self._on_tts_voice_changed)
-        voice_row.addWidget(voice_label)
+        voice_row.addWidget(self._voice_voice_label)
         voice_row.addWidget(self._tts_voice_combo, 1)
         l.addWidget(self._tts_voice_row)
 
+        # Kokoro — local, free, keyless info row. Shown only when the local
+        # provider is active (see _populate_voice_combo).
+        self._kokoro_row = QFrame()
+        self._kokoro_row.setObjectName("providerCard")
+        kr = QVBoxLayout(self._kokoro_row)
+        kr.setContentsMargins(12, 10, 12, 10)
+        krh = QHBoxLayout()
+        krh.setSpacing(8)
+        kokoro_name = QLabel("Kokoro")
+        kokoro_name.setObjectName("providerName")
+        self._kokoro_tag = QLabel(i18n.t("tts.kokoro_desc"))
+        self._kokoro_tag.setObjectName("providerSub")
+        krh.addWidget(kokoro_name)
+        krh.addStretch()
+        krh.addWidget(self._kokoro_tag)
+        kr.addLayout(krh)
+        l.addWidget(self._kokoro_row)
+
+        # OpenAI / Google cloud TTS — reuse the AI provider key (same store),
+        # so a key saved here also unlocks chat models and vice-versa. Only the
+        # active provider's card is shown (see _populate_voice_combo).
+        for provider in ("openai", "google"):
+            card = _ProviderCard(provider)
+            card.saved.connect(self._on_provider_saved)
+            l.addWidget(card)
+            self._tts_cards[provider] = card
+
         return wrap
 
-    # Order in which providers appear in the "Choose provider" menu.
-    _PROVIDER_MENU_ORDER = ("anthropic", "openai", "deepseek", "google", "xai", "groq", "ollama")
+    # ── Section 3: Whisper providers (speech-to-text) ──────────────────────
+
+    def _build_stt_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._stt_title = QLabel(i18n.t("settings.whisper_providers"))
+        self._stt_title.setObjectName("sectionTitle")
+        self._stt_sub = QLabel(i18n.t("settings.whisper_providers_sub"))
+        self._stt_sub.setObjectName("sectionSub")
+        self._stt_sub.setWordWrap(True)
+        l.addWidget(self._stt_title)
+        l.addWidget(self._stt_sub)
+
+        # Active provider selector: faster-whisper (local) or Groq Whisper.
+        prov_row = QHBoxLayout()
+        self._stt_prov_label = QLabel(i18n.t("settings.active_provider"))
+        self._stt_prov_label.setObjectName("fieldLabel")
+        self._stt_prov_label.setFixedWidth(96)
+        self._stt_provider_combo = QComboBox()
+        self._stt_provider_combo.setObjectName("voiceCombo")
+        self._stt_provider_combo.addItem(i18n.t("stt.local_name"), "local")
+        self._stt_provider_combo.addItem(i18n.t("stt.groq_name"), "groq")
+        self._stt_provider_combo.currentIndexChanged.connect(
+            self._on_stt_provider_changed
+        )
+        prov_row.addWidget(self._stt_prov_label)
+        prov_row.addWidget(self._stt_provider_combo, 1)
+        # Free-tier "!" badge — only meaningful for Groq; toggled with provider.
+        self._stt_groq_badge = _InfoBadge("groq_freetier_info")
+        prov_row.addWidget(self._stt_groq_badge)
+        l.addLayout(prov_row)
+
+        # Model sub-options (small/medium for local, large-v3* for Groq).
+        model_row = QHBoxLayout()
+        self._stt_model_label = QLabel(i18n.t("settings.model"))
+        self._stt_model_label.setObjectName("fieldLabel")
+        self._stt_model_label.setFixedWidth(96)
+        self._stt_model_combo = QComboBox()
+        self._stt_model_combo.setObjectName("voiceCombo")
+        self._stt_model_combo.currentIndexChanged.connect(
+            self._on_stt_model_changed
+        )
+        model_row.addWidget(self._stt_model_label)
+        model_row.addWidget(self._stt_model_combo, 1)
+        l.addLayout(model_row)
+
+        # Hint that Groq STT reuses the Groq API key from Section 1.
+        self._stt_groq_hint = QLabel(i18n.t("stt.groq_hint"))
+        self._stt_groq_hint.setObjectName("providerSub")
+        self._stt_groq_hint.setWordWrap(True)
+        l.addWidget(self._stt_groq_hint)
+
+        return wrap
+
+    # ── Mobile connection (pairing token) ──────────────────────────────────
+
+    def _build_mobile_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._mobile_title = QLabel(i18n.t("settings.mobile"))
+        self._mobile_title.setObjectName("sectionTitle")
+        self._mobile_sub = QLabel(i18n.t("settings.mobile_sub"))
+        self._mobile_sub.setObjectName("sectionSub")
+        self._mobile_sub.setWordWrap(True)
+        l.addWidget(self._mobile_title)
+        l.addWidget(self._mobile_sub)
+
+        token_row = QHBoxLayout()
+        token_row.setSpacing(8)
+        self._mobile_token_label = QLabel(i18n.t("settings.mobile_token"))
+        self._mobile_token_label.setObjectName("fieldLabel")
+        self._mobile_token_label.setFixedWidth(60)
+        self._token_mask_label = QLabel(_mask_token(""))
+        self._token_mask_label.setObjectName("tokenMask")
+        self._token_mask_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.NoTextInteraction
+        )
+        self._mobile_show_btn = QPushButton(i18n.t("settings.show"))
+        self._mobile_show_btn.setObjectName("ghostBtn")
+        self._mobile_show_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mobile_show_btn.clicked.connect(self._on_show_token)
+        self._mobile_regen_btn = QPushButton(i18n.t("settings.regenerate"))
+        self._mobile_regen_btn.setObjectName("ghostBtn")
+        self._mobile_regen_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mobile_regen_btn.clicked.connect(self._on_regenerate_token)
+        token_row.addWidget(self._mobile_token_label)
+        token_row.addWidget(self._token_mask_label, 1)
+        token_row.addWidget(self._mobile_show_btn)
+        token_row.addWidget(self._mobile_regen_btn)
+        l.addLayout(token_row)
+
+        self._mobile_warn = QLabel(i18n.t("settings.mobile_token_warning"))
+        self._mobile_warn.setObjectName("warnLabel")
+        self._mobile_warn.setWordWrap(True)
+        l.addWidget(self._mobile_warn)
+
+        return wrap
+
+    # ── Section 1: AI providers (text / chat models) ───────────────────────
 
     def _build_ai_providers_section(self) -> QFrame:
         wrap = QFrame()
@@ -1178,32 +1459,45 @@ class _SettingsPanel(QWidget):
         l.setContentsMargins(14, 12, 14, 12)
         l.setSpacing(8)
 
-        title = QLabel("AI providers")
-        title.setObjectName("sectionTitle")
-        sub = QLabel("Choose a provider and configure its API key.")
-        sub.setObjectName("sectionSub")
-        sub.setWordWrap(True)
-        l.addWidget(title)
-        l.addWidget(sub)
+        self._ai_title = QLabel(i18n.t("settings.ai_providers"))
+        self._ai_title.setObjectName("sectionTitle")
+        self._ai_sub = QLabel(i18n.t("settings.ai_providers_sub"))
+        self._ai_sub.setObjectName("sectionSub")
+        self._ai_sub.setWordWrap(True)
+        l.addWidget(self._ai_title)
+        l.addWidget(self._ai_sub)
 
-        # Single "Choose provider" button that opens a dropdown.
-        self._choose_btn = QPushButton("Choose provider  ▾")
-        self._choose_btn.setObjectName("chooseProviderBtn")
-        self._choose_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._choose_btn.clicked.connect(self._open_provider_menu)
-        l.addWidget(self._choose_btn)
+        # Compact "Choose provider" dropdown: picking a provider reveals only
+        # that provider's configuration card below, instead of stacking every
+        # provider's full card at once.
+        sel_row = QHBoxLayout()
+        self._ai_prov_label = QLabel(i18n.t("settings.choose_provider"))
+        self._ai_prov_label.setObjectName("fieldLabel")
+        self._ai_prov_label.setFixedWidth(96)
+        self._ai_provider_combo = QComboBox()
+        self._ai_provider_combo.setObjectName("voiceCombo")
+        for provider in (*self._AI_PROVIDER_ORDER, "ollama"):
+            self._ai_provider_combo.addItem(PROVIDERS[provider]["name"], provider)
+        sel_row.addWidget(self._ai_prov_label)
+        sel_row.addWidget(self._ai_provider_combo, 1)
+        l.addLayout(sel_row)
 
-        # One configuration row per API provider; only one is shown at a time.
-        for provider in API_PROVIDERS:
+        # One configuration card per API provider. Each card carries its own
+        # "Configurer une clé API" + Naviguer row, key input and Save button
+        # (with the green flash) — see _ProviderCard. Only the selected
+        # provider's card is shown; the rest stay hidden.
+        for provider in self._AI_PROVIDER_ORDER:
             card = _ProviderCard(provider)
             card.saved.connect(self._on_provider_saved)
-            card.hide()
+            card.setVisible(False)
             l.addWidget(card)
             self._provider_cards[provider] = card
 
-        # Ollama is keyless — show it as an info-only row.
+        # Ollama is keyless — its "card" is an info-only row, revealed the same
+        # way when Ollama is the chosen provider.
         self._ollama_row = QFrame()
         self._ollama_row.setObjectName("providerCard")
+        self._ollama_row.setVisible(False)
         ol = QVBoxLayout(self._ollama_row)
         ol.setContentsMargins(12, 10, 12, 10)
         olh = QHBoxLayout()
@@ -1219,48 +1513,26 @@ class _SettingsPanel(QWidget):
         )
         olh.addWidget(self._ollama_tag)
         ol.addLayout(olh)
-        self._ollama_row.hide()
         l.addWidget(self._ollama_row)
 
-        self._visible_provider: str | None = None
+        # Wire the selector and reveal the first provider's card.
+        self._ai_provider_combo.currentIndexChanged.connect(
+            self._on_ai_provider_changed
+        )
+        self._on_ai_provider_changed(self._ai_provider_combo.currentIndex())
+
         return wrap
 
-    def _open_provider_menu(self) -> None:
-        menu = QMenu(self)
-        menu.setObjectName("providerMenu")
-        for provider in self._PROVIDER_MENU_ORDER:
-            name = PROVIDERS.get(provider, {}).get("name") or provider.title()
-            act = menu.addAction(name)
-            act.triggered.connect(
-                lambda _checked=False, p=provider: self._select_provider(p)
-            )
-        menu.exec(
-            self._choose_btn.mapToGlobal(self._choose_btn.rect().bottomLeft())
-        )
-
-    def _select_provider(self, provider: str) -> None:
-        # Hide every provider row, then reveal the chosen one.
-        for card in self._provider_cards.values():
-            card.hide()
-        self._ollama_row.hide()
-
-        if provider == "ollama":
-            self._ollama_row.show()
-        else:
-            card = self._provider_cards.get(provider)
-            if card is not None:
-                card.show()
-
-        name = PROVIDERS.get(provider, {}).get("name") or provider.title()
-        self._choose_btn.setText(f"{name}  ▾")
-        self._visible_provider = provider
+    def _on_ai_provider_changed(self, _idx: int) -> None:
+        provider = self._ai_provider_combo.currentData()
+        for p, card in self._provider_cards.items():
+            card.setVisible(p == provider)
+        self._ollama_row.setVisible(provider == "ollama")
 
     # ── State load / save ─────────────────────────────────────────────────
 
     def _load_state(self) -> None:
-        keys = load_api_keys()
-        for provider, card in self._provider_cards.items():
-            card.set_key(keys.get(provider, ""))
+        self._sync_all_cards_keys()
 
         settings = load_settings()
 
@@ -1276,6 +1548,7 @@ class _SettingsPanel(QWidget):
         self._smart_toggle.setChecked(bool(settings.get("smart_routing", False)))
         self._smart_toggle.blockSignals(False)
 
+        # Voice (TTS)
         provider = settings.get("tts_provider", "local") or "local"
         voice = settings.get("tts_voice")
         self._tts_provider_combo.blockSignals(True)
@@ -1285,6 +1558,35 @@ class _SettingsPanel(QWidget):
                 break
         self._tts_provider_combo.blockSignals(False)
         self._populate_voice_combo(provider, voice)
+
+        # Whisper (STT)
+        stt_provider = settings.get("stt_provider", "local") or "local"
+        self._stt_provider_combo.blockSignals(True)
+        for i in range(self._stt_provider_combo.count()):
+            if self._stt_provider_combo.itemData(i) == stt_provider:
+                self._stt_provider_combo.setCurrentIndex(i)
+                break
+        self._stt_provider_combo.blockSignals(False)
+        self._populate_stt_model_combo(stt_provider, self._stt_selected_model(settings, stt_provider))
+
+        # Mobile token (masked)
+        self._mobile_token = load_mobile_token()
+        self._update_token_mask()
+
+    @staticmethod
+    def _stt_selected_model(settings: dict, provider: str) -> str | None:
+        if provider == "groq":
+            return settings.get("stt_groq_model")
+        return settings.get("stt_local_model")
+
+    def _sync_all_cards_keys(self) -> None:
+        """Push the saved keys into every provider card across both the AI and
+        Voice sections so duplicate (openai/google) cards stay in sync."""
+        keys = load_api_keys()
+        for provider, card in self._provider_cards.items():
+            card.set_key(keys.get(provider, ""))
+        for provider, card in self._tts_cards.items():
+            card.set_key(keys.get(provider, ""))
 
     def _populate_voice_combo(self, provider: str, selected: str | None) -> None:
         combo = self._tts_voice_combo
@@ -1303,6 +1605,48 @@ class _SettingsPanel(QWidget):
                     break
         combo.blockSignals(False)
         self._tts_voice_row.setVisible(provider != "local")
+        # Reveal only the chosen provider's config: the Kokoro info row for the
+        # local provider, or the matching cloud key card for openai/google.
+        self._kokoro_row.setVisible(provider == "local")
+        for p, card in self._tts_cards.items():
+            card.setVisible(p == provider)
+
+    def _populate_stt_model_combo(self, provider: str, selected: str | None) -> None:
+        combo = self._stt_model_combo
+        combo.blockSignals(True)
+        combo.clear()
+        is_groq = provider == "groq"
+        if is_groq:
+            # Groq Whisper runs server-side, so every size is always available.
+            for label, value in self._STT_GROQ_MODELS:
+                combo.addItem(label, value)
+        else:
+            # Local faster-whisper: only sizes downloaded to the HF hub cache can
+            # actually be loaded. Offer the present ones; list the rest greyed
+            # out and unselectable so they're discoverable but can't be chosen.
+            downloaded = _downloaded_whisper_models()
+            for label, value in self._STT_LOCAL_MODELS:
+                if value in downloaded:
+                    combo.addItem(label, value)
+                else:
+                    combo.addItem(
+                        i18n.t("stt.model_not_downloaded", name=label), value
+                    )
+                    combo.model().item(combo.count() - 1).setEnabled(False)
+            # Never land the selection on a size that isn't downloaded.
+            if selected not in downloaded:
+                selected = next(
+                    (v for _, v in self._STT_LOCAL_MODELS if v in downloaded), None
+                )
+        if selected:
+            for i in range(combo.count()):
+                if combo.itemData(i) == selected and combo.model().item(i).isEnabled():
+                    combo.setCurrentIndex(i)
+                    break
+        combo.blockSignals(False)
+        # The free-tier badge + Groq-key hint only apply to Groq Whisper.
+        self._stt_groq_badge.setVisible(is_groq)
+        self._stt_groq_hint.setVisible(is_groq)
 
     # ── Handlers ──────────────────────────────────────────────────────────
 
@@ -1323,8 +1667,85 @@ class _SettingsPanel(QWidget):
         if voice:
             set_setting("tts_voice", voice)
 
+    def _on_stt_provider_changed(self, _idx: int) -> None:
+        provider = self._stt_provider_combo.currentData()
+        if not provider:
+            return
+        set_setting("stt_provider", provider)
+        selected = self._stt_selected_model(load_settings(), provider)
+        self._populate_stt_model_combo(provider, selected)
+
+    def _on_stt_model_changed(self, _idx: int) -> None:
+        model = self._stt_model_combo.currentData()
+        if not model:
+            return
+        provider = self._stt_provider_combo.currentData()
+        key = "stt_groq_model" if provider == "groq" else "stt_local_model"
+        set_setting(key, model)
+
     def _on_provider_saved(self, _provider: str) -> None:
+        # Keep duplicate (openai/google) cards across sections in sync, then
+        # notify the host that the key set changed.
+        self._sync_all_cards_keys()
         self.api_keys_saved.emit(load_api_keys())
+
+    # ── Mobile token ──────────────────────────────────────────────────────
+
+    def _update_token_mask(self) -> None:
+        self._token_mask_label.setText(_mask_token(self._mobile_token))
+
+    def _on_show_token(self) -> None:
+        self._mobile_token = load_mobile_token()
+        self._update_token_mask()
+        if not self._mobile_token:
+            return
+        self._show_token_popup(
+            i18n.t("settings.mobile_token_current"), self._mobile_token
+        )
+
+    def _on_regenerate_token(self) -> None:
+        self._mobile_token = regenerate_mobile_token()
+        self._update_token_mask()
+        # The server caches the token at import, so restart it now to pick up
+        # the new value immediately. The phone still needs to re-pair — see the
+        # mobile-reconnection warning below the token row.
+        restart_service(STARTUP_SERVICES[0])
+        self._show_token_popup(
+            i18n.t("settings.mobile_token_new"), self._mobile_token
+        )
+
+    def _show_token_popup(self, title: str, token: str) -> None:
+        dialog = _TokenDialog(self, title, token)
+        dialog.exec()
+
+    # ── Re-translation ────────────────────────────────────────────────────
+
+    def _retranslate_sections(self) -> None:
+        self._ai_title.setText(i18n.t("settings.ai_providers"))
+        self._ai_sub.setText(i18n.t("settings.ai_providers_sub"))
+        self._ai_prov_label.setText(i18n.t("settings.choose_provider"))
+
+        self._voice_title.setText(i18n.t("settings.voice_providers"))
+        self._voice_sub.setText(i18n.t("settings.voice_providers_sub"))
+        self._voice_prov_label.setText(i18n.t("settings.active_provider"))
+        self._voice_voice_label.setText(i18n.t("settings.voice"))
+        self._kokoro_tag.setText(i18n.t("tts.kokoro_desc"))
+        self._tts_provider_combo.setItemText(0, i18n.t("tts.local_option"))
+
+        self._stt_title.setText(i18n.t("settings.whisper_providers"))
+        self._stt_sub.setText(i18n.t("settings.whisper_providers_sub"))
+        self._stt_prov_label.setText(i18n.t("settings.active_provider"))
+        self._stt_model_label.setText(i18n.t("settings.model"))
+        self._stt_groq_hint.setText(i18n.t("stt.groq_hint"))
+        self._stt_provider_combo.setItemText(0, i18n.t("stt.local_name"))
+        self._stt_provider_combo.setItemText(1, i18n.t("stt.groq_name"))
+
+        self._mobile_title.setText(i18n.t("settings.mobile"))
+        self._mobile_sub.setText(i18n.t("settings.mobile_sub"))
+        self._mobile_token_label.setText(i18n.t("settings.mobile_token"))
+        self._mobile_show_btn.setText(i18n.t("settings.show"))
+        self._mobile_regen_btn.setText(i18n.t("settings.regenerate"))
+        self._mobile_warn.setText(i18n.t("settings.mobile_token_warning"))
 
     def _on_startup_toggle_changed(self, unit: str, toggle: QCheckBox) -> None:
         if self._startup_refresh_guard:
@@ -2114,37 +2535,6 @@ class MainPopup(QWidget):
                 background: rgba(196, 181, 245, 0.55);
             }
 
-            /* Choose-provider button + dropdown ─────────────────────── */
-            QPushButton#chooseProviderBtn {
-                background: rgba(196, 181, 245, 0.16);
-                border: 1px solid rgba(196, 181, 245, 0.45);
-                border-radius: 10px;
-                padding: 9px 14px;
-                font-size: 13px;
-                font-weight: 600;
-                color: #f5f0ff;
-                text-align: left;
-            }
-            QPushButton#chooseProviderBtn:hover {
-                background: rgba(196, 181, 245, 0.30);
-                border: 1px solid rgba(196, 181, 245, 0.65);
-            }
-            QMenu#providerMenu {
-                background: rgb(28, 24, 36);
-                border: 1px solid rgba(196, 181, 245, 0.30);
-                border-radius: 8px;
-                padding: 4px;
-            }
-            QMenu#providerMenu::item {
-                padding: 6px 22px;
-                border-radius: 6px;
-                color: #f5f5fa;
-                font-size: 12px;
-            }
-            QMenu#providerMenu::item:selected {
-                background: rgba(196, 181, 245, 0.30);
-            }
-
             /* Provider card (compact configuration row) ─────────────── */
             QFrame#providerCard {
                 background: #0f0d16;
@@ -2172,6 +2562,28 @@ class MainPopup(QWidget):
                 color: #c4b5f5;
                 font-size: 9px;
                 font-weight: 700;
+            }
+
+            /* Mobile token + reveal dialog ──────────────────────────────── */
+            QLabel#tokenMask {
+                font-family: "DejaVu Sans Mono", "SF Mono", monospace;
+                font-size: 13px;
+                color: #f5f0ff;
+                letter-spacing: 1px;
+            }
+            QLabel#warnLabel {
+                color: #e0a23c;
+                font-size: 11px;
+            }
+            QFrame#dialogCard {
+                background: #14111c;
+                border: 1px solid rgba(196, 181, 245, 0.40);
+                border-radius: 14px;
+            }
+            QLabel#dialogTitle {
+                font-size: 14px;
+                font-weight: 600;
+                color: #f5f5fa;
             }
 
             QPushButton#ghostBtn {

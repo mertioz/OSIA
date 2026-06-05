@@ -8,17 +8,24 @@ Settings are stored at /home/OSIA/code/osia-project/config/settings.json.
 
 import json
 import os
+import secrets
 import stat
 
 CONFIG_DIR = "/home/OSIA/code/osia-project/config"
 API_KEYS_FILE = os.path.join(CONFIG_DIR, "api_keys.json")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+MOBILE_TOKEN_FILE = os.path.join(CONFIG_DIR, "mobile_token.txt")
 
 DEFAULT_SETTINGS = {
     "smart_routing": False,
     "selected_model": None,
     "tts_provider": "local",   # one of: "local", "openai", "google"
     "tts_voice": None,         # provider-specific voice id; None = provider default
+    # Speech-to-text (Whisper). The active switching logic lands in Bloc 2;
+    # for now the GUI only persists the user's choice.
+    "stt_provider": "local",   # one of: "local" (faster-whisper), "groq"
+    "stt_local_model": "small",                 # faster-whisper size: "small", "medium"
+    "stt_groq_model": "whisper-large-v3-turbo", # "whisper-large-v3", "whisper-large-v3-turbo"
     "language": "en",          # UI language; one of osia.i18n.LANGUAGES
     "island_x": None,          # last dragged capsule position; None = top-centre
     "island_y": None,
@@ -96,3 +103,31 @@ def set_setting(key: str, value) -> None:
     settings = load_settings()
     settings[key] = value
     save_settings(settings)
+
+
+# ── Mobile pairing token ───────────────────────────────────────────────────
+# The mobile app authenticates against the token stored in
+# ``config/mobile_token.txt`` (the same file the server reads on startup).
+# The GUI can reveal it and regenerate it; regenerating invalidates the old
+# token so the mobile app must re-pair.
+
+def load_mobile_token() -> str:
+    """Return the mobile pairing token, or '' if it hasn't been created yet."""
+    try:
+        with open(MOBILE_TOKEN_FILE, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def regenerate_mobile_token() -> str:
+    """Generate a fresh 16-char mobile token, persist it (0600), and return it."""
+    _ensure_config_dir()
+    token = secrets.token_hex(8)  # 16 hex chars
+    with open(MOBILE_TOKEN_FILE, "w") as f:
+        f.write(token)
+    try:
+        os.chmod(MOBILE_TOKEN_FILE, stat.S_IRUSR | stat.S_IWUSR)
+    except Exception:
+        pass
+    return token
