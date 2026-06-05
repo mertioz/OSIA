@@ -27,7 +27,7 @@ from PyQt6.QtCore import (
     QRectF, QPointF,
 )
 from PyQt6.QtGui import (
-    QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen,
+    QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -47,6 +47,7 @@ from osia.config import (
 from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
 )
+from osia.utils.assets import LOGO_PATH
 from osia import i18n
 
 # sip lets us detect widgets whose C++ side has already been destroyed
@@ -1588,15 +1589,30 @@ class MainPopup(QWidget):
         outer.setContentsMargins(14, 14, 14, 14)
         outer.setSpacing(8)
 
-        # Header (close button only)
+        # Header — OSIA logo on the left, close button on the right. The logo
+        # alone represents OSIA, so no separate "OSIA" wordmark is shown.
         header = QHBoxLayout()
+        header.setSpacing(8)
+
+        logo = QLabel()
+        logo.setObjectName("popupLogo")
+        logo_pix = QPixmap(LOGO_PATH)
+        if not logo_pix.isNull():
+            logo.setPixmap(
+                logo_pix.scaledToHeight(
+                    44, Qt.TransformationMode.SmoothTransformation
+                )
+            )
+
         close_btn = QPushButton("✕")
         close_btn.setObjectName("closeBtn")
         close_btn.setFixedSize(26, 26)
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.clicked.connect(self.hide)
+
+        header.addWidget(logo)
         header.addStretch()
-        header.addWidget(close_btn)
+        header.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         outer.addLayout(header)
 
         # Central stack
@@ -1806,12 +1822,6 @@ class MainPopup(QWidget):
                              "Helvetica Neue", sans-serif;
             }
 
-            QLabel#popupTitle {
-                font-size: 13px;
-                font-weight: 600;
-                letter-spacing: 3px;
-                color: rgba(245, 245, 250, 0.85);
-            }
             QPushButton#closeBtn {
                 background: rgba(255, 255, 255, 0.06);
                 color: rgba(245, 245, 250, 0.7);

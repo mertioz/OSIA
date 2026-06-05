@@ -1,8 +1,8 @@
 {
   "smart_routing": false,
   "selected_model": "deepseek-v4-flash",
-  "tts_provider": "openai",
-  "tts_voice": "marin",
+  "tts_provider": "local",
+  "tts_voice": null,
   "language": "fr",
   "island_x": 611,
   "island_y": 287,

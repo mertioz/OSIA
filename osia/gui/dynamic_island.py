@@ -27,7 +27,7 @@ from PyQt6.QtCore import (
     Qt, QTimer, QRect, QRectF, QPointF, pyqtSignal, QPropertyAnimation,
     QEasingCurve, QVariantAnimation,
 )
-from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont, QPen
+from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont, QPen, QPixmap
 from PyQt6.QtWidgets import QApplication, QWidget
 
 
@@ -48,6 +48,10 @@ ACTIVE_OPACITY = 1.0
 LAUNCH_W = 60
 LAUNCH_H = 20
 LAUNCH_MS = 600
+
+# Idle state — the OSIA logo sits to the left of the "OSIA" wordmark.
+IDLE_LOGO_H = 44               # px; the capsule is 52px tall
+IDLE_LOGO_GAP = 8              # px between the logo and the wordmark
 
 # Thinking animation — traveling wave. Seven dots sit on a horizontal line
 # through the capsule centre; each dot oscillates vertically on a sine wave
@@ -80,6 +84,21 @@ class DynamicIsland(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedSize(ISLAND_W, ISLAND_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        # OSIA logo shown beside the wordmark in the idle state. Scaled once
+        # at load (the idle paint runs at 30 FPS). A null pixmap — asset
+        # missing or osia not importable in the standalone self-test — is
+        # simply skipped while painting, so the wordmark still shows.
+        self._logo = QPixmap()
+        try:
+            from osia.utils.assets import LOGO_PATH
+            logo = QPixmap(LOGO_PATH)
+            if not logo.isNull():
+                self._logo = logo.scaledToHeight(
+                    IDLE_LOGO_H, Qt.TransformationMode.SmoothTransformation
+                )
+        except Exception:
+            pass
 
         # Animation state
         self._state = "idle"
@@ -305,20 +324,47 @@ class DynamicIsland(QWidget):
         painter.end()
 
     def _paint_idle(self, p: QPainter) -> None:
-        """Just the OSIA wordmark, dim — fading in at the end of the launch."""
-        # Hold the text invisible until the capsule is nearly full size, then
+        """The OSIA logo + wordmark, dim — fading in at the end of the launch."""
+        # Hold the mark invisible until the capsule is nearly full size, then
         # fade it in over the last stretch of the launch animation.
         fade = max(0.0, (self._launch_t - 0.7) / 0.3)
         fade = min(1.0, fade)
         if fade <= 0.0:
             return
-        p.setPen(QColor(255, 255, 255, int(130 * fade)))
+
+        rect = self._capsule_rect()
+        cy = rect.center().y()
+
         font = QFont()
         font.setPixelSize(12)
         font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
         font.setBold(True)
         p.setFont(font)
-        p.drawText(self._capsule_rect(), Qt.AlignmentFlag.AlignCenter, "OSIA")
+        text_w = p.fontMetrics().horizontalAdvance("OSIA")
+
+        # Logo (left) + wordmark (right) laid out as a single group centred in
+        # the capsule. The logo is dropped from the layout when unavailable.
+        logo_w = self._logo.width() if not self._logo.isNull() else 0
+        gap = IDLE_LOGO_GAP if logo_w else 0
+        x = rect.center().x() - (logo_w + gap + text_w) / 2.0
+
+        # One opacity for the whole group so logo and text fade in together.
+        p.save()
+        p.setOpacity(fade)
+        if logo_w:
+            p.drawPixmap(
+                int(round(x)), int(round(cy - self._logo.height() / 2.0)),
+                self._logo,
+            )
+            x += logo_w + gap
+        p.setPen(QColor(255, 255, 255, 200))
+        text_rect = QRectF(x, rect.top(), text_w + 2, rect.height())
+        p.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            "OSIA",
+        )
+        p.restore()
 
     def _paint_listening(self, p: QPainter) -> None:
         """Centred mic glyph wrapped in 3 concentric pulse rings.

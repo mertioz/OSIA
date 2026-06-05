@@ -208,7 +208,9 @@ def wake_mode():
     """
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtCore import QObject, pyqtSignal
+    from PyQt6.QtGui import QGuiApplication, QIcon
 
+    from osia.utils.assets import ICON_PATH, ensure_desktop_entry
     from osia.gui.dynamic_island import DynamicIsland
     from osia.gui.main_popup import MainPopup
     from osia.voice.wake import WakeWordDetector, verifier_available
@@ -230,8 +232,23 @@ def wake_mode():
 
     bridge = Bridge()
 
+    # Identify the app to the windowing system *before* any window is
+    # created, so the taskbar/dock shows "OSIA" + the logo instead of
+    # "python"/"osia_desktop" and a generic icon.
+    #   • applicationName / displayName  → the window title + dock label
+    #   • desktopFileName ("osia")       → Wayland/XCB map the window to
+    #     ~/.local/share/applications/osia.desktop for its taskbar icon
+    #   • setWindowIcon (absolute path)  → the icon every window inherits,
+    #     resolved from the project root so it works from any CWD. Uses the
+    #     tightly-cropped ICON_PATH (not the padded logo) so the taskbar/dock
+    #     shows the swirl at a proper visible size.
+    ensure_desktop_entry()
+    QGuiApplication.setDesktopFileName("osia")
+
     app = QApplication(sys.argv)
     app.setApplicationName("OSIA")
+    app.setApplicationDisplayName("OSIA")
+    app.setWindowIcon(QIcon(ICON_PATH))
 
     island = DynamicIsland()
     popup = MainPopup()
