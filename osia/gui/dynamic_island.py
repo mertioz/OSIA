@@ -307,7 +307,7 @@ class DynamicIsland(QWidget):
 
         # Background capsule
         path = self._capsule_path()
-        painter.setPen(QPen(QColor(255, 255, 255, 18), 1))
+        painter.setPen(QPen(QColor(196, 181, 245, 31), 1))
         painter.fillPath(path, BG_COLOR)
         painter.drawPath(path)
 
@@ -357,7 +357,7 @@ class DynamicIsland(QWidget):
                 self._logo,
             )
             x += logo_w + gap
-        p.setPen(QColor(255, 255, 255, 200))
+        p.setPen(QColor(232, 230, 240, 200))
         text_rect = QRectF(x, rect.top(), text_w + 2, rect.height())
         p.drawText(
             text_rect,

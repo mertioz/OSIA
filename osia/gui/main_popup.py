@@ -1207,7 +1207,8 @@ class _ApiKeyFallbackDialog(_PopoverDialog):
         label = QLabel(i18n.t("api_keys.primary") if index == 0
                        else i18n.t("api_keys.fallback_n", n=index))
         label.setObjectName("fieldLabel")
-        label.setFixedWidth(74)
+        label.setMinimumWidth(74)
+        label.setWordWrap(True)
         inp = QLineEdit(key)
         inp.setObjectName("keyInput")
         inp.setEchoMode(QLineEdit.EchoMode.Password)
@@ -1409,15 +1410,8 @@ class _SettingsPanel(QWidget):
         header = QHBoxLayout()
         self._settings_title = QLabel(i18n.t("settings.title"))
         self._settings_title.setObjectName("panelTitle")
-        self._min_btn = QPushButton("−")
-        self._min_btn.setObjectName("minBtn")
-        self._min_btn.setFixedSize(26, 26)
-        self._min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._min_btn.setToolTip(i18n.t("settings.minimize"))
-        self._min_btn.clicked.connect(self.hide)
         header.addWidget(self._settings_title)
         header.addStretch()
-        header.addWidget(self._min_btn)
         outer.addLayout(header)
 
         scroll = QScrollArea()
@@ -1581,7 +1575,8 @@ class _SettingsPanel(QWidget):
         prov_row = QHBoxLayout()
         self._voice_prov_label = QLabel(i18n.t("settings.active_provider"))
         self._voice_prov_label.setObjectName("fieldLabel")
-        self._voice_prov_label.setFixedWidth(96)
+        self._voice_prov_label.setMinimumWidth(96)
+        self._voice_prov_label.setWordWrap(True)
         self._tts_provider_combo = QComboBox()
         self._tts_provider_combo.setObjectName("voiceCombo")
         for key, i18n_key in self._TTS_PROVIDERS:
@@ -1600,7 +1595,8 @@ class _SettingsPanel(QWidget):
         voice_row.setContentsMargins(0, 0, 0, 0)
         self._voice_voice_label = QLabel(i18n.t("settings.voice"))
         self._voice_voice_label.setObjectName("fieldLabel")
-        self._voice_voice_label.setFixedWidth(96)
+        self._voice_voice_label.setMinimumWidth(96)
+        self._voice_voice_label.setWordWrap(True)
         self._tts_voice_combo = QComboBox()
         self._tts_voice_combo.setObjectName("voiceCombo")
         self._tts_voice_combo.currentIndexChanged.connect(self._on_tts_voice_changed)
@@ -1658,7 +1654,8 @@ class _SettingsPanel(QWidget):
         prov_row = QHBoxLayout()
         self._stt_prov_label = QLabel(i18n.t("settings.active_provider"))
         self._stt_prov_label.setObjectName("fieldLabel")
-        self._stt_prov_label.setFixedWidth(96)
+        self._stt_prov_label.setMinimumWidth(96)
+        self._stt_prov_label.setWordWrap(True)
         self._stt_provider_combo = QComboBox()
         self._stt_provider_combo.setObjectName("voiceCombo")
         self._stt_provider_combo.addItem(i18n.t("stt.local_name"), "local")
@@ -1677,7 +1674,8 @@ class _SettingsPanel(QWidget):
         model_row = QHBoxLayout()
         self._stt_model_label = QLabel(i18n.t("settings.model"))
         self._stt_model_label.setObjectName("fieldLabel")
-        self._stt_model_label.setFixedWidth(96)
+        self._stt_model_label.setMinimumWidth(96)
+        self._stt_model_label.setWordWrap(True)
         self._stt_model_combo = QComboBox()
         self._stt_model_combo.setObjectName("voiceCombo")
         self._stt_model_combo.currentIndexChanged.connect(
@@ -1692,7 +1690,8 @@ class _SettingsPanel(QWidget):
         fb_row = QHBoxLayout()
         self._stt_fallback_label = QLabel(i18n.t("settings.fallback_provider"))
         self._stt_fallback_label.setObjectName("fieldLabel")
-        self._stt_fallback_label.setFixedWidth(96)
+        self._stt_fallback_label.setMinimumWidth(96)
+        self._stt_fallback_label.setWordWrap(True)
         self._stt_fallback_combo = QComboBox()
         self._stt_fallback_combo.setObjectName("voiceCombo")
         self._stt_fallback_combo.addItem(i18n.t("stt.local_name"), "local")
@@ -1713,7 +1712,8 @@ class _SettingsPanel(QWidget):
         fb_model_row.setContentsMargins(0, 0, 0, 0)
         self._stt_fallback_model_label = QLabel(i18n.t("settings.model"))
         self._stt_fallback_model_label.setObjectName("fieldLabel")
-        self._stt_fallback_model_label.setFixedWidth(96)
+        self._stt_fallback_model_label.setMinimumWidth(96)
+        self._stt_fallback_model_label.setWordWrap(True)
         self._stt_fallback_model_combo = QComboBox()
         self._stt_fallback_model_combo.setObjectName("voiceCombo")
         self._stt_fallback_model_combo.currentIndexChanged.connect(
@@ -1777,7 +1777,8 @@ class _SettingsPanel(QWidget):
         prov_row = QHBoxLayout()
         self._liveapi_prov_label = QLabel(i18n.t("settings.active_provider"))
         self._liveapi_prov_label.setObjectName("fieldLabel")
-        self._liveapi_prov_label.setFixedWidth(96)
+        self._liveapi_prov_label.setMinimumWidth(96)
+        self._liveapi_prov_label.setWordWrap(True)
         self._liveapi_provider_combo = QComboBox()
         self._liveapi_provider_combo.setObjectName("voiceCombo")
         for key in self._LIVEAPI_PROVIDER_ORDER:
@@ -1795,7 +1796,8 @@ class _SettingsPanel(QWidget):
         model_row = QHBoxLayout()
         self._liveapi_model_label = QLabel(i18n.t("settings.model"))
         self._liveapi_model_label.setObjectName("fieldLabel")
-        self._liveapi_model_label.setFixedWidth(96)
+        self._liveapi_model_label.setMinimumWidth(96)
+        self._liveapi_model_label.setWordWrap(True)
         self._liveapi_model_combo = QComboBox()
         self._liveapi_model_combo.setObjectName("voiceCombo")
         self._liveapi_model_combo.currentIndexChanged.connect(
@@ -2582,7 +2584,8 @@ class _SettingsPanel(QWidget):
         token_row.setSpacing(8)
         self._mobile_token_label = QLabel(i18n.t("settings.mobile_token"))
         self._mobile_token_label.setObjectName("fieldLabel")
-        self._mobile_token_label.setFixedWidth(60)
+        self._mobile_token_label.setMinimumWidth(60)
+        self._mobile_token_label.setWordWrap(True)
         self._token_mask_label = QLabel(_mask_token(""))
         self._token_mask_label.setObjectName("tokenMask")
         self._token_mask_label.setTextInteractionFlags(
@@ -2632,7 +2635,8 @@ class _SettingsPanel(QWidget):
         sel_row = QHBoxLayout()
         self._ai_prov_label = QLabel(i18n.t("settings.choose_provider"))
         self._ai_prov_label.setObjectName("fieldLabel")
-        self._ai_prov_label.setFixedWidth(96)
+        self._ai_prov_label.setMinimumWidth(96)
+        self._ai_prov_label.setWordWrap(True)
         self._ai_provider_combo = QComboBox()
         self._ai_provider_combo.setObjectName("voiceCombo")
         for provider in (*self._AI_PROVIDER_ORDER, "ollama"):
@@ -3024,7 +3028,6 @@ class _SettingsPanel(QWidget):
 
     def _retranslate_sections(self) -> None:
         self._settings_title.setText(i18n.t("settings.title"))
-        self._min_btn.setToolTip(i18n.t("settings.minimize"))
 
         self._ai_title.setText(i18n.t("settings.ai_providers"))
         self._ai_sub.setText(i18n.t("settings.ai_providers_sub"))
@@ -3217,15 +3220,8 @@ class _OsiaPanel(QWidget):
         # "OSIA" is a proper noun — shown verbatim like the other panel titles.
         title = QLabel("OSIA")
         title.setObjectName("panelTitle")
-        self._min_btn = QPushButton("−")
-        self._min_btn.setObjectName("minBtn")
-        self._min_btn.setFixedSize(26, 26)
-        self._min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._min_btn.setToolTip(i18n.t("settings.minimize"))
-        self._min_btn.clicked.connect(self.hide)
         header.addWidget(title)
         header.addStretch()
-        header.addWidget(self._min_btn)
         outer.addLayout(header)
 
         scroll = QScrollArea()
@@ -3480,7 +3476,6 @@ class _OsiaPanel(QWidget):
         self._load_state()
 
     def _retranslate(self) -> None:
-        self._min_btn.setToolTip(i18n.t("settings.minimize"))
         self._pers_title.setText(i18n.t("osia.personality"))
         self._pers_sub.setText(i18n.t("osia.personality_sub"))
         if not self._pers_save_btn.property("saved"):
@@ -3540,7 +3535,7 @@ class _NavButton(QPushButton):
     itself switches to the violet accent; hover shows a softer violet wash.
     """
 
-    ICON_PX = 22
+    ICON_PX = 33
 
     def __init__(self, kind: str, tooltip: str):
         super().__init__()
@@ -3550,7 +3545,10 @@ class _NavButton(QPushButton):
         self._tip_key: str | None = None
         self.setObjectName("navBtn")
         self.setCheckable(True)
-        self.setFixedSize(52, 40)
+        # 56px (was 48) so the painted glyphs — notably the speech-bubble tail,
+        # which reaches ~0.22*ICON_PX below the bubble body — have vertical room
+        # and no longer clip against the button's bottom edge.
+        self.setFixedSize(52, 56)
         self.setToolTip(tooltip)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._hovered = False
@@ -3572,12 +3570,12 @@ class _NavButton(QPushButton):
         rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
         active = self.isChecked()
 
-        # Rounded pill background — solid violet wash when active, a softer
-        # one on hover.
+        # Rounded pill background — a subtle violet wash when active (no border
+        # line), a softer one on hover.
         if active:
-            p.setPen(QPen(QColor(196, 181, 245, 180), 1))
-            p.setBrush(QColor(196, 181, 245, 64))
-            p.drawRoundedRect(rect, 12, 12)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(196, 181, 245, 31))  # rgba(196,181,245,0.12)
+            p.drawRoundedRect(rect, 10, 10)
         elif self._hovered:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(196, 181, 245, 36))
@@ -3982,33 +3980,21 @@ class MainPopup(QWidget):
     def _apply_style(self) -> None:
         self.setStyleSheet("""
             QWidget {
-                color: #f5f5fa;
+                color: #e8e6f0;
                 font-family: -apple-system, "Segoe UI", "SF Pro Text",
                              "Helvetica Neue", sans-serif;
             }
 
             QPushButton#closeBtn {
-                background: rgba(255, 255, 255, 0.06);
-                color: rgba(245, 245, 250, 0.7);
-                border: 1px solid rgba(255, 255, 255, 0.08);
+                background: rgba(196, 181, 245, 0.06);
+                color: rgba(232, 230, 240, 0.7);
+                border: 1px solid rgba(196, 181, 245, 0.12);
                 border-radius: 13px;
                 font-size: 12px;
             }
             QPushButton#closeBtn:hover {
-                background: rgba(255, 255, 255, 0.16);
-                color: #ffffff;
-            }
-            QPushButton#minBtn {
-                background: rgba(255, 255, 255, 0.06);
-                color: rgba(245, 245, 250, 0.7);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 13px;
-                font-size: 16px;
-                font-weight: 600;
-            }
-            QPushButton#minBtn:hover {
-                background: rgba(196, 181, 245, 0.22);
-                color: #ffffff;
+                background: rgba(196, 181, 245, 0.16);
+                color: #e8e6f0;
             }
 
             /* Panels ─────────────────────────────────────────────────── */
@@ -4018,10 +4004,10 @@ class MainPopup(QWidget):
             }
             QLabel#panelSub {
                 font-size: 11px;
-                color: #8b7fb5;
+                color: #9d9aad;
             }
             QLabel#panelEmpty {
-                color: #8b7fb5;
+                color: #9d9aad;
                 font-size: 12px;
                 padding: 30px 10px;
             }
@@ -4032,16 +4018,21 @@ class MainPopup(QWidget):
                 border: none;
             }
             /* The scroll-area viewport + its host pick up an opaque grey
-               palette background by default — force every layer back to
-               transparent so panels sit on the app's dark #0d0b12 glass. */
+               palette background AND a 1px frame by default — force every
+               layer (viewport + host) back to transparent with no border so
+               panels sit on the app's dark #0d0b12 glass and no stray rule
+               shows through when the list is empty and no rows cover it. */
+            QScrollArea#chatScroll > QWidget,
+            QScrollArea#panelScroll > QWidget,
             QScrollArea#chatScroll > QWidget > QWidget,
             QScrollArea#panelScroll > QWidget > QWidget {
                 background: transparent;
+                border: none;
             }
 
             /* Chat ───────────────────────────────────────────────────── */
             QLabel#chatEmpty {
-                color: #8b7fb5;
+                color: #9d9aad;
                 font-size: 12px;
                 padding: 40px 12px;
             }
@@ -4050,22 +4041,22 @@ class MainPopup(QWidget):
                 padding: 0px;
             }
             QFrame#msgBubble[role="user"] {
-                background: rgba(140, 110, 220, 0.35);
-                border: 1px solid rgba(196, 181, 245, 0.45);
+                background: rgba(196, 181, 245, 0.20);
+                border: 1px solid rgba(196, 181, 245, 0.30);
             }
             QFrame#msgBubble[role="assistant"] {
-                background: rgba(255, 255, 255, 0.06);
-                border: 1px solid rgba(255, 255, 255, 0.08);
+                background: #0f0d16;
+                border: 1px solid rgba(196, 181, 245, 0.12);
             }
             QLabel#msgText {
-                color: #f5f5fa;
+                color: #e8e6f0;
                 font-size: 12px;
                 background: transparent;
             }
 
             QFrame#inputWrap {
-                background: #1a1625;
-                border: 1px solid rgba(196, 181, 245, 0.16);
+                background: #13111a;
+                border: 1px solid rgba(196, 181, 245, 0.12);
                 border-radius: 16px;
             }
             QFrame#inputWrap:hover {
@@ -4074,28 +4065,28 @@ class MainPopup(QWidget):
             QLineEdit#chatInput {
                 background: transparent;
                 border: none;
-                color: #f5f5fa;
-                font-size: 13px;
+                color: #e8e6f0;
+                font-size: 12px;
                 padding: 4px 2px;
             }
             QPushButton#iconBtn {
-                background: rgba(255, 255, 255, 0.06);
-                border: 1px solid rgba(255, 255, 255, 0.08);
+                background: rgba(196, 181, 245, 0.06);
+                border: 1px solid rgba(196, 181, 245, 0.12);
                 border-radius: 17px;
-                color: rgba(245, 245, 250, 0.8);
-                font-size: 16px;
+                color: rgba(232, 230, 240, 0.8);
+                font-size: 20px;
                 font-weight: 600;
             }
             QPushButton#iconBtn:hover {
                 background: rgba(196, 181, 245, 0.20);
-                color: #ffffff;
+                color: #e8e6f0;
             }
             QPushButton#sendBtn {
                 background: rgba(196, 181, 245, 0.85);
                 border: none;
                 border-radius: 17px;
-                color: #1a1422;
-                font-size: 13px;
+                color: #0d0b12;
+                font-size: 20px;
                 font-weight: 700;
             }
             QPushButton#sendBtn:hover {
@@ -4111,16 +4102,17 @@ class MainPopup(QWidget):
             /* Conversations list ────────────────────────────────────── */
             QFrame#convRow {
                 background: #0f0d16;
-                border: 1px solid rgba(196, 181, 245, 0.08);
+                border: 1px solid rgba(196, 181, 245, 0.12);
                 border-radius: 12px;
             }
             QFrame#convRow:hover {
                 border: 1px solid rgba(196, 181, 245, 0.35);
-                background: #1a1625;
+                background: #13111a;
             }
             QFrame#convRow[active="true"] {
                 background: rgba(196, 181, 245, 0.16);
                 border: 1px solid rgba(196, 181, 245, 0.5);
+                border-left: 3px solid #c4b5f5;
             }
             QLabel#convTitle {
                 font-size: 13px;
@@ -4129,23 +4121,23 @@ class MainPopup(QWidget):
             }
             QLabel#convSub {
                 font-size: 11px;
-                color: #8b7fb5;
+                color: #9d9aad;
             }
             QPushButton#convOpen {
                 background: rgba(196, 181, 245, 0.20);
                 border: 1px solid rgba(196, 181, 245, 0.40);
-                color: #f5f0ff;
-                border-radius: 8px;
-                padding: 4px 10px;
+                color: #e8e6f0;
+                border-radius: 10px;
+                padding: 8px 16px;
                 font-size: 11px;
             }
             QPushButton#convOpen:hover {
                 background: rgba(196, 181, 245, 0.35);
             }
             QPushButton#convDel {
-                background: rgba(255, 255, 255, 0.04);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                color: rgba(245, 245, 250, 0.6);
+                background: rgba(196, 181, 245, 0.04);
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                color: rgba(232, 230, 240, 0.6);
                 border-radius: 13px;
                 font-size: 11px;
             }
@@ -4157,26 +4149,26 @@ class MainPopup(QWidget):
 
             /* Model panel — provider grid ───────────────────────────── */
             QPushButton#backBtn {
-                background: rgba(255, 255, 255, 0.05);
-                border: 1px solid rgba(255, 255, 255, 0.10);
-                border-radius: 8px;
-                padding: 3px 10px;
+                background: rgba(196, 181, 245, 0.05);
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                border-radius: 10px;
+                padding: 8px 16px;
                 font-size: 12px;
-                color: rgba(245, 245, 250, 0.85);
+                color: rgba(232, 230, 240, 0.85);
             }
             QPushButton#backBtn:hover {
                 background: rgba(196, 181, 245, 0.18);
                 border: 1px solid rgba(196, 181, 245, 0.45);
-                color: #ffffff;
+                color: #e8e6f0;
             }
             QFrame#provGridCard {
                 background: #0f0d16;
-                border: 1px solid rgba(196, 181, 245, 0.10);
+                border: 1px solid rgba(196, 181, 245, 0.12);
                 border-radius: 12px;
             }
             QFrame#provGridCard:hover {
                 border: 1px solid rgba(196, 181, 245, 0.45);
-                background: #1a1625;
+                background: #13111a;
             }
             QLabel#provGridName {
                 font-size: 13px;
@@ -4184,7 +4176,7 @@ class MainPopup(QWidget):
             }
             QLabel#provGridCount {
                 font-size: 11px;
-                color: rgba(245, 245, 250, 0.45);
+                color: #9d9aad;
             }
 
             /* Model list ────────────────────────────────────────────── */
@@ -4198,16 +4190,17 @@ class MainPopup(QWidget):
             }
             QFrame#modelRow {
                 background: #0f0d16;
-                border: 1px solid rgba(196, 181, 245, 0.08);
+                border: 1px solid rgba(196, 181, 245, 0.12);
                 border-radius: 12px;
             }
             QFrame#modelRow:hover {
                 border: 1px solid rgba(196, 181, 245, 0.35);
-                background: #1a1625;
+                background: #13111a;
             }
             QFrame#modelRow[active="true"] {
                 background: rgba(196, 181, 245, 0.16);
                 border: 1px solid rgba(196, 181, 245, 0.5);
+                border-left: 3px solid #c4b5f5;
             }
             QLabel#modelProv {
                 color: rgba(196, 181, 245, 0.85);
@@ -4220,15 +4213,15 @@ class MainPopup(QWidget):
                 font-weight: 500;
             }
             QLabel#modelSub {
-                font-size: 10px;
-                color: #8b7fb5;
+                font-size: 11px;
+                color: #9d9aad;
             }
             QPushButton#modelUse {
                 background: rgba(196, 181, 245, 0.18);
                 border: 1px solid rgba(196, 181, 245, 0.40);
-                color: #f5f0ff;
-                border-radius: 8px;
-                padding: 4px 12px;
+                color: #e8e6f0;
+                border-radius: 10px;
+                padding: 8px 16px;
                 font-size: 11px;
             }
             QPushButton#modelUse:hover {
@@ -4237,13 +4230,13 @@ class MainPopup(QWidget):
             QPushButton#modelUse:disabled {
                 background: rgba(196, 181, 245, 0.22);
                 border: 1px solid rgba(196, 181, 245, 0.5);
-                color: rgba(245, 245, 250, 0.7);
+                color: rgba(232, 230, 240, 0.7);
             }
 
             /* Settings sections ─────────────────────────────────────── */
             QFrame#section {
                 background: #0f0d16;
-                border: 1px solid rgba(196, 181, 245, 0.08);
+                border: 1px solid rgba(196, 181, 245, 0.12);
                 border-radius: 12px;
             }
             QFrame#section:hover {
@@ -4252,18 +4245,21 @@ class MainPopup(QWidget):
             QLabel#sectionTitle {
                 font-size: 13px;
                 font-weight: 600;
+                background: rgba(196, 181, 245, 0.06);
+                border-radius: 10px;
+                padding: 5px 10px;
             }
             QLabel#sectionSub {
                 font-size: 11px;
-                color: #8b7fb5;
+                color: #9d9aad;
             }
             QLabel#fieldLabel {
-                font-size: 11px;
-                color: rgba(245, 245, 250, 0.55);
+                font-size: 12px;
+                color: #9d9aad;
             }
             QLabel#startupLabel {
                 font-size: 12px;
-                color: rgba(245, 245, 250, 0.85);
+                color: rgba(232, 230, 240, 0.85);
             }
             QLabel#statusDot {
                 border-radius: 5px;
@@ -4282,14 +4278,11 @@ class MainPopup(QWidget):
             /* Provider card (compact configuration row) ─────────────── */
             QFrame#providerCard {
                 background: #0f0d16;
-                border: 1px solid rgba(196, 181, 245, 0.08);
+                border: 1px solid rgba(196, 181, 245, 0.12);
                 border-radius: 12px;
             }
             QFrame#providerCard:hover {
                 border: 1px solid rgba(196, 181, 245, 0.35);
-            }
-            QFrame#providerCard:hover {
-                border: 1px solid rgba(196, 181, 245, 0.40);
             }
             QLabel#providerName {
                 font-size: 13px;
@@ -4297,7 +4290,7 @@ class MainPopup(QWidget):
             }
             QLabel#providerSub {
                 font-size: 11px;
-                color: #8b7fb5;
+                color: #9d9aad;
             }
             QLabel#infoBadge {
                 background: rgba(196, 181, 245, 0.18);
@@ -4312,7 +4305,7 @@ class MainPopup(QWidget):
             QLabel#tokenMask {
                 font-family: "DejaVu Sans Mono", "SF Mono", monospace;
                 font-size: 13px;
-                color: #f5f0ff;
+                color: #e8e6f0;
                 letter-spacing: 1px;
             }
             QLabel#warnLabel {
@@ -4322,29 +4315,29 @@ class MainPopup(QWidget):
             /* Live API (Bloc 4) — violet info box: STT + TTS bypassed notice */
             QLabel#liveApiNotice {
                 background: rgba(196, 181, 245, 0.14);
-                border: 1px solid rgba(196, 181, 245, 0.45);
-                border-radius: 8px;
+                border: 1px solid rgba(196, 181, 245, 0.30);
+                border-radius: 10px;
                 padding: 8px 10px;
-                color: #d9cffb;
+                color: #c4b5f5;
                 font-size: 11px;
             }
             QFrame#dialogCard {
-                background: #14111c;
-                border: 1px solid rgba(196, 181, 245, 0.40);
+                background: #0f0d16;
+                border: 1px solid rgba(196, 181, 245, 0.30);
                 border-radius: 14px;
             }
             QLabel#dialogTitle {
                 font-size: 14px;
                 font-weight: 600;
-                color: #f5f5fa;
+                color: #e8e6f0;
             }
             /* Conversation pill on a cron row + the picker popover rows */
             QLabel#convPill {
                 background: rgba(196, 181, 245, 0.14);
-                border: 1px solid rgba(196, 181, 245, 0.35);
-                border-radius: 9px;
+                border: 1px solid rgba(196, 181, 245, 0.30);
+                border-radius: 10px;
                 padding: 2px 9px;
-                color: #d9cffb;
+                color: #c4b5f5;
                 font-size: 10px;
             }
             QScrollArea#convScroll {
@@ -4352,39 +4345,39 @@ class MainPopup(QWidget):
                 border: none;
             }
             QPushButton#convPick {
-                background: rgba(255, 255, 255, 0.04);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 8px;
-                padding: 7px 10px;
-                color: #f5f5fa;
+                background: rgba(196, 181, 245, 0.04);
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                border-radius: 10px;
+                padding: 8px 16px;
+                color: #e8e6f0;
                 font-size: 12px;
                 text-align: left;
             }
             QPushButton#convPick:hover {
                 background: rgba(196, 181, 245, 0.18);
                 border: 1px solid rgba(196, 181, 245, 0.45);
-                color: #ffffff;
+                color: #e8e6f0;
             }
 
             QPushButton#ghostBtn {
-                background: rgba(255, 255, 255, 0.05);
-                border: 1px solid rgba(255, 255, 255, 0.10);
-                border-radius: 8px;
-                padding: 4px 12px;
+                background: rgba(196, 181, 245, 0.05);
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                border-radius: 10px;
+                padding: 8px 16px;
                 font-size: 11px;
-                color: rgba(245, 245, 250, 0.85);
+                color: rgba(232, 230, 240, 0.85);
             }
             QPushButton#ghostBtn:hover {
                 background: rgba(196, 181, 245, 0.18);
                 border: 1px solid rgba(196, 181, 245, 0.45);
-                color: #ffffff;
+                color: #e8e6f0;
             }
             QPushButton#primaryBtn {
                 background: rgba(196, 181, 245, 0.22);
                 border: 1px solid rgba(196, 181, 245, 0.45);
-                color: #f5f0ff;
-                border-radius: 8px;
-                padding: 5px 14px;
+                color: #e8e6f0;
+                border-radius: 10px;
+                padding: 8px 16px;
                 font-size: 12px;
                 font-weight: 500;
             }
@@ -4394,20 +4387,20 @@ class MainPopup(QWidget):
             QPushButton#linkBtn {
                 background: transparent;
                 border: none;
-                color: rgba(245, 245, 250, 0.55);
+                color: #9d9aad;
                 font-size: 11px;
                 text-decoration: underline;
             }
             QPushButton#linkBtn:hover {
-                color: #ffffff;
+                color: #e8e6f0;
             }
 
             QLineEdit#keyInput {
-                background: #14111c;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 8px;
+                background: #13111a;
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                border-radius: 10px;
                 padding: 6px 10px;
-                color: #f5f5fa;
+                color: #e8e6f0;
                 font-size: 12px;
             }
             QLineEdit#keyInput:focus {
@@ -4415,11 +4408,11 @@ class MainPopup(QWidget):
             }
             /* Multi-line Markdown editor (OSIA personality + skills) ──── */
             QTextEdit#mdEditor {
-                background: #14111c;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 8px;
-                padding: 6px 8px;
-                color: #f5f5fa;
+                background: #13111a;
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                border-radius: 10px;
+                padding: 6px 10px;
+                color: #e8e6f0;
                 font-family: "DejaVu Sans Mono", "SF Mono", monospace;
                 font-size: 12px;
                 selection-background-color: rgba(196, 181, 245, 0.30);
@@ -4428,11 +4421,11 @@ class MainPopup(QWidget):
                 border: 1px solid rgba(196, 181, 245, 0.55);
             }
             QPushButton#saveBtn {
-                background: rgba(255, 255, 255, 0.08);
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 8px;
-                padding: 5px 18px;
-                color: #f5f5fa;
+                background: rgba(196, 181, 245, 0.08);
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                border-radius: 10px;
+                padding: 8px 18px;
+                color: #e8e6f0;
                 font-size: 12px;
             }
             QPushButton#saveBtn:hover {
@@ -4442,16 +4435,16 @@ class MainPopup(QWidget):
             QPushButton#saveBtn[saved="true"] {
                 background: rgba(196, 181, 245, 0.35);
                 border: 1px solid rgba(196, 181, 245, 0.85);
-                color: #ffffff;
+                color: #e8e6f0;
             }
 
             /* Voice combos ──────────────────────────────────────────── */
             QComboBox#voiceCombo {
-                background: #14111c;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 6px;
-                padding: 5px 10px;
-                color: #f5f5fa;
+                background: #13111a;
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                border-radius: 10px;
+                padding: 6px 10px;
+                color: #e8e6f0;
                 font-size: 12px;
             }
             QComboBox#voiceCombo::drop-down {
@@ -4462,14 +4455,14 @@ class MainPopup(QWidget):
                 image: none;
                 border-left: 4px solid transparent;
                 border-right: 4px solid transparent;
-                border-top: 6px solid rgba(245, 245, 250, 0.5);
+                border-top: 6px solid #9d9aad;
                 margin-right: 6px;
             }
             QComboBox#voiceCombo QAbstractItemView {
-                background: rgb(28, 24, 36);
-                color: #f5f5fa;
-                border: 1px solid rgba(196, 181, 245, 0.30);
-                border-radius: 6px;
+                background: #13111a;
+                color: #e8e6f0;
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                border-radius: 10px;
                 selection-background-color: rgba(196, 181, 245, 0.30);
                 font-size: 12px;
             }
@@ -4479,8 +4472,8 @@ class MainPopup(QWidget):
                 width: 36px;
                 height: 20px;
                 border-radius: 10px;
-                background: rgba(255, 255, 255, 0.15);
-                border: 1px solid rgba(255, 255, 255, 0.15);
+                background: rgba(196, 181, 245, 0.15);
+                border: 1px solid rgba(196, 181, 245, 0.12);
             }
             QCheckBox#smartToggle::indicator:checked {
                 background: rgba(196, 181, 245, 0.85);
@@ -4493,12 +4486,12 @@ class MainPopup(QWidget):
                 margin: 0;
             }
             QScrollBar::handle:vertical {
-                background: rgba(255, 255, 255, 0.18);
+                background: rgba(196, 181, 245, 0.18);
                 border-radius: 4px;
                 min-height: 24px;
             }
             QScrollBar::handle:vertical:hover {
-                background: rgba(255, 255, 255, 0.3);
+                background: rgba(196, 181, 245, 0.30);
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0;
