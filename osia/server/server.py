@@ -15,6 +15,14 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "set_model",            "model": "..."}
     {"type": "file",                 "filename": "...", "data": "<base64>"}
     {"type": "speak",                "text": "..."}      # synthesize text → audio frame sent back to the phone
+    {"type": "set_api_key",          "provider": "...", "key": "..."}  # save/clear a provider key (config/api_keys.json)
+    {"type": "set_setting",          "key": "...", "value": ...}       # set one whitelisted key in config/settings.json
+                                                                       #   (heavy_chain/medium_chain map onto ai_hierarchy.{heavy,medium})
+    {"type": "get_config"}                                             # request the full config snapshot (settings sans secrets, personality, skills)
+    {"type": "set_personality",      "text": "..."}                    # save the personality document (~/.osia/personality.md)
+    {"type": "set_skill",            "name": "...", "enabled": true, "text": "..."}  # update a skill's enabled flag and/or prose (both optional)
+    {"type": "create_skill",         "name": "..."}                    # create a new skill from the template (starts enabled)
+    {"type": "delete_skill",         "name": "..."}                    # delete a skill and drop its enabled flag
   Server → Client:
     {"type": "transcript",           "content": "..."}
     {"type": "response_chunk",       "content": "..."}        # streamed sentence-by-sentence
@@ -28,6 +36,8 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "active_conversation",  "id": "...", "title": "..."}
     {"type": "models_list",          "models": [{id,label,provider,tier}, ...], "current": "..."}
     {"type": "file_received",        "filename": "...", "path": "...", "success": true|false}
+    {"type": "config",               "config": {...}}                  # full config snapshot (settings sans secrets, personality, skills)
+    {"type": "status",               "status": "done|error"}           # ack for the config-family setters (create_skill adds "name")
 """
 
 import asyncio
@@ -560,6 +570,209 @@ async def websocket_endpoint(ws: WebSocket):
                 except Exception as e:
                     print(f"[OSIA Server] set_model({model_id!r}) failed: {e}")
                     await ws.send_json({"type": "status", "content": "error"})
+                continue
+
+            # --- API keys & settings (mobile "Configure APIs & Providers") ---
+            # set_api_key persists a provider's key to the canonical key store
+            # (config/api_keys.json — the file get_api_key() reads, so the key
+            # is immediately usable by the agent/TTS). set_setting writes a
+            # single whitelisted key into config/settings.json.
+            if msg_type == "set_api_key":
+                provider = (msg.get("provider") or "").strip().lower()
+                key = (msg.get("key") or "").strip()
+                if not provider:
+                    await ws.send_json({"type": "status", "status": "error"})
+                    continue
+                try:
+                    from osia.config import set_api_key
+                    set_api_key(provider, key)
+                    print(
+                        f"[OSIA Server] set_api_key provider={provider!r} "
+                        f"({'set, len=' + str(len(key)) if key else 'cleared'})"
+                    )
+                    await ws.send_json({"type": "status", "status": "done"})
+                except Exception as e:
+                    print(f"[OSIA Server] set_api_key({provider!r}) failed: {e}")
+                    await ws.send_json({"type": "status", "status": "error"})
+                continue
+
+            if msg_type == "set_setting":
+                setting_key = (msg.get("key") or "").strip()
+                setting_value = msg.get("value")
+                # Whitelist: only these settings.json keys are writable from the
+                # mobile app. Anything else is rejected so a client can't poke
+                # arbitrary server state.
+                allowed_settings = {
+                    "liveapi_enabled", "liveapi_provider", "liveapi_model",
+                    "tts_provider", "stt_provider",
+                    "wake_greeting_enabled", "wake_greeting_text",
+                    "cron_jobs", "ai_hierarchy_enabled",
+                    # Flat aliases for the two AI-hierarchy fallback chains; the
+                    # write path below folds them into ai_hierarchy.{heavy,medium}.
+                    "heavy_chain", "medium_chain",
+                }
+                if setting_key not in allowed_settings:
+                    print(
+                        f"[OSIA Server] set_setting rejected non-whitelisted "
+                        f"key={setting_key!r}"
+                    )
+                    await ws.send_json({"type": "status", "status": "error"})
+                    continue
+                try:
+                    from osia.config import set_setting, get_setting
+                    if setting_key in ("heavy_chain", "medium_chain"):
+                        # heavy_chain/medium_chain are the flat names the mobile
+                        # app uses for the two ordered fallback chains that live
+                        # nested under ``ai_hierarchy`` in settings.json. Nothing
+                        # reads a flat key, so fold them into the nested dict the
+                        # desktop GUI and task router already consume.
+                        category = (
+                            "heavy" if setting_key == "heavy_chain" else "medium"
+                        )
+                        hierarchy = dict(get_setting("ai_hierarchy", {}) or {})
+                        chain = setting_value if isinstance(setting_value, list) else []
+                        hierarchy[category] = [
+                            v for v in chain if isinstance(v, str) and v
+                        ]
+                        set_setting("ai_hierarchy", hierarchy)
+                    else:
+                        set_setting(setting_key, setting_value)
+                    print(
+                        f"[OSIA Server] set_setting {setting_key!r} -> "
+                        f"{setting_value!r}"
+                    )
+                    await ws.send_json({"type": "status", "status": "done"})
+                except Exception as e:
+                    print(f"[OSIA Server] set_setting({setting_key!r}) failed: {e}")
+                    await ws.send_json({"type": "status", "status": "error"})
+                continue
+
+            # --- Config snapshot (mobile "OSIA / Personality / Skills" screen) ---
+            # get_config returns everything the mobile config screens need in one
+            # frame: the settings.json contents (MINUS stored secrets), the two
+            # hierarchy chains exposed under their flat mobile names, the
+            # personality document, and the full skill list (name/enabled/prose).
+            if msg_type == "get_config":
+                try:
+                    from osia.config import load_settings, load_api_keys
+                    from osia import personality
+                    cfg = load_settings()
+                    # Never ship stored secrets over the wire: api_key_fallbacks
+                    # holds raw provider keys. Expose only WHICH providers have a
+                    # key set, never the keys themselves.
+                    cfg.pop("api_key_fallbacks", None)
+                    # Desktop-only capsule position is meaningless to the phone.
+                    cfg.pop("island_x", None)
+                    cfg.pop("island_y", None)
+                    # Mirror the two hierarchy chains under the flat names the
+                    # mobile app writes back via set_setting, so the round-trip
+                    # is symmetric (read heavy_chain → write heavy_chain).
+                    hierarchy = cfg.get("ai_hierarchy") or {}
+                    cfg["heavy_chain"] = list(hierarchy.get("heavy") or [])
+                    cfg["medium_chain"] = list(hierarchy.get("medium") or [])
+                    cfg["personality"] = personality.load_personality()
+                    cfg["skills"] = [
+                        {
+                            "name": n,
+                            "enabled": personality.is_skill_enabled(n),
+                            "text": personality.read_skill(n),
+                        }
+                        for n in personality.list_skills()
+                    ]
+                    cfg["api_keys_set"] = {
+                        p: bool(k) for p, k in load_api_keys().items()
+                    }
+                    await ws.send_json({"type": "config", "config": cfg})
+                    print(
+                        f"[OSIA Server] get_config sent "
+                        f"({len(cfg.get('skills', []))} skills)"
+                    )
+                except Exception as e:
+                    print(f"[OSIA Server] get_config failed: {e}")
+                    traceback.print_exc()
+                    await ws.send_json({"type": "status", "status": "error"})
+                continue
+
+            # --- Personality document ---
+            if msg_type == "set_personality":
+                persona_text = msg.get("text")
+                if not isinstance(persona_text, str):
+                    persona_text = ""
+                try:
+                    from osia import personality
+                    personality.save_personality(persona_text)
+                    print(
+                        f"[OSIA Server] set_personality "
+                        f"({len(persona_text)} chars)"
+                    )
+                    await ws.send_json({"type": "status", "status": "done"})
+                except Exception as e:
+                    print(f"[OSIA Server] set_personality failed: {e}")
+                    await ws.send_json({"type": "status", "status": "error"})
+                continue
+
+            # --- Skills: update / create / delete ---
+            # set_skill updates an EXISTING skill's enabled flag and/or its prose
+            # (both fields optional, so a toggle and a text edit can each arrive
+            # alone). create_skill seeds a new <name>.md from the template;
+            # delete_skill removes the file and its enabled flag.
+            if msg_type == "set_skill":
+                skill_name = (msg.get("name") or "").strip()
+                if not skill_name:
+                    await ws.send_json({"type": "status", "status": "error"})
+                    continue
+                try:
+                    from osia import personality
+                    if "text" in msg:
+                        personality.write_skill(skill_name, msg.get("text") or "")
+                    if "enabled" in msg:
+                        personality.set_skill_enabled(
+                            skill_name, bool(msg.get("enabled"))
+                        )
+                    print(
+                        f"[OSIA Server] set_skill name={skill_name!r} "
+                        f"text={'text' in msg} "
+                        f"enabled={msg.get('enabled') if 'enabled' in msg else '—'}"
+                    )
+                    await ws.send_json({"type": "status", "status": "done"})
+                except Exception as e:
+                    print(f"[OSIA Server] set_skill({skill_name!r}) failed: {e}")
+                    await ws.send_json({"type": "status", "status": "error"})
+                continue
+
+            if msg_type == "create_skill":
+                skill_name = (msg.get("name") or "").strip()
+                if not skill_name:
+                    await ws.send_json({"type": "status", "status": "error"})
+                    continue
+                try:
+                    from osia import personality
+                    created = personality.create_skill(skill_name)
+                    if not created:
+                        await ws.send_json({"type": "status", "status": "error"})
+                        continue
+                    print(f"[OSIA Server] create_skill -> {created!r}")
+                    await ws.send_json({
+                        "type": "status", "status": "done", "name": created,
+                    })
+                except Exception as e:
+                    print(f"[OSIA Server] create_skill({skill_name!r}) failed: {e}")
+                    await ws.send_json({"type": "status", "status": "error"})
+                continue
+
+            if msg_type == "delete_skill":
+                skill_name = (msg.get("name") or "").strip()
+                if not skill_name:
+                    await ws.send_json({"type": "status", "status": "error"})
+                    continue
+                try:
+                    from osia import personality
+                    personality.delete_skill(skill_name)
+                    print(f"[OSIA Server] delete_skill name={skill_name!r}")
+                    await ws.send_json({"type": "status", "status": "done"})
+                except Exception as e:
+                    print(f"[OSIA Server] delete_skill({skill_name!r}) failed: {e}")
+                    await ws.send_json({"type": "status", "status": "error"})
                 continue
 
             # --- Speak on demand (read-aloud button on the phone) ---
