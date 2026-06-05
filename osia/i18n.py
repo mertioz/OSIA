@@ -17,11 +17,13 @@ with :func:`add_listener`; every :func:`set_language` call invokes the
 listeners so the UI can re-translate itself in place. Remember to
 :func:`remove_listener` when a widget is destroyed.
 
-Migration status: this is the foundation. The newly-added / changed UI
-strings (the provider configuration card, the "Get API key" row, and the
-language selector) are routed through ``t()``. The remaining legacy GUI
-strings are still hardcoded and tracked for a follow-up migration pass in
-``docs/i18n_backlog.md``.
+Migration status: the PC GUI popup is fully migrated — every user-facing
+string in ``osia/gui/main_popup.py`` and ``osia/gui/dynamic_island.py``
+(chat page, conversations panel, model picker, settings sections, the
+startup section, and the bottom-nav tooltips) is routed through ``t()``.
+Proper nouns (the "OSIA" wordmark, "Kokoro", provider/product names) are
+shown verbatim by design. Any remaining legacy strings elsewhere are
+tracked for a follow-up pass in ``docs/i18n_backlog.md``.
 """
 
 from typing import Callable
@@ -1037,6 +1039,228 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ja": "スキル名：",
         "de": "Name der Fähigkeit:",
         "es": "Nombre de la habilidad:",
+    },
+    # — Chat page (input row + empty state) —
+    "chat.attach_file": {
+        "en": "Attach a file",
+        "fr": "Joindre un fichier",
+        "zh": "附加文件",
+        "ja": "ファイルを添付",
+        "de": "Datei anhängen",
+        "es": "Adjuntar un archivo",
+    },
+    "chat.input_placeholder": {
+        "en": "Message OSIA…",
+        "fr": "Écrire à OSIA…",
+        "zh": "给 OSIA 发消息…",
+        "ja": "OSIA にメッセージ…",
+        "de": "Nachricht an OSIA…",
+        "es": "Mensaje a OSIA…",
+    },
+    "chat.send": {
+        "en": "Send",
+        "fr": "Envoyer",
+        "zh": "发送",
+        "ja": "送信",
+        "de": "Senden",
+        "es": "Enviar",
+    },
+    "chat.empty": {
+        "en": "Say “OSIA” or type below to start.",
+        "fr": "Dites « OSIA » ou écrivez ci-dessous pour commencer.",
+        "zh": "说「OSIA」或在下方输入以开始。",
+        "ja": "「OSIA」と話しかけるか、下に入力して始めましょう。",
+        "de": "Sagen Sie „OSIA“ oder tippen Sie unten, um zu beginnen.",
+        "es": "Di «OSIA» o escribe abajo para empezar.",
+    },
+    # — Conversations panel —
+    "conversations.title": {
+        "en": "Conversations",
+        "fr": "Conversations",
+        "zh": "对话",
+        "ja": "会話",
+        "de": "Unterhaltungen",
+        "es": "Conversaciones",
+    },
+    "conversations.new_chat": {
+        "en": "New chat",
+        "fr": "Nouveau chat",
+        "zh": "新聊天",
+        "ja": "新しいチャット",
+        "de": "Neuer Chat",
+        "es": "Nuevo chat",
+    },
+    "conversations.new_conversation": {
+        "en": "New conversation",
+        "fr": "Nouvelle conversation",
+        "zh": "新对话",
+        "ja": "新しい会話",
+        "de": "Neue Unterhaltung",
+        "es": "Nueva conversación",
+    },
+    "conversations.msg_count": {
+        "en": "{count} msg",
+        "fr": "{count} msg",
+        "zh": "{count} 条",
+        "ja": "{count} 件",
+        "de": "{count} Nachr.",
+        "es": "{count} msj",
+    },
+    "conversations.open": {
+        "en": "Open",
+        "fr": "Ouvrir",
+        "zh": "打开",
+        "ja": "開く",
+        "de": "Öffnen",
+        "es": "Abrir",
+    },
+    # — Model panel (two-level picker) —
+    "models.title": {
+        "en": "Models",
+        "fr": "Modèles",
+        "zh": "模型",
+        "ja": "モデル",
+        "de": "Modelle",
+        "es": "Modelos",
+    },
+    "models.choose_provider_sub": {
+        "en": "Choose a provider to see its models.",
+        "fr": "Choisissez un fournisseur pour voir ses modèles.",
+        "zh": "选择一个提供商以查看其模型。",
+        "ja": "プロバイダーを選択してそのモデルを表示します。",
+        "de": "Wählen Sie einen Anbieter, um seine Modelle anzuzeigen.",
+        "es": "Elige un proveedor para ver sus modelos.",
+    },
+    "models.pick_model_sub": {
+        "en": "Pick the model OSIA will use for new messages.",
+        "fr": "Choisissez le modèle qu'OSIA utilisera pour les nouveaux messages.",
+        "zh": "选择 OSIA 用于新消息的模型。",
+        "ja": "OSIA が新しいメッセージに使用するモデルを選択します。",
+        "de": "Wählen Sie das Modell, das OSIA für neue Nachrichten verwendet.",
+        "es": "Elige el modelo que OSIA usará para los nuevos mensajes.",
+    },
+    "models.none_for_provider": {
+        "en": "No models available for this provider.",
+        "fr": "Aucun modèle disponible pour ce fournisseur.",
+        "zh": "此提供商没有可用的模型。",
+        "ja": "このプロバイダーには利用可能なモデルがありません。",
+        "de": "Keine Modelle für diesen Anbieter verfügbar.",
+        "es": "No hay modelos disponibles para este proveedor.",
+    },
+    "models.back": {
+        "en": "Back",
+        "fr": "Retour",
+        "zh": "返回",
+        "ja": "戻る",
+        "de": "Zurück",
+        "es": "Atrás",
+    },
+    "models.use": {
+        "en": "Use",
+        "fr": "Utiliser",
+        "zh": "使用",
+        "ja": "使用",
+        "de": "Verwenden",
+        "es": "Usar",
+    },
+    "models.active": {
+        "en": "Active",
+        "fr": "Actif",
+        "zh": "使用中",
+        "ja": "使用中",
+        "de": "Aktiv",
+        "es": "Activo",
+    },
+    "models.count_one": {
+        "en": "{count} model",
+        "fr": "{count} modèle",
+        "zh": "{count} 个模型",
+        "ja": "{count} モデル",
+        "de": "{count} Modell",
+        "es": "{count} modelo",
+    },
+    "models.count_other": {
+        "en": "{count} models",
+        "fr": "{count} modèles",
+        "zh": "{count} 个模型",
+        "ja": "{count} モデル",
+        "de": "{count} Modelle",
+        "es": "{count} modelos",
+    },
+    # — Settings panel header —
+    "settings.title": {
+        "en": "Settings",
+        "fr": "Paramètres",
+        "zh": "设置",
+        "ja": "設定",
+        "de": "Einstellungen",
+        "es": "Ajustes",
+    },
+    "settings.minimize": {
+        "en": "Minimize",
+        "fr": "Réduire",
+        "zh": "最小化",
+        "ja": "最小化",
+        "de": "Minimieren",
+        "es": "Minimizar",
+    },
+    # — Startup section (autostart services) —
+    "settings.startup": {
+        "en": "Startup",
+        "fr": "Démarrage",
+        "zh": "启动",
+        "ja": "起動",
+        "de": "Autostart",
+        "es": "Inicio",
+    },
+    "settings.startup_sub": {
+        "en": "Launch the mobile server and Cloudflare tunnel at startup.",
+        "fr": "Lancer le serveur mobile et le tunnel Cloudflare au démarrage.",
+        "zh": "在启动时启动移动服务器和 Cloudflare 隧道。",
+        "ja": "起動時にモバイルサーバーと Cloudflare トンネルを起動します。",
+        "de": "Mobilen Server und Cloudflare-Tunnel beim Start ausführen.",
+        "es": "Iniciar el servidor móvil y el túnel de Cloudflare al arrancar.",
+    },
+    "settings.startup_mobile_server": {
+        "en": "Mobile server",
+        "fr": "Serveur mobile",
+        "zh": "移动服务器",
+        "ja": "モバイルサーバー",
+        "de": "Mobiler Server",
+        "es": "Servidor móvil",
+    },
+    "settings.startup_cloudflare": {
+        "en": "Cloudflare tunnel",
+        "fr": "Tunnel Cloudflare",
+        "zh": "Cloudflare 隧道",
+        "ja": "Cloudflare トンネル",
+        "de": "Cloudflare-Tunnel",
+        "es": "Túnel de Cloudflare",
+    },
+    # — Bottom navigation (icon tooltips) —
+    "nav.conversations": {
+        "en": "Conversations",
+        "fr": "Conversations",
+        "zh": "对话",
+        "ja": "会話",
+        "de": "Unterhaltungen",
+        "es": "Conversaciones",
+    },
+    "nav.models": {
+        "en": "Model",
+        "fr": "Modèle",
+        "zh": "模型",
+        "ja": "モデル",
+        "de": "Modell",
+        "es": "Modelo",
+    },
+    "nav.settings": {
+        "en": "Settings",
+        "fr": "Paramètres",
+        "zh": "设置",
+        "ja": "設定",
+        "de": "Einstellungen",
+        "es": "Ajustes",
     },
 }
 

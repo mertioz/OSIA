@@ -287,25 +287,36 @@ class _ChatPage(QWidget):
         self._file_btn.setObjectName("iconBtn")
         self._file_btn.setFixedSize(34, 34)
         self._file_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._file_btn.setToolTip("Attach a file")
+        self._file_btn.setToolTip(i18n.t("chat.attach_file"))
         self._file_btn.clicked.connect(self._on_pick_file)
 
         self._input = QLineEdit()
         self._input.setObjectName("chatInput")
-        self._input.setPlaceholderText("Message OSIA…")
+        self._input.setPlaceholderText(i18n.t("chat.input_placeholder"))
         self._input.returnPressed.connect(self._on_send)
 
         self._send_btn = QPushButton("➤")
         self._send_btn.setObjectName("sendBtn")
         self._send_btn.setFixedSize(34, 34)
         self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._send_btn.setToolTip("Send")
+        self._send_btn.setToolTip(i18n.t("chat.send"))
         self._send_btn.clicked.connect(self._on_send)
 
         row.addWidget(self._file_btn)
         row.addWidget(self._input, 1)
         row.addWidget(self._send_btn)
         outer.addWidget(input_wrap)
+
+        # Re-translate the input chrome + empty-state label on language change.
+        i18n.add_listener(self._retranslate)
+        self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
+
+    def _retranslate(self) -> None:
+        self._file_btn.setToolTip(i18n.t("chat.attach_file"))
+        self._input.setPlaceholderText(i18n.t("chat.input_placeholder"))
+        self._send_btn.setToolTip(i18n.t("chat.send"))
+        if not _is_deleted(self._empty):
+            self._empty.setText(i18n.t("chat.empty"))
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -371,7 +382,7 @@ class _ChatPage(QWidget):
 
     @staticmethod
     def _build_empty_label() -> QLabel:
-        label = QLabel("Say “OSIA” or type below to start.")
+        label = QLabel(i18n.t("chat.empty"))
         label.setObjectName("chatEmpty")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         return label
@@ -413,7 +424,7 @@ class _ChatPage(QWidget):
         self.send_text.emit(text)
 
     def _on_pick_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Attach a file")
+        path, _ = QFileDialog.getOpenFileName(self, i18n.t("chat.attach_file"))
         if path:
             self.pick_file.emit(path)
 
@@ -439,7 +450,7 @@ class _ConvRow(QFrame):
         title_col = QVBoxLayout()
         title_col.setContentsMargins(0, 0, 0, 0)
         title_col.setSpacing(2)
-        self._full_title = conv.get("title") or "New conversation"
+        self._full_title = conv.get("title") or i18n.t("conversations.new_conversation")
         title = QLabel(self._full_title)
         title.setObjectName("convTitle")
         title.setWordWrap(False)
@@ -449,14 +460,15 @@ class _ConvRow(QFrame):
         title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self._title_label = title
         sub = QLabel(
-            f"{conv.get('message_count', 0)} msg · "
-            f"{_format_time(conv.get('updated_at'))}"
+            i18n.t("conversations.msg_count", count=conv.get("message_count", 0))
+            + " · "
+            + _format_time(conv.get("updated_at"))
         )
         sub.setObjectName("convSub")
         title_col.addWidget(title)
         title_col.addWidget(sub)
 
-        open_btn = QPushButton("Open")
+        open_btn = QPushButton(i18n.t("conversations.open"))
         open_btn.setObjectName("convOpen")
         open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         open_btn.clicked.connect(lambda: self.open_clicked.emit(self._conv_id))
@@ -498,15 +510,15 @@ class _ConversationsPanel(QWidget):
         outer.setSpacing(10)
 
         header = QHBoxLayout()
-        title = QLabel("Conversations")
-        title.setObjectName("panelTitle")
-        new_btn = QPushButton("＋ New chat")
-        new_btn.setObjectName("primaryBtn")
-        new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        new_btn.clicked.connect(self.new_conversation.emit)
-        header.addWidget(title)
+        self._title = QLabel(i18n.t("conversations.title"))
+        self._title.setObjectName("panelTitle")
+        self._new_btn = QPushButton("＋ " + i18n.t("conversations.new_chat"))
+        self._new_btn.setObjectName("primaryBtn")
+        self._new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._new_btn.clicked.connect(self.new_conversation.emit)
+        header.addWidget(self._title)
         header.addStretch()
-        header.addWidget(new_btn)
+        header.addWidget(self._new_btn)
         outer.addLayout(header)
 
         scroll = QScrollArea()
@@ -528,6 +540,16 @@ class _ConversationsPanel(QWidget):
         self._host_layout.addStretch(1)
         scroll.setWidget(self._host)
         outer.addWidget(scroll, 1)
+
+        # Re-translate the header + rebuild rows (so per-row labels re-translate)
+        # on language change.
+        i18n.add_listener(self._retranslate)
+        self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
+
+    def _retranslate(self) -> None:
+        self._title.setText(i18n.t("conversations.title"))
+        self._new_btn.setText("＋ " + i18n.t("conversations.new_chat"))
+        self.refresh()
 
     def set_active(self, conv_id: str | None) -> None:
         self._active_id = conv_id
@@ -591,7 +613,9 @@ class _ModelRow(QFrame):
         col.addWidget(name)
         col.addWidget(sub)
 
-        btn = QPushButton("✓ Active" if is_active else "Use")
+        btn = QPushButton(
+            "✓ " + i18n.t("models.active") if is_active else i18n.t("models.use")
+        )
         btn.setObjectName("modelUse")
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setEnabled(not is_active)
@@ -662,7 +686,10 @@ class _ProviderGridCard(QFrame):
         lay.addLayout(top)
 
         count = QLabel(
-            f"{model_count} model{'s' if model_count != 1 else ''}"
+            i18n.t(
+                "models.count_one" if model_count == 1 else "models.count_other",
+                count=model_count,
+            )
         )
         count.setObjectName("provGridCount")
         lay.addWidget(count)
@@ -699,19 +726,19 @@ class _ModelPanel(QWidget):
 
         header = QHBoxLayout()
         header.setSpacing(8)
-        self._back_btn = QPushButton("←  Back")
+        self._back_btn = QPushButton("←  " + i18n.t("models.back"))
         self._back_btn.setObjectName("backBtn")
         self._back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._back_btn.clicked.connect(self._show_grid)
         self._back_btn.hide()
-        self._title = QLabel("Models")
+        self._title = QLabel(i18n.t("models.title"))
         self._title.setObjectName("panelTitle")
         header.addWidget(self._back_btn)
         header.addWidget(self._title)
         header.addStretch()
         outer.addLayout(header)
 
-        self._sub = QLabel("Choose a provider to see its models.")
+        self._sub = QLabel(i18n.t("models.choose_provider_sub"))
         self._sub.setObjectName("panelSub")
         outer.addWidget(self._sub)
 
@@ -733,6 +760,16 @@ class _ModelPanel(QWidget):
         self._host_layout.addStretch(1)
         scroll.setWidget(self._host)
         outer.addWidget(scroll, 1)
+
+        # Re-translate the back button + rebuild the current view (grid or model
+        # list) so its header, rows and placeholders re-translate on language
+        # change.
+        i18n.add_listener(self._retranslate)
+        self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
+
+    def _retranslate(self) -> None:
+        self._back_btn.setText("←  " + i18n.t("models.back"))
+        self.refresh()
 
     def set_remote_models(self, remote: list) -> None:
         self._remote = remote or []
@@ -767,8 +804,8 @@ class _ModelPanel(QWidget):
 
     def _build_grid(self) -> None:
         self._back_btn.hide()
-        self._title.setText("Models")
-        self._sub.setText("Choose a provider to see its models.")
+        self._title.setText(i18n.t("models.title"))
+        self._sub.setText(i18n.t("models.choose_provider_sub"))
 
         models = get_all_models(remote_models=self._remote)
         counts: dict[str, int] = {}
@@ -806,7 +843,7 @@ class _ModelPanel(QWidget):
         self._title.setText(
             PROVIDERS.get(provider, {}).get("name") or provider.title()
         )
-        self._sub.setText("Pick the model OSIA will use for new messages.")
+        self._sub.setText(i18n.t("models.pick_model_sub"))
 
         models = [
             m for m in get_all_models(remote_models=self._remote)
@@ -815,7 +852,7 @@ class _ModelPanel(QWidget):
         models.sort(key=lambda m: m.get("label", ""))
 
         if not models:
-            empty = QLabel("No models available for this provider.")
+            empty = QLabel(i18n.t("models.none_for_provider"))
             empty.setObjectName("panelEmpty")
             self._host_layout.insertWidget(0, empty)
             return
@@ -1370,17 +1407,17 @@ class _SettingsPanel(QWidget):
         outer.setSpacing(10)
 
         header = QHBoxLayout()
-        title = QLabel("Settings")
-        title.setObjectName("panelTitle")
-        min_btn = QPushButton("−")
-        min_btn.setObjectName("minBtn")
-        min_btn.setFixedSize(26, 26)
-        min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        min_btn.setToolTip("Minimize")
-        min_btn.clicked.connect(self.hide)
-        header.addWidget(title)
+        self._settings_title = QLabel(i18n.t("settings.title"))
+        self._settings_title.setObjectName("panelTitle")
+        self._min_btn = QPushButton("−")
+        self._min_btn.setObjectName("minBtn")
+        self._min_btn.setFixedSize(26, 26)
+        self._min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._min_btn.setToolTip(i18n.t("settings.minimize"))
+        self._min_btn.clicked.connect(self.hide)
+        header.addWidget(self._settings_title)
         header.addStretch()
-        header.addWidget(min_btn)
+        header.addWidget(self._min_btn)
         outer.addLayout(header)
 
         scroll = QScrollArea()
@@ -1476,22 +1513,26 @@ class _SettingsPanel(QWidget):
         l.setContentsMargins(14, 12, 14, 12)
         l.setSpacing(8)
 
-        title = QLabel("Démarrage")
-        title.setObjectName("sectionTitle")
-        sub = QLabel("Lancer le serveur mobile et le tunnel Cloudflare au démarrage.")
-        sub.setObjectName("sectionSub")
-        sub.setWordWrap(True)
-        l.addWidget(title)
-        l.addWidget(sub)
+        self._startup_title = QLabel(i18n.t("settings.startup"))
+        self._startup_title.setObjectName("sectionTitle")
+        self._startup_sub = QLabel(i18n.t("settings.startup_sub"))
+        self._startup_sub.setObjectName("sectionSub")
+        self._startup_sub.setWordWrap(True)
+        l.addWidget(self._startup_title)
+        l.addWidget(self._startup_sub)
 
+        # (unit, i18n key) — the label widget + key are tracked in
+        # self._startup_labels so they re-translate on language change.
+        self._startup_labels: list[tuple[QLabel, str]] = []
         rows = [
-            (STARTUP_SERVICES[0], "Serveur mobile"),
-            (STARTUP_SERVICES[1], "Tunnel Cloudflare"),
+            (STARTUP_SERVICES[0], "settings.startup_mobile_server"),
+            (STARTUP_SERVICES[1], "settings.startup_cloudflare"),
         ]
-        for unit, display in rows:
+        for unit, label_key in rows:
             row = QHBoxLayout()
-            label = QLabel(display)
+            label = QLabel(i18n.t(label_key))
             label.setObjectName("startupLabel")
+            self._startup_labels.append((label, label_key))
             dot = QLabel()
             dot.setObjectName("statusDot")
             dot.setFixedSize(10, 10)
@@ -2982,6 +3023,9 @@ class _SettingsPanel(QWidget):
     # ── Re-translation ────────────────────────────────────────────────────
 
     def _retranslate_sections(self) -> None:
+        self._settings_title.setText(i18n.t("settings.title"))
+        self._min_btn.setToolTip(i18n.t("settings.minimize"))
+
         self._ai_title.setText(i18n.t("settings.ai_providers"))
         self._ai_sub.setText(i18n.t("settings.ai_providers_sub"))
         self._ai_prov_label.setText(i18n.t("settings.choose_provider"))
@@ -3056,6 +3100,12 @@ class _SettingsPanel(QWidget):
         self._mobile_show_btn.setText(i18n.t("settings.show"))
         self._mobile_regen_btn.setText(i18n.t("settings.regenerate"))
         self._mobile_warn.setText(i18n.t("settings.mobile_token_warning"))
+
+        # Startup section (autostart services)
+        self._startup_title.setText(i18n.t("settings.startup"))
+        self._startup_sub.setText(i18n.t("settings.startup_sub"))
+        for _label, _label_key in self._startup_labels:
+            _label.setText(i18n.t(_label_key))
 
     def _on_startup_toggle_changed(self, unit: str, toggle: QCheckBox) -> None:
         if self._startup_refresh_guard:
@@ -3167,15 +3217,15 @@ class _OsiaPanel(QWidget):
         # "OSIA" is a proper noun — shown verbatim like the other panel titles.
         title = QLabel("OSIA")
         title.setObjectName("panelTitle")
-        min_btn = QPushButton("−")
-        min_btn.setObjectName("minBtn")
-        min_btn.setFixedSize(26, 26)
-        min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        min_btn.setToolTip("Minimize")
-        min_btn.clicked.connect(self.hide)
+        self._min_btn = QPushButton("−")
+        self._min_btn.setObjectName("minBtn")
+        self._min_btn.setFixedSize(26, 26)
+        self._min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._min_btn.setToolTip(i18n.t("settings.minimize"))
+        self._min_btn.clicked.connect(self.hide)
         header.addWidget(title)
         header.addStretch()
-        header.addWidget(min_btn)
+        header.addWidget(self._min_btn)
         outer.addLayout(header)
 
         scroll = QScrollArea()
@@ -3430,6 +3480,7 @@ class _OsiaPanel(QWidget):
         self._load_state()
 
     def _retranslate(self) -> None:
+        self._min_btn.setToolTip(i18n.t("settings.minimize"))
         self._pers_title.setText(i18n.t("osia.personality"))
         self._pers_sub.setText(i18n.t("osia.personality_sub"))
         if not self._pers_save_btn.property("saved"):
@@ -3494,6 +3545,9 @@ class _NavButton(QPushButton):
     def __init__(self, kind: str, tooltip: str):
         super().__init__()
         self._kind = kind
+        # i18n key for the tooltip, set by the owner; None for proper nouns
+        # (e.g. "OSIA") that are shown verbatim and never translated.
+        self._tip_key: str | None = None
         self.setObjectName("navBtn")
         self.setCheckable(True)
         self.setFixedSize(52, 40)
@@ -3738,18 +3792,28 @@ class MainPopup(QWidget):
         self._nav_group.setExclusive(True)
 
         self._nav_buttons: dict[int, QPushButton] = {}
-        for page_idx, kind, tooltip in [
-            (self.PAGE_CONVS,   "conv",     "Conversations"),
-            (self.PAGE_MODELS,  "models",   "Model"),
-            (self.PAGE_SETTINGS,"settings", "Settings"),
-            (self.PAGE_OSIA,    "osia",     "OSIA"),
+        # "OSIA" is a proper noun (tip_key=None) — shown verbatim; the others
+        # carry an i18n key so their tooltips re-translate on language change.
+        for page_idx, kind, tip_key in [
+            (self.PAGE_CONVS,   "conv",     "nav.conversations"),
+            (self.PAGE_MODELS,  "models",   "nav.models"),
+            (self.PAGE_SETTINGS,"settings", "nav.settings"),
+            (self.PAGE_OSIA,    "osia",     None),
         ]:
+            tooltip = i18n.t(tip_key) if tip_key else "OSIA"
             btn = _NavButton(kind, tooltip)
+            btn._tip_key = tip_key
             btn.clicked.connect(
                 lambda _checked=False, idx=page_idx: self._on_nav_clicked(idx)
             )
             self._nav_group.addButton(btn, page_idx)
             self._nav_buttons[page_idx] = btn
+
+        # Keep nav tooltips translated on language change.
+        i18n.add_listener(self._retranslate_nav)
+        self.destroyed.connect(
+            lambda: i18n.remove_listener(self._retranslate_nav)
+        )
 
         nav.addStretch()
         for btn in self._nav_buttons.values():
@@ -3832,6 +3896,12 @@ class MainPopup(QWidget):
         self._models.set_remote_models(remote)
 
     # ── Internal handlers ─────────────────────────────────────────────────
+
+    def _retranslate_nav(self) -> None:
+        for btn in self._nav_buttons.values():
+            tip_key = getattr(btn, "_tip_key", None)
+            if tip_key:
+                btn.setToolTip(i18n.t(tip_key))
 
     def _on_nav_clicked(self, page_idx: int) -> None:
         # Clicking the active nav button returns to the chat.
