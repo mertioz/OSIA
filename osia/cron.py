@@ -10,6 +10,8 @@ of ``{"task": <description>, "schedule": <spec>, "enabled": <bool>,
 
   * ``"every <N> minutes"`` / ``"every <N> hours"`` / ``"every <N> days"``
   * ``"at HH:MM"`` — fires once a day at that local wall-clock time
+  * ``"once:YYYY-MM-DDTHH:MM"`` — fires exactly once at that local date+time,
+    then the entry is auto-disabled (``enabled: false``) and persisted
 
 The manager polls the settings on every tick, so jobs added / edited / toggled
 in the Settings GUI take effect without restarting OSIA. A single background
@@ -31,7 +33,7 @@ import threading
 from datetime import datetime, timedelta
 from typing import Callable
 
-from osia.config import get_setting
+from osia.config import get_setting, set_setting
 
 # How often the scheduler wakes to re-evaluate the job list. 20s keeps
 # "at HH:MM" jobs accurate to within one tick while staying cheap.
@@ -51,6 +53,7 @@ def parse_schedule(spec: str) -> dict | None:
 
         {"kind": "interval", "seconds": <int>}     # "every N minutes/hours/days"
         {"kind": "daily", "hour": <int>, "minute": <int>}   # "at HH:MM"
+        {"kind": "once", "dt": <datetime>}    # "once:YYYY-MM-DDTHH:MM"
 
     or ``None`` when the spec is empty / unrecognised (the job is then skipped,
     not crashed).
@@ -60,6 +63,19 @@ def parse_schedule(spec: str) -> dict | None:
     s = spec.strip().lower()
     if not s:
         return None
+
+    # "once:YYYY-MM-DDTHH:MM" — fire exactly once at this local date+time, then
+    # auto-disable. The 'T' separator is lower-cased to 't' by ``.lower()`` above.
+    m = re.match(r"^once:(\d{4})-(\d{2})-(\d{2})t([01]?\d|2[0-3]):([0-5]\d)$", s)
+    if m:
+        try:
+            dt = datetime(
+                int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                int(m.group(4)), int(m.group(5)),
+            )
+        except ValueError:
+            return None  # impossible calendar date (e.g. 31/02)
+        return {"kind": "once", "dt": dt}
 
     # "every <N> <unit>(s)"  — unit ∈ minute/hour/day (singular or plural).
     m = re.match(r"^every\s+(\d+)\s*(minute|hour|day)s?$", s)
@@ -182,8 +198,16 @@ class CronManager:
                 continue
 
             if self._is_due(spec, st, now):
-                self._fire(job.get("task", ""), job.get("schedule", ""), st, now,
-                           conversation_id=job.get("conversation_id"))
+                launched = self._fire(
+                    job.get("task", ""), job.get("schedule", ""), st, now,
+                    conversation_id=job.get("conversation_id"))
+                # A one-shot job runs exactly once: as soon as it actually
+                # launches, flag it in-memory (so it never re-fires this
+                # session even if the persist below fails) and disable it on
+                # disk so it stays off across restarts.
+                if launched and spec["kind"] == "once":
+                    st["once_fired"] = True
+                    self._disable_once_job(idx, sig)
 
         # Drop state for slots that no longer exist (jobs were removed).
         for stale in [i for i in self._state if i not in seen_indices]:
@@ -222,20 +246,33 @@ class CronManager:
                 hour=spec["hour"], minute=spec["minute"], second=0, microsecond=0
             )
             return now >= scheduled
+        if spec["kind"] == "once":
+            # Fire once when the target time is reached (or already past, e.g.
+            # OSIA started after it), then never again this session.
+            if st.get("once_fired"):
+                return False
+            return now >= spec["dt"]
         return False
 
     def _fire(self, task: str, schedule: str, st: dict, now: datetime,
-              conversation_id: str | None = None) -> None:
+              conversation_id: str | None = None) -> bool:
+        """Launch a job's task on a worker thread.
+
+        Returns ``True`` when the task was actually launched (timing state
+        committed), ``False`` when it was skipped — empty task or the scheduler
+        is busy with another run. Callers use this to know whether a one-shot
+        job has run and may now be disabled.
+        """
         task = (task or "").strip()
         if not task:
-            return
+            return False
         # If another scheduled task is still running, leave this job's timing
         # state UNTOUCHED so it stays "due" and retries on the next tick. We must
         # NOT mark it done here: a daily "at HH:MM" run blocked at its fire time
         # would otherwise be silently lost for the rest of the day.
         if self._busy.is_set():
             print(f"[CRON] busy — deferring '{task[:60]}' to the next tick")
-            return
+            return False
 
         # Commit the timing state only now that we are actually launching. The
         # scheduler loop is single-threaded, so this completes before any later
@@ -255,3 +292,22 @@ class CronManager:
                 self._busy.clear()
 
         threading.Thread(target=_worker, name="osia-cron-task", daemon=True).start()
+        return True
+
+    def _disable_once_job(self, idx: int, sig: tuple) -> None:
+        """Persist ``enabled: false`` for the one-shot job at ``idx`` so it does
+        not fire again after a restart. Matches on signature so a concurrent
+        reorder/edit in the GUI never disables the wrong row."""
+        try:
+            jobs = get_setting("cron_jobs", []) or []
+            if not isinstance(jobs, list) or not (0 <= idx < len(jobs)):
+                return
+            job = jobs[idx]
+            if not isinstance(job, dict) or _job_signature(job) != sig:
+                return
+            job["enabled"] = False
+            set_setting("cron_jobs", jobs)
+            print(f"[CRON] one-shot complete — disabled: "
+                  f"{str(job.get('task', ''))[:60]}")
+        except Exception as e:
+            print(f"[CRON] could not disable one-shot job: {e}")

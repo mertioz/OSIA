@@ -541,6 +541,49 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
               "voz (TTS) se desactivan automáticamente cuando la Live API está "
               "activa.",
     },
+    # — Wake-word greeting response —
+    "settings.wake_greeting": {
+        "en": "Wake word response",
+        "fr": "Réponse au mot d'activation",
+        "zh": "唤醒词回应",
+        "ja": "ウェイクワード応答",
+        "de": "Aktivierungswort-Antwort",
+        "es": "Respuesta a la palabra de activación",
+    },
+    "settings.wake_greeting_sub": {
+        "en": "Speak a short greeting when you say “OSIA”, before listening.",
+        "fr": "Dire une courte phrase quand vous dites « OSIA », avant d'écouter.",
+        "zh": "当您说「OSIA」时，先说一句简短的问候语，然后再开始聆听。",
+        "ja": "「OSIA」と言ったとき、聞き取りを始める前に短い挨拶を話します。",
+        "de": "Eine kurze Begrüßung sprechen, wenn Sie „OSIA“ sagen, bevor "
+              "zugehört wird.",
+        "es": "Decir un breve saludo cuando dices «OSIA», antes de escuchar.",
+    },
+    "wake.greeting_enabled": {
+        "en": "Speak greeting on wake",
+        "fr": "Dire un message à l'activation",
+        "zh": "唤醒时播报问候语",
+        "ja": "起動時に挨拶を話す",
+        "de": "Begrüßung beim Aktivieren sprechen",
+        "es": "Decir saludo al activar",
+    },
+    "wake.greeting_placeholder": {
+        "en": "Greeting text",
+        "fr": "Texte du message",
+        "zh": "问候语文本",
+        "ja": "挨拶のテキスト",
+        "de": "Begrüßungstext",
+        "es": "Texto del saludo",
+    },
+    # Default greeting, auto-filled into the text field per the active language.
+    "wake.greeting_default": {
+        "en": "I'm listening",
+        "fr": "Je vous écoute",
+        "zh": "我在听",
+        "ja": "お聞きしています",
+        "de": "Ich höre zu",
+        "es": "Te escucho",
+    },
     # — Scheduled Tasks / Cron (Bloc 5) —
     "settings.cron": {
         "en": "Scheduled Tasks",
@@ -618,6 +661,33 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ja": "毎日 …",
         "de": "Täglich um …",
         "es": "Cada día a las …",
+    },
+    # Schedule-type selector per task: a repeating schedule vs a single run.
+    "cron.type_repeat": {
+        "en": "Repeat",
+        "fr": "Répéter",
+        "zh": "重复",
+        "ja": "繰り返し",
+        "de": "Wiederholen",
+        "es": "Repetir",
+    },
+    "cron.type_once": {
+        "en": "Once",
+        "fr": "Une fois",
+        "zh": "一次",
+        "ja": "一回",
+        "de": "Einmalig",
+        "es": "Una vez",
+    },
+    # Date-field placeholder (mask hint only — the parser always reads
+    # day/month/year by position regardless of the localized letters).
+    "cron.once_date_placeholder": {
+        "en": "DD/MM/YYYY",
+        "fr": "JJ/MM/AAAA",
+        "zh": "日/月/年",
+        "ja": "日/月/年",
+        "de": "TT/MM/JJJJ",
+        "es": "DD/MM/AAAA",
     },
     # Conversation association for scheduled tasks
     "cron.conversation": {

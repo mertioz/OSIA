@@ -48,6 +48,11 @@ DEFAULT_SETTINGS = {
     "liveapi_enabled": False,                  # master switch
     "liveapi_provider": "google",              # "google", "openai", "claude"
     "liveapi_model": "gemini-3.1-flash-live",  # provider-specific live model id
+    # Wake-word greeting: when enabled, OSIA speaks ``wake_greeting_text`` right
+    # after the wake word is detected and BEFORE it starts listening for the
+    # command (see osia.main.wake_mode.handle_wake). Empty text = no greeting.
+    "wake_greeting_enabled": False,
+    "wake_greeting_text": "",
     # Scheduled tasks (Bloc 5): list of cron entries. Each entry is
     # ``{"task": <description>, "schedule": <spec>, "enabled": <bool>}``.
     # ``schedule`` is one of "every <N> minutes|hours|days" or "at HH:MM"

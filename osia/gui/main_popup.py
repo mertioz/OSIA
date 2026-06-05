@@ -19,8 +19,9 @@ GUI knowing about threads or persistence.
 """
 
 import math
+import re
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from PyQt6.QtCore import (
@@ -1434,6 +1435,7 @@ class _SettingsPanel(QWidget):
         v.addWidget(self._build_language_section())
         v.addWidget(self._build_ai_providers_section())     # Section 1
         v.addWidget(self._build_voice_section())            # Section 2 (TTS)
+        v.addWidget(self._build_wake_section())             # Wake-word greeting
         v.addWidget(self._build_stt_section())              # Section 3 (STT)
         v.addWidget(self._build_liveapi_section())          # Section 4 (Live API)
         v.addWidget(self._build_ai_hierarchy_section())     # AI Task Hierarchy
@@ -1657,6 +1659,59 @@ class _SettingsPanel(QWidget):
             self._tts_cards[provider] = card
 
         return wrap
+
+    # ── Wake-word greeting response ────────────────────────────────────────
+    # A master toggle + a single text field. When enabled, OSIA speaks the
+    # text right after the wake word and before listening (see
+    # osia.main.wake_mode.handle_wake). An empty field auto-fills with the
+    # active language's default greeting.
+
+    def _build_wake_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._wake_title = QLabel(i18n.t("settings.wake_greeting"))
+        self._wake_title.setObjectName("sectionTitle")
+        self._wake_sub = QLabel(i18n.t("settings.wake_greeting_sub"))
+        self._wake_sub.setObjectName("sectionSub")
+        self._wake_sub.setWordWrap(True)
+        l.addWidget(self._wake_title)
+        l.addWidget(self._wake_sub)
+
+        enable_row = QHBoxLayout()
+        self._wake_enabled_label = QLabel(i18n.t("wake.greeting_enabled"))
+        self._wake_enabled_label.setObjectName("providerName")
+        self._wake_enabled_toggle = QCheckBox()
+        self._wake_enabled_toggle.setObjectName("smartToggle")
+        self._wake_enabled_toggle.stateChanged.connect(self._on_wake_enabled_changed)
+        enable_row.addWidget(self._wake_enabled_label)
+        enable_row.addStretch()
+        enable_row.addWidget(self._wake_enabled_toggle)
+        l.addLayout(enable_row)
+
+        self._wake_text_input = QLineEdit()
+        self._wake_text_input.setObjectName("keyInput")
+        self._wake_text_input.setPlaceholderText(i18n.t("wake.greeting_placeholder"))
+        self._wake_text_input.editingFinished.connect(self._on_wake_text_changed)
+        l.addWidget(self._wake_text_input)
+        return wrap
+
+    def _on_wake_enabled_changed(self, _state) -> None:
+        enabled = self._wake_enabled_toggle.isChecked()
+        set_setting("wake_greeting_enabled", enabled)
+        if enabled:
+            # Persist whatever is shown (the auto-filled language default when
+            # the user hasn't typed their own) so the spoken greeting is never
+            # silently empty the first time the toggle is switched on.
+            text = self._wake_text_input.text().strip() or i18n.t("wake.greeting_default")
+            self._wake_text_input.setText(text)
+            set_setting("wake_greeting_text", text)
+
+    def _on_wake_text_changed(self) -> None:
+        set_setting("wake_greeting_text", self._wake_text_input.text().strip())
 
     # ── Section 3: Whisper providers (speech-to-text) ──────────────────────
 
@@ -2234,46 +2289,95 @@ class _SettingsPanel(QWidget):
         top.addWidget(rm)
         v.addLayout(top)
 
-        # Row B — schedule mode + value (count or HH:MM).
+        # Row B — schedule type (Repeat / Once) + its inputs. "Repeat" keeps the
+        # recurring mode + value editor; "Once" swaps in a date + time picker.
         mode, value = self._parse_cron_schedule(job.get("schedule", ""))
+        is_once = (mode == "once")
         bottom = QHBoxLayout()
         bottom.setSpacing(6)
-        mode_combo = QComboBox()
-        mode_combo.setObjectName("voiceCombo")
-        for m in self._CRON_MODES:
-            mode_combo.addItem(i18n.t(self._CRON_MODE_KEYS[m]), m)
-        for i in range(mode_combo.count()):
-            if mode_combo.itemData(i) == mode:
-                mode_combo.setCurrentIndex(i)
-                break
-        value_input = QLineEdit(value)
-        value_input.setObjectName("keyInput")
-        value_input.setFixedWidth(90)
-        value_input.setPlaceholderText(
-            ("2:30 PM" if timefmt.use_12h() else "14:30") if mode == "daily" else "5")
-        mode_combo.currentIndexChanged.connect(
-            lambda _i, idx=index, mc=mode_combo, vi=value_input:
-                self._on_cron_schedule_changed(idx, mc, vi)
+
+        type_combo = QComboBox()
+        type_combo.setObjectName("voiceCombo")
+        type_combo.addItem(i18n.t("cron.type_repeat"), "repeat")
+        type_combo.addItem(i18n.t("cron.type_once"), "once")
+        type_combo.setCurrentIndex(1 if is_once else 0)
+        type_combo.currentIndexChanged.connect(
+            lambda _i, idx=index, tc=type_combo: self._on_cron_type_changed(idx, tc)
         )
-        value_input.textChanged.connect(
-            lambda _t, idx=index, mc=mode_combo, vi=value_input:
-                self._on_cron_schedule_changed(idx, mc, vi, persist=False)
-        )
-        value_input.editingFinished.connect(self._persist_cron)
-        bottom.addWidget(mode_combo, 1)
-        bottom.addWidget(value_input)
+        bottom.addWidget(type_combo)
+
+        if is_once:
+            date_str, time_str = self._once_fields_from_iso(value)
+            date_input = QLineEdit(date_str)
+            date_input.setObjectName("keyInput")
+            date_input.setFixedWidth(110)
+            date_input.setPlaceholderText(i18n.t("cron.once_date_placeholder"))
+            time_input = QLineEdit(time_str)
+            time_input.setObjectName("keyInput")
+            time_input.setFixedWidth(90)
+            time_input.setPlaceholderText(
+                "2:30 PM" if timefmt.use_12h() else "14:30")
+            for fld in (date_input, time_input):
+                fld.textChanged.connect(
+                    lambda _t, idx=index, di=date_input, ti=time_input:
+                        self._on_cron_once_changed(idx, di, ti, persist=False)
+                )
+                fld.editingFinished.connect(self._persist_cron)
+            bottom.addWidget(date_input)
+            bottom.addWidget(time_input)
+            bottom.addStretch()
+        else:
+            mode_combo = QComboBox()
+            mode_combo.setObjectName("voiceCombo")
+            for m in self._CRON_MODES:
+                mode_combo.addItem(i18n.t(self._CRON_MODE_KEYS[m]), m)
+            for i in range(mode_combo.count()):
+                if mode_combo.itemData(i) == mode:
+                    mode_combo.setCurrentIndex(i)
+                    break
+            value_input = QLineEdit(value)
+            value_input.setObjectName("keyInput")
+            value_input.setFixedWidth(90)
+            value_input.setPlaceholderText(
+                ("2:30 PM" if timefmt.use_12h() else "14:30") if mode == "daily" else "5")
+            mode_combo.currentIndexChanged.connect(
+                lambda _i, idx=index, mc=mode_combo, vi=value_input:
+                    self._on_cron_schedule_changed(idx, mc, vi)
+            )
+            value_input.textChanged.connect(
+                lambda _t, idx=index, mc=mode_combo, vi=value_input:
+                    self._on_cron_schedule_changed(idx, mc, vi, persist=False)
+            )
+            value_input.editingFinished.connect(self._persist_cron)
+            bottom.addWidget(mode_combo, 1)
+            bottom.addWidget(value_input)
         v.addLayout(bottom)
         return row
 
     @staticmethod
     def _parse_cron_schedule(schedule: str) -> tuple[str, str]:
-        """Split a canonical schedule string into ``(mode, value)`` for the UI."""
+        """Split a canonical schedule string into ``(mode, value)`` for the UI.
+
+        For one-shot jobs ``mode`` is ``"once"`` and ``value`` is the ISO
+        ``YYYY-MM-DDTHH:MM`` string (split into date + time fields by the row
+        builder). Recurring jobs return their interval/daily mode as before.
+        """
+        schedule = schedule or ""
         try:
             from osia.cron import parse_schedule
             spec = parse_schedule(schedule)
         except Exception:
             spec = None
+        if spec is not None and spec["kind"] == "once":
+            dt = spec["dt"]
+            return ("once",
+                    f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}"
+                    f"T{dt.hour:02d}:{dt.minute:02d}")
         if spec is None:
+            # Unparseable: keep a half-typed one-shot on the "Once" tab so the
+            # user can finish entering it; otherwise default to the interval tab.
+            if schedule.strip().lower().startswith("once:"):
+                return ("once", "")
             return ("minutes", "")
         if spec["kind"] == "daily":
             return ("daily", timefmt.format_hm(spec["hour"], spec["minute"]))
@@ -2283,6 +2387,51 @@ class _SettingsPanel(QWidget):
         if secs % 3600 == 0:
             return ("hours", str(secs // 3600))
         return ("minutes", str(secs // 60))
+
+    @staticmethod
+    def _once_fields_from_iso(iso: str) -> tuple[str, str]:
+        """Split an ISO ``YYYY-MM-DDTHH:MM`` into ``(DD/MM/YYYY, time)`` for the
+        date + time inputs. The time respects the 12h/24h setting. A partial /
+        empty ISO yields empty fields."""
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$", iso or "")
+        if not m:
+            return ("", "")
+        y, mo, d, h, mi = (int(g) for g in m.groups())
+        return (f"{d:02d}/{mo:02d}/{y:04d}", timefmt.format_hm(h, mi))
+
+    @staticmethod
+    def _parse_time_display(text: str) -> tuple[int, int] | None:
+        """Parse a ``HH:MM`` (24h) or ``H:MM AM/PM`` (12h) string into a 24-hour
+        ``(hour, minute)`` pair, or ``None`` when it isn't a valid time."""
+        s = (text or "").strip().lower()
+        m = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", s)
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+        m = re.match(r"^(1[0-2]|0?[1-9]):([0-5]\d)\s*(am|pm)$", s)
+        if m:
+            hour = int(m.group(1)) % 12
+            if m.group(3) == "pm":
+                hour += 12
+            return (hour, int(m.group(2)))
+        return None
+
+    @classmethod
+    def _compose_once_schedule(cls, date_str: str, time_str: str) -> str:
+        """Build a canonical ``once:YYYY-MM-DDTHH:MM`` string from the date
+        (DD/MM/YYYY) and time fields. Incomplete/invalid input yields a bare
+        ``"once:"`` that the scheduler ignores until it's corrected, while still
+        keeping the row on the "Once" tab."""
+        dm = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$", date_str or "")
+        hm = cls._parse_time_display(time_str)
+        if not dm or hm is None:
+            return "once:"
+        day, month, year = int(dm.group(1)), int(dm.group(2)), int(dm.group(3))
+        hour, minute = hm
+        try:
+            datetime(year, month, day, hour, minute)  # reject impossible dates
+        except ValueError:
+            return "once:"
+        return f"once:{year:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}"
 
     @staticmethod
     def _compose_cron_schedule(mode: str, value: str) -> str:
@@ -2307,6 +2456,33 @@ class _SettingsPanel(QWidget):
         if 0 <= index < len(self._cron_jobs):
             self._cron_jobs[index]["schedule"] = self._compose_cron_schedule(
                 mode, value_input.text()
+            )
+            if persist:
+                self._persist_cron()
+
+    def _on_cron_type_changed(self, index: int, type_combo: QComboBox) -> None:
+        """Switch a job between a recurring schedule and a single run. Seeds a
+        sensible default (top of the next hour for "Once", every 30 min for
+        "Repeat") and re-renders so the matching inputs appear."""
+        if not (0 <= index < len(self._cron_jobs)):
+            return
+        typ = type_combo.currentData() or "repeat"
+        if typ == "once":
+            dt = (datetime.now() + timedelta(hours=1)).replace(
+                minute=0, second=0, microsecond=0)
+            self._cron_jobs[index]["schedule"] = (
+                f"once:{dt.year:04d}-{dt.month:02d}-{dt.day:02d}"
+                f"T{dt.hour:02d}:{dt.minute:02d}")
+        else:
+            self._cron_jobs[index]["schedule"] = "every 30 minutes"
+        self._persist_cron()
+        self._render_cron()
+
+    def _on_cron_once_changed(self, index: int, date_input: QLineEdit,
+                              time_input: QLineEdit, persist: bool = True) -> None:
+        if 0 <= index < len(self._cron_jobs):
+            self._cron_jobs[index]["schedule"] = self._compose_once_schedule(
+                date_input.text(), time_input.text()
             )
             if persist:
                 self._persist_cron()
@@ -2754,6 +2930,18 @@ class _SettingsPanel(QWidget):
         self._tts_provider_combo.blockSignals(False)
         self._populate_voice_combo(provider, voice)
 
+        # Wake-word greeting — empty stored text shows the active language's
+        # default as a hint; it's only persisted once the toggle is enabled or
+        # the user edits the field.
+        self._wake_enabled_toggle.blockSignals(True)
+        self._wake_enabled_toggle.setChecked(
+            bool(settings.get("wake_greeting_enabled", False)))
+        self._wake_enabled_toggle.blockSignals(False)
+        wake_text = (settings.get("wake_greeting_text") or "").strip()
+        self._wake_text_input.blockSignals(True)
+        self._wake_text_input.setText(wake_text or i18n.t("wake.greeting_default"))
+        self._wake_text_input.blockSignals(False)
+
         # Whisper (STT)
         stt_provider = settings.get("stt_provider", "local") or "local"
         self._stt_provider_combo.blockSignals(True)
@@ -3075,6 +3263,14 @@ class _SettingsPanel(QWidget):
         self._voice_voice_label.setText(i18n.t("settings.voice"))
         self._kokoro_tag.setText(i18n.t("tts.kokoro_desc"))
         self._tts_provider_combo.setItemText(0, i18n.t("tts.local_option"))
+
+        self._wake_title.setText(i18n.t("settings.wake_greeting"))
+        self._wake_sub.setText(i18n.t("settings.wake_greeting_sub"))
+        self._wake_enabled_label.setText(i18n.t("wake.greeting_enabled"))
+        self._wake_text_input.setPlaceholderText(i18n.t("wake.greeting_placeholder"))
+        # If the greeting hasn't been customised, follow the UI language.
+        if not (load_settings().get("wake_greeting_text") or "").strip():
+            self._wake_text_input.setText(i18n.t("wake.greeting_default"))
 
         self._stt_title.setText(i18n.t("settings.whisper_providers"))
         self._stt_sub.setText(i18n.t("settings.whisper_providers_sub"))

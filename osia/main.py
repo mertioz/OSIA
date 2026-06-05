@@ -392,6 +392,16 @@ def wake_mode():
 
         def process():
             try:
+                # Optional spoken greeting before listening. When enabled, OSIA
+                # speaks the preconfigured text first, then starts capturing the
+                # command (speak() is synchronous, so the greeting finishes
+                # before the mic opens — it never bleeds into the recording).
+                if live_settings.get("wake_greeting_enabled"):
+                    greeting = (live_settings.get("wake_greeting_text") or "").strip()
+                    if greeting:
+                        bridge.island_state.emit("speaking")
+                        speak(greeting)
+                        bridge.island_state.emit("listening")
                 user_text = listen_for_command(max_retries=3)
                 if not user_text:
                     bridge.island_state.emit("idle")
