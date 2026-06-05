@@ -53,6 +53,7 @@ from osia.utils.systemd_manager import (
 )
 from osia.utils.assets import LOGO_PATH
 from osia import i18n
+from osia import timefmt
 
 # sip lets us detect widgets whose C++ side has already been destroyed
 # (accessing them raises RuntimeError otherwise). It ships with PyQt6 but
@@ -123,7 +124,7 @@ def _format_time(ts: str | None) -> str:
         return ""
     try:
         dt = datetime.fromisoformat(ts)
-        return dt.strftime("%d %b %H:%M")
+        return dt.strftime("%d %b ") + timefmt.format_time(dt)
     except (ValueError, TypeError):
         return ts
 
@@ -1484,6 +1485,18 @@ class _SettingsPanel(QWidget):
         self._language_combo.currentIndexChanged.connect(self._on_language_changed)
         l.addWidget(self._language_combo)
 
+        # Time format (12h / 24h) — applies to every wall-clock time OSIA shows
+        # (conversation timestamps, cron daily schedules, heartbeat alerts).
+        self._timefmt_label = QLabel(i18n.t("settings.time_format"))
+        self._timefmt_label.setObjectName("sectionSub")
+        l.addWidget(self._timefmt_label)
+        self._timefmt_combo = QComboBox()
+        self._timefmt_combo.setObjectName("voiceCombo")
+        self._timefmt_combo.addItem(i18n.t("settings.time_format_24h"), "24h")
+        self._timefmt_combo.addItem(i18n.t("settings.time_format_12h"), "12h")
+        self._timefmt_combo.currentIndexChanged.connect(self._on_time_format_changed)
+        l.addWidget(self._timefmt_combo)
+
         # Keep this section's own labels translated on language change.
         i18n.add_listener(self._retranslate_language_section)
         self.destroyed.connect(
@@ -1494,11 +1507,23 @@ class _SettingsPanel(QWidget):
     def _retranslate_language_section(self) -> None:
         self._language_title.setText(i18n.t("settings.language"))
         self._language_sub.setText(i18n.t("settings.language_sub"))
+        self._timefmt_label.setText(i18n.t("settings.time_format"))
+        self._timefmt_combo.setItemText(0, i18n.t("settings.time_format_24h"))
+        self._timefmt_combo.setItemText(1, i18n.t("settings.time_format_12h"))
 
     def _on_language_changed(self, _idx: int) -> None:
         code = self._language_combo.currentData()
         if code:
             i18n.set_language(code)
+
+    def _on_time_format_changed(self, _idx: int) -> None:
+        fmt = self._timefmt_combo.currentData()
+        if not fmt:
+            return
+        set_setting("time_format", fmt)
+        # Live-refresh the times shown in this panel (cron daily schedules);
+        # the conversation list re-reads the setting when it is next opened.
+        self._render_cron()
 
     def _build_startup_section(self) -> QFrame:
         wrap = QFrame()
@@ -2224,7 +2249,8 @@ class _SettingsPanel(QWidget):
         value_input = QLineEdit(value)
         value_input.setObjectName("keyInput")
         value_input.setFixedWidth(90)
-        value_input.setPlaceholderText("14:30" if mode == "daily" else "5")
+        value_input.setPlaceholderText(
+            ("2:30 PM" if timefmt.use_12h() else "14:30") if mode == "daily" else "5")
         mode_combo.currentIndexChanged.connect(
             lambda _i, idx=index, mc=mode_combo, vi=value_input:
                 self._on_cron_schedule_changed(idx, mc, vi)
@@ -2250,7 +2276,7 @@ class _SettingsPanel(QWidget):
         if spec is None:
             return ("minutes", "")
         if spec["kind"] == "daily":
-            return ("daily", f"{spec['hour']:02d}:{spec['minute']:02d}")
+            return ("daily", timefmt.format_hm(spec["hour"], spec["minute"]))
         secs = spec["seconds"]
         if secs % 86400 == 0:
             return ("days", str(secs // 86400))
@@ -2276,7 +2302,8 @@ class _SettingsPanel(QWidget):
     def _on_cron_schedule_changed(self, index: int, mode_combo: QComboBox,
                                   value_input: QLineEdit, persist: bool = True) -> None:
         mode = mode_combo.currentData() or "minutes"
-        value_input.setPlaceholderText("14:30" if mode == "daily" else "5")
+        value_input.setPlaceholderText(
+            ("2:30 PM" if timefmt.use_12h() else "14:30") if mode == "daily" else "5")
         if 0 <= index < len(self._cron_jobs):
             self._cron_jobs[index]["schedule"] = self._compose_cron_schedule(
                 mode, value_input.text()
@@ -2706,6 +2733,15 @@ class _SettingsPanel(QWidget):
                 self._language_combo.setCurrentIndex(i)
                 break
         self._language_combo.blockSignals(False)
+
+        # Time format (12h / 24h)
+        tf = settings.get("time_format", "24h") or "24h"
+        self._timefmt_combo.blockSignals(True)
+        for i in range(self._timefmt_combo.count()):
+            if self._timefmt_combo.itemData(i) == tf:
+                self._timefmt_combo.setCurrentIndex(i)
+                break
+        self._timefmt_combo.blockSignals(False)
 
         # Voice (TTS)
         provider = settings.get("tts_provider", "local") or "local"

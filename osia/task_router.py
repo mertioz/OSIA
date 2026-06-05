@@ -5,7 +5,8 @@ Maps a user message to one of two task categories used by the AI task
 hierarchy:
 
     "heavy"  — code, refactoring, complex reasoning, debugging,
-               architecture, long-document analysis.
+               architecture, long-document analysis, deep/multi-source
+               web research.
     "medium" — everything else: web navigation, data gathering, email,
                summaries, routine / short tasks.
 
@@ -59,6 +60,9 @@ _HEAVY_STEMS = (
     "débug",       # FR: débugge, débuggage
     "debog",       # debogue, deboguer (unaccented FR spelling)
     "débog",       # FR: débogue, déboguer, débogage, débogueur
+    # — deep / multi-source web research (implies multi-step investigation) —
+    "investigat",  # investigate, investigates, investigating, investigation
+    "enquêt",      # FR: enquête, enquêter, enquêtes, enquêteur
     # NOTE: bare "analyse"/"analyze" intentionally NOT keywords — they collide
     # with everyday MEDIUM requests ("analyse du marché", "analyze my sales").
     # Genuinely-heavy analysis ("analyse cet algorithme", "analyze this code")
@@ -91,6 +95,12 @@ _HEAVY_LITERALS = (
     "c++", "c#", "node.js", "nodejs",
     # language & framework names (strong coding signal)
     "python", "javascript", "typescript",
+    # deep / multi-source web research phrases (EN + FR) — imply multi-step,
+    # multi-source investigation that should use the heavy model chain.
+    "deep research", "thorough research", "comprehensive search",
+    "find everything about", "compare plusieurs sites",
+    "recherche approfondie", "recherche complète", "analyse complète",
+    "dossier complet",  # "enquête" is covered by the "enquêt" stem above
 )
 
 

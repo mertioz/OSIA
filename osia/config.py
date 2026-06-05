@@ -28,6 +28,10 @@ DEFAULT_SETTINGS = {
     "stt_local_model": "small",                 # faster-whisper size: "small", "medium"
     "stt_groq_model": "whisper-large-v3-turbo", # "whisper-large-v3", "whisper-large-v3-turbo"
     "language": "en",          # UI language; one of osia.i18n.LANGUAGES
+    # Clock display format for the wall-clock times OSIA shows (conversation
+    # timestamps, cron daily schedules, heartbeat alert logs): "24h" → 14:30,
+    # "12h" → 2:30 PM. See osia.timefmt.
+    "time_format": "24h",      # one of: "24h", "12h"
     # AI task hierarchy (Bloc 3): ordered "provider:model" fallback chains per
     # task category. Empty chains = no hierarchy → the manually selected model
     # is used unchanged. See osia.task_router and OSIAAgent.run().

@@ -160,6 +160,30 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Sprache der Oberfläche.",
         "es": "Idioma de la interfaz.",
     },
+    "settings.time_format": {
+        "en": "Time format",
+        "fr": "Format de l'heure",
+        "zh": "时间格式",
+        "ja": "時刻の形式",
+        "de": "Zeitformat",
+        "es": "Formato de hora",
+    },
+    "settings.time_format_24h": {
+        "en": "24-hour (14:30)",
+        "fr": "24 heures (14:30)",
+        "zh": "24 小时制（14:30）",
+        "ja": "24時間表示（14:30）",
+        "de": "24-Stunden (14:30)",
+        "es": "24 horas (14:30)",
+    },
+    "settings.time_format_12h": {
+        "en": "12-hour (2:30 PM)",
+        "fr": "12 heures (2:30 PM)",
+        "zh": "12 小时制（2:30 PM）",
+        "ja": "12時間表示（2:30 PM）",
+        "de": "12-Stunden (2:30 PM)",
+        "es": "12 horas (2:30 PM)",
+    },
     # — Section 1: AI providers (text / chat models) —
     "settings.ai_providers": {
         "en": "AI Providers",

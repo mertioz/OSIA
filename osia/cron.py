@@ -74,6 +74,15 @@ def parse_schedule(spec: str) -> dict | None:
     if m:
         return {"kind": "daily", "hour": int(m.group(1)), "minute": int(m.group(2))}
 
+    # "at H:MM am/pm" — daily 12-hour time (the GUI emits this when the user's
+    # time_format is "12h"). Stored hour/minute stay 24h internally.
+    m = re.match(r"^(?:at\s+)?(1[0-2]|0?[1-9]):([0-5]\d)\s*(am|pm)$", s)
+    if m:
+        hour = int(m.group(1)) % 12
+        if m.group(3) == "pm":
+            hour += 12
+        return {"kind": "daily", "hour": hour, "minute": int(m.group(2))}
+
     return None
 
 
