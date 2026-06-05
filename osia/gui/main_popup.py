@@ -67,7 +67,7 @@ except ImportError:
 
 # ── Visual constants ────────────────────────────────────────────────────────
 
-POPUP_W = 480
+POPUP_W = 560
 POPUP_H = 680
 RADIUS = 20
 # Dark, semi-transparent glassmorphism fill so the popup reads as a floating
@@ -1412,6 +1412,7 @@ class _SettingsPanel(QWidget):
         header = QHBoxLayout()
         self._settings_title = QLabel(i18n.t("settings.title"))
         self._settings_title.setObjectName("panelTitle")
+        self._settings_title.setWordWrap(True)
         header.addWidget(self._settings_title)
         header.addStretch()
         outer.addLayout(header)
@@ -1474,6 +1475,7 @@ class _SettingsPanel(QWidget):
 
         self._language_title = QLabel(i18n.t("settings.language"))
         self._language_title.setObjectName("sectionTitle")
+        self._language_title.setWordWrap(True)
         self._language_sub = QLabel(i18n.t("settings.language_sub"))
         self._language_sub.setObjectName("sectionSub")
         self._language_sub.setWordWrap(True)
@@ -1491,6 +1493,7 @@ class _SettingsPanel(QWidget):
         # (conversation timestamps, cron daily schedules, heartbeat alerts).
         self._timefmt_label = QLabel(i18n.t("settings.time_format"))
         self._timefmt_label.setObjectName("sectionSub")
+        self._timefmt_label.setWordWrap(True)
         l.addWidget(self._timefmt_label)
         self._timefmt_combo = QComboBox()
         self._timefmt_combo.setObjectName("voiceCombo")
@@ -1536,6 +1539,7 @@ class _SettingsPanel(QWidget):
 
         self._startup_title = QLabel(i18n.t("settings.startup"))
         self._startup_title.setObjectName("sectionTitle")
+        self._startup_title.setWordWrap(True)
         self._startup_sub = QLabel(i18n.t("settings.startup_sub"))
         self._startup_sub.setObjectName("sectionSub")
         self._startup_sub.setWordWrap(True)
@@ -1553,6 +1557,7 @@ class _SettingsPanel(QWidget):
             row = QHBoxLayout()
             label = QLabel(i18n.t(label_key))
             label.setObjectName("startupLabel")
+            label.setWordWrap(True)
             self._startup_labels.append((label, label_key))
             dot = QLabel()
             dot.setObjectName("statusDot")
@@ -1592,6 +1597,7 @@ class _SettingsPanel(QWidget):
 
         self._voice_title = QLabel(i18n.t("settings.voice_providers"))
         self._voice_title.setObjectName("sectionTitle")
+        self._voice_title.setWordWrap(True)
         self._voice_sub = QLabel(i18n.t("settings.voice_providers_sub"))
         self._voice_sub.setObjectName("sectionSub")
         self._voice_sub.setWordWrap(True)
@@ -1641,8 +1647,10 @@ class _SettingsPanel(QWidget):
         krh.setSpacing(8)
         kokoro_name = QLabel("Kokoro")
         kokoro_name.setObjectName("providerName")
+        kokoro_name.setWordWrap(True)
         self._kokoro_tag = QLabel(i18n.t("tts.kokoro_desc"))
         self._kokoro_tag.setObjectName("providerSub")
+        self._kokoro_tag.setWordWrap(True)
         krh.addWidget(kokoro_name)
         krh.addStretch()
         krh.addWidget(self._kokoro_tag)
@@ -1675,6 +1683,7 @@ class _SettingsPanel(QWidget):
 
         self._wake_title = QLabel(i18n.t("settings.wake_greeting"))
         self._wake_title.setObjectName("sectionTitle")
+        self._wake_title.setWordWrap(True)
         self._wake_sub = QLabel(i18n.t("settings.wake_greeting_sub"))
         self._wake_sub.setObjectName("sectionSub")
         self._wake_sub.setWordWrap(True)
@@ -1684,6 +1693,7 @@ class _SettingsPanel(QWidget):
         enable_row = QHBoxLayout()
         self._wake_enabled_label = QLabel(i18n.t("wake.greeting_enabled"))
         self._wake_enabled_label.setObjectName("providerName")
+        self._wake_enabled_label.setWordWrap(True)
         self._wake_enabled_toggle = QCheckBox()
         self._wake_enabled_toggle.setObjectName("smartToggle")
         self._wake_enabled_toggle.stateChanged.connect(self._on_wake_enabled_changed)
@@ -1724,6 +1734,7 @@ class _SettingsPanel(QWidget):
 
         self._stt_title = QLabel(i18n.t("settings.whisper_providers"))
         self._stt_title.setObjectName("sectionTitle")
+        self._stt_title.setWordWrap(True)
         self._stt_sub = QLabel(i18n.t("settings.whisper_providers_sub"))
         self._stt_sub.setObjectName("sectionSub")
         self._stt_sub.setWordWrap(True)
@@ -1827,6 +1838,7 @@ class _SettingsPanel(QWidget):
 
         self._liveapi_title = QLabel(i18n.t("settings.liveapi"))
         self._liveapi_title.setObjectName("sectionTitle")
+        self._liveapi_title.setWordWrap(True)
         self._liveapi_sub = QLabel(i18n.t("settings.liveapi_sub"))
         self._liveapi_sub.setObjectName("sectionSub")
         self._liveapi_sub.setWordWrap(True)
@@ -1837,6 +1849,7 @@ class _SettingsPanel(QWidget):
         enable_row = QHBoxLayout()
         self._liveapi_enabled_label = QLabel(i18n.t("liveapi.enabled"))
         self._liveapi_enabled_label.setObjectName("providerName")
+        self._liveapi_enabled_label.setWordWrap(True)
         self._liveapi_enabled_toggle = QCheckBox()
         self._liveapi_enabled_toggle.setObjectName("smartToggle")
         self._liveapi_enabled_toggle.stateChanged.connect(
@@ -1982,6 +1995,7 @@ class _SettingsPanel(QWidget):
 
         self._hier_title = QLabel(i18n.t("settings.ai_hierarchy"))
         self._hier_title.setObjectName("sectionTitle")
+        self._hier_title.setWordWrap(True)
         self._hier_sub = QLabel(i18n.t("settings.ai_hierarchy_sub"))
         self._hier_sub.setObjectName("sectionSub")
         self._hier_sub.setWordWrap(True)
@@ -2007,6 +2021,7 @@ class _SettingsPanel(QWidget):
         enable_row = QHBoxLayout()
         self._hier_enabled_label = QLabel(i18n.t("hierarchy.enabled"))
         self._hier_enabled_label.setObjectName("providerName")
+        self._hier_enabled_label.setWordWrap(True)
         self._hier_enabled_toggle = QCheckBox()
         self._hier_enabled_toggle.setObjectName("smartToggle")
         self._hier_enabled_toggle.stateChanged.connect(self._on_hier_enabled_changed)
@@ -2020,6 +2035,7 @@ class _SettingsPanel(QWidget):
     def _build_hier_subsection(self, parent_layout, cat, label_key, sub_key) -> None:
         header = QLabel(i18n.t(label_key))
         header.setObjectName("providerName")
+        header.setWordWrap(True)
         parent_layout.addWidget(header)
 
         sub = QLabel(i18n.t(sub_key))
@@ -2197,6 +2213,7 @@ class _SettingsPanel(QWidget):
 
         self._cron_title = QLabel(i18n.t("settings.cron"))
         self._cron_title.setObjectName("sectionTitle")
+        self._cron_title.setWordWrap(True)
         self._cron_sub = QLabel(i18n.t("settings.cron_sub"))
         self._cron_sub.setObjectName("sectionSub")
         self._cron_sub.setWordWrap(True)
@@ -2263,6 +2280,7 @@ class _SettingsPanel(QWidget):
         # Linked-conversation pill + chat-bubble button opening the picker.
         pill = QLabel(self._cron_pill_text(job.get("conversation_id")))
         pill.setObjectName("convPill")
+        pill.setWordWrap(True)
         bubble = QPushButton("💬")
         bubble.setObjectName("ghostBtn")
         bubble.setFixedSize(28, 28)
@@ -2560,6 +2578,7 @@ class _SettingsPanel(QWidget):
 
         self._hb_title = QLabel(i18n.t("settings.heartbeat"))
         self._hb_title.setObjectName("sectionTitle")
+        self._hb_title.setWordWrap(True)
         self._hb_sub = QLabel(i18n.t("settings.heartbeat_sub"))
         self._hb_sub.setObjectName("sectionSub")
         self._hb_sub.setWordWrap(True)
@@ -2570,6 +2589,7 @@ class _SettingsPanel(QWidget):
         enable_row = QHBoxLayout()
         self._hb_enabled_label = QLabel(i18n.t("heartbeat.enabled"))
         self._hb_enabled_label.setObjectName("providerName")
+        self._hb_enabled_label.setWordWrap(True)
         self._hb_enabled_toggle = QCheckBox()
         self._hb_enabled_toggle.setObjectName("smartToggle")
         self._hb_enabled_toggle.stateChanged.connect(self._on_hb_enabled_changed)
@@ -2587,6 +2607,7 @@ class _SettingsPanel(QWidget):
         interval_row = QHBoxLayout()
         self._hb_interval_label = QLabel(i18n.t("heartbeat.interval"))
         self._hb_interval_label.setObjectName("fieldLabel")
+        self._hb_interval_label.setWordWrap(True)
         self._hb_interval_input = QLineEdit()
         self._hb_interval_input.setObjectName("keyInput")
         self._hb_interval_input.setFixedWidth(70)
@@ -2624,6 +2645,7 @@ class _SettingsPanel(QWidget):
         toggle.stateChanged.connect(self._persist_heartbeat_checks)
         label = QLabel(i18n.t(label_key))
         label.setObjectName("providerName")
+        label.setWordWrap(True)
         top.addWidget(toggle)
         top.addWidget(label)
         top.addStretch()
@@ -2634,6 +2656,7 @@ class _SettingsPanel(QWidget):
             thr.editingFinished.connect(self._persist_heartbeat_checks)
             pct = QLabel("%")
             pct.setObjectName("providerSub")
+            pct.setWordWrap(True)
             top.addWidget(thr)
             top.addWidget(pct)
             self._hb_threshold_inputs[name] = thr
@@ -2695,6 +2718,7 @@ class _SettingsPanel(QWidget):
 
         self._apikeys_title = QLabel(i18n.t("settings.api_keys"))
         self._apikeys_title.setObjectName("sectionTitle")
+        self._apikeys_title.setWordWrap(True)
         self._apikeys_sub = QLabel(i18n.t("settings.api_keys_sub"))
         self._apikeys_sub.setObjectName("sectionSub")
         self._apikeys_sub.setWordWrap(True)
@@ -2777,6 +2801,7 @@ class _SettingsPanel(QWidget):
 
         self._mobile_title = QLabel(i18n.t("settings.mobile"))
         self._mobile_title.setObjectName("sectionTitle")
+        self._mobile_title.setWordWrap(True)
         self._mobile_sub = QLabel(i18n.t("settings.mobile_sub"))
         self._mobile_sub.setObjectName("sectionSub")
         self._mobile_sub.setWordWrap(True)
@@ -2791,6 +2816,7 @@ class _SettingsPanel(QWidget):
         self._mobile_token_label.setWordWrap(True)
         self._token_mask_label = QLabel(_mask_token(""))
         self._token_mask_label.setObjectName("tokenMask")
+        self._token_mask_label.setWordWrap(True)
         self._token_mask_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.NoTextInteraction
         )
@@ -2826,6 +2852,7 @@ class _SettingsPanel(QWidget):
 
         self._ai_title = QLabel(i18n.t("settings.ai_providers"))
         self._ai_title.setObjectName("sectionTitle")
+        self._ai_title.setWordWrap(True)
         self._ai_sub = QLabel(i18n.t("settings.ai_providers_sub"))
         self._ai_sub.setObjectName("sectionSub")
         self._ai_sub.setWordWrap(True)
@@ -2870,10 +2897,12 @@ class _SettingsPanel(QWidget):
         olh.setSpacing(8)
         ol_name = QLabel(PROVIDERS["ollama"]["name"])
         ol_name.setObjectName("providerName")
+        ol_name.setWordWrap(True)
         olh.addWidget(ol_name)
         olh.addStretch()
         self._ollama_tag = QLabel(i18n.t("provider.no_key_required"))
         self._ollama_tag.setObjectName("providerSub")
+        self._ollama_tag.setWordWrap(True)
         i18n.add_listener(
             lambda: self._ollama_tag.setText(i18n.t("provider.no_key_required"))
         )
