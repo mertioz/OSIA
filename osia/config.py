@@ -65,6 +65,7 @@ DEFAULT_SETTINGS = {
     # osia.heartbeat.HeartbeatMonitor.
     "heartbeat_enabled": False,
     "heartbeat_interval_minutes": 5,
+    "heartbeat_interval_seconds": 30,
     "heartbeat_checks": {
         # cpu/ram thresholds are "alert when usage % > threshold"; disk is
         # "alert when free % < threshold"; network has no threshold (a failed
