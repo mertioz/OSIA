@@ -52,6 +52,7 @@ DEFAULT_LANG = detect_system_lang()
 SYSTEM_PROMPT_EN = """You are a local AI assistant running on the user's local machine with FULL SYSTEM ACCESS. Reply in English by default.
 You can run any shell command, read/write/delete any file, launch any application, take screenshots, and control a web browser.
 Your working directory is /home/OSIA/code/osia-project/.
+When the user refers to the "desktop" or "bureau", it means the desktop folder — ~/Bureau on French Linux systems and ~/Desktop on English ones. Always use the exact absolute path given in the [DESKTOP PATH: ...] line of this prompt.
 
 ## Available Tools
 You have these tools available:
@@ -115,6 +116,7 @@ When all tools are done, you MUST write a complete final answer based on everyth
 SYSTEM_PROMPT_FR = """Tu es un assistant vocal IA local fonctionnant sur la machine locale de l'utilisateur avec UN ACCÈS SYSTÈME COMPLET. Réponds en français par défaut.
 Tu peux exécuter n'importe quelle commande shell, lire/écrire/supprimer n'importe quel fichier, lancer n'importe quelle application, prendre des captures d'écran, et contrôler un navigateur web.
 Ton répertoire de travail est /home/OSIA/code/osia-project/.
+Quand l'utilisateur parle du « bureau » (ou « desktop »), il s'agit du dossier Bureau — ~/Bureau sur les systèmes Linux français et ~/Desktop sur les anglais. Utilise toujours le chemin absolu exact donné dans la ligne [DESKTOP PATH: ...] de ce prompt.
 
 ## Outils disponibles
 Tu disposes des outils suivants :
@@ -176,6 +178,22 @@ Quand tu as toutes les informations nécessaires, donne ta réponse finale en te
 Quand tous les outils ont terminé, tu DOIS écrire une réponse finale complète basée sur tout ce que tu as trouvé — ne termine jamais ton tour avec seulement des appels d'outils, du balisage d'outil ou une réponse vide."""
 
 
+def get_desktop_path() -> str:
+    """Resolve the user's desktop directory for this machine.
+
+    French Linux systems name it ``~/Bureau`` and English ones
+    ``~/Desktop``; check those in order and fall back to the home
+    directory if neither exists, so a resolved path never points at a
+    missing folder.
+    """
+    home = os.path.expanduser("~")
+    for name in ("Bureau", "Desktop"):
+        candidate = os.path.join(home, name)
+        if os.path.isdir(candidate):
+            return candidate
+    return home
+
+
 def get_system_prompt(lang: str = None, model: str = None, provider: str = None) -> str:
     """Return the system prompt for the given language, with the active
     model and provider injected at the start so the agent knows what it's
@@ -187,6 +205,10 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
     if model and provider:
         header = f"Tu es OSIA. Tu tournes sur {model} ({provider}).\n\n"
         body = header + body
+    # Inject the resolved desktop path so the model always targets the
+    # correct folder when the user says "desktop"/"bureau" (~/Bureau on
+    # French systems, ~/Desktop on English ones).
+    body = body + f"\n\n[DESKTOP PATH: {get_desktop_path()}]"
     # Bloc 6 — prepend the user's custom personality (~/.osia/personality.md)
     # and append any enabled skill files (~/.osia/skills/*.md). Both are
     # optional Markdown the user edits from the "OSIA" tab; any failure here
@@ -2681,6 +2703,39 @@ class OSIAAgent:
             "Could you rephrase your request?"
         )
 
+    def _drop_history_screenshots(self) -> None:
+        """Reduce past tool-result messages in ``self.messages`` to their
+        text part, dropping any base64 screenshot/image data.
+
+        A screenshot is attached as a vision part only so the model can
+        analyze the page on the very next turn; once that turn has run,
+        the now-stale image (100K-600K base64 chars each) would otherwise
+        sit in history forever and balloon the context across a multi-step
+        browser task. This is called right before the current turn's fresh
+        screenshot is appended, so the live screenshot is left untouched
+        and only the already-seen ones are stripped.
+        """
+        saved = 0
+        for msg in self.messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            texts = []
+            had_image = False
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    texts.append(part.get("text", ""))
+                elif part.get("type") == "image_url":
+                    had_image = True
+                    url = (part.get("image_url") or {}).get("url", "")
+                    saved += len(url.split("base64,", 1)[-1])
+            if had_image:
+                msg["content"] = "\n\n".join(t for t in texts if t)
+        if saved:
+            print(f"[CONTEXT] dropped screenshot from history ({saved} chars saved)")
+
     def run(self, user_input: str, max_tool_rounds: int | None = None, on_sentence=None,
             history: list | None = None, max_tokens: int | None = None,
             on_first_token=None) -> str:
@@ -3130,6 +3185,12 @@ class OSIAAgent:
                         f"<tool_result>\n{feedback}\n</tool_result>\n\n"
                         f"{guard.stop_instruction()}"
                     )
+                # Before storing this turn's tool results, strip the base64
+                # screenshots already in history: the model saw them on the
+                # turn right after their capture, so keeping them only
+                # balloons the context. The fresh screenshot for THIS turn is
+                # appended just below, so it survives for the next turn.
+                self._drop_history_screenshots()
                 if tool_screenshots and _provider_supports_vision(self.provider, self.model):
                     content_parts: list = [{"type": "text", "text": feedback_text}]
                     for shot in tool_screenshots:
