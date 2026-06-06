@@ -8,6 +8,7 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "text",                 "content": "..."}
     {"type": "audio",                "format": "wav", "data": "<base64>"}
     {"type": "list_conversations"}
+    {"type": "get_conversations"}                                      # compact id+title list (≤50 most recent) for the mobile cron "linked conversation" picker
     {"type": "load_conversation",    "id": "..."}
     {"type": "new_conversation"}
     {"type": "delete_conversation",  "id": "..."}
@@ -38,6 +39,7 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "audio",                "format": "mp3", "data": "<base64>", "source": "response|speak"}
     {"type": "status",               "content": "thinking|done|error"}
     {"type": "conversations",        "items": [{id,title,created_at,updated_at,message_count}, ...]}
+    {"type": "conversations_list",   "conversations": [{id,title}, ...]}  # compact list (≤50 most recent) for the mobile cron "linked conversation" picker
     {"type": "conversation_history", "id": "...", "title": "...",
                                      "messages": [{"role": "user|assistant", "content": "..."}]}
     {"type": "conversation_deleted", "id": "...", "success": true|false}
@@ -641,6 +643,20 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({
                     "type": "conversations",
                     "items": conversations.list_conversations(),
+                })
+                continue
+
+            if msg_type == "get_conversations":
+                # Compact id+title list for the mobile cron editor's "linked
+                # conversation" picker (WOR-24). list_conversations() is already
+                # sorted by updated_at descending; cap at the 50 most recent.
+                recent = conversations.list_conversations()[:50]
+                await ws.send_json({
+                    "type": "conversations_list",
+                    "conversations": [
+                        {"id": c.get("id"), "title": c.get("title")}
+                        for c in recent
+                    ],
                 })
                 continue
 
