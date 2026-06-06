@@ -71,7 +71,7 @@ VALID_STATES = ("idle", "listening", "thinking", "speaking")
 # morphs between three shapes with a smooth ~300ms geometry animation.
 SHAPE_CAPSULE = "capsule"   # default horizontal pill (ISLAND_W x ISLAND_H)
 SHAPE_CIRCLE = "circle"     # compact logo+mic disc, snapped into a bottom corner
-SHAPE_DOCKED = "docked"     # slid behind a side edge, only DOCK_STRIP px showing
+SHAPE_DOCKED = "docked"     # vertical pill tucked behind a side edge ("ear")
 
 MORPH_MS = 300              # shape-morph animation duration
 CIRCLE_SIZE = 60           # circle diameter (px)
@@ -79,7 +79,13 @@ CIRCLE_SIZE = 60           # circle diameter (px)
 # painted inside the compact circle so they read as a centred glyph rather than
 # a clipped fragment.
 CIRCLE_ACTIVE_SCALE = 0.7
-DOCK_STRIP = 24            # visible strip when docked behind an edge (px)
+# Docked "ear": a tall, narrow vertical pill that sits half-tucked behind a side
+# edge. Only DOCK_PEEK px (exactly half its width) stays on screen; the outer
+# half is clipped by the monitor edge, leaving a rounded edge facing inward. On
+# wake word it slides out to the full horizontal capsule and back when idle.
+DOCK_PILL_W = 28           # docked pill width (px) — narrow vertical pill
+DOCK_PILL_H = 80           # docked pill height (px) — tall vertical pill
+DOCK_PEEK = DOCK_PILL_W // 2   # px of the pill kept on screen (exactly half)
 SHAPE_MARGIN = 8           # gap kept from the screen edge for visible shapes
 
 # Drop-zone thresholds. A bottom corner is "within 15% of the screen width AND
@@ -142,6 +148,10 @@ class DynamicIsland(QWidget):
         self._shape = SHAPE_CAPSULE
         self._dock_side = None
         self._docked_slid_out = False
+        # Vertical centre the docked "ear" anchors to, so the tucked pill and the
+        # slid-out capsule stay aligned across the slide animation. None unless
+        # docked.
+        self._dock_center_y = None
         self._phase = 0.0
         # Milliseconds elapsed in the current state — drives time-based
         # animations (thinking dots). Reset on every state change.
@@ -165,9 +175,14 @@ class DynamicIsland(QWidget):
         # position) between shapes. The painted corner radius follows the live
         # geometry (see _capsule_path), so the pill rounds into a full circle as
         # the window approaches CIRCLE_SIZE² with no separate radius animation.
-        self._morph_anim = QPropertyAnimation(self, b"geometry")
+        # Driven as a QRect QVariantAnimation (not a "geometry" QPropertyAnimation)
+        # so each frame is committed via _commit_geometry, which re-asserts the
+        # rect on the native window and lets a docked capsule rest partially
+        # off-screen past WM clamping (negative x / x beyond the right edge).
+        self._morph_anim = QVariantAnimation(self)
         self._morph_anim.setDuration(MORPH_MS)
         self._morph_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._morph_anim.valueChanged.connect(self._on_morph_value)
 
         # Launch-expand animation — grows the painted capsule from tiny to full.
         self._launch_anim = QVariantAnimation(self)
@@ -185,6 +200,12 @@ class DynamicIsland(QWidget):
         self.setWindowOpacity(IDLE_OPACITY)
         self._restore_position()
         self.show()
+        # Re-assert frameless on the native window so the WM honours the
+        # off-screen docked geometry (negative x on the left, x beyond the right
+        # edge) instead of pulling the window back fully on screen.
+        handle = self.windowHandle()
+        if handle is not None:
+            handle.setFlag(Qt.WindowType.FramelessWindowHint, True)
         self._launch_anim.start()
 
     # ── Public API ────────────────────────────────────────────────────────
@@ -274,6 +295,9 @@ class DynamicIsland(QWidget):
                     break
         if not moved:
             self._position_at_top()
+        # Anchor the docked ear on the restored drop position's vertical centre.
+        if shape == SHAPE_DOCKED:
+            self._dock_center_y = self.geometry().center().y()
         # Snap straight to the restored shape's geometry (no launch-time morph).
         if shape != SHAPE_CAPSULE:
             self._apply_shape_geometry(animate=False)
@@ -417,8 +441,15 @@ class DynamicIsland(QWidget):
         """Switch to ``shape`` (snapping to ``side``) with an animated morph."""
         self._shape = shape
         self._dock_side = side
-        self._docked_slid_out = False
-        self._apply_shape_geometry(animate=True)
+        if shape == SHAPE_DOCKED:
+            # Anchor the ear on the drop point's vertical centre; start slid out
+            # if OSIA is mid-interaction so the active animation stays visible.
+            self._dock_center_y = self.geometry().center().y()
+            self._docked_slid_out = self._state != "idle"
+        else:
+            self._dock_center_y = None
+            self._docked_slid_out = False
+        self._apply_shape_geometry(animate=True, slid_out=self._docked_slid_out)
 
     def _apply_shape_geometry(self, animate: bool = True,
                               slid_out: bool = False) -> None:
@@ -430,8 +461,25 @@ class DynamicIsland(QWidget):
             self._morph_anim.setEndValue(target)
             self._morph_anim.start()
         else:
-            self.setGeometry(target)
+            self._commit_geometry(target)
         self.update()
+
+    def _on_morph_value(self, rect: QRect) -> None:
+        """Per-frame morph step — commit the interpolated geometry."""
+        self._commit_geometry(rect)
+        self.update()
+
+    def _commit_geometry(self, rect: QRect) -> None:
+        """Apply ``rect`` to the window, forcing it past WM clamping so a docked
+        capsule can rest partially off-screen (negative x on the left, or x
+        beyond the right edge). Setting the geometry on the native ``QWindow``
+        handle in addition to the widget bypasses managers that would otherwise
+        pull a top-level window back fully on screen.
+        """
+        self.setGeometry(rect)
+        handle = self.windowHandle()
+        if handle is not None:
+            handle.setGeometry(rect)
 
     def _target_geometry(self, shape: str, side: str | None,
                          slid_out: bool = False) -> QRect:
@@ -448,17 +496,24 @@ class DynamicIsland(QWidget):
             x = avail.left() + m if side == "left" else avail.right() - w - m
             y = avail.bottom() - h - m
         elif shape == SHAPE_DOCKED:
-            w, h = ISLAND_W, ISLAND_H
-            y = _clamp(cur.top(), avail.top() + m, avail.bottom() - h - m)
+            anchor_y = (self._dock_center_y if self._dock_center_y is not None
+                        else cur.center().y())
             if slid_out:
-                # Fully on screen so the mic + animation are visible.
-                x = avail.left() + m if side == "left" else avail.right() - w - m
-            elif side == "left":
-                # Hidden off the left edge, only the rounded right cap showing.
-                x = avail.left() - (w - DOCK_STRIP)
+                # Wake word: the full horizontal capsule slides on screen so the
+                # mic + animation read normally, flush against the docked edge
+                # (x = 0 on the left, x = screen_width - full_width on the right).
+                w, h = ISLAND_W, ISLAND_H
+                x = avail.left() if side == "left" else avail.right() + 1 - w
             else:
-                # Hidden off the right edge, only the rounded left cap showing.
-                x = avail.right() - DOCK_STRIP
+                # Idle: a tall vertical pill, exactly half tucked behind the edge
+                # (DOCK_PEEK px showing). The outer half is clipped by the monitor
+                # edge, leaving a rounded "ear" facing inward (left dock x = -14,
+                # right dock x = screen_width - 14 for a 28px pill).
+                w, h = DOCK_PILL_W, DOCK_PILL_H
+                x = (avail.left() - DOCK_PEEK if side == "left"
+                     else avail.right() + 1 - DOCK_PEEK)
+            y = _clamp(anchor_y - h // 2,
+                       avail.top() + m, avail.bottom() - h - m)
         else:  # SHAPE_CAPSULE — centre on the drop point, kept fully on screen.
             w, h = ISLAND_W, ISLAND_H
             x = _clamp(cur.center().x() - w // 2,
@@ -481,8 +536,11 @@ class DynamicIsland(QWidget):
         t = self._launch_t
         full_w = self.width()
         full_h = self.height()
-        w = LAUNCH_W + (full_w - LAUNCH_W) * t
-        h = LAUNCH_H + (full_h - LAUNCH_H) * t
+        # min() guards the narrow docked pill: its full width (DOCK_PILL_W) is
+        # smaller than LAUNCH_W, so the raw interpolation would paint a capsule
+        # wider than the window. Clamp so the painted shape never exceeds it.
+        w = min(full_w, LAUNCH_W + (full_w - LAUNCH_W) * t)
+        h = min(full_h, LAUNCH_H + (full_h - LAUNCH_H) * t)
         x = (self.width() - w) / 2
         y = (self.height() - h) / 2
         return QRectF(x + 0.5, y + 0.5, w - 1, h - 1)
@@ -507,9 +565,14 @@ class DynamicIsland(QWidget):
         painter.fillPath(path, BG_COLOR)
         painter.drawPath(path)
 
-        # Content overlay. The circle is a compact logo+mic disc when idle, and
-        # clips its active-state animation to the disc so nothing spills out.
-        if self._shape == SHAPE_CIRCLE:
+        # Content overlay.
+        if self._shape == SHAPE_DOCKED and not self._docked_slid_out:
+            # Tucked "ear": only a grip hint on the visible inner half. The mic +
+            # active animation appear once it slides out on the wake word.
+            self._paint_docked_ear(painter)
+        # The circle is a compact logo+mic disc when idle, and clips its
+        # active-state animation to the disc so nothing spills out.
+        elif self._shape == SHAPE_CIRCLE:
             painter.save()
             painter.setClipPath(path)
             if self._state == "idle":
@@ -538,6 +601,24 @@ class DynamicIsland(QWidget):
             self._paint_thinking(p)
         elif self._state == "speaking":
             self._paint_speaking(p)
+
+    def _paint_docked_ear(self, p: QPainter) -> None:
+        """A subtle three-dot grip on the visible (inner) half of the docked
+        pill, hinting it can be pulled out. Docked left → the right half is on
+        screen; docked right → the left half is, so the grip hugs that side.
+        """
+        rect = self._capsule_rect()
+        cy = rect.center().y()
+        if self._dock_side == "right":
+            gx = rect.left() + rect.width() * 0.30
+        else:
+            gx = rect.right() - rect.width() * 0.30
+        p.setPen(Qt.PenStyle.NoPen)
+        color = QColor(ACCENT)
+        color.setAlpha(200)
+        p.setBrush(color)
+        for dy in (-7.0, 0.0, 7.0):
+            p.drawEllipse(QPointF(gx, cy + dy), 1.6, 1.6)
 
     def _paint_circle_idle(self, p: QPainter) -> None:
         """Compact circle: the OSIA logo with a small mic glyph beneath it."""
