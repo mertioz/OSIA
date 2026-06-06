@@ -813,6 +813,8 @@ async def websocket_endpoint(ws: WebSocket):
                     # Live system-metrics push: master flag (shared with the
                     # desktop monitor) + seconds-granularity push cadence.
                     "heartbeat_enabled", "heartbeat_interval_seconds",
+                    # Cooperation IA vision provider/model (WOR-25).
+                    "vision_provider", "vision_model",
                 }
                 if setting_key not in allowed_settings:
                     print(
