@@ -64,6 +64,7 @@ import os
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from datetime import datetime
@@ -79,10 +80,17 @@ from osia import conversations
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-PROJECT_DIR = Path("/home/OSIA/code/osia-project")
-CONFIG_DIR = PROJECT_DIR / "config"
+# <repo>/osia/server/server.py → <repo>. Resolved dynamically so the server
+# runs from any install location / drive on both Linux and Windows (WOR-11),
+# never a hardcoded /home/OSIA/code/... path.
+PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
+# Per-user config/data dir — matches osia.config.CONFIG_DIR (``~/.osia``) so the
+# server and the desktop GUI share one mobile token and config on both OSes.
+CONFIG_DIR = Path.home() / ".osia"
 TOKEN_FILE = CONFIG_DIR / "mobile_token.txt"
-UPLOAD_DIR = Path("/tmp/osia_uploads")
+# Cross-platform scratch dir for mobile uploads — ``/tmp`` does not exist on
+# Windows, so derive it from the OS temp dir instead.
+UPLOAD_DIR = Path(tempfile.gettempdir()) / "osia_uploads"
 
 # Image extensions that should trigger DeepSeek Vision automatically.
 _IMAGE_MIME = {

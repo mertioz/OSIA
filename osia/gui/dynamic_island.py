@@ -22,6 +22,7 @@ press + move drags the capsule instead.
 """
 
 import math
+import sys
 
 from PyQt6.QtCore import (
     Qt, QTimer, QRect, QRectF, QPointF, pyqtSignal, QPropertyAnimation,
@@ -110,18 +111,23 @@ class DynamicIsland(QWidget):
     def __init__(self):
         super().__init__()
 
-        self.setWindowFlags(
+        flags = (
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
             | Qt.WindowType.WindowDoesNotAcceptFocus
-            # The WM otherwise clamps the docked "ear" back on screen (x=0),
-            # cancelling the negative-x left dock (e.g. x=-14). Bypassing the WM
-            # makes this an override-redirect window so it keeps the exact
-            # off-screen geometry we commit. Override-redirect windows also stay
-            # above managed windows, so WindowStaysOnTopHint above still holds.
-            | Qt.WindowType.X11BypassWindowManagerHint
         )
+        # On X11 the WM otherwise clamps the docked "ear" back on screen (x=0),
+        # cancelling the negative-x left dock (e.g. x=-14). Bypassing the WM
+        # makes this an override-redirect window so it keeps the exact off-screen
+        # geometry we commit. Override-redirect windows also stay above managed
+        # windows, so WindowStaysOnTopHint above still holds. This hint is X11-
+        # only and meaningless on Windows, where FramelessWindowHint |
+        # WindowStaysOnTopHint | Tool already give the right behaviour — so skip
+        # it on win32 (WOR-11).
+        if sys.platform != "win32":
+            flags |= Qt.WindowType.X11BypassWindowManagerHint
+        self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         # Not setFixedSize: the shape morph animates the window geometry between
@@ -824,9 +830,9 @@ class DynamicIsland(QWidget):
 
 if __name__ == "__main__":
     import os
-    import sys
 
-    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
     app = QApplication(sys.argv)
     island = DynamicIsland()

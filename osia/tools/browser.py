@@ -33,6 +33,7 @@ import socket
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
@@ -48,7 +49,7 @@ CDP_URL = f"http://localhost:{CDP_PORT}"
 
 # Every browser OSIA launches gets a dedicated profile under ~/.osia/ so it
 # never touches (or opens a window in) the user's personal browser profiles.
-OSIA_DATA_DIR = "/home/OSIA/.osia"
+OSIA_DATA_DIR = str(Path.home() / ".osia")
 OSIA_PROFILE_DIR = f"{OSIA_DATA_DIR}/brave-profile"          # CDP (Brave/Chromium)
 FIREFOX_PROFILE_DIR = f"{OSIA_DATA_DIR}/firefox-profile"     # Firefox (non-CDP)
 

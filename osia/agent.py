@@ -9,19 +9,26 @@ import json
 import re
 import subprocess
 import os
+import platform
 import shutil
 import stat
 import fnmatch
 import signal
 import time
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
+from pathlib import Path
 
 import psutil
 from openai import OpenAI
 
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 MODEL = "llama3"
+
+# Project root — resolved dynamically so paths work on any machine and OS
+# (Windows + Linux) instead of a hardcoded home directory.
+_PROJECT_DIR = str(Path(__file__).resolve().parent.parent)
 
 # ---------------------------------------------------------------------------
 # Language detection (Phase 1)
@@ -55,7 +62,7 @@ System & shell:
 - bash: Execute a bash command. Usage: {"tool": "bash", "command": "<command>"}
 - run_command: Run any shell command and return its output. Usage: {"tool": "run_command", "command": "<command>"}
 - open_application: Launch an application by name. Usage: {"tool": "open_application", "name": "<app_name>"}
-- take_screenshot: Capture the desktop to /tmp/screenshot.png and return the path. Usage: {"tool": "take_screenshot"}
+- take_screenshot: Capture the desktop to the system temp directory and return the path. Usage: {"tool": "take_screenshot"}
 - get_system_info: Snapshot of CPU, RAM and disk usage. Usage: {"tool": "get_system_info"}
 - list_running_processes: Top processes by CPU/memory. Usage: {"tool": "list_running_processes", "limit": 20}
 - kill_process: Kill a process by PID (int) or name (substring match). Usage: {"tool": "kill_process", "name_or_pid": "<pid_or_name>"}
@@ -119,7 +126,7 @@ Système & shell :
 - bash : Exécuter une commande bash. Usage : {"tool": "bash", "command": "<commande>"}
 - run_command : Exécuter n'importe quelle commande shell et retourner sa sortie. Usage : {"tool": "run_command", "command": "<commande>"}
 - open_application : Lancer une application par son nom. Usage : {"tool": "open_application", "name": "<nom_app>"}
-- take_screenshot : Capturer le bureau vers /tmp/screenshot.png et retourner le chemin. Usage : {"tool": "take_screenshot"}
+- take_screenshot : Capturer le bureau vers le répertoire temporaire système et retourner le chemin. Usage : {"tool": "take_screenshot"}
 - get_system_info : Aperçu de l'utilisation CPU, RAM et disque. Usage : {"tool": "get_system_info"}
 - list_running_processes : Top des processus par CPU/mémoire. Usage : {"tool": "list_running_processes", "limit": 20}
 - kill_process : Tuer un processus par PID (entier) ou nom (sous-chaîne). Usage : {"tool": "kill_process", "name_or_pid": "<pid_ou_nom>"}
@@ -196,6 +203,9 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
     if lang is None:
         lang = DEFAULT_LANG
     body = SYSTEM_PROMPT_FR if lang == "fr" else SYSTEM_PROMPT_EN
+    # Point the model at the real project root on this machine instead of the
+    # /home/OSIA path baked into the prompt text (works on Windows + Linux).
+    body = body.replace("/home/OSIA/code/osia-project", _PROJECT_DIR)
     if model and provider:
         header = f"Tu es OSIA. Tu tournes sur {model} ({provider}).\n\n"
         body = header + body
@@ -430,7 +440,7 @@ def tool_bash(command: str) -> str:
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True,
-            timeout=30, cwd="/home/OSIA/code/osia-project"
+            timeout=30, cwd=_PROJECT_DIR
         )
         out = result.stdout.strip()
         err = result.stderr.strip()
@@ -450,7 +460,7 @@ def tool_bash(command: str) -> str:
 def tool_read_file(path: str) -> str:
     """Read a file and return its contents (truncated to 4000 chars)."""
     if not path.startswith("/"):
-        path = os.path.join("/home/OSIA/code/osia-project", path)
+        path = os.path.join(_PROJECT_DIR, path)
     try:
         with open(path, "r") as f:
             content = f.read()
@@ -464,7 +474,7 @@ def tool_read_file(path: str) -> str:
 def tool_write_file(path: str, content: str) -> str:
     """Write content to a file. Creates parent directories if needed."""
     if not path.startswith("/"):
-        path = os.path.join("/home/OSIA/code/osia-project", path)
+        path = os.path.join(_PROJECT_DIR, path)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
@@ -486,7 +496,7 @@ def tool_open_application(name: str) -> str:
 def tool_list_files(path: str) -> str:
     """List files in a directory."""
     if not path.startswith("/"):
-        path = os.path.join("/home/OSIA/code/osia-project", path)
+        path = os.path.join(_PROJECT_DIR, path)
     try:
         entries = os.listdir(path)
         entries.sort()
@@ -498,7 +508,7 @@ def tool_list_files(path: str) -> str:
 def tool_delete_file(path: str) -> str:
     """Delete a file."""
     if not path.startswith("/"):
-        path = os.path.join("/home/OSIA/code/osia-project", path)
+        path = os.path.join(_PROJECT_DIR, path)
     try:
         os.remove(path)
         return f"Deleted: {path}"
@@ -513,7 +523,7 @@ def tool_run_command(command: str) -> str:
 
 def tool_take_screenshot() -> str:
     """Take a screenshot of the desktop using scrot. Returns the path."""
-    path = "/tmp/screenshot.png"
+    path = str(Path(tempfile.gettempdir()) / "osia_screenshot.png")
     try:
         result = subprocess.run(
             ["scrot", "-o", path], capture_output=True, text=True, timeout=10
@@ -527,9 +537,7 @@ def tool_take_screenshot() -> str:
         return f"ERROR taking screenshot: {e}"
 
 
-# ── Path helper (new tools only — existing tools keep their inline form) ───
-
-_PROJECT_DIR = "/home/OSIA/code/osia-project"
+# ── Path helper (resolves relative paths against the dynamic _PROJECT_DIR) ──
 
 
 def _abs(path: str) -> str:
@@ -722,13 +730,17 @@ def tool_get_system_info() -> str:
     try:
         cpu_pct = psutil.cpu_percent(interval=0.3)
         cores = psutil.cpu_count(logical=True)
-        load1, load5, load15 = os.getloadavg()
+        try:
+            load1, load5, load15 = os.getloadavg()
+            load_str = f"{load1:.2f} / {load5:.2f} / {load15:.2f}"
+        except AttributeError:
+            load_str = "N/A"  # os.getloadavg() is Unix-only (absent on Windows)
         vm = psutil.virtual_memory()
         du = psutil.disk_usage("/")
-        uname = os.uname()
+        uname = platform.uname()
         return (
-            f"host:    {uname.nodename} ({uname.sysname} {uname.release})\n"
-            f"cpu:     {cpu_pct:.1f}% across {cores} cores  (load 1/5/15: {load1:.2f} / {load5:.2f} / {load15:.2f})\n"
+            f"host:    {uname.node} ({uname.system} {uname.release})\n"
+            f"cpu:     {cpu_pct:.1f}% across {cores} cores  (load 1/5/15: {load_str})\n"
             f"memory:  {vm.used / 1024**3:.1f} / {vm.total / 1024**3:.1f} GiB used ({vm.percent:.0f}%)\n"
             f"disk /:  {du.used / 1024**3:.1f} / {du.total / 1024**3:.1f} GiB used ({du.percent:.0f}%)"
         )

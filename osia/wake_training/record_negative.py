@@ -8,7 +8,18 @@ Saves as 16-bit WAV files in wake_training/negative/.
 import os
 import sys
 import time
-import sounddevice as sd
+
+# Recording these training samples requires a working microphone. If the audio
+# backend (PortAudio) is unavailable, exit with a clear message instead of an
+# opaque ImportError traceback (WOR-11).
+try:
+    import sounddevice as sd
+except Exception as _audio_exc:
+    print(
+        f"⚠️  audio backend unavailable ({_audio_exc}); cannot record training "
+        "samples without a working microphone."
+    )
+    sys.exit(1)
 import scipy.io.wavfile as wav
 
 SAMPLE_RATE = 16000

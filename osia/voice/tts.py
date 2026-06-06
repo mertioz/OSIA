@@ -16,9 +16,23 @@ import queue
 import threading
 
 import numpy as np
-import sounddevice as sd
 import soundfile as sf
 from langdetect import detect, DetectorFactory
+
+# sounddevice loads PortAudio at import time and can fail on a machine with no
+# audio backend / drivers. Degrade gracefully: with ``sd = None`` the synthesis
+# helpers below skip playback (the text reply is still shown elsewhere), so OSIA
+# never crashes for lack of a speaker (WOR-11).
+try:
+    import sounddevice as sd
+    _AUDIO_OK = True
+except Exception as _audio_exc:  # PortAudio missing / no audio device
+    sd = None
+    _AUDIO_OK = False
+    print(
+        f"⚠️  [TTS] audio backend unavailable ({_audio_exc}); spoken output is "
+        "disabled (text replies still work)."
+    )
 
 from osia.config import get_api_key, get_setting
 
@@ -323,6 +337,9 @@ def get_active_tts_provider() -> str:
 def _speak_blocking(text: str):
     """One synthesis pass through the dispatcher. Used by both the public
     ``speak`` entrypoint and the streaming worker."""
+    if not _AUDIO_OK:
+        _debug("_speak_blocking: no audio backend — skipping playback")
+        return
     provider = get_active_tts_provider()
     _debug(f"_speak_blocking: dispatch start (provider={provider!r})")
 
@@ -451,7 +468,8 @@ def stop() -> None:
     if drained:
         _debug(f"stop(): drained {drained} pending sentence(s)")
     try:
-        sd.stop()
+        if _AUDIO_OK:
+            sd.stop()
     except Exception as e:
         print(f"⚠️  sd.stop() failed: {e}")
 

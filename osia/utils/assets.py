@@ -88,11 +88,18 @@ def ensure_desktop_entry() -> str | None:
         return None
 
 
-# ── Launch-at-login autostart (WOR-22) ──────────────────────────────────────
+# ── Launch-at-login autostart (WOR-22, Windows in WOR-11) ───────────────────
 # Separate from ensure_desktop_entry(): that installs the app menu launcher;
-# this manages whether OSIA starts automatically when the user logs in. On
-# Linux that is a ``~/.config/autostart/osia.desktop`` file (the XDG autostart
-# spec). Windows/Mac are stubs for now.
+# this manages whether OSIA starts automatically when the user logs in.
+#   • Linux:   a ``~/.config/autostart/osia.desktop`` file (XDG autostart spec)
+#   • Windows: an ``OSIA`` value under the per-user Run key
+#              ``HKCU\Software\Microsoft\Windows\CurrentVersion\Run``
+#   • Mac:     not yet implemented (reports disabled)
+
+# Windows per-user "run at login" registry location.
+_WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_WIN_RUN_VALUE = "OSIA"
+
 
 def _autostart_desktop_path() -> str:
     """Path to the XDG autostart entry that launches OSIA at login (Linux)."""
@@ -101,15 +108,72 @@ def _autostart_desktop_path() -> str:
     )
 
 
+def _windows_autostart_command() -> str:
+    """Command Windows runs at login to launch OSIA in wake mode.
+
+    Prefers the project venv's windowless ``pythonw.exe`` (so no console flashes
+    at login); falls back to the running interpreter (``sys.executable``). Both
+    the interpreter and ``main.py`` are derived from this module's own location
+    (``PROJECT_ROOT`` / ``Path(__file__)``), never a hardcoded path — WOR-11.
+    """
+    main_py = os.path.join(PROJECT_ROOT, "osia", "main.py")
+    pythonw = os.path.join(PROJECT_ROOT, "venv", "Scripts", "pythonw.exe")
+    py = pythonw if os.path.exists(pythonw) else (sys.executable or "pythonw.exe")
+    # Quote both paths so spaces (e.g. "C:\\Users\\My Name\\...") survive.
+    return f'"{py}" "{main_py}" --wake'
+
+
+def _set_autostart_windows(enabled: bool) -> bool:
+    """Add/remove the ``OSIA`` value under the HKCU Run key. Returns True on
+    success, False on any failure (never raises). Disabling is idempotent."""
+    try:
+        import winreg  # Windows-only stdlib module
+    except Exception as e:
+        print(f"[autostart] winreg unavailable: {e}")
+        return False
+    try:
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE,
+        )
+        try:
+            if enabled:
+                winreg.SetValueEx(
+                    key, _WIN_RUN_VALUE, 0, winreg.REG_SZ,
+                    _windows_autostart_command(),
+                )
+            else:
+                try:
+                    winreg.DeleteValue(key, _WIN_RUN_VALUE)
+                except FileNotFoundError:
+                    pass  # already absent — nothing to disable
+        finally:
+            winreg.CloseKey(key)
+        return True
+    except Exception as e:
+        print(f"[autostart] Windows registry update failed: {e}")
+        return False
+
+
 def autostart_enabled() -> bool:
     """Return True when OSIA is configured to launch at login.
 
-    The state is derived from the autostart entry actually existing (Linux),
-    so the settings toggle always reflects reality. Non-Linux platforms have
-    no implementation yet and report disabled.
+    The state is derived from reality — the XDG autostart entry existing
+    (Linux) or the HKCU Run value existing (Windows) — so the settings toggle
+    always mirrors the actual configuration. Mac reports disabled (no impl).
     """
-    if platform.system() == "Linux":
+    system = platform.system()
+    if system == "Linux":
         return os.path.exists(_autostart_desktop_path())
+    if system == "Windows":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as key:
+                winreg.QueryValueEx(key, _WIN_RUN_VALUE)
+            return True
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
     return False
 
 
@@ -118,16 +182,19 @@ def set_autostart(enabled: bool) -> bool:
 
     Linux: write / remove ``~/.config/autostart/osia.desktop`` launching
     ``osia/main.py --wake`` through the project venv with ``QT_QPA_PLATFORM=xcb``
-    forced (the GUI always runs under XCB). Returns True on success.
+    forced (the GUI always runs under XCB).
 
-    Windows / Mac: logs that autostart is not yet implemented and returns
-    False so the caller can revert the toggle. Never raises.
+    Windows: add / remove the ``OSIA`` value under the HKCU Run key, launching
+    ``osia/main.py --wake`` via the venv ``pythonw.exe`` (WOR-11).
+
+    Mac: logs that autostart is not yet implemented and returns False so the
+    caller can revert the toggle. Returns True on success; never raises.
     """
     system = platform.system()
+    if system == "Windows":
+        return _set_autostart_windows(enabled)
     if system != "Linux":
-        if system == "Windows":
-            print("[autostart] not yet implemented on Windows")
-        elif system == "Darwin":
+        if system == "Darwin":
             print("[autostart] not yet implemented on Mac")
         else:
             print(f"[autostart] not yet implemented on {system}")

@@ -21,7 +21,20 @@ import time
 import os
 import pickle
 import numpy as np
-import sounddevice as sd
+
+# sounddevice loads PortAudio at import time and can fail when no audio backend
+# / drivers are present. Degrade gracefully: with ``sd = None`` the listen loop
+# bails early and OSIA stays reachable via the capsule / Ctrl+Alt+O (WOR-11).
+try:
+    import sounddevice as sd
+    _AUDIO_OK = True
+except Exception as _audio_exc:  # PortAudio missing / no audio device
+    sd = None
+    _AUDIO_OK = False
+    print(
+        f"⚠️  [wake] audio backend unavailable ({_audio_exc}); wake-word "
+        "detection is disabled (use the capsule / Ctrl+Alt+O)."
+    )
 
 from openwakeword.utils import AudioFeatures
 
@@ -95,6 +108,10 @@ class WakeWordDetector:
 
     def _listen_loop(self):
         """Main loop: stream audio, extract features, run verifier."""
+        if not _AUDIO_OK:
+            print("⚠️  [wake] no audio backend — wake-word detection disabled; "
+                  "use the capsule or Ctrl+Alt+O to reach OSIA.")
+            return
         preprocessor = _get_feature_extractor()
         verifier = _get_verifier()
         n_frames = _get_n_frames()

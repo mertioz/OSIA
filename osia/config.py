@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 """OSIA configuration — API keys and settings persistence.
 
-API keys are stored at /home/OSIA/code/osia-project/config/api_keys.json
-with file mode 0600 (owner read/write only).
-Settings are stored at /home/OSIA/code/osia-project/config/settings.json.
+API keys are stored at ``~/.osia/api_keys.json`` with file mode 0600 (owner
+read/write only). Settings are stored at ``~/.osia/settings.json``. The mobile
+pairing token lives at ``~/.osia/mobile_token.txt``.
+
+The config directory resolves to ``Path.home() / ".osia"`` so it is per-user
+and works identically on Linux (``/home/<user>/.osia``) and Windows
+(``C:\\Users\\<user>\\.osia``) — see WOR-11 (Windows port).
 """
 
 import json
 import os
 import secrets
 import stat
+from pathlib import Path
 
-CONFIG_DIR = "/home/OSIA/code/osia-project/config"
+# <repo>/osia/config.py → <repo>. Dynamic so the package works from any
+# install location / drive (no hardcoded /home/OSIA/code/... path).
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Per-user config/data dir, identical resolution on Linux and Windows.
+CONFIG_DIR = str(Path.home() / ".osia")
 API_KEYS_FILE = os.path.join(CONFIG_DIR, "api_keys.json")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 MOBILE_TOKEN_FILE = os.path.join(CONFIG_DIR, "mobile_token.txt")

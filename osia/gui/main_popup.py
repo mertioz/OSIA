@@ -96,6 +96,7 @@ PROVIDER_KEY_URLS = {
     "deepseek":  "https://platform.deepseek.com/api_keys",
     "xai":       "https://console.x.ai",
     "groq":      "https://console.groq.com/keys",
+    "mistral":   "https://console.mistral.ai/api-keys",
 }
 
 # Per-provider accent colors used for the dot indicators on the model panel
@@ -107,6 +108,7 @@ PROVIDER_COLORS = {
     "google":    "#4285f4",   # Google blue
     "xai":       "#cfcfcf",   # xAI light
     "groq":      "#f55036",   # Groq orange
+    "mistral":   "#FA520F",   # Mistral orange
     "ollama":    "#69c88c",   # Local green
 }
 
@@ -715,7 +717,7 @@ class _ModelPanel(QWidget):
 
     model_changed = pyqtSignal(str)
 
-    PROVIDER_ORDER = ("anthropic", "openai", "deepseek", "google", "xai", "groq", "ollama")
+    PROVIDER_ORDER = ("anthropic", "openai", "deepseek", "google", "xai", "groq", "mistral", "ollama")
 
     def __init__(self):
         super().__init__()
@@ -1344,7 +1346,7 @@ class _SettingsPanel(QWidget):
 
     # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
     # last as an info-only row).
-    _AI_PROVIDER_ORDER = ("anthropic", "openai", "google", "deepseek", "xai", "groq")
+    _AI_PROVIDER_ORDER = ("anthropic", "openai", "google", "deepseek", "xai", "groq", "mistral")
 
     # Active TTS provider options: (settings value, combo label / i18n key).
     _TTS_PROVIDERS = (
@@ -5128,7 +5130,8 @@ if __name__ == "__main__":
     import os
     import sys
 
-    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
     app = QApplication(sys.argv)
     p = MainPopup()

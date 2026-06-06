@@ -1,5 +1,5 @@
 {
-  "selected_model": "deepseek-v4-flash",
+  "selected_model": "deepseek-v4-pro",
   "tts_provider": "google",
   "tts_voice": "Leda",
   "stt_provider": "groq",
@@ -12,8 +12,8 @@
   "ai_hierarchy": {
     "heavy": [
       "deepseek:deepseek-v4-pro",
-      "google:gemini-3.1-pro",
-      "google:gemini-2.5-pro",
+      "google:gemini-3.1-pro-preview",
+      "google:gemini-3.5-flash",
       "groq:llama-3.3-70b-versatile"
     ],
     "medium": [

@@ -212,15 +212,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     },
     "settings.vision_hint": {
         "en": "Use this if your main model cannot process images (e.g. DeepSeek, "
-              "Groq, Llama, Mistral).",
+              "Groq, Llama, Codestral).",
         "fr": "Utile si votre modèle principal ne gère pas les images (ex: "
-              "DeepSeek, Groq, Llama, Mistral).",
-        "zh": "如果您的主模型无法处理图像（例如 DeepSeek、Groq、Llama、Mistral），请使用此选项。",
-        "ja": "メインモデルが画像を処理できない場合に使用します（例：DeepSeek、Groq、Llama、Mistral）。",
+              "DeepSeek, Groq, Llama, Codestral).",
+        "zh": "如果您的主模型无法处理图像（例如 DeepSeek、Groq、Llama、Codestral），请使用此选项。",
+        "ja": "メインモデルが画像を処理できない場合に使用します（例：DeepSeek、Groq、Llama、Codestral）。",
         "de": "Nützlich, wenn Ihr Hauptmodell keine Bilder verarbeiten kann "
-              "(z. B. DeepSeek, Groq, Llama, Mistral).",
+              "(z. B. DeepSeek, Groq, Llama, Codestral).",
         "es": "Útil si tu modelo principal no puede procesar imágenes (p. ej., "
-              "DeepSeek, Groq, Llama, Mistral).",
+              "DeepSeek, Groq, Llama, Codestral).",
     },
     "settings.vision_provider": {
         "en": "Vision provider",

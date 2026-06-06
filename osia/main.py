@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 import os
-os.environ["QT_QPA_PLATFORM"] = "xcb"
+import sys
+# The Qt GUI must run under the X11 (xcb) platform plugin on Linux. On Windows
+# Qt uses its native "windows" plugin automatically, so xcb must NOT be forced
+# (it would fail to start). Guard it to Linux only — WOR-11 (Windows port).
+if sys.platform.startswith("linux"):
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
 """
 OSIA main entry point — supports text mode, voice mode, wake-word mode.
 

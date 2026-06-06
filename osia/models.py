@@ -44,6 +44,13 @@ PROVIDERS = {
         "base_url": "https://api.groq.com/openai/v1",
         "models_endpoint": "https://api.groq.com/openai/v1/models",
     },
+    "mistral": {
+        "name": "Mistral",
+        "base_url": "https://api.mistral.ai/v1",
+        # hardcoded only (cf. DeepSeek) — Mistral's /models also lists
+        # embed/OCR/moderation models, which don't belong in the chat selector.
+        "models_endpoint": None,
+    },
     "ollama": {
         "name": "Local (Ollama)",
         "base_url": "http://localhost:11434/v1",
@@ -52,7 +59,7 @@ PROVIDERS = {
 }
 
 # Providers that take an API key (ollama doesn't).
-API_PROVIDERS = ("anthropic", "openai", "deepseek", "google", "xai", "groq")
+API_PROVIDERS = ("anthropic", "openai", "deepseek", "google", "xai", "groq", "mistral")
 
 # ── Hardcoded models (2026) ───────────────────────────────────────────────
 
@@ -74,10 +81,12 @@ HARDCODED_MODELS = [
     {"id": "deepseek-v4-pro",     "label": "DeepSeek V4 Pro",     "provider": "deepseek",  "tier": "best",  "vision": False},
     {"id": "deepseek-v4-flash",   "label": "DeepSeek V4 Flash",   "provider": "deepseek",  "tier": "light", "vision": False},
     # Google — all Gemini models are multimodal.
-    {"id": "gemini-3.1-pro",        "label": "Gemini 3.1 Pro",        "provider": "google", "tier": "best",  "vision": True},
-    {"id": "gemini-2.5-pro",        "label": "Gemini 2.5 Pro",        "provider": "google", "tier": "mid",   "vision": True},
-    {"id": "gemini-2.5-flash",      "label": "Gemini 2.5 Flash",      "provider": "google", "tier": "light", "vision": True},
-    {"id": "gemini-2.5-flash-lite", "label": "Gemini 2.5 Flash Lite", "provider": "google", "tier": "light", "vision": True},
+    {"id": "gemini-3.5-flash",        "label": "Gemini 3.5 Flash",      "provider": "google", "tier": "mid",   "vision": True},
+    {"id": "gemini-3.1-pro-preview",  "label": "Gemini 3.1 Pro",        "provider": "google", "tier": "best",  "vision": True},
+    {"id": "gemini-3-flash-preview",  "label": "Gemini 3 Flash",        "provider": "google", "tier": "mid",   "vision": True},
+    {"id": "gemini-3.1-flash-lite",   "label": "Gemini 3.1 Flash Lite", "provider": "google", "tier": "light", "vision": True},
+    {"id": "gemini-2.5-flash",        "label": "Gemini 2.5 Flash",      "provider": "google", "tier": "light", "vision": True},  # GA; shutting down Oct 2026
+    {"id": "gemini-2.5-flash-lite",   "label": "Gemini 2.5 Flash Lite", "provider": "google", "tier": "light", "vision": True},
     # xAI — Grok is vision-capable.
     {"id": "grok-3",              "label": "Grok 3",              "provider": "xai",       "tier": "mid",   "vision": True},
     {"id": "grok-3-mini",         "label": "Grok 3 Mini",         "provider": "xai",       "tier": "light", "vision": True},
@@ -90,6 +99,12 @@ HARDCODED_MODELS = [
     {"id": "openai/gpt-oss-120b",                       "label": "GPT-OSS 120B",            "provider": "groq", "tier": "best",  "vision": False},
     {"id": "openai/gpt-oss-20b",                        "label": "GPT-OSS 20B",             "provider": "groq", "tier": "light", "vision": False},
     {"id": "moonshotai/kimi-k2-instruct",               "label": "Kimi K2",                 "provider": "groq", "tier": "best",  "vision": False},
+    # Mistral — OpenAI-compatible chat API (cf. DeepSeek/Groq). The Large/Medium/
+    # Small lines are multimodal; Codestral is a text-only coding model.
+    {"id": "mistral-large-2512",  "label": "Mistral Large 3",    "provider": "mistral", "tier": "best",  "vision": True},
+    {"id": "mistral-medium-3-5",  "label": "Mistral Medium 3.5", "provider": "mistral", "tier": "mid",   "vision": True},
+    {"id": "mistral-small-2603",  "label": "Mistral Small 4",    "provider": "mistral", "tier": "light", "vision": True},
+    {"id": "codestral-2508",      "label": "Codestral",          "provider": "mistral", "tier": "mid",   "vision": False},
 ]
 
 # Vision-capable models kept OUT of the chat selector — referenced internally
@@ -115,7 +130,10 @@ def model_has_vision(provider: str | None, model_id: str) -> bool:
       3. A name-based heuristic for ids not in the registry (e.g. remote-
          discovered models): Anthropic Claude, Google Gemini, xAI Grok and the
          OpenAI GPT-4o/4.1/5.x/o-series families are vision-capable; DeepSeek,
-         Groq-hosted text models, Llama/Qwen/Mistral chat models are not.
+         Groq-hosted text models and Llama/Qwen chat models are not. Mistral
+         vision support varies by model version (Large/Medium/Small are
+         multimodal, Codestral is not), so it is taken from the registry above
+         rather than guessed here; unknown Mistral ids default to non-vision.
     """
     if not model_id:
         return False
@@ -427,6 +445,12 @@ def provider_for_model(model_id: str, models: list | None = None) -> str:
         return "openai"
     if "deepseek" in lower:
         return "deepseek"
+    # Mistral families (mistral-*, codestral-*, pixtral-*, …) — mirrors the
+    # DeepSeek case so non-hardcoded Mistral ids resolve to the right endpoint.
+    if lower.startswith(("mistral", "codestral", "pixtral", "ministral",
+                         "magistral", "devstral", "mixtral", "open-mistral",
+                         "open-mixtral")):
+        return "mistral"
     if "gemini" in lower:
         return "google"
     if "grok" in lower:

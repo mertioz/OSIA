@@ -1,0 +1,14 @@
+# Windows batch files MUST use CRLF — cmd.exe misparses multi-line if/else and
+# goto/label blocks in bare-LF .bat files. Force CRLF on checkout (WOR-11).
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# Keep Unix-style scripts and Python as LF on all platforms.
+*.sh        text eol=lf
+*.py        text eol=lf
+
+# Treat binaries as binary (no EOL/CRLF munging, no diff).
+*.wav       binary
+*.pkl       binary
+*.png       binary
+*.exe       binary

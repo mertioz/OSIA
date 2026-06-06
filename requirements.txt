@@ -1,0 +1,49 @@
+# OSIA — Python dependencies (Windows port, WOR-11)
+# Generated from the imports across osia/. Install with:
+#     pip install -r requirements.txt
+# Then fetch the browser engines used by the browser tool:
+#     python -m playwright install
+#
+# Python 3.10+ required.
+
+# ── Web / mobile server ─────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0          # ASGI server; [standard] pulls websockets for /ws
+
+# ── Desktop GUI ─────────────────────────────────────────────────────────────
+PyQt6>=6.6.0
+
+# ── Speech-to-text ──────────────────────────────────────────────────────────
+faster-whisper>=1.0.0              # on-device Whisper (CTranslate2 backend)
+openai-whisper>=20231117           # reference Whisper implementation
+
+# ── Wake word ───────────────────────────────────────────────────────────────
+openwakeword>=0.6.0
+scikit-learn>=1.3.0                # logistic-regression verifier (osia_verifier.pkl)
+
+# ── Audio I/O + DSP ─────────────────────────────────────────────────────────
+sounddevice>=0.4.6                 # PortAudio bindings (mic capture / playback)
+soundfile>=0.12.1                  # WAV encode/decode (libsndfile)
+numpy>=1.24.0
+scipy>=1.11.0
+
+# ── Text-to-speech ──────────────────────────────────────────────────────────
+kokoro>=0.7.0                      # offline Kokoro TTS (pulls torch/transformers)
+langdetect>=1.0.9                  # language detection for TTS voice routing
+
+# ── Browser automation tool ─────────────────────────────────────────────────
+playwright>=1.40.0
+
+# ── LLM provider clients / HTTP ─────────────────────────────────────────────
+openai>=1.0.0                      # OpenAI-compatible client (OpenAI/DeepSeek/Groq)
+requests>=2.31.0
+
+# ── System / input / utilities ──────────────────────────────────────────────
+psutil>=5.9.0                      # heartbeat metrics + Windows service control
+pynput>=1.7.6                      # global hotkeys (Ctrl+Space, Ctrl+Alt+O)
+tqdm>=4.65.0
+
+# ── Optional ────────────────────────────────────────────────────────────────
+# NVIDIA GPU temperature in the heartbeat monitor; safely skipped at runtime
+# when absent or when there is no NVIDIA GPU. Remove if not needed.
+pynvml>=11.5.0

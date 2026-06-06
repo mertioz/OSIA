@@ -9,10 +9,25 @@ Phase 3: listen_for_command() with retry loop — keeps listening until
 import io
 import re
 
-import sounddevice as sd
 import numpy as np
 from scipy.signal import resample as scipy_resample
 from faster_whisper import WhisperModel
+
+# sounddevice loads PortAudio at import time; on a machine with no audio backend
+# or drivers (common on headless boxes and freshly-provisioned Windows) that
+# import itself can fail. Degrade gracefully — set ``sd = None`` and let the
+# recording helpers below return empty audio so the STT pipeline yields "" and
+# text mode + the mobile server keep working (WOR-11).
+try:
+    import sounddevice as sd
+    _AUDIO_OK = True
+except Exception as _audio_exc:  # PortAudio missing / no audio device
+    sd = None
+    _AUDIO_OK = False
+    print(
+        f"⚠️  [STT] audio backend unavailable ({_audio_exc}); microphone input "
+        "is disabled (text + mobile still work)."
+    )
 
 from osia.config import get_api_key, get_setting
 from osia.voice.commands import is_new_chat_command
@@ -66,6 +81,9 @@ def record_audio(duration: int = RECORD_SECONDS, sample_rate: int = DEVICE_SAMPL
     """Record audio from the default microphone for `duration` seconds.
     Returns a numpy array of float32 samples at the device sample rate.
     """
+    if not _AUDIO_OK:
+        print("⚠️  [STT] no audio backend — cannot record.")
+        return np.zeros(0, dtype=np.float32)
     print(f"🎤 Recording for {duration} seconds... (speak now)")
     audio = sd.rec(
         int(duration * sample_rate),
@@ -90,6 +108,10 @@ def calibrate_ambient_threshold(
     `record_audio_vad()` pick it up automatically.
     """
     global _calibrated_silence_rms
+    if not _AUDIO_OK:
+        # No mic to sample — keep the conservative default silence threshold.
+        _calibrated_silence_rms = VAD_SILENCE_RMS
+        return VAD_SILENCE_RMS
     n_samples = int(duration * sample_rate)
     audio = sd.rec(n_samples, samplerate=sample_rate, channels=1, dtype="float32")
     sd.wait()
@@ -124,6 +146,9 @@ def record_audio_vad(
     Returns mono float32 samples at `sample_rate` — feed straight to
     `transcribe(audio, sample_rate=sample_rate)`.
     """
+    if not _AUDIO_OK:
+        print("⚠️  [STT] no audio backend — cannot record (VAD).")
+        return np.zeros(0, dtype=np.float32)
     if silence_rms is None:
         if _calibrated_silence_rms is None:
             calibrate_ambient_threshold(sample_rate=sample_rate)
