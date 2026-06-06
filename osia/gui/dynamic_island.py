@@ -115,6 +115,12 @@ class DynamicIsland(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
             | Qt.WindowType.WindowDoesNotAcceptFocus
+            # The WM otherwise clamps the docked "ear" back on screen (x=0),
+            # cancelling the negative-x left dock (e.g. x=-14). Bypassing the WM
+            # makes this an override-redirect window so it keeps the exact
+            # off-screen geometry we commit. Override-redirect windows also stay
+            # above managed windows, so WindowStaysOnTopHint above still holds.
+            | Qt.WindowType.X11BypassWindowManagerHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
