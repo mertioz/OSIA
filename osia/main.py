@@ -122,6 +122,28 @@ def _start_ctrl_space_listener(callback):
     return listener.stop
 
 
+def _start_popup_hotkey_listener(callback):
+    """
+    Start a global Ctrl+Alt+O listener that triggers `callback` (toggle the
+    popup). This is the recovery path so the chat/settings GUI stays reachable
+    even when the floating capsule is hidden (WOR-22 "show_capsule" toggle).
+
+    Uses pynput's GlobalHotKeys, which canonicalises the modifier+letter combo
+    reliably. `callback` runs on the listener thread, so the caller must hand in
+    a thread-safe sink (a Qt signal's ``emit``). Returns a stop function, or
+    ``None`` if the listener could not be started (never raises).
+    """
+    try:
+        from pynput import keyboard
+        hotkeys = keyboard.GlobalHotKeys({"<ctrl>+<alt>+o": callback})
+        hotkeys.daemon = True
+        hotkeys.start()
+        return hotkeys.stop
+    except Exception as e:
+        print(f"[OSIA] could not start Ctrl+Alt+O popup hotkey: {e}")
+        return None
+
+
 # ── Modes ───────────────────────────────────────────────────────────────────
 
 def text_mode():
@@ -256,6 +278,9 @@ def wake_mode():
         # Reset chat (agent + GUI) from a worker thread — "nouveau chat" voice
         # command (WOR-10). Runs on the GUI thread so Qt calls are safe.
         new_chat = pyqtSignal()
+        # Toggle the popup from the global Ctrl+Alt+O hotkey thread (WOR-22).
+        # Marshalled onto the GUI thread so popup.toggle() is Qt-safe.
+        toggle_popup = pyqtSignal()
 
     bridge = Bridge()
 
@@ -299,6 +324,9 @@ def wake_mode():
         except Exception as e:
             print(f"[DEBUG] set_model({initial_model!r}) failed: {e}")
     popup.set_current_model(agent.model)
+
+    # WOR-22: honour the saved "show the floating capsule" preference at launch.
+    island.set_capsule_visible(settings.get("show_capsule", True))
 
     # --- Wake word / hotkey trigger ---
     def on_wake():
@@ -565,6 +593,10 @@ def wake_mode():
     bridge.remote_models_signal.connect(handle_remote_models)
     bridge.conversations_changed.connect(popup.refresh_conversations)
     bridge.new_chat.connect(handle_voice_new_chat)
+    # WOR-22: Ctrl+Alt+O toggles the popup, keeping the GUI reachable even when
+    # the floating capsule is hidden.
+    bridge.toggle_popup.connect(popup.toggle)
+    stop_popup_hotkey = _start_popup_hotkey_listener(bridge.toggle_popup.emit)
 
     popup.send_text.connect(handle_send_text)
     popup.pick_file.connect(handle_pick_file)
@@ -573,6 +605,8 @@ def wake_mode():
     popup.delete_conversation.connect(handle_delete_conversation)
     popup.model_changed.connect(handle_model_change)
     popup.api_keys_saved.connect(handle_keys_saved)
+    # WOR-22: the "Show the floating capsule" toggle hides/shows the capsule.
+    popup.capsule_visibility_changed.connect(island.set_capsule_visible)
 
     # Initial population — no active conversation yet; the panel shows the
     # stored list (or its "No conversations" placeholder when empty).
@@ -659,6 +693,7 @@ def wake_mode():
     print("  OSIA — Wake Mode (Dynamic Island)")
     print(f"  Language: {DEFAULT_LANG.upper()}")
     print(f"  {trigger_label}")
+    print("  Ctrl+Alt+O: show/hide the OSIA window")
     print("=" * 60)
 
     def on_quit():
@@ -669,6 +704,8 @@ def wake_mode():
             detector.stop()
         if stop_hotkey:
             stop_hotkey()
+        if stop_popup_hotkey:
+            stop_popup_hotkey()
 
     app.aboutToQuit.connect(on_quit)
 

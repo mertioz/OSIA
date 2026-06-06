@@ -8,6 +8,7 @@ systemd unit, or a desktop launcher.
 """
 
 import os
+import platform
 import sys
 
 # <root>/osia/utils/assets.py → <root>
@@ -85,3 +86,85 @@ def ensure_desktop_entry() -> str | None:
         return dest
     except Exception:
         return None
+
+
+# ── Launch-at-login autostart (WOR-22) ──────────────────────────────────────
+# Separate from ensure_desktop_entry(): that installs the app menu launcher;
+# this manages whether OSIA starts automatically when the user logs in. On
+# Linux that is a ``~/.config/autostart/osia.desktop`` file (the XDG autostart
+# spec). Windows/Mac are stubs for now.
+
+def _autostart_desktop_path() -> str:
+    """Path to the XDG autostart entry that launches OSIA at login (Linux)."""
+    return os.path.join(
+        os.path.expanduser("~"), ".config", "autostart", "osia.desktop"
+    )
+
+
+def autostart_enabled() -> bool:
+    """Return True when OSIA is configured to launch at login.
+
+    The state is derived from the autostart entry actually existing (Linux),
+    so the settings toggle always reflects reality. Non-Linux platforms have
+    no implementation yet and report disabled.
+    """
+    if platform.system() == "Linux":
+        return os.path.exists(_autostart_desktop_path())
+    return False
+
+
+def set_autostart(enabled: bool) -> bool:
+    """Enable or disable launching OSIA (wake mode) at login.
+
+    Linux: write / remove ``~/.config/autostart/osia.desktop`` launching
+    ``osia/main.py --wake`` through the project venv with ``QT_QPA_PLATFORM=xcb``
+    forced (the GUI always runs under XCB). Returns True on success.
+
+    Windows / Mac: logs that autostart is not yet implemented and returns
+    False so the caller can revert the toggle. Never raises.
+    """
+    system = platform.system()
+    if system != "Linux":
+        if system == "Windows":
+            print("[autostart] not yet implemented on Windows")
+        elif system == "Darwin":
+            print("[autostart] not yet implemented on Mac")
+        else:
+            print(f"[autostart] not yet implemented on {system}")
+        return False
+
+    path = _autostart_desktop_path()
+    try:
+        if enabled:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            # Prefer the project venv interpreter so the autostart launch uses
+            # the same Python/deps as a manual launch; fall back to whatever is
+            # running this process.
+            py = os.path.join(PROJECT_ROOT, "venv", "bin", "python")
+            if not os.path.exists(py):
+                py = sys.executable or "python3"
+            main_py = os.path.join(PROJECT_ROOT, "osia", "main.py")
+            # .desktop Exec= does not run a shell, so the QT_QPA_PLATFORM
+            # environment variable is set via `env` (a bare `VAR=val cmd`
+            # prefix would be parsed as a binary name, not an assignment).
+            content = (
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                "Name=OSIA\n"
+                "Comment=OSIA — Local AI Voice Assistant\n"
+                f"Exec=env QT_QPA_PLATFORM=xcb {py} {main_py} --wake\n"
+                f"Icon={ICON_PATH}\n"
+                "Terminal=false\n"
+                "Categories=Utility;\n"
+                "StartupWMClass=osia\n"
+                "X-GNOME-Autostart-enabled=true\n"
+            )
+            with open(path, "w") as f:
+                f.write(content)
+        else:
+            if os.path.exists(path):
+                os.remove(path)
+        return True
+    except Exception as e:
+        print(f"[autostart] failed to {'enable' if enabled else 'disable'}: {e}")
+        return False

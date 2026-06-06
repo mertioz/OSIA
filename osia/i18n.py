@@ -1339,6 +1339,31 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Cloudflare-Tunnel",
         "es": "Túnel de Cloudflare",
     },
+    # — Floating capsule + autostart (WOR-22) —
+    "settings.capsule": {
+        "en": "Floating capsule",
+        "fr": "Capsule flottante",
+        "zh": "浮动胶囊",
+        "ja": "フローティングカプセル",
+        "de": "Schwebende Kapsel",
+        "es": "Cápsula flotante",
+    },
+    "settings.show_capsule": {
+        "en": "Show the floating capsule",
+        "fr": "Afficher la capsule flottante",
+        "zh": "显示浮动胶囊",
+        "ja": "フローティングカプセルを表示",
+        "de": "Schwebende Kapsel anzeigen",
+        "es": "Mostrar la cápsula flotante",
+    },
+    "settings.autostart_gui": {
+        "en": "Launch OSIA at startup",
+        "fr": "Lancer OSIA au démarrage",
+        "zh": "开机时启动 OSIA",
+        "ja": "起動時に OSIA を起動",
+        "de": "OSIA beim Start ausführen",
+        "es": "Iniciar OSIA al arrancar",
+    },
     # — Bottom navigation (icon tooltips) —
     "nav.conversations": {
         "en": "Conversations",

@@ -52,7 +52,7 @@ from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
     restart_service,
 )
-from osia.utils.assets import LOGO_PATH
+from osia.utils.assets import LOGO_PATH, autostart_enabled, set_autostart
 from osia import i18n
 from osia import timefmt
 
@@ -1334,6 +1334,9 @@ class _SettingsPanel(QWidget):
     """
 
     api_keys_saved = pyqtSignal(dict)
+    # Emitted when the "Show the floating capsule" toggle changes (WOR-22).
+    # The host (osia.main.wake_mode) connects it to the capsule's visibility.
+    capsule_visibility_changed = pyqtSignal(bool)
 
     # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
     # last as an info-only row).
@@ -1403,6 +1406,9 @@ class _SettingsPanel(QWidget):
         self._mobile_token: str = ""
         self._startup_refresh_guard = False
         self._startup_rows: list[tuple[str, QLabel, QCheckBox]] = []
+        # Guards the autostart toggle against re-entrant stateChanged while it is
+        # being reverted (e.g. on an unsupported platform). See WOR-22.
+        self._autostart_guard = False
         self._drag_pos: QPoint | None = None
 
         outer = QVBoxLayout(self)
@@ -1434,6 +1440,7 @@ class _SettingsPanel(QWidget):
         v.setSpacing(14)
 
         v.addWidget(self._build_language_section())
+        v.addWidget(self._build_capsule_section())          # Capsule + autostart
         v.addWidget(self._build_ai_providers_section())     # Section 1
         v.addWidget(self._build_voice_section())            # Section 2 (TTS)
         v.addWidget(self._build_wake_section())             # Wake-word greeting
@@ -1529,6 +1536,66 @@ class _SettingsPanel(QWidget):
         # Live-refresh the times shown in this panel (cron daily schedules);
         # the conversation list re-reads the setting when it is next opened.
         self._render_cron()
+
+    def _build_capsule_section(self) -> QFrame:
+        """Floating-capsule controls (WOR-22): show/hide it + launch at login."""
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._capsule_title = QLabel(i18n.t("settings.capsule"))
+        self._capsule_title.setObjectName("sectionTitle")
+        self._capsule_title.setWordWrap(True)
+        l.addWidget(self._capsule_title)
+
+        # Toggle: show / hide the floating capsule window.
+        show_row = QHBoxLayout()
+        self._show_capsule_label = QLabel(i18n.t("settings.show_capsule"))
+        self._show_capsule_label.setObjectName("providerName")
+        self._show_capsule_label.setWordWrap(True)
+        self._show_capsule_toggle = QCheckBox()
+        self._show_capsule_toggle.setObjectName("smartToggle")
+        self._show_capsule_toggle.stateChanged.connect(
+            self._on_show_capsule_changed
+        )
+        show_row.addWidget(self._show_capsule_label)
+        show_row.addStretch()
+        show_row.addWidget(self._show_capsule_toggle)
+        l.addLayout(show_row)
+
+        # Toggle: launch OSIA (wake mode) automatically at login.
+        auto_row = QHBoxLayout()
+        self._autostart_label = QLabel(i18n.t("settings.autostart_gui"))
+        self._autostart_label.setObjectName("providerName")
+        self._autostart_label.setWordWrap(True)
+        self._autostart_toggle = QCheckBox()
+        self._autostart_toggle.setObjectName("smartToggle")
+        self._autostart_toggle.stateChanged.connect(self._on_autostart_changed)
+        auto_row.addWidget(self._autostart_label)
+        auto_row.addStretch()
+        auto_row.addWidget(self._autostart_toggle)
+        l.addLayout(auto_row)
+
+        return wrap
+
+    def _on_show_capsule_changed(self, _state) -> None:
+        checked = self._show_capsule_toggle.isChecked()
+        set_setting("show_capsule", checked)
+        self.capsule_visibility_changed.emit(checked)
+
+    def _on_autostart_changed(self, _state) -> None:
+        if self._autostart_guard:
+            return
+        checked = self._autostart_toggle.isChecked()
+        ok = set_autostart(checked)
+        if not ok:
+            # Unsupported platform (Windows/Mac stub) or a write failure —
+            # revert the toggle so it keeps reflecting the real state.
+            self._autostart_guard = True
+            self._autostart_toggle.setChecked(not checked)
+            self._autostart_guard = False
 
     def _build_startup_section(self) -> QFrame:
         wrap = QFrame()
@@ -2948,6 +3015,16 @@ class _SettingsPanel(QWidget):
                 break
         self._timefmt_combo.blockSignals(False)
 
+        # Floating capsule (WOR-22) — visibility from settings, autostart from
+        # the actual autostart entry so the toggle mirrors reality.
+        self._show_capsule_toggle.blockSignals(True)
+        self._show_capsule_toggle.setChecked(
+            bool(settings.get("show_capsule", True)))
+        self._show_capsule_toggle.blockSignals(False)
+        self._autostart_toggle.blockSignals(True)
+        self._autostart_toggle.setChecked(autostart_enabled())
+        self._autostart_toggle.blockSignals(False)
+
         # Voice (TTS)
         provider = settings.get("tts_provider", "local") or "local"
         voice = settings.get("tts_voice")
@@ -3281,6 +3358,10 @@ class _SettingsPanel(QWidget):
 
     def _retranslate_sections(self) -> None:
         self._settings_title.setText(i18n.t("settings.title"))
+
+        self._capsule_title.setText(i18n.t("settings.capsule"))
+        self._show_capsule_label.setText(i18n.t("settings.show_capsule"))
+        self._autostart_label.setText(i18n.t("settings.autostart_gui"))
 
         self._ai_title.setText(i18n.t("settings.ai_providers"))
         self._ai_sub.setText(i18n.t("settings.ai_providers_sub"))
@@ -3954,6 +4035,9 @@ class MainPopup(QWidget):
     delete_conversation = pyqtSignal(str)
     model_changed = pyqtSignal(str)
     api_keys_saved = pyqtSignal(dict)
+    # Re-emitted from the settings panel: the floating-capsule visibility toggle
+    # (WOR-22). The host wires it to the Dynamic Island's set_capsule_visible.
+    capsule_visibility_changed = pyqtSignal(bool)
 
     # Index of the chat page in the QStackedWidget.
     PAGE_CHAT = 0
@@ -4034,6 +4118,9 @@ class MainPopup(QWidget):
 
         self._settings = _SettingsPanel()
         self._settings.api_keys_saved.connect(self.api_keys_saved.emit)
+        self._settings.capsule_visibility_changed.connect(
+            self.capsule_visibility_changed.emit
+        )
 
         self._osia = _OsiaPanel()
 

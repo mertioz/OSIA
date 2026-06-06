@@ -65,6 +65,36 @@ THINK_WAVE_PHASE = math.pi / 3  # phase shift between adjacent dots (60°)
 
 VALID_STATES = ("idle", "listening", "thinking", "speaking")
 
+# ── Adaptive shape (WOR-22) ──────────────────────────────────────────────────
+# Independent of the animation state above: the *shape* is driven by where the
+# capsule is dropped on screen, the *state* by what OSIA is doing. The capsule
+# morphs between three shapes with a smooth ~300ms geometry animation.
+SHAPE_CAPSULE = "capsule"   # default horizontal pill (ISLAND_W x ISLAND_H)
+SHAPE_CIRCLE = "circle"     # compact logo+mic disc, snapped into a bottom corner
+SHAPE_DOCKED = "docked"     # slid behind a side edge, only DOCK_STRIP px showing
+
+MORPH_MS = 300              # shape-morph animation duration
+CIRCLE_SIZE = 60           # circle diameter (px)
+# The pill-sized active animations (≈72px wide) are scaled by this factor when
+# painted inside the compact circle so they read as a centred glyph rather than
+# a clipped fragment.
+CIRCLE_ACTIVE_SCALE = 0.7
+DOCK_STRIP = 24            # visible strip when docked behind an edge (px)
+SHAPE_MARGIN = 8           # gap kept from the screen edge for visible shapes
+
+# Drop-zone thresholds. A bottom corner is "within 15% of the screen width AND
+# 15% of its height" of that corner → circle. Otherwise, within 40px of a side
+# edge → docked. Anything else → capsule.
+CORNER_FRAC = 0.15
+EDGE_DOCK_PX = 40
+
+
+def _clamp(value, low, high):
+    """Clamp ``value`` into ``[low, high]`` (tolerant of inverted bounds)."""
+    if high < low:
+        return low
+    return max(low, min(high, value))
+
 
 class DynamicIsland(QWidget):
     """Top-center floating capsule with state-driven animations."""
@@ -82,7 +112,10 @@ class DynamicIsland(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setFixedSize(ISLAND_W, ISLAND_H)
+        # Not setFixedSize: the shape morph animates the window geometry between
+        # the capsule (ISLAND_W x ISLAND_H) and the circle (CIRCLE_SIZE²), so the
+        # window must be resizable. It starts as the full capsule.
+        self.resize(ISLAND_W, ISLAND_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         # OSIA logo shown beside the wordmark in the idle state. Scaled once
@@ -102,6 +135,13 @@ class DynamicIsland(QWidget):
 
         # Animation state
         self._state = "idle"
+        # Adaptive shape state (WOR-22). ``_shape`` is one of SHAPE_*; for the
+        # circle/docked shapes ``_dock_side`` records which side ("left"/"right")
+        # it snapped to. ``_docked_slid_out`` is True while a docked capsule is
+        # temporarily slid out on screen (active state) before tucking back in.
+        self._shape = SHAPE_CAPSULE
+        self._dock_side = None
+        self._docked_slid_out = False
         self._phase = 0.0
         # Milliseconds elapsed in the current state — drives time-based
         # animations (thinking dots). Reset on every state change.
@@ -120,6 +160,14 @@ class DynamicIsland(QWidget):
         self._opacity_anim = QPropertyAnimation(self, b"windowOpacity")
         self._opacity_anim.setDuration(220)
         self._opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        # Shape-morph animation — smoothly animates the window geometry (size +
+        # position) between shapes. The painted corner radius follows the live
+        # geometry (see _capsule_path), so the pill rounds into a full circle as
+        # the window approaches CIRCLE_SIZE² with no separate radius animation.
+        self._morph_anim = QPropertyAnimation(self, b"geometry")
+        self._morph_anim.setDuration(MORPH_MS)
+        self._morph_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
 
         # Launch-expand animation — grows the painted capsule from tiny to full.
         self._launch_anim = QVariantAnimation(self)
@@ -155,10 +203,31 @@ class DynamicIsland(QWidget):
         self._opacity_anim.setStartValue(self.windowOpacity())
         self._opacity_anim.setEndValue(target)
         self._opacity_anim.start()
+
+        # A docked capsule slides out from behind the edge while OSIA is active
+        # (so the mic + thinking animation are fully visible) and tucks back in
+        # when it returns to idle. The shape itself stays SHAPE_DOCKED.
+        if self._shape == SHAPE_DOCKED:
+            if state == "idle":
+                if self._docked_slid_out:
+                    self._docked_slid_out = False
+                    self._apply_shape_geometry(animate=True, slid_out=False)
+            elif not self._docked_slid_out:
+                self._docked_slid_out = True
+                self._apply_shape_geometry(animate=True, slid_out=True)
+
         self.update()
 
     def current_state(self) -> str:
         return self._state
+
+    def set_capsule_visible(self, visible: bool) -> None:
+        """Show or hide the whole capsule window (WOR-22 disable toggle)."""
+        if visible:
+            self.show()
+            self.raise_()
+        else:
+            self.hide()
 
     # ── Internals ─────────────────────────────────────────────────────────
 
@@ -173,9 +242,10 @@ class DynamicIsland(QWidget):
 
     def _restore_position(self) -> None:
         """Move to the last saved position (``island_x``/``island_y`` in
-        settings), falling back to top-centre when nothing is saved or the
-        saved point is no longer on any connected screen (monitor unplugged,
-        resolution change).
+        settings) and restore the last shape (``island_shape`` /
+        ``island_dock_side``), falling back to top-centre/capsule when nothing
+        is saved or the saved point is no longer on any connected screen
+        (monitor unplugged, resolution change).
         """
         try:
             # Lazy import so the module stays importable standalone
@@ -183,32 +253,57 @@ class DynamicIsland(QWidget):
             from osia.config import load_settings
             settings = load_settings()
             x, y = settings.get("island_x"), settings.get("island_y")
+            shape = settings.get("island_shape", SHAPE_CAPSULE)
+            side = settings.get("island_dock_side")
         except Exception:
             x = y = None
-        if x is None or y is None:
+            shape, side = SHAPE_CAPSULE, None
+        if shape not in (SHAPE_CAPSULE, SHAPE_CIRCLE, SHAPE_DOCKED):
+            shape = SHAPE_CAPSULE
+        self._shape = shape
+        self._dock_side = side
+        self._docked_slid_out = False
+
+        moved = False
+        if x is not None and y is not None:
+            rect = QRect(int(x), int(y), self.width(), self.height())
+            for screen in QApplication.screens():
+                if screen.availableGeometry().intersects(rect):
+                    self.move(rect.topLeft())
+                    moved = True
+                    break
+        if not moved:
             self._position_at_top()
-            return
-        rect = QRect(int(x), int(y), self.width(), self.height())
-        for screen in QApplication.screens():
-            if screen.availableGeometry().intersects(rect):
-                self.move(rect.topLeft())
-                return
-        self._position_at_top()
+        # Snap straight to the restored shape's geometry (no launch-time morph).
+        if shape != SHAPE_CAPSULE:
+            self._apply_shape_geometry(animate=False)
 
     def _save_position(self) -> None:
-        """Persist the capsule position so the next launch restores it."""
+        """Persist the capsule position + shape so the next launch restores it.
+
+        ``island_x``/``island_y`` record where the capsule was dropped (before
+        any morph), and ``island_shape``/``island_dock_side`` the resolved shape
+        so a docked/circle capsule comes back the same way on next launch.
+        """
         try:
             from osia.config import load_settings, save_settings
             settings = load_settings()
             settings["island_x"] = self.x()
             settings["island_y"] = self.y()
+            settings["island_shape"] = self._shape
+            settings["island_dock_side"] = self._dock_side
             save_settings(settings)
         except Exception as e:
             print(f"[DynamicIsland] failed to save position: {e}")
 
     def showEvent(self, event):
         super().showEvent(event)
-        self._restore_position()
+        # Re-assert the CURRENT in-memory shape's geometry (honouring an active
+        # docked slide-out) rather than re-reading settings: the disk read +
+        # shape restore happens once in __init__. This keeps a re-shown capsule
+        # (e.g. after the visibility toggle) from snapping back behind the edge
+        # mid-conversation or clobbering the live slide-out state.
+        self._apply_shape_geometry(animate=False, slid_out=self._docked_slid_out)
         self.raise_()
 
     def _tick(self) -> None:
@@ -236,6 +331,10 @@ class DynamicIsland(QWidget):
             # everything outside the rounded rect should feel click-through.
             path = self._capsule_path()
             if path.contains(event.position()):
+                # The grab takes over geometry control — stop any in-flight
+                # morph (drop-driven shape change or docked slide) so the two
+                # geometry writers don't fight and jitter under the cursor.
+                self._morph_anim.stop()
                 self._press_global = event.globalPosition().toPoint()
                 self._drag_offset = (
                     self._press_global - self.frameGeometry().topLeft()
@@ -270,6 +369,10 @@ class DynamicIsland(QWidget):
             self._press_global = None
             self._dragging = False
             if was_drag:
+                # Re-evaluate the shape from where the capsule was dropped
+                # (capsule / circle / docked), morphing to it, then persist the
+                # drop position + resolved shape.
+                self._evaluate_and_apply_shape()
                 self._save_position()
             else:
                 # Plain click (no drag) — toggle the popup.
@@ -278,25 +381,118 @@ class DynamicIsland(QWidget):
             return
         super().mouseReleaseEvent(event)
 
+    # ── Adaptive shape (WOR-22) ───────────────────────────────────────────
+    # The shape is resolved from the dropped position (not on every move()):
+    # morphing mid-drag would fight the drag, and "dropped in a corner" /
+    # "dragged close to an edge" are inherently drop-time decisions.
+
+    def _evaluate_and_apply_shape(self) -> None:
+        shape, side = self._evaluate_shape()
+        self._set_shape(shape, side)
+
+    def _evaluate_shape(self) -> tuple[str, str | None]:
+        """Resolve (shape, side) from the capsule's current screen position."""
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        geo = self.geometry()
+        corner_w = avail.width() * CORNER_FRAC
+        corner_h = avail.height() * CORNER_FRAC
+        left_gap = geo.left() - avail.left()
+        right_gap = avail.right() - geo.right()
+        bottom_gap = avail.bottom() - geo.bottom()
+
+        # Bottom corners take priority → compact circle.
+        if bottom_gap <= corner_h and left_gap <= corner_w:
+            return SHAPE_CIRCLE, "left"
+        if bottom_gap <= corner_h and right_gap <= corner_w:
+            return SHAPE_CIRCLE, "right"
+        # Otherwise, hugging a side edge → docked.
+        if left_gap <= EDGE_DOCK_PX:
+            return SHAPE_DOCKED, "left"
+        if right_gap <= EDGE_DOCK_PX:
+            return SHAPE_DOCKED, "right"
+        return SHAPE_CAPSULE, None
+
+    def _set_shape(self, shape: str, side: str | None) -> None:
+        """Switch to ``shape`` (snapping to ``side``) with an animated morph."""
+        self._shape = shape
+        self._dock_side = side
+        self._docked_slid_out = False
+        self._apply_shape_geometry(animate=True)
+
+    def _apply_shape_geometry(self, animate: bool = True,
+                              slid_out: bool = False) -> None:
+        """Move/resize the window to the current shape's target geometry."""
+        target = self._target_geometry(self._shape, self._dock_side, slid_out)
+        self._morph_anim.stop()
+        if animate and self.isVisible():
+            self._morph_anim.setStartValue(self.geometry())
+            self._morph_anim.setEndValue(target)
+            self._morph_anim.start()
+        else:
+            self.setGeometry(target)
+        self.update()
+
+    def _target_geometry(self, shape: str, side: str | None,
+                         slid_out: bool = False) -> QRect:
+        """Compute the window rect for ``shape`` on the current screen."""
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        cur = self.geometry()
+        m = SHAPE_MARGIN
+        if side is None and shape in (SHAPE_CIRCLE, SHAPE_DOCKED):
+            side = "left" if cur.center().x() < avail.center().x() else "right"
+
+        if shape == SHAPE_CIRCLE:
+            w = h = CIRCLE_SIZE
+            x = avail.left() + m if side == "left" else avail.right() - w - m
+            y = avail.bottom() - h - m
+        elif shape == SHAPE_DOCKED:
+            w, h = ISLAND_W, ISLAND_H
+            y = _clamp(cur.top(), avail.top() + m, avail.bottom() - h - m)
+            if slid_out:
+                # Fully on screen so the mic + animation are visible.
+                x = avail.left() + m if side == "left" else avail.right() - w - m
+            elif side == "left":
+                # Hidden off the left edge, only the rounded right cap showing.
+                x = avail.left() - (w - DOCK_STRIP)
+            else:
+                # Hidden off the right edge, only the rounded left cap showing.
+                x = avail.right() - DOCK_STRIP
+        else:  # SHAPE_CAPSULE — centre on the drop point, kept fully on screen.
+            w, h = ISLAND_W, ISLAND_H
+            x = _clamp(cur.center().x() - w // 2,
+                       avail.left() + m, avail.right() - w - m)
+            y = _clamp(cur.center().y() - h // 2,
+                       avail.top() + m, avail.bottom() - h - m)
+        return QRect(int(x), int(y), int(w), int(h))
+
     # ── Painting ──────────────────────────────────────────────────────────
 
     def _capsule_rect(self) -> QRectF:
         """Current painted-capsule rect, interpolated by the launch progress.
 
-        At ``_launch_t == 1`` this fills the whole (full-size) window; while
+        At ``_launch_t == 1`` this fills the whole (current-size) window; while
         the launch animation runs it is a smaller capsule centred in the
-        window, so the surrounding translucent area stays click-through.
+        window, so the surrounding translucent area stays click-through. The
+        full size tracks the live window size (not ISLAND_W/H) so the painted
+        capsule follows the shape-morph animation between pill and circle.
         """
         t = self._launch_t
-        w = LAUNCH_W + (ISLAND_W - LAUNCH_W) * t
-        h = LAUNCH_H + (ISLAND_H - LAUNCH_H) * t
+        full_w = self.width()
+        full_h = self.height()
+        w = LAUNCH_W + (full_w - LAUNCH_W) * t
+        h = LAUNCH_H + (full_h - LAUNCH_H) * t
         x = (self.width() - w) / 2
         y = (self.height() - h) / 2
         return QRectF(x + 0.5, y + 0.5, w - 1, h - 1)
 
     def _capsule_path(self) -> QPainterPath:
         rect = self._capsule_rect()
-        radius = min(RADIUS, rect.height() / 2)
+        # Radius follows the live geometry: a wide pill keeps the 26px rounding,
+        # and as the window squares off toward CIRCLE_SIZE² it becomes a full
+        # circle — the morph between shapes needs no separate radius animation.
+        radius = min(rect.width(), rect.height()) / 2
         path = QPainterPath()
         path.addRoundedRect(rect, radius, radius)
         return path
@@ -311,17 +507,79 @@ class DynamicIsland(QWidget):
         painter.fillPath(path, BG_COLOR)
         painter.drawPath(path)
 
-        # State-specific overlay
-        if self._state == "idle":
-            self._paint_idle(painter)
-        elif self._state == "listening":
-            self._paint_listening(painter)
-        elif self._state == "thinking":
-            self._paint_thinking(painter)
-        elif self._state == "speaking":
-            self._paint_speaking(painter)
+        # Content overlay. The circle is a compact logo+mic disc when idle, and
+        # clips its active-state animation to the disc so nothing spills out.
+        if self._shape == SHAPE_CIRCLE:
+            painter.save()
+            painter.setClipPath(path)
+            if self._state == "idle":
+                self._paint_circle_idle(painter)
+            else:
+                # Scale the pill-sized active animation down around the disc
+                # centre so it fits the circle instead of being clipped.
+                cx, cy = self.width() / 2, self.height() / 2
+                painter.translate(cx, cy)
+                painter.scale(CIRCLE_ACTIVE_SCALE, CIRCLE_ACTIVE_SCALE)
+                painter.translate(-cx, -cy)
+                self._paint_state(painter)
+            painter.restore()
+        else:
+            self._paint_state(painter)
 
         painter.end()
+
+    def _paint_state(self, p: QPainter) -> None:
+        """Dispatch to the active animation-state painter (idle/…/speaking)."""
+        if self._state == "idle":
+            self._paint_idle(p)
+        elif self._state == "listening":
+            self._paint_listening(p)
+        elif self._state == "thinking":
+            self._paint_thinking(p)
+        elif self._state == "speaking":
+            self._paint_speaking(p)
+
+    def _paint_circle_idle(self, p: QPainter) -> None:
+        """Compact circle: the OSIA logo with a small mic glyph beneath it."""
+        fade = min(1.0, max(0.0, (self._launch_t - 0.7) / 0.3))
+        if fade <= 0.0:
+            return
+        rect = self._capsule_rect()
+        cx = rect.center().x()
+        cy = rect.center().y()
+
+        p.save()
+        p.setOpacity(fade)
+        if not self._logo.isNull():
+            size = int(rect.height() * 0.42)
+            logo = self._logo.scaledToHeight(
+                max(1, size), Qt.TransformationMode.SmoothTransformation
+            )
+            p.drawPixmap(
+                int(cx - logo.width() / 2.0),
+                int(cy - logo.height() - 1),
+                logo,
+            )
+        self._draw_mini_mic(p, cx, cy + rect.height() * 0.20)
+        p.restore()
+
+    def _draw_mini_mic(self, p: QPainter, cx: float, cy: float) -> None:
+        """A small static microphone glyph centred at (cx, cy), ~16px tall."""
+        pen = QPen(ACCENT, 1.4)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        # Mic body — a rounded vertical capsule.
+        p.drawRoundedRect(QRectF(cx - 3.4, cy - 7.0, 6.8, 10.5), 3.4, 3.4)
+        # Cradle arc beneath the body.
+        stand = QPainterPath()
+        stand.moveTo(cx - 6.0, cy - 0.5)
+        stand.cubicTo(cx - 6.0, cy + 5.5, cx + 6.0, cy + 5.5, cx + 6.0, cy - 0.5)
+        p.drawPath(stand)
+        # Stem + base foot.
+        p.drawLine(QPointF(cx, cy + 5.5), QPointF(cx, cy + 8.5))
+        p.drawLine(QPointF(cx - 3.0, cy + 8.5), QPointF(cx + 3.0, cy + 8.5))
 
     def _paint_idle(self, p: QPainter) -> None:
         """The OSIA logo + wordmark, dim — fading in at the end of the launch."""
