@@ -18,9 +18,11 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "speak",                "text": "..."}      # synthesize text → audio frame sent back to the phone
     {"type": "set_api_key",          "provider": "...", "key": "..."}  # save a provider key; empty key deletes it entirely (config/api_keys.json)
     {"type": "delete_api_key",       "provider": "..."}                # remove a provider's key entirely from config/api_keys.json
+    {"type": "set_api_fallback_key", "provider": "...", "index": int, "key": "..."}  # set/replace the fallback key at index (index=-1 appends) in settings.json api_key_fallbacks
+    {"type": "delete_api_fallback_key", "provider": "...", "index": int}             # remove the fallback key at index from settings.json api_key_fallbacks
     {"type": "set_setting",          "key": "...", "value": ...}       # set one whitelisted key in config/settings.json
                                                                        #   (heavy_chain/medium_chain map onto ai_hierarchy.{heavy,medium})
-    {"type": "get_config"}                                             # request the full config snapshot (settings sans secrets, personality, skills)
+    {"type": "get_config"}                                             # request the full config snapshot (settings incl. api_key_fallbacks, personality, skills)
     {"type": "set_personality",      "text": "..."}                    # save the personality document (~/.osia/personality.md)
     {"type": "set_skill",            "name": "...", "enabled": true, "text": "..."}  # update a skill's enabled flag and/or prose (both optional)
     {"type": "create_skill",         "name": "..."}                    # create a new skill from the template (starts enabled)
@@ -47,7 +49,7 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "active_conversation",  "id": "...", "title": "..."}
     {"type": "models_list",          "models": [{id,label,provider,tier}, ...], "current": "..."}
     {"type": "file_received",        "filename": "...", "path": "...", "success": true|false}
-    {"type": "config",               "config": {...}}                  # full config snapshot (settings sans secrets, personality, skills)
+    {"type": "config",               "config": {...}}                  # full config snapshot (settings incl. api_key_fallbacks, personality, skills)
     {"type": "status",               "status": "done|error"}           # ack for the config-family setters (create_skill adds "name")
 """
 
@@ -834,6 +836,97 @@ async def websocket_endpoint(ws: WebSocket):
                     await ws.send_json({"type": "status", "status": "error"})
                 continue
 
+            # --- API fallback keys (mobile fallback-keys editor, WOR-29) ---
+            # Each provider keeps an ORDERED list of backup keys under
+            # settings.json:api_key_fallbacks[provider]; the agent rotates through
+            # them when the primary key is rate-limited/exhausted. These two
+            # handlers mirror the desktop GUI editor (main_popup._persist): set
+            # replaces one slot (or appends), delete removes one slot.
+            #
+            # set_api_fallback_key sets/replaces the fallback key at ``index`` for
+            # the provider; index == -1 appends a new key. An out-of-range index
+            # (the client's view is stale) is rejected so we never punch holes in
+            # the ordered list.
+            if msg_type == "set_api_fallback_key":
+                provider = (msg.get("provider") or "").strip().lower()
+                index = msg.get("index")
+                key = (msg.get("key") or "").strip()
+                # bool is an int subclass: reject JSON true/false explicitly so it
+                # can't slip through as index 1/0 and clobber the wrong slot.
+                if (not provider or isinstance(index, bool)
+                        or not isinstance(index, int) or not key):
+                    await ws.send_json({"type": "status", "status": "error"})
+                    continue
+                try:
+                    from osia.config import get_setting, set_setting
+                    fallbacks = dict(get_setting("api_key_fallbacks", {}) or {})
+                    chain = list(fallbacks.get(provider) or [])
+                    if index == -1:
+                        chain.append(key)
+                    elif 0 <= index < len(chain):
+                        chain[index] = key
+                    else:
+                        print(
+                            f"[OSIA Server] set_api_fallback_key provider={provider!r} "
+                            f"rejected out-of-range index={index} (len={len(chain)})"
+                        )
+                        await ws.send_json({"type": "status", "status": "error"})
+                        continue
+                    fallbacks[provider] = chain
+                    set_setting("api_key_fallbacks", fallbacks)
+                    print(
+                        f"[OSIA Server] set_api_fallback_key provider={provider!r} "
+                        f"index={index} ({len(chain)} keys, len={len(key)})"
+                    )
+                    await ws.send_json({"type": "status", "status": "done"})
+                except Exception as e:
+                    print(
+                        f"[OSIA Server] set_api_fallback_key({provider!r}) failed: {e}"
+                    )
+                    await ws.send_json({"type": "status", "status": "error"})
+                continue
+
+            # delete_api_fallback_key removes the fallback key at ``index`` for the
+            # provider. When the last key for a provider is removed the provider
+            # entry is dropped entirely (same as the desktop GUI _persist), so the
+            # dict never carries empty lists. Out-of-range index is rejected.
+            if msg_type == "delete_api_fallback_key":
+                provider = (msg.get("provider") or "").strip().lower()
+                index = msg.get("index")
+                # bool is an int subclass: reject JSON true/false explicitly so it
+                # can't slip through as index 1/0 and delete the wrong slot.
+                if not provider or isinstance(index, bool) or not isinstance(index, int):
+                    await ws.send_json({"type": "status", "status": "error"})
+                    continue
+                try:
+                    from osia.config import get_setting, set_setting
+                    fallbacks = dict(get_setting("api_key_fallbacks", {}) or {})
+                    chain = list(fallbacks.get(provider) or [])
+                    if not (0 <= index < len(chain)):
+                        print(
+                            f"[OSIA Server] delete_api_fallback_key provider={provider!r} "
+                            f"rejected out-of-range index={index} (len={len(chain)})"
+                        )
+                        await ws.send_json({"type": "status", "status": "error"})
+                        continue
+                    chain.pop(index)
+                    if chain:
+                        fallbacks[provider] = chain
+                    else:
+                        fallbacks.pop(provider, None)
+                    set_setting("api_key_fallbacks", fallbacks)
+                    print(
+                        f"[OSIA Server] delete_api_fallback_key provider={provider!r} "
+                        f"index={index} ({len(chain)} keys left)"
+                    )
+                    await ws.send_json({"type": "status", "status": "done"})
+                except Exception as e:
+                    print(
+                        f"[OSIA Server] delete_api_fallback_key({provider!r}) failed: {e}"
+                    )
+                    await ws.send_json({"type": "status", "status": "error"})
+                continue
+
             if msg_type == "set_setting":
                 setting_key = (msg.get("key") or "").strip()
                 setting_value = msg.get("value")
@@ -892,18 +985,19 @@ async def websocket_endpoint(ws: WebSocket):
 
             # --- Config snapshot (mobile "OSIA / Personality / Skills" screen) ---
             # get_config returns everything the mobile config screens need in one
-            # frame: the settings.json contents (MINUS stored secrets), the two
+            # frame: the settings.json contents (incl. api_key_fallbacks), the two
             # hierarchy chains exposed under their flat mobile names, the
             # personality document, and the full skill list (name/enabled/prose).
             if msg_type == "get_config":
                 try:
-                    from osia.config import load_settings, load_api_keys
+                    from osia.config import load_settings, load_api_keys, get_setting
                     from osia import personality
                     cfg = load_settings()
-                    # Never ship stored secrets over the wire: api_key_fallbacks
-                    # holds raw provider keys. Expose only WHICH providers have a
-                    # key set, never the keys themselves.
-                    cfg.pop("api_key_fallbacks", None)
+                    # api_key_fallbacks holds the raw ordered fallback keys per
+                    # provider (WOR-29). The mobile fallback-keys editor needs the
+                    # actual keys, so ship them as-is — the connection is already
+                    # authenticated + TLS, identical to the get_api_keys path.
+                    cfg["api_key_fallbacks"] = get_setting("api_key_fallbacks", {})
                     # Desktop-only capsule position is meaningless to the phone.
                     cfg.pop("island_x", None)
                     cfg.pop("island_y", None)
@@ -937,9 +1031,11 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             # --- API keys (mobile "Configure APIs & Providers" editor) ---
-            # Unlike get_config (which reveals only WHICH providers have a key),
-            # get_api_keys returns the actual stored key per provider so the
-            # mobile editor can display/prefill them. Authenticated-only.
+            # get_config's api_keys_set field reveals only WHICH providers have a
+            # primary key; get_api_keys returns the actual stored primary key per
+            # provider so the mobile editor can display/prefill them. (Fallback
+            # keys travel separately via get_config's api_key_fallbacks.)
+            # Authenticated-only.
             if msg_type == "get_api_keys":
                 try:
                     from osia.config import get_api_key
