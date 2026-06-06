@@ -76,6 +76,7 @@ import soundfile as sf
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 
 from osia import conversations
+from osia.config import CONFIG_DIR as _CONFIG_DIR
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -84,9 +85,11 @@ from osia import conversations
 # runs from any install location / drive on both Linux and Windows (WOR-11),
 # never a hardcoded /home/OSIA/code/... path.
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-# Per-user config/data dir — matches osia.config.CONFIG_DIR (``~/.osia``) so the
-# server and the desktop GUI share one mobile token and config on both OSes.
-CONFIG_DIR = Path.home() / ".osia"
+# Per-user config/data dir — imported from osia.config so the server and the
+# desktop GUI always resolve the SAME directory via ``_resolve_config_dir()``
+# (``~/.osia``, with the Linux <repo>/config fallback). Wrapped in ``Path`` here
+# because osia.config.CONFIG_DIR is a ``str`` while the server uses Path ops.
+CONFIG_DIR = Path(_CONFIG_DIR)
 TOKEN_FILE = CONFIG_DIR / "mobile_token.txt"
 # Cross-platform scratch dir for mobile uploads — ``/tmp`` does not exist on
 # Windows, so derive it from the OS temp dir instead.

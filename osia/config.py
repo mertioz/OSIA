@@ -6,22 +6,46 @@ read/write only). Settings are stored at ``~/.osia/settings.json``. The mobile
 pairing token lives at ``~/.osia/mobile_token.txt``.
 
 The config directory resolves to ``Path.home() / ".osia"`` so it is per-user
-and works identically on Linux (``/home/<user>/.osia``) and Windows
-(``C:\\Users\\<user>\\.osia``) — see WOR-11 (Windows port).
+and works identically on Windows (``C:\\Users\\<user>\\.osia``) and Mac. On
+Linux it falls back to the in-repo ``<repo>/config/`` dir for backward
+compatibility with the existing dev setup when ``~/.osia`` does not yet exist
+— see WOR-11 (Windows port) and ``_resolve_config_dir`` below.
 """
 
 import json
 import os
 import secrets
 import stat
+import sys
 from pathlib import Path
 
 # <repo>/osia/config.py → <repo>. Dynamic so the package works from any
 # install location / drive (no hardcoded /home/OSIA/code/... path).
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Per-user config/data dir, identical resolution on Linux and Windows.
-CONFIG_DIR = str(Path.home() / ".osia")
+
+def _resolve_config_dir() -> str:
+    """Resolve the per-user config/data dir.
+
+    Windows and Mac (and Linux once ``~/.osia`` exists) use the cross-platform
+    per-user dir ``Path.home() / ".osia"`` (WOR-11). On Linux only, when that
+    dir does not yet exist but the in-repo ``<repo>/config/`` dir does and
+    already holds ``settings.json`` or ``api_keys.json``, fall back to it so
+    the existing Linux dev setup keeps working.
+    """
+    home_dir = Path.home() / ".osia"
+    if sys.platform.startswith("linux") and not home_dir.exists():
+        repo_config = PROJECT_ROOT / "config"
+        if repo_config.is_dir() and (
+            (repo_config / "settings.json").exists()
+            or (repo_config / "api_keys.json").exists()
+        ):
+            return str(repo_config)
+    return str(home_dir)
+
+
+# Per-user config/data dir; Linux dev falls back to <repo>/config (see above).
+CONFIG_DIR = _resolve_config_dir()
 API_KEYS_FILE = os.path.join(CONFIG_DIR, "api_keys.json")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 MOBILE_TOKEN_FILE = os.path.join(CONFIG_DIR, "mobile_token.txt")
