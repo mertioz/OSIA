@@ -16,7 +16,8 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "set_model",            "model": "..."}
     {"type": "file",                 "filename": "...", "data": "<base64>"}
     {"type": "speak",                "text": "..."}      # synthesize text → audio frame sent back to the phone
-    {"type": "set_api_key",          "provider": "...", "key": "..."}  # save/clear a provider key (config/api_keys.json)
+    {"type": "set_api_key",          "provider": "...", "key": "..."}  # save a provider key; empty key deletes it entirely (config/api_keys.json)
+    {"type": "delete_api_key",       "provider": "..."}                # remove a provider's key entirely from config/api_keys.json
     {"type": "set_setting",          "key": "...", "value": ...}       # set one whitelisted key in config/settings.json
                                                                        #   (heavy_chain/medium_chain map onto ai_hierarchy.{heavy,medium})
     {"type": "get_config"}                                             # request the full config snapshot (settings sans secrets, personality, skills)
@@ -784,15 +785,52 @@ async def websocket_endpoint(ws: WebSocket):
                     await ws.send_json({"type": "status", "status": "error"})
                     continue
                 try:
-                    from osia.config import set_api_key
-                    set_api_key(provider, key)
-                    print(
-                        f"[OSIA Server] set_api_key provider={provider!r} "
-                        f"({'set, len=' + str(len(key)) if key else 'cleared'})"
+                    from osia.config import (
+                        set_api_key, load_api_keys, save_api_keys,
                     )
+                    if key:
+                        set_api_key(provider, key)
+                        print(
+                            f"[OSIA Server] set_api_key provider={provider!r} "
+                            f"(set, len={len(key)})"
+                        )
+                    else:
+                        # An empty value means "delete": drop the entry from
+                        # api_keys.json entirely rather than storing "". Same
+                        # behavior as the delete_api_key handler below.
+                        keys = load_api_keys()
+                        keys.pop(provider, None)
+                        save_api_keys(keys)
+                        print(
+                            f"[OSIA Server] set_api_key provider={provider!r} "
+                            f"(empty -> deleted)"
+                        )
                     await ws.send_json({"type": "status", "status": "done"})
                 except Exception as e:
                     print(f"[OSIA Server] set_api_key({provider!r}) failed: {e}")
+                    await ws.send_json({"type": "status", "status": "error"})
+                continue
+
+            # delete_api_key removes a provider's key entirely from the canonical
+            # key store (config/api_keys.json) — it does NOT leave behind an empty
+            # string, so get_api_key()/load_api_keys() report the provider as unset.
+            if msg_type == "delete_api_key":
+                provider = (msg.get("provider") or "").strip().lower()
+                if not provider:
+                    await ws.send_json({"type": "status", "status": "error"})
+                    continue
+                try:
+                    from osia.config import load_api_keys, save_api_keys
+                    keys = load_api_keys()
+                    existed = keys.pop(provider, None) is not None
+                    save_api_keys(keys)
+                    print(
+                        f"[OSIA Server] delete_api_key provider={provider!r} "
+                        f"({'removed' if existed else 'absent'})"
+                    )
+                    await ws.send_json({"type": "status", "status": "done"})
+                except Exception as e:
+                    print(f"[OSIA Server] delete_api_key({provider!r}) failed: {e}")
                     await ws.send_json({"type": "status", "status": "error"})
                 continue
 
