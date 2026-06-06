@@ -60,6 +60,11 @@ DEFAULT_SETTINGS = {
     "liveapi_enabled": False,                  # master switch
     "liveapi_provider": "google",              # "google", "openai", "claude"
     "liveapi_model": "gemini-3.1-flash-live",  # provider-specific live model id
+    # Wake-word listener master switch (settings UI toggle): when False OSIA
+    # does not start — and stops — the always-on "OSIA" wake-word detector.
+    # OSIA stays reachable via the capsule click and the Ctrl+Alt+O window.
+    # Wired in osia.main.wake_mode via MainPopup.wake_word_enabled_changed.
+    "wake_word_enabled": True,
     # Wake-word greeting: when enabled, OSIA speaks ``wake_greeting_text`` right
     # after the wake word is detected and BEFORE it starts listening for the
     # command (see osia.main.wake_mode.handle_wake). Empty text = no greeting.
@@ -107,6 +112,8 @@ DEFAULT_SETTINGS = {
     # recorded flag defaults to enabled. Enabled skills are appended to the
     # system prompt — see osia.personality and osia.agent.get_system_prompt.
     "skills_enabled": {},
+    "island_shape": "capsule",  # adaptive shape: "capsule", "circle", "docked"
+    "island_dock_side": "right",  # docked screen edge: "left", "right"
     "island_x": None,          # last dragged capsule position; None = top-centre
     "island_y": None,
 }

@@ -11,6 +11,7 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "get_conversations"}                                      # compact id+title list (≤50 most recent) for the mobile cron "linked conversation" picker
     {"type": "load_conversation",    "id": "..."}
     {"type": "new_conversation"}
+    {"type": "new_chat"}                                               # "Nouveau chat" voice command relayed from mobile; resets server state like new_conversation, then broadcasts new_chat to other devices (WOR-10)
     {"type": "delete_conversation",  "id": "..."}
     {"type": "get_models"}
     {"type": "set_model",            "model": "..."}
@@ -29,6 +30,7 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "delete_skill",         "name": "..."}                    # delete a skill and drop its enabled flag
     {"type": "get_api_keys"}                                           # request the actual stored provider keys (mobile API-keys editor)
     {"type": "get_heartbeat_config"}                                   # request the live-heartbeat enable flag + push interval (seconds)
+    {"type": "restart_server"}                                         # restart the server process in place via os.execv; acked with status "done" + "message": "restarting" first (WOR-28)
   Server → Client:
     {"type": "api_keys",             "keys": {provider: key, ...}}     # actual stored keys, one entry per models.API_PROVIDERS ("" if unset)
     {"type": "heartbeat_config",     "config": {"enabled": bool, "interval_seconds": int}}
@@ -47,10 +49,11 @@ Protocol (JSON over WebSocket, port 8765):
                                      "messages": [{"role": "user|assistant", "content": "..."}]}
     {"type": "conversation_deleted", "id": "...", "success": true|false}
     {"type": "active_conversation",  "id": "...", "title": "..."}
+    {"type": "new_chat"}                                               # broadcast to OTHER connected devices when one device starts a new chat, so every UI clears (WOR-10)
     {"type": "models_list",          "models": [{id,label,provider,tier}, ...], "current": "..."}
     {"type": "file_received",        "filename": "...", "path": "...", "success": true|false}
     {"type": "config",               "config": {...}}                  # full config snapshot (settings incl. api_key_fallbacks, personality, skills)
-    {"type": "status",               "status": "done|error"}           # ack for the config-family setters (create_skill adds "name")
+    {"type": "status",               "status": "done|error"}           # ack for the config-family setters (create_skill adds "name", restart_server adds "message": "restarting")
 """
 
 import asyncio
@@ -710,6 +713,20 @@ async def websocket_endpoint(ws: WebSocket):
                 await _broadcast_new_chat(exclude=ws)
                 continue
 
+            if msg_type == "restart_server":
+                # Self-restart the server process in place (WOR-28). Ack the
+                # client first so the phone knows the request landed, then
+                # re-exec the same interpreter + argv; os.execv replaces this
+                # process image, so nothing after the call runs.
+                print("[OSIA Server] restart_server requested → re-exec")
+                await ws.send_json({
+                    "type": "status",
+                    "status": "done",
+                    "message": "restarting",
+                })
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+                continue
+
             if msg_type == "load_conversation":
                 conv_id = msg.get("id", "")
                 conv = conversations.get_conversation(conv_id)
@@ -935,7 +952,8 @@ async def websocket_endpoint(ws: WebSocket):
                 # arbitrary server state.
                 allowed_settings = {
                     "liveapi_enabled", "liveapi_provider", "liveapi_model",
-                    "tts_provider", "stt_provider",
+                    "tts_provider", "tts_voice", "stt_provider",
+                    "wake_word_enabled",
                     "wake_greeting_enabled", "wake_greeting_text",
                     "cron_jobs", "ai_hierarchy_enabled",
                     # Flat aliases for the two AI-hierarchy fallback chains; the
