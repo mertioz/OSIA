@@ -15,6 +15,7 @@ from scipy.signal import resample as scipy_resample
 from faster_whisper import WhisperModel
 
 from osia.config import get_api_key, get_setting
+from osia.voice.commands import is_new_chat_command
 
 DEVICE_SAMPLE_RATE = 48000  # Hardware native rate
 WHISPER_SAMPLE_RATE = 16000
@@ -411,6 +412,13 @@ def listen_for_command(max_retries: int = 3) -> str:
         if not text:
             print("   ⚠️  Nothing transcribed, retrying...")
             continue
+
+        # Control commands like "nouveau chat" / "new chat" are short (1-2
+        # words) and would otherwise be dropped by the word-count gate below.
+        # Let them through so the caller can intercept them.
+        if is_new_chat_command(text):
+            print(f"   ✅ New-chat command: '{text}'")
+            return text
 
         words = text.strip().split()
         if len(words) < 3:

@@ -30,6 +30,26 @@ from osia.agent import OSIAAgent, DEFAULT_LANG, get_system_prompt
 from osia import conversations
 from osia.tools import verify_tools
 
+# Loopback trigger for the mobile WebSocket server (osia/server/server.py,
+# listens on :8765). Used by the "nouveau chat" voice command (WOR-10) to push
+# a {"type": "new_chat"} reset to every connected device. The endpoint is
+# localhost-only on the server side.
+_SERVER_NEW_CHAT_URL = "http://127.0.0.1:8765/internal/new_chat"
+
+
+def _notify_mobile_new_chat() -> None:
+    """Best-effort: ask the mobile server to broadcast a new-chat reset to all
+    connected devices. Silent no-op when the server isn't running."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            _SERVER_NEW_CHAT_URL, data=b"{}", method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=1.5).close()
+    except Exception as e:
+        print(f"[WOR-10] mobile new_chat notify skipped: {e}")
+
 
 def _persist_agent_delta(conv_id, agent, prev_history_len):
     """Persist messages added to ``agent.messages`` during the most recent
@@ -215,8 +235,10 @@ def wake_mode():
     from osia.gui.main_popup import MainPopup
     from osia.voice.wake import WakeWordDetector, verifier_available
     from osia.voice.stt import listen_for_command
+    from osia.voice.commands import is_new_chat_command
     from osia.voice.tts import speak, speak_streaming, stop as tts_stop
     from osia.agent import clean_response
+    from osia import i18n
     from osia.config import load_settings, set_setting
     from osia.models import discover_models_async
     from osia.cron import CronManager
@@ -231,6 +253,9 @@ def wake_mode():
         island_state = pyqtSignal(str)
         # Refresh the conversations panel (new active id) from a worker thread.
         conversations_changed = pyqtSignal(str)
+        # Reset chat (agent + GUI) from a worker thread — "nouveau chat" voice
+        # command (WOR-10). Runs on the GUI thread so Qt calls are safe.
+        new_chat = pyqtSignal()
 
     bridge = Bridge()
 
@@ -408,6 +433,15 @@ def wake_mode():
                     speak("Je n'ai pas compris, répétez.")
                     return
                 print(f"📝 You said: {user_text}")
+                # WOR-10 — intercept "nouveau chat" / "new chat" before the LLM.
+                if is_new_chat_command(user_text):
+                    print("🆕 Voice command recognised: new chat")
+                    bridge.new_chat.emit()        # reset agent + GUI (Qt thread)
+                    _notify_mobile_new_chat()      # push {"type":"new_chat"} to mobile
+                    bridge.island_state.emit("speaking")
+                    speak(i18n.t("conversations.new_chat_confirm"))
+                    bridge.island_state.emit("idle")
+                    return
                 bridge.chat_message.emit("user", user_text)
                 _run_agent(user_text, voice_response=True)
             finally:
@@ -449,6 +483,18 @@ def wake_mode():
         popup.set_messages([])
         popup.refresh_conversations(active_conv["id"])
         print(f"🆕 New conversation: {active_conv['id']}")
+
+    def handle_voice_new_chat():
+        # GUI-thread reset for the "nouveau chat" voice command (WOR-10).
+        # Same effect as clicking "Nouveau chat": clear agent history, start a
+        # fresh conversation, and reset the chat view + Dynamic Island.
+        nonlocal active_conv
+        agent.reset()
+        active_conv = conversations.create_conversation()
+        popup.reset_conversation()
+        popup.refresh_conversations(active_conv["id"])
+        island.set_state("idle")
+        print(f"🆕 New conversation (voice): {active_conv['id']}")
 
     def handle_open_conversation(conv_id: str):
         nonlocal active_conv
@@ -518,6 +564,7 @@ def wake_mode():
     bridge.island_state.connect(handle_island_state)
     bridge.remote_models_signal.connect(handle_remote_models)
     bridge.conversations_changed.connect(popup.refresh_conversations)
+    bridge.new_chat.connect(handle_voice_new_chat)
 
     popup.send_text.connect(handle_send_text)
     popup.pick_file.connect(handle_pick_file)

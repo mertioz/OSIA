@@ -23,7 +23,15 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "set_skill",            "name": "...", "enabled": true, "text": "..."}  # update a skill's enabled flag and/or prose (both optional)
     {"type": "create_skill",         "name": "..."}                    # create a new skill from the template (starts enabled)
     {"type": "delete_skill",         "name": "..."}                    # delete a skill and drop its enabled flag
+    {"type": "get_api_keys"}                                           # request the actual stored provider keys (mobile API-keys editor)
+    {"type": "get_heartbeat_config"}                                   # request the live-heartbeat enable flag + push interval (seconds)
   Server → Client:
+    {"type": "api_keys",             "keys": {provider: key, ...}}     # actual stored keys, one entry per models.API_PROVIDERS ("" if unset)
+    {"type": "heartbeat_config",     "config": {"enabled": bool, "interval_seconds": int}}
+    {"type": "heartbeat_data",       "cpu_percent": float, "ram_mb": int,
+                                     "ram_percent": float, "disk_percent": float,
+                                     "cpu_temp": float|null, "gpu_temp": float|null,
+                                     "timestamp": "<ISO>"}              # pushed every heartbeat_interval_seconds while heartbeat_enabled
     {"type": "transcript",           "content": "..."}
     {"type": "response_chunk",       "content": "..."}        # streamed sentence-by-sentence
     {"type": "response",             "content": "..."}        # final assembled reply
@@ -50,11 +58,13 @@ import subprocess
 import sys
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import psutil
 import soundfile as sf
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 
 from osia import conversations
 
@@ -345,6 +355,36 @@ def decode_base64_wav(b64_data: str) -> tuple[np.ndarray, int]:
 app = FastAPI(title="OSIA Mobile Server", version="1.0.0")
 
 
+# Registry of authenticated mobile WebSocket clients (WOR-10). Used to push
+# server-initiated frames — currently the "new chat" reset triggered either by
+# a mobile device or by the desktop app's voice command. Populated after a
+# successful auth, pruned on disconnect.
+_WS_CLIENTS: set[WebSocket] = set()
+
+
+async def _broadcast_new_chat(exclude: WebSocket | None = None) -> None:
+    """Best-effort fan-out of {"type": "new_chat"} to all connected clients."""
+    for client in list(_WS_CLIENTS):
+        if client is exclude:
+            continue
+        try:
+            await client.send_json({"type": "new_chat"})
+        except Exception:
+            _WS_CLIENTS.discard(client)
+
+
+@app.post("/internal/new_chat")
+async def internal_new_chat(request: Request):
+    """Localhost-only trigger used by the desktop app (osia/main.py) when the
+    user says "nouveau chat" / "new chat". Pushes the reset to every connected
+    mobile device. Not part of the public mobile WS protocol."""
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    await _broadcast_new_chat()
+    return {"ok": True, "clients": len(_WS_CLIENTS)}
+
+
 @app.on_event("startup")
 async def _warm_models() -> None:
     """Pre-load slow models in the background at server startup so the
@@ -383,6 +423,113 @@ async def health():
     return {"status": "healthy"}
 
 
+# ---------------------------------------------------------------------------
+# Live system-metrics heartbeat (pushed to connected mobile clients)
+# ---------------------------------------------------------------------------
+def _read_cpu_temp() -> float | None:
+    """Best-effort CPU temperature in °C, or None if unavailable.
+
+    ``psutil.sensors_temperatures`` is Linux-only (absent on Windows/macOS,
+    hence the getattr guard). Prefer well-known CPU sensor chips, then fall
+    back to the first reading any chip reports.
+    """
+    try:
+        sensors = getattr(psutil, "sensors_temperatures", None)
+        if not sensors:
+            return None
+        temps = sensors()
+        if not temps:
+            return None
+        for chip in ("coretemp", "k10temp", "zenpower", "cpu_thermal", "acpitz"):
+            entries = temps.get(chip)
+            if entries:
+                return float(entries[0].current)
+        for entries in temps.values():
+            if entries:
+                return float(entries[0].current)
+    except Exception:
+        pass
+    return None
+
+
+def _read_gpu_temp() -> float | None:
+    """Best-effort NVIDIA GPU temperature in °C via pynvml, or None.
+
+    pynvml is an optional dependency; any failure (package missing, no NVIDIA
+    driver, no GPU) yields None rather than raising.
+    """
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            temp = pynvml.nvmlDeviceGetTemperature(
+                handle, pynvml.NVML_TEMPERATURE_GPU
+            )
+            return float(temp)
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        return None
+
+
+def _collect_heartbeat_data() -> dict:
+    """Snapshot system metrics for a ``heartbeat_data`` frame.
+
+    ``cpu_percent(interval=None)`` is non-blocking: it reports usage since the
+    previous call, and the push loop's cadence supplies that spacing, so the
+    event loop is never blocked.
+    """
+    vm = psutil.virtual_memory()
+    return {
+        "type": "heartbeat_data",
+        "cpu_percent": float(psutil.cpu_percent(interval=None)),
+        "ram_mb": int(vm.used / (1024 * 1024)),
+        "ram_percent": float(vm.percent),
+        "disk_percent": float(psutil.disk_usage("/").percent),
+        "cpu_temp": _read_cpu_temp(),
+        "gpu_temp": _read_gpu_temp(),
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+async def _heartbeat_push_loop(ws: WebSocket) -> None:
+    """Push ``heartbeat_data`` frames to one authenticated client.
+
+    Settings are re-read every tick so toggling ``heartbeat_enabled`` or
+    changing ``heartbeat_interval_seconds`` takes effect live (no reconnect).
+    The cadence is seconds-granularity and is deliberately distinct from the
+    desktop monitor's ``heartbeat_interval_minutes`` (osia/heartbeat.py).
+    Cancelled by ``websocket_endpoint`` on disconnect.
+    """
+    # Prime cpu_percent so the first emitted sample reflects real usage rather
+    # than psutil's 0.0 "first call" placeholder.
+    try:
+        psutil.cpu_percent(interval=None)
+    except Exception:
+        pass
+    while True:
+        try:
+            from osia.config import load_settings
+            settings = load_settings()
+            try:
+                interval = float(settings.get("heartbeat_interval_seconds", 5) or 5)
+            except (TypeError, ValueError):
+                interval = 5.0
+            if interval <= 0:
+                interval = 5.0
+            if settings.get("heartbeat_enabled", False):
+                await ws.send_json(_collect_heartbeat_data())
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # A transient sampling/send failure must not kill the loop; the
+            # main read loop owns disconnect detection and cancellation.
+            print(f"[OSIA Server] heartbeat push error: {e}")
+            await asyncio.sleep(5)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -397,6 +544,9 @@ async def websocket_endpoint(ws: WebSocket):
     # Files uploaded by the client that haven't been consumed by a turn yet.
     # The next text/audio turn consumes and clears this list.
     pending_files: list[str] = []
+    # Live system-metrics push task (heartbeat_data frames). Created once after
+    # a successful auth, cancelled in the finally block on disconnect.
+    heartbeat_task: asyncio.Task | None = None
 
     first_message_logged = False
     try:
@@ -434,6 +584,9 @@ async def websocket_endpoint(ws: WebSocket):
                     authenticated = True
                     session_history = []
                     active_conv_id = None
+                    # Track this client so server-initiated frames (e.g. a
+                    # "new chat" reset) can reach it (WOR-10).
+                    _WS_CLIENTS.add(ws)
                     # Send the first data frames the mobile app expects right
                     # after auth. Build the conversation list DEFENSIVELY: a
                     # failure here must not silently tear down a freshly
@@ -459,6 +612,13 @@ async def websocket_endpoint(ws: WebSocket):
                         f"({len(items)} items)"
                     )
                     print("[OSIA Server] Mobile client authenticated.")
+                    # Start the live system-metrics push for this client. The
+                    # loop self-gates on heartbeat_enabled; guard against a
+                    # stray second auth frame spawning a duplicate loop.
+                    if heartbeat_task is None:
+                        heartbeat_task = asyncio.create_task(
+                            _heartbeat_push_loop(ws)
+                        )
                 else:
                     print("[WS] closing connection, reason: invalid token")
                     await ws.send_json({"type": "status", "content": "error"})
@@ -505,6 +665,30 @@ async def websocket_endpoint(ws: WebSocket):
                     "type": "conversations",
                     "items": conversations.list_conversations(),
                 })
+                continue
+
+            if msg_type == "new_chat":
+                # "Nouveau chat" voice command relayed from the mobile (WOR-10).
+                # Reset this session's server-side state (the PC side) exactly
+                # like new_conversation, then notify any OTHER connected devices
+                # so every UI clears too.
+                session_history = []
+                conv = conversations.create_conversation()
+                active_conv_id = conv["id"]
+                print(
+                    f"[OSIA Server] new_chat from mobile → reset, "
+                    f"new conv {active_conv_id}"
+                )
+                await ws.send_json({
+                    "type": "active_conversation",
+                    "id": conv["id"],
+                    "title": conv["title"],
+                })
+                await ws.send_json({
+                    "type": "conversations",
+                    "items": conversations.list_conversations(),
+                })
+                await _broadcast_new_chat(exclude=ws)
                 continue
 
             if msg_type == "load_conversation":
@@ -610,6 +794,9 @@ async def websocket_endpoint(ws: WebSocket):
                     # Flat aliases for the two AI-hierarchy fallback chains; the
                     # write path below folds them into ai_hierarchy.{heavy,medium}.
                     "heavy_chain", "medium_chain",
+                    # Live system-metrics push: master flag (shared with the
+                    # desktop monitor) + seconds-granularity push cadence.
+                    "heartbeat_enabled", "heartbeat_interval_seconds",
                 }
                 if setting_key not in allowed_settings:
                     print(
@@ -690,6 +877,50 @@ async def websocket_endpoint(ws: WebSocket):
                 except Exception as e:
                     print(f"[OSIA Server] get_config failed: {e}")
                     traceback.print_exc()
+                    await ws.send_json({"type": "status", "status": "error"})
+                continue
+
+            # --- API keys (mobile "Configure APIs & Providers" editor) ---
+            # Unlike get_config (which reveals only WHICH providers have a key),
+            # get_api_keys returns the actual stored key per provider so the
+            # mobile editor can display/prefill them. Authenticated-only.
+            if msg_type == "get_api_keys":
+                try:
+                    from osia.config import get_api_key
+                    from osia.models import API_PROVIDERS
+                    keys = {p: get_api_key(p) for p in API_PROVIDERS}
+                    await ws.send_json({"type": "api_keys", "keys": keys})
+                    print(
+                        f"[OSIA Server] get_api_keys sent "
+                        f"({sum(1 for v in keys.values() if v)}/{len(keys)} set)"
+                    )
+                except Exception as e:
+                    print(f"[OSIA Server] get_api_keys failed: {e}")
+                    await ws.send_json({"type": "status", "status": "error"})
+                continue
+
+            # --- Heartbeat config (mobile live-metrics screen) ---
+            # enable flag + the seconds-granularity push cadence used by the
+            # heartbeat_data stream (distinct from the desktop monitor's
+            # heartbeat_interval_minutes).
+            if msg_type == "get_heartbeat_config":
+                try:
+                    from osia.config import load_settings
+                    s = load_settings()
+                    try:
+                        interval = int(s.get("heartbeat_interval_seconds", 5) or 5)
+                    except (TypeError, ValueError):
+                        interval = 5
+                    await ws.send_json({
+                        "type": "heartbeat_config",
+                        "config": {
+                            "enabled": bool(s.get("heartbeat_enabled", False)),
+                            "interval_seconds": interval,
+                        },
+                    })
+                    print("[OSIA Server] get_heartbeat_config sent")
+                except Exception as e:
+                    print(f"[OSIA Server] get_heartbeat_config failed: {e}")
                     await ws.send_json({"type": "status", "status": "error"})
                 continue
 
@@ -913,6 +1144,18 @@ async def websocket_endpoint(ws: WebSocket):
         except Exception:
             pass
     finally:
+        # Drop this client from the broadcast registry (WOR-10). discard() is
+        # a no-op if it was never added (e.g. auth failed).
+        _WS_CLIENTS.discard(ws)
+        # Stop this client's live heartbeat push (no-op if never started).
+        # Cancel then await so the task unwinds cleanly without a pending-task
+        # warning; CancelledError on the await is expected.
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
         # State is local to this function; on return it is garbage-collected.
         session_history = []
         active_conv_id = None

@@ -4142,6 +4142,16 @@ class MainPopup(QWidget):
     def set_messages(self, messages: list[dict]) -> None:
         self._chat.set_messages(messages)
 
+    def reset_conversation(self) -> None:
+        """Clear the chat view back to its empty state and show the chat page.
+
+        Display-only counterpart to the "Nouveau chat" action: used when the
+        backend (agent history + active conversation) has already been reset
+        elsewhere — e.g. the "nouveau chat" voice command (WOR-10).
+        """
+        self._chat.set_messages([])
+        self.show_chat()
+
     def append_message(self, role: str, text: str) -> None:
         self._chat.append_message(role, text)
 

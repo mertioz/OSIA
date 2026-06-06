@@ -1192,6 +1192,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Neue Unterhaltung",
         "es": "Nueva conversación",
     },
+    "conversations.new_chat_confirm": {
+        "en": "New chat started",
+        "fr": "Nouvelle conversation démarrée",
+        "zh": "已开始新对话",
+        "ja": "新しいチャットを開始しました",
+        "de": "Neues Gespräch gestartet",
+        "es": "Nueva conversación iniciada",
+    },
     "conversations.msg_count": {
         "en": "{count} msg",
         "fr": "{count} msg",
