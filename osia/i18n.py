@@ -210,6 +210,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Verknüpftes Vision-Modell",
         "es": "Modelo de visión asociado",
     },
+    "settings.vision_hint": {
+        "en": "Use this if your main model cannot process images (e.g. DeepSeek, "
+              "Groq, Llama, Mistral).",
+        "fr": "Utile si votre modèle principal ne gère pas les images (ex: "
+              "DeepSeek, Groq, Llama, Mistral).",
+        "zh": "如果您的主模型无法处理图像（例如 DeepSeek、Groq、Llama、Mistral），请使用此选项。",
+        "ja": "メインモデルが画像を処理できない場合に使用します（例：DeepSeek、Groq、Llama、Mistral）。",
+        "de": "Nützlich, wenn Ihr Hauptmodell keine Bilder verarbeiten kann "
+              "(z. B. DeepSeek, Groq, Llama, Mistral).",
+        "es": "Útil si tu modelo principal no puede procesar imágenes (p. ej., "
+              "DeepSeek, Groq, Llama, Mistral).",
+    },
     "settings.vision_provider": {
         "en": "Vision provider",
         "fr": "Fournisseur vision",
@@ -559,6 +571,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
               "activa.",
     },
     # — Wake-word greeting response —
+    "settings.wake_word_enabled": {
+        "en": "Enable wake word",
+        "fr": "Activer le wake word",
+        "zh": "启用唤醒词",
+        "ja": "ウェイクワードを有効にする",
+        "de": "Aktivierungswort aktivieren",
+        "es": "Activar la palabra de activación",
+    },
     "settings.wake_greeting": {
         "en": "Wake word response",
         "fr": "Réponse au mot d'activation",

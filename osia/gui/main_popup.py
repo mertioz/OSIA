@@ -1338,6 +1338,9 @@ class _SettingsPanel(QWidget):
     # Emitted when the "Show the floating capsule" toggle changes (WOR-22).
     # The host (osia.main.wake_mode) connects it to the capsule's visibility.
     capsule_visibility_changed = pyqtSignal(bool)
+    # Emitted when the "Enable wake word" toggle changes. The host
+    # (osia.main.wake_mode) connects it to the wake-word detector start/stop.
+    wake_word_enabled_changed = pyqtSignal(bool)
 
     # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
     # last as an info-only row).
@@ -1758,6 +1761,24 @@ class _SettingsPanel(QWidget):
         l.addWidget(self._wake_title)
         l.addWidget(self._wake_sub)
 
+        # Master switch for the always-on "OSIA" wake-word listener. When off,
+        # the detector loop is stopped (OSIA stays reachable via the capsule
+        # click / Ctrl+Alt+O window). Wired to the detector in
+        # osia.main.wake_mode via the wake_word_enabled_changed signal.
+        ww_row = QHBoxLayout()
+        self._wake_word_label = QLabel(i18n.t("settings.wake_word_enabled"))
+        self._wake_word_label.setObjectName("providerName")
+        self._wake_word_label.setWordWrap(True)
+        self._wake_word_toggle = QCheckBox()
+        self._wake_word_toggle.setObjectName("smartToggle")
+        self._wake_word_toggle.stateChanged.connect(
+            self._on_wake_word_enabled_changed
+        )
+        ww_row.addWidget(self._wake_word_label)
+        ww_row.addStretch()
+        ww_row.addWidget(self._wake_word_toggle)
+        l.addLayout(ww_row)
+
         enable_row = QHBoxLayout()
         self._wake_enabled_label = QLabel(i18n.t("wake.greeting_enabled"))
         self._wake_enabled_label.setObjectName("providerName")
@@ -1776,6 +1797,11 @@ class _SettingsPanel(QWidget):
         self._wake_text_input.editingFinished.connect(self._on_wake_text_changed)
         l.addWidget(self._wake_text_input)
         return wrap
+
+    def _on_wake_word_enabled_changed(self, _state) -> None:
+        enabled = self._wake_word_toggle.isChecked()
+        set_setting("wake_word_enabled", enabled)
+        self.wake_word_enabled_changed.emit(enabled)
 
     def _on_wake_enabled_changed(self, _state) -> None:
         enabled = self._wake_enabled_toggle.isChecked()
@@ -3004,6 +3030,13 @@ class _SettingsPanel(QWidget):
         self._vision_heading.setWordWrap(True)
         vbox.addWidget(self._vision_heading)
 
+        # Small italic hint: clarifies when pairing a vision model is useful
+        # (shown above the provider dropdown). Style: see QLabel#visionHint.
+        self._vision_hint = QLabel(i18n.t("settings.vision_hint"))
+        self._vision_hint.setObjectName("visionHint")
+        self._vision_hint.setWordWrap(True)
+        vbox.addWidget(self._vision_hint)
+
         # Provider dropdown (vision-capable providers only).
         vprov_row = QHBoxLayout()
         vprov_row.setSpacing(8)
@@ -3217,6 +3250,12 @@ class _SettingsPanel(QWidget):
                 break
         self._tts_provider_combo.blockSignals(False)
         self._populate_voice_combo(provider, voice)
+
+        # Wake-word listener master switch (defaults on when unset).
+        self._wake_word_toggle.blockSignals(True)
+        self._wake_word_toggle.setChecked(
+            bool(settings.get("wake_word_enabled", True)))
+        self._wake_word_toggle.blockSignals(False)
 
         # Wake-word greeting — empty stored text shows the active language's
         # default as a hint; it's only persisted once the toggle is enabled or
@@ -3561,6 +3600,7 @@ class _SettingsPanel(QWidget):
 
         # Vision companion (WOR-25)
         self._vision_heading.setText(i18n.t("settings.vision_model"))
+        self._vision_hint.setText(i18n.t("settings.vision_hint"))
         self._vision_prov_label.setText(i18n.t("settings.vision_provider"))
         self._vision_model_label.setText(i18n.t("settings.model"))
         if not self._vision_key_save.property("saved"):
@@ -3581,6 +3621,7 @@ class _SettingsPanel(QWidget):
 
         self._wake_title.setText(i18n.t("settings.wake_greeting"))
         self._wake_sub.setText(i18n.t("settings.wake_greeting_sub"))
+        self._wake_word_label.setText(i18n.t("settings.wake_word_enabled"))
         self._wake_enabled_label.setText(i18n.t("wake.greeting_enabled"))
         self._wake_text_input.setPlaceholderText(i18n.t("wake.greeting_placeholder"))
         # If the greeting hasn't been customised, follow the UI language.
@@ -4243,6 +4284,9 @@ class MainPopup(QWidget):
     # Re-emitted from the settings panel: the floating-capsule visibility toggle
     # (WOR-22). The host wires it to the Dynamic Island's set_capsule_visible.
     capsule_visibility_changed = pyqtSignal(bool)
+    # Re-emitted from the settings panel: the "Enable wake word" toggle. The
+    # host wires it to the wake-word detector's start()/stop().
+    wake_word_enabled_changed = pyqtSignal(bool)
 
     # Index of the chat page in the QStackedWidget.
     PAGE_CHAT = 0
@@ -4325,6 +4369,9 @@ class MainPopup(QWidget):
         self._settings.api_keys_saved.connect(self.api_keys_saved.emit)
         self._settings.capsule_visibility_changed.connect(
             self.capsule_visibility_changed.emit
+        )
+        self._settings.wake_word_enabled_changed.connect(
+            self.wake_word_enabled_changed.emit
         )
 
         self._osia = _OsiaPanel()
@@ -4854,6 +4901,11 @@ class MainPopup(QWidget):
             QLabel#providerSub {
                 font-size: 11px;
                 color: #9d9aad;
+            }
+            QLabel#visionHint {
+                font-size: 11px;
+                color: #9d9aad;
+                font-style: italic;
             }
             QLabel#infoBadge {
                 background: rgba(196, 181, 245, 0.18);

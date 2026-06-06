@@ -608,6 +608,18 @@ def wake_mode():
     # WOR-22: the "Show the floating capsule" toggle hides/shows the capsule.
     popup.capsule_visibility_changed.connect(island.set_capsule_visible)
 
+    # The "Enable wake word" settings toggle stops/restarts the always-on
+    # listener live. OSIA stays reachable via the capsule / Ctrl+Alt+O window
+    # while it's off. No-op when no detector exists (no wake model available).
+    def _set_wake_word_enabled(enabled: bool) -> None:
+        if not detector:
+            return
+        if enabled:
+            detector.start()
+        else:
+            detector.stop()
+    popup.wake_word_enabled_changed.connect(_set_wake_word_enabled)
+
     # Initial population — no active conversation yet; the panel shows the
     # stored list (or its "No conversations" placeholder when empty).
     popup.refresh_conversations(None)
@@ -683,9 +695,15 @@ def wake_mode():
     cron_manager.start()
     heartbeat_monitor.start()
 
-    if detector:
+    # Honour the saved "Enable wake word" preference at launch: when off, the
+    # detector exists but isn't started (OSIA stays reachable via the capsule /
+    # Ctrl+Alt+O window). The settings toggle can start it again at runtime.
+    wake_word_on = settings.get("wake_word_enabled", True)
+    if detector and wake_word_on:
         detector.start()
         trigger_label = "Say 'osia' to activate"
+    elif detector:
+        trigger_label = "Wake word off — click the capsule or press Ctrl+Alt+O"
     else:
         trigger_label = "Press Ctrl+Space to activate"
 

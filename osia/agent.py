@@ -23,12 +23,6 @@ from openai import OpenAI
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 MODEL = "llama3"
 
-# Response length cap sent on every model call. 32768 is a safe maximum
-# accepted across all supported providers (Ollama, Groq, DeepSeek,
-# Anthropic, OpenAI, …) — large enough that no model is ever meaningfully
-# token-limited or truncated mid-answer.
-MAX_RESPONSE_TOKENS = 32768
-
 # ---------------------------------------------------------------------------
 # Language detection (Phase 1)
 # ---------------------------------------------------------------------------
@@ -2430,14 +2424,13 @@ class OSIAAgent:
         """Yield text deltas from the OpenAI-compatible chat-completions
         stream, abstracting it so the sentence-splitting loop stays simple.
 
-        Responses are never token-limited: every call sends the
-        provider-safe maximum (``MAX_RESPONSE_TOKENS``).
+        Responses are never token-limited: no ``max_tokens`` is sent, so
+        each provider applies its own native limit.
         """
         create_kwargs = {
             "model": self.model,
             "messages": self.messages,
             "stream": True,
-            "max_tokens": MAX_RESPONSE_TOKENS,
         }
         stream = self.client.chat.completions.create(**create_kwargs)
         for chunk in stream:
@@ -2648,7 +2641,6 @@ class OSIAAgent:
                 create_kwargs = {
                     "model": self.model,
                     "messages": self.messages,
-                    "max_tokens": MAX_RESPONSE_TOKENS,
                 }
                 response = self.client.chat.completions.create(**create_kwargs)
                 content = response.choices[0].message.content or ""
@@ -2764,8 +2756,8 @@ class OSIAAgent:
         the updated history (system prompt is at index 0).
 
         ``max_tokens`` is DEPRECATED and ignored. Responses are never
-        token-limited: every model call sends the provider-safe maximum
-        (``MAX_RESPONSE_TOKENS`` = 32768) so no reply is ever truncated
+        token-limited: no ``max_tokens`` is sent on any model call, so each
+        provider applies its own native limit and no reply is ever truncated
         mid-answer, regardless of what callers pass here.
 
         ``max_tool_rounds`` is DEPRECATED and ignored. The hard cap on
@@ -2884,7 +2876,6 @@ class OSIAAgent:
                     create_kwargs = {
                         "model": self.model,
                         "messages": self.messages,
-                        "max_tokens": MAX_RESPONSE_TOKENS,
                     }
                     response = self.client.chat.completions.create(**create_kwargs)
                     # Keep the message object: native providers may return

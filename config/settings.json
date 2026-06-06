@@ -1,10 +1,67 @@
 {
-  "smart_routing": false,
   "selected_model": "deepseek-v4-flash",
-  "tts_provider": "local",
-  "tts_voice": null,
+  "tts_provider": "google",
+  "tts_voice": "Leda",
+  "stt_provider": "groq",
+  "stt_fallback_provider": "local",
+  "stt_local_model": "small",
+  "stt_groq_model": "whisper-large-v3-turbo",
   "language": "fr",
-  "island_x": 611,
-  "island_y": 287,
+  "show_capsule": true,
+  "time_format": "24h",
+  "ai_hierarchy": {
+    "heavy": [
+      "deepseek:deepseek-v4-pro",
+      "google:gemini-3.1-pro",
+      "google:gemini-2.5-pro",
+      "groq:llama-3.3-70b-versatile"
+    ],
+    "medium": [
+      "google:gemini-2.5-flash-lite",
+      "google:gemini-2.5-flash",
+      "deepseek:deepseek-v4-flash",
+      "groq:llama-3.3-70b-versatile"
+    ]
+  },
+  "ai_hierarchy_enabled": false,
+  "vision_provider": "google",
+  "vision_model": "gemini-2.5-flash-lite",
+  "liveapi_enabled": false,
+  "liveapi_provider": "google",
+  "liveapi_model": "gemini-2.5-flash-live",
+  "wake_word_enabled": true,
+  "wake_greeting_enabled": true,
+  "wake_greeting_text": "Je vous \u00e9coute",
+  "cron_jobs": [],
+  "heartbeat_enabled": false,
+  "heartbeat_interval_minutes": 5,
+  "heartbeat_interval_seconds": 10,
+  "heartbeat_checks": {
+    "cpu": {
+      "enabled": true,
+      "threshold": 80
+    },
+    "ram": {
+      "enabled": true,
+      "threshold": 90
+    },
+    "disk": {
+      "enabled": true,
+      "threshold": 10
+    },
+    "network": {
+      "enabled": true
+    }
+  },
+  "api_fallbacks": {},
+  "api_key_fallbacks": {},
+  "skills_enabled": {
+    "zzz_review_test.md": true
+  },
+  "island_shape": "circle",
+  "island_dock_side": "right",
+  "island_x": 1684,
+  "island_y": 858,
+  "smart_routing": false,
   "parler_voice_description": null
 }
