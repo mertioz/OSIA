@@ -201,6 +201,23 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "API-Schlüssel für Text- und Chat-Modelle.",
         "es": "Claves API para modelos de texto y chat.",
     },
+    # — Vision companion model (WOR-25): shown when the main model can't see —
+    "settings.vision_model": {
+        "en": "Paired vision model",
+        "fr": "Modèle vision associé",
+        "zh": "配套视觉模型",
+        "ja": "連携ビジョンモデル",
+        "de": "Verknüpftes Vision-Modell",
+        "es": "Modelo de visión asociado",
+    },
+    "settings.vision_provider": {
+        "en": "Vision provider",
+        "fr": "Fournisseur vision",
+        "zh": "视觉提供商",
+        "ja": "ビジョンプロバイダー",
+        "de": "Vision-Anbieter",
+        "es": "Proveedor de visión",
+    },
     # — Section 2: voice providers (text-to-speech) —
     "settings.voice_providers": {
         "en": "Voice Providers",

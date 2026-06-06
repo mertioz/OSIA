@@ -45,6 +45,13 @@ DEFAULT_SETTINGS = {
     # and always uses the manually selected model (the chains above are kept so
     # they can still be configured). See OSIAAgent.run().
     "ai_hierarchy_enabled": False,
+    # Vision model cooperation (WOR-25): when the selected main model has no
+    # vision capability (e.g. DeepSeek text), OSIA pairs it with a vision-capable
+    # companion (e.g. Gemini) for image/screenshot tasks. Empty = no companion
+    # configured; the settings UI only surfaces these when the main model can't
+    # see. See osia.vision_router and osia.models.model_has_vision.
+    "vision_provider": "",
+    "vision_model": "",
     # Live API voice-to-voice (Bloc 4): when enabled, OSIA streams audio to a
     # provider's realtime/live endpoint and bypasses the local STT (Whisper)
     # and TTS pipelines — the live endpoint handles both natively. The API key

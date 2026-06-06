@@ -43,6 +43,7 @@ from osia import personality
 from osia.agent import strip_tool_artifacts
 from osia.models import (
     PROVIDERS, get_all_models,
+    provider_for_model, model_has_vision, vision_capable_models,
 )
 from osia.config import (
     load_api_keys, save_api_keys, load_settings, set_setting, set_api_key,
@@ -2977,6 +2978,88 @@ class _SettingsPanel(QWidget):
         ol.addLayout(olh)
         l.addWidget(self._ollama_row)
 
+        # ── Vision companion model (WOR-25) ─────────────────────────────────
+        # Shown only when the selected main model can't process images (e.g.
+        # DeepSeek text): the user pairs it with a vision-capable model and that
+        # provider's API key. Hidden entirely when the main model already sees.
+        # Visibility + prefill are driven from _apply_vision_row() in
+        # _load_state(), so the row tracks whichever model is currently selected.
+        self._vision_models_by_provider: dict[str, list] = {}
+        for m in vision_capable_models():
+            self._vision_models_by_provider.setdefault(m["provider"], []).append(m)
+        self._vision_provider_order = [
+            p for p in self._AI_PROVIDER_ORDER
+            if p in self._vision_models_by_provider
+        ]
+
+        self._vision_row = QFrame()
+        self._vision_row.setObjectName("providerCard")
+        self._vision_row.setVisible(False)
+        vbox = QVBoxLayout(self._vision_row)
+        vbox.setContentsMargins(12, 10, 12, 10)
+        vbox.setSpacing(8)
+
+        self._vision_heading = QLabel(i18n.t("settings.vision_model"))
+        self._vision_heading.setObjectName("providerName")
+        self._vision_heading.setWordWrap(True)
+        vbox.addWidget(self._vision_heading)
+
+        # Provider dropdown (vision-capable providers only).
+        vprov_row = QHBoxLayout()
+        vprov_row.setSpacing(8)
+        self._vision_prov_label = QLabel(i18n.t("settings.vision_provider"))
+        self._vision_prov_label.setObjectName("fieldLabel")
+        self._vision_prov_label.setMinimumWidth(96)
+        self._vision_prov_label.setWordWrap(True)
+        self._vision_provider_combo = QComboBox()
+        self._vision_provider_combo.setObjectName("voiceCombo")
+        for p in self._vision_provider_order:
+            self._vision_provider_combo.addItem(PROVIDERS[p]["name"], p)
+        self._vision_provider_combo.currentIndexChanged.connect(
+            self._on_vision_provider_changed
+        )
+        vprov_row.addWidget(self._vision_prov_label)
+        vprov_row.addWidget(self._vision_provider_combo, 1)
+        vbox.addLayout(vprov_row)
+
+        # Model dropdown (repopulated per provider).
+        vmodel_row = QHBoxLayout()
+        vmodel_row.setSpacing(8)
+        self._vision_model_label = QLabel(i18n.t("settings.model"))
+        self._vision_model_label.setObjectName("fieldLabel")
+        self._vision_model_label.setMinimumWidth(96)
+        self._vision_model_label.setWordWrap(True)
+        self._vision_model_combo = QComboBox()
+        self._vision_model_combo.setObjectName("voiceCombo")
+        self._vision_model_combo.currentIndexChanged.connect(
+            self._on_vision_model_changed
+        )
+        vmodel_row.addWidget(self._vision_model_label)
+        vmodel_row.addWidget(self._vision_model_combo, 1)
+        vbox.addLayout(vmodel_row)
+
+        # API key for the chosen vision provider — same storage as that
+        # provider's main key (api_keys.json keyed by provider).
+        vkey_row = QHBoxLayout()
+        vkey_row.setSpacing(8)
+        self._vision_key_dot = QLabel()
+        self._vision_key_dot.setObjectName("statusDot")
+        self._vision_key_dot.setFixedSize(8, 8)
+        self._vision_key_dot.setProperty("state", "stopped")
+        self._vision_key_input = QLineEdit()
+        self._vision_key_input.setObjectName("keyInput")
+        self._vision_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._vision_key_save = QPushButton(i18n.t("provider.save"))
+        self._vision_key_save.setObjectName("saveBtn")
+        self._vision_key_save.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._vision_key_save.clicked.connect(self._on_vision_key_save)
+        vkey_row.addWidget(self._vision_key_dot)
+        vkey_row.addWidget(self._vision_key_input, 1)
+        vkey_row.addWidget(self._vision_key_save)
+        vbox.addLayout(vkey_row)
+
+        l.addWidget(self._vision_row)
+
         # Wire the selector and reveal the first provider's card.
         self._ai_provider_combo.currentIndexChanged.connect(
             self._on_ai_provider_changed
@@ -2990,6 +3073,105 @@ class _SettingsPanel(QWidget):
         for p, card in self._provider_cards.items():
             card.setVisible(p == provider)
         self._ollama_row.setVisible(provider == "ollama")
+
+    # ── Vision companion (WOR-25) ──────────────────────────────────────────
+
+    def _apply_vision_row(self, settings: dict) -> None:
+        """Show the vision-companion row only when the selected main model
+        can't process images, and prefill it from ``settings`` (WOR-25)."""
+        main_model = (settings.get("selected_model") or "").strip()
+        main_provider = provider_for_model(main_model) if main_model else None
+        show = bool(main_model) and not model_has_vision(main_provider, main_model)
+        self._vision_row.setVisible(show)
+        if not show or not self._vision_provider_order:
+            return
+        v_provider = (settings.get("vision_provider") or "").strip()
+        if v_provider not in self._vision_provider_order:
+            v_provider = self._vision_provider_order[0]
+        v_model = (settings.get("vision_model") or "").strip()
+        self._vision_provider_combo.blockSignals(True)
+        for i in range(self._vision_provider_combo.count()):
+            if self._vision_provider_combo.itemData(i) == v_provider:
+                self._vision_provider_combo.setCurrentIndex(i)
+                break
+        self._vision_provider_combo.blockSignals(False)
+        self._populate_vision_models(v_provider, v_model)
+        self._refresh_vision_key_field(v_provider)
+
+    def _populate_vision_models(self, provider: str, model: str | None) -> None:
+        """Fill the vision-model dropdown with ``provider``'s vision models and
+        select ``model`` (or the first entry)."""
+        combo = self._vision_model_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for m in self._vision_models_by_provider.get(provider, []):
+            combo.addItem(m.get("label") or m["id"], m["id"])
+        idx = 0
+        if model:
+            for i in range(combo.count()):
+                if combo.itemData(i) == model:
+                    idx = i
+                    break
+        if combo.count():
+            combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+    def _refresh_vision_key_field(self, provider: str) -> None:
+        """Prefill the vision key field with ``provider``'s saved key and refresh
+        the placeholder + status dot."""
+        key = get_api_key(provider)
+        self._vision_key_input.setText(key or "")
+        self._vision_key_input.setPlaceholderText(
+            i18n.t("provider.key_placeholder",
+                   name=PROVIDERS.get(provider, {}).get("name", provider))
+        )
+        self._vision_key_dot.setProperty("state", "running" if key else "stopped")
+        self._vision_key_dot.style().unpolish(self._vision_key_dot)
+        self._vision_key_dot.style().polish(self._vision_key_dot)
+
+    def _on_vision_provider_changed(self, _idx: int) -> None:
+        provider = self._vision_provider_combo.currentData()
+        if not provider:
+            return
+        set_setting("vision_provider", provider)
+        models = self._vision_models_by_provider.get(provider, [])
+        default_model = models[0]["id"] if models else ""
+        set_setting("vision_model", default_model)
+        self._populate_vision_models(provider, default_model)
+        self._refresh_vision_key_field(provider)
+
+    def _on_vision_model_changed(self, _idx: int) -> None:
+        model = self._vision_model_combo.currentData()
+        if model:
+            set_setting("vision_model", model)
+
+    def _on_vision_key_save(self) -> None:
+        provider = self._vision_provider_combo.currentData()
+        if not provider:
+            return
+        key = self._vision_key_input.text().strip()
+        set_api_key(provider, key)
+        # Keep the matching provider card (if built) in sync with the new key.
+        card = self._provider_cards.get(provider)
+        if card is not None:
+            card.set_key(key)
+        self._refresh_vision_key_field(provider)
+        self._flash_vision_saved()
+
+    def _flash_vision_saved(self) -> None:
+        btn = self._vision_key_save
+        btn.setText(i18n.t("provider.saved"))
+        btn.setProperty("saved", True)
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
+
+        def restore():
+            btn.setProperty("saved", False)
+            btn.setText(i18n.t("provider.save"))
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+        QTimer.singleShot(1500, restore)
 
     # ── State load / save ─────────────────────────────────────────────────
 
@@ -3106,6 +3288,10 @@ class _SettingsPanel(QWidget):
             bool(settings.get("liveapi_enabled", False)))
         self._liveapi_enabled_toggle.blockSignals(False)
         self._apply_liveapi_visibility()
+
+        # Vision companion (WOR-25) — show + prefill only when the selected
+        # main model can't see; hidden otherwise.
+        self._apply_vision_row(settings)
 
         # Scheduled tasks (Bloc 5) — rebuild the cron job editor.
         cron_jobs = settings.get("cron_jobs", []) or []
@@ -3318,6 +3504,12 @@ class _SettingsPanel(QWidget):
         # Keep duplicate (openai/google) cards across sections in sync, then
         # notify the host that the key set changed.
         self._sync_all_cards_keys()
+        # If the vision companion row is visible and pinned to the same provider,
+        # mirror the newly-saved key there too (the vision->card direction is
+        # already handled in _on_vision_key_save).
+        if (not self._vision_row.isHidden()
+                and self._vision_provider_combo.currentData() == _provider):
+            self._refresh_vision_key_field(_provider)
         self.api_keys_saved.emit(load_api_keys())
         # A newly-saved key can unlock a provider — refresh the task-hierarchy
         # dropdowns so its models become selectable without reopening settings.
@@ -3366,6 +3558,19 @@ class _SettingsPanel(QWidget):
         self._ai_title.setText(i18n.t("settings.ai_providers"))
         self._ai_sub.setText(i18n.t("settings.ai_providers_sub"))
         self._ai_prov_label.setText(i18n.t("settings.choose_provider"))
+
+        # Vision companion (WOR-25)
+        self._vision_heading.setText(i18n.t("settings.vision_model"))
+        self._vision_prov_label.setText(i18n.t("settings.vision_provider"))
+        self._vision_model_label.setText(i18n.t("settings.model"))
+        if not self._vision_key_save.property("saved"):
+            self._vision_key_save.setText(i18n.t("provider.save"))
+        _vprov = self._vision_provider_combo.currentData()
+        if _vprov:
+            self._vision_key_input.setPlaceholderText(
+                i18n.t("provider.key_placeholder",
+                       name=PROVIDERS.get(_vprov, {}).get("name", _vprov))
+            )
 
         self._voice_title.setText(i18n.t("settings.voice_providers"))
         self._voice_sub.setText(i18n.t("settings.voice_providers_sub"))
