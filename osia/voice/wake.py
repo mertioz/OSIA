@@ -20,6 +20,7 @@ import threading
 import time
 import os
 import pickle
+from collections import deque
 import numpy as np
 
 # sounddevice loads PortAudio at import time and can fail when no audio backend
@@ -66,6 +67,14 @@ CHUNK_SIZE = 1280  # 80ms at 16kHz — required by openWakeWord
 VERIFIER_THRESHOLD = 0.80  # Score above which we consider "osia" detected
 COOLDOWN_SECONDS = 1.5    # Minimum time between detections
 PATIENCE_FRAMES = 8       # Number of consecutive positive frames required
+# Voice-activity energy gate (RMS over the verifier's ~1.28s context window).
+# The universal verifier (WOR-37) scores a silent/ambient room as high as ~0.91
+# — above VERIFIER_THRESHOLD — so without this gate a quiet room fires the wake
+# on its own (e.g. greeting + listening at startup, with no one speaking). A
+# high score may only count toward a detection when real speech is present in
+# the window. 300 sits well under the quietest real "osia" sample (peak-frame
+# RMS ~640) and comfortably above a typical quiet-room noise floor.
+ENERGY_GATE_RMS = 300
 
 # === Lazy-loaded globals ===
 _verifier_model = None
@@ -141,6 +150,11 @@ class WakeWordDetector:
         print(f"👂 Wake word detection active. Say 'osia' to wake me up...")
         print(f"   Verifier: {n_frames} frames × 96 = {n_frames * 96} features")
 
+        # Rolling per-chunk RMS over the verifier's context window (one 80ms
+        # chunk per feature frame), so we can tell whether real speech occurred
+        # anywhere in the ~1.28s the verifier is scoring — see ENERGY_GATE_RMS.
+        energy_window = deque(maxlen=n_frames)
+
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=1,
@@ -152,8 +166,14 @@ class WakeWordDetector:
                     audio_chunk, _ = stream.read(CHUNK_SIZE)
                     audio_np = audio_chunk.flatten()
 
-                    # Feed audio through the feature extractor
+                    # Feed audio through the feature extractor. Always feed every
+                    # chunk so the streaming mel buffer stays continuous (gating
+                    # the audio here would corrupt the verifier's context).
                     preprocessor(audio_np)
+
+                    # Track energy over the context window for the gate below.
+                    rms = float(np.sqrt(np.mean(audio_np.astype(np.float64) ** 2)))
+                    energy_window.append(rms)
 
                     # Get the latest feature window
                     features = preprocessor.get_features(n_frames)
@@ -169,7 +189,13 @@ class WakeWordDetector:
 
                     now = time.time()
 
-                    if score >= VERIFIER_THRESHOLD:
+                    # Voice-activity gate: a high score only counts when real
+                    # speech is present somewhere in the window. A quiet room
+                    # (verifier ~0.88 on silence) can never build a streak, so
+                    # startup stays silent/passive until "osia" is actually said.
+                    speech_present = bool(energy_window) and max(energy_window) >= ENERGY_GATE_RMS
+
+                    if score >= VERIFIER_THRESHOLD and speech_present:
                         self._positive_streak += 1
                         if self._positive_streak >= PATIENCE_FRAMES:
                             if now - self._last_detection > COOLDOWN_SECONDS:
