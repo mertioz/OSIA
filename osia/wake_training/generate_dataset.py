@@ -7,16 +7,26 @@ The original verifier (osia_verifier.pkl) was trained on a single person's voice
 dataset entirely from text-to-speech + signal-processing augmentation so the
 retrained verifier works for any voice out of the box — no microphone needed.
 
+Each positive is rendered from three spellings — "ossia" / "ocia" / "osia" — so
+the dataset covers the hard /s/, soft /s/ and voiced /z/ pronunciations users
+actually produce (see ``POSITIVE_VARIANTS``).
+
 Sources
 -------
 * Gemini TTS  — the ~30 prebuilt Gemini voices already used by osia.voice.tts
                 (Kore, Puck, Charon, Leda, Fenrir, Aoede, ...). Each positive
-                voice is rendered in three prompt styles: normal / slow / fast.
-* Kokoro TTS  — the offline local voices, for extra timbre variety (free, no
-                rate limit). Optional: skipped gracefully if Kokoro is absent.
+                voice × variant is rendered in three prompt styles:
+                normal / slow / fast. Rate-limited (free tier), so optional.
+* Kokoro TTS  — the full English + French offline Kokoro line-up (~14 voices,
+                free, no rate limit) — the primary source when Gemini is rate-
+                limited. Lazily downloaded from HuggingFace; each voice is wrapped
+                in try/except and skipped gracefully if it fails to load. Kokoro
+                positives are augmented deeply (``--kokoro-aug``, default 6) to
+                make up for fewer base timbres than Gemini.
 * numpy/scipy — silence, white-noise and pink-noise negatives, plus per-clip
-                augmentation (pitch shift ±10 %, speed ±15 %, volume ±20 %,
-                light background-noise injection).
+                augmentation (speed/pitch/volume jitter + light background noise;
+                Gemini ±10–20 %, Kokoro a wider ±20–25 % — see ``augment`` /
+                ``_kokoro_aug``).
 
 Output
 ------
@@ -25,8 +35,12 @@ Every clip is written as the exact format train.py expects:
 same window record_samples.py uses), with the spoken word trimmed of leading /
 trailing silence and re-centred so it falls inside the verifier's 16-frame window.
 
-  positives -> <out>/synthetic/positive/*.wav   (~300 with the defaults)
-  negatives -> <out>/synthetic/negative/*.wav   (~500 with the defaults)
+  positives -> <out>/synthetic/positive/*.wav
+  negatives -> <out>/synthetic/negative/*.wav
+
+With Kokoro alone (~14 voices) the defaults yield ~294 positives + ~1000
+negatives; ``--target-total`` (default 1000) prints the on-disk total against
+that goal at the end.
 
 Rate limiting & resume
 ----------------------
@@ -87,7 +101,22 @@ except Exception as _tts_exc:  # pragma: no cover - defensive only
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_RATE = 16000  # train.py / wake.py both require 16 kHz mono
 
-POSITIVE_TEXT = "osia"
+# The wake word is "osia". Real users pronounce it three ways, so we render all
+# three spellings — each *forces* a different sibilant so the positives span the
+# whole pronunciation space instead of whatever a single voice happens to read:
+#   • "ossia" — hard, unvoiced /s/ (the doubled s is unambiguous in FR and EN)
+#   • "ocia"  — soft /s/ (a slightly softer sibilant realisation)
+#   • "osia"  — voiced /z/ ("ozia"); some users naturally pronounce it this way,
+#               so it is kept as a *deliberate* variant, not an accident.
+# Each entry is (variant_name, tts_text); the variant name is baked into every
+# positive filename so (a) resume stays deterministic and (b) every NEW positive
+# carries a variant token (ossia/ocia/osia), which is exactly what distinguishes
+# it from the OLD, untagged "pos_<voice>_<style>" clips the cleanup step removes.
+POSITIVE_VARIANTS = [
+    ("ossia", "ossia"),  # hard /s/
+    ("ocia", "ocia"),    # soft /s/
+    ("osia", "osia"),    # voiced /z/ — some users pronounce it this way
+]
 
 # Phonetically close to "osia" — the hard negatives that teach the verifier the
 # precise boundary of the wake word.
@@ -100,15 +129,34 @@ NEG_PHRASES = [
     "ok google", "hey siri", "bonjour", "hello",
     "qu'est-ce que", "what is",
 ]
-NEG_TEXTS = NEG_PHONETIC + NEG_PHRASES
-
-# Kokoro voices (offline). Prefix → language: a=US-English, b=UK-English,
-# f=French. Each is wrapped in try/except so an unknown id never aborts the run.
-KOKORO_POS_VOICES = [
-    "af_sky", "af_heart", "af_bella", "am_michael",
-    "am_adam", "bf_emma", "bm_george", "ff_siwis",
+# Extra hard negatives (WOR-37) — more near-misses plus everyday FR/EN phrases.
+# Names/words ending in "-ia" are especially valuable: they share the wake
+# word's "-ia" vowel tail and are exactly what the verifier is most likely to
+# false-trigger on, so the boundary must be taught explicitly.
+NEG_EXTRA = [
+    "c'est ça", "au cas où", "associé", "officiellement", "Astoria",
+    "Sophia", "Olivia", "anesthésia", "ambrosia", "Asia Minor",
+    "in Asia", "et voilà", "on y va", "où ça", "OK",
+    "merci", "bonjour à tous", "salut", "dis-moi", "écoute",
 ]
-KOKORO_NEG_VOICES = ["af_sky", "am_michael", "ff_siwis"]
+NEG_TEXTS = NEG_PHONETIC + NEG_PHRASES + NEG_EXTRA
+
+# Kokoro voices (offline, free, no rate limit). Prefix → language/gender:
+# a=US-English, b=UK-English, f=French; the 2nd char (f/m) is female/male. This
+# is the full English + French Kokoro line-up — the languages relevant to the
+# "osia" wake word. Voices are lazily downloaded from HuggingFace on first use
+# and every synthesis is wrapped in try/except (see ``kokoro_tts``), so any voice
+# that fails to download or load is skipped gracefully instead of aborting the
+# run. Both positives and negatives use the whole set for maximum timbre variety.
+KOKORO_VOICES = [
+    "af_sky", "af_heart", "af_bella", "af_nicole", "af_sarah",  # US-EN female
+    "am_michael", "am_adam", "am_eric", "am_onyx",              # US-EN male
+    "bf_emma", "bf_isabella",                                   # UK-EN female
+    "bm_george", "bm_lewis",                                    # UK-EN male
+    "ff_siwis",                                                 # FR female
+]
+KOKORO_POS_VOICES = KOKORO_VOICES
+KOKORO_NEG_VOICES = KOKORO_VOICES
 
 NOISE_KINDS = ["silence", "white", "pink"]
 
@@ -248,20 +296,46 @@ def _pink_noise(n: int, rng: np.random.Generator) -> np.ndarray:
     return pink / (np.max(np.abs(pink)) + 1e-9)
 
 
-def augment(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Apply a random combination of the four augmentations to a speech clip."""
+def augment(
+    x: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    speed: float = 0.15,
+    pitch: float = 0.10,
+    vol: float = 0.20,
+    noise_p: float = 0.7,
+    noise_lo: float = 0.003,
+    noise_hi: float = 0.02,
+) -> np.ndarray:
+    """Apply a random combination of the four augmentations to a speech clip.
+
+    The ranges are keyword-tunable so callers can dial augmentation *depth* up
+    per source. The defaults reproduce the original behaviour (speed ±15 %, pitch
+    ±10 %, volume ±20 %, light noise) used for the Gemini positives; the Kokoro
+    positives pass wider ranges (see ``_kokoro_aug``)."""
     y = x.astype(np.float32)
     if rng.random() < 0.8:
-        y = speed_change(y, rng.uniform(-0.15, 0.15))
+        y = speed_change(y, rng.uniform(-speed, speed))
     if rng.random() < 0.8:
-        y = pitch_shift(y, rng.uniform(-0.10, 0.10))
+        y = pitch_shift(y, rng.uniform(-pitch, pitch))
     y = normalize_peak(y, 0.7)
-    if rng.random() < 0.7:  # light background noise injection
+    if rng.random() < noise_p:  # background-noise injection at varying levels
         noise = (_pink_noise if rng.random() < 0.5 else _white_noise)(len(y), rng)
-        y = y + noise * rng.uniform(0.003, 0.02)
-    # volume variation ±20 %
-    y = y * (1.0 + rng.uniform(-0.2, 0.2))
+        y = y + noise * rng.uniform(noise_lo, noise_hi)
+    y = y * (1.0 + rng.uniform(-vol, vol))  # volume variation ±vol
     return np.clip(y, -1.0, 1.0).astype(np.float32)
+
+
+def _kokoro_aug(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Deeper augmentation for Kokoro positives (``--kokoro-aug`` copies): wider
+    pitch/speed/volume swings (±20 %, ±20 %, ±25 %) and a touch more noise.
+    Kokoro contributes fewer base timbres than Gemini, so each base clip is
+    augmented more heavily to compensate."""
+    return augment(
+        x, rng,
+        speed=0.20, pitch=0.20, vol=0.25,
+        noise_p=0.85, noise_lo=0.003, noise_hi=0.03,
+    )
 
 
 def write_wav(path: str, x: np.ndarray) -> None:
@@ -386,13 +460,17 @@ def _variant_paths(out_dir: str, stem: str, n_aug: int) -> list[str]:
     return [os.path.join(out_dir, f"{stem}_{i:02d}.wav") for i in range(n_aug + 1)]
 
 
-def _emit(out_dir, stem, fetch, n_aug, duration, is_noise, stats, args):
+def _emit(out_dir, stem, fetch, n_aug, duration, is_noise, stats, args, *, aug=None):
     """Resume-safe emission of one base clip + its augmented variants.
 
     ``fetch`` is a zero-arg callable returning (float32_mono, sr) or None. It is
     only invoked when at least one target file is missing, so resuming never
-    re-hits the TTS API for already-generated clips. Returns True if a *network*
-    synthesis actually happened (caller applies the rate-limit delay)."""
+    re-hits the TTS API for already-generated clips. ``aug`` is an optional
+    ``(x, rng) -> y`` augmentation callable for the speech variants (defaults to
+    the standard :func:`augment`); pass :func:`_kokoro_aug` for deeper Kokoro
+    augmentation. Returns True if a *network* synthesis actually happened (caller
+    applies the rate-limit delay)."""
+    aug_fn = aug if aug is not None else augment
     paths = _variant_paths(out_dir, stem, n_aug)
     if all(os.path.exists(p) for p in paths):
         stats.skipped += len(paths)
@@ -423,7 +501,7 @@ def _emit(out_dir, stem, fetch, n_aug, duration, is_noise, stats, args):
         elif idx == 0:
             y = fit_duration(normalize_peak(x, 0.7), duration, center=True)
         else:
-            y = fit_duration(augment(x, rng), duration, center=True)
+            y = fit_duration(aug_fn(x, rng), duration, center=True)
         write_wav(p, y)
         stats.written += 1
     return True
@@ -453,7 +531,7 @@ def generate(args):
         kok_neg_voices = KOKORO_NEG_VOICES[:1]
         neg_texts = NEG_TEXTS[:3]
         noise_per_kind = 2
-        pos_aug, neg_aug, noise_aug = 1, 1, 1
+        pos_aug, neg_aug, noise_aug, kok_aug = 1, 1, 1, 1
         pos_styles = POS_STYLES
     else:
         if args.gemini_pos_voices.strip().lower() == "all":
@@ -461,11 +539,18 @@ def generate(args):
         else:
             gem_pos_voices = GEMINI_VOICES[: int(args.gemini_pos_voices)]
         gem_neg_voices = GEMINI_VOICES[: args.gemini_neg_voices]
-        kok_pos_voices = [] if args.no_kokoro else KOKORO_POS_VOICES
-        kok_neg_voices = [] if args.no_kokoro else KOKORO_NEG_VOICES[: args.kokoro_neg_voices]
+        kok_pos_voices = [] if args.no_kokoro else list(KOKORO_POS_VOICES)
+        if str(args.kokoro_neg_voices).strip().lower() == "all":
+            kok_neg_voices = [] if args.no_kokoro else list(KOKORO_NEG_VOICES)
+        else:
+            kok_neg_voices = (
+                [] if args.no_kokoro
+                else KOKORO_NEG_VOICES[: int(args.kokoro_neg_voices)]
+            )
         neg_texts = NEG_TEXTS
         noise_per_kind = args.noise_per_kind
         pos_aug, neg_aug, noise_aug = args.pos_aug, args.neg_aug, args.noise_aug
+        kok_aug = args.kokoro_aug
         pos_styles = POS_STYLES
     if args.no_kokoro:
         kok_pos_voices, kok_neg_voices = [], []
@@ -481,46 +566,49 @@ def generate(args):
     print("=" * 64)
     print("  OSIA Wake Word — Synthetic Multi-Voice Dataset Generator (WOR-37)")
     print("=" * 64)
-    print(f"  Gemini positives : {len(gem_pos_voices)} voices × {len(pos_styles)} styles")
+    print(f"  Gemini positives : {len(gem_pos_voices)} voices × {len(POSITIVE_VARIANTS)} variants × {len(pos_styles)} styles")
     print(f"  Gemini negatives : {len(gem_neg_voices)} voices × {len(neg_texts)} texts")
-    print(f"  Kokoro positives : {len(kok_pos_voices)} voices")
+    print(f"  Kokoro positives : {len(kok_pos_voices)} voices × {len(POSITIVE_VARIANTS)} variants  (+{kok_aug} aug each)")
     print(f"  Kokoro negatives : {len(kok_neg_voices)} voices × {len(neg_texts)} texts")
     print(f"  Noise negatives  : {len(NOISE_KINDS)} kinds × {noise_per_kind}")
-    print(f"  Aug copies       : pos+{pos_aug}, neg+{neg_aug}, noise+{noise_aug}")
+    print(f"  Aug copies       : gem-pos+{pos_aug}, kok-pos+{kok_aug}, neg+{neg_aug}, noise+{noise_aug}")
     print(f"  TTS delay        : {delay}s   max Gemini calls: "
           f"{args.max_tts_calls or 'unlimited'}")
     print(f"  Positive dir     : {pos_dir}")
     print(f"  Negative dir     : {neg_dir}")
     print("=" * 64)
 
-    # ── POSITIVES — Gemini (all voices × normal/slow/fast) ──
+    # ── POSITIVES — Gemini (all voices × ossia/ocia variants × normal/slow/fast) ──
     for vi, voice in enumerate(gem_pos_voices):
-        for style in pos_styles:
-            if not _cap_ok():
-                print("   ⚠️  max Gemini call cap reached — stopping Gemini positives.")
-                break
-            stem = f"pos_gem_{voice}_{style}"
-            prompt = STYLE_PROMPTS[style].format(t=POSITIVE_TEXT)
+        for variant, text in POSITIVE_VARIANTS:
+            for style in pos_styles:
+                if not _cap_ok():
+                    print("   ⚠️  max Gemini call cap reached — stopping Gemini positives.")
+                    break
+                stem = f"pos_gem_{voice}_{variant}_{style}"
+                prompt = STYLE_PROMPTS[style].format(t=text)
 
-            def fetch(p=prompt, v=voice):
-                stats.gemini_calls += 1
-                return gemini_tts(p, v, api_key, delay)
+                def fetch(p=prompt, v=voice):
+                    stats.gemini_calls += 1
+                    return gemini_tts(p, v, api_key, delay)
 
-            used = _emit(pos_dir, stem, fetch, pos_aug, args.duration, False, stats, args)
-            print(f"  [pos/gem {vi + 1}/{len(gem_pos_voices)}] {voice}/{style} "
-                  f"-> written={stats.written} skipped={stats.skipped} failed={stats.failed}")
-            _maybe_delay(used, delay)
+                used = _emit(pos_dir, stem, fetch, pos_aug, args.duration, False, stats, args)
+                print(f"  [pos/gem {vi + 1}/{len(gem_pos_voices)}] {voice}/{variant}/{style} "
+                      f"-> written={stats.written} skipped={stats.skipped} failed={stats.failed}")
+                _maybe_delay(used, delay)
 
-    # ── POSITIVES — Kokoro ──
+    # ── POSITIVES — Kokoro (each voice × all 3 variants, deeply augmented) ──
     for vi, voice in enumerate(kok_pos_voices):
-        stem = f"pos_kok_{voice}_normal"
+        for variant, text in POSITIVE_VARIANTS:
+            stem = f"pos_kok_{voice}_{variant}_normal"
 
-        def fetch(v=voice):
-            return kokoro_tts(POSITIVE_TEXT, v, speed=1.0)
+            def fetch(v=voice, t=text):
+                return kokoro_tts(t, v, speed=1.0)
 
-        _emit(pos_dir, stem, fetch, pos_aug, args.duration, False, stats, args)
-        print(f"  [pos/kok {vi + 1}/{len(kok_pos_voices)}] {voice} "
-              f"-> written={stats.written} skipped={stats.skipped} failed={stats.failed}")
+            _emit(pos_dir, stem, fetch, kok_aug, args.duration, False, stats, args,
+                  aug=_kokoro_aug)
+            print(f"  [pos/kok {vi + 1}/{len(kok_pos_voices)}] {voice}/{variant} "
+                  f"-> written={stats.written} skipped={stats.skipped} failed={stats.failed}")
 
     # ── NEGATIVES — Gemini (phonetic + phrases) ──
     for vi, voice in enumerate(gem_neg_voices):
@@ -575,6 +663,8 @@ def generate(args):
     # ── Summary ──
     n_pos = len([f for f in os.listdir(pos_dir) if f.endswith(".wav")])
     n_neg = len([f for f in os.listdir(neg_dir) if f.endswith(".wav")])
+    n_total = n_pos + n_neg
+    goal = args.target_total
     print("\n" + "=" * 64)
     print("  Generation complete.")
     print(f"  Written this run : {stats.written}   skipped (already present): "
@@ -582,6 +672,11 @@ def generate(args):
     print(f"  Gemini API calls : {stats.gemini_calls}")
     print(f"  Positive WAVs on disk : {n_pos}  ({pos_dir})")
     print(f"  Negative WAVs on disk : {n_neg}  ({neg_dir})")
+    print(f"  TOTAL on disk    : {n_total}  =  {n_pos} pos + {n_neg} neg")
+    if goal > 0:
+        pct = 100.0 * n_total / goal
+        status = "✅ reached" if n_total >= goal else "⏳ below target"
+        print(f"  Target total     : {n_total}/{goal}  ({pct:.0f}% of goal)  {status}")
     print("=" * 64)
     print("\nNext — retrain the verifier on this dataset:\n")
     print(f"  venv/bin/python osia/wake_training/train.py \\")
@@ -591,6 +686,28 @@ def generate(args):
     print(f"  venv/bin/python osia/wake_training/train.py \\")
     print(f"      --positive-dir {pos_dir} {os.path.join(BASE_DIR, 'positive')} \\")
     print(f"      --negative-dir {neg_dir} {os.path.join(BASE_DIR, 'negative')}\n")
+
+    # ── Clean up the old, mispronounced positives ──
+    # Pre-fix positives were synthesized from a bare "osia", which TTS reads as
+    # "ozia" (voiced s) — they no longer match the wake word. Every *new* positive
+    # filename carries a variant token (ossia/ocia); the old ones don't, so that
+    # absence is the discriminator. The command is scoped to synthetic 'pos_*.wav'
+    # only, so personal mic recordings ('osia_*.wav' from record_samples.py) are
+    # left untouched. Build the exclusions from POSITIVE_VARIANTS so they stay
+    # in sync if the variant list changes.
+    find_excl = " ".join(f"! -name '*_{name}_*'" for name, _ in POSITIVE_VARIANTS)
+    ps_re = "|".join(name for name, _ in POSITIVE_VARIANTS)
+    print("=" * 64)
+    print("Old positives synthesized from the bare \"osia\" text are mispronounced")
+    print('("ozia") and should be deleted so they don\'t dilute the retrain. They')
+    print("are the synthetic positives with NO variant token in their filename")
+    print("(personal 'osia_*.wav' mic recordings are NOT matched). Preview, then run:\n")
+    print(f"  find {pos_dir} -type f -name 'pos_*.wav' {find_excl} -print")
+    print(f"  find {pos_dir} -type f -name 'pos_*.wav' {find_excl} -delete")
+    print("\n  # Windows PowerShell equivalent:")
+    print(f"  Get-ChildItem '{pos_dir}' -Filter pos_*.wav | "
+          f"Where-Object {{ $_.Name -notmatch '_({ps_re})_' }} | Remove-Item")
+    print("=" * 64)
 
 
 def _slug(text: str) -> str:
@@ -619,13 +736,20 @@ def parse_args(argv=None):
                    help="'all' (~30) or an integer count of Gemini voices for positives")
     p.add_argument("--gemini-neg-voices", type=int, default=8,
                    help="number of Gemini voices used for spoken negatives")
-    p.add_argument("--kokoro-neg-voices", type=int, default=3,
-                   help="number of Kokoro voices used for spoken negatives")
+    p.add_argument("--kokoro-neg-voices", default="all",
+                   help="'all' or an integer count of Kokoro voices for spoken negatives")
     p.add_argument("--noise-per-kind", type=int, default=16,
                    help="base noise clips per kind (silence/white/pink)")
-    p.add_argument("--pos-aug", type=int, default=2, help="augmented copies per positive base")
+    p.add_argument("--pos-aug", type=int, default=2,
+                   help="augmented copies per Gemini positive base")
+    p.add_argument("--kokoro-aug", type=int, default=6,
+                   help="augmented copies per Kokoro positive base (deeper aug to "
+                        "offset Kokoro's smaller timbre pool)")
     p.add_argument("--neg-aug", type=int, default=1, help="augmented copies per spoken-negative base")
     p.add_argument("--noise-aug", type=int, default=2, help="augmented copies per noise base")
+    p.add_argument("--target-total", type=int, default=1000,
+                   help="report positives+negatives on disk against this goal "
+                        "(0 = don't show a target)")
     p.add_argument("--max-tts-calls", type=int, default=0,
                    help="hard cap on Gemini calls this run (0 = unlimited)")
     p.add_argument("--no-gemini", action="store_true", help="skip Gemini TTS entirely")
