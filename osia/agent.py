@@ -121,7 +121,13 @@ To call a tool, output a JSON tool call wrapped in <tool_call> tags:
 
 After each tool call you will receive the tool output. You may issue multiple tool calls in sequence.
 When you have all the information you need, give your final answer as plain text (no <tool_call> tags).
-When all tools are done, you MUST write a complete final answer based on everything you found — never end your turn with only tool calls, tool markup, or an empty reply."""
+When all tools are done, you MUST write a complete final answer based on everything you found — never end your turn with only tool calls, tool markup, or an empty reply.
+
+## Honesty about tool results (CRITICAL)
+Tool results are facts — never contradict them or invent outcomes you did not see.
+- If a tool result starts with "ERROR:" or "⚠️ TOOL FAILED", the action did NOT happen. You MUST tell the user the action failed and exactly what the error was. NEVER say or imply it succeeded.
+- Never claim you opened, installed, created, sent, or changed something unless the tool result confirms it. If you did not call a tool, you did not do the action.
+- If you are unsure whether an action succeeded, say so honestly instead of guessing."""
 
 SYSTEM_PROMPT_FR = """Tu es un assistant vocal IA local fonctionnant sur la machine locale de l'utilisateur avec UN ACCÈS SYSTÈME COMPLET. Réponds en français par défaut.
 Tu peux exécuter n'importe quelle commande shell, lire/écrire/supprimer n'importe quel fichier, lancer n'importe quelle application, prendre des captures d'écran, et contrôler un navigateur web.
@@ -185,7 +191,13 @@ Pour appeler un outil, produis un appel JSON dans des balises <tool_call> :
 
 Après chaque appel, tu reçois le résultat de l'outil. Tu peux enchaîner plusieurs appels.
 Quand tu as toutes les informations nécessaires, donne ta réponse finale en texte simple (sans balises <tool_call>).
-Quand tous les outils ont terminé, tu DOIS écrire une réponse finale complète basée sur tout ce que tu as trouvé — ne termine jamais ton tour avec seulement des appels d'outils, du balisage d'outil ou une réponse vide."""
+Quand tous les outils ont terminé, tu DOIS écrire une réponse finale complète basée sur tout ce que tu as trouvé — ne termine jamais ton tour avec seulement des appels d'outils, du balisage d'outil ou une réponse vide.
+
+## Honnêteté sur les résultats d'outils (CRITIQUE)
+Les résultats d'outils sont des faits — ne les contredis jamais et n'invente pas de résultats que tu n'as pas vus.
+- Si un résultat d'outil commence par « ERROR: » ou « ⚠️ TOOL FAILED », l'action n'a PAS eu lieu. Tu DOIS dire à l'utilisateur que l'action a échoué et exactement quelle était l'erreur. N'affirme JAMAIS qu'elle a réussi.
+- N'affirme jamais avoir ouvert, installé, créé, envoyé ou modifié quelque chose sauf si le résultat de l'outil le confirme. Si tu n'as pas appelé d'outil, tu n'as pas fait l'action.
+- Si tu n'es pas sûr qu'une action a réussi, dis-le honnêtement au lieu de deviner."""
 
 
 def get_desktop_path() -> str:
@@ -444,36 +456,145 @@ def clean_response(text: str) -> str:
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+DEFAULT_BASH_TIMEOUT_SECONDS = 30
+# Slow install/download/clone commands get a much larger time budget than the
+# default so a slow machine never reports a false timeout while the work is
+# still in progress (WOR-31). Both the command's own timeout AND the agent's
+# wall-clock tool budget (see ``_tool_timeout_seconds``) are raised for these.
+LONG_RUNNING_TIMEOUT_SECONDS = 300
+# Install/download/clone keywords. Word-boundaried so a substring inside an
+# unrelated word (e.g. "adapter" containing "apt") never triggers the extended
+# budget by accident.
+_LONG_RUNNING_PATTERNS = (
+    re.compile(r"\bpip[0-9]*\s+install\b", re.IGNORECASE),
+    re.compile(r"\bnpm\s+(install|i|ci)\b", re.IGNORECASE),
+    re.compile(r"\bapt(-get)?\b", re.IGNORECASE),
+    re.compile(r"\bdnf\s+install\b", re.IGNORECASE),
+    re.compile(r"\bwget\b", re.IGNORECASE),
+    re.compile(r"\bcurl\b.*-O\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+clone\b", re.IGNORECASE),
+)
+
+
+def _is_long_running_command(command: str) -> bool:
+    """True when a shell command looks like a slow install/download/clone and
+    therefore deserves the extended timeout (WOR-31). Non-string input (a
+    malformed tool call) is never long-running — it falls through to the
+    default budget and the executor reports the real error."""
+    if not command or not isinstance(command, str):
+        return False
+    return any(p.search(command) for p in _LONG_RUNNING_PATTERNS)
+
+
 def tool_bash(command: str) -> str:
     """Execute a bash command and return stdout + stderr (truncated).
 
     On Windows the command is run in PowerShell (not bash/sh), so use
     PowerShell syntax there.
+
+    Install/download/clone commands (``pip install``, ``npm install``,
+    ``apt``, ``dnf install``, ``wget``, ``curl -O``, ``git clone``) are
+    detected as long-running: they get a 300 s budget instead of 30 s and the
+    result reports how long the command actually took, so a slow install is
+    waited out instead of failing blindly (WOR-31).
     """
+    if not _is_long_running_command(command):
+        # Fast path: short commands keep the simple, proven blocking run.
+        try:
+            if sys.platform == "win32":
+                result = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-Command", command],
+                    capture_output=True, text=True,
+                    timeout=DEFAULT_BASH_TIMEOUT_SECONDS, cwd=_PROJECT_DIR,
+                )
+            else:
+                result = subprocess.run(
+                    command, shell=True, capture_output=True, text=True,
+                    timeout=DEFAULT_BASH_TIMEOUT_SECONDS, cwd=_PROJECT_DIR,
+                )
+            out = result.stdout.strip()
+            err = result.stderr.strip()
+            if out and err:
+                return f"STDOUT:\n{out}\n\nSTDERR:\n{err}"
+            if out:
+                return out
+            if err:
+                return f"STDERR:\n{err}"
+            return "(no output)"
+        except subprocess.TimeoutExpired:
+            return f"ERROR: command timed out after {DEFAULT_BASH_TIMEOUT_SECONDS}s"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    # Long-running path: poll the process to completion (up to 300 s) via the
+    # shared wait-and-recheck helper so we both wait it out AND report the
+    # elapsed time. Output is captured to temp files (not pipes) so a chatty
+    # installer can never deadlock on a full pipe buffer while we poll.
+    from osia.tools.task_wait import wait_and_verify
     try:
-        if sys.platform == "win32":
-            result = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-Command", command],
-                capture_output=True, text=True, timeout=30, cwd=_PROJECT_DIR
-            )
-        else:
-            result = subprocess.run(
-                command, shell=True, capture_output=True, text=True,
-                timeout=30, cwd=_PROJECT_DIR
-            )
-        out = result.stdout.strip()
-        err = result.stderr.strip()
-        if out and err:
-            return f"STDOUT:\n{out}\n\nSTDERR:\n{err}"
-        if out:
-            return out
-        if err:
-            return f"STDERR:\n{err}"
-        return "(no output)"
-    except subprocess.TimeoutExpired:
-        return "ERROR: command timed out after 30s"
+        out_f = tempfile.TemporaryFile()
+        err_f = tempfile.TemporaryFile()
     except Exception as e:
         return f"ERROR: {e}"
+    try:
+        if sys.platform == "win32":
+            proc = subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-Command", command],
+                stdout=out_f, stderr=err_f, cwd=_PROJECT_DIR,
+            )
+        else:
+            # start_new_session puts the shell in its own process group so a
+            # timeout can kill the WHOLE tree: with shell=True the installer is
+            # a grandchild of the shell, and proc.kill() alone would orphan it
+            # (it keeps running while we report "killed"). POSIX only — the
+            # win32 branch above launches powershell directly.
+            proc = subprocess.Popen(
+                command, shell=True, stdout=out_f, stderr=err_f,
+                cwd=_PROJECT_DIR, start_new_session=True,
+            )
+    except Exception as e:
+        out_f.close()
+        err_f.close()
+        return f"ERROR: {e}"
+    done, elapsed = wait_and_verify(
+        lambda: proc.poll() is not None,
+        timeout_s=LONG_RUNNING_TIMEOUT_SECONDS,
+        poll_interval_s=1.0,
+        description=f"bash: {command[:60]}",
+    )
+    if not done:
+        # Still running after the budget — kill the whole process group (so the
+        # installer grandchild dies too, not just the shell) and report honestly.
+        try:
+            if sys.platform == "win32":
+                proc.kill()
+            else:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait(timeout=3)
+        except Exception:
+            pass
+        out_f.close()
+        err_f.close()
+        return (
+            f"ERROR: command timed out after {LONG_RUNNING_TIMEOUT_SECONDS}s "
+            f"(elapsed {elapsed:.1f}s, still running — killed)"
+        )
+    try:
+        out_f.seek(0)
+        err_f.seek(0)
+        out = out_f.read().decode("utf-8", "replace").strip()
+        err = err_f.read().decode("utf-8", "replace").strip()
+    finally:
+        out_f.close()
+        err_f.close()
+    suffix = f"\n\n[completed in {elapsed:.1f}s, exit code {proc.returncode}]"
+    if out and err:
+        return f"STDOUT:\n{out}\n\nSTDERR:\n{err}{suffix}"
+    if out:
+        return f"{out}{suffix}"
+    if err:
+        return f"STDERR:\n{err}{suffix}"
+    return f"(no output){suffix}"
 
 
 def tool_read_file(path: str) -> str:
@@ -487,7 +608,7 @@ def tool_read_file(path: str) -> str:
             content = content[:4000] + "\n... [TRUNCATED]"
         return content
     except Exception as e:
-        return f"ERROR reading file: {e}"
+        return f"ERROR: reading file: {e}"
 
 
 def tool_write_file(path: str, content: str) -> str:
@@ -500,7 +621,7 @@ def tool_write_file(path: str, content: str) -> str:
             f.write(content)
         return f"Successfully wrote {len(content)} bytes to {path}"
     except Exception as e:
-        return f"ERROR writing file: {e}"
+        return f"ERROR: writing file: {e}"
 
 
 def tool_open_application(name: str) -> str:
@@ -509,7 +630,7 @@ def tool_open_application(name: str) -> str:
         subprocess.Popen(name, shell=True)
         return f"Launched: {name}"
     except Exception as e:
-        return f"ERROR launching {name}: {e}"
+        return f"ERROR: launching {name}: {e}"
 
 
 def tool_list_files(path: str) -> str:
@@ -521,7 +642,7 @@ def tool_list_files(path: str) -> str:
         entries.sort()
         return "\n".join(entries) if entries else "(empty directory)"
     except Exception as e:
-        return f"ERROR listing {path}: {e}"
+        return f"ERROR: listing {path}: {e}"
 
 
 def tool_delete_file(path: str) -> str:
@@ -532,7 +653,7 @@ def tool_delete_file(path: str) -> str:
         os.remove(path)
         return f"Deleted: {path}"
     except Exception as e:
-        return f"ERROR deleting {path}: {e}"
+        return f"ERROR: deleting {path}: {e}"
 
 
 def tool_run_command(command: str) -> str:
@@ -553,18 +674,18 @@ def tool_take_screenshot() -> str:
             ImageGrab.grab().save(path)
             return path
         except Exception as e:
-            return f"ERROR taking screenshot: {e}"
+            return f"ERROR: taking screenshot: {e}"
     try:
         result = subprocess.run(
             ["scrot", "-o", path], capture_output=True, text=True, timeout=10
         )
         if result.returncode != 0:
-            return f"ERROR taking screenshot: {result.stderr.strip() or 'scrot failed'}"
+            return f"ERROR: taking screenshot: {result.stderr.strip() or 'scrot failed'}"
         return path
     except FileNotFoundError:
         return "ERROR: scrot is not installed"
     except Exception as e:
-        return f"ERROR taking screenshot: {e}"
+        return f"ERROR: taking screenshot: {e}"
 
 
 # ── Path helper (resolves relative paths against the dynamic _PROJECT_DIR) ──
@@ -584,7 +705,7 @@ def tool_create_directory(path: str) -> str:
         os.makedirs(path, exist_ok=True)
         return f"Created directory: {path}"
     except Exception as e:
-        return f"ERROR creating directory {path}: {e}"
+        return f"ERROR: creating directory {path}: {e}"
 
 
 def tool_delete_directory(path: str, recursive: bool = False) -> str:
@@ -601,9 +722,9 @@ def tool_delete_directory(path: str, recursive: bool = False) -> str:
     except FileNotFoundError:
         return f"ERROR: {path} does not exist"
     except OSError as e:
-        return f"ERROR deleting {path}: {e} (use recursive=true to remove non-empty dirs)"
+        return f"ERROR: deleting {path}: {e} (use recursive=true to remove non-empty dirs)"
     except Exception as e:
-        return f"ERROR deleting {path}: {e}"
+        return f"ERROR: deleting {path}: {e}"
 
 
 def tool_rename_file(old_path: str, new_path: str) -> str:
@@ -614,7 +735,7 @@ def tool_rename_file(old_path: str, new_path: str) -> str:
         os.rename(src, dst)
         return f"Renamed: {src} -> {dst}"
     except Exception as e:
-        return f"ERROR renaming {src} -> {dst}: {e}"
+        return f"ERROR: renaming {src} -> {dst}: {e}"
 
 
 def tool_copy_file(src: str, dst: str) -> str:
@@ -629,7 +750,7 @@ def tool_copy_file(src: str, dst: str) -> str:
     except IsADirectoryError:
         return f"ERROR: source {src_abs} is a directory; this tool copies files only"
     except Exception as e:
-        return f"ERROR copying {src_abs} -> {dst_abs}: {e}"
+        return f"ERROR: copying {src_abs} -> {dst_abs}: {e}"
 
 
 def tool_get_file_info(path: str) -> str:
@@ -661,7 +782,7 @@ def tool_get_file_info(path: str) -> str:
     except FileNotFoundError:
         return f"ERROR: {path} does not exist"
     except Exception as e:
-        return f"ERROR getting info for {path}: {e}"
+        return f"ERROR: getting info for {path}: {e}"
 
 
 def tool_search_files(directory: str, pattern: str) -> str:
@@ -682,7 +803,7 @@ def tool_search_files(directory: str, pattern: str) -> str:
             if len(matches) >= 200:
                 break
     except Exception as e:
-        return f"ERROR searching {directory}: {e}"
+        return f"ERROR: searching {directory}: {e}"
     if not matches:
         return f"(no files matching {pattern!r} under {directory})"
     suffix = "\n... [TRUNCATED at 200 hits]" if len(matches) >= 200 else ""
@@ -712,13 +833,13 @@ def tool_open_in_editor(path: str) -> str:
             os.startfile(path)  # type: ignore[attr-defined]
             return f"Opened {path}"
         except Exception as e:
-            return f"ERROR opening {path}: {e}"
+            return f"ERROR: opening {path}: {e}"
     if sys.platform == "darwin":
         try:
             subprocess.Popen(["open", path])
             return f"Opened {path}"
         except Exception as e:
-            return f"ERROR opening {path}: {e}"
+            return f"ERROR: opening {path}: {e}"
     editor = _detect_editor()
     if not editor:
         return "ERROR: no known editor or xdg-open available"
@@ -731,7 +852,7 @@ def tool_open_in_editor(path: str) -> str:
         )
         return f"Opened {path} in {os.path.basename(editor)}"
     except Exception as e:
-        return f"ERROR opening {path} in {editor}: {e}"
+        return f"ERROR: opening {path} in {editor}: {e}"
 
 
 def tool_edit_file_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
@@ -751,7 +872,7 @@ def tool_edit_file_lines(path: str, start_line: int, end_line: int, new_content:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
     except Exception as e:
-        return f"ERROR reading {path}: {e}"
+        return f"ERROR: reading {path}: {e}"
     if start > len(lines):
         return f"ERROR: start_line {start} is past end of file ({len(lines)} lines)"
     end = min(end, len(lines))
@@ -761,7 +882,7 @@ def tool_edit_file_lines(path: str, start_line: int, end_line: int, new_content:
         with open(path, "w", encoding="utf-8") as f:
             f.writelines(new_lines)
     except Exception as e:
-        return f"ERROR writing {path}: {e}"
+        return f"ERROR: writing {path}: {e}"
     return f"Replaced lines {start}-{end} of {path} ({end - start + 1} -> {replacement.count(chr(10))} lines)"
 
 
@@ -787,7 +908,7 @@ def tool_get_system_info() -> str:
             f"disk /:  {du.used / 1024**3:.1f} / {du.total / 1024**3:.1f} GiB used ({du.percent:.0f}%)"
         )
     except Exception as e:
-        return f"ERROR collecting system info: {e}"
+        return f"ERROR: collecting system info: {e}"
 
 
 def tool_list_running_processes(limit: int = 20) -> str:
@@ -849,7 +970,7 @@ def tool_kill_process(name_or_pid) -> str:
         except psutil.AccessDenied:
             return f"ERROR: permission denied killing PID {pid}"
         except Exception as e:
-            return f"ERROR killing PID {pid}: {e}"
+            return f"ERROR: killing PID {pid}: {e}"
     killed = []
     failed = []
     for p in psutil.process_iter(["pid", "name"]):
@@ -886,12 +1007,12 @@ def tool_set_volume(level) -> str:
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
-            return f"ERROR setting volume: {result.stderr.strip() or 'pactl failed'}"
+            return f"ERROR: setting volume: {result.stderr.strip() or 'pactl failed'}"
         return f"Volume set to {pct}%"
     except FileNotFoundError:
         return "ERROR: pactl is not installed"
     except Exception as e:
-        return f"ERROR setting volume: {e}"
+        return f"ERROR: setting volume: {e}"
 
 
 def _clipboard_backend() -> tuple[list[str], list[str]] | None:
@@ -922,10 +1043,10 @@ def tool_get_clipboard() -> str:
                     capture_output=True, text=True, timeout=3,
                 )
                 if result.returncode != 0:
-                    return f"ERROR reading clipboard: {result.stderr.strip() or 'Get-Clipboard failed'}"
+                    return f"ERROR: reading clipboard: {result.stderr.strip() or 'Get-Clipboard failed'}"
                 text = result.stdout
             except Exception as e:
-                return f"ERROR reading clipboard: {e}"
+                return f"ERROR: reading clipboard: {e}"
         if len(text) > 4000:
             text = text[:4000] + "\n... [TRUNCATED]"
         return text if text else "(clipboard is empty)"
@@ -936,13 +1057,13 @@ def tool_get_clipboard() -> str:
     try:
         result = subprocess.run(read_cmd, capture_output=True, text=True, timeout=3)
         if result.returncode != 0:
-            return f"ERROR reading clipboard: {result.stderr.strip() or read_cmd[0] + ' failed'}"
+            return f"ERROR: reading clipboard: {result.stderr.strip() or read_cmd[0] + ' failed'}"
         text = result.stdout
         if len(text) > 4000:
             text = text[:4000] + "\n... [TRUNCATED]"
         return text if text else "(clipboard is empty)"
     except Exception as e:
-        return f"ERROR reading clipboard: {e}"
+        return f"ERROR: reading clipboard: {e}"
 
 
 def tool_set_clipboard(text: str) -> str:
@@ -958,10 +1079,10 @@ def tool_set_clipboard(text: str) -> str:
                     ["clip.exe"], input=text, capture_output=True, text=True, timeout=3,
                 )
                 if result.returncode != 0:
-                    return f"ERROR writing clipboard: {result.stderr.strip() or 'clip.exe failed'}"
+                    return f"ERROR: writing clipboard: {result.stderr.strip() or 'clip.exe failed'}"
                 return f"Copied {len(text)} chars to clipboard"
             except Exception as e:
-                return f"ERROR writing clipboard: {e}"
+                return f"ERROR: writing clipboard: {e}"
     backend = _clipboard_backend()
     if backend is None:
         return "ERROR: no clipboard backend (install wl-clipboard, xclip, or xsel)"
@@ -971,10 +1092,10 @@ def tool_set_clipboard(text: str) -> str:
             write_cmd, input=text, capture_output=True, text=True, timeout=3,
         )
         if result.returncode != 0:
-            return f"ERROR writing clipboard: {result.stderr.strip() or write_cmd[0] + ' failed'}"
+            return f"ERROR: writing clipboard: {result.stderr.strip() or write_cmd[0] + ' failed'}"
         return f"Copied {len(text)} chars to clipboard"
     except Exception as e:
-        return f"ERROR writing clipboard: {e}"
+        return f"ERROR: writing clipboard: {e}"
 
 
 # Browser tools are imported lazily to avoid startup overhead
@@ -1149,18 +1270,33 @@ def _is_tool_error(result) -> bool:
     return any(upper.startswith(p) for p in _ERROR_PREFIXES)
 
 
-def _execute_tool_once(tool_name: str, kwargs: dict):
-    """Run one tool with a 30 s wall-clock timeout. Returns the result
-    (a string, or a ``{"text", "screenshot"}`` dict for navigation
-    tools), or a clear [ERREUR] line on timeout/exception so the model
-    can read the failure back and report it honestly. Submitting through
-    a ThreadPoolExecutor means the surrounding agent loop can never be
-    wedged by a stuck synchronous tool.
+def _tool_timeout_seconds(tool_name: str, kwargs: dict) -> float:
+    """Wall-clock budget for ONE tool execution in the executor. Slow
+    install/download/clone shell commands get the extended budget plus a small
+    grace so ``tool_bash``'s own timeout message fires before the executor's
+    generic one (WOR-31); every other tool keeps the default 30 s.
     """
+    if tool_name in ("bash", "run_command"):
+        if _is_long_running_command(kwargs.get("command", "") or ""):
+            return LONG_RUNNING_TIMEOUT_SECONDS + 30
+    return TOOL_TIMEOUT_SECONDS
+
+
+def _execute_tool_once(tool_name: str, kwargs: dict, timeout_s: float | None = None):
+    """Run one tool with a wall-clock timeout (default 30 s; longer for
+    install/download/clone commands — see ``_tool_timeout_seconds``). Returns
+    the result (a string, or a ``{"text", "screenshot"}`` dict for navigation
+    tools), or a clear [ERREUR] line on timeout/exception so the model can read
+    the failure back and report it honestly. Submitting through a
+    ThreadPoolExecutor means the surrounding agent loop can never be wedged by
+    a stuck synchronous tool.
+    """
+    if timeout_s is None:
+        timeout_s = TOOL_TIMEOUT_SECONDS
     fn = TOOL_MAP[tool_name]
     try:
         fut = _TOOL_EXECUTOR.submit(fn, **kwargs)
-        result = fut.result(timeout=TOOL_TIMEOUT_SECONDS)
+        result = fut.result(timeout=timeout_s)
         # Preserve dict results (browser tools) so screenshots survive.
         if isinstance(result, dict):
             return result
@@ -1168,7 +1304,7 @@ def _execute_tool_once(tool_name: str, kwargs: dict):
     except FutureTimeoutError:
         return (
             f"[ERREUR] L'outil '{tool_name}' n'a pas répondu après "
-            f"{TOOL_TIMEOUT_SECONDS}s (timeout). L'action n'a pas été confirmée."
+            f"{int(timeout_s)}s (timeout). L'action n'a pas été confirmée."
         )
     except Exception as e:
         return f"[ERREUR] '{tool_name}' a échoué: {e}"
@@ -1180,11 +1316,19 @@ def _execute_tool_with_retry(tool_name: str, kwargs: dict):
     where ``is_error`` reflects the *final* attempt — callers use it to
     decide whether to keep dispatching the rest of a tool-call batch.
     """
-    result = _execute_tool_once(tool_name, kwargs)
-    if _is_tool_error(result):
+    timeout_s = _tool_timeout_seconds(tool_name, kwargs)
+    result = _execute_tool_once(tool_name, kwargs, timeout_s=timeout_s)
+    # Slow install/download/clone commands are NOT auto-retried: an immediate
+    # identical retry would just double an already-long wait (WOR-31). Fast
+    # tools keep the retry-once-on-error behavior.
+    long_running = (
+        tool_name in ("bash", "run_command")
+        and _is_long_running_command(kwargs.get("command", "") or "")
+    )
+    if _is_tool_error(result) and not long_running:
         preview = _result_text(result).replace("\n", " ")[:120]
         print(f"[OSIA Agent] ↻ retry tool: {tool_name} (first attempt: {preview!r})")
-        result = _execute_tool_once(tool_name, kwargs)
+        result = _execute_tool_once(tool_name, kwargs, timeout_s=timeout_s)
     return result, _is_tool_error(result)
 
 
@@ -3147,7 +3291,9 @@ class OSIAAgent:
                             f"(known tools: {len(TOOL_MAP)})"
                         )
                         tool_results.append(
-                            f"Tool {tool_name} result:\n[ERREUR] outil inconnu: {tool_name}"
+                            f"Tool {tool_name} result:\n"
+                            "⚠️ TOOL FAILED — the action did NOT happen: "
+                            f"[ERREUR] outil inconnu: {tool_name}"
                         )
                         # Unknown-tool requests count toward the anti-loop
                         # detectors too (repetition / error streak).
@@ -3188,7 +3334,20 @@ class OSIAAgent:
                         f"[OSIA Agent] ◀ tool: {tool_name} → "
                         f"{len(text_part)} chars [{status}]{extra}"
                     )
-                    result_entry = f"Tool {tool_name} result:\n{text_part}"
+                    # Make failures impossible for a fast model to skim past:
+                    # an error result the model might otherwise ignore gets an
+                    # unmissable banner so it can never claim the action
+                    # happened (WOR-31). The banner is added ONLY to the
+                    # model-facing feedback — text_part stays clean for the
+                    # anti-loop guard's failure log below.
+                    if is_error:
+                        display_text = (
+                            "⚠️ TOOL FAILED — the action did NOT happen: "
+                            f"{text_part}"
+                        )
+                    else:
+                        display_text = text_part
+                    result_entry = f"Tool {tool_name} result:\n{display_text}"
                     # Force screenshot analysis: navigation tool results
                     # (navigate, click, find_and_click) carrying a screenshot
                     # the model will actually see get a mandatory
