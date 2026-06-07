@@ -63,7 +63,7 @@ SAMPLE_RATE = 16000
 CHUNK_SIZE = 1280  # 80ms at 16kHz — required by openWakeWord
 
 # === Detection settings ===
-VERIFIER_THRESHOLD = 0.85  # Score above which we consider "osia" detected
+VERIFIER_THRESHOLD = 0.75  # Score above which we consider "osia" detected
 COOLDOWN_SECONDS = 1.5    # Minimum time between detections
 PATIENCE_FRAMES = 8       # Number of consecutive positive frames required
 

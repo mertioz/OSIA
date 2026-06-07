@@ -55,13 +55,11 @@
   },
   "api_fallbacks": {},
   "api_key_fallbacks": {},
-  "skills_enabled": {
-    "zzz_review_test.md": true
-  },
-  "island_shape": "circle",
-  "island_dock_side": "right",
-  "island_x": 1684,
-  "island_y": 858,
+  "skills_enabled": {},
+  "island_shape": "capsule",
+  "island_dock_side": null,
+  "island_x": 441,
+  "island_y": 393,
   "smart_routing": false,
   "parler_voice_description": null
 }
