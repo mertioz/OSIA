@@ -12,6 +12,8 @@ Kokoro so the assistant always has a voice.
 """
 
 import io
+import json
+import os
 import queue
 import threading
 
@@ -34,7 +36,7 @@ except Exception as _audio_exc:  # PortAudio missing / no audio device
         "disabled (text replies still work)."
     )
 
-from osia.config import get_api_key, get_setting
+from osia.config import CONFIG_DIR, get_api_key, get_setting
 
 # Make langdetect deterministic
 DetectorFactory.seed = 0
@@ -378,6 +380,217 @@ def speak(text: str, block: bool = True):
         threading.Thread(
             target=_speak_blocking, args=(text,), daemon=True,
         ).start()
+
+
+# ── Wake-greeting audio cache ──────────────────────────────────────────────
+# The wake greeting (e.g. "Bonjour, monsieur !") is a short, near-constant
+# phrase spoken on EVERY wake-word detection. Re-synthesizing it through a cloud
+# TTS API each time adds ~1.5s of latency for nothing. We cache the raw audio on
+# disk keyed on (text, provider, voice, speed); when those are unchanged we
+# replay the cached wav instantly with no API call. Any change re-synthesizes
+# once and refreshes the cache. CONFIG_DIR is imported from osia.config (never
+# hardcoded) so the cache lives next to settings.json on every OS.
+
+_GREETING_CACHE_WAV = os.path.join(CONFIG_DIR, "greeting_cache.wav")
+_GREETING_CACHE_META = os.path.join(CONFIG_DIR, "greeting_cache.json")
+
+
+def _synthesize_to_buffer(text: str, provider: str, voice):
+    """Synthesize ``text`` to raw audio WITHOUT playing it.
+
+    Returns ``(samples, samplerate)`` — float32 mono ``np.ndarray`` + ``int`` —
+    on success, or ``None`` on any failure (so the caller can fall back to the
+    normal ``speak`` path). Used only to (re)fill the greeting cache; normal
+    speech keeps going through ``speak`` / ``_speak_blocking`` untouched.
+
+    Mirrors the *synthesis* half of ``speak_openai`` / ``speak_google`` /
+    ``speak_kokoro`` (minus playback). Returns audio ONLY for the requested
+    provider — never a cloud-tagged Kokoro fallback — so the cached bytes always
+    match the cache metadata. Keep in sync if a provider's request shape changes.
+    """
+    try:
+        if provider == "openai":
+            api_key = get_api_key("openai")
+            if not api_key:
+                return None
+            import requests
+            v = voice or PROVIDER_DEFAULT_VOICE["openai"]
+            if v not in OPENAI_VOICES:
+                v = PROVIDER_DEFAULT_VOICE["openai"]
+            _debug(f"greeting cache: synth openai (voice={v})")
+            r = requests.post(
+                "https://api.openai.com/v1/audio/speech",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": "gpt-4o-mini-tts",
+                    "input": text,
+                    "voice": v,
+                    "response_format": "wav",
+                    "speed": TTS_SPEED,
+                },
+                timeout=60,
+            )
+            r.raise_for_status()
+            audio, sr = sf.read(io.BytesIO(r.content), dtype="float32", always_2d=False)
+            return audio, int(sr)
+
+        if provider == "google":
+            api_key = get_api_key("google")
+            if not api_key:
+                return None
+            import base64
+            import requests
+            v = voice or GEMINI_DEFAULT_VOICE
+            if v not in GEMINI_VOICES:
+                v = GEMINI_DEFAULT_VOICE
+            body = {
+                "contents": [{"parts": [{"text": gemini_tts_prompt(text)}]}],
+                "generationConfig": {
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {
+                        "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": v}}
+                    },
+                },
+            }
+            for model in GEMINI_TTS_MODELS:
+                try:
+                    _debug(f"greeting cache: synth google (model={model}, voice={v})")
+                    r = requests.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                        json=body,
+                        timeout=60,
+                    )
+                    r.raise_for_status()
+                    data = r.json()
+                    b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+                    pcm = base64.b64decode(b64)
+                    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                    return samples, GEMINI_TTS_SR
+                except Exception as e:
+                    _debug(f"greeting cache: google model {model} failed: {e}")
+                    continue
+            return None
+
+        # local / unknown provider → Kokoro (offline)
+        lang = detect_language(text)
+        lang_code = "f" if lang == "fr" else "a"
+        kvoice = KOKORO_VOICE_FR if lang == "fr" else KOKORO_VOICE_EN
+        _debug(f"greeting cache: synth kokoro (voice={kvoice})")
+        pipeline = _get_kokoro_pipeline(lang_code)
+        segments = [
+            audio
+            for _, _, audio in pipeline(text, voice=kvoice, speed=KOKORO_SPEED)
+            if audio is not None
+        ]
+        if not segments:
+            return None
+        return np.concatenate(segments), KOKORO_SR
+    except Exception as e:
+        _debug(f"greeting cache: synthesis to buffer failed: {e}")
+        return None
+
+
+def _play_buffer_blocking(samples, sr) -> None:
+    """Play raw audio synchronously (used by the greeting-cache path)."""
+    _log_audio_device()
+    sd.play(samples, samplerate=sr)
+    sd.wait()
+
+
+def speak_greeting_cached(text: str) -> None:
+    """Speak the wake greeting, replaying cached audio when possible.
+
+    On a cache hit — the on-disk (text, provider, voice, speed) matches the
+    current ``tts_provider`` / ``tts_voice`` settings — the stored wav is played
+    instantly with no synthesis/API call. On a miss (first run, or any of those
+    changed) the greeting is synthesized once, the cache is refreshed, and the
+    fresh audio is played. Always blocks until playback finishes, so the greeting
+    never bleeds into the command recording that follows.
+
+    Falls back to the normal blocking ``speak`` path if anything goes wrong, so
+    the greeting always plays even when the cache can't be read or written.
+    """
+    if not text or not text.strip():
+        _debug("speak_greeting_cached: empty text — nothing to do")
+        return
+    if not _AUDIO_OK:
+        _debug("speak_greeting_cached: no audio backend — skipping playback")
+        return
+
+    text = text.strip()
+    provider = get_active_tts_provider()
+    voice = get_setting("tts_voice")
+
+    # 1) Cache hit → play the stored wav directly, no synthesis / API call.
+    try:
+        if os.path.exists(_GREETING_CACHE_WAV) and os.path.exists(_GREETING_CACHE_META):
+            with open(_GREETING_CACHE_META, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if (
+                meta.get("text") == text
+                and meta.get("provider") == provider
+                and meta.get("voice") == voice
+                and meta.get("speed") == TTS_SPEED
+            ):
+                audio, sr = sf.read(
+                    _GREETING_CACHE_WAV, dtype="float32", always_2d=False
+                )
+                _debug(
+                    f"speak_greeting_cached: cache HIT "
+                    f"(provider={provider!r}, voice={voice!r})"
+                )
+                print(f"🔊 Speaking (cached greeting): {text[:80]}")
+                _play_buffer_blocking(audio, int(sr))
+                _debug("speak_greeting_cached: cached playback finished")
+                return
+    except Exception as e:
+        _debug(f"speak_greeting_cached: cache read failed ({e}) — re-synthesizing")
+
+    # 2) Cache miss / stale / settings changed → synthesize once, refresh cache.
+    _debug(
+        f"speak_greeting_cached: cache MISS — synthesizing "
+        f"(provider={provider!r}, voice={voice!r})"
+    )
+    res = _synthesize_to_buffer(text, provider, voice)
+    if res is None:
+        # Buffer synth failed (cloud API down / no key). Fall back to the proven
+        # speak() path so the greeting still plays (uncached this time).
+        _debug("speak_greeting_cached: buffer synth failed — falling back to speak()")
+        speak(text)
+        return
+    samples, sr = res
+
+    # Persist the cache atomically BEFORE playing, so a crash mid-playback still
+    # leaves a valid cache for next time.
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        tmp_wav = _GREETING_CACHE_WAV + ".tmp"
+        # format="WAV" is explicit because the ".tmp" extension hides the format
+        # from soundfile's extension sniffing (it raises otherwise).
+        sf.write(tmp_wav, samples, sr, format="WAV")
+        os.replace(tmp_wav, _GREETING_CACHE_WAV)
+        tmp_meta = _GREETING_CACHE_META + ".tmp"
+        with open(tmp_meta, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "text": text,
+                    "provider": provider,
+                    "voice": voice,
+                    "speed": TTS_SPEED,
+                    "sr": int(sr),
+                },
+                f,
+                indent=2,
+            )
+        os.replace(tmp_meta, _GREETING_CACHE_META)
+        _debug("speak_greeting_cached: cache updated")
+    except Exception as e:
+        _debug(f"speak_greeting_cached: cache write failed: {e}")
+
+    print(f"🔊 Speaking (greeting): {text[:80]}")
+    _play_buffer_blocking(samples, int(sr))
+    _debug("speak_greeting_cached: playback finished")
 
 
 # ── Streaming playback queue ───────────────────────────────────────────────

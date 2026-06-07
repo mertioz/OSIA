@@ -272,7 +272,9 @@ def wake_mode():
     from osia.voice.wake import WakeWordDetector, verifier_available
     from osia.voice.stt import listen_for_command
     from osia.voice.commands import is_new_chat_command
-    from osia.voice.tts import speak, speak_streaming, stop as tts_stop
+    from osia.voice.tts import (
+        speak, speak_greeting_cached, speak_streaming, stop as tts_stop,
+    )
     from osia.agent import clean_response
     from osia import i18n
     from osia.config import load_settings, set_setting
@@ -467,7 +469,7 @@ def wake_mode():
                     greeting = (live_settings.get("wake_greeting_text") or "").strip()
                     if greeting:
                         bridge.island_state.emit("speaking")
-                        speak(greeting)
+                        speak_greeting_cached(greeting)
                         bridge.island_state.emit("listening")
                 user_text = listen_for_command(max_retries=3)
                 if not user_text:
