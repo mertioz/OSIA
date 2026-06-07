@@ -41,13 +41,13 @@ MODEL_SIZE = "small"  # tiny, base, small, medium, large
 VAD_SAMPLE_RATE = 16000
 VAD_CHUNK_SECONDS = 0.5
 VAD_SILENCE_RMS = 0.015      # fallback if calibration fails; normally overridden
-VAD_SILENCE_SECONDS = 2.0    # silence run length that ends the recording
+VAD_SILENCE_SECONDS = 1.2    # silence run length that ends the recording
 VAD_MAX_SECONDS = 60.0       # hard cap on recording length
 VAD_MIN_SECONDS = 3.0        # don't end before this many seconds
 
 # Ambient calibration
 VAD_CALIBRATION_SECONDS = 1.0
-VAD_CALIBRATION_MULTIPLIER = 1.3
+VAD_CALIBRATION_MULTIPLIER = 1.5
 VAD_THRESHOLD_CEILING = 0.05   # never let calibrated threshold exceed this
 _calibrated_silence_rms: float | None = None  # set by calibrate_ambient_threshold()
 

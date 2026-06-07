@@ -43,10 +43,34 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_pla
 # Playwright versions (newer versions subclass the builtin, older don't).
 _TIMEOUT_ERRORS = (PlaywrightTimeoutError, TimeoutError)
 
+# psutil powers the stale-instance scan (Bug 1): it spots a browser left over
+# from a previous OSIA session that still holds one of OSIA's dedicated
+# profiles, so we can clear it before launching instead of spawning a duplicate
+# window. psutil is a declared dependency, but the import is guarded so a
+# missing psutil only disables the optimization — it never breaks a launch.
+try:
+    import psutil
+
+    _PSUTIL_OK = True
+except Exception:  # pragma: no cover - psutil is a declared dependency
+    psutil = None
+    _PSUTIL_OK = False
+
 # ── Configuration ──────────────────────────────────────────────────────────
 
 CDP_PORT = 9222
 CDP_URL = f"http://localhost:{CDP_PORT}"
+
+# Max time to wait for a freshly launched browser to confirm it is ready
+# (the CDP debugger reachable on CDP_PORT for Chromium; the BiDi session is
+# established synchronously by Playwright). Fast models call the page tools the
+# instant they ask for a browser, so this must be generous enough that a
+# slow-but-fine startup is never misreported as "the browser failed to open"
+# (Bug 2). Return success the moment the browser is ready; only report failure
+# after the full timeout.
+BROWSER_READY_TIMEOUT_S = 15
+# Poll cadence while waiting for the browser to come up.
+_BROWSER_READY_POLL_S = 0.5
 
 # Every browser OSIA launches gets a dedicated profile under ~/.osia/ so it
 # never touches (or opens a window in) the user's personal browser profiles.
@@ -284,14 +308,106 @@ def _detect_firefox() -> str | None:
     return None
 
 
-def _wait_for_cdp(timeout: float) -> bool:
-    """Poll until a CDP debugger responds on ``CDP_PORT`` or ``timeout`` elapses."""
+def _wait_for_cdp(timeout: float = BROWSER_READY_TIMEOUT_S) -> bool:
+    """Poll until a CDP debugger responds on ``CDP_PORT`` or ``timeout``
+    elapses, checking every ``_BROWSER_READY_POLL_S`` seconds. Returns
+    ``True`` as soon as the debugger is reachable, ``False`` only once the
+    full timeout has passed.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         if _is_cdp_alive():
             return True
-        time.sleep(0.2)
+        time.sleep(_BROWSER_READY_POLL_S)
     return False
+
+
+# Executable-name stems that identify a browser process. The stale-profile
+# scan is gated on these so it only ever targets a real browser — never an
+# unrelated process (a shell, an editor, OSIA itself) that merely mentions the
+# profile path on its command line.
+_BROWSER_PROC_TOKENS = (
+    "firefox", "brave", "chrome", "chromium", "opera", "msedge", "microsoft-edge",
+)
+
+
+def _looks_like_browser(name: str, exe: str) -> bool:
+    """True if a process's name/executable identifies it as a known browser."""
+    blob = f"{name or ''} {os.path.basename(exe or '')}".lower()
+    return any(tok in blob for tok in _BROWSER_PROC_TOKENS)
+
+
+def _processes_using_profile(profile_dir: str):
+    """Return the running *browser* processes whose command line references
+    ``profile_dir`` — a browser still holding one of OSIA's dedicated
+    profiles. This catches a stale/zombie browser left over from a previous
+    OSIA session: OSIA has no Playwright handle to drive it, yet it holds the
+    profile lock, so launching a fresh browser against the same profile is
+    exactly what spawns a duplicate window (Bug 1).
+
+    Two conditions must BOTH hold, so the scan never targets an unrelated
+    process: the process must look like a browser (``_looks_like_browser``)
+    AND its command line must point at ``profile_dir``. Best-effort: returns
+    ``[]`` when psutil is unavailable so the scan can never break a launch.
+
+    Assumes a single OSIA instance (the normal deployment): a match is treated
+    as a stale browser this OSIA owns but lost its handle to. If two OSIA
+    processes ever shared a profile, this could match the other's live browser
+    — out of scope here, since OSIA runs one instance per machine.
+    """
+    if not _PSUTIL_OK:
+        return []
+    target = os.path.normpath(profile_dir)
+    self_pid = os.getpid()
+    matches = []
+    for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+        try:
+            info = proc.info
+            if info.get("pid") == self_pid:
+                continue
+            if not _looks_like_browser(info.get("name"), info.get("exe")):
+                continue
+            cmdline = info.get("cmdline") or []
+        except Exception:
+            continue
+        for arg in cmdline:
+            if arg and (profile_dir in arg or target in os.path.normpath(arg)):
+                matches.append(proc)
+                break
+    return matches
+
+
+def _terminate_processes(procs) -> None:
+    """Terminate ``procs`` cleanly: SIGTERM, a brief grace period, then
+    SIGKILL for any survivor. Best-effort — a permission error on one process
+    must never block the launch that follows.
+    """
+    if not _PSUTIL_OK or not procs:
+        return
+    for proc in procs:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        _gone, alive = psutil.wait_procs(procs, timeout=3)
+    except Exception:
+        alive = procs
+    if not alive:
+        return
+    for proc in alive:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    # SIGKILL returns immediately while the OS tears the process down; the
+    # profile lock (Chromium SingletonLock / Firefox .parentlock) is released
+    # only once the process is fully reaped. Wait for that before returning so
+    # the immediate relaunch never races a still-locked profile (Bug 1).
+    try:
+        psutil.wait_procs(alive, timeout=3)
+    except Exception:
+        pass
 
 
 def _launch_cdp_browser(binary: str | None = None) -> tuple[bool, str]:
@@ -322,7 +438,7 @@ def _launch_cdp_browser(binary: str | None = None) -> tuple[bool, str]:
     # Another call is already launching — wait for its debugger to come
     # online instead of racing it with a second process.
     if _cdp_launching:
-        if _wait_for_cdp(15.0):
+        if _wait_for_cdp(BROWSER_READY_TIMEOUT_S):
             return True, f"reusing CDP browser launched by a concurrent call on port {CDP_PORT}"
         return False, (
             f"another CDP launch was in progress but the debugger never came "
@@ -350,6 +466,15 @@ def _launch_cdp_browser(binary: str | None = None) -> tuple[bool, str]:
         "refusing to launch CDP browser without --user-data-dir pointing at "
         f"the OSIA profile ({OSIA_PROFILE_DIR})"
     )
+    # No CDP debugger answered above, yet a Chromium browser from a previous
+    # OSIA session may still be holding our dedicated profile without exposing
+    # the debug port (e.g. a plain-application fallback launch). Its profile
+    # lock would make this fresh launch attach silently or never expose the
+    # port — kill the stale, undriveable instance cleanly first so the new
+    # window is the one we control (Bug 1).
+    stale = _processes_using_profile(OSIA_PROFILE_DIR)
+    if stale:
+        _terminate_processes(stale)
     _cdp_launching = True
     try:
         try:
@@ -362,11 +487,14 @@ def _launch_cdp_browser(binary: str | None = None) -> tuple[bool, str]:
         except Exception as e:
             return False, f"failed to launch {browser}: {e}"
 
-        # Poll for the debugger socket — Chromium typically needs ~0.5-2s.
-        if _wait_for_cdp(10.0):
+        # Poll for the debugger socket — Chromium typically needs ~0.5-2s, but
+        # a cold start can take longer; wait up to BROWSER_READY_TIMEOUT_S and
+        # succeed the moment the debugger answers (Bug 2).
+        if _wait_for_cdp(BROWSER_READY_TIMEOUT_S):
             return True, f"launched {os.path.basename(browser)} with CDP on port {CDP_PORT}"
         return False, (
-            f"launched {browser} but CDP did not come online on port {CDP_PORT} within 10s"
+            f"launched {browser} but its CDP debugger never came online on "
+            f"port {CDP_PORT} within {BROWSER_READY_TIMEOUT_S}s"
         )
     finally:
         _cdp_launching = False
@@ -510,6 +638,14 @@ def _ensure_firefox_bidi():
                 "in /usr/bin, /snap/bin, and $PATH"
             )
         os.makedirs(FIREFOX_PROFILE_DIR, exist_ok=True)
+        # A Firefox from a previous OSIA session may still be holding our
+        # dedicated profile. The Playwright connection that drove it died with
+        # that process, so it is effectively unresponsive — and launching a
+        # second Firefox against the locked profile is what opens a duplicate
+        # window. Kill the stale instance cleanly, then launch fresh (Bug 1).
+        stale = _processes_using_profile(FIREFOX_PROFILE_DIR)
+        if stale:
+            _terminate_processes(stale)
         _firefox_launching = True
         try:
             # launch_persistent_context() is Playwright's supported way to run
@@ -621,7 +757,11 @@ def navigate(url: str):
         try:
             page = _ensure_browser()
         except Exception as e:
-            return f"ERROR navigating to {url}: {e}"
+            # The browser itself failed to launch/connect — this is NOT a
+            # navigation problem. Start with "ERROR:" and say so plainly so a
+            # fast model never misreads it as success and hallucinates an open
+            # window (Bug 2).
+            return f"ERROR: the browser did not open — {e}"
         try:
             page.goto(url, wait_until="commit", timeout=10000)
         except _TIMEOUT_ERRORS:
@@ -931,7 +1071,10 @@ def open_browser(name: str, url: str | None = None):
             **_detach_kwargs(),
         )
     except Exception as e:
-        return f"ERROR launching {binary}: {e}"
+        return (
+            f"ERROR: the browser did not open — failed to launch "
+            f"{os.path.basename(binary)}: {e}"
+        )
     suffix = f" at {_normalize_url(url)}" if url else ""
     return f"Opened {os.path.basename(binary)}{suffix}{bidi_note}"
 
