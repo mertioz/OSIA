@@ -96,6 +96,71 @@ TOKEN_FILE = CONFIG_DIR / "mobile_token.txt"
 # Windows, so derive it from the OS temp dir instead.
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "osia_uploads"
 
+
+# ---------------------------------------------------------------------------
+# X11 environment for headless browser automation (Linux only)
+# ---------------------------------------------------------------------------
+def _ensure_x11_env() -> None:
+    """Resolve DISPLAY + XAUTHORITY so the CDP/Firefox-BiDi browser tools work
+    when the server runs headless under systemd (no graphical login session).
+
+    The per-session X authority cookie lives in the XDG runtime dir
+    (``/run/user/<uid>/xauth_XXXXXX``) under a *random* suffix that changes on
+    every login/reboot, so it can't be pinned in a systemd override without
+    going stale. We resolve it live at startup and stash it in ``os.environ``;
+    the browser subprocesses OSIA launches inherit the environment (Popen is
+    called without ``env=`` in ``osia/tools/browser.py``), so that's all they
+    need.
+
+    Linux-only — a no-op on Windows/macOS, where the desktop login session
+    already exports a valid DISPLAY/XAUTHORITY.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+
+    # DISPLAY — default to the primary local display when the unit inherited none.
+    if not os.environ.get("DISPLAY"):
+        os.environ["DISPLAY"] = ":0"
+
+    # XAUTHORITY — keep an existing value only while it still points at a real
+    # file; otherwise hunt for the live per-session cookie.
+    xauth = os.environ.get("XAUTHORITY")
+    if not (xauth and os.path.isfile(xauth)):
+        # Primary location is the XDG runtime dir (/run/user/<uid>); the
+        # classic ``~/.Xauthority`` is the fallback.
+        search_dirs = [f"/run/user/{os.getuid()}"]
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        if xdg and xdg not in search_dirs:
+            search_dirs.append(xdg)
+
+        candidates: list[Path] = []
+        for d in search_dirs:
+            try:
+                candidates.extend(Path(d).glob("xauth_*"))
+            except OSError:
+                pass
+        home_xauth = Path.home() / ".Xauthority"
+        if home_xauth.is_file():
+            candidates.append(home_xauth)
+
+        # The most recently modified cookie belongs to the live session.
+        best: Path | None = None
+        best_mtime = -1.0
+        for path in candidates:
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > best_mtime:
+                best, best_mtime = path, mtime
+
+        if best is not None:
+            os.environ["XAUTHORITY"] = str(best)
+
+    resolved = os.environ.get("XAUTHORITY", "<unresolved>")
+    print(f"[X11] DISPLAY={os.environ['DISPLAY']} XAUTHORITY={resolved}")
+
+
 # Image extensions that should trigger DeepSeek Vision automatically.
 _IMAGE_MIME = {
     "jpg": "image/jpeg",
@@ -485,6 +550,18 @@ async def _warm_models() -> None:
 
     # Run in the background so /health responds immediately during warm-up.
     asyncio.create_task(_warm())
+
+
+@app.on_event("startup")
+async def _resolve_x11_on_startup() -> None:
+    """Resolve DISPLAY/XAUTHORITY before any browser tool can run.
+
+    Fires once at server startup — well before the first WebSocket request can
+    trigger a CDP/Firefox-BiDi browser launch — so the headless systemd service
+    reaches the X display without a (stale-prone) manual systemd override.
+    Linux-only effect; see ``_ensure_x11_env``.
+    """
+    _ensure_x11_env()
 
 
 @app.get("/")
