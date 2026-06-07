@@ -36,11 +36,19 @@ _PROJECT_DIR = str(Path(__file__).resolve().parent.parent)
 
 def detect_system_lang() -> str:
     """Detect host system language from $LANG env var.
-    Returns 'fr' if French, 'en' otherwise.
+
+    Returns one of the supported language codes; falls back to ``"en"`` if
+    detection raises or yields a value outside the supported list.
     """
-    lang_env = os.environ.get("LANG", "")
-    if lang_env.lower().startswith("fr"):
-        return "fr"
+    supported = ("en", "fr", "zh", "ja", "de", "es")
+    try:
+        lang_env = os.environ.get("LANG", "") or ""
+        # e.g. "fr_FR.UTF-8" / "zh_CN.UTF-8" -> "fr" / "zh"
+        code = lang_env.split("_", 1)[0].split(".", 1)[0].strip().lower()
+        if code in supported:
+            return code
+    except Exception:
+        pass
     return "en"
 
 
