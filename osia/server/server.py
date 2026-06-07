@@ -122,6 +122,28 @@ def _ensure_x11_env() -> None:
     if not os.environ.get("DISPLAY"):
         os.environ["DISPLAY"] = ":0"
 
+    # WAYLAND_DISPLAY — under a Wayland login (KDE Plasma/GNOME on Fedora) the
+    # screenshot backend (spectacle/grim, see osia/agent.py) needs the
+    # compositor socket, which a headless systemd unit may not inherit. Resolve
+    # it from the XDG runtime dir — only when a socket really exists — so we
+    # never set a bogus value on a pure X11 host (which would otherwise fool the
+    # Wayland detection in take_screenshot into trying Wayland-only tools).
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        xdg_rt = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        runtime = Path(xdg_rt)
+        if (runtime / "wayland-0").exists():
+            os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+        else:
+            try:
+                sockets = sorted(
+                    p.name for p in runtime.glob("wayland-*")
+                    if not p.name.endswith(".lock")
+                )
+            except OSError:
+                sockets = []
+            if sockets:
+                os.environ["WAYLAND_DISPLAY"] = sockets[0]
+
     # XAUTHORITY — keep an existing value only while it still points at a real
     # file; otherwise hunt for the live per-session cookie.
     xauth = os.environ.get("XAUTHORITY")
@@ -158,7 +180,11 @@ def _ensure_x11_env() -> None:
             os.environ["XAUTHORITY"] = str(best)
 
     resolved = os.environ.get("XAUTHORITY", "<unresolved>")
-    print(f"[X11] DISPLAY={os.environ['DISPLAY']} XAUTHORITY={resolved}")
+    wayland = os.environ.get("WAYLAND_DISPLAY", "<none>")
+    print(
+        f"[X11] DISPLAY={os.environ['DISPLAY']} XAUTHORITY={resolved} "
+        f"WAYLAND_DISPLAY={wayland}"
+    )
 
 
 # Image extensions that should trigger DeepSeek Vision automatically.
@@ -308,33 +334,43 @@ def _kokoro_to_mp3_bytes(text: str) -> bytes:
 
 
 def _openai_to_mp3_bytes(text: str) -> bytes:
-    """Synthesize text with OpenAI TTS and return mp3 bytes."""
-    import requests
-    from osia.config import get_api_key, get_setting
-    from osia.voice.tts import OPENAI_VOICES, PROVIDER_DEFAULT_VOICE
+    """Synthesize text with OpenAI TTS and return mp3 bytes.
 
-    api_key = get_api_key("openai")
-    if not api_key:
+    Rotates through the user's OpenAI key chain on a 429/5xx/auth/timeout error
+    (shared rotation via :func:`osia.utils.key_chain.with_key_rotation`) before
+    the caller falls back to Kokoro. WAV→MP3 conversion stays outside the
+    rotation so an ffmpeg failure never burns API keys.
+    """
+    import requests
+    from osia.config import get_setting
+    from osia.voice.tts import OPENAI_VOICES, PROVIDER_DEFAULT_VOICE
+    from osia.utils.key_chain import with_key_rotation, has_key
+
+    if not has_key("openai"):
         raise RuntimeError("OpenAI TTS: no API key")
 
     voice = get_setting("tts_voice") or PROVIDER_DEFAULT_VOICE["openai"]
     if voice not in OPENAI_VOICES:
         voice = PROVIDER_DEFAULT_VOICE["openai"]
 
-    r = requests.post(
-        "https://api.openai.com/v1/audio/speech",
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": "gpt-4o-mini-tts",
-            "input": text,
-            "voice": voice,
-            "response_format": "wav",
-        },
-        timeout=60,
-    )
-    r.raise_for_status()
+    def _synth(key):
+        r = requests.post(
+            "https://api.openai.com/v1/audio/speech",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": "gpt-4o-mini-tts",
+                "input": text,
+                "voice": voice,
+                "response_format": "wav",
+            },
+            timeout=60,
+        )
+        r.raise_for_status()
+        return r.content
+
     # OpenAI returns WAV; convert to MP3
-    return _wav_to_mp3(r.content)
+    content = with_key_rotation("openai", _synth, label="server-tts:openai")
+    return _wav_to_mp3(content)
 
 
 def _google_to_mp3_bytes(text: str) -> bytes:
@@ -347,14 +383,14 @@ def _google_to_mp3_bytes(text: str) -> bytes:
     transcode to MP3 for the phone (the WebSocket protocol still ships mp3).
     """
     import requests
-    from osia.config import get_api_key, get_setting
+    from osia.config import get_setting
     from osia.voice.tts import (
         GEMINI_TTS_MODELS, GEMINI_TTS_SR, GEMINI_VOICES, GEMINI_DEFAULT_VOICE,
         gemini_tts_prompt,
     )
+    from osia.utils.key_chain import with_key_rotation, has_key
 
-    api_key = get_api_key("google")
-    if not api_key:
+    if not has_key("google"):
         raise RuntimeError("Google (Gemini) TTS: no API key")
 
     # A stale Cloud-style voice (e.g. "fr-FR-Neural2-A") isn't a Gemini voice,
@@ -375,32 +411,38 @@ def _google_to_mp3_bytes(text: str) -> bytes:
         },
     }
 
-    last_err = None
-    for model in GEMINI_TTS_MODELS:
-        try:
-            r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                json=body,
-                timeout=60,
-            )
-            r.raise_for_status()
-            data = r.json()
-            # base64 PCM lives at candidates[0].content.parts[0].inlineData.data
-            b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
-            pcm = base64.b64decode(b64)
-            # 24kHz 16-bit signed PCM mono -> WAV -> MP3 (matches the kokoro path)
-            samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-            wav_buf = io.BytesIO()
-            sf.write(wav_buf, samples, GEMINI_TTS_SR, format="WAV")
-            wav_buf.seek(0)
-            return _wav_to_mp3(wav_buf.read())
-        except Exception as e:
-            # Model unavailable on this tier / transient error -> try the next.
-            last_err = e
-            continue
+    def _synth(key):
+        """Try the model list (newest first) for one API key; return float32
+        samples on the first success, else raise the last error so
+        ``with_key_rotation`` can advance to the next key on a 429/5xx."""
+        last_err = None
+        for model in GEMINI_TTS_MODELS:
+            try:
+                r = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    json=body,
+                    timeout=60,
+                )
+                r.raise_for_status()
+                data = r.json()
+                # base64 PCM lives at candidates[0].content.parts[0].inlineData.data
+                b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+                pcm = base64.b64decode(b64)
+                # 24kHz 16-bit signed PCM mono -> float32 in [-1, 1]
+                return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+            except Exception as e:
+                # Model unavailable on this tier / transient error -> try the next.
+                last_err = e
+                continue
+        raise last_err
 
-    raise RuntimeError(f"Google (Gemini) TTS failed: {last_err}")
+    # WAV→MP3 conversion stays outside the rotation (matches the kokoro path).
+    samples = with_key_rotation("google", _synth, label="server-tts:google")
+    wav_buf = io.BytesIO()
+    sf.write(wav_buf, samples, GEMINI_TTS_SR, format="WAV")
+    wav_buf.seek(0)
+    return _wav_to_mp3(wav_buf.read())
 
 
 def _wav_to_mp3(wav_bytes: bytes, bitrate: str = "128k") -> bytes:
@@ -438,7 +480,8 @@ def synthesize_to_mp3_bytes(text: str) -> bytes:
     Follows the same provider chain as ``osia.voice.tts._speak_blocking``:
     openai → google → local (Kokoro). Falls back to Kokoro on failure.
     """
-    from osia.config import get_api_key, get_setting
+    from osia.config import get_setting
+    from osia.utils.key_chain import has_key
 
     provider = get_setting("tts_provider", "local") or "local"
     print(
@@ -447,8 +490,10 @@ def synthesize_to_mp3_bytes(text: str) -> bytes:
         flush=True,
     )
 
-    # Try configured provider first, fall back to Kokoro
-    if provider == "openai" and get_api_key("openai"):
+    # Try configured provider first, fall back to Kokoro. The per-provider
+    # helpers rotate through the user's key chain internally before raising, so
+    # we only reach Kokoro once every configured key is exhausted.
+    if provider == "openai" and has_key("openai"):
         try:
             mp3 = _openai_to_mp3_bytes(text)
             print(
@@ -458,7 +503,7 @@ def synthesize_to_mp3_bytes(text: str) -> bytes:
             return mp3
         except Exception as e:
             print(f"⚠️  OpenAI TTS failed, falling back to Kokoro: {e}")
-    elif provider == "google" and get_api_key("google"):
+    elif provider == "google" and has_key("google"):
         try:
             mp3 = _google_to_mp3_bytes(text)
             print(

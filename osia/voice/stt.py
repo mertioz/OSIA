@@ -29,7 +29,8 @@ except Exception as _audio_exc:  # PortAudio missing / no audio device
         "is disabled (text + mobile still work)."
     )
 
-from osia.config import get_api_key, get_setting
+from osia.config import get_setting
+from osia.utils.key_chain import with_key_rotation, has_key
 from osia.voice.commands import is_new_chat_command
 
 DEVICE_SAMPLE_RATE = 48000  # Hardware native rate
@@ -284,8 +285,7 @@ def _transcribe_groq(audio_path_or_bytes, sample_rate: int = WHISPER_SAMPLE_RATE
     """
     import requests
 
-    api_key = get_api_key("groq")
-    if not api_key:
+    if not has_key("groq"):
         raise RuntimeError("Groq STT: no API key configured")
 
     model = model or get_setting("stt_groq_model", GROQ_DEFAULT_MODEL) or GROQ_DEFAULT_MODEL
@@ -309,16 +309,25 @@ def _transcribe_groq(audio_path_or_bytes, sample_rate: int = WHISPER_SAMPLE_RATE
     if language:
         data["language"] = language
 
-    resp = requests.post(
-        GROQ_TRANSCRIBE_URL,
-        headers={"Authorization": f"Bearer {api_key}"},
-        files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-        data=data,
-        timeout=60,
-    )
-    resp.raise_for_status()
+    # Rotate through the user's Groq key chain on a 429/5xx/auth/timeout error
+    # before the caller (``transcribe``) falls back to local faster-whisper.
+    # ``wav_bytes`` is reusable across attempts, so each retry re-sends the same
+    # audio with the next key. Shared rotation via
+    # :func:`osia.utils.key_chain.with_key_rotation`.
+    def _do(key):
+        resp = requests.post(
+            GROQ_TRANSCRIBE_URL,
+            headers={"Authorization": f"Bearer {key}"},
+            files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+            data=data,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return (resp.json().get("text") or "").strip()
+
+    text = with_key_rotation("groq", _do, label="stt:groq")
     print(f"[STT] transcribed via groq ({model})")
-    return (resp.json().get("text") or "").strip()
+    return text
 
 
 def _transcribe_local(audio: np.ndarray, sample_rate: int = DEVICE_SAMPLE_RATE,

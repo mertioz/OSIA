@@ -36,7 +36,8 @@ except Exception as _audio_exc:  # PortAudio missing / no audio device
         "disabled (text replies still work)."
     )
 
-from osia.config import CONFIG_DIR, get_api_key, get_setting
+from osia.config import CONFIG_DIR, get_setting
+from osia.utils.key_chain import with_key_rotation, has_key, KeyChainEmpty
 
 # Make langdetect deterministic
 DetectorFactory.seed = 0
@@ -168,10 +169,16 @@ def speak_kokoro(text: str, block: bool = True) -> bool:
 # ── OpenAI TTS ─────────────────────────────────────────────────────────────
 
 def speak_openai(text: str, voice: str | None = None, block: bool = True) -> bool:
-    """Synthesize via OpenAI gpt-4o-mini-tts. Returns True on success."""
+    """Synthesize via OpenAI gpt-4o-mini-tts. Returns True on success.
+
+    The HTTP request rotates through the user's OpenAI key chain on a
+    429/5xx/auth/timeout error (shared rotation via
+    :func:`osia.utils.key_chain.with_key_rotation`); only when every key is
+    exhausted does the caller fall back to Kokoro. Playback stays OUTSIDE the
+    rotation so a sounddevice failure never burns API keys.
+    """
     import requests
-    api_key = get_api_key("openai")
-    if not api_key:
+    if not has_key("openai"):
         print("⚠️  OpenAI TTS: no API key.")
         return False
 
@@ -179,14 +186,10 @@ def speak_openai(text: str, voice: str | None = None, block: bool = True) -> boo
     if voice not in OPENAI_VOICES:
         voice = PROVIDER_DEFAULT_VOICE["openai"]
 
-    try:
-        _debug(
-            f"openai: synthesis start (voice={voice}, speed={TTS_SPEED}, "
-            f"{len(text)} chars)"
-        )
+    def _synth(key):
         r = requests.post(
             "https://api.openai.com/v1/audio/speech",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers={"Authorization": f"Bearer {key}"},
             json={
                 "model": "gpt-4o-mini-tts",
                 "input": text,
@@ -197,7 +200,20 @@ def speak_openai(text: str, voice: str | None = None, block: bool = True) -> boo
             timeout=60,
         )
         r.raise_for_status()
-        audio, sr = sf.read(io.BytesIO(r.content), dtype="float32", always_2d=False)
+        return r.content
+
+    try:
+        _debug(
+            f"openai: synthesis start (voice={voice}, speed={TTS_SPEED}, "
+            f"{len(text)} chars)"
+        )
+        content = with_key_rotation("openai", _synth, label="tts:openai")
+    except (Exception, KeyChainEmpty) as e:
+        print(f"⚠️  OpenAI TTS failed: {e}")
+        return False
+
+    try:
+        audio, sr = sf.read(io.BytesIO(content), dtype="float32", always_2d=False)
         _debug(f"openai: synthesis done ({len(audio)} samples @ {sr}Hz)")
         _log_audio_device()
         _debug("openai: playback start")
@@ -209,7 +225,7 @@ def speak_openai(text: str, voice: str | None = None, block: bool = True) -> boo
             _debug("openai: playback started (non-blocking)")
         return True
     except Exception as e:
-        print(f"⚠️  OpenAI TTS failed: {e}")
+        print(f"⚠️  OpenAI TTS playback failed: {e}")
         return False
 
 
@@ -260,8 +276,7 @@ def speak_google(text: str, voice: str | None = None, block: bool = True) -> boo
     import base64
     import requests
 
-    api_key = get_api_key("google")
-    if not api_key:
+    if not has_key("google"):
         print("⚠️  Google (Gemini) TTS: no API key.")
         return False
 
@@ -286,47 +301,63 @@ def speak_google(text: str, voice: str | None = None, block: bool = True) -> boo
         },
     }
 
-    last_err = None
-    for model in GEMINI_TTS_MODELS:
-        try:
-            _debug(
-                f"google(gemini): synthesis start (model={model}, voice={voice}, "
-                f"{len(text)} chars)"
-            )
-            r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                json=body,
-                timeout=60,
-            )
-            r.raise_for_status()
-            data = r.json()
-            # base64 PCM lives at candidates[0].content.parts[0].inlineData.data
-            b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
-            pcm = base64.b64decode(b64)
-            # 24kHz 16-bit signed PCM, mono -> float32 in [-1, 1] for sounddevice
-            samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-            _debug(
-                f"google(gemini): synthesis done (model={model}, {len(samples)} "
-                f"samples, {len(samples) / GEMINI_TTS_SR:.2f}s)"
-            )
-            _log_audio_device()
-            _debug("google(gemini): playback start")
-            sd.play(samples, samplerate=GEMINI_TTS_SR)
-            if block:
-                sd.wait()
-                _debug("google(gemini): playback finished")
-            else:
-                _debug("google(gemini): playback started (non-blocking)")
-            return True
-        except Exception as e:
-            # Model unavailable on this tier / transient error -> try the next.
-            last_err = e
-            _debug(f"google(gemini): model {model} FAILED: {e}")
-            continue
+    def _synth(key):
+        """Try the model list (newest first) for one API key; return float32
+        samples on the first success, else raise the last error. A 429/5xx from
+        every model propagates out so ``with_key_rotation`` advances to the next
+        key; a 404 (model not on tier) is non-technical and falls through to
+        Kokoro, exactly as before."""
+        last_err = None
+        for model in GEMINI_TTS_MODELS:
+            try:
+                _debug(
+                    f"google(gemini): synthesis start (model={model}, "
+                    f"voice={voice}, {len(text)} chars)"
+                )
+                r = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                    json=body,
+                    timeout=60,
+                )
+                r.raise_for_status()
+                data = r.json()
+                # base64 PCM lives at candidates[0].content.parts[0].inlineData.data
+                b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+                pcm = base64.b64decode(b64)
+                # 24kHz 16-bit signed PCM, mono -> float32 in [-1, 1] for sounddevice
+                samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                _debug(
+                    f"google(gemini): synthesis done (model={model}, "
+                    f"{len(samples)} samples, {len(samples) / GEMINI_TTS_SR:.2f}s)"
+                )
+                return samples
+            except Exception as e:
+                # Model unavailable on this tier / transient error -> try the next.
+                last_err = e
+                _debug(f"google(gemini): model {model} FAILED: {e}")
+                continue
+        raise last_err
 
-    print(f"⚠️  Google (Gemini) TTS failed: {last_err}")
-    return False
+    try:
+        samples = with_key_rotation("google", _synth, label="tts:google")
+    except (Exception, KeyChainEmpty) as e:
+        print(f"⚠️  Google (Gemini) TTS failed: {e}")
+        return False
+
+    try:
+        _log_audio_device()
+        _debug("google(gemini): playback start")
+        sd.play(samples, samplerate=GEMINI_TTS_SR)
+        if block:
+            sd.wait()
+            _debug("google(gemini): playback finished")
+        else:
+            _debug("google(gemini): playback started (non-blocking)")
+        return True
+    except Exception as e:
+        print(f"⚠️  Google (Gemini) TTS playback failed: {e}")
+        return False
 
 
 # ── Dispatcher ─────────────────────────────────────────────────────────────
@@ -345,12 +376,12 @@ def _speak_blocking(text: str):
     provider = get_active_tts_provider()
     _debug(f"_speak_blocking: dispatch start (provider={provider!r})")
 
-    if provider == "openai" and get_api_key("openai"):
+    if provider == "openai" and has_key("openai"):
         if speak_openai(text, block=True):
             _debug("_speak_blocking: dispatch done (openai)")
             return
         _debug("_speak_blocking: openai FAILED — falling back to kokoro")
-    elif provider == "google" and get_api_key("google"):
+    elif provider == "google" and has_key("google"):
         if speak_google(text, block=True):
             _debug("_speak_blocking: dispatch done (google)")
             return
@@ -410,33 +441,36 @@ def _synthesize_to_buffer(text: str, provider: str, voice):
     """
     try:
         if provider == "openai":
-            api_key = get_api_key("openai")
-            if not api_key:
+            if not has_key("openai"):
                 return None
             import requests
             v = voice or PROVIDER_DEFAULT_VOICE["openai"]
             if v not in OPENAI_VOICES:
                 v = PROVIDER_DEFAULT_VOICE["openai"]
             _debug(f"greeting cache: synth openai (voice={v})")
-            r = requests.post(
-                "https://api.openai.com/v1/audio/speech",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": "gpt-4o-mini-tts",
-                    "input": text,
-                    "voice": v,
-                    "response_format": "wav",
-                    "speed": TTS_SPEED,
-                },
-                timeout=60,
-            )
-            r.raise_for_status()
-            audio, sr = sf.read(io.BytesIO(r.content), dtype="float32", always_2d=False)
+
+            def _synth(key):
+                r = requests.post(
+                    "https://api.openai.com/v1/audio/speech",
+                    headers={"Authorization": f"Bearer {key}"},
+                    json={
+                        "model": "gpt-4o-mini-tts",
+                        "input": text,
+                        "voice": v,
+                        "response_format": "wav",
+                        "speed": TTS_SPEED,
+                    },
+                    timeout=60,
+                )
+                r.raise_for_status()
+                return r.content
+
+            content = with_key_rotation("openai", _synth, label="tts-cache:openai")
+            audio, sr = sf.read(io.BytesIO(content), dtype="float32", always_2d=False)
             return audio, int(sr)
 
         if provider == "google":
-            api_key = get_api_key("google")
-            if not api_key:
+            if not has_key("google"):
                 return None
             import base64
             import requests
@@ -452,25 +486,31 @@ def _synthesize_to_buffer(text: str, provider: str, voice):
                     },
                 },
             }
-            for model in GEMINI_TTS_MODELS:
-                try:
-                    _debug(f"greeting cache: synth google (model={model}, voice={v})")
-                    r = requests.post(
-                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                        json=body,
-                        timeout=60,
-                    )
-                    r.raise_for_status()
-                    data = r.json()
-                    b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
-                    pcm = base64.b64decode(b64)
-                    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                    return samples, GEMINI_TTS_SR
-                except Exception as e:
-                    _debug(f"greeting cache: google model {model} failed: {e}")
-                    continue
-            return None
+            def _synth(key):
+                last_err = None
+                for model in GEMINI_TTS_MODELS:
+                    try:
+                        _debug(f"greeting cache: synth google (model={model}, voice={v})")
+                        r = requests.post(
+                            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                            json=body,
+                            timeout=60,
+                        )
+                        r.raise_for_status()
+                        data = r.json()
+                        b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+                        pcm = base64.b64decode(b64)
+                        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                        return samples
+                    except Exception as e:
+                        last_err = e
+                        _debug(f"greeting cache: google model {model} failed: {e}")
+                        continue
+                raise last_err
+
+            samples = with_key_rotation("google", _synth, label="tts-cache:google")
+            return samples, GEMINI_TTS_SR
 
         # local / unknown provider → Kokoro (offline)
         lang = detect_language(text)

@@ -82,12 +82,29 @@ def _build_client(provider: str, api_key: str) -> OpenAI:
     )
 
 
+def build_vision_client(provider: str, api_key: str) -> OpenAI:
+    """Build an OpenAI-compatible vision client for ``provider`` with ``api_key``.
+
+    Public wrapper around :func:`_build_client` for callers that rotate API keys
+    themselves — e.g. ``agent._describe_screenshot`` drives this through
+    :func:`osia.utils.key_chain.with_key_rotation`, calling it once per key in
+    the provider's fallback chain until one succeeds.
+    """
+    return _build_client(provider, api_key)
+
+
 def get_vision_client(settings: dict | None = None):
     """Return ``(provider, model, client)`` for image/screenshot tasks.
 
     ``client`` is an OpenAI-compatible client already pointed at the resolved
-    provider's base-url with the right auth. Returns ``(None, None, None)`` when
-    no model can be resolved (no main model and no companion configured).
+    provider's base-url with the right auth, built with the **primary** key of
+    the provider's fallback chain (so a provider configured with only fallback
+    keys still resolves). Returns ``(None, None, None)`` when no model can be
+    resolved (no main model and no companion configured).
+
+    This is the single-key convenience entry point; callers that need to rotate
+    across the whole chain on a 429/auth error use :func:`build_vision_client`
+    together with ``osia.utils.key_chain.with_key_rotation`` instead.
     """
     if settings is None:
         settings = load_settings()
@@ -96,6 +113,11 @@ def get_vision_client(settings: dict | None = None):
     if not model or not provider:
         return None, None, None
 
-    api_key = "ollama" if provider == "ollama" else get_api_key(provider)
+    if provider == "ollama":
+        api_key = "ollama"
+    else:
+        from osia.utils.key_chain import iter_keys
+        chain = iter_keys(provider)
+        api_key = chain[0] if chain else get_api_key(provider)
     client = _build_client(provider, api_key)
     return provider, model, client

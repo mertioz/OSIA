@@ -16,7 +16,7 @@ The API key is **reused** from the matching AI provider configured in the
 "AI Providers" settings section — there is no separate Live-API key store.
 """
 
-from osia.config import get_api_key
+from osia.utils.key_chain import has_key
 
 # Maps the Live API provider value (settings ``liveapi_provider``) to the
 # AI-provider entry in the shared key store its credential is reused from.
@@ -38,9 +38,12 @@ def _connect_live_api(provider: str, model: str | None = None):
     Never raises — a failure here must not crash the wake handler.
     """
     key_provider = LIVEAPI_KEY_PROVIDER.get(provider, provider)
-    has_key = bool(get_api_key(key_provider))
+    # No network call yet (stub) — key rotation will apply once the real
+    # streaming layer lands; for now report presence via the shared chain so a
+    # provider configured with only fallback keys still reads as "set".
+    key_present = has_key(key_provider)
     print(
         f"[LIVE API] Live API not yet implemented — provider={provider} "
-        f"model={model or '(default)'} key={'set' if has_key else 'missing'}"
+        f"model={model or '(default)'} key={'set' if key_present else 'missing'}"
     )
     return None

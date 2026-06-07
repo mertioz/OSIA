@@ -661,11 +661,33 @@ def tool_run_command(command: str) -> str:
     return tool_bash(command)
 
 
+def _screenshot_is_blank(path: str) -> bool:
+    """Cheap all-black detector for captures that silently failed.
+
+    X11 tools (``scrot``) can't see native Wayland windows, so they write a
+    fully black frame instead of erroring — returncode 0, file present, but
+    nothing visible. We load the image and treat it as blank when its
+    brightest pixel is near zero (max luminance < 10).
+
+    Degrades gracefully: if Pillow is missing or the file can't be read we
+    return ``False`` so a genuine capture is never discarded just because the
+    check itself couldn't run.
+    """
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            _lo, hi = img.convert("L").getextrema()
+        return hi < 10
+    except Exception:
+        return False
+
+
 def tool_take_screenshot() -> str:
     """Capture the desktop and return a description of what is on screen.
 
-    Captures to the system temp dir (Pillow's ImageGrab on Windows; ``scrot``
-    on Linux/mac), then routes the image to the vision model resolved by
+    Captures to the system temp dir (Pillow's ImageGrab on Windows; a Wayland-
+    aware backend chain on Linux/mac), then routes the image to the vision
+    model resolved by
     :mod:`osia.vision_router` (the main model when it is vision-capable, else
     the configured ``vision_provider``/``vision_model`` companion — WOR-25) and
     returns its description, so the assistant can actually "see" the screen.
@@ -687,16 +709,57 @@ def tool_take_screenshot() -> str:
         except Exception as e:
             return f"ERROR: taking screenshot: {e}"
     else:
-        try:
-            result = subprocess.run(
-                ["scrot", "-o", path], capture_output=True, text=True, timeout=10
-            )
+        # Linux/mac. On Wayland (KDE Plasma/GNOME on Fedora) X11 tools like
+        # scrot capture a black frame because they can't see native Wayland
+        # windows — prefer Wayland-native backends there and only fall back to
+        # scrot via XWayland. Each backend is verified (file present AND not
+        # all-black) before we accept it; otherwise we try the next one.
+        is_wayland = bool(
+            os.environ.get("WAYLAND_DISPLAY")
+            or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        )
+        if is_wayland:
+            backends = [
+                ("spectacle", ["spectacle", "-b", "-n", "-o", path]),  # KDE
+                ("grim", ["grim", path]),                              # wlroots
+                ("gnome-screenshot", ["gnome-screenshot", "-f", path]),  # GNOME
+                ("scrot", ["scrot", "-o", path]),                     # XWayland
+            ]
+        else:
+            backends = [("scrot", ["scrot", "-o", path])]
+
+        last_err = ""
+        captured = False
+        for name, cmd in backends:
+            if shutil.which(name) is None:
+                last_err = f"{name} is not installed"
+                continue
+            # Drop any stale file so the existence check below is meaningful.
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=10
+                )
+            except Exception as e:
+                last_err = f"{name}: {e}"
+                continue
             if result.returncode != 0:
-                return f"ERROR: taking screenshot: {result.stderr.strip() or 'scrot failed'}"
-        except FileNotFoundError:
-            return "ERROR: scrot is not installed"
-        except Exception as e:
-            return f"ERROR: taking screenshot: {e}"
+                last_err = result.stderr.strip() or f"{name} failed"
+                continue
+            if not os.path.isfile(path):
+                last_err = f"{name} produced no file"
+                continue
+            if _screenshot_is_blank(path):
+                last_err = f"{name} captured a black screen"
+                continue
+            captured = True
+            break
+
+        if not captured:
+            return f"ERROR: taking screenshot: {last_err or 'no screenshot backend succeeded'}"
     return _describe_screenshot(path)
 
 
@@ -724,18 +787,29 @@ def _describe_screenshot(path: str) -> str:
     key, network/timeout, provider error) it returns the file path plus a plain
     note — never an ``ERROR:``-prefixed string, so a successful capture is not
     mistaken for a hard failure by ``_is_tool_error`` / the anti-loop guard.
+
+    API keys honour the user's fallback chain: the request rotates through the
+    vision provider's configured keys on a 429/5xx/auth/timeout error, and — if
+    every vision-provider key is exhausted AND the main model is itself
+    vision-capable — falls back to the main model's own key chain as a last
+    resort (shared rotation via :func:`osia.utils.key_chain.with_key_rotation`).
     """
     try:
         import base64
-        from osia.vision_router import get_vision_client
-        from osia.models import model_has_vision
+        from osia.config import load_settings
+        from osia.vision_router import resolve_vision_model, build_vision_client
+        from osia.models import model_has_vision, provider_for_model
+        from osia.utils.key_chain import (
+            with_key_rotation, KeyChainEmpty, is_technical_error, error_status,
+        )
 
-        provider, model, client = get_vision_client()
+        settings = load_settings()
+        provider, model = resolve_vision_model(settings)
         # Only call a genuinely vision-capable model. resolve_vision_model()
         # falls back to the (possibly text-only) MAIN model when no companion is
         # configured; sending an image_url array to such a model raises a 400,
         # so guard before the network call.
-        if not client or not model or not model_has_vision(provider, model):
+        if not provider or not model or not model_has_vision(provider, model):
             return (
                 f"{path}\n(Note : capture enregistrée, mais aucun modèle de "
                 "vision n'est configuré — impossible de décrire l'écran. "
@@ -743,25 +817,84 @@ def _describe_screenshot(path: str) -> str:
             )
         with open(path, "rb") as fh:
             b64 = base64.b64encode(fh.read()).decode("ascii")
-        # Bound the request well under the 30 s tool-executor cap so a slow
-        # provider yields this clean note instead of the generic timeout
-        # [ERREUR] line (which would trigger an identical, doubled retry). No
-        # max_tokens — providers apply their native limits (MAX_RESPONSE_TOKENS
-        # was removed deliberately, WOR-28).
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _SCREENSHOT_VISION_PROMPT},
-                    {"type": "image_url", "image_url": {
-                        "url": f"data:image/png;base64,{b64}"}},
-                ],
-            }],
-            timeout=25,
-        )
-        description = (resp.choices[0].message.content or "").strip()
+
+        def _vision_call(call_provider, call_model):
+            """A screenshot request for ``(call_provider, call_model)`` that
+            rebuilds its client from whichever key the rotation hands it. Bound
+            well under the 30 s tool-executor cap so a slow provider yields a
+            clean note, not the generic timeout [ERREUR] (which would double the
+            retry). No max_tokens — providers apply their native limits
+            (MAX_RESPONSE_TOKENS removed deliberately, WOR-28)."""
+            def _do(key):
+                client = build_vision_client(call_provider, key)
+                resp = client.chat.completions.create(
+                    model=call_model,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": _SCREENSHOT_VISION_PROMPT},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:image/png;base64,{b64}"}},
+                        ],
+                    }],
+                    timeout=25,
+                )
+                return (resp.choices[0].message.content or "").strip()
+            return _do
+
+        # 1) Rotate through the vision provider's key chain (fallbacks first when
+        #    configured, else the single saved key).
+        description = ""
+        last_err = None
+        vision_failed = False
+        try:
+            description = with_key_rotation(
+                provider, _vision_call(provider, model),
+                label=f"vision:{provider}",
+            )
+        except KeyChainEmpty:
+            # No vision-provider key at all — vacuously "exhausted". A configured
+            # but key-less vision companion may still fall back to a
+            # vision-capable main model below, so allow the last resort.
+            vision_failed = True
+            last_err = (
+                f"aucune clé API configurée pour le fournisseur de vision "
+                f"« {provider} »"
+            )
+        except Exception as e:
+            last_err = e
+            # Only treat as "vision keys exhausted" — which licenses the
+            # main-model last resort — when the failure was technical
+            # (429/5xx/auth/timeout across the whole chain). A non-technical
+            # error (400/404) is re-raised by with_key_rotation WITHOUT rotating;
+            # another model won't fix a malformed request, so surface it directly
+            # instead of burning an extra call on the main model.
+            if is_technical_error(e, error_status(e)):
+                vision_failed = True
+
+        # 2) Last resort: every vision-provider key exhausted AND the MAIN model
+        #    is itself vision-capable (and a different target) — try the main
+        #    model's own key chain before giving up.
+        if vision_failed:
+            main_model = (settings.get("selected_model") or "").strip()
+            main_provider = provider_for_model(main_model) if main_model else None
+            if (main_model and main_provider
+                    and model_has_vision(main_provider, main_model)
+                    and (main_provider, main_model) != (provider, model)):
+                try:
+                    description = with_key_rotation(
+                        main_provider, _vision_call(main_provider, main_model),
+                        label=f"vision-fallback:{main_provider}",
+                    )
+                except Exception as e:
+                    last_err = e
+
         if not description:
+            if last_err is not None:
+                return (
+                    f"{path}\n(Note : la capture est enregistrée mais l'analyse "
+                    f"visuelle a échoué : {last_err})"
+                )
             return (
                 f"{path}\n(Note : le modèle de vision n'a renvoyé aucune "
                 "description de l'écran.)"
@@ -2592,21 +2725,16 @@ class OSIAAgent:
     def _provider_key_chain(self, provider: str) -> list:
         """Ordered list of API keys to try for ``provider``.
 
-        When the user configured an ``api_key_fallbacks`` list for the provider
-        it is authoritative (key[0] = primary, the rest = fallbacks). Otherwise
-        the single saved key from ``api_keys.json`` is used. Ollama needs no
-        key. Blank entries are dropped so an empty slot never shadows a real key.
+        Delegates to the shared :func:`osia.utils.key_chain.iter_keys` so the
+        main chat path and every other provider call site (vision, TTS, STT)
+        resolve the **identical** chain: the user's ``api_key_fallbacks`` list
+        when set (key[0] = primary, the rest = fallbacks), otherwise the single
+        saved key from ``api_keys.json``; ollama needs no key; blank entries are
+        dropped. Behaviour is unchanged from the previous inline implementation —
+        run()'s rotation on a 429/auth error still drives this list.
         """
-        if provider == "ollama":
-            return ["ollama"]
-        from osia.config import get_setting, get_api_key
-        fallbacks = get_setting("api_key_fallbacks", {}) or {}
-        chain = [k.strip() for k in (fallbacks.get(provider) or [])
-                 if isinstance(k, str) and k.strip()]
-        if chain:
-            return chain
-        key = get_api_key(provider)
-        return [key] if key else []
+        from osia.utils.key_chain import iter_keys
+        return iter_keys(provider)
 
     def _activate_next_api_key(self):
         """Advance to the next key in the current provider's fallback chain and
