@@ -71,7 +71,7 @@ System & shell:
 - bash: Execute a bash command (on Windows it runs in PowerShell — use PowerShell syntax there). Usage: {"tool": "bash", "command": "<command>"}
 - run_command: Run any shell command and return its output. Usage: {"tool": "run_command", "command": "<command>"}
 - open_application: Launch an application by name. Usage: {"tool": "open_application", "name": "<app_name>"}
-- take_screenshot: Capture the desktop to the system temp directory and return the path. Usage: {"tool": "take_screenshot"}
+- take_screenshot: Capture the desktop and return a description of what is visible on screen (the screenshot is analyzed by the vision model — you CAN see the screen with this). Usage: {"tool": "take_screenshot"}
 - get_system_info: Snapshot of CPU, RAM and disk usage. Usage: {"tool": "get_system_info"}
 - list_running_processes: Top processes by CPU/memory. Usage: {"tool": "list_running_processes", "limit": 20}
 - kill_process: Kill a process by PID (int) or name (substring match). Usage: {"tool": "kill_process", "name_or_pid": "<pid_or_name>"}
@@ -141,7 +141,7 @@ Système & shell :
 - bash : Exécuter une commande bash (sous Windows elle s'exécute dans PowerShell — utilise la syntaxe PowerShell). Usage : {"tool": "bash", "command": "<commande>"}
 - run_command : Exécuter n'importe quelle commande shell et retourner sa sortie. Usage : {"tool": "run_command", "command": "<commande>"}
 - open_application : Lancer une application par son nom. Usage : {"tool": "open_application", "name": "<nom_app>"}
-- take_screenshot : Capturer le bureau vers le répertoire temporaire système et retourner le chemin. Usage : {"tool": "take_screenshot"}
+- take_screenshot : Capturer le bureau et retourner une description de ce qui est visible à l'écran (la capture est analysée par le modèle de vision — tu PEUX voir l'écran avec cet outil). Usage : {"tool": "take_screenshot"}
 - get_system_info : Aperçu de l'utilisation CPU, RAM et disque. Usage : {"tool": "get_system_info"}
 - list_running_processes : Top des processus par CPU/mémoire. Usage : {"tool": "list_running_processes", "limit": 20}
 - kill_process : Tuer un processus par PID (entier) ou nom (sous-chaîne). Usage : {"tool": "kill_process", "name_or_pid": "<pid_ou_nom>"}
@@ -662,30 +662,116 @@ def tool_run_command(command: str) -> str:
 
 
 def tool_take_screenshot() -> str:
-    """Take a screenshot of the desktop. Returns the path.
+    """Capture the desktop and return a description of what is on screen.
 
-    Uses Pillow's ImageGrab on Windows; ``scrot`` on Linux (mac is
-    best-effort via scrot if present).
+    Captures to the system temp dir (Pillow's ImageGrab on Windows; ``scrot``
+    on Linux/mac), then routes the image to the vision model resolved by
+    :mod:`osia.vision_router` (the main model when it is vision-capable, else
+    the configured ``vision_provider``/``vision_model`` companion — WOR-25) and
+    returns its description, so the assistant can actually "see" the screen.
+
+    Why analyse here instead of letting the run loop attach the image: the run
+    loop only injects an image when a tool result is a browser-style
+    ``{"text","screenshot"}`` dict (and only for the narrow set of providers
+    ``_provider_supports_vision`` allows). ``take_screenshot`` returns a plain
+    string, so its image was never seen by the model — which is why a text-only
+    main model replied "I can't see images". Describing the image through the
+    vision companion fixes that uniformly on every entry point (desktop GUI,
+    mobile server, cron) without touching the run loop's injection gate.
     """
     path = str(Path(tempfile.gettempdir()) / "osia_screenshot.png")
     if sys.platform == "win32":
         try:
             from PIL import ImageGrab
             ImageGrab.grab().save(path)
-            return path
         except Exception as e:
             return f"ERROR: taking screenshot: {e}"
+    else:
+        try:
+            result = subprocess.run(
+                ["scrot", "-o", path], capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                return f"ERROR: taking screenshot: {result.stderr.strip() or 'scrot failed'}"
+        except FileNotFoundError:
+            return "ERROR: scrot is not installed"
+        except Exception as e:
+            return f"ERROR: taking screenshot: {e}"
+    return _describe_screenshot(path)
+
+
+# Prompt sent to the vision model alongside a captured screenshot. FR-first to
+# match OSIA's default UX; the main model reformulates for the user's language.
+_SCREENSHOT_VISION_PROMPT = (
+    "Décris en détail tout ce qui est visible sur cette capture d'écran : "
+    "fenêtres et applications ouvertes, textes lisibles, boutons, menus, "
+    "messages d'erreur et état général de l'écran. Sois précis et factuel."
+)
+
+
+def _describe_screenshot(path: str) -> str:
+    """Analyse a captured screenshot with the resolved vision model (WOR-25)
+    and return its description as plain text.
+
+    Vision routing is delegated to :func:`osia.vision_router.get_vision_client`,
+    which honours the user's endpoint/auth config identically to
+    ``OSIAAgent.set_model`` (it re-derives, never mutates, the frozen client
+    wiring). The call passes NO tool schema, so the vision model cannot emit a
+    tool call, and the result is a plain string, so the run loop never tries to
+    attach base64 or start an extra tool round.
+
+    Degrades gracefully: on any failure (no vision model configured, missing
+    key, network/timeout, provider error) it returns the file path plus a plain
+    note — never an ``ERROR:``-prefixed string, so a successful capture is not
+    mistaken for a hard failure by ``_is_tool_error`` / the anti-loop guard.
+    """
     try:
-        result = subprocess.run(
-            ["scrot", "-o", path], capture_output=True, text=True, timeout=10
+        import base64
+        from osia.vision_router import get_vision_client
+        from osia.models import model_has_vision
+
+        provider, model, client = get_vision_client()
+        # Only call a genuinely vision-capable model. resolve_vision_model()
+        # falls back to the (possibly text-only) MAIN model when no companion is
+        # configured; sending an image_url array to such a model raises a 400,
+        # so guard before the network call.
+        if not client or not model or not model_has_vision(provider, model):
+            return (
+                f"{path}\n(Note : capture enregistrée, mais aucun modèle de "
+                "vision n'est configuré — impossible de décrire l'écran. "
+                "Configurez un modèle de vision dans les paramètres.)"
+            )
+        with open(path, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode("ascii")
+        # Bound the request well under the 30 s tool-executor cap so a slow
+        # provider yields this clean note instead of the generic timeout
+        # [ERREUR] line (which would trigger an identical, doubled retry). No
+        # max_tokens — providers apply their native limits (MAX_RESPONSE_TOKENS
+        # was removed deliberately, WOR-28).
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _SCREENSHOT_VISION_PROMPT},
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:image/png;base64,{b64}"}},
+                ],
+            }],
+            timeout=25,
         )
-        if result.returncode != 0:
-            return f"ERROR: taking screenshot: {result.stderr.strip() or 'scrot failed'}"
-        return path
-    except FileNotFoundError:
-        return "ERROR: scrot is not installed"
+        description = (resp.choices[0].message.content or "").strip()
+        if not description:
+            return (
+                f"{path}\n(Note : le modèle de vision n'a renvoyé aucune "
+                "description de l'écran.)"
+            )
+        return f"Description de l'écran (capture : {path}) :\n{description}"
     except Exception as e:
-        return f"ERROR: taking screenshot: {e}"
+        return (
+            f"{path}\n(Note : la capture est enregistrée mais l'analyse "
+            f"visuelle a échoué : {e})"
+        )
 
 
 # ── Path helper (resolves relative paths against the dynamic _PROJECT_DIR) ──
