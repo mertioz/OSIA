@@ -42,6 +42,7 @@ requests>=2.31.0
 psutil>=5.9.0                      # heartbeat metrics + Windows service control
 pynput>=1.7.6                      # global hotkeys (Ctrl+Space, Ctrl+Alt+O)
 pyperclip>=1.8.0                   # clipboard backend on Windows (get/set_clipboard)
+pyautogui>=0.9.54                  # native mouse/keyboard control on Windows/Mac (WOR-42 desktop_* tools; Linux uses ydotool/xdotool)
 tqdm>=4.65.0
 
 # ── Optional ────────────────────────────────────────────────────────────────

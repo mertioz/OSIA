@@ -112,6 +112,12 @@ Browser (drives a REAL visible browser — Chromium/Brave via CDP, or Firefox vi
 - open_new_tab: Open a URL in a new tab and switch to it. Usage: {"tool": "open_new_tab", "url": "<url>"}
 - open_browser: Open a SPECIFIC browser by name (firefox, chrome, chromium, opera, edge, brave), optionally at a URL. Use when the user asks for a particular browser ("open Firefox"). Firefox is FULLY supported for automation via WebDriver BiDi: after opening it, all browser tools (navigate, click, fill, type_text, read_page, screenshots, …) work inside Firefox exactly like Brave/Chrome. Usage: {"tool": "open_browser", "name": "firefox", "url": "<optional_url>"}
 
+Desktop automation (control NATIVE desktop apps — file managers, settings panes, native dialogs, games — by looking at the screen and using the REAL mouse and keyboard. These are for windows that are NOT web pages; for anything inside a web page, PREFER the Browser tools above):
+- desktop_click: Look at the screen and click a UI element you describe in plain words. OSIA captures the screen, the vision model locates the element, then clicks its center. Usage: {"tool": "desktop_click", "description": "the Create button"}
+- desktop_type: Type a string of text into the currently focused field via the real keyboard. Usage: {"tool": "desktop_type", "text": "<text>"}
+- desktop_press: Press a single key or a shortcut system-wide on the focused window (Enter, Escape, Tab, "ctrl+s", "alt+F4", …). Usage: {"tool": "desktop_press", "key": "Enter"}
+- desktop_scroll: Scroll the active window in a direction by a number of notches. Usage: {"tool": "desktop_scroll", "direction": "down", "amount": 3}
+
 ## How to Use Tools
 To call a tool, output a JSON tool call wrapped in <tool_call> tags:
 
@@ -181,6 +187,12 @@ Navigateur (pilote le VRAI navigateur visible — Chromium/Brave via CDP, ou Fir
 - go_forward : Avancer dans l'historique. Usage : {"tool": "go_forward"}
 - open_new_tab : Ouvrir une URL dans un nouvel onglet et basculer dessus. Usage : {"tool": "open_new_tab", "url": "<url>"}
 - open_browser : Ouvrir un navigateur PRÉCIS par son nom (firefox, chrome, chromium, opera, edge, brave), éventuellement sur une URL. À utiliser quand l'utilisateur demande un navigateur particulier (« ouvre Firefox »). Firefox est ENTIÈREMENT pris en charge pour l'automatisation via WebDriver BiDi : après l'avoir ouvert, tous les outils navigateur (navigate, click, fill, type_text, read_page, captures d'écran…) fonctionnent dans Firefox exactement comme avec Brave/Chrome. Usage : {"tool": "open_browser", "name": "firefox", "url": "<url_optionnelle>"}
+
+Automatisation du bureau (piloter les applis NATIVES — gestionnaires de fichiers, paramètres, boîtes de dialogue natives, jeux — en regardant l'écran et en utilisant la VRAIE souris et le VRAI clavier. Ces outils sont pour les fenêtres qui ne sont PAS des pages web ; pour tout ce qui est dans une page web, PRÉFÈRE les outils Navigateur ci-dessus) :
+- desktop_click : Regarder l'écran et cliquer sur un élément d'interface que tu décris en mots. OSIA capture l'écran, le modèle de vision localise l'élément, puis clique en son centre. Usage : {"tool": "desktop_click", "description": "le bouton Créer"}
+- desktop_type : Taper une chaîne de texte dans le champ actuellement focalisé via le vrai clavier. Usage : {"tool": "desktop_type", "text": "<texte>"}
+- desktop_press : Appuyer sur une touche ou un raccourci au niveau système sur la fenêtre active (Enter, Escape, Tab, « ctrl+s », « alt+F4 »…). Usage : {"tool": "desktop_press", "key": "Enter"}
+- desktop_scroll : Faire défiler la fenêtre active dans une direction d'un certain nombre de crans. Usage : {"tool": "desktop_scroll", "direction": "down", "amount": 3}
 
 ## Comment utiliser les outils
 Pour appeler un outil, produis un appel JSON dans des balises <tool_call> :
@@ -682,6 +694,74 @@ def _screenshot_is_blank(path: str) -> bool:
         return False
 
 
+def _capture_screen(path: str) -> str | None:
+    """Capture the full screen to ``path``. Returns ``None`` on success, or an
+    ``ERROR: ...`` string on failure.
+
+    The capture-backend chain (Pillow's ImageGrab on Windows; a Wayland-aware
+    chain on Linux/mac, each verified to be present AND not all-black) is the
+    single source of truth shared by :func:`tool_take_screenshot` (describe the
+    screen) and the desktop-click path (locate an element by pixel) so the two
+    never drift apart.
+    """
+    if sys.platform == "win32":
+        try:
+            from PIL import ImageGrab
+            ImageGrab.grab().save(path)
+        except Exception as e:
+            return f"ERROR: taking screenshot: {e}"
+        return None
+
+    # Linux/mac. On Wayland (KDE Plasma/GNOME on Fedora) X11 tools like scrot
+    # capture a black frame because they can't see native Wayland windows —
+    # prefer Wayland-native backends there and only fall back to scrot via
+    # XWayland. Each backend is verified (file present AND not all-black) before
+    # we accept it; otherwise we try the next one.
+    is_wayland = bool(
+        os.environ.get("WAYLAND_DISPLAY")
+        or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+    )
+    if is_wayland:
+        backends = [
+            ("spectacle", ["spectacle", "-b", "-n", "-o", path]),  # KDE
+            ("grim", ["grim", path]),                              # wlroots
+            ("gnome-screenshot", ["gnome-screenshot", "-f", path]),  # GNOME
+            ("scrot", ["scrot", "-o", path]),                     # XWayland
+        ]
+    else:
+        backends = [("scrot", ["scrot", "-o", path])]
+
+    last_err = ""
+    for name, cmd in backends:
+        if shutil.which(name) is None:
+            last_err = f"{name} is not installed"
+            continue
+        # Drop any stale file so the existence check below is meaningful.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10
+            )
+        except Exception as e:
+            last_err = f"{name}: {e}"
+            continue
+        if result.returncode != 0:
+            last_err = result.stderr.strip() or f"{name} failed"
+            continue
+        if not os.path.isfile(path):
+            last_err = f"{name} produced no file"
+            continue
+        if _screenshot_is_blank(path):
+            last_err = f"{name} captured a black screen"
+            continue
+        return None
+
+    return f"ERROR: taking screenshot: {last_err or 'no screenshot backend succeeded'}"
+
+
 def tool_take_screenshot() -> str:
     """Capture the desktop and return a description of what is on screen.
 
@@ -702,64 +782,9 @@ def tool_take_screenshot() -> str:
     mobile server, cron) without touching the run loop's injection gate.
     """
     path = str(Path(tempfile.gettempdir()) / "osia_screenshot.png")
-    if sys.platform == "win32":
-        try:
-            from PIL import ImageGrab
-            ImageGrab.grab().save(path)
-        except Exception as e:
-            return f"ERROR: taking screenshot: {e}"
-    else:
-        # Linux/mac. On Wayland (KDE Plasma/GNOME on Fedora) X11 tools like
-        # scrot capture a black frame because they can't see native Wayland
-        # windows — prefer Wayland-native backends there and only fall back to
-        # scrot via XWayland. Each backend is verified (file present AND not
-        # all-black) before we accept it; otherwise we try the next one.
-        is_wayland = bool(
-            os.environ.get("WAYLAND_DISPLAY")
-            or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
-        )
-        if is_wayland:
-            backends = [
-                ("spectacle", ["spectacle", "-b", "-n", "-o", path]),  # KDE
-                ("grim", ["grim", path]),                              # wlroots
-                ("gnome-screenshot", ["gnome-screenshot", "-f", path]),  # GNOME
-                ("scrot", ["scrot", "-o", path]),                     # XWayland
-            ]
-        else:
-            backends = [("scrot", ["scrot", "-o", path])]
-
-        last_err = ""
-        captured = False
-        for name, cmd in backends:
-            if shutil.which(name) is None:
-                last_err = f"{name} is not installed"
-                continue
-            # Drop any stale file so the existence check below is meaningful.
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-            try:
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=10
-                )
-            except Exception as e:
-                last_err = f"{name}: {e}"
-                continue
-            if result.returncode != 0:
-                last_err = result.stderr.strip() or f"{name} failed"
-                continue
-            if not os.path.isfile(path):
-                last_err = f"{name} produced no file"
-                continue
-            if _screenshot_is_blank(path):
-                last_err = f"{name} captured a black screen"
-                continue
-            captured = True
-            break
-
-        if not captured:
-            return f"ERROR: taking screenshot: {last_err or 'no screenshot backend succeeded'}"
+    err = _capture_screen(path)
+    if err:
+        return err
     return _describe_screenshot(path)
 
 
@@ -1401,6 +1426,419 @@ def tool_open_browser(name: str, url: str | None = None):
     return _get_browser_tools()["open_browser"](name, url)
 
 
+# ---------------------------------------------------------------------------
+# Desktop automation (WOR-42) — vision-guided control of NATIVE apps.
+#
+# These drive the real mouse/keyboard at the OS level (ydotool/xdotool/pyautogui
+# via osia.tools.desktop_control). ``desktop_click`` is the smart entry point: it
+# captures the screen, asks the vision model for the target's pixel coordinates,
+# then clicks. Every vision call goes through key_chain rotation (CLAUDE.md).
+# ---------------------------------------------------------------------------
+def _vision_locate(path: str, description: str) -> dict:
+    """Ask the vision model for the pixel coordinates of ``description`` in the
+    screenshot at ``path``.
+
+    Returns one of:
+      ``{"found": True, "x": int, "y": int, "w": W, "h": H}``
+      ``{"found": False, "reason": str}``
+      ``{"error": "ERROR: ..."}``  (no vision model configured / technical failure)
+
+    The vision request mirrors :func:`_describe_screenshot`'s core but swaps in a
+    coordinate prompt; like it, the network call runs under ``with_key_rotation``
+    so the vision provider's whole key chain (fallbacks first) is tried.
+    """
+    try:
+        import base64
+        from osia.config import load_settings
+        from osia.vision_router import resolve_vision_model, build_vision_client
+        from osia.models import model_has_vision
+        from osia.utils.key_chain import with_key_rotation, KeyChainEmpty
+
+        settings = load_settings()
+        provider, model = resolve_vision_model(settings)
+        if not provider or not model or not model_has_vision(provider, model):
+            return {"error": (
+                "ERROR: desktop_click needs a vision model to locate the target on "
+                "screen, but none is configured. Set a vision model in the settings."
+            )}
+
+        try:
+            from PIL import Image
+            with Image.open(path) as img:
+                w, h = img.size
+        except Exception:
+            w = h = 0
+
+        with open(path, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode("ascii")
+
+        size_note = (
+            f"The image is {w}x{h} pixels; the top-left corner is (0,0). "
+            if (w and h) else
+            "The top-left corner of the image is (0,0). "
+        )
+        prompt = (
+            "You are looking at a screenshot of a computer screen. " + size_note +
+            f"Find this on-screen element: \"{description}\".\n"
+            "Reply with ONLY a JSON object — no prose, no markdown fences.\n"
+            "If you can see it, return the CENTER of the element in pixels: "
+            "{\"found\": true, \"x\": <int>, \"y\": <int>}.\n"
+            "If it is not visible, return: {\"found\": false, \"reason\": \"<short reason>\"}.\n"
+            "If you cannot clearly see the described element, return found=false. "
+            "NEVER guess coordinates."
+        )
+
+        def _call(call_provider, call_model):
+            def _do(key):
+                client = build_vision_client(call_provider, key)
+                resp = client.chat.completions.create(
+                    model=call_model,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:image/png;base64,{b64}"}},
+                        ],
+                    }],
+                    timeout=25,
+                )
+                return (resp.choices[0].message.content or "").strip()
+            return _do
+
+        try:
+            raw = with_key_rotation(
+                provider, _call(provider, model),
+                label=f"desktop-locate:{provider}",
+            )
+        except KeyChainEmpty:
+            return {"error": (
+                f"ERROR: no API key configured for the vision provider '{provider}' "
+                "— cannot locate the target on screen."
+            )}
+        except Exception as e:
+            return {"error": f"ERROR: the vision model failed while locating the target: {e}"}
+
+        # Strict schema: the reply MUST be a balanced JSON object — no falling
+        # back to the raw text (which would let prose smuggle in numbers).
+        blob = _extract_json_object(raw)
+        if blob is None:
+            return {"error": (
+                f"ERROR: vision model did not return a JSON object while locating "
+                f"\"{description}\" — refusing to guess: {raw[:200]}"
+            )}
+        try:
+            data = json.loads(blob, strict=False)
+        except Exception:
+            return {"error": (
+                f"ERROR: could not parse the vision model's reply while locating "
+                f"\"{description}\": {raw[:200]}"
+            )}
+        # The object must match {"found": bool, "x": int, "y": int} exactly:
+        # "found" present and a real bool (not a truthy string/number). Anything
+        # else is rejected rather than guessed (anti-hallucination).
+        if not isinstance(data, dict) or not isinstance(data.get("found"), bool):
+            return {"error": (
+                "ERROR: vision model returned an invalid response (expected "
+                "{\"found\": bool, \"x\": int, \"y\": int}) while locating "
+                f"\"{description}\": {raw[:200]}"
+            )}
+        if not data["found"]:
+            reason = data.get("reason") or "element not visible on screen"
+            return {"found": False, "reason": str(reason)}
+        # found == True ⇒ x and y must both be numbers (int/float), never bool,
+        # never a string. No coercion from other types.
+        xv, yv = data.get("x"), data.get("y")
+        if (not isinstance(xv, (int, float)) or isinstance(xv, bool)
+                or not isinstance(yv, (int, float)) or isinstance(yv, bool)):
+            return {"error": (
+                f"ERROR: the vision model reported finding \"{description}\" but "
+                f"returned no valid integer coordinates: {raw[:200]}"
+            )}
+        x = int(round(float(xv)))
+        y = int(round(float(yv)))
+        # Reject suspicious coordinates: a vision model that did NOT actually
+        # find the element often defaults to (0,0) / negatives / off-screen.
+        # Clicking the top-left corner is worse than reporting failure.
+        if (x, y) == (0, 0) or x < 0 or y < 0 or (w and x >= w) or (h and y >= h):
+            bounds = f", screen is {w}x{h}" if (w and h) else ""
+            return {"error": (
+                f"ERROR: vision model returned invalid coordinates ({x},{y}{bounds}) "
+                f"for \"{description}\" — element probably not found."
+            )}
+        return {"found": True, "x": x, "y": y, "w": w, "h": h}
+    except Exception as e:
+        return {"error": f"ERROR: locating \"{description}\" on screen failed: {e}"}
+
+
+def _summarize_description(desc: str) -> str:
+    """Collapse a (possibly multi-line) screenshot description to a single short
+    line for inline BEFORE/AFTER reporting in ``tool_desktop_click``."""
+    if not desc:
+        return ""
+    one_line = " ".join(str(desc).split())
+    return (one_line[:200] + "…") if len(one_line) > 200 else one_line
+
+
+def _descriptions_nearly_identical(a: str, b: str) -> bool:
+    """True when two screenshot descriptions are so similar that the screen
+    likely did not change between them — used to flag a click that missed.
+
+    Compares the full (normalised) descriptions, not just their summaries, so a
+    change anywhere on screen breaks the match.
+    """
+    import difflib
+    na = " ".join(str(a).split()).lower()
+    nb = " ".join(str(b).split()).lower()
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.92
+
+
+_REFINE_CROP_PX = 300   # side of the square crop used by the fine (2nd-pass) locate
+
+
+def _crop_window(center: int, span: int, extent: int):
+    """Top-left coordinate and size of a ``span``-pixel window centred on
+    ``center`` and kept fully inside ``[0, extent]`` (shrinks to ``extent`` when
+    the image is smaller than ``span``). Returns ``(start, size)``."""
+    if extent <= span:
+        return 0, extent
+    start = max(0, min(int(center) - span // 2, extent - span))
+    return start, span
+
+
+def _vision_refine_crop(path: str, description: str, x0: int, y0: int,
+                        cw: int, ch: int):
+    """Second-pass fine locate inside a crop. Asks the vision model for the
+    corrected CENTER of ``description`` WITHIN the crop at ``path`` (whose
+    top-left sits at screen ``(x0, y0)``), then maps the crop-relative answer back
+    to absolute screen pixels. Returns ``(screen_x, screen_y)``, or ``None`` on
+    ANY failure / not-found / out-of-crop result so the caller keeps the coarse
+    coordinates (best-effort refinement — it must never fail the click).
+
+    Mirrors :func:`_vision_locate`'s key_chain rotation and strict-JSON contract,
+    on a small crop and with a refinement prompt (CLAUDE.md: every new vision
+    call site rotates keys via ``with_key_rotation``)."""
+    try:
+        import base64
+        from osia.config import load_settings
+        from osia.vision_router import resolve_vision_model, build_vision_client
+        from osia.models import model_has_vision
+        from osia.utils.key_chain import with_key_rotation
+
+        settings = load_settings()
+        provider, model = resolve_vision_model(settings)
+        if not provider or not model or not model_has_vision(provider, model):
+            return None
+        with open(path, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode("ascii")
+
+        prompt = (
+            f"You are looking at a zoomed-in {cw}x{ch}-pixel CROP of a computer "
+            "screen; the top-left of this crop is (0,0). The mouse cursor needs to "
+            f"click on this element: \"{description}\".\n"
+            "Give the corrected coordinates of the CENTER of that element, measured "
+            "WITHIN this crop (relative to the crop's own top-left). For reference, "
+            f"the crop's top-left (0,0) is at screen position ({x0},{y0}).\n"
+            "Reply with ONLY a JSON object — no prose, no markdown fences.\n"
+            "If you can see it: {\"found\": true, \"x\": <int>, \"y\": <int>} "
+            "(crop-relative pixels).\n"
+            "If it is not inside this crop: {\"found\": false, \"reason\": \"<short reason>\"}.\n"
+            "NEVER guess coordinates."
+        )
+
+        def _call(call_provider, call_model):
+            def _do(key):
+                client = build_vision_client(call_provider, key)
+                resp = client.chat.completions.create(
+                    model=call_model,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:image/png;base64,{b64}"}},
+                        ],
+                    }],
+                    timeout=25,
+                )
+                return (resp.choices[0].message.content or "").strip()
+            return _do
+
+        try:
+            raw = with_key_rotation(
+                provider, _call(provider, model),
+                label=f"desktop-refine:{provider}",
+            )
+        except Exception:
+            return None   # quota/auth/network/no-key -> keep the coarse coordinates
+
+        blob = _extract_json_object(raw)
+        if blob is None:
+            return None
+        try:
+            data = json.loads(blob, strict=False)
+        except Exception:
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("found"), bool):
+            return None
+        if not data["found"]:
+            return None
+        xv, yv = data.get("x"), data.get("y")
+        if (not isinstance(xv, (int, float)) or isinstance(xv, bool)
+                or not isinstance(yv, (int, float)) or isinstance(yv, bool)):
+            return None
+        cx = int(round(float(xv)))
+        cy = int(round(float(yv)))
+        # The corrected point must land inside the crop; otherwise the refinement
+        # is bogus (model hallucinated) -> discard and keep the coarse target.
+        if not (0 <= cx < cw and 0 <= cy < ch):
+            return None
+        return (x0 + cx, y0 + cy)
+    except Exception:
+        return None
+
+
+def _refine_click_target(x: int, y: int, description: str, _dc):
+    """Second pass of the vision-guided click for precision on small targets.
+
+    Moves the cursor to the coarse point (NO click), re-captures the screen,
+    crops a ``_REFINE_CROP_PX`` square centred on that point, and asks the vision
+    model for the corrected element centre inside that crop (a zoomed view locates
+    small elements — text links, tiny icons — far more precisely than the full
+    screen). Returns ``(screen_x, screen_y, refined)``: the sharpened coordinates
+    and ``True``, or the untouched ``(x, y)`` and ``False`` on ANY failure, so the
+    caller still clicks the coarse point rather than failing the whole click."""
+    try:
+        # Move the cursor to the coarse target first (no click). If even the move
+        # fails, the backend is not ready -> let the caller's click surface it.
+        mv = _dc.move_to(x, y)
+        if isinstance(mv, str) and mv.upper().startswith("ERROR"):
+            return x, y, False
+        try:
+            from PIL import Image
+        except Exception:
+            return x, y, False   # no Pillow -> cannot crop; keep the coarse target
+        refine_shot = str(Path(tempfile.gettempdir()) / "osia_desktop_refine.png")
+        if _capture_screen(refine_shot) is not None:
+            return x, y, False
+        crop_path = str(Path(tempfile.gettempdir()) / "osia_desktop_crop.png")
+        try:
+            with Image.open(refine_shot) as im:
+                iw, ih = im.size
+                x0, cw = _crop_window(x, _REFINE_CROP_PX, iw)
+                y0, ch = _crop_window(y, _REFINE_CROP_PX, ih)
+                im.crop((x0, y0, x0 + cw, y0 + ch)).save(crop_path)
+        except Exception:
+            return x, y, False
+        refined = _vision_refine_crop(crop_path, description, x0, y0, cw, ch)
+        if refined is None:
+            return x, y, False
+        return refined[0], refined[1], True
+    except Exception:
+        return x, y, False
+
+
+def tool_desktop_click(description: str) -> str:
+    """Vision-guided click on a NATIVE desktop element described in plain words.
+
+    Captures the screen, asks the vision model for the element's pixel
+    coordinates, clicks there, then captures + describes the screen again so the
+    model can confirm the click actually changed something (anti-hallucination).
+    The result reports BEFORE and AFTER one-line summaries and warns when the
+    screen did not visibly change (the click probably missed).
+    """
+    if not description or not str(description).strip():
+        return "ERROR: desktop_click: provide a description of what to click."
+    description = str(description).strip()
+
+    shot = str(Path(tempfile.gettempdir()) / "osia_desktop_click.png")
+    err = _capture_screen(shot)
+    if err:
+        return err
+
+    loc = _vision_locate(shot, description)
+    if loc.get("error"):
+        return loc["error"]
+    if not loc.get("found"):
+        return (
+            f"ERROR: could not find \"{description}\" on screen "
+            f"({loc.get('reason', 'not visible')}). Take a screenshot to see what "
+            "is currently displayed, then try a different description."
+        )
+
+    # Describe the screen BEFORE the click (reuses the screenshot we located on,
+    # so no extra capture). Vision call goes through key_chain rotation.
+    before_full = _describe_screenshot(shot)
+
+    from osia.tools import desktop_control as _dc
+    cx, cy = loc["x"], loc["y"]
+
+    # Two-pass precision refinement: coarse full-screen locate -> move the cursor
+    # there (no click) -> fine locate on a 300x300 crop around it -> click the
+    # corrected point. Sharpens small targets (text links, tiny icons). Best-
+    # effort: any hiccup (quota, vision error, not-found) falls back to the coarse
+    # coordinates rather than failing the whole click.
+    fx, fy, refined = _refine_click_target(cx, cy, description, _dc)
+
+    res = _dc.click_at(fx, fy)
+    if isinstance(res, str) and res.upper().startswith("ERROR"):
+        return res
+
+    if refined and (fx, fy) != (cx, cy):
+        note = (f"Clicked \"{description}\" at ({fx}, {fy}) "
+                f"— refined from coarse ({cx}, {cy}).")
+    else:
+        note = f"Clicked \"{description}\" at ({fx}, {fy})."
+
+    # Verification screenshot (distinct path so it never clobbers the click-shot).
+    verify = str(Path(tempfile.gettempdir()) / "osia_desktop_verify.png")
+    if _capture_screen(verify) is not None:
+        # Re-capture failed — report the click without a before/after compare.
+        return note
+    after_full = _describe_screenshot(verify)
+
+    before = _summarize_description(before_full)
+    after = _summarize_description(after_full)
+    lines = [note]
+    if before:
+        lines.append(f"BEFORE click: {before}")
+    if after:
+        lines.append(f"AFTER click: {after}")
+    # If the screen looks unchanged, the click likely missed — say so explicitly
+    # so a no-op click is never mistaken for success.
+    if before_full and after_full and _descriptions_nearly_identical(before_full, after_full):
+        lines.append(
+            "WARNING: the screen did not visibly change — the click may have missed."
+        )
+    return "\n".join(lines)
+
+
+def tool_desktop_type(text: str) -> str:
+    """Type text into the currently focused native element."""
+    if text is None:
+        return "ERROR: desktop_type: no text provided."
+    from osia.tools import desktop_control as _dc
+    return _dc.type_text(str(text))
+
+
+def tool_desktop_press(key: str) -> str:
+    """Press a key or shortcut (e.g. "enter", "ctrl+s", "alt+F4") system-wide."""
+    if not key or not str(key).strip():
+        return "ERROR: desktop_press: no key provided."
+    from osia.tools import desktop_control as _dc
+    return _dc.press_key(str(key))
+
+
+def tool_desktop_scroll(direction: str = "down", amount=3) -> str:
+    """Scroll the active native window up/down/left/right."""
+    from osia.tools import desktop_control as _dc
+    return _dc.scroll(direction, amount)
+
+
 TOOL_MAP = {
     # Shell & launchers
     "bash": tool_bash,
@@ -1445,6 +1883,11 @@ TOOL_MAP = {
     "type_text": tool_type_text,
     "press_key": tool_press_key,
     "open_browser": tool_open_browser,
+    # Desktop automation (native apps — OS-level mouse/keyboard, WOR-42)
+    "desktop_click": tool_desktop_click,
+    "desktop_type": tool_desktop_type,
+    "desktop_press": tool_desktop_press,
+    "desktop_scroll": tool_desktop_scroll,
 }
 
 # Known tool names — bare-JSON candidates (priority 3 of the universal
@@ -1493,11 +1936,16 @@ def _tool_timeout_seconds(tool_name: str, kwargs: dict) -> float:
     """Wall-clock budget for ONE tool execution in the executor. Slow
     install/download/clone shell commands get the extended budget plus a small
     grace so ``tool_bash``'s own timeout message fires before the executor's
-    generic one (WOR-31); every other tool keeps the default 30 s.
+    generic one (WOR-31); ``desktop_click`` gets 120 s because it makes up to
+    three vision API calls (coarse locate + crop refinement + verification) and
+    each can traverse several key rotations when keys are rate-limited; every
+    other tool keeps the default 30 s.
     """
     if tool_name in ("bash", "run_command"):
         if _is_long_running_command(kwargs.get("command", "") or ""):
             return LONG_RUNNING_TIMEOUT_SECONDS + 30
+    if tool_name == "desktop_click":
+        return 120
     return TOOL_TIMEOUT_SECONDS
 
 
@@ -1538,13 +1986,16 @@ def _execute_tool_with_retry(tool_name: str, kwargs: dict):
     timeout_s = _tool_timeout_seconds(tool_name, kwargs)
     result = _execute_tool_once(tool_name, kwargs, timeout_s=timeout_s)
     # Slow install/download/clone commands are NOT auto-retried: an immediate
-    # identical retry would just double an already-long wait (WOR-31). Fast
-    # tools keep the retry-once-on-error behavior.
+    # identical retry would just double an already-long wait (WOR-31).
+    # ``desktop_click`` is also NOT auto-retried: a blind retry doubles the
+    # (already long) wait and can double-click. Fast tools keep the
+    # retry-once-on-error behavior.
     long_running = (
         tool_name in ("bash", "run_command")
         and _is_long_running_command(kwargs.get("command", "") or "")
     )
-    if _is_tool_error(result) and not long_running:
+    no_retry = long_running or tool_name == "desktop_click"
+    if _is_tool_error(result) and not no_retry:
         preview = _result_text(result).replace("\n", " ")[:120]
         print(f"[OSIA Agent] ↻ retry tool: {tool_name} (first attempt: {preview!r})")
         result = _execute_tool_once(tool_name, kwargs, timeout_s=timeout_s)
