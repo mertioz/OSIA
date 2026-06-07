@@ -36,7 +36,20 @@ except Exception as _audio_exc:  # PortAudio missing / no audio device
         "detection is disabled (use the capsule / Ctrl+Alt+O)."
     )
 
-from openwakeword.utils import AudioFeatures
+# openWakeWord provides the AudioFeatures mel-spectrogram preprocessor. It is an
+# optional dependency: degrade gracefully when it (or its onnxruntime/tflite
+# backend) is missing so a fresh install / Windows box without the package still
+# starts and stays reachable via the capsule / Ctrl+Alt+O (mirrors _AUDIO_OK).
+try:
+    from openwakeword.utils import AudioFeatures
+    _WAKE_OK = True
+except ImportError as _wake_exc:  # openwakeword not installed
+    AudioFeatures = None
+    _WAKE_OK = False
+    print(
+        f"⚠️  [wake] openwakeword unavailable ({_wake_exc}); wake-word "
+        "detection is disabled (use the capsule / Ctrl+Alt+O)."
+    )
 
 # === Paths ===
 _MODEL_DIR = os.path.join(
@@ -111,6 +124,10 @@ class WakeWordDetector:
         if not _AUDIO_OK:
             print("⚠️  [wake] no audio backend — wake-word detection disabled; "
                   "use the capsule or Ctrl+Alt+O to reach OSIA.")
+            return
+        if not _WAKE_OK:
+            print("⚠️  [wake] openwakeword not installed — wake-word detection "
+                  "disabled; use the capsule or Ctrl+Alt+O to reach OSIA.")
             return
         preprocessor = _get_feature_extractor()
         verifier = _get_verifier()

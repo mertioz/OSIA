@@ -4,7 +4,9 @@ OSIA tools package — startup health check for the major tool categories.
 """
 
 import os
+import shutil
 import subprocess
+import sys
 
 
 def verify_tools() -> dict:
@@ -24,19 +26,35 @@ def verify_tools() -> dict:
 
     # bash ------------------------------------------------------------------
     try:
-        proc = subprocess.run(
-            ["bash", "-c", "echo osia-health-check"],
-            capture_output=True, text=True, timeout=5,
-        )
-        results["bash"] = (
-            proc.returncode == 0 and proc.stdout.strip() == "osia-health-check"
-        )
+        if sys.platform == "win32":
+            # No bash on Windows — probe PowerShell instead.
+            if shutil.which("powershell"):
+                results["bash"] = True
+            else:
+                proc = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-Command",
+                     "echo osia-health-check"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                results["bash"] = (
+                    proc.returncode == 0
+                    and proc.stdout.strip() == "osia-health-check"
+                )
+        else:
+            proc = subprocess.run(
+                ["bash", "-c", "echo osia-health-check"],
+                capture_output=True, text=True, timeout=5,
+            )
+            results["bash"] = (
+                proc.returncode == 0 and proc.stdout.strip() == "osia-health-check"
+            )
     except Exception:
         results["bash"] = False
 
     # file read --------------------------------------------------------------
     try:
-        with open(os.path.abspath(__file__), "r") as f:
+        with open(os.path.abspath(__file__), "r",
+                  encoding="utf-8", errors="replace") as f:
             f.read(64)
         results["file_read"] = True
     except Exception:

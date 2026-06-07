@@ -31,7 +31,7 @@
   "liveapi_model": "gemini-2.5-flash-live",
   "wake_word_enabled": true,
   "wake_greeting_enabled": true,
-  "wake_greeting_text": "Je vous \u00e9coute",
+  "wake_greeting_text": "bonjour, monsieur !",
   "cron_jobs": [],
   "heartbeat_enabled": false,
   "heartbeat_interval_minutes": 5,

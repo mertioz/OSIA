@@ -5,11 +5,11 @@ API keys are stored at ``~/.osia/api_keys.json`` with file mode 0600 (owner
 read/write only). Settings are stored at ``~/.osia/settings.json``. The mobile
 pairing token lives at ``~/.osia/mobile_token.txt``.
 
-The config directory resolves to ``Path.home() / ".osia"`` so it is per-user
-and works identically on Windows (``C:\\Users\\<user>\\.osia``) and Mac. On
-Linux it falls back to the in-repo ``<repo>/config/`` dir for backward
-compatibility with the existing dev setup when ``~/.osia`` does not yet exist
-— see WOR-11 (Windows port) and ``_resolve_config_dir`` below.
+The config directory is resolved by ``_resolve_config_dir`` below: in dev/repo
+mode — a cloned repo whose ``<repo>/config/settings.json`` exists — it is the
+in-repo ``<repo>/config/`` dir; otherwise (installed app / Windows) it is the
+per-user ``Path.home() / ".osia"`` dir, which works identically on Windows
+(``C:\\Users\\<user>\\.osia``), Mac and Linux. See WOR-11 (Windows port).
 """
 
 import json
@@ -25,26 +25,21 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _resolve_config_dir() -> str:
-    """Resolve the per-user config/data dir.
+    """Resolve the config/data dir.
 
-    Windows and Mac (and Linux once ``~/.osia`` exists) use the cross-platform
-    per-user dir ``Path.home() / ".osia"`` (WOR-11). On Linux only, when that
-    dir does not yet exist but the in-repo ``<repo>/config/`` dir does and
-    already holds ``settings.json`` or ``api_keys.json``, fall back to it so
-    the existing Linux dev setup keeps working.
+    Dev/repo mode: when the in-repo ``<repo>/config/settings.json`` exists
+    (i.e. you cloned the repo and have a populated ``config/`` folder), use
+    ``<repo>/config`` — even on Linux, where ``~/.osia`` may also exist to hold
+    conversations/profiles. Otherwise (installed app / Windows) use the
+    cross-platform per-user dir ``Path.home() / ".osia"`` (WOR-11).
     """
-    home_dir = Path.home() / ".osia"
-    if sys.platform.startswith("linux") and not home_dir.exists():
-        repo_config = PROJECT_ROOT / "config"
-        if repo_config.is_dir() and (
-            (repo_config / "settings.json").exists()
-            or (repo_config / "api_keys.json").exists()
-        ):
-            return str(repo_config)
-    return str(home_dir)
+    repo_config = PROJECT_ROOT / "config"
+    if (repo_config / "settings.json").exists():
+        return str(repo_config)
+    return str(Path.home() / ".osia")
 
 
-# Per-user config/data dir; Linux dev falls back to <repo>/config (see above).
+# Config/data dir: <repo>/config in dev/repo mode, else ~/.osia (see above).
 CONFIG_DIR = _resolve_config_dir()
 API_KEYS_FILE = os.path.join(CONFIG_DIR, "api_keys.json")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
@@ -162,7 +157,7 @@ def load_api_keys() -> dict:
     if not os.path.exists(API_KEYS_FILE):
         return {}
     try:
-        with open(API_KEYS_FILE, "r") as f:
+        with open(API_KEYS_FILE, "r", encoding="utf-8", errors="replace") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception:
@@ -172,12 +167,15 @@ def load_api_keys() -> dict:
 def save_api_keys(keys: dict) -> None:
     """Persist API keys to disk and chmod the file to 0600."""
     _ensure_config_dir()
-    with open(API_KEYS_FILE, "w") as f:
+    with open(API_KEYS_FILE, "w", encoding="utf-8") as f:
         json.dump(keys, f, indent=2)
-    try:
-        os.chmod(API_KEYS_FILE, stat.S_IRUSR | stat.S_IWUSR)
-    except Exception:
-        pass
+    if sys.platform != "win32":
+        try:
+            os.chmod(API_KEYS_FILE, stat.S_IRUSR | stat.S_IWUSR)
+        except Exception:
+            pass
+    else:
+        print("[config] ACL hardening (0o600) not applied on Windows")
 
 
 def get_api_key(provider: str) -> str:
@@ -201,7 +199,7 @@ def load_settings() -> dict:
     if not os.path.exists(SETTINGS_FILE):
         return base
     try:
-        with open(SETTINGS_FILE, "r") as f:
+        with open(SETTINGS_FILE, "r", encoding="utf-8", errors="replace") as f:
             data = json.load(f)
         if isinstance(data, dict):
             base.update(data)
@@ -212,7 +210,7 @@ def load_settings() -> dict:
 
 def save_settings(settings: dict) -> None:
     _ensure_config_dir()
-    with open(SETTINGS_FILE, "w") as f:
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
 
 
@@ -235,7 +233,7 @@ def set_setting(key: str, value) -> None:
 def load_mobile_token() -> str:
     """Return the mobile pairing token, or '' if it hasn't been created yet."""
     try:
-        with open(MOBILE_TOKEN_FILE, "r") as f:
+        with open(MOBILE_TOKEN_FILE, "r", encoding="utf-8", errors="replace") as f:
             return f.read().strip()
     except Exception:
         return ""
@@ -245,10 +243,13 @@ def regenerate_mobile_token() -> str:
     """Generate a fresh 20-char mobile token, persist it (0600), and return it."""
     _ensure_config_dir()
     token = secrets.token_hex(10)  # 20 hex chars
-    with open(MOBILE_TOKEN_FILE, "w") as f:
+    with open(MOBILE_TOKEN_FILE, "w", encoding="utf-8") as f:
         f.write(token)
-    try:
-        os.chmod(MOBILE_TOKEN_FILE, stat.S_IRUSR | stat.S_IWUSR)
-    except Exception:
-        pass
+    if sys.platform != "win32":
+        try:
+            os.chmod(MOBILE_TOKEN_FILE, stat.S_IRUSR | stat.S_IWUSR)
+        except Exception:
+            pass
+    else:
+        print("[config] ACL hardening (0o600) not applied on Windows")
     return token

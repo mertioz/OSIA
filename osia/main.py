@@ -6,6 +6,15 @@ import sys
 # (it would fail to start). Guard it to Linux only — WOR-11 (Windows port).
 if sys.platform.startswith("linux"):
     os.environ["QT_QPA_PLATFORM"] = "xcb"
+# On Windows, cmd.exe's default console encoding (cp1252) raises
+# UnicodeEncodeError when printing emoji / non-ASCII. Reconfigure stdout/stderr
+# to UTF-8 (replace on error) before any code prints non-ASCII — WOR-11.
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 """
 OSIA main entry point — supports text mode, voice mode, wake-word mode.
 

@@ -31,6 +31,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -72,6 +73,24 @@ _BROWSER_CANDIDATES = [
     "microsoft-edge",
 ]
 
+# Windows install locations (env vars expanded at import time). Chrome/Brave
+# commonly install under both %ProgramFiles(x86)% and %LOCALAPPDATA% as well as
+# %ProgramFiles%; all variants are added so existing resolution finds them.
+if sys.platform == "win32":
+    _BROWSER_CANDIDATES = [
+        os.path.expandvars(p) for p in (
+            r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"%ProgramFiles(x86)%\BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+            r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+            r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+            r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
+            r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+            r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
+        )
+    ] + _BROWSER_CANDIDATES
+
 # Map common user-facing browser names ("open Firefox", "open Chrome") to
 # the binary candidates to try for that browser, in preference order.
 _BROWSER_NAME_MAP = {
@@ -82,6 +101,33 @@ _BROWSER_NAME_MAP = {
     "opera": ["opera"],
     "edge": ["microsoft-edge", "microsoft-edge-stable", "msedge"],
 }
+
+# On Windows, prepend the full install paths (env vars expanded) so the name
+# resolver finds installed browsers without altering Linux/Mac candidate lists.
+if sys.platform == "win32":
+    _WINDOWS_NAME_PATHS = {
+        "brave": [
+            r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"%ProgramFiles(x86)%\BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe",
+        ],
+        "chrome": [
+            r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+            r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+            r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+        ],
+        "edge": [
+            r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
+            r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+        ],
+        "firefox": [
+            r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
+        ],
+    }
+    for _key, _paths in _WINDOWS_NAME_PATHS.items():
+        _BROWSER_NAME_MAP[_key] = (
+            [os.path.expandvars(p) for p in _paths] + _BROWSER_NAME_MAP[_key]
+        )
 
 # Browsers that can NOT be driven over the Chrome DevTools Protocol
 # (non-Chromium engines). They are skipped for CDP automation; Firefox is
@@ -110,6 +156,20 @@ _firefox_launching = False
 
 # ── CDP lifecycle ──────────────────────────────────────────────────────────
 
+def _detach_kwargs() -> dict:
+    """Platform-correct ``subprocess.Popen`` kwargs to detach the child.
+
+    ``start_new_session`` is POSIX-only; on Windows use the detached/new-group
+    creation flags instead so launching a browser never crashes.
+    """
+    if sys.platform == "win32":
+        return {
+            "creationflags": getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        }
+    return {"start_new_session": True}
+
+
 def _is_cdp_alive() -> bool:
     """Return True if a CDP debugger is responding on ``CDP_PORT``."""
     try:
@@ -128,10 +188,11 @@ def _find_binary(name: str) -> str | None:
     """
     if os.path.isabs(name):
         return name if os.path.exists(name) else None
-    for directory in ("/usr/bin", "/snap/bin"):
-        path = os.path.join(directory, name)
-        if os.path.exists(path):
-            return path
+    if sys.platform != "win32":
+        for directory in ("/usr/bin", "/snap/bin"):
+            path = os.path.join(directory, name)
+            if os.path.exists(path):
+                return path
     return shutil.which(name)
 
 
@@ -296,7 +357,7 @@ def _launch_cdp_browser(binary: str | None = None) -> tuple[bool, str]:
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                start_new_session=True,
+                **_detach_kwargs(),
             )
         except Exception as e:
             return False, f"failed to launch {browser}: {e}"
@@ -867,7 +928,7 @@ def open_browser(name: str, url: str | None = None):
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            **_detach_kwargs(),
         )
     except Exception as e:
         return f"ERROR launching {binary}: {e}"

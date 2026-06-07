@@ -8,6 +8,7 @@ import ast
 import json
 import re
 import subprocess
+import sys
 import os
 import platform
 import shutil
@@ -67,7 +68,7 @@ When the user refers to the "desktop" or "bureau", it means the desktop folder �
 You have these tools available:
 
 System & shell:
-- bash: Execute a bash command. Usage: {"tool": "bash", "command": "<command>"}
+- bash: Execute a bash command (on Windows it runs in PowerShell — use PowerShell syntax there). Usage: {"tool": "bash", "command": "<command>"}
 - run_command: Run any shell command and return its output. Usage: {"tool": "run_command", "command": "<command>"}
 - open_application: Launch an application by name. Usage: {"tool": "open_application", "name": "<app_name>"}
 - take_screenshot: Capture the desktop to the system temp directory and return the path. Usage: {"tool": "take_screenshot"}
@@ -131,7 +132,7 @@ Quand l'utilisateur parle du « bureau » (ou « desktop »), il s'agit du dossi
 Tu disposes des outils suivants :
 
 Système & shell :
-- bash : Exécuter une commande bash. Usage : {"tool": "bash", "command": "<commande>"}
+- bash : Exécuter une commande bash (sous Windows elle s'exécute dans PowerShell — utilise la syntaxe PowerShell). Usage : {"tool": "bash", "command": "<commande>"}
 - run_command : Exécuter n'importe quelle commande shell et retourner sa sortie. Usage : {"tool": "run_command", "command": "<commande>"}
 - open_application : Lancer une application par son nom. Usage : {"tool": "open_application", "name": "<nom_app>"}
 - take_screenshot : Capturer le bureau vers le répertoire temporaire système et retourner le chemin. Usage : {"tool": "take_screenshot"}
@@ -444,12 +445,22 @@ def clean_response(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def tool_bash(command: str) -> str:
-    """Execute a bash command and return stdout + stderr (truncated)."""
+    """Execute a bash command and return stdout + stderr (truncated).
+
+    On Windows the command is run in PowerShell (not bash/sh), so use
+    PowerShell syntax there.
+    """
     try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            timeout=30, cwd=_PROJECT_DIR
-        )
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", command],
+                capture_output=True, text=True, timeout=30, cwd=_PROJECT_DIR
+            )
+        else:
+            result = subprocess.run(
+                command, shell=True, capture_output=True, text=True,
+                timeout=30, cwd=_PROJECT_DIR
+            )
         out = result.stdout.strip()
         err = result.stderr.strip()
         if out and err:
@@ -467,10 +478,10 @@ def tool_bash(command: str) -> str:
 
 def tool_read_file(path: str) -> str:
     """Read a file and return its contents (truncated to 4000 chars)."""
-    if not path.startswith("/"):
+    if not os.path.isabs(path):
         path = os.path.join(_PROJECT_DIR, path)
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
         if len(content) > 4000:
             content = content[:4000] + "\n... [TRUNCATED]"
@@ -481,11 +492,11 @@ def tool_read_file(path: str) -> str:
 
 def tool_write_file(path: str, content: str) -> str:
     """Write content to a file. Creates parent directories if needed."""
-    if not path.startswith("/"):
+    if not os.path.isabs(path):
         path = os.path.join(_PROJECT_DIR, path)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(content)
         return f"Successfully wrote {len(content)} bytes to {path}"
     except Exception as e:
@@ -503,7 +514,7 @@ def tool_open_application(name: str) -> str:
 
 def tool_list_files(path: str) -> str:
     """List files in a directory."""
-    if not path.startswith("/"):
+    if not os.path.isabs(path):
         path = os.path.join(_PROJECT_DIR, path)
     try:
         entries = os.listdir(path)
@@ -515,7 +526,7 @@ def tool_list_files(path: str) -> str:
 
 def tool_delete_file(path: str) -> str:
     """Delete a file."""
-    if not path.startswith("/"):
+    if not os.path.isabs(path):
         path = os.path.join(_PROJECT_DIR, path)
     try:
         os.remove(path)
@@ -530,8 +541,19 @@ def tool_run_command(command: str) -> str:
 
 
 def tool_take_screenshot() -> str:
-    """Take a screenshot of the desktop using scrot. Returns the path."""
+    """Take a screenshot of the desktop. Returns the path.
+
+    Uses Pillow's ImageGrab on Windows; ``scrot`` on Linux (mac is
+    best-effort via scrot if present).
+    """
     path = str(Path(tempfile.gettempdir()) / "osia_screenshot.png")
+    if sys.platform == "win32":
+        try:
+            from PIL import ImageGrab
+            ImageGrab.grab().save(path)
+            return path
+        except Exception as e:
+            return f"ERROR taking screenshot: {e}"
     try:
         result = subprocess.run(
             ["scrot", "-o", path], capture_output=True, text=True, timeout=10
@@ -550,7 +572,7 @@ def tool_take_screenshot() -> str:
 
 def _abs(path: str) -> str:
     """Resolve a possibly-relative path against the project directory."""
-    return path if path.startswith("/") else os.path.join(_PROJECT_DIR, path)
+    return path if os.path.isabs(path) else os.path.join(_PROJECT_DIR, path)
 
 
 # ── File-system tools ──────────────────────────────────────────────────────
@@ -685,6 +707,18 @@ def tool_open_in_editor(path: str) -> str:
     xed, nano…). Falls back to ``xdg-open``.
     """
     path = _abs(path)
+    if sys.platform == "win32":
+        try:
+            os.startfile(path)  # type: ignore[attr-defined]
+            return f"Opened {path}"
+        except Exception as e:
+            return f"ERROR opening {path}: {e}"
+    if sys.platform == "darwin":
+        try:
+            subprocess.Popen(["open", path])
+            return f"Opened {path}"
+        except Exception as e:
+            return f"ERROR opening {path}: {e}"
     editor = _detect_editor()
     if not editor:
         return "ERROR: no known editor or xdg-open available"
@@ -714,7 +748,7 @@ def tool_edit_file_lines(path: str, start_line: int, end_line: int, new_content:
     if start < 1 or end < start:
         return f"ERROR: invalid range start_line={start}, end_line={end}"
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
     except Exception as e:
         return f"ERROR reading {path}: {e}"
@@ -724,7 +758,7 @@ def tool_edit_file_lines(path: str, start_line: int, end_line: int, new_content:
     replacement = new_content if new_content.endswith("\n") else new_content + "\n"
     new_lines = lines[:start - 1] + [replacement] + lines[end:]
     try:
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.writelines(new_lines)
     except Exception as e:
         return f"ERROR writing {path}: {e}"
@@ -744,7 +778,7 @@ def tool_get_system_info() -> str:
         except AttributeError:
             load_str = "N/A"  # os.getloadavg() is Unix-only (absent on Windows)
         vm = psutil.virtual_memory()
-        du = psutil.disk_usage("/")
+        du = psutil.disk_usage(str(Path.home().anchor))
         uname = platform.uname()
         return (
             f"host:    {uname.node} ({uname.system} {uname.release})\n"
@@ -877,6 +911,24 @@ def _clipboard_backend() -> tuple[list[str], list[str]] | None:
 
 def tool_get_clipboard() -> str:
     """Return the current clipboard text."""
+    if sys.platform == "win32":
+        try:
+            import pyperclip
+            text = pyperclip.paste()
+        except Exception:
+            try:
+                result = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if result.returncode != 0:
+                    return f"ERROR reading clipboard: {result.stderr.strip() or 'Get-Clipboard failed'}"
+                text = result.stdout
+            except Exception as e:
+                return f"ERROR reading clipboard: {e}"
+        if len(text) > 4000:
+            text = text[:4000] + "\n... [TRUNCATED]"
+        return text if text else "(clipboard is empty)"
     backend = _clipboard_backend()
     if backend is None:
         return "ERROR: no clipboard backend (install wl-clipboard, xclip, or xsel)"
@@ -895,6 +947,21 @@ def tool_get_clipboard() -> str:
 
 def tool_set_clipboard(text: str) -> str:
     """Place ``text`` on the clipboard."""
+    if sys.platform == "win32":
+        try:
+            import pyperclip
+            pyperclip.copy(text)
+            return f"Copied {len(text)} chars to clipboard"
+        except Exception:
+            try:
+                result = subprocess.run(
+                    ["clip.exe"], input=text, capture_output=True, text=True, timeout=3,
+                )
+                if result.returncode != 0:
+                    return f"ERROR writing clipboard: {result.stderr.strip() or 'clip.exe failed'}"
+                return f"Copied {len(text)} chars to clipboard"
+            except Exception as e:
+                return f"ERROR writing clipboard: {e}"
     backend = _clipboard_backend()
     if backend is None:
         return "ERROR: no clipboard backend (install wl-clipboard, xclip, or xsel)"

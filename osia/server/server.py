@@ -62,6 +62,7 @@ import io
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -111,6 +112,38 @@ def _image_mime_for(path: Path) -> str | None:
     """
     return _IMAGE_MIME.get(path.suffix.lower().lstrip("."))
 
+
+# Windows reserved device basenames — invalid as filenames (with or without an
+# extension, case-insensitive) on Windows. Sanitized on every OS so uploads are
+# portable.
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _sanitize_upload_filename(filename: str) -> str:
+    """Return a safe basename for a client-supplied upload filename.
+
+    Applied on all platforms (important on Windows): keep the basename only,
+    drop the chars ``<>:"/\\|?*`` and control chars, strip leading/trailing
+    dots and spaces, and rename Windows reserved basenames. Always returns a
+    non-empty name (falls back to ``upload.bin``).
+    """
+    name = os.path.basename(filename or "")
+    name = "".join(
+        ch for ch in name
+        if ch not in '<>:"/\\|?*' and ord(ch) >= 32
+    )
+    name = name.strip(" .")
+    if not name:
+        return "upload.bin"
+    stem = name.split(".", 1)[0]
+    if stem.upper() in _WINDOWS_RESERVED_NAMES:
+        name = f"_{name}"
+    return name
+
 # ---------------------------------------------------------------------------
 # Token management
 # ---------------------------------------------------------------------------
@@ -124,12 +157,18 @@ def load_or_create_token() -> str:
             if len(token) == 16:
                 token = secrets.token_hex(10)  # 20 hex chars
                 TOKEN_FILE.write_text(token)
-                TOKEN_FILE.chmod(0o600)
+                if sys.platform != "win32":
+                    TOKEN_FILE.chmod(0o600)
+                else:
+                    print("[OSIA Server] ACL hardening (0o600) not applied on Windows")
             return token
     # Generate a secure random token
     token = secrets.token_hex(32)  # 64 hex chars
     TOKEN_FILE.write_text(token)
-    TOKEN_FILE.chmod(0o600)
+    if sys.platform != "win32":
+        TOKEN_FILE.chmod(0o600)
+    else:
+        print("[OSIA Server] ACL hardening (0o600) not applied on Windows")
     return token
 
 
@@ -301,14 +340,30 @@ def _google_to_mp3_bytes(text: str) -> bytes:
 
 def _wav_to_mp3(wav_bytes: bytes, bitrate: str = "128k") -> bytes:
     """Convert WAV audio bytes to MP3 via ffmpeg pipe."""
+    # Resolve ffmpeg robustly: prefer one on PATH; on Windows fall back to the
+    # bundled <project_root>/windows/ffmpeg.exe if present.
+    ffmpeg_exe = shutil.which("ffmpeg")
+    if ffmpeg_exe is None:
+        bundled = PROJECT_DIR / "windows" / "ffmpeg.exe"
+        if bundled.exists():
+            ffmpeg_exe = str(bundled)
+    if ffmpeg_exe is None:
+        msg = (
+            "ffmpeg not found: install ffmpeg and ensure it is on PATH "
+            "(or provide windows/ffmpeg.exe on Windows)."
+        )
+        print(f"[OSIA Server] {msg}", flush=True)
+        raise RuntimeError(msg)
     proc = subprocess.run(
-        ["ffmpeg", "-y", "-i", "pipe:0", "-f", "mp3", "-b:a", bitrate, "pipe:1"],
+        [ffmpeg_exe, "-y", "-i", "pipe:0", "-f", "mp3", "-b:a", bitrate, "pipe:1"],
         input=wav_bytes,
         capture_output=True,
         timeout=30,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg conversion failed: {proc.stderr.decode()}")
+        raise RuntimeError(
+            f"ffmpeg conversion failed: {proc.stderr.decode('utf-8', 'replace')}"
+        )
     return proc.stdout
 
 
@@ -505,7 +560,7 @@ def _collect_heartbeat_data() -> dict:
         "cpu_percent": float(psutil.cpu_percent(interval=None)),
         "ram_mb": int(vm.used / (1024 * 1024)),
         "ram_percent": float(vm.percent),
-        "disk_percent": float(psutil.disk_usage("/").percent),
+        "disk_percent": float(psutil.disk_usage(str(Path.home().anchor)).percent),
         "cpu_temp": _read_cpu_temp(),
         "gpu_temp": _read_gpu_temp(),
         "timestamp": datetime.now().isoformat(),
@@ -735,6 +790,15 @@ async def websocket_endpoint(ws: WebSocket):
                     "status": "done",
                     "message": "restarting",
                 })
+                if sys.platform == "win32":
+                    # os.execv on Windows does not reliably replace the process
+                    # image; spawn a detached new process and exit instead.
+                    subprocess.Popen(
+                        [sys.executable, *sys.argv],
+                        creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
+                        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                    )
+                    os._exit(0)
                 os.execv(sys.executable, [sys.executable] + sys.argv)
                 continue
 
@@ -1242,8 +1306,10 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 try:
                     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-                    # Sanitize: keep basename only, prefix with timestamp to avoid clobbering.
-                    safe_name = os.path.basename(filename) or "upload.bin"
+                    # Sanitize the client-supplied name (basename only, strip
+                    # illegal/reserved chars & Windows device names), prefix
+                    # with a timestamp to avoid clobbering.
+                    safe_name = _sanitize_upload_filename(filename)
                     target = UPLOAD_DIR / f"{int(time.time() * 1000)}_{safe_name}"
                     target.write_bytes(base64.b64decode(b64_data))
                     image_mime = _image_mime_for(target)

@@ -106,8 +106,8 @@ def _win_start_server() -> bool:
             [_win_python(), str(run_server)],
             cwd=str(_REPO_ROOT),
             creationflags=(
-                getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                | getattr(subprocess, "DETACHED_PROCESS", 0)
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             ),
         )
         return True

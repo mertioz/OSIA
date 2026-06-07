@@ -11,8 +11,62 @@
 - The `_AntiLoopGuard` class and its detectors
 - `osia/tools/browser.py` — CDP/Firefox BiDi launch logic, profile isolation, `_cdp_launching`/`_firefox_launching` flags
 - The WebSocket message protocol in `osia/server/server.py`
-- `MAX_RESPONSE_TOKENS` (must stay 32768, provider-safe max)
+- `MAX_RESPONSE_TOKENS` was intentionally **removed** (WOR-28) — do NOT reintroduce it (providers apply their native limits). See "VALEURS CRITIQUES ET DÉCISIONS ARCHITECTURALES" below.
 - Provider config in `osia/models.py` (base URLs, model IDs)
+
+## VALEURS CRITIQUES ET DÉCISIONS ARCHITECTURALES
+
+> Valeurs et choix **délibérés** (souvent WOR-28) — à ne PAS « corriger »,
+> réinitialiser ni réintroduire. Avant tout changement (et avant tout merge),
+> vérifier que chacune est préservée à l'identique.
+
+- **`POPUP_W = 520`** (`osia/gui/main_popup.py:71`) — largeur du popup principal,
+  consommée par `setFixedSize(POPUP_W, POPUP_H)` (`main_popup.py:4311`). Valeur
+  **délibérée** (WOR-28 l'avait passée de `480` → `560` ; réduite ensuite à `520`
+  pour un popup plus compact, sur demande explicite). **Ne JAMAIS** la « corriger »
+  ni la repasser à `480`/`560` sans demande explicite.
+
+- **`CONFIG_DIR`** — **toujours** résolu via `_resolve_config_dir()`
+  (`osia/config.py`), **jamais codé en dur**. Règle de résolution : si
+  `<project>/config/settings.json` existe → utiliser `<project>/config`
+  (mode dev/repo). Sinon → `Path.home() / ".osia"` (mode installé/Windows,
+  identique sur Windows `C:\Users\<user>\.osia`, Mac et Linux). Tout autre
+  module doit **importer `CONFIG_DIR` depuis `osia.config`** — jamais le
+  redéfinir ni recopier la logique de résolution.
+
+- **`CONFIG_DIR` dans `server.py`** — **importé** depuis `osia.config`
+  (`from osia.config import CONFIG_DIR as _CONFIG_DIR`, `osia/server/server.py:79`),
+  **jamais redéfini ni recalculé**. Le serveur l'enveloppe seulement dans
+  `Path(...)` (`server.py:92`) car `osia.config.CONFIG_DIR` est un `str` et le
+  serveur fait des opérations `Path`. But : le serveur et la GUI résolvent
+  **EXACTEMENT le même** dossier via `_resolve_config_dir()`.
+
+- **`MAX_RESPONSE_TOKENS`** — **supprimé volontairement (WOR-28)**. Les providers
+  appliquent leurs **limites natives**. **Ne JAMAIS le réintroduire** — ni la
+  valeur `32768`, ni un plafond équivalent. Son absence de tout l'arbre est voulue.
+
+- **`QT_QPA_PLATFORM=xcb`** — **Linux uniquement** (X11 only), gardé par
+  `sys.platform.startswith("linux")`. **Ne JAMAIS** le définir sur Windows/Mac
+  (`osia/main.py`, `osia/gui/dynamic_island.py`, `osia/gui/main_popup.py`, et
+  l'`Exec=` du `.desktop` d'autostart Linux dans `osia/utils/assets.py`).
+
+- **`X11BypassWindowManagerHint`** — **Linux uniquement** (X11 only) : ajouté aux
+  flags de fenêtre seulement quand `sys.platform != "win32"`
+  (`osia/gui/dynamic_island.py:129`). Les flags de base
+  `FramelessWindowHint | WindowStaysOnTopHint | Tool` suffisent sur Windows/Mac.
+
+- **Règle cross-platform** — tout nouveau code au comportement dépendant de l'OS
+  **doit** passer par un garde `sys.platform` (`startswith("linux")`, `== "win32"`,
+  etc.). **Aucun nouveau chemin Linux codé en dur** : résoudre la racine projet
+  via `pathlib.Path(__file__).resolve().parent...` et les dossiers scratch via
+  `tempfile.gettempdir()` (jamais `/home/OSIA/...` ni `/tmp`).
+
+- **Règle de merge** — lors d'un merge depuis une branche, **ne JAMAIS** prendre
+  un fichier entier en bloc (pas de « take theirs/ours » aveugle). Toujours
+  **differ** et **vérifier** que les valeurs critiques ci-dessus sont préservées :
+  `POPUP_W = 520`, la résolution `CONFIG_DIR` (`_resolve_config_dir` + import dans
+  `server.py`), l'**absence** de `MAX_RESPONSE_TOKENS`, et les gardes
+  `sys.platform` (`xcb`, `X11BypassWindowManagerHint`).
 
 ## Cross-platform rules (WOR-11) — Linux / Windows / Mac:
 - **Cross-platform paths only.** Resolve the project root dynamically with

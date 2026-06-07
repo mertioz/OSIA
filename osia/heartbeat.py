@@ -29,6 +29,7 @@ import socket
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Callable
 
 from osia.config import get_setting
@@ -170,7 +171,7 @@ class HeartbeatMonitor:
             return
         try:
             import psutil
-            free_pct = 100.0 - psutil.disk_usage("/").percent
+            free_pct = 100.0 - psutil.disk_usage(str(Path.home().anchor)).percent
         except Exception as e:
             print(f"[HEARTBEAT] disk sample failed: {e}")
             return

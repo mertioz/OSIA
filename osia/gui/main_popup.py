@@ -68,8 +68,8 @@ except ImportError:
 
 # ── Visual constants ────────────────────────────────────────────────────────
 
-POPUP_W = 560
-POPUP_H = 680
+POPUP_W = 520
+POPUP_H = 640
 RADIUS = 20
 # Dark, semi-transparent glassmorphism fill so the popup reads as a floating
 # glass panel rather than an opaque window. Lower alpha → more transparent;
@@ -670,8 +670,8 @@ class _ProviderGridCard(QFrame):
         self._provider = provider
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(14, 14, 14, 14)
-        lay.setSpacing(6)
+        lay.setContentsMargins(11, 11, 11, 11)
+        lay.setSpacing(5)
 
         top = QHBoxLayout()
         top.setSpacing(8)
@@ -829,7 +829,7 @@ class _ModelPanel(QWidget):
         grid_host = QWidget()
         grid = QGridLayout(grid_host)
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(8)
+        grid.setSpacing(6)
         cols = 2
         for i, provider in enumerate(configured):
             card = _ProviderGridCard(
@@ -1443,7 +1443,7 @@ class _SettingsPanel(QWidget):
         host.setObjectName("panelHost")
         v = QVBoxLayout(host)
         v.setContentsMargins(0, 0, 6, 0)
-        v.setSpacing(14)
+        v.setSpacing(11)
 
         v.addWidget(self._build_language_section())
         v.addWidget(self._build_capsule_section())          # Capsule + autostart
@@ -4922,7 +4922,7 @@ class MainPopup(QWidget):
 
             /* Mobile token + reveal dialog ──────────────────────────────── */
             QLabel#tokenMask {
-                font-family: "DejaVu Sans Mono", "SF Mono", monospace;
+                font-family: "Consolas", "Cascadia Mono", "DejaVu Sans Mono", "SF Mono", monospace;
                 font-size: 13px;
                 color: #e8e6f0;
                 letter-spacing: 1px;
@@ -5032,7 +5032,7 @@ class MainPopup(QWidget):
                 border-radius: 10px;
                 padding: 6px 10px;
                 color: #e8e6f0;
-                font-family: "DejaVu Sans Mono", "SF Mono", monospace;
+                font-family: "Consolas", "Cascadia Mono", "DejaVu Sans Mono", "SF Mono", monospace;
                 font-size: 12px;
                 selection-background-color: rgba(196, 181, 245, 0.30);
             }

@@ -47,6 +47,8 @@ def ensure_desktop_entry() -> str | None:
     the written path, or ``None`` on any failure — this must never raise,
     the app has to start regardless.
     """
+    if platform.system() != "Linux":
+        return None
     try:
         apps_dir = os.path.join(
             os.path.expanduser("~"), ".local", "share", "applications"
@@ -75,13 +77,13 @@ def ensure_desktop_entry() -> str | None:
         )
 
         try:
-            with open(dest, "r") as f:
+            with open(dest, "r", encoding="utf-8", errors="replace") as f:
                 if f.read() == content:
                     return dest
         except OSError:
             pass
 
-        with open(dest, "w") as f:
+        with open(dest, "w", encoding="utf-8") as f:
             f.write(content)
         return dest
     except Exception:
@@ -226,7 +228,7 @@ def set_autostart(enabled: bool) -> bool:
                 "StartupWMClass=osia\n"
                 "X-GNOME-Autostart-enabled=true\n"
             )
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
         else:
             if os.path.exists(path):

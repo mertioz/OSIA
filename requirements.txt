@@ -41,6 +41,7 @@ requests>=2.31.0
 # ── System / input / utilities ──────────────────────────────────────────────
 psutil>=5.9.0                      # heartbeat metrics + Windows service control
 pynput>=1.7.6                      # global hotkeys (Ctrl+Space, Ctrl+Alt+O)
+pyperclip>=1.8.0                   # clipboard backend on Windows (get/set_clipboard)
 tqdm>=4.65.0
 
 # ── Optional ────────────────────────────────────────────────────────────────
