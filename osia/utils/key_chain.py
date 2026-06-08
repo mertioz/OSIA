@@ -26,11 +26,25 @@ key instead of re-burning a failed round-trip on each dead one. Cooldowns are
 best-effort and self-healing — if every key for a provider is cooling down they
 are all retried anyway, so a fully rate-limited provider never fails unattempted.
 
+On top of cooldowns, a **per-task sticky key** avoids re-walking the chain from
+key1 on every call inside one task (one agent run / one tool sequence). The first
+key that succeeds is remembered as that provider's *active* key for the rest of
+the task; subsequent calls start straight from it, and if it later fails they
+advance FORWARD along the chain (active+1, wrapping) rather than restarting at
+key1. This state lives in a :class:`contextvars.ContextVar` scoped by
+:func:`task_scope`, so it never leaks across unrelated tasks and — crucially —
+**when no task scope is active the behavior is byte-for-byte identical to before**
+(every existing caller is unaffected until the run loop opts in). The sticky key
+composes with cooldowns: it only chooses the *starting* point; cooling keys are
+still skipped. See :func:`task_scope`.
+
 It depends only on :mod:`osia.config` (never :mod:`osia.agent`) so any module can
 import it without a circular import.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import threading
 import time
 
@@ -84,26 +98,31 @@ def _cooldown_seconds(status) -> float:
     return _COOLDOWN_TRANSIENT
 
 
-def _live_indices(provider: str, chain: list):
+def _live_indices(provider: str, chain: list, order=None):
     """Split ``chain``'s indices into ``(live, cooling)``.
 
-    ``live`` are the indices whose cooldown has lapsed (or never started), in
-    chain order; ``cooling`` is ``[(index, seconds_left), …]`` for the parked
-    ones. If *every* key is still cooling down they are all treated as live
-    (``cooling`` returned empty) so a fully rate-limited provider is still
+    ``order`` is the sequence of indices to consider, in priority order; it
+    defaults to natural chain order ``[0, 1, …]`` (so the result is identical to
+    the pre-sticky behavior) and the per-task sticky key passes a rotated order
+    so the active key — and the keys after it — come first. ``live`` are the
+    ``order`` indices whose cooldown has lapsed (or never started), keeping
+    ``order``'s sequence; ``cooling`` is ``[(index, seconds_left), …]`` for the
+    parked ones. If *every* key is still cooling down they are all treated as
+    live (``cooling`` returned empty) so a fully rate-limited provider is still
     attempted instead of failing without trying.
     """
     now = time.time()
+    order = list(range(len(chain))) if order is None else list(order)
     live, cooling = [], []
     with _cooldowns_lock:
-        for idx in range(len(chain)):
+        for idx in order:
             until = _key_cooldowns.get((provider, idx), 0.0)
             if until > now:
                 cooling.append((idx, until - now))
             else:
                 live.append(idx)
     if not live:
-        return list(range(len(chain))), []
+        return order, []
     return live, cooling
 
 
@@ -117,6 +136,93 @@ def _clear_key(provider: str, idx: int) -> None:
     """Drop a key's cooldown once it succeeds, so it is preferred again."""
     with _cooldowns_lock:
         _key_cooldowns.pop((provider, idx), None)
+
+
+# ── Per-task sticky "active key" ───────────────────────────────────────────
+# Once a key succeeds inside a task we remember it as that provider's *active*
+# key and start subsequent calls FROM it, instead of re-testing key1, key2, …
+# from scratch every call. The active key is the *starting point* only — cooling
+# keys are still skipped (it composes with the cooldown cache above) — and on a
+# technical failure we advance FORWARD along the chain (active+1, wrapping),
+# never restarting at key1.
+#
+# The state is a ContextVar holding ``{provider: raw_chain_index}`` (the same
+# stable index identity the cooldown cache uses). It is established/cleared by
+# :func:`task_scope`, so it is naturally scoped to one task and isolated per
+# thread / asyncio task. The default is ``None`` ("no task scope"): when no scope
+# is active, :func:`_get_active` returns ``None``, ordering falls back to natural
+# chain order, and :func:`_set_active` is a no-op — i.e. every existing caller
+# behaves EXACTLY as before until the run loop opts in via ``task_scope()``.
+_active_keys: "contextvars.ContextVar[dict[str, int] | None]" = contextvars.ContextVar(
+    "osia_key_chain_active_keys", default=None
+)
+
+
+@contextlib.contextmanager
+def task_scope():
+    """Scope the per-task sticky "active key" to a single task.
+
+    Wrap one task (one agent run / one tool sequence) in ``with task_scope():``
+    so the keys that work during it are remembered and reused, then forgotten
+    when it ends:
+
+        with key_chain.task_scope():
+            agent.run(user_msg)        # all provider calls share active keys here
+        # scope cleared — the next task starts fresh from key1 (cooldowns persist)
+
+    This is the intended integration point for ``OSIAAgent.run`` and the mobile
+    server's request handler, but adopting it is OPTIONAL and additive: every
+    call site keeps working unchanged, and outside any ``task_scope`` the chain
+    behaves byte-for-byte as it did before stickiness existed. Scopes nest
+    safely (a nested scope is its own fresh sub-task) and, being a ContextVar,
+    each thread / asyncio task gets its own isolated state.
+    """
+    token = _active_keys.set({})
+    try:
+        yield
+    finally:
+        _active_keys.reset(token)
+
+
+def _get_active(provider: str):
+    """The current task's remembered raw-chain index for ``provider``, or
+    ``None`` when no task scope is active or no key has succeeded yet."""
+    state = _active_keys.get()
+    return None if state is None else state.get(provider)
+
+
+def _set_active(provider: str, idx: int) -> None:
+    """Remember ``idx`` as ``provider``'s active key for the rest of this task.
+    A no-op when no :func:`task_scope` is active (preserves legacy behavior)."""
+    state = _active_keys.get()
+    if state is not None:
+        state[provider] = idx
+
+
+def _ordered_indices(provider: str, chain: list) -> list:
+    """Indices of ``chain`` in the order to try them for the current task.
+
+    With a remembered active key, start from it and walk FORWARD, wrapping:
+    ``[active, active+1, …, n-1, 0, …, active-1]`` — so a task that already found
+    a working key never re-tests the keys before it. Without an active key (no
+    task scope, or none recorded yet, or a stale out-of-range index after the
+    configured chain shrank) this is natural order ``[0, 1, …, n-1]``.
+    """
+    n = len(chain)
+    active = _get_active(provider)
+    if active is None or not (0 <= active < n):
+        return list(range(n))
+    return [(active + off) % n for off in range(n)]
+
+
+def _format_skipped(active_idx: int) -> str:
+    """Render the keys jumped over by a sticky start as ``key1`` / ``key1-3``
+    (1-based, the keys before ``active_idx``); ``""`` when nothing is skipped."""
+    if active_idx <= 0:
+        return ""
+    if active_idx == 1:
+        return "key1"
+    return f"key1-{active_idx}"
 
 
 def _resolve_keys(provider: str) -> list:
@@ -153,11 +259,18 @@ def iter_keys(provider: str) -> list:
     so repeated calls stop re-testing dead keys. If every key is cooling down the
     full chain is returned anyway (never fail without trying), which also keeps
     :func:`has_key` and the single-key convenience callers correct.
+
+    Inside a :func:`task_scope` the list is rotated to start from this provider's
+    remembered active key (then forward, wrapping) so the caller's own rotation
+    begins where the task last succeeded; outside any scope the order is the
+    natural chain, identical to before. ``iter_keys`` only *consumes* the active
+    key — it cannot observe which key the caller ends up using, so it never
+    records one; that is :func:`with_key_rotation`'s job.
     """
     chain = _resolve_keys(provider)
     if not chain:
         return []
-    live, _cooling = _live_indices(provider, chain)
+    live, _cooling = _live_indices(provider, chain, _ordered_indices(provider, chain))
     return [chain[i] for i in live]
 
 
@@ -227,6 +340,46 @@ def _default_log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def record_active_key(provider: str, key: str) -> None:
+    """Publish ``key`` as ``provider``'s per-task active key, resolving it back to
+    its raw-chain index so subsequent calls in this task start straight from it.
+
+    This is the recording hook for callers that drive their OWN key rotation and
+    therefore never reach :func:`with_key_rotation` (which records the winning key
+    itself). The main chat loop is exactly such a caller: ``OSIAAgent.run`` selects
+    and rotates keys via :func:`iter_keys` + ``_activate_next_api_key``, and
+    :func:`iter_keys` can only *consume* the active key, never set one. After the
+    chat completion succeeds the run loop calls this so the rest of the turn's
+    provider calls (vision / TTS / STT via :func:`with_key_rotation`, and any
+    :func:`iter_keys` consumer) start from the key that just worked.
+
+    Resolves ``key`` against the *raw* chain (:func:`_resolve_keys`) so the
+    recorded index is the same stable identity the cooldown cache and
+    :func:`_set_active` use. It is a deliberate no-op — leaving behavior
+    byte-for-byte unchanged — when any of the following hold:
+
+      * no :func:`task_scope` is active (checked first, so the legacy path never
+        even resolves the chain);
+      * ``key`` is empty; or
+      * ``key`` is not in the provider's configured chain (e.g. the ``"ollama"``
+        placeholder, or a key edited out of config mid-session) — there is no
+        stable index to pin, so stickiness simply stays off for it, as before.
+    """
+    if not key:
+        return
+    # Short-circuit before touching config: outside a task_scope there is no
+    # active-key state to write, so the no-scope path stays allocation-free and
+    # identical to pre-stickiness behavior.
+    if _active_keys.get() is None:
+        return
+    chain = _resolve_keys(provider)
+    try:
+        idx = chain.index(key)
+    except ValueError:
+        return
+    _set_active(provider, idx)
+
+
 def with_key_rotation(provider, call_fn, *, label=None, log=None):
     """Call ``call_fn(key)`` for each key in ``provider``'s chain, rotating to
     the next key when the call raises a *technical* error (429/5xx/auth/timeout)
@@ -250,13 +403,31 @@ def with_key_rotation(provider, call_fn, *, label=None, log=None):
     If every key is cooling down they are all attempted anyway. Key numbers in
     the log (``key1`` …) are positions in the configured chain, stable across
     calls regardless of which keys are currently skipped.
+
+    Inside a :func:`task_scope` this is also where the per-task sticky key is
+    *recorded*: the chain is walked starting from the provider's remembered
+    active key (forward, wrapping — never restarting at key1), and the key that
+    succeeds becomes the active key for the rest of the task. Outside any scope
+    these steps are inert (start at key1, record nothing), so behavior is
+    unchanged. The sticky key only picks the starting point — cooling keys are
+    still skipped on top of it.
     """
     chain = _resolve_keys(provider)
     if not chain:
         raise KeyChainEmpty(provider)
     log = log or _default_log
     tag = label or provider
-    live, cooling = _live_indices(provider, chain)
+    active = _get_active(provider)
+    live, cooling = _live_indices(provider, chain, _ordered_indices(provider, chain))
+    # Sticky start: announce the remembered active key as the starting point, but
+    # only when it really is the live start (``live[0]``). If the active key is
+    # itself cooling it is skipped to the next live key, and the cooldown line
+    # below explains that — so don't print a "starting from key{N}" line for a
+    # key we immediately skip. (``live[0] == active`` also implies active is a
+    # valid in-range index, so chain[active] below is safe.)
+    if active is not None and active > 0 and live and live[0] == active:
+        log(f"[key-chain {tag}] task: starting from active key{active + 1} "
+            f"(…{mask_key(chain[active])}) — skipping {_format_skipped(active)}")
     for idx, left in cooling:
         log(f"[key-chain {tag}] skipping key{idx + 1} (…{mask_key(chain[idx])}) "
             f"— cooldown {int(left)}s left")
@@ -278,14 +449,24 @@ def with_key_rotation(provider, call_fn, *, label=None, log=None):
             _park_key(provider, idx, status)
             if pos + 1 < attempts:
                 nxt = live[pos + 1]
-                log(f"[key-chain {tag}] key{idx + 1} (…{mask_key(key)}) failed "
-                    f"[{reason}] — rotating to key{nxt + 1} "
-                    f"(…{mask_key(chain[nxt])})")
+                if active is not None and idx == active:
+                    # The remembered active key just died — advance FORWARD along
+                    # the chain (key+1, wrapping), never restarting at key1.
+                    log(f"[key-chain {tag}] task: active key{idx + 1} "
+                        f"(…{mask_key(key)}) failed [{reason}] — advancing to "
+                        f"key{nxt + 1} (…{mask_key(chain[nxt])})")
+                else:
+                    log(f"[key-chain {tag}] key{idx + 1} (…{mask_key(key)}) failed "
+                        f"[{reason}] — rotating to key{nxt + 1} "
+                        f"(…{mask_key(chain[nxt])})")
             else:
                 log(f"[key-chain {tag}] key{idx + 1} (…{mask_key(key)}) failed "
                     f"[{reason}] — chain exhausted "
                     f"({attempts} key{'s' if attempts != 1 else ''})")
         else:
             _clear_key(provider, idx)
+            # Remember the winning key as this task's active key (no-op outside a
+            # task_scope), so the next call in the task starts straight from it.
+            _set_active(provider, idx)
             return result
     raise last_exc

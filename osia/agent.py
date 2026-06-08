@@ -5,6 +5,7 @@ with a manual tool-calling loop that works with any model (llama3, etc.).
 """
 
 import ast
+import contextvars
 import json
 import re
 import subprocess
@@ -1599,6 +1600,33 @@ def _descriptions_nearly_identical(a: str, b: str) -> bool:
 
 _REFINE_CROP_PX = 300   # side of the square crop used by the fine (2nd-pass) locate
 
+# Max distance (px) the 2nd-pass refinement may move the click from the coarse
+# point. A genuine refinement only NUDGES the target (a few px to a few tens of
+# px) — the crop is only 300px wide, so a centred crop can never honestly move
+# the point more than ~150px. Anything beyond that means the refinement drifted
+# (vision returned bad/absolute coords) → discard it and keep the coarse point.
+_MAX_REFINE_DRIFT_PX = 150
+
+# A/B toggle for the 2nd-pass fine-locate refinement in tool_desktop_click.
+# Override at runtime with the env var DESKTOP_CLICK_REFINE (1/true/yes/on to
+# enable, 0/false/no/off to disable). Default is currently FALSE: the coarse
+# full-screen locate lands within a few px of the target, while the refinement
+# pass was observed DRIFTING FURTHER away — keeping it off isolates (and lets us
+# verify) the accurate coarse-only path. Flip the env var to re-enable for A/B.
+_REFINE_DEFAULT = False
+
+
+def _refine_flag() -> bool:
+    """Resolve the DESKTOP_CLICK_REFINE toggle from the environment, falling back
+    to ``_REFINE_DEFAULT`` when the var is unset/blank."""
+    raw = os.environ.get("DESKTOP_CLICK_REFINE")
+    if raw is None or not raw.strip():
+        return _REFINE_DEFAULT
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+DESKTOP_CLICK_REFINE = _refine_flag()
+
 
 def _crop_window(center: int, span: int, extent: int):
     """Top-left coordinate and size of a ``span``-pixel window centred on
@@ -1696,8 +1724,14 @@ def _vision_refine_crop(path: str, description: str, x0: int, y0: int,
         # The corrected point must land inside the crop; otherwise the refinement
         # is bogus (model hallucinated) -> discard and keep the coarse target.
         if not (0 <= cx < cw and 0 <= cy < ch):
+            print(f"[DESKTOP-REFINE] vision crop-relative ({cx},{cy}) outside "
+                  f"crop {cw}x{ch} — discarding refinement")
             return None
-        return (x0 + cx, y0 + cy)
+        fx, fy = x0 + cx, y0 + cy
+        # Crop→screen conversion: crop top-left (x0,y0) + crop-relative (cx,cy).
+        print(f"[DESKTOP-REFINE] crop origin=({x0},{y0}) size={cw}x{ch} "
+              f"vision crop-relative=({cx},{cy}) -> screen=({fx},{fy})")
+        return (fx, fy)
     except Exception:
         return None
 
@@ -1734,10 +1768,24 @@ def _refine_click_target(x: int, y: int, description: str, _dc):
                 im.crop((x0, y0, x0 + cw, y0 + ch)).save(crop_path)
         except Exception:
             return x, y, False
+        print(f"[DESKTOP-REFINE] coarse=({x},{y}) screenshot={iw}x{ih} "
+              f"crop origin=({x0},{y0}) size={cw}x{ch}")
         refined = _vision_refine_crop(crop_path, description, x0, y0, cw, ch)
         if refined is None:
             return x, y, False
-        return refined[0], refined[1], True
+        fx, fy = refined
+        # Sanity check: a real refinement only NUDGES the coarse point. If it
+        # jumped further than _MAX_REFINE_DRIFT_PX, the refinement drifted
+        # (bad conversion / hallucinated coords) -> discard, keep coarse.
+        drift = ((fx - x) ** 2 + (fy - y) ** 2) ** 0.5
+        if drift > _MAX_REFINE_DRIFT_PX:
+            print(f"[DESKTOP-REFINE] refined=({fx},{fy}) drifts {drift:.0f}px "
+                  f"from coarse ({x},{y}) > {_MAX_REFINE_DRIFT_PX}px — "
+                  f"discarding refinement, keeping coarse")
+            return x, y, False
+        print(f"[DESKTOP-REFINE] coarse=({x},{y}) -> refined=({fx},{fy}) "
+              f"drift={drift:.0f}px (accepted)")
+        return fx, fy, True
     except Exception:
         return x, y, False
 
@@ -1781,8 +1829,15 @@ def tool_desktop_click(description: str) -> str:
     # there (no click) -> fine locate on a 300x300 crop around it -> click the
     # corrected point. Sharpens small targets (text links, tiny icons). Best-
     # effort: any hiccup (quota, vision error, not-found) falls back to the coarse
-    # coordinates rather than failing the whole click.
-    fx, fy, refined = _refine_click_target(cx, cy, description, _dc)
+    # coordinates rather than failing the whole click. Gated by the
+    # DESKTOP_CLICK_REFINE A/B flag (default OFF — coarse-only) so the refinement
+    # can be toggled without code changes while its drift bug is investigated.
+    if DESKTOP_CLICK_REFINE:
+        fx, fy, refined = _refine_click_target(cx, cy, description, _dc)
+    else:
+        print(f"[DESKTOP-REFINE] disabled (DESKTOP_CLICK_REFINE=off) — "
+              f"clicking coarse ({cx}, {cy})")
+        fx, fy, refined = cx, cy, False
 
     res = _dc.click_at(fx, fy)
     if isinstance(res, str) and res.upper().startswith("ERROR"):
@@ -1962,7 +2017,15 @@ def _execute_tool_once(tool_name: str, kwargs: dict, timeout_s: float | None = N
         timeout_s = TOOL_TIMEOUT_SECONDS
     fn = TOOL_MAP[tool_name]
     try:
-        fut = _TOOL_EXECUTOR.submit(fn, **kwargs)
+        # Run the tool inside a copy of the CURRENT context so the per-task
+        # sticky-key scope (key_chain.task_scope, a ContextVar set on the agent
+        # thread) is visible inside this worker thread — ThreadPoolExecutor does
+        # NOT propagate context on its own. The scope's state is a dict mutated
+        # in place, so a key a tool's vision/TTS/STT call records (e.g. the 2nd
+        # of desktop_click's three vision calls) is seen by the next call and by
+        # the agent thread. Outside any task_scope this copy is inert.
+        ctx = contextvars.copy_context()
+        fut = _TOOL_EXECUTOR.submit(ctx.run, fn, **kwargs)
         result = fut.result(timeout=timeout_s)
         # Preserve dict results (browser tools) so screenshots survive.
         if isinstance(result, dict):
@@ -3627,6 +3690,33 @@ class OSIAAgent:
     def run(self, user_input: str, max_tool_rounds: int | None = None, on_sentence=None,
             history: list | None = None, max_tokens: int | None = None,
             on_first_token=None) -> str:
+        """Run one user turn under a per-task sticky-key scope, then delegate to
+        :meth:`_run_turn` for the actual agent loop.
+
+        Wrapping the whole turn in :func:`osia.utils.key_chain.task_scope` makes
+        ONE user request = ONE task: every provider call it triggers — the main
+        chat completion(s), and the vision / screenshot / TTS / STT calls made by
+        the tools it runs — shares that task's *active key* (the first key that
+        works is reused instead of re-walking the chain from key1 on each call),
+        and the scope is cleared when the turn ends so the NEXT turn starts fresh.
+        Being a context manager, the scope exits correctly on a normal return, an
+        anti-loop stop, or an exception. The scope is entered exactly ONCE here,
+        never per tool call, so stickiness is never reset mid-turn.
+        """
+        from osia.utils.key_chain import task_scope
+        with task_scope():
+            return self._run_turn(
+                user_input,
+                max_tool_rounds=max_tool_rounds,
+                on_sentence=on_sentence,
+                history=history,
+                max_tokens=max_tokens,
+                on_first_token=on_first_token,
+            )
+
+    def _run_turn(self, user_input: str, max_tool_rounds: int | None = None, on_sentence=None,
+                  history: list | None = None, max_tokens: int | None = None,
+                  on_first_token=None) -> str:
         """Run the agent loop: send user input, handle tool calls, return final response.
 
         Each round runs the tool pipeline in strict order: ``<think>``
@@ -3756,6 +3846,12 @@ class OSIAAgent:
         # stopped when the guard says no progress is being made.
         guard = _AntiLoopGuard(lang=self.lang)
 
+        # The chat path drives its OWN key rotation (the except block below +
+        # _activate_next_api_key), so it never reaches with_key_rotation's
+        # active-key recording. Import the explicit recorder to publish each
+        # successful chat key into the task scope (no-op outside a task_scope).
+        from osia.utils.key_chain import record_active_key
+
         while True:
             try:
                 if on_sentence is not None:
@@ -3870,6 +3966,14 @@ class OSIAAgent:
                           f"falling back to {self._fmt_route(nxt)}")
                     continue
                 raise
+
+            # The main chat completion above succeeded on self._api_key. Publish
+            # it as this task's active key so the rest of the turn — the vision /
+            # screenshot / TTS / STT calls its tools make (which rotate through
+            # with_key_rotation), plus any iter_keys consumer — starts from the
+            # key that just worked instead of re-walking the chain from key1.
+            # No-op outside a task_scope or for an unrecognised key (e.g. ollama).
+            record_active_key(self.provider, self._api_key)
 
             # ── Tool-call pipeline ──────────────────────────────────────
             # The order below is load-bearing:
