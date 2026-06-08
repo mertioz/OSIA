@@ -825,6 +825,22 @@ def wake_mode():
 
 
 def main():
+    # First-launch config bootstrap: create any missing config files
+    # (settings.json, mobile pairing token) BEFORE anything starts the mobile
+    # WebSocket server, so a fresh install works out of the box on any OS and the
+    # server authenticates against a persisted token. On Windows/Mac the GUI is
+    # the de-facto sole/primary process, so it creates the token here (on Windows
+    # this runs before _ensure_mobile_server_windows launches the server). On
+    # Linux a separate systemd server process (run_server.py) is the single token
+    # creator, so pass create_token=False to avoid two processes racing to
+    # persist divergent tokens. settings.json is always created (GUI is its only
+    # creator). Idempotent + best-effort — it must never block startup.
+    try:
+        from osia.config import ensure_config_files
+        ensure_config_files(create_token=not sys.platform.startswith("linux"))
+    except Exception as e:
+        print(f"[CONFIG] ensure_config_files skipped: {e}")
+
     # One-time tool health check: logs which tool categories (bash, file
     # read, browser) are usable so missing dependencies show up at startup
     # instead of failing mid-conversation. It imports playwright and probes

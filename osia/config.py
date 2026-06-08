@@ -253,3 +253,56 @@ def regenerate_mobile_token() -> str:
     else:
         print("[config] ACL hardening (0o600) not applied on Windows")
     return token
+
+
+# ── First-launch config bootstrap ──────────────────────────────────────────
+# A fresh clone/install ships without the gitignored, security-sensitive config
+# files (settings.json, mobile_token.txt) — only settings.example.json is in the
+# repo. ``ensure_config_files`` creates whatever is missing on the very first
+# launch, on every OS, so first-time setup (and the mobile pairing) works out of
+# the box. It is idempotent and best-effort: it only writes files that don't yet
+# exist, and never raises (a config-bootstrap failure must not block startup).
+
+def ensure_config_files(create_token: bool = True) -> None:
+    """Create any missing config files on first launch (idempotent, best-effort).
+
+    Ensures ``settings.json`` (persisted from ``DEFAULT_SETTINGS``) and — when
+    ``create_token`` is True — the mobile pairing token exist on disk, so a fresh
+    install on Windows/Mac/Linux works immediately and the mobile WebSocket
+    server authenticates against a *persisted* token rather than a memory-only
+    one.
+
+    ``create_token`` must be False for callers that do NOT own the mobile-server
+    launch (the desktop GUI on Linux, where a separate ``run_server.py`` process
+    is the single token creator) — otherwise two processes could race on a fresh
+    boot and persist *divergent* tokens, leaving the phone unable to connect
+    until the server is restarted. See the call sites in ``osia/main.py`` (GUI)
+    and ``osia/server/run_server.py`` (server).
+    """
+    try:
+        _ensure_config_dir()
+    except Exception as e:
+        print(f"[CONFIG] could not create config dir {CONFIG_DIR!r}: {e}")
+        return
+    # settings.json — persist the defaults so the file exists for the user to
+    # find/edit and so every component reads the same on-disk config.
+    if not os.path.exists(SETTINGS_FILE):
+        try:
+            save_settings(dict(DEFAULT_SETTINGS))
+            print("[CONFIG] Created settings.json from defaults (saved to disk)")
+        except Exception as e:
+            print(f"[CONFIG] could not create settings.json: {e}")
+    # Mobile pairing token — generate + persist BEFORE the WebSocket server
+    # starts so the server reads the same token the GUI displays. load_mobile_token()
+    # returns "" for both a missing and an empty/whitespace-only token file.
+    if create_token and not load_mobile_token():
+        try:
+            token = regenerate_mobile_token()
+            masked = (
+                f"{token[:4]}...{token[-4:]}" if len(token) >= 8 else "****"
+            )
+            print(
+                f"[CONFIG] Generated new mobile token: {masked} (saved to disk)"
+            )
+        except Exception as e:
+            print(f"[CONFIG] could not generate mobile token: {e}")
