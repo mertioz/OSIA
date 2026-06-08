@@ -43,7 +43,14 @@ psutil>=5.9.0                      # heartbeat metrics + Windows service control
 pynput>=1.7.6                      # global hotkeys (Ctrl+Space, Ctrl+Alt+O)
 pyperclip>=1.8.0                   # clipboard backend on Windows (get/set_clipboard)
 pyautogui>=0.9.54                  # native mouse/keyboard control on Windows/Mac (WOR-42 desktop_* tools; Linux uses ydotool/xdotool)
+Pillow>=10.0                       # screenshots + image handling (agent.py ImageGrab, desktop_control.py)
 tqdm>=4.65.0
+
+# ── Windows-only ─────────────────────────────────────────────────────────────
+# pywin32 ships Win32 API bindings for Windows service / process management.
+# Marker-guarded so `pip install -r requirements.txt` still works on Linux/Mac,
+# where the package is unavailable (cross-platform rule, WOR-11).
+pywin32>=306; sys_platform == "win32"
 
 # ── Optional ────────────────────────────────────────────────────────────────
 # NVIDIA GPU temperature in the heartbeat monitor; safely skipped at runtime
