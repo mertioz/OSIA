@@ -41,14 +41,24 @@ except Exception as _audio_exc:  # PortAudio missing / no audio device
 # optional dependency: degrade gracefully when it (or its onnxruntime/tflite
 # backend) is missing so a fresh install / Windows box without the package still
 # starts and stays reachable via the capsule / Ctrl+Alt+O (mirrors _AUDIO_OK).
+#
+# Importing openwakeword pulls in onnxruntime/tflite and costs ~1.2s on Windows.
+# It is only needed inside the wake-detection daemon loop, never on the GUI
+# startup path — so here we only CHECK availability with a cheap find_spec (no
+# import) and defer the actual ``from openwakeword.utils import AudioFeatures`` to
+# _get_feature_extractor(), which runs on the detector's background thread (WOR
+# perf fix). ``AudioFeatures`` stays None until first use; ``_WAKE_OK`` still
+# drives graceful degradation exactly as before.
+import importlib.util as _importlib_util
+
+AudioFeatures = None
 try:
-    from openwakeword.utils import AudioFeatures
-    _WAKE_OK = True
-except ImportError as _wake_exc:  # openwakeword not installed
-    AudioFeatures = None
+    _WAKE_OK = _importlib_util.find_spec("openwakeword") is not None
+except Exception:
     _WAKE_OK = False
+if not _WAKE_OK:
     print(
-        f"⚠️  [wake] openwakeword unavailable ({_wake_exc}); wake-word "
+        "⚠️  [wake] openwakeword unavailable; wake-word "
         "detection is disabled (use the capsule / Ctrl+Alt+O)."
     )
 
@@ -106,9 +116,29 @@ def _get_n_frames():
 
 
 def _get_feature_extractor():
-    """Lazy-load the openWakeWord AudioFeatures preprocessor."""
-    global _feature_extractor
+    """Lazy-load the openWakeWord AudioFeatures preprocessor.
+
+    The heavy ``openwakeword`` import (onnxruntime/tflite, ~1.2s) is performed
+    here, on first use, rather than at module import time — this method is only
+    ever called from the detector's background ``_listen_loop`` thread, so the
+    cost never lands on the GUI startup path.
+    """
+    global _feature_extractor, AudioFeatures, _WAKE_OK
     if _feature_extractor is None:
+        if AudioFeatures is None:
+            try:
+                from openwakeword.utils import AudioFeatures as _AudioFeatures
+            except Exception as exc:
+                # find_spec reported openwakeword present but its backend
+                # (onnxruntime/tflite) failed to load — degrade exactly as a
+                # missing package would, instead of crashing the listen thread.
+                _WAKE_OK = False
+                print(
+                    f"⚠️  [wake] openwakeword import failed ({exc}); wake-word "
+                    "detection disabled (use the capsule / Ctrl+Alt+O)."
+                )
+                return None
+            AudioFeatures = _AudioFeatures
         _feature_extractor = AudioFeatures(sr=SAMPLE_RATE, ncpu=1)
     return _feature_extractor
 
@@ -139,6 +169,10 @@ class WakeWordDetector:
                   "disabled; use the capsule or Ctrl+Alt+O to reach OSIA.")
             return
         preprocessor = _get_feature_extractor()
+        if preprocessor is None:
+            # openwakeword backend failed to load (see _get_feature_extractor) —
+            # bail cleanly; OSIA stays reachable via the capsule / Ctrl+Alt+O.
+            return
         verifier = _get_verifier()
         n_frames = _get_n_frames()
 

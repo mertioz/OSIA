@@ -83,10 +83,15 @@ def _win_proc_running(image: str) -> bool:
 
 
 def _win_port_open(port: int) -> bool:
-    """True if something accepts TCP connections on 127.0.0.1:port."""
+    """True if something accepts TCP connections on 127.0.0.1:port.
+
+    A local port either accepts or refuses near-instantly; the short timeout
+    only bounds the rare "filtered/no-response" case so a status probe can never
+    stall for a full second (WOR perf fix).
+    """
     import socket
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
             return True
     except Exception:
         return False

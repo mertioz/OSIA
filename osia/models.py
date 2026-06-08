@@ -8,8 +8,11 @@ remote model discovery.
 import re
 import subprocess
 import threading
+import time
 
 import requests
+
+from osia.perf import perf_timer
 
 # ── Provider configurations ───────────────────────────────────────────────
 
@@ -175,26 +178,50 @@ def vision_capable_models() -> list:
 
 # ── Local Ollama discovery ────────────────────────────────────────────────
 
+# ``ollama list`` spawns a subprocess that is slow on Windows (~30-50ms, and up
+# to the timeout if the ollama service is installed-but-hung). The GUI hits it on
+# many main-thread paths (model panel grid, AI-hierarchy rows, provider_for_model
+# → get_all_models, the settings _load_state pass), so a single settings open or
+# tab switch used to fan out into a dozen subprocess spawns. Cache the result for
+# a short TTL so those repeated calls are served from memory (WOR perf fix). The
+# timeout is also lowered (10s → 2s) so an unresponsive ollama can never stall
+# the UI for ten seconds.
+_OLLAMA_CACHE: list | None = None
+_OLLAMA_CACHE_AT: float = 0.0
+_OLLAMA_TTL = 30.0  # seconds
+
+
 def get_ollama_models() -> list:
-    """List locally-installed Ollama models."""
-    try:
-        result = subprocess.run(
-            ["ollama", "list"], capture_output=True, text=True, timeout=10
-        )
-        out = []
-        for line in result.stdout.strip().split("\n")[1:]:
-            parts = line.split()
-            if parts:
-                mid = parts[0]
-                out.append({
-                    "id": mid,
-                    "label": mid,
-                    "provider": "ollama",
-                    "tier": "light",
-                })
-        return out
-    except Exception:
-        return []
+    """List locally-installed Ollama models (cached for ``_OLLAMA_TTL`` seconds).
+
+    Returns a fresh copy each call so callers may mutate the result without
+    corrupting the cache.
+    """
+    global _OLLAMA_CACHE, _OLLAMA_CACHE_AT
+    now = time.monotonic()
+    if _OLLAMA_CACHE is not None and (now - _OLLAMA_CACHE_AT) < _OLLAMA_TTL:
+        return list(_OLLAMA_CACHE)
+    with perf_timer("models.get_ollama_models (ollama list subprocess)"):
+        try:
+            result = subprocess.run(
+                ["ollama", "list"], capture_output=True, text=True, timeout=2
+            )
+            out = []
+            for line in result.stdout.strip().split("\n")[1:]:
+                parts = line.split()
+                if parts:
+                    mid = parts[0]
+                    out.append({
+                        "id": mid,
+                        "label": mid,
+                        "provider": "ollama",
+                        "tier": "light",
+                    })
+        except Exception:
+            out = []
+    _OLLAMA_CACHE = out
+    _OLLAMA_CACHE_AT = now
+    return list(out)
 
 
 # ── Remote model discovery ────────────────────────────────────────────────

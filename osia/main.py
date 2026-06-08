@@ -266,11 +266,17 @@ def wake_mode():
     from PyQt6.QtCore import QObject, pyqtSignal
     from PyQt6.QtGui import QGuiApplication, QIcon
 
+    from osia.perf import perf_mark
+    perf_mark("wake_mode: enter")
+
     from osia.utils.assets import ICON_PATH, ensure_desktop_entry
     from osia.gui.dynamic_island import DynamicIsland
     from osia.gui.main_popup import MainPopup
     from osia.voice.wake import WakeWordDetector, verifier_available
-    from osia.voice.stt import listen_for_command
+    # NOTE: osia.voice.stt (faster_whisper, ~4.3s to import on Windows) is NOT
+    # imported here. listen_for_command is only used on the wake daemon thread —
+    # it is imported lazily inside handle_wake()'s process() worker so the heavy
+    # import never blocks GUI startup (WOR perf fix).
     from osia.voice.commands import is_new_chat_command
     from osia.voice.tts import (
         speak, speak_greeting_cached, speak_streaming, stop as tts_stop,
@@ -281,6 +287,7 @@ def wake_mode():
     from osia.models import discover_models_async
     from osia.cron import CronManager
     from osia.heartbeat import HeartbeatMonitor
+    perf_mark("wake_mode: heavy imports done")
 
     class Bridge(QObject):
         wake_detected = pyqtSignal()
@@ -320,6 +327,7 @@ def wake_mode():
 
     island = DynamicIsland()
     popup = MainPopup()
+    perf_mark("wake_mode: GUI constructed (island + popup)")
 
     # Toggle the popup when the island is clicked; the popup opens below
     # the capsule's current (possibly dragged) position.
@@ -461,6 +469,9 @@ def wake_mode():
 
         def process():
             try:
+                # Deferred heavy import (faster_whisper, ~4.3s on Windows). This
+                # runs on the wake daemon thread, never on the GUI startup path.
+                from osia.voice.stt import listen_for_command
                 # Optional spoken greeting before listening. When enabled, OSIA
                 # speaks the preconfigured text first, then starts capturing the
                 # command (speak() is synchronous, so the greeting finishes
@@ -743,17 +754,22 @@ def wake_mode():
 
     app.aboutToQuit.connect(on_quit)
 
+    perf_mark("wake_mode: entering app.exec() (GUI now interactive)")
     sys.exit(app.exec())
 
 
 def main():
     # One-time tool health check: logs which tool categories (bash, file
     # read, browser) are usable so missing dependencies show up at startup
-    # instead of failing mid-conversation. Must never block startup.
-    try:
-        verify_tools()
-    except Exception as e:
-        print(f"[OSIA] tool health check failed: {e}")
+    # instead of failing mid-conversation. It imports playwright and probes
+    # PATH, so it runs on a daemon thread to keep it off the GUI startup path
+    # (WOR perf fix) — it must never block startup.
+    def _health_check():
+        try:
+            verify_tools()
+        except Exception as e:
+            print(f"[OSIA] tool health check failed: {e}")
+    threading.Thread(target=_health_check, daemon=True).start()
 
     if "--text" in sys.argv:
         text_mode()

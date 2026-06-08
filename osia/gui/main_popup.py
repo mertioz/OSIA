@@ -20,6 +20,7 @@ GUI knowing about threads or persistence.
 
 import math
 import re
+import threading
 import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -56,6 +57,7 @@ from osia.utils.systemd_manager import (
 from osia.utils.assets import LOGO_PATH, autostart_enabled, set_autostart
 from osia import i18n
 from osia import timefmt
+from osia.perf import perf_timer
 
 # sip lets us detect widgets whose C++ side has already been destroyed
 # (accessing them raises RuntimeError otherwise). It ships with PyQt6 but
@@ -1343,6 +1345,10 @@ class _SettingsPanel(QWidget):
     # Emitted when the "Enable wake word" toggle changes. The host
     # (osia.main.wake_mode) connects it to the wake-word detector start/stop.
     wake_word_enabled_changed = pyqtSignal(bool)
+    # Carries startup-service probe results [(unit, state, enabled), ...] from
+    # the background probe thread back onto the GUI thread (WOR perf fix — the
+    # probe does slow tasklist/socket calls that must not block the UI).
+    _startup_status_ready = pyqtSignal(list)
 
     # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
     # last as an info-only row).
@@ -1411,6 +1417,10 @@ class _SettingsPanel(QWidget):
         self._liveapi_cards: dict[str, _ProviderCard] = {}
         self._mobile_token: str = ""
         self._startup_refresh_guard = False
+        # True while a background startup-status probe is in flight, so the 5s
+        # timer / repeated shows never pile up overlapping probe threads.
+        self._startup_probe_busy = False
+        self._startup_status_ready.connect(self._apply_startup_status)
         self._startup_rows: list[tuple[str, QLabel, QCheckBox]] = []
         # Guards the autostart toggle against re-entrant stateChanged while it is
         # being reverted (e.g. on an unsupported platform). See WOR-22.
@@ -3720,14 +3730,49 @@ class _SettingsPanel(QWidget):
         self._refresh_startup_status()
 
     def _refresh_startup_status(self) -> None:
+        """Probe each startup service OFF the UI thread.
+
+        ``get_service_status`` / ``is_service_enabled`` shell out to ``tasklist``
+        and open a socket to the mobile-server port; on Windows those can take
+        ~1s each and were called twice per row, freezing the settings panel for
+        ~2s on every open and again every 5s via the refresh timer. Run them on a
+        daemon thread and apply the result on the GUI thread via a queued signal
+        (WOR perf fix). A guard prevents overlapping probes from stacking up.
+        """
+        if self._startup_probe_busy:
+            return
+        units = [unit for unit, _dot, _toggle in self._startup_rows]
+        if not units:
+            return
+        self._startup_probe_busy = True
+
+        def _probe():
+            results = []
+            for unit in units:
+                try:
+                    state = get_service_status(unit)
+                    enabled = is_service_enabled(unit)
+                except Exception:
+                    state, enabled = "error", False
+                results.append((unit, state, enabled))
+            # Queued (cross-thread) signal — applied on the GUI thread.
+            self._startup_status_ready.emit(results)
+
+        threading.Thread(target=_probe, daemon=True).start()
+
+    def _apply_startup_status(self, results: list) -> None:
+        """Apply background startup-status probe results on the GUI thread."""
+        self._startup_probe_busy = False
+        status = {unit: (state, enabled) for (unit, state, enabled) in results}
         self._startup_refresh_guard = True
         for unit, dot, toggle in self._startup_rows:
-            state = get_service_status(unit)
+            if unit not in status:
+                continue
+            state, enabled = status[unit]
             if dot.property("state") != state:
                 dot.setProperty("state", state)
                 dot.style().unpolish(dot)
                 dot.style().polish(dot)
-            enabled = is_service_enabled(unit)
             if toggle.isChecked() != enabled:
                 toggle.setChecked(enabled)
         self._startup_refresh_guard = False
@@ -3764,8 +3809,10 @@ class _SettingsPanel(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self._load_state()
-        self._refresh_startup_status()
+        with perf_timer("settings.showEvent: _load_state"):
+            self._load_state()
+        with perf_timer("settings.showEvent: _refresh_startup_status (async)"):
+            self._refresh_startup_status()
         self._startup_timer.start()
 
     def hideEvent(self, event):
@@ -4516,17 +4563,18 @@ class MainPopup(QWidget):
                 btn.setToolTip(i18n.t(tip_key))
 
     def _on_nav_clicked(self, page_idx: int) -> None:
-        # Clicking the active nav button returns to the chat.
-        if self._stack.currentIndex() == page_idx:
-            self.show_chat()
-            return
-        self._stack.setCurrentIndex(page_idx)
-        if page_idx == self.PAGE_CONVS:
-            self._convs.refresh()
-        elif page_idx == self.PAGE_MODELS:
-            self._models.refresh()
-        elif page_idx == self.PAGE_OSIA:
-            self._osia.refresh()
+        with perf_timer(f"nav -> page {page_idx}"):
+            # Clicking the active nav button returns to the chat.
+            if self._stack.currentIndex() == page_idx:
+                self.show_chat()
+                return
+            self._stack.setCurrentIndex(page_idx)
+            if page_idx == self.PAGE_CONVS:
+                self._convs.refresh()
+            elif page_idx == self.PAGE_MODELS:
+                self._models.refresh()
+            elif page_idx == self.PAGE_OSIA:
+                self._osia.refresh()
 
     def _on_new_conv(self) -> None:
         self.new_conversation.emit()
