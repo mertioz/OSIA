@@ -140,14 +140,27 @@ class DynamicIsland(QWidget):
         # at load (the idle paint runs at 30 FPS). A null pixmap — asset
         # missing or osia not importable in the standalone self-test — is
         # simply skipped while painting, so the wordmark still shows.
+        # ``_logo_src`` is the full-resolution master; every on-screen size is
+        # scaled from it so the result is crisp. ``_logo`` is the idle-row logo
+        # cached at the current device-pixel ratio (DPR), rebuilt by
+        # ``_ensure_logo_dpr`` if the capsule moves to a screen with a different
+        # DPR — this is what keeps the logo sharp on high-DPI / fractionally
+        # scaled Windows displays (WOR-11). ``_circle_logo``/``_circle_key``
+        # memoise the per-size scaling done for the compact circle shape so the
+        # 30 FPS idle paint never re-scales the master every frame. A null master
+        # (asset missing / standalone self-test) is simply skipped while
+        # painting, so the wordmark still shows.
+        self._dpr = 1.0
+        self._logo_src = QPixmap()
         self._logo = QPixmap()
+        self._circle_logo = QPixmap()
+        self._circle_key = None
         try:
             from osia.utils.assets import LOGO_PATH
-            logo = QPixmap(LOGO_PATH)
-            if not logo.isNull():
-                self._logo = logo.scaledToHeight(
-                    IDLE_LOGO_H, Qt.TransformationMode.SmoothTransformation
-                )
+            src = QPixmap(LOGO_PATH)
+            if not src.isNull():
+                self._logo_src = src
+                self._logo = self._scaled_logo(IDLE_LOGO_H, self._dpr)
         except Exception:
             pass
 
@@ -567,9 +580,37 @@ class DynamicIsland(QWidget):
         path.addRoundedRect(rect, radius, radius)
         return path
 
+    def _scaled_logo(self, logical_h: float, dpr: float) -> QPixmap:
+        """The logo scaled to ``logical_h`` logical px for a ``dpr`` display.
+
+        Scales from the full-resolution master to ``logical_h·dpr`` physical px
+        and tags the pixmap with ``dpr`` so QPainter draws it at ``logical_h``
+        logical px from native-resolution pixels — crisp on high-DPI Windows
+        displays. ``dpr == 1.0`` reproduces the previous behaviour exactly.
+        """
+        pm = self._logo_src.scaledToHeight(
+            max(1, round(logical_h * dpr)),
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        pm.setDevicePixelRatio(dpr)
+        return pm
+
+    def _ensure_logo_dpr(self, dpr: float) -> None:
+        """Rebuild the cached idle-row logo when the display's DPR changes."""
+        if dpr <= 0:
+            dpr = 1.0
+        if dpr != self._dpr and not self._logo_src.isNull():
+            self._dpr = dpr
+            self._logo = self._scaled_logo(IDLE_LOGO_H, dpr)
+            self._circle_key = None  # force the circle logo to re-scale too
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Keep the logo cached at the current screen's DPR so it stays sharp if
+        # the capsule is dragged to a monitor with a different scale factor.
+        self._ensure_logo_dpr(self.devicePixelRatioF())
 
         # Background capsule
         path = self._capsule_path()
@@ -643,14 +684,21 @@ class DynamicIsland(QWidget):
 
         p.save()
         p.setOpacity(fade)
-        if not self._logo.isNull():
+        if not self._logo_src.isNull():
             size = int(rect.height() * 0.42)
-            logo = self._logo.scaledToHeight(
-                max(1, size), Qt.TransformationMode.SmoothTransformation
-            )
+            key = (size, self._dpr)
+            if key != self._circle_key:
+                # Re-scale from the master only when the target size or DPR
+                # changes (steady state hits the cache every frame).
+                self._circle_logo = self._scaled_logo(size, self._dpr)
+                self._circle_key = key
+            logo = self._circle_logo
+            # Device-independent dims for positioning (the pixmap carries its DPR).
+            lw = logo.width() / self._dpr
+            lh = logo.height() / self._dpr
             p.drawPixmap(
-                int(cx - logo.width() / 2.0),
-                int(cy - logo.height() - 1),
+                int(cx - lw / 2.0),
+                int(cy - lh - 1),
                 logo,
             )
         self._draw_mini_mic(p, cx, cy + rect.height() * 0.20)
@@ -695,7 +743,9 @@ class DynamicIsland(QWidget):
 
         # Logo (left) + wordmark (right) laid out as a single group centred in
         # the capsule. The logo is dropped from the layout when unavailable.
-        logo_w = self._logo.width() if not self._logo.isNull() else 0
+        # Device-independent width/height (the pixmap carries its DPR), so the
+        # layout is identical at dpr == 1.0 and correct on high-DPI displays.
+        logo_w = (self._logo.width() / self._dpr) if not self._logo.isNull() else 0
         gap = IDLE_LOGO_GAP if logo_w else 0
         x = rect.center().x() - (logo_w + gap + text_w) / 2.0
 
@@ -704,7 +754,8 @@ class DynamicIsland(QWidget):
         p.setOpacity(fade)
         if logo_w:
             p.drawPixmap(
-                int(round(x)), int(round(cy - self._logo.height() / 2.0)),
+                int(round(x)),
+                int(round(cy - (self._logo.height() / self._dpr) / 2.0)),
                 self._logo,
             )
             x += logo_w + gap

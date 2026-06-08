@@ -139,7 +139,44 @@ def _get_feature_extractor():
                 )
                 return None
             AudioFeatures = _AudioFeatures
-        _feature_extractor = AudioFeatures(sr=SAMPLE_RATE, ncpu=1)
+        # Force the ONNX backend explicitly (tflite's runtime ships no Windows
+        # wheels; onnxruntime does, on CPUExecutionProvider — no CUDA needed),
+        # and make sure openWakeWord's feature models are actually present.
+        # openWakeWord ships WITHOUT its melspectrogram/embedding models and
+        # fetches them on first use — a fresh install (Windows especially) has
+        # an empty resources/ dir, so the first AudioFeatures(onnx) raises
+        # "melspectrogram.onnx ... File doesn't exist" and wake-word detection
+        # silently never works. Self-heal: download the feature + VAD models once
+        # (a non-matching model name skips the unused pretrained wakeword models —
+        # OSIA classifies with its own verifier) and retry. (WOR-11)
+        def _build_audiofeatures():
+            return AudioFeatures(
+                sr=SAMPLE_RATE, ncpu=1, inference_framework="onnx",
+            )
+
+        try:
+            _feature_extractor = _build_audiofeatures()
+        except Exception as first_exc:
+            print(
+                f"ℹ️  [wake] openWakeWord feature models not found ({first_exc}); "
+                "downloading them now (one-time, requires internet)…"
+            )
+            try:
+                from openwakeword.utils import download_models
+                download_models(model_names=["_osia_features_only"])
+                _feature_extractor = _build_audiofeatures()
+            except Exception as exc:
+                _WAKE_OK = False
+                print(
+                    f"⚠️  [wake] could not download/initialise the openWakeWord "
+                    f"ONNX feature extractor ({exc}); wake-word detection "
+                    "disabled (use the capsule / Ctrl+Alt+O). Check your internet "
+                    "connection and that 'onnxruntime' is installed."
+                )
+                return None
+        provider = getattr(_feature_extractor, "onnx_execution_provider", "?")
+        print(f"👂 [wake] openWakeWord feature extractor ready "
+              f"(ONNX provider: {provider}).")
     return _feature_extractor
 
 
@@ -189,12 +226,43 @@ class WakeWordDetector:
         # anywhere in the ~1.28s the verifier is scoring — see ENERGY_GATE_RMS.
         energy_window = deque(maxlen=n_frames)
 
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="int16",
-            blocksize=CHUNK_SIZE,
-        ) as stream:
+        # Log the input device so a silent wake-word failure on Windows is
+        # diagnosable (no mic, wrong default device, or blocked by Windows
+        # microphone privacy settings). Never fatal — only informational.
+        try:
+            info = sd.query_devices(kind="input")
+            name = info.get("name", "?") if isinstance(info, dict) else "?"
+            print(f"🎙  [wake] using audio input device: {name}")
+        except Exception as exc:
+            print(
+                f"⚠️  [wake] no default audio input device ({exc}); wake-word "
+                "detection will not work. On Windows, connect a microphone and "
+                "allow microphone access in Settings ▸ Privacy & security ▸ "
+                "Microphone."
+            )
+
+        # Opening the stream is the step that fails on a fresh Windows box (no
+        # mic, mic blocked by privacy settings, or held exclusively by another
+        # app). Catch it here with a clear, actionable message instead of letting
+        # an uncaught PortAudioError kill the detector thread silently. (WOR-11)
+        try:
+            _stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+                blocksize=CHUNK_SIZE,
+            )
+        except Exception as exc:
+            print(
+                f"⚠️  [wake] could not open the microphone ({exc}); wake-word "
+                "detection disabled. On Windows, check Settings ▸ Privacy & "
+                "security ▸ Microphone (allow desktop apps to access the mic), "
+                "make sure a microphone is connected, and that no other app is "
+                "using it exclusively. Use the capsule / Ctrl+Alt+O to reach OSIA."
+            )
+            return
+
+        with _stream as stream:
             while self._running:
                 try:
                     audio_chunk, _ = stream.read(CHUNK_SIZE)

@@ -104,12 +104,33 @@ def _win_python() -> str:
 
 
 def _win_start_server() -> bool:
-    """Launch the OSIA mobile server (run_server.py) as a detached process."""
+    """Launch the OSIA mobile server (run_server.py) as a detached process.
+
+    The server runs under the windowless ``pythonw.exe`` (no console flashes),
+    which means it has NO real stdout/stderr — ``sys.stdout``/``sys.stderr`` are
+    ``None``. The server writes on startup (uvicorn's logging plus torch/HF
+    import warnings), so without redirecting those streams the very first write
+    raises and the process dies at ~1s, never binding port 8765 — the bug behind
+    "Serveur mobile: éteint" on Windows. Redirect both to a log file in the temp
+    dir so the server starts cleanly AND its output stays diagnosable; fall back
+    to DEVNULL if the log can't be opened. (WOR-11 Windows server fix.)
+    """
+    import tempfile
     run_server = _REPO_ROOT / "osia" / "server" / "run_server.py"
+    log_target = subprocess.DEVNULL
+    try:
+        log_target = open(
+            Path(tempfile.gettempdir()) / "osia_server.log",
+            "a", encoding="utf-8", errors="replace",
+        )
+    except Exception:
+        log_target = subprocess.DEVNULL
     try:
         subprocess.Popen(
             [_win_python(), str(run_server)],
             cwd=str(_REPO_ROOT),
+            stdout=log_target,
+            stderr=subprocess.STDOUT,
             creationflags=(
                 getattr(subprocess, "DETACHED_PROCESS", 0)
                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -119,6 +140,14 @@ def _win_start_server() -> bool:
     except Exception as e:
         print(f"[win-service] failed to start server: {e}")
         return False
+    finally:
+        # The child inherited its own copy of the handle; close the parent's so
+        # we don't leak a file handle for the GUI process's lifetime.
+        if log_target is not subprocess.DEVNULL:
+            try:
+                log_target.close()
+            except Exception:
+                pass
 
 
 def _win_stop_server() -> bool:

@@ -65,6 +65,38 @@ def _notify_mobile_new_chat() -> None:
         print(f"[WOR-10] mobile new_chat notify skipped: {e}")
 
 
+def _ensure_mobile_server_windows() -> None:
+    """On Windows, make sure the OSIA mobile server (run_server.py) is running.
+
+    Linux runs the mobile server as a systemd unit (``osia-server.service``);
+    Windows has no systemd, and the login-autostart entry only launches
+    ``main.py --wake`` — so without this the server never comes up on a normal
+    boot and the Settings panel reports it as "off" (WOR-11 Windows bug fix).
+
+    Idempotent and safe: it first checks whether port 8765 is already serving
+    (e.g. a server from a previous launch) and starts one only when none is
+    running, so it can never double-bind the port. Delegates the actual launch
+    to ``systemd_manager.enable_service`` (the same detached-process path the
+    Settings toggle uses), so the toggle and this autostart stay consistent.
+    No-op on every non-Windows platform.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        from osia.utils.systemd_manager import (
+            get_service_status, enable_service,
+        )
+        if get_service_status("osia-server.service") == "running":
+            print("[OSIA] mobile server already running (Windows).")
+            return
+        if enable_service("osia-server.service"):
+            print("[OSIA] mobile server started (Windows).")
+        else:
+            print("[OSIA] could not start the mobile server (Windows).")
+    except Exception as e:
+        print(f"[OSIA] mobile server autostart skipped: {e}")
+
+
 def _persist_agent_delta(conv_id, agent, prev_history_len):
     """Persist messages added to ``agent.messages`` during the most recent
     ``agent.run()`` call. ``prev_history_len`` is the length of the
@@ -263,7 +295,7 @@ def wake_mode():
     available.
     """
     from PyQt6.QtWidgets import QApplication
-    from PyQt6.QtCore import QObject, pyqtSignal
+    from PyQt6.QtCore import QObject, pyqtSignal, Qt
     from PyQt6.QtGui import QGuiApplication, QIcon
 
     from osia.perf import perf_mark
@@ -320,10 +352,30 @@ def wake_mode():
     ensure_desktop_entry()
     QGuiApplication.setDesktopFileName("osia")
 
+    # HiDPI: crisp logo/icon rendering on Windows fractional-scaling displays
+    # (125%/150%/175%). Qt6 always enables high-DPI scaling and DPI-aware pixmaps
+    # (the old Qt.AA_EnableHighDpiScaling / AA_UseHighDpiPixmaps attributes are
+    # no-ops) and already defaults to PassThrough rounding, so the actual fix is
+    # the per-pixmap setDevicePixelRatio scaling in main_popup.py /
+    # dynamic_island.py (which renders the logo at native resolution). We pin
+    # PassThrough explicitly to document the fractional-scale rounding those
+    # DPR-tagged pixmaps assume — it equals the Qt6 default, so it is a no-op on
+    # every platform today (integer-scale Linux/Mac included) and changes no
+    # behaviour. Must run before the QApplication is constructed. (WOR-11.)
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+
     app = QApplication(sys.argv)
     app.setApplicationName("OSIA")
     app.setApplicationDisplayName("OSIA")
     app.setWindowIcon(QIcon(ICON_PATH))
+
+    # WOR-11 (Windows): bring up the mobile server alongside the GUI. On Linux a
+    # systemd unit owns it; on Windows main.py does, so it also starts on the
+    # login-autostart path (which only runs main.py). Idempotent + off-thread so
+    # it never blocks GUI startup. No-op on non-Windows platforms.
+    threading.Thread(target=_ensure_mobile_server_windows, daemon=True).start()
 
     island = DynamicIsland()
     popup = MainPopup()

@@ -4385,11 +4385,18 @@ class MainPopup(QWidget):
         logo.setObjectName("popupLogo")
         logo_pix = QPixmap(LOGO_PATH)
         if not logo_pix.isNull():
-            logo.setPixmap(
-                logo_pix.scaledToHeight(
-                    44, Qt.TransformationMode.SmoothTransformation
-                )
+            # Render at the screen's device-pixel ratio so the logo stays crisp
+            # on high-DPI / fractionally-scaled Windows displays: scale to
+            # 44·dpr physical px and tag the pixmap with that ratio, so Qt shows
+            # it at 44 logical px from native-resolution pixels (no upscale
+            # blur). dpr == 1.0 reproduces the previous result exactly.
+            dpr = logo.devicePixelRatioF() or 1.0
+            scaled = logo_pix.scaledToHeight(
+                max(1, round(44 * dpr)),
+                Qt.TransformationMode.SmoothTransformation,
             )
+            scaled.setDevicePixelRatio(dpr)
+            logo.setPixmap(scaled)
 
         close_btn = QPushButton("✕")
         close_btn.setObjectName("closeBtn")
