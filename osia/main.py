@@ -82,6 +82,20 @@ def _ensure_mobile_server_windows() -> None:
     """
     if sys.platform != "win32":
         return
+    # Persist the mobile pairing token to disk BEFORE launching the server, so
+    # the detached server process reads an existing token instead of generating
+    # a fresh one on first run (WOR-11 Windows: on a clean start the token must
+    # survive restarts AND match the one the server uses). load_mobile_token()
+    # returns "" when no token file exists yet; regenerate_mobile_token() then
+    # creates one and writes config/mobile_token.txt. Idempotent (a no-op load
+    # once the file exists) and best-effort — it must never block server startup.
+    try:
+        from osia.config import load_mobile_token, regenerate_mobile_token
+        if not load_mobile_token():
+            regenerate_mobile_token()
+            print("[OSIA] mobile token generated and saved (Windows).")
+    except Exception as e:
+        print(f"[OSIA] mobile token ensure skipped: {e}")
     try:
         from osia.utils.systemd_manager import (
             get_service_status, enable_service,
