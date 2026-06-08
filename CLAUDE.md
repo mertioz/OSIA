@@ -14,6 +14,52 @@
 - `MAX_RESPONSE_TOKENS` was intentionally **removed** (WOR-28) — do NOT reintroduce it (providers apply their native limits). See "VALEURS CRITIQUES ET DÉCISIONS ARCHITECTURALES" below.
 - Provider config in `osia/models.py` (base URLs, model IDs)
 
+## PROTOCOLE QUALITÉ — NE PAS CASSER L'EXISTANT EN CORRIGEANT
+
+> Section **obligatoire**. Ces règles s'appliquent à **CHAQUE tâche**, sans
+> exception, en plus des sections « Before ANY change » / « When fixing a bug » /
+> « After every change » ci-dessous. **Principe directeur : la qualité prime sur
+> la vitesse. Un fix qui crée une régression ailleurs est un échec, même s'il
+> résout le problème initial.**
+
+1. **Périmètre minimal** — ne modifier **QUE** ce qui est strictement nécessaire
+   pour la tâche en cours. **Aucun** refactoring hors-scope, **aucune**
+   « amélioration » non demandée. Ne pas toucher aux chemins de code voisins.
+
+2. **Identifier les call sites AVANT de modifier** — avant de changer une
+   fonction, lister **tous** ses appelants (`grep` sur le nom de la fonction /
+   symbole) et vérifier que le changement n'en casse aucun. **Si la signature
+   change, mettre à jour TOUS les appelants** dans le même changement.
+
+3. **Vérifier les features adjacentes après chaque fix** — après une correction,
+   vérifier que les fonctionnalités liées (celles qui partagent le **même
+   fichier / module / flux**) fonctionnent toujours. **Lister dans le résumé**
+   ce qui a été vérifié.
+
+4. **`py_compile` obligatoire** — exécuter `python -m py_compile` sur **tous**
+   les fichiers modifiés **+ un test d'import** du / des module(s) touché(s)
+   (vérifier l'absence d'**import circulaire**) avant de considérer la tâche
+   terminée.
+
+5. **Revue adversariale pour les changements non triviaux** — lancer une revue
+   **multi-angles** (correctness / régression / conformité CLAUDE.md), vérifier
+   **chaque finding indépendamment**, et corriger les vrais problèmes.
+
+6. **Préserver les contrats existants** — les valeurs et mécanismes protégés ne
+   doivent **JAMAIS** régresser : `POPUP_W` (= `520`), la résolution `CONFIG_DIR`
+   (`_resolve_config_dir` + import dans `server.py`), l'**absence** de
+   `MAX_RESPONSE_TOKENS`, le système `key_chain` (fallback de clés), le parser de
+   tool-calls (`_extract_tool_calls` & co.), l'ordre du pipeline
+   `strip_raw_tool_tags` / `strip_reasoning_blocks` (parse avant strip),
+   `_AntiLoopGuard`, le **protocole WebSocket** (`osia/server/server.py`), le
+   **contrat anti-hallucination `ERROR:`**, et les gardes `sys.platform`. Voir
+   « CRITICAL » ci-dessus et « VALEURS CRITIQUES » ci-dessous.
+
+7. **Résumé précis et complet** — lister dans le résumé final : **(a)** les
+   fichiers modifiés, **(b)** ce qui a été vérifié (call sites, `py_compile`,
+   import, features adjacentes), et **(c)** tout effet de bord potentiel
+   identifié.
+
 ## VALEURS CRITIQUES ET DÉCISIONS ARCHITECTURALES
 
 > Valeurs et choix **délibérés** (souvent WOR-28) — à ne PAS « corriger »,
@@ -67,6 +113,22 @@
   `POPUP_W = 520`, la résolution `CONFIG_DIR` (`_resolve_config_dir` + import dans
   `server.py`), l'**absence** de `MAX_RESPONSE_TOKENS`, et les gardes
   `sys.platform` (`xcb`, `X11BypassWindowManagerHint`).
+
+- **Système de fallback de clés universel (`key_chain`)** —
+  `osia/utils/key_chain.py` est la **source unique de vérité** pour la rotation
+  des clés API. Règles à **ne JAMAIS casser** :
+  - Tout **NOUVEAU** call site API (vision, TTS, STT, Live API, futurs providers)
+    **DOIT** utiliser `with_key_rotation()` ou `iter_keys()` de `key_chain` —
+    **jamais** un appel direct avec une seule clé via `get_api_key()`.
+  - La rotation se déclenche **uniquement** sur erreurs techniques
+    (`429`/`5xx`/`401`/`403`/`408`/timeout/connection) — **jamais** sur les
+    erreurs de contenu (`400`).
+  - `_provider_key_chain` dans `agent.py` **délègue** à `key_chain.iter_keys` —
+    **ne pas dupliquer** la logique.
+  - Les logs de rotation **masquent** les clés (4 derniers chars uniquement).
+  - **Call sites protégés actuellement** : `agent.py` (chat principal +
+    `_describe_screenshot`), `vision_router.py`, `voice/tts.py`, `voice/stt.py`,
+    `server/server.py` (TTS mp3), `voice/live_api.py`.
 
 ## Cross-platform rules (WOR-11) — Linux / Windows / Mac:
 - **Cross-platform paths only.** Resolve the project root dynamically with
