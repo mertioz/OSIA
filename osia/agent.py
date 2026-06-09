@@ -114,7 +114,7 @@ Browser (drives a REAL visible browser — Chromium/Brave via CDP, or Firefox vi
 - open_browser: Open a SPECIFIC browser by name (firefox, chrome, chromium, opera, edge, brave), optionally at a URL. Use when the user asks for a particular browser ("open Firefox"). Firefox is FULLY supported for automation via WebDriver BiDi: after opening it, all browser tools (navigate, click, fill, type_text, read_page, screenshots, …) work inside Firefox exactly like Brave/Chrome. Usage: {"tool": "open_browser", "name": "firefox", "url": "<optional_url>"}
 
 Desktop automation (control NATIVE desktop apps — file managers, settings panes, native dialogs, games — by looking at the screen and using the REAL mouse and keyboard. These are for windows that are NOT web pages; for anything inside a web page, PREFER the Browser tools above):
-- desktop_click: Look at the screen and click a UI element you describe in plain words. OSIA captures the screen, the vision model locates the element, then clicks its center. Usage: {"tool": "desktop_click", "description": "the Create button"}
+- desktop_click: Look at the screen and click a UI element you describe in plain words. OSIA captures the screen, the vision model locates the element, then clicks its center. Usage: {"tool": "desktop_click", "description": "the Create button"} — After a desktop_click, read the BEFORE/AFTER descriptions in the result carefully. If AFTER does not show the expected result (e.g. the file selected/opened), tell the user the click may have missed and offer to retry.
 - desktop_type: Type a string of text into the currently focused field via the real keyboard. Usage: {"tool": "desktop_type", "text": "<text>"}
 - desktop_press: Press a single key or a shortcut system-wide on the focused window (Enter, Escape, Tab, "ctrl+s", "alt+F4", …). Usage: {"tool": "desktop_press", "key": "Enter"}
 - desktop_scroll: Scroll the active window in a direction by a number of notches. Usage: {"tool": "desktop_scroll", "direction": "down", "amount": 3}
@@ -190,7 +190,7 @@ Navigateur (pilote le VRAI navigateur visible — Chromium/Brave via CDP, ou Fir
 - open_browser : Ouvrir un navigateur PRÉCIS par son nom (firefox, chrome, chromium, opera, edge, brave), éventuellement sur une URL. À utiliser quand l'utilisateur demande un navigateur particulier (« ouvre Firefox »). Firefox est ENTIÈREMENT pris en charge pour l'automatisation via WebDriver BiDi : après l'avoir ouvert, tous les outils navigateur (navigate, click, fill, type_text, read_page, captures d'écran…) fonctionnent dans Firefox exactement comme avec Brave/Chrome. Usage : {"tool": "open_browser", "name": "firefox", "url": "<url_optionnelle>"}
 
 Automatisation du bureau (piloter les applis NATIVES — gestionnaires de fichiers, paramètres, boîtes de dialogue natives, jeux — en regardant l'écran et en utilisant la VRAIE souris et le VRAI clavier. Ces outils sont pour les fenêtres qui ne sont PAS des pages web ; pour tout ce qui est dans une page web, PRÉFÈRE les outils Navigateur ci-dessus) :
-- desktop_click : Regarder l'écran et cliquer sur un élément d'interface que tu décris en mots. OSIA capture l'écran, le modèle de vision localise l'élément, puis clique en son centre. Usage : {"tool": "desktop_click", "description": "le bouton Créer"}
+- desktop_click : Regarder l'écran et cliquer sur un élément d'interface que tu décris en mots. OSIA capture l'écran, le modèle de vision localise l'élément, puis clique en son centre. Usage : {"tool": "desktop_click", "description": "le bouton Créer"} — Après un desktop_click, lis attentivement les descriptions BEFORE/AFTER du résultat. Si AFTER ne montre pas le résultat attendu (par ex. le fichier sélectionné/ouvert), dis à l'utilisateur que le clic a peut-être raté et propose de réessayer.
 - desktop_type : Taper une chaîne de texte dans le champ actuellement focalisé via le vrai clavier. Usage : {"tool": "desktop_type", "text": "<texte>"}
 - desktop_press : Appuyer sur une touche ou un raccourci au niveau système sur la fenêtre active (Enter, Escape, Tab, « ctrl+s », « alt+F4 »…). Usage : {"tool": "desktop_press", "key": "Enter"}
 - desktop_scroll : Faire défiler la fenêtre active dans une direction d'un certain nombre de crans. Usage : {"tool": "desktop_scroll", "direction": "down", "amount": 3}
@@ -1867,7 +1867,8 @@ def tool_desktop_click(description: str) -> str:
     # so a no-op click is never mistaken for success.
     if before_full and after_full and _descriptions_nearly_identical(before_full, after_full):
         lines.append(
-            "WARNING: the screen did not visibly change — the click may have missed."
+            "WARNING: the screen did not visibly change after the click — "
+            "the target may have been missed."
         )
     return "\n".join(lines)
 
