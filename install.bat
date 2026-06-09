@@ -10,6 +10,7 @@ REM   * migrates any existing config\ into %USERPROFILE%\.osia and ensures a
 REM     mobile pairing token exists
 REM   * registers the mobile server + Cloudflare tunnel as per-user Scheduled
 REM     Tasks (start at login, independent of the GUI) and starts them now
+REM   * registers the OSIA GUI to launch at login (per-user HKCU Run key)
 REM ===========================================================================
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
@@ -42,14 +43,14 @@ if errorlevel 1 (
     python --version
     goto :fail
 )
-echo [1/6] Python detecte :
+echo [1/7] Python detecte :
 python --version
 
 REM --- 2. Virtual environment ------------------------------------------------
 if exist "%VENV_PY%" (
-    echo [2/6] venv deja present - reutilisation.
+    echo [2/7] venv deja present - reutilisation.
 ) else (
-    echo [2/6] Creation du venv...
+    echo [2/7] Creation du venv...
     python -m venv "%VENV_DIR%"
     if errorlevel 1 (
         echo [ERREUR] Echec de la creation du venv.
@@ -58,7 +59,7 @@ if exist "%VENV_PY%" (
 )
 
 REM --- 3. Dependencies -------------------------------------------------------
-echo [3/6] Installation des dependances ^(peut prendre plusieurs minutes^)...
+echo [3/7] Installation des dependances ^(peut prendre plusieurs minutes^)...
 "%VENV_PY%" -m pip install --upgrade pip
 "%VENV_PY%" -m pip install -r "%PROJECT_DIR%requirements.txt"
 if errorlevel 1 (
@@ -69,9 +70,9 @@ if errorlevel 1 (
 REM --- 4. cloudflared.exe ----------------------------------------------------
 if not exist "%WINDOWS_DIR%" mkdir "%WINDOWS_DIR%"
 if exist "%CLOUDFLARED%" (
-    echo [4/6] cloudflared.exe deja present.
+    echo [4/7] cloudflared.exe deja present.
 ) else (
-    echo [4/6] Telechargement de cloudflared.exe...
+    echo [4/7] Telechargement de cloudflared.exe...
     REM Paths/URL are passed via env vars so apostrophes in them cannot break
     REM the single-quoted PowerShell string.
     powershell -NoProfile -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri $env:CF_URL -OutFile $env:CLOUDFLARED } catch { Write-Host $_.Exception.Message; exit 1 }"
@@ -81,7 +82,7 @@ if exist "%CLOUDFLARED%" (
 )
 
 REM --- 5. Config dir (%USERPROFILE%\.osia) + mobile token --------------------
-echo [5/6] Configuration ^(%OSIA_HOME%^)...
+echo [5/7] Configuration ^(%OSIA_HOME%^)...
 if not exist "%OSIA_HOME%" mkdir "%OSIA_HOME%"
 REM Migrate any existing repo config\ files without overwriting newer ones.
 for %%F in (api_keys.json settings.json mobile_token.txt) do (
@@ -97,9 +98,24 @@ REM Register the mobile server + Cloudflare tunnel as per-user Scheduled Tasks
 REM that start at login and run independently of the OSIA GUI (the Windows
 REM equivalent of the Linux osia-server / osia-tunnel systemd units). They are
 REM also started now so a fresh install works without a re-login. Needs no admin.
-echo [6/6] Enregistrement des services en arriere-plan ^(serveur mobile + tunnel^)...
+echo [6/7] Enregistrement des services en arriere-plan ^(serveur mobile + tunnel^)...
 "%VENV_PY%" -c "from osia.utils.systemd_manager import install_windows_services; print('Services:', 'OK' if install_windows_services() else 'partiel')"
 set "PYTHONPATH="
+
+REM --- 7. GUI autostart at login (per-user HKCU Run key) ---------------------
+REM Launch the OSIA interface automatically at login, after the server/tunnel
+REM tasks. Per-user (HKCU) so it needs no admin. The value is kept identical to
+REM osia.utils.assets._windows_autostart_command() - the single source of truth
+REM the Settings toggle "Lancer OSIA au demarrage" reads via autostart_enabled()
+REM and writes via set_autostart() - so install.bat seeds it and the GUI toggle
+REM can later add/remove it without drift.
+echo [7/7] Activation du lancement d'OSIA au demarrage...
+set "VENV_PYW=%VENV_DIR%\Scripts\pythonw.exe"
+set "MAIN_PY=%PROJECT_DIR%osia\main.py"
+reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "OSIA" /t REG_SZ /d "\"%VENV_PYW%\" \"%MAIN_PY%\" --wake" /f >nul
+if errorlevel 1 (
+    echo [ATTENTION] Lancement au demarrage non active - vous pourrez l'activer depuis Parametres ^> Demarrage.
+)
 
 echo.
 echo OSIA installe avec succes. Lancez start.bat pour demarrer.

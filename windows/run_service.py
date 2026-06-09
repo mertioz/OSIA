@@ -3,7 +3,7 @@
 
 This is the Windows equivalent of the Linux ``osia-server.service`` /
 ``osia-tunnel.service`` systemd units. It is launched by the per-user Scheduled
-Tasks ("OSIA Mobile Server" / "OSIA Cloudflare Tunnel") that ``install.bat`` /
+Tasks ("OSIA Server" / "OSIA Tunnel") that ``install.bat`` /
 ``osia.utils.systemd_manager.install_windows_services`` register with an AtLogOn
 trigger. As a result the services:
 

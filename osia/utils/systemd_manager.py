@@ -9,8 +9,8 @@ Windows: there is no systemd. The two units the GUI knows about map to per-user
 **Scheduled Tasks** that run independently of the OSIA GUI process — the Windows
 equivalent of the Linux units:
 
-  * ``osia-tunnel.service`` -> task "OSIA Cloudflare Tunnel"
-  * ``osia-server.service`` -> task "OSIA Mobile Server"
+  * ``osia-tunnel.service`` -> task "OSIA Tunnel"
+  * ``osia-server.service`` -> task "OSIA Server"
 
 Each task triggers AtLogOn and runs ``windows\\run_service.py {tunnel|server}``
 (a windowless supervisor that keeps the child alive, mirroring systemd
@@ -50,9 +50,28 @@ _UNIT_KIND = {
 }
 
 # Scheduled Task display names (the Windows equivalent of the systemd units).
+# Short, branded names so they read clearly in Task Scheduler and the Windows
+# "Startup apps" list.
 _TASK_NAME = {
-    "tunnel": "OSIA Cloudflare Tunnel",
-    "server": "OSIA Mobile Server",
+    "tunnel": "OSIA Tunnel",
+    "server": "OSIA Server",
+}
+
+# Human-readable task descriptions (shown in Task Scheduler's "Description"
+# field). Task Scheduler 2.0 has no per-task icon property — the only branding
+# levers are the task name (above) and this description; the icon shown in
+# "Startup apps" comes from the launched executable, not the task itself.
+_TASK_DESC = {
+    "server": "OSIA Server — Mobile WebSocket Server",
+    "tunnel": "OSIA Tunnel — Cloudflare Tunnel",
+}
+
+# Display names used by earlier WOR-47 iterations. Removed on (re)registration so
+# an upgrade never leaves an orphaned AtLogOn task that would double-start the
+# service at the next login.
+_LEGACY_TASK_NAMES = {
+    "server": ("OSIA Mobile Server",),
+    "tunnel": ("OSIA Cloudflare Tunnel",),
 }
 
 
@@ -173,11 +192,16 @@ def _win_register_task(kind: str) -> bool:
     AtLogOn trigger; runs the windowless ``run_service.py`` supervisor; no
     execution time limit, runs on battery, restart-on-failure — the closest
     Task Scheduler analogue to the Linux unit's ``Restart=always``. Needs no
-    admin (LeastPrivilege / InteractiveToken for the current user).
+    admin (LeastPrivilege / InteractiveToken for the current user). A branded
+    name + description make it legible in Task Scheduler / "Startup apps".
     """
     task = _TASK_NAME.get(kind)
     if not task:
         return False
+    # Drop any pre-rename task with the old display name so an upgrade never
+    # leaves an orphan that also fires AtLogOn (best-effort; no-op if absent).
+    for legacy in _LEGACY_TASK_NAMES.get(kind, ()):
+        _win_delete_task(legacy)
     user = _win_current_user()
     script = (
         "$ErrorActionPreference='Stop';"
@@ -191,7 +215,7 @@ def _win_register_task(kind: str) -> bool:
         "$p = New-ScheduledTaskPrincipal -UserId $env:OSIA_USER"
         " -LogonType Interactive -RunLevel Limited;"
         "Register-ScheduledTask -TaskName $env:OSIA_TASK -Action $a -Trigger $t"
-        " -Settings $s -Principal $p -Force | Out-Null"
+        " -Settings $s -Principal $p -Description $env:OSIA_DESC -Force | Out-Null"
     )
     try:
         r = _ps(script, {
@@ -200,6 +224,7 @@ def _win_register_task(kind: str) -> bool:
             "OSIA_REPO": str(_REPO_ROOT),
             "OSIA_USER": user,
             "OSIA_TASK": task,
+            "OSIA_DESC": _TASK_DESC.get(kind, task),
         })
     except Exception as e:
         print(f"[win-service] register {task} failed: {e}")
