@@ -928,3 +928,465 @@ def scroll(direction: str = "down", amount=3):
         f"scrolled {d} ({n}) using {d}-arrow keypresses "
         "(Wayland/ydotool has no mouse-wheel command — approximated with the keyboard)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Foreground-window readiness (WOR-50 follow-up): after open_application launches
+# an app, confirm the app's window has actually APPEARED and taken foreground
+# focus before any desktop_type / desktop_click runs — otherwise keystrokes fire
+# into the void or the wrong window while a slow app (IDE, Photoshop) is still
+# opening. This is ACTIVE WAITING (poll, no fixed sleep): we return the instant a
+# new foreground window stabilises (so fast apps like notepad are not slowed) and
+# ERROR only if nothing appears within a generous timeout.
+#
+# Foreground detection is per-platform and degrades gracefully where no portable
+# API is wired (the caller then reports the launch WITHOUT the readiness guarantee
+# rather than emitting a false error):
+#   * Windows  -> win32gui.GetForegroundWindow (+ GetWindowText / GetClassName /
+#                 GetWindowThreadProcessId) via pywin32 (a declared Windows-only
+#                 dependency). Console-host windows (the transient ``cmd /c <app>``
+#                 shell that subprocess.Popen(shell=True) spawns) are skipped by
+#                 class so we lock onto the real app window, never the launch shell.
+#   * Linux X11 -> ``xdotool getactivewindow`` (already required for X11 input).
+#   * Linux Wayland -> ``kdotool getactivewindow`` when present (best effort; it
+#                 exposes no pid, so OSIA's own window cannot be filtered there)
+#                 else unavailable.
+#   * macOS / other -> unavailable (no pyobjc dependency) -> graceful fallback.
+# Every branch is guarded by ``sys.platform`` (cross-platform rule).
+# ---------------------------------------------------------------------------
+APP_WINDOW_TIMEOUT = 14.0          # generous cap: heavy apps can take >10s to show
+_APP_WINDOW_POLL = 0.2             # poll interval (~200ms)
+_APP_WINDOW_STABLE_POLLS = 2       # consecutive polls a new fg window must persist
+
+# conhost / terminal host window classes — the transient ``cmd /c <app>`` shell
+# that subprocess.Popen(shell=True) spawns on Windows. Skipped so the readiness
+# wait locks onto the real app window, never the launch shell.
+_WIN_CONSOLE_CLASSES = {
+    "ConsoleWindowClass",            # classic conhost console
+    "CASCADIA_HOSTING_WINDOW_CLASS", # Windows Terminal
+    "PseudoConsoleWindow",
+}
+
+_win32 = None
+_win32_loaded = False
+
+
+def _load_win32():
+    """Import pywin32's ``win32gui``/``win32process`` once (Windows only), caching
+    the pair or ``None``. Mirrors the lazy, cached :func:`_load_pyautogui` guard so
+    a missing/broken pywin32 degrades gracefully instead of raising."""
+    global _win32, _win32_loaded
+    if _win32_loaded:
+        return _win32
+    _win32_loaded = True
+    if sys.platform != "win32":
+        _win32 = None
+        return None
+    try:
+        import win32gui
+        import win32process
+        _win32 = (win32gui, win32process)
+    except Exception:
+        _win32 = None
+    return _win32
+
+
+def _foreground_available() -> bool:
+    """True when this platform has a foreground-window API wired (so the readiness
+    wait can run); False -> the caller degrades gracefully (no wait, no false
+    error)."""
+    if sys.platform == "win32":
+        return _load_win32() is not None
+    if sys.platform.startswith("linux"):
+        if _is_wayland():
+            return shutil.which("kdotool") is not None
+        return shutil.which("xdotool") is not None
+    return False
+
+
+def _foreground_window_win32():
+    """(hwnd, title, pid) of the foreground window on Windows, or ``(0, "", 0)``
+    when nothing usable is focused (invisible window, or a console-host shell we
+    deliberately skip). ``None`` only if pywin32 is unavailable."""
+    w = _load_win32()
+    if not w:
+        return None
+    win32gui, win32process = w
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd or not win32gui.IsWindowVisible(hwnd):
+            return (0, "", 0)
+        try:
+            cls = win32gui.GetClassName(hwnd) or ""
+        except Exception:
+            cls = ""
+        if cls in _WIN_CONSOLE_CLASSES:        # the launch shell, not the app
+            return (0, "", 0)
+        title = win32gui.GetWindowText(hwnd) or ""
+        try:
+            _tid, pid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception:
+            pid = 0
+        return (int(hwnd), title, int(pid or 0))
+    except Exception:
+        return (0, "", 0)
+
+
+def _foreground_window_xdotool():
+    """(window-id, title, pid) of the active window on X11 via xdotool, or
+    ``(0, "", 0)`` when there is no active window. ``None`` if xdotool is missing."""
+    if shutil.which("xdotool") is None:
+        return None
+    try:
+        r = subprocess.run(["xdotool", "getactivewindow"],
+                           capture_output=True, text=True, timeout=3)
+    except Exception:
+        return (0, "", 0)
+    wid = (r.stdout or "").strip()
+    if r.returncode != 0 or not wid.isdigit():
+        return (0, "", 0)                      # no active window right now
+    title, pid = "", 0
+    try:
+        rt = subprocess.run(["xdotool", "getwindowname", wid],
+                           capture_output=True, text=True, timeout=3)
+        if rt.returncode == 0:
+            title = (rt.stdout or "").strip()
+    except Exception:
+        pass
+    try:
+        rp = subprocess.run(["xdotool", "getwindowpid", wid],
+                           capture_output=True, text=True, timeout=3)
+        out = (rp.stdout or "").strip()
+        if rp.returncode == 0 and out.isdigit():
+            pid = int(out)
+    except Exception:
+        pass
+    return (int(wid), title, pid)
+
+
+def _foreground_window_kdotool():
+    """(window-uuid, title, 0) of the active window on KDE Wayland via kdotool, or
+    ``(0, "", 0)`` when none. ``None`` if kdotool is missing. Best effort: kdotool
+    exposes no pid, so OSIA's own window cannot be filtered on Wayland."""
+    if shutil.which("kdotool") is None:
+        return None
+    try:
+        r = subprocess.run(["kdotool", "getactivewindow"],
+                           capture_output=True, text=True, timeout=3)
+    except Exception:
+        return (0, "", 0)
+    wid = (r.stdout or "").strip()
+    if r.returncode != 0 or not wid:
+        return (0, "", 0)
+    title = ""
+    try:
+        rt = subprocess.run(["kdotool", "getwindowname", wid],
+                           capture_output=True, text=True, timeout=3)
+        if rt.returncode == 0:
+            title = (rt.stdout or "").strip()
+    except Exception:
+        pass
+    return (wid, title, 0)
+
+
+def _foreground_window():
+    """(id, title, pid) of the current foreground window, or ``None`` when no
+    foreground API is wired on this platform. ``id`` is an opaque per-process
+    identity used only for change detection (int hwnd / X11 id on Win/X11, str
+    UUID on Wayland); ``title``/``pid`` may be ``""``/``0`` when nothing usable is
+    focused. Never raises."""
+    if sys.platform == "win32":
+        return _foreground_window_win32()
+    if sys.platform.startswith("linux"):
+        return _foreground_window_kdotool() if _is_wayland() else _foreground_window_xdotool()
+    return None
+
+
+def foreground_snapshot():
+    """Capture the current foreground-window identity BEFORE launching an app, so
+    :func:`wait_for_app_window` can detect when focus has moved to the NEW window.
+    Returns the ``(id, title, pid)`` tuple, or ``None`` when detection is
+    unavailable on this platform. Never raises."""
+    if not _foreground_available():
+        return None
+    return _foreground_window()
+
+
+def wait_for_app_window(before, timeout=APP_WINDOW_TIMEOUT,
+                        poll=_APP_WINDOW_POLL, stable_polls=_APP_WINDOW_STABLE_POLLS):
+    """Active-wait until a NEW foreground window appears and stabilises after an app
+    launch, so a following desktop_type/desktop_click cannot fire into the void or
+    the wrong window.
+
+    ``before`` is the pre-launch identity from :func:`foreground_snapshot`. Polls
+    every ``poll`` s up to ``timeout`` s and returns a ``(status, detail)`` tuple:
+      * ``("ready", <window title>)`` — a visible, titled window that is NOT the
+        pre-launch foreground and NOT OSIA's own window has held foreground for
+        ``stable_polls`` consecutive polls. Returns the INSTANT this happens, so a
+        fast app (notepad) adds only a couple hundred ms, while a slow one is
+        waited for up to ``timeout``.
+      * ``("timeout", "")`` — detection works here but no such window appeared
+        within ``timeout`` (the app did not open a window) -> the caller ERRORs.
+      * ``("unavailable", "")`` — no foreground API on this platform -> the caller
+        degrades gracefully (reports the launch without the readiness guarantee).
+    Never raises.
+    """
+    if not _foreground_available():
+        return ("unavailable", "")
+    own = os.getpid()
+    before_id = before[0] if before else None
+    stable_id, stable_count = None, 0
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    while True:
+        fg = _foreground_window()
+        if fg is None:                         # API vanished mid-wait -> degrade
+            return ("unavailable", "")
+        fid, ftitle, fpid = fg
+        # A genuine app window: a real, titled, visible window that is neither the
+        # window focused before the launch nor one of OSIA's own windows.
+        is_new_app = bool(fid) and fid != before_id and fpid != own and bool(ftitle.strip())
+        if is_new_app:
+            if fid == stable_id:
+                stable_count += 1
+            else:
+                stable_id, stable_count = fid, 1
+            if stable_count >= stable_polls:
+                return ("ready", ftitle.strip())
+        else:
+            stable_id, stable_count = None, 0
+        if time.monotonic() >= deadline:
+            return ("timeout", "")
+        time.sleep(poll)
+
+
+# ---------------------------------------------------------------------------
+# Already-open detection + focus (WOR-50 follow-up #2): before launching, check
+# whether the requested app ALREADY has an open window and, if so, bring that
+# window to the foreground instead of launching a second instance. This also
+# removes the documented false-ERROR edge case where an already-open+focused app
+# would otherwise time out in wait_for_app_window (no NEW window ever appears).
+#
+# Matching is by PROCESS NAME, not window title: titles rarely contain the app
+# name ("Untitled - Notepad", "… - Google Chrome"), but the owning process does
+# (notepad.exe, chrome.exe). We enumerate visible top-level app windows
+# (EnumWindows, Z-ordered), resolve each window's pid -> process name (psutil, a
+# declared dependency), and require an EXACT executable-base match ('notepad' ==
+# 'notepad') so we never focus the wrong app. Among several windows of one app we
+# take the topmost (most-recently-active). If nothing matches confidently we
+# return None and the caller launches as before — a wrong-window focus is worse
+# than a relaunch.
+#
+# Windows-only (pywin32 + psutil). On Linux/Mac reliable name->process->window
+# mapping is not wired here, so find_app_window returns None and the caller falls
+# back to the existing launch-and-wait path (no regression, no false error).
+# ---------------------------------------------------------------------------
+APP_FOCUS_TIMEOUT = 4.0   # focusing an already-open window should be near-instant
+
+# Desktop shell / taskbar / start-menu window classes — never "the app" even when
+# their owning process (explorer.exe) matches; skipped so "open explorer" focuses
+# a File Explorer window, never the desktop or taskbar.
+_WIN_SHELL_CLASSES = {
+    "Progman", "WorkerW",                        # desktop
+    "Shell_TrayWnd", "Shell_SecondaryTrayWnd",   # taskbars
+    "DV2ControlHost",                            # start menu (legacy)
+    "Windows.UI.Core.CoreWindow",                # start / search (modern)
+}
+
+_EXE_EXTS = (".exe", ".com", ".bat", ".cmd", ".lnk", ".app")
+
+
+def _norm_app_token(name) -> str:
+    """Reduce a launch string ('notepad', 'notepad.exe doc.txt', a quoted path) to
+    its lowercase executable base ('notepad') for process-name matching, or '' when
+    it can't be reduced. Best-effort: a wrong reduction just means no match -> the
+    caller launches (safe)."""
+    s = (name or "").strip()
+    if not s:
+        return ""
+    if s[0] in "\"'":                             # leading quoted path with spaces
+        end = s.find(s[0], 1)
+        first = s[1:end] if end > 1 else s[1:]
+    else:
+        first = s.split()[0]
+    base = os.path.basename(first.replace("\\", "/"))
+    root, ext = os.path.splitext(base)
+    if ext.lower() in _EXE_EXTS:
+        base = root
+    return base.strip().lower()
+
+
+def _proc_base(proc_name) -> str:
+    """'notepad.exe' -> 'notepad' (lowercase); strips only known executable exts."""
+    root, ext = os.path.splitext(proc_name or "")
+    if ext.lower() in _EXE_EXTS:
+        return root.lower()
+    return (proc_name or "").strip().lower()
+
+
+def _enum_app_windows_win32():
+    """Visible, titled, top-level application windows as (hwnd, title, pid, cls) in
+    Z-order (topmost first). Excludes OSIA's own windows, owned/child windows, tool
+    windows, console hosts and the desktop shell. Windows-only; [] if pywin32 is
+    missing. Never raises."""
+    w = _load_win32()
+    if not w:
+        return []
+    win32gui, win32process = w
+    try:
+        import win32con
+        ex_tool = win32con.WS_EX_TOOLWINDOW
+        gwl_exstyle = win32con.GWL_EXSTYLE
+        gw_owner = win32con.GW_OWNER
+    except Exception:
+        ex_tool, gwl_exstyle, gw_owner = 0x00000080, -20, 4
+    own = os.getpid()
+    out = []
+
+    def _cb(hwnd, _lparam):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            if win32gui.GetWindow(hwnd, gw_owner):       # owned dialog, not main win
+                return True
+            title = win32gui.GetWindowText(hwnd) or ""
+            if not title.strip():
+                return True
+            try:
+                cls = win32gui.GetClassName(hwnd) or ""
+            except Exception:
+                cls = ""
+            if cls in _WIN_CONSOLE_CLASSES or cls in _WIN_SHELL_CLASSES:
+                return True
+            try:
+                if win32gui.GetWindowLong(hwnd, gwl_exstyle) & ex_tool:
+                    return True
+            except Exception:
+                pass
+            try:
+                _tid, pid = win32process.GetWindowThreadProcessId(hwnd)
+            except Exception:
+                pid = 0
+            if not pid or pid == own:
+                return True
+            out.append((int(hwnd), title, int(pid), cls))
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        pass
+    return out
+
+
+def find_app_window(name):
+    """(hwnd, title, pid) of the best ALREADY-OPEN window whose owning PROCESS name
+    matches ``name`` (e.g. 'notepad' -> notepad.exe), or ``None`` when nothing
+    matches confidently / detection is unavailable.
+
+    Matches on the process name (titles rarely carry the app name) and requires an
+    EXACT executable-base match so the wrong app is never focused; among several
+    windows of one app the topmost (most-recently-active) is returned. Windows-only
+    — returns None on Linux/Mac (caller launches as usual). Never raises."""
+    if sys.platform != "win32" or _load_win32() is None:
+        return None
+    req = _norm_app_token(name)
+    if not req:
+        return None
+    try:
+        import psutil
+    except Exception:
+        return None
+    for hwnd, title, pid, _cls in _enum_app_windows_win32():   # topmost first
+        try:
+            pname = psutil.Process(pid).name()
+        except Exception:
+            continue
+        if _proc_base(pname) == req:
+            return (hwnd, title, pid)
+    return None
+
+
+def _raise_window_win32(win32gui, win32process, hwnd) -> None:
+    """Best-effort bring ``hwnd`` to the foreground, working around Windows'
+    foreground lock (a background process can't normally steal focus) by briefly
+    attaching our input thread to the current foreground window's thread. Never
+    raises — if focus is refused, the caller's confirm-poll detects it."""
+    try:
+        import win32con
+        sw_restore = win32con.SW_RESTORE
+    except Exception:
+        sw_restore = 9
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, sw_restore)
+    except Exception:
+        pass
+    cur_tid = our_tid = 0
+    attached = False
+    try:
+        import win32api
+        our_tid = win32api.GetCurrentThreadId()
+        fg = win32gui.GetForegroundWindow()
+        if fg:
+            cur_tid, _ = win32process.GetWindowThreadProcessId(fg)
+        if our_tid and cur_tid and our_tid != cur_tid:
+            try:
+                win32process.AttachThreadInput(our_tid, cur_tid, True)
+                attached = True
+            except Exception:
+                attached = False
+    except Exception:
+        pass
+    for fn in ("BringWindowToTop", "SetForegroundWindow"):
+        try:
+            getattr(win32gui, fn)(hwnd)
+        except Exception:
+            pass
+    if attached:
+        try:
+            win32process.AttachThreadInput(our_tid, cur_tid, False)
+        except Exception:
+            pass
+
+
+def focus_app_window(window, timeout=APP_FOCUS_TIMEOUT,
+                     poll=_APP_WINDOW_POLL, stable_polls=_APP_WINDOW_STABLE_POLLS):
+    """Bring an already-open ``window`` ((hwnd, title, pid) from find_app_window) to
+    the foreground and CONFIRM it took focus by polling, so a chained
+    desktop_type/desktop_click is reliable. Returns a ``(status, detail)`` tuple:
+      * ``("ready", <title>)`` — the window is now the foreground window (confirmed).
+      * ``("timeout", "")``    — focus could not be confirmed in time -> the caller
+        falls back to launching (safer than claiming success on an unfocused window).
+      * ``("unavailable", "")``— focus not wired on this platform.
+    Windows-only; never raises."""
+    if sys.platform != "win32":
+        return ("unavailable", "")
+    w = _load_win32()
+    if not w:
+        return ("unavailable", "")
+    win32gui, win32process = w
+    try:
+        hwnd = int(window[0])
+    except Exception:
+        return ("unavailable", "")
+    _raise_window_win32(win32gui, win32process, hwnd)
+    deadline = time.monotonic() + max(0.5, float(timeout))
+    stable = 0
+    while True:
+        fg = _foreground_window_win32()
+        if fg is None:
+            return ("unavailable", "")
+        fid, ftitle, _fpid = fg
+        if fid == hwnd:
+            stable += 1
+            if stable >= stable_polls:
+                title = (ftitle or (window[1] if len(window) > 1 else "")).strip()
+                return ("ready", title)
+        else:
+            stable = 0
+            _raise_window_win32(win32gui, win32process, hwnd)   # re-assert
+        if time.monotonic() >= deadline:
+            return ("timeout", "")
+        time.sleep(poll)

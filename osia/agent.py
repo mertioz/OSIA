@@ -667,7 +667,35 @@ def tool_open_application(name: str) -> str:
     never checking whether the inner command was found). A process still alive
     after a short grace window — or one that exits cleanly (code 0, e.g. a
     launcher that spawned the real process) — is a genuinely launched app.
+
+    Before launching, if the app is ALREADY open its existing window is brought to
+    the foreground instead of starting a second instance (WOR-50 follow-up #2):
+    matched by owning PROCESS name (titles rarely carry the app name), exact base
+    only so the wrong app is never focused, and the focus is poll-confirmed. On no
+    or uncertain match — and on Linux/Mac, where already-open detection is not
+    wired — we fall through and launch as usual (no regression, no false error).
+    This also removes the edge case where an already-open+focused app timed out in
+    the post-launch window wait.
     """
+    # Already open? Focus the existing window instead of relaunching.
+    try:
+        from osia.tools import desktop_control as _dc
+        _existing = _dc.find_app_window(name)
+    except Exception:
+        _dc, _existing = None, None
+    if _existing is not None:
+        try:
+            _st, _detail = _dc.focus_app_window(_existing)
+        except Exception:
+            _st, _detail = "unavailable", ""
+        if _st == "ready":
+            return (
+                f"'{name}' is already open — brought its window '{_detail}' to the "
+                "foreground and focused it (ready; did not launch a second instance)."
+            )
+        # focus unconfirmed -> fall through and launch normally (safer than
+        # claiming success on a window we could not confirm focused).
+
     # Capture the shell's stderr to a temp file rather than a PIPE so a
     # long-running app that chatters on stderr can never deadlock on a full pipe
     # buffer (we'd never be draining it).
@@ -694,6 +722,15 @@ def tool_open_application(name: str) -> str:
             except OSError:
                 pass
 
+    # Snapshot the foreground window BEFORE launching so the post-launch readiness
+    # wait can tell when focus has moved to the NEW app window (WOR-50 follow-up).
+    _before_fg = None
+    try:
+        from osia.tools import desktop_control as _dc
+        _before_fg = _dc.foreground_snapshot()
+    except Exception:
+        _before_fg = None
+
     try:
         proc = subprocess.Popen(
             name,
@@ -716,6 +753,31 @@ def tool_open_application(name: str) -> str:
 
     if rc is None or rc == 0:
         _cleanup()
+        # The process is alive (or a launcher exited cleanly) -> now ACTIVELY WAIT
+        # for the app's window to appear and take foreground focus before reporting
+        # success, so a following desktop_type/desktop_click cannot fire into the
+        # void or the wrong window (WOR-50 follow-up). No fixed sleep: poll and
+        # return the instant the window is ready (fast apps are not slowed), ERROR
+        # if none appears within the timeout so the model knows not to type blindly
+        # (mirrors the false-success guard above).
+        try:
+            from osia.tools import desktop_control as _dc
+            status, detail = _dc.wait_for_app_window(_before_fg)
+        except Exception:
+            status, detail = "unavailable", ""
+        if status == "ready":
+            return f"Launched: {name} — window '{detail}' is ready and focused"
+        if status == "timeout":
+            return (
+                f"ERROR: launched '{name}' but no application window appeared and "
+                f"took focus within {int(_dc.APP_WINDOW_TIMEOUT)}s — the app may have "
+                "failed to open a window. Take a screenshot to see the current state "
+                "before doing anything else; do NOT type yet — the keystrokes would "
+                "land in the wrong window."
+            )
+        # 'unavailable': foreground detection is not wired on this platform (e.g.
+        # Wayland without kdotool, or macOS) -> preserve the prior behaviour and
+        # report the launch without the readiness guarantee.
         return f"Launched: {name}"
 
     # Non-zero exit within the grace window → real failure. Surface the shell's
