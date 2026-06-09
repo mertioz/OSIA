@@ -12,11 +12,13 @@ per-user ``Path.home() / ".osia"`` dir, which works identically on Windows
 (``C:\\Users\\<user>\\.osia``), Mac and Linux. See WOR-11 (Windows port).
 """
 
+import copy
 import json
 import os
 import secrets
 import stat
 import sys
+import threading
 from pathlib import Path
 
 # <repo>/osia/config.py → <repo>. Dynamic so the package works from any
@@ -193,25 +195,100 @@ def set_api_key(provider: str, key: str) -> None:
     save_api_keys(keys)
 
 
-def load_settings() -> dict:
-    """Return the saved settings dict, merging in defaults."""
-    base = dict(DEFAULT_SETTINGS)
-    if not os.path.exists(SETTINGS_FILE):
-        return base
+# ── settings.json read cache (mtime+size based) ────────────────────────────
+# load_settings() is on the hot per-message server path and was opening
+# settings.json on EVERY call (config.py callers: get_setting, iter_keys, the
+# per-skill is_skill_enabled loop, …). On Windows each open triggers an
+# antivirus scan, so the repeated reads cost real time. This cache parses the
+# file at most once per (mtime_ns, size): the fast path only os.stat()s it
+# (cheap, no content scan) and reuses the last parse. It is a TRANSPARENT
+# read-path optimization — load_settings() still returns the same value and
+# still reflects on-disk changes (the stat catches external/cross-process
+# edits; save_settings invalidates it for in-process writes).
+_settings_cache_lock = threading.Lock()
+# (st_mtime_ns, st_size) of the file the cache was built from, or None when
+# nothing valid is cached yet (first read, missing file, corrupt parse, write).
+_settings_cache_signature: "tuple | None" = None
+# Last good RAW parse of the file (defaults NOT merged in). Never handed out
+# directly — load_settings() deep-copies it so callers can't mutate the cache.
+_settings_cache_data: dict = {}
+
+
+def _read_settings_file() -> dict:
+    """Return the raw dict stored in settings.json (no defaults merged), or
+    ``{}`` when the file is missing / empty / corrupt.
+
+    Served from an mtime+size cache: when the file is unchanged since the last
+    read it is NOT reopened — only ``os.stat`` runs — and an independent
+    deep copy of the cached parse is returned. The copy guarantees callers can
+    freely mutate ``load_settings()``'s result without corrupting the cache,
+    exactly as when every call re-parsed the file.
+    """
+    global _settings_cache_signature, _settings_cache_data
+    try:
+        st = os.stat(SETTINGS_FILE)
+    except OSError:
+        # Missing/unreadable — match the old "file absent → defaults only"
+        # path and forget any stale cache so a later (re)created file is read.
+        with _settings_cache_lock:
+            _settings_cache_signature = None
+            _settings_cache_data = {}
+        return {}
+
+    signature = (st.st_mtime_ns, st.st_size)
+    with _settings_cache_lock:
+        if signature == _settings_cache_signature:
+            return copy.deepcopy(_settings_cache_data)
+
+    # Slow path: file changed (or first read). Do the open+parse OUTSIDE the
+    # lock so concurrent readers never block on disk I/O; the worst case is two
+    # threads parsing the same bytes, which is harmless (same result stored).
+    data: dict = {}
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8", errors="replace") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            base.update(data)
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            data = loaded
     except Exception:
-        pass
+        # Corrupt or mid-write file: behave like before (defaults only) and do
+        # NOT poison the cache — drop the signature so the next call retries.
+        with _settings_cache_lock:
+            _settings_cache_signature = None
+            _settings_cache_data = {}
+        return {}
+
+    with _settings_cache_lock:
+        _settings_cache_signature = signature
+        _settings_cache_data = data
+        return copy.deepcopy(data)
+
+
+def load_settings() -> dict:
+    """Return the saved settings dict, merging in defaults.
+
+    Reads are served from an mtime+size cache (see :func:`_read_settings_file`)
+    so an unchanged ``settings.json`` is opened at most once — a transparent
+    optimization that matters on Windows, where every file open triggers an
+    antivirus scan. The return value is always a fresh, independent dict, so
+    callers may mutate it (e.g. :func:`set_setting`) without touching the cache.
+    """
+    base = dict(DEFAULT_SETTINGS)
+    base.update(_read_settings_file())
     return base
 
 
 def save_settings(settings: dict) -> None:
+    global _settings_cache_signature, _settings_cache_data
     _ensure_config_dir()
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
+    # Invalidate the read cache so the very next load_settings() re-reads what
+    # we just wrote. Hard invalidation (not in-place update) keeps the cache
+    # byte-for-byte identical to disk — a populate-from-memory shortcut could
+    # diverge via JSON round-tripping (tuples→lists, int keys→strings).
+    with _settings_cache_lock:
+        _settings_cache_signature = None
+        _settings_cache_data = {}
 
 
 def get_setting(key: str, default=None):
