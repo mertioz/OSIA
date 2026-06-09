@@ -9,6 +9,26 @@ if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
 if __name__ == "__main__":
+    # Windows consoles default to cp1252, which raises UnicodeEncodeError the
+    # moment a log line contains a non-ASCII char (e.g. the "▶" in
+    # "[OSIA Agent] ▶ tool:") — that crash propagates to the mobile client as an
+    # error instead of the AI's reply and blocks persisting new conversations.
+    # Force UTF-8 (replace undecodable chars) on the std streams. Guarded for the
+    # detached-launch case (Task Scheduler / pythonw), where stdout/stderr may be
+    # None or lack .reconfigure — this must never crash startup. Linux/Mac
+    # consoles are UTF-8 already, so the whole block is win32-only.
+    if sys.platform == "win32":
+        for _stream in (sys.stdout, sys.stderr):
+            try:
+                if _stream is not None and hasattr(_stream, "reconfigure"):
+                    _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        # Belt-and-suspenders: child processes (the restart re-spawn, browser
+        # tools) inherit a UTF-8 default too. setdefault never clobbers an
+        # explicit override the environment may already carry.
+        os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
     # Windows windowless safety net: under pythonw.exe (e.g. the detached
     # restart_server re-spawn in osia/server/server.py, which does not redirect
     # streams) sys.stdout/sys.stderr are None, and uvicorn's first log write

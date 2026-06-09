@@ -79,6 +79,25 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from osia import conversations
 from osia.config import CONFIG_DIR as _CONFIG_DIR
 
+# Windows consoles default to cp1252, which raises UnicodeEncodeError the moment
+# a log line contains a non-ASCII char (e.g. the "▶" in "[OSIA Agent] ▶ tool:")
+# — that crash propagates to the mobile client as an error instead of the AI's
+# reply and blocks persisting new conversations. Force UTF-8 (replace
+# undecodable chars) on the std streams as soon as this module is imported, so
+# it applies whether the server is started via run_server.py (Task Scheduler) or
+# directly (python -m osia.server.server / the restart re-spawn). Guarded for
+# the detached-launch case where stdout/stderr may be None or lack .reconfigure
+# — this must never crash startup. Linux/Mac consoles are UTF-8 already, so the
+# whole block is win32-only.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            if _stream is not None and hasattr(_stream, "reconfigure"):
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
