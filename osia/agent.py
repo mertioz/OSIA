@@ -638,12 +638,83 @@ def tool_write_file(path: str, content: str) -> str:
 
 
 def tool_open_application(name: str) -> str:
-    """Launch an application by name. Detaches so it keeps running."""
+    """Launch an application by name. Detaches so it keeps running.
+
+    The launch is only reported as success when it actually started. A typo'd or
+    missing app makes the shell exit almost immediately with a non-zero code
+    (Windows ``'X' n'est pas reconnu`` / ``is not recognized`` → 1/9009; POSIX
+    ``command not found`` → 127), which we surface as an ``ERROR:`` so OSIA tells
+    the user it could not launch the app instead of falsely claiming success
+    (the old code returned "Launched" the instant ``Popen`` spawned the shell,
+    never checking whether the inner command was found). A process still alive
+    after a short grace window — or one that exits cleanly (code 0, e.g. a
+    launcher that spawned the real process) — is a genuinely launched app.
+    """
+    # Capture the shell's stderr to a temp file rather than a PIPE so a
+    # long-running app that chatters on stderr can never deadlock on a full pipe
+    # buffer (we'd never be draining it).
+    err_path = None
+    err_fh = None
     try:
-        subprocess.Popen(name, shell=True)
-        return f"Launched: {name}"
+        fd, err_path = tempfile.mkstemp(prefix="osia_launch_", suffix=".log")
+        err_fh = os.fdopen(fd, "w+b")
+    except Exception:
+        err_path, err_fh = None, None
+
+    def _cleanup():
+        if err_fh is not None:
+            try:
+                err_fh.close()
+            except Exception:
+                pass
+        if err_path:
+            # On POSIX the child keeps its own fd so unlinking now is safe; on
+            # Windows it may fail while the child holds the handle (the OS temp
+            # sweeper reclaims it later) — either way, best-effort.
+            try:
+                os.remove(err_path)
+            except OSError:
+                pass
+
+    try:
+        proc = subprocess.Popen(
+            name,
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=(err_fh if err_fh is not None else subprocess.DEVNULL),
+        )
     except Exception as e:
+        _cleanup()
         return f"ERROR: launching {name}: {e}"
+
+    # Watch briefly: a not-found/typo'd command dies in milliseconds; a real
+    # GUI/CLI app is still running when the grace window elapses.
+    grace, step, waited = 1.5, 0.05, 0.0
+    rc = proc.poll()
+    while rc is None and waited < grace:
+        time.sleep(step)
+        waited += step
+        rc = proc.poll()
+
+    if rc is None or rc == 0:
+        _cleanup()
+        return f"Launched: {name}"
+
+    # Non-zero exit within the grace window → real failure. Surface the shell's
+    # stderr (the "is not recognized" / "command not found" line) before cleanup.
+    err_text = ""
+    if err_fh is not None:
+        try:
+            err_fh.seek(0)
+            err_text = err_fh.read().decode("utf-8", "replace").strip()
+        except Exception:
+            err_text = ""
+    _cleanup()
+    detail = f": {err_text}" if err_text else ""
+    return (
+        f"ERROR: could not launch application '{name}' — not found or failed to "
+        f"start (exit code {rc}){detail}"
+    )
 
 
 def tool_list_files(path: str) -> str:
