@@ -71,6 +71,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
@@ -818,6 +819,59 @@ async def _heartbeat_push_loop(channel: "_OutboundChannel") -> None:
             await asyncio.sleep(5)
 
 
+# ---------------------------------------------------------------------------
+# Per-connection agent reuse (perf fix #3)
+# ---------------------------------------------------------------------------
+# Soft cap on how many OSIAAgent instances ONE WebSocket connection keeps alive
+# at once (one per conversation it has touched). Each agent owns an OpenAI/httpx
+# client (SSL context + connection pool), so the per-connection cache is
+# LRU-bounded to keep a session that hops across many conversations from leaking
+# sockets/SSL contexts.
+_AGENT_CACHE_MAX = 8
+
+
+def _close_agent_client(agent) -> None:
+    """Release ``agent``'s OpenAI/httpx client so its sockets and SSL context
+    are freed promptly. Safe on a half-built agent; never raises. The caller
+    MUST ensure the agent is idle (no worker thread mid-``run``) before calling
+    — the OpenAI client is uncancellable from here and closing one in use would
+    break the in-flight turn."""
+    try:
+        client = getattr(agent, "client", None)
+        if client is not None:
+            client.close()
+    except Exception:
+        pass
+
+
+def _agent_needs_model_apply(agent, selected_model: str) -> bool:
+    """Whether ``agent``'s client must be (re)built via ``set_model`` for
+    ``selected_model`` this turn.
+
+    Perf fix #3 reuses one OSIAAgent across the serialized turns of a single
+    conversation, so ``set_model`` — which constructs a fresh ``OpenAI()``
+    client (SSL context + certifi load, ~100-300 ms on Windows) — must run ONLY
+    when the agent does not already hold a *clean primary* client for exactly
+    this model. "Clean primary" = the last model we applied is this one, the
+    agent is still on it (the task-hierarchy router can switch ``self.model``
+    mid-turn), the API-key cursor is back at the primary key, and the endpoint
+    is the primary (not a Bloc-5 fallback). ANY drift -> rebuild, which is
+    exactly what the old per-message ``OSIAAgent() + set_model`` did every turn,
+    so behaviour (per-turn reset to the primary key/endpoint and a fresh key
+    chain) is preserved on every non-hot path; only the redundant rebuild on the
+    hot path (same model, no prior error) is skipped.
+    """
+    if getattr(agent, "_applied_selected_model", None) != selected_model:
+        return True                       # first turn for this agent, or model changed
+    if getattr(agent, "model", None) != selected_model:
+        return True                       # a prior turn's router left a different model
+    if getattr(agent, "_api_key_index", 0) != 0:
+        return True                       # a prior turn rotated to a fallback API key
+    if getattr(agent, "_active_base_url", None) != getattr(agent, "_primary_base_url", None):
+        return True                       # a prior turn fell back to the secondary endpoint
+    return False
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -854,6 +908,63 @@ async def websocket_endpoint(ws: WebSocket):
     # re-points the *viewed* conversation can never redirect or corrupt an
     # in-flight stream.
     streaming_tasks: dict = {}
+
+    # ── Per-connection agent reuse (perf fix #3) ─────────────────────────
+    # One OSIAAgent per CONVERSATION this connection has touched, reused across
+    # that conversation's (serialized) turns instead of rebuilt — with its
+    # SSL/certifi OpenAI client — on every message. Keyed by conv_id because
+    # turns on the SAME conversation are serialized (see _run_turn), so a
+    # per-conversation agent never has concurrent turns, while turns on
+    # DIFFERENT conversations of this one connection CAN overlap (a backgrounded
+    # stream): giving them distinct agents prevents a cross-thread race on
+    # self.messages/self.client. The cache is local to this handler, so two
+    # connections (users) NEVER share an agent. LRU-bounded here, disposed in
+    # the finally block.
+    conn_agents: "OrderedDict[str, object]" = OrderedDict()
+
+    def _get_conn_agent(conv_id: str):
+        """Return this connection's OSIAAgent for ``conv_id`` (marking it
+        most-recently-used), creating it on first use. When the cache exceeds
+        the cap, evict the OLDEST IDLE agent and close its client — but skip any
+        agent whose conversation is mid-stream (``_in_use``: its worker thread
+        still holds the client) and never evict the one just requested. If every
+        other cached agent is busy, leave the cache briefly over the cap rather
+        than close a live client (the orphan is reclaimed by GC once its stream
+        ends).
+        """
+        from osia.agent import OSIAAgent
+        agent = conn_agents.get(conv_id)
+        if agent is not None:
+            conn_agents.move_to_end(conv_id)
+            return agent
+        agent = OSIAAgent()
+        conn_agents[conv_id] = agent
+        while len(conn_agents) > _AGENT_CACHE_MAX:
+            victim_id = None
+            for cid, cand in conn_agents.items():      # oldest -> newest
+                if cid == conv_id:
+                    continue                           # never evict the one we return
+                if not getattr(cand, "_in_use", False):
+                    victim_id = cid
+                    break
+            if victim_id is None:
+                break                                  # all others busy: can't evict safely
+            _close_agent_client(conn_agents.pop(victim_id))
+        return agent
+
+    def _invalidate_cached_models(provider: str | None = None):
+        """Force cached agents (optionally only those on ``provider``) to
+        re-apply set_model — which re-reads that provider's key chain from disk —
+        on their NEXT turn. Called after a mid-session API-key edit so a swapped
+        key is honoured: the per-conversation agent reuse (perf fix #3) skips
+        set_model on the hot path, so without this a clean key swap would stay
+        stale on an already-warmed conversation until a model change, a
+        technical-error rotation, or disconnect. Cheap — clears a flag; the
+        rebuild happens lazily on the next turn, exactly like the old
+        rebuild-every-message behaviour, just deferred by one turn."""
+        for _ag in conn_agents.values():
+            if provider is None or getattr(_ag, "provider", None) == provider:
+                _ag._applied_selected_model = None
 
     async def _ensure_active_conv(seed_text):
         """Resolve the conversation a turn will run in, creating it NOW
@@ -1203,6 +1314,15 @@ async def websocket_endpoint(ws: WebSocket):
                 doomed = streaming_tasks.pop(conv_id, None)
                 if doomed is not None:
                     doomed.cancel()
+                # Drop this conversation's reused agent (perf fix #3) so the
+                # deleted conv can't pin a slot in the LRU cache for the rest of
+                # the connection. Its random UUID is never reused, so nothing
+                # will look it up again. Close the client only when idle — if a
+                # just-cancelled turn's uncancellable worker thread may still be
+                # using it (_in_use), leave the close to GC once that thread ends.
+                dead_agent = conn_agents.pop(conv_id, None)
+                if dead_agent is not None and not getattr(dead_agent, "_in_use", False):
+                    _close_agent_client(dead_agent)
                 ok = conversations.delete_conversation(conv_id)
                 if active_conv_id == conv_id:
                     active_conv_id = None
@@ -1278,6 +1398,8 @@ async def websocket_endpoint(ws: WebSocket):
                             f"[OSIA Server] set_api_key provider={provider!r} "
                             f"(empty -> deleted)"
                         )
+                    # Reused agents must re-read this provider's key next turn.
+                    _invalidate_cached_models(provider)
                     await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
                     print(f"[OSIA Server] set_api_key({provider!r}) failed: {e}")
@@ -1301,6 +1423,8 @@ async def websocket_endpoint(ws: WebSocket):
                         f"[OSIA Server] delete_api_key provider={provider!r} "
                         f"({'removed' if existed else 'absent'})"
                     )
+                    # Reused agents must re-read this provider's key next turn.
+                    _invalidate_cached_models(provider)
                     await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
                     print(f"[OSIA Server] delete_api_key({provider!r}) failed: {e}")
@@ -1349,6 +1473,8 @@ async def websocket_endpoint(ws: WebSocket):
                         f"[OSIA Server] set_api_fallback_key provider={provider!r} "
                         f"index={index} ({len(chain)} keys, len={len(key)})"
                     )
+                    # Reused agents must re-read this provider's key chain next turn.
+                    _invalidate_cached_models(provider)
                     await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
                     print(
@@ -1390,6 +1516,8 @@ async def websocket_endpoint(ws: WebSocket):
                         f"[OSIA Server] delete_api_fallback_key provider={provider!r} "
                         f"index={index} ({len(chain)} keys left)"
                     )
+                    # Reused agents must re-read this provider's key chain next turn.
+                    _invalidate_cached_models(provider)
                     await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
                     print(
@@ -1730,7 +1858,9 @@ async def websocket_endpoint(ws: WebSocket):
                             _spawn_turn(
                                 _conv,
                                 lambda snap, _vc=vision_content, _c=_conv:
-                                    _run_agent_and_respond(out, _vc, snap, _c),
+                                    _run_agent_and_respond(
+                                        out, _vc, snap, _c,
+                                        get_agent=_get_conn_agent),
                             )
                 except Exception as e:
                     print(f"[OSIA Server] file upload failed: {e}")
@@ -1758,7 +1888,9 @@ async def websocket_endpoint(ws: WebSocket):
                     _spawn_turn(
                         _conv,
                         lambda snap, _t=user_text, _c=_conv:
-                            _run_agent_and_respond(out, _t, snap, _c),
+                            _run_agent_and_respond(
+                                out, _t, snap, _c,
+                                get_agent=_get_conn_agent),
                     )
 
             # --- Audio message ---
@@ -1784,7 +1916,9 @@ async def websocket_endpoint(ws: WebSocket):
                     _spawn_turn(
                         _conv,
                         lambda snap, _b=b64_data, _f=audio_format, _c=_conv, _files=_pf:
-                            _handle_audio(out, _b, _f, snap, _c, pending_files=_files),
+                            _handle_audio(out, _b, _f, snap, _c,
+                                          pending_files=_files,
+                                          get_agent=_get_conn_agent),
                     )
 
             else:
@@ -1819,6 +1953,17 @@ async def websocket_endpoint(ws: WebSocket):
             except (asyncio.CancelledError, Exception):
                 pass
         streaming_tasks.clear()
+        # Dispose this connection's reused agents (perf fix #3): close each
+        # idle agent's OpenAI/httpx client so its sockets + SSL context are
+        # released promptly, then drop the cache. Runs AFTER the streaming
+        # turns above are cancelled/awaited. Agents still flagged ``_in_use``
+        # (a cancelled turn whose uncancellable worker thread may still be
+        # running) are SKIPPED here and reclaimed by GC once that thread ends —
+        # closing a client mid-use would break it.
+        for _ag in list(conn_agents.values()):
+            if not getattr(_ag, "_in_use", False):
+                _close_agent_client(_ag)
+        conn_agents.clear()
         # Stop this client's live heartbeat push (no-op if never started).
         # Cancel then await so the task unwinds cleanly without a pending-task
         # warning; CancelledError on the await is expected.
@@ -1977,7 +2122,8 @@ def _persist_new_messages(conv_id: str | None, full_history: list,
 # ---------------------------------------------------------------------------
 async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                                  active_conv_id: str | None,
-                                 *, t0: float | None = None) -> tuple[list, str]:
+                                 *, t0: float | None = None,
+                                 get_agent=None) -> tuple[list, str]:
     """Run the agent with the given conversation history, persist the
     new turn, stream the spoken response sentence-by-sentence, then send
     the assembled reply + TTS audio.
@@ -2117,11 +2263,21 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     try:
         from osia.config import load_settings
 
-        agent = OSIAAgent()
+        # Reuse this connection's per-conversation agent (perf fix #3) instead
+        # of rebuilding it — and its SSL/certifi OpenAI client — on every
+        # message. Fall back to a throwaway agent only when no accessor was
+        # supplied (a direct/legacy call); the live text/audio/vision paths
+        # always pass get_agent, keyed by this turn's conversation.
+        agent = get_agent(active_conv_id) if get_agent is not None else OSIAAgent()
         selected_model = load_settings().get("selected_model")
-        if selected_model:
+        # Only (re)build the client when the agent isn't already on a clean
+        # primary client for this model — the user switched models, a prior
+        # turn's router/key/endpoint fallback drifted it, or it's this agent's
+        # first turn. Otherwise skip the costly rebuild and reuse the client.
+        if selected_model and _agent_needs_model_apply(agent, selected_model):
             try:
                 agent.set_model(selected_model)
+                agent._applied_selected_model = selected_model
             except Exception as e:
                 print(
                     f"[OSIA Server] set_model({selected_model!r}) failed, "
@@ -2146,13 +2302,29 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             f"(model={agent.model}, provider={agent.provider}, "
             f"history={len(history)} msgs, TOOL_MAP={len(TOOL_MAP)} tools, "
             f"streaming=on, max_tokens=model-default)")
+        # Mark the agent busy so LRU eviction / disconnect teardown never close
+        # a client its (uncancellable) worker thread is still using. The flag is
+        # cleared in the worker thread's OWN finally — i.e. exactly when
+        # agent.run returns or raises and the client falls idle — so it resets
+        # correctly on a normal return, on an exception (the thread is done by
+        # then), AND after a cancelled turn whose orphan thread keeps running
+        # until agent.run finishes. (Attribute get/set is atomic under the GIL,
+        # so the event loop reading _in_use never sees a torn value.)
+        agent._in_use = True
+
+        def _run_agent_busy_tracked():
+            try:
+                return agent.run(
+                    text,
+                    history=history,
+                    on_sentence=on_sentence,
+                    on_first_token=on_first_token,
+                )
+            finally:
+                agent._in_use = False
+
         # Off-thread so the event loop stays free to flush response_chunks.
-        response_text = await asyncio.to_thread(
-            agent.run, text,
-            history=history,
-            on_sentence=on_sentence,
-            on_first_token=on_first_token,
-        )
+        response_text = await asyncio.to_thread(_run_agent_busy_tracked)
         print(
             f"[DEBUG] agent.run() returned: {repr((response_text or '')[:200])}",
             flush=True,
@@ -2370,7 +2542,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
 async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str,
                         history: list,
                         active_conv_id: str | None,
-                        *, pending_files: list[str] | None = None) -> tuple[list, str | None]:
+                        *, pending_files: list[str] | None = None,
+                        get_agent=None) -> tuple[list, str | None]:
     """Process an audio command: transcribe, then run the agent on the
     transcript using the SAME path as text commands (so tools execute
     identically and the transcript ends up in the same conversation).
@@ -2453,6 +2626,7 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
         try:
             return await _run_agent_and_respond(
                 ws, agent_input, history, active_conv_id, t0=t0,
+                get_agent=get_agent,
             )
         finally:
             # Make sure the transcript frame finished going out before
