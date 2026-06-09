@@ -68,17 +68,16 @@ def _notify_mobile_new_chat() -> None:
 def _ensure_mobile_server_windows() -> None:
     """On Windows, make sure the OSIA mobile server (run_server.py) is running.
 
-    Linux runs the mobile server as a systemd unit (``osia-server.service``);
-    Windows has no systemd, and the login-autostart entry only launches
-    ``main.py --wake`` — so without this the server never comes up on a normal
-    boot and the Settings panel reports it as "off" (WOR-11 Windows bug fix).
+    The server normally starts at login via its own per-user Scheduled Task
+    ("OSIA Mobile Server", registered by ``install.bat``) — the Windows
+    equivalent of the Linux ``osia-server.service`` systemd unit, fully
+    independent of this GUI process. This call is a self-heal safety net: it
+    registers the task if it is missing (e.g. an install that predates the task
+    model) and starts the service when nothing is serving yet.
 
-    Idempotent and safe: it first checks whether port 8765 is already serving
-    (e.g. a server from a previous launch) and starts one only when none is
-    running, so it can never double-bind the port. Delegates the actual launch
-    to ``systemd_manager.enable_service`` (the same detached-process path the
-    Settings toggle uses), so the toggle and this autostart stay consistent.
-    No-op on every non-Windows platform.
+    Idempotent and safe: ``ensure_service_running`` only starts a task instance
+    when neither the port (8765) nor a supervisor is already up, so it can never
+    double-bind the port. No-op on every non-Windows platform.
     """
     if sys.platform != "win32":
         return
@@ -97,16 +96,11 @@ def _ensure_mobile_server_windows() -> None:
     except Exception as e:
         print(f"[OSIA] mobile token ensure skipped: {e}")
     try:
-        from osia.utils.systemd_manager import (
-            get_service_status, enable_service,
-        )
-        if get_service_status("osia-server.service") == "running":
-            print("[OSIA] mobile server already running (Windows).")
-            return
-        if enable_service("osia-server.service"):
-            print("[OSIA] mobile server started (Windows).")
+        from osia.utils.systemd_manager import ensure_service_running
+        if ensure_service_running("osia-server.service"):
+            print("[OSIA] mobile server task ensured (Windows).")
         else:
-            print("[OSIA] could not start the mobile server (Windows).")
+            print("[OSIA] could not ensure the mobile server (Windows).")
     except Exception as e:
         print(f"[OSIA] mobile server autostart skipped: {e}")
 

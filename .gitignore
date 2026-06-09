@@ -12,3 +12,7 @@ config/mobile_token.txt
 config/desktop_calibration.json
 config/greeting_cache.json
 config/greeting_cache.wav
+# Windows tunnel runtime artifacts (cloudflared.exe is downloaded by install.bat;
+# tunnel.log is written at runtime by the tunnel service) — never commit these.
+windows/cloudflared.exe
+windows/tunnel.log

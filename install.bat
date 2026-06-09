@@ -8,6 +8,8 @@ REM   * installs all dependencies from requirements.txt
 REM   * downloads cloudflared.exe to windows\
 REM   * migrates any existing config\ into %USERPROFILE%\.osia and ensures a
 REM     mobile pairing token exists
+REM   * registers the mobile server + Cloudflare tunnel as per-user Scheduled
+REM     Tasks (start at login, independent of the GUI) and starts them now
 REM ===========================================================================
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
@@ -40,14 +42,14 @@ if errorlevel 1 (
     python --version
     goto :fail
 )
-echo [1/5] Python detecte :
+echo [1/6] Python detecte :
 python --version
 
 REM --- 2. Virtual environment ------------------------------------------------
 if exist "%VENV_PY%" (
-    echo [2/5] venv deja present - reutilisation.
+    echo [2/6] venv deja present - reutilisation.
 ) else (
-    echo [2/5] Creation du venv...
+    echo [2/6] Creation du venv...
     python -m venv "%VENV_DIR%"
     if errorlevel 1 (
         echo [ERREUR] Echec de la creation du venv.
@@ -56,7 +58,7 @@ if exist "%VENV_PY%" (
 )
 
 REM --- 3. Dependencies -------------------------------------------------------
-echo [3/5] Installation des dependances ^(peut prendre plusieurs minutes^)...
+echo [3/6] Installation des dependances ^(peut prendre plusieurs minutes^)...
 "%VENV_PY%" -m pip install --upgrade pip
 "%VENV_PY%" -m pip install -r "%PROJECT_DIR%requirements.txt"
 if errorlevel 1 (
@@ -67,9 +69,9 @@ if errorlevel 1 (
 REM --- 4. cloudflared.exe ----------------------------------------------------
 if not exist "%WINDOWS_DIR%" mkdir "%WINDOWS_DIR%"
 if exist "%CLOUDFLARED%" (
-    echo [4/5] cloudflared.exe deja present.
+    echo [4/6] cloudflared.exe deja present.
 ) else (
-    echo [4/5] Telechargement de cloudflared.exe...
+    echo [4/6] Telechargement de cloudflared.exe...
     REM Paths/URL are passed via env vars so apostrophes in them cannot break
     REM the single-quoted PowerShell string.
     powershell -NoProfile -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri $env:CF_URL -OutFile $env:CLOUDFLARED } catch { Write-Host $_.Exception.Message; exit 1 }"
@@ -79,7 +81,7 @@ if exist "%CLOUDFLARED%" (
 )
 
 REM --- 5. Config dir (%USERPROFILE%\.osia) + mobile token --------------------
-echo [5/5] Configuration ^(%OSIA_HOME%^)...
+echo [5/6] Configuration ^(%OSIA_HOME%^)...
 if not exist "%OSIA_HOME%" mkdir "%OSIA_HOME%"
 REM Migrate any existing repo config\ files without overwriting newer ones.
 for %%F in (api_keys.json settings.json mobile_token.txt) do (
@@ -89,6 +91,14 @@ REM Ensure a mobile pairing token exists (writes %USERPROFILE%\.osia\mobile_toke
 REM PYTHONPATH guarantees `osia` is importable even if cd above failed.
 set "PYTHONPATH=%PROJECT_DIR%"
 "%VENV_PY%" -c "from osia.config import load_mobile_token, regenerate_mobile_token; print('Mobile token:', load_mobile_token() or regenerate_mobile_token())"
+
+REM --- 6. Background services (Scheduled Tasks) ------------------------------
+REM Register the mobile server + Cloudflare tunnel as per-user Scheduled Tasks
+REM that start at login and run independently of the OSIA GUI (the Windows
+REM equivalent of the Linux osia-server / osia-tunnel systemd units). They are
+REM also started now so a fresh install works without a re-login. Needs no admin.
+echo [6/6] Enregistrement des services en arriere-plan ^(serveur mobile + tunnel^)...
+"%VENV_PY%" -c "from osia.utils.systemd_manager import install_windows_services; print('Services:', 'OK' if install_windows_services() else 'partiel')"
 set "PYTHONPATH="
 
 echo.
