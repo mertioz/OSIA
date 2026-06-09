@@ -38,15 +38,18 @@ Protocol (JSON over WebSocket, port 8765):
                                      "ram_percent": float, "disk_percent": float,
                                      "cpu_temp": float|null, "gpu_temp": float|null,
                                      "timestamp": "<ISO>"}              # pushed every heartbeat_interval_seconds while heartbeat_enabled
-    {"type": "transcript",           "content": "..."}
-    {"type": "response_chunk",       "content": "..."}        # streamed sentence-by-sentence
-    {"type": "response",             "content": "..."}        # final assembled reply
-    {"type": "audio",                "format": "mp3", "data": "<base64>", "source": "response|speak"}
-    {"type": "status",               "content": "thinking|done|error"}
+    {"type": "transcript",           "content": "...", "conversation_id": "..."}
+    {"type": "response_chunk",       "content": "...", "conversation_id": "..."}  # streamed sentence-by-sentence
+    {"type": "response",             "content": "...", "conversation_id": "..."}  # final assembled reply
+    {"type": "audio",                "format": "mp3", "data": "<base64>", "source": "response|speak", "conversation_id": "..."}
+    {"type": "status",               "content": "thinking|done|error", "conversation_id": "..."}
+                                     # conversation_id (added WOR HOL fix): OPTIONAL routing hint on the per-turn frames
+                                     # above so a client can attach a backgrounded stream to the right conversation
+                                     # while viewing another. Absent on non-turn frames; old clients may ignore it.
     {"type": "conversations",        "items": [{id,title,created_at,updated_at,message_count}, ...]}
     {"type": "conversations_list",   "conversations": [{id,title}, ...]}  # compact list (≤50 most recent) for the mobile cron "linked conversation" picker
-    {"type": "conversation_history", "id": "...", "title": "...",
-                                     "messages": [{"role": "user|assistant", "content": "..."}]}
+    {"type": "conversation_history", "id": "...", "conversation_id": "...", "title": "...",
+                                     "messages": [{"role": "user|assistant", "content": "..."}]}  # conversation_id mirrors id (additive routing field)
     {"type": "conversation_deleted", "id": "...", "success": true|false}
     {"type": "active_conversation",  "id": "...", "title": "..."}
     {"type": "new_chat"}                                               # broadcast to OTHER connected devices when one device starts a new chat, so every UI clears (WOR-10)
@@ -558,15 +561,85 @@ def decode_base64_wav(b64_data: str) -> tuple[np.ndarray, int]:
 app = FastAPI(title="OSIA Mobile Server", version="1.0.0")
 
 
-# Registry of authenticated mobile WebSocket clients (WOR-10). Used to push
-# server-initiated frames — currently the "new chat" reset triggered either by
-# a mobile device or by the desktop app's voice command. Populated after a
-# successful auth, pruned on disconnect.
-_WS_CLIENTS: set[WebSocket] = set()
+# Registry of authenticated mobile clients (WOR-10). Holds each connection's
+# OUTBOUND CHANNEL (``_OutboundChannel``) — NOT the raw WebSocket — so a
+# server-initiated fan-out frame (e.g. the "new chat" reset) is funnelled
+# through that connection's single writer task instead of being sent from a
+# foreign coroutine (which would race the connection's own writer and corrupt
+# Starlette's send state). Populated after a successful auth, pruned on
+# disconnect.
+_WS_CLIENTS: set["_OutboundChannel"] = set()
 
 
-async def _broadcast_new_chat(exclude: WebSocket | None = None) -> None:
-    """Best-effort fan-out of {"type": "new_chat"} to all connected clients."""
+# Sentinel pushed onto an _OutboundChannel to tell its writer task to stop.
+_WRITER_STOP = object()
+
+
+class _OutboundChannel:
+    """Single-writer outbound funnel for ONE WebSocket connection.
+
+    Head-of-line fix: the per-connection handler is split into cooperating
+    tasks (the receive loop, one streaming task per turn, the heartbeat). Any
+    of them may want to emit a frame, but Starlette's ``WebSocket.send`` has no
+    internal lock — two coroutines sending concurrently corrupt the connection.
+    So NOBODY calls ``ws.send_*`` directly any more; every outbound frame is
+    enqueued here and a single dedicated writer task (``_writer``) performs the
+    real sends in FIFO order.
+
+    The public surface mirrors the subset of ``WebSocket`` the handlers use
+    (``send_json`` / ``send_text``), so a call site that previously held a
+    ``ws`` for sending can hold an ``_OutboundChannel`` instead with no other
+    change. ``put`` on an unbounded queue never blocks, so
+    ``await channel.send_json(...)`` returns immediately — it does NOT wait for
+    the network. That is exactly what keeps the receive loop free while a
+    response streams.
+    """
+
+    __slots__ = ("_queue",)
+
+    def __init__(self) -> None:
+        self._queue: asyncio.Queue = asyncio.Queue()
+
+    async def send_json(self, obj) -> None:
+        await self._queue.put(("json", obj))
+
+    async def send_text(self, text: str) -> None:
+        await self._queue.put(("text", text))
+
+    async def close(self) -> None:
+        """Signal the writer task to drain what's queued, then stop."""
+        await self._queue.put((_WRITER_STOP, None))
+
+
+async def _writer(ws: WebSocket, channel: "_OutboundChannel") -> None:
+    """Drain ``channel`` and perform the real WebSocket sends — the ONLY
+    coroutine that touches ``ws.send_*`` for this connection.
+
+    Exits when it pulls the stop sentinel (graceful close, after draining
+    everything queued before it) or when a send raises (the socket is gone;
+    the receive loop owns disconnect detection and teardown).
+    """
+    queue = channel._queue
+    while True:
+        kind, payload = await queue.get()
+        if kind is _WRITER_STOP:
+            return
+        try:
+            if kind == "json":
+                await ws.send_json(payload)
+            else:
+                await ws.send_text(payload)
+        except Exception as e:
+            print(f"[OSIA Server] writer send failed, stopping writer: {e}")
+            return
+
+
+async def _broadcast_new_chat(exclude: "_OutboundChannel | None" = None) -> None:
+    """Best-effort fan-out of {"type": "new_chat"} to all connected clients.
+
+    Enqueues onto each connection's outbound channel, so the actual send is
+    performed by that connection's own writer task (never from here).
+    """
     for client in list(_WS_CLIENTS):
         if client is exclude:
             continue
@@ -708,7 +781,7 @@ def _collect_heartbeat_data() -> dict:
     }
 
 
-async def _heartbeat_push_loop(ws: WebSocket) -> None:
+async def _heartbeat_push_loop(channel: "_OutboundChannel") -> None:
     """Push ``heartbeat_data`` frames to one authenticated client.
 
     Settings are re-read every tick so toggling ``heartbeat_enabled`` or
@@ -734,7 +807,7 @@ async def _heartbeat_push_loop(ws: WebSocket) -> None:
             if interval <= 0:
                 interval = 5.0
             if settings.get("heartbeat_enabled", False):
-                await ws.send_json(_collect_heartbeat_data())
+                await channel.send_json(_collect_heartbeat_data())
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
             raise
@@ -749,11 +822,20 @@ async def _heartbeat_push_loop(ws: WebSocket) -> None:
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     authenticated = False
+    # Single-writer funnel + its drain task. From here on, the receive loop,
+    # streaming tasks and the heartbeat NEVER call ``ws.send_*`` directly —
+    # they enqueue on ``out`` and ``writer_task`` does the real sends (so two
+    # tasks can't corrupt the connection with concurrent writes). The auth
+    # handshake and the restart ack are the only intentional exceptions (see
+    # the inline notes): they send on ``ws`` directly because no other sender
+    # is active yet / the process is about to be replaced.
+    out = _OutboundChannel()
+    writer_task: asyncio.Task = asyncio.create_task(_writer(ws, out))
     # Per-session state.
     # ``session_history`` is the OpenAI-format message list (sans system
     # prompt) handed to the agent each turn. ``active_conv_id`` is the
-    # conversation file currently being written to. Both reset on
-    # disconnect (function returns => GC).
+    # conversation file currently being VIEWED / targeted for new turns. Both
+    # reset on disconnect (function returns => GC).
     session_history: list = []
     active_conv_id: str | None = None
     # Files uploaded by the client that haven't been consumed by a turn yet.
@@ -762,6 +844,120 @@ async def websocket_endpoint(ws: WebSocket):
     # Live system-metrics push task (heartbeat_data frames). Created once after
     # a successful auth, cancelled in the finally block on disconnect.
     heartbeat_task: asyncio.Task | None = None
+
+    # ── Streaming-turn machinery (head-of-line fix) ──────────────────────
+    # A user message (text / audio / image) runs in a SEPARATE task so the
+    # receive loop stays free to answer lightweight control messages
+    # (load_conversation, …) within milliseconds, even while a long response
+    # is streaming. The persistence-target conversation is captured AT SPAWN
+    # TIME (passed by value into the turn), so a later load_conversation that
+    # re-points the *viewed* conversation can never redirect or corrupt an
+    # in-flight stream.
+    streaming_tasks: dict = {}
+
+    async def _ensure_active_conv(seed_text):
+        """Resolve the conversation a turn will run in, creating it NOW
+        (synchronously) when none is active.
+
+        This used to happen lazily inside ``_run_agent_and_respond`` AFTER the
+        agent run, which meant a brand-new conversation had no id at spawn
+        time. Spawning turns then keyed them under a synthetic placeholder and
+        left ``active_conv_id`` None until the turn finished — so two messages
+        sent into a fresh chat each created a SEPARATE conversation, and a
+        mid-stream delete/new-chat could not find the in-flight turn. Creating
+        the conversation here makes the id real at spawn time, so every turn is
+        keyed by its true id (serialised correctly) and reachable for
+        cancellation. Has NO ``await`` suspension point (queue puts don't
+        yield), so two back-to-back messages can't race into two conversations.
+
+        ``seed_text`` seeds a smart title when it's a string (text turns);
+        audio/image pass a non-string and fall back to the default title,
+        which ``conversations.add_message`` upgrades from the first persisted
+        user message just as before.
+
+        Returns the conversation id, or ``None`` if creation failed — the
+        creating disk write is wrapped so a transient failure aborts just this
+        turn (the caller skips the spawn) instead of tearing down the whole
+        connection, since this now runs in the receive-loop coroutine.
+        """
+        nonlocal active_conv_id, session_history
+        if active_conv_id is not None:
+            return active_conv_id
+        try:
+            seed_title = (conversations.smart_title(seed_text)
+                          if isinstance(seed_text, str) else None)
+            conv = conversations.create_conversation(title=seed_title)
+        except Exception as e:
+            print(f"[OSIA Server] create_conversation failed: {e}")
+            traceback.print_exc()
+            await out.send_json({"type": "status", "content": "error"})
+            return None
+        active_conv_id = conv["id"]
+        session_history = []
+        await out.send_json({
+            "type": "active_conversation",
+            "id": conv["id"],
+            "title": conv["title"],
+        })
+        # Defensive like the post-auth burst: a list failure must not abort
+        # the turn now that the conversation already exists.
+        try:
+            items = conversations.list_conversations()
+        except Exception as e:
+            print(f"[OSIA Server] list_conversations() failed post-create: {e}")
+            items = []
+        await out.send_json({
+            "type": "conversations",
+            "items": items,
+        })
+        return active_conv_id
+
+    async def _run_turn(conv_id, prev, make_coro):
+        nonlocal session_history, active_conv_id
+        # Serialise turns on the SAME conversation: wait for an earlier
+        # in-flight turn to finish so this one sees its result and the two
+        # never append to that conversation concurrently.
+        if prev is not None and not prev.done():
+            try:
+                await prev
+            except Exception:
+                pass
+        # Snapshot the working history for THIS conversation right before the
+        # turn runs — independent of whatever conversation is being viewed.
+        if active_conv_id == conv_id:
+            snapshot = list(session_history)
+        else:
+            conv = conversations.get_conversation(conv_id)
+            snapshot = list(conv.get("messages") or []) if conv else []
+        try:
+            new_history, result_conv_id = await make_coro(snapshot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[OSIA Server] streaming turn failed: {e}")
+            traceback.print_exc()
+            return
+        # Keep the in-memory pointer coherent ONLY when the user is still
+        # viewing this conversation. Otherwise the new messages live on disk
+        # and are reloaded on demand — the currently-viewed conversation is
+        # never clobbered by a background stream completing.
+        if result_conv_id is not None and active_conv_id == result_conv_id:
+            session_history = new_history
+
+    def _spawn_turn(conv_id, make_coro):
+        # conv_id is always a real id here (resolved via _ensure_active_conv
+        # before spawning), so the task is keyed by it: a follow-up turn on
+        # the same conversation chains after this one, and delete/disconnect
+        # can find and cancel it.
+        prev = streaming_tasks.get(conv_id)
+        task = asyncio.create_task(_run_turn(conv_id, prev, make_coro))
+        streaming_tasks[conv_id] = task
+
+        def _clear(t):
+            if streaming_tasks.get(conv_id) is t:
+                streaming_tasks.pop(conv_id, None)
+
+        task.add_done_callback(_clear)
 
     first_message_logged = False
     try:
@@ -775,7 +971,14 @@ async def websocket_endpoint(ws: WebSocket):
                 msg = json.loads(raw_msg)
             except json.JSONDecodeError:
                 print(f"[WS] bad JSON frame (not closing): {repr(raw_msg)[:120]}")
-                await ws.send_json({"type": "status", "content": "error"})
+                # Post-auth, funnel through the writer (heartbeat/streams may be
+                # sending). Pre-auth there is no other sender AND the auth burst
+                # below sends on ws directly — so send directly too, never
+                # queuing a frame the writer could race against that burst.
+                if authenticated:
+                    await out.send_json({"type": "status", "content": "error"})
+                else:
+                    await ws.send_json({"type": "status", "content": "error"})
                 continue
 
             msg_type = msg.get("type", "")
@@ -800,13 +1003,22 @@ async def websocket_endpoint(ws: WebSocket):
                     session_history = []
                     active_conv_id = None
                     # Track this client so server-initiated frames (e.g. a
-                    # "new chat" reset) can reach it (WOR-10).
-                    _WS_CLIENTS.add(ws)
+                    # "new chat" reset) can reach it (WOR-10) — register the
+                    # outbound CHANNEL, not the raw socket, so broadcasts go
+                    # through this connection's writer.
+                    _WS_CLIENTS.add(out)
                     # Send the first data frames the mobile app expects right
                     # after auth. Build the conversation list DEFENSIVELY: a
                     # failure here must not silently tear down a freshly
                     # authenticated socket (that looked like "open -> closed
                     # instantly even with a valid token").
+                    #
+                    # The post-auth burst (status/done + conversation LIST) is
+                    # sent on ``ws`` DIRECTLY and unchanged: at this point no
+                    # other coroutine sends (the heartbeat is started just
+                    # below, the writer is idle), so there is no concurrency to
+                    # funnel and the historically delicate auth handshake stays
+                    # byte-for-byte as before.
                     await ws.send_json({"type": "status", "content": "done"})
                     print("[WS] auth OK, sending: status/done")
                     try:
@@ -829,13 +1041,16 @@ async def websocket_endpoint(ws: WebSocket):
                     print("[OSIA Server] Mobile client authenticated.")
                     # Start the live system-metrics push for this client. The
                     # loop self-gates on heartbeat_enabled; guard against a
-                    # stray second auth frame spawning a duplicate loop.
+                    # stray second auth frame spawning a duplicate loop. It
+                    # sends through ``out`` so it never races the writer.
                     if heartbeat_task is None:
                         heartbeat_task = asyncio.create_task(
-                            _heartbeat_push_loop(ws)
+                            _heartbeat_push_loop(out)
                         )
                 else:
                     print("[WS] closing connection, reason: invalid token")
+                    # Terminal pre-auth path: send directly then close, so the
+                    # error frame is flushed before the socket is torn down.
                     await ws.send_json({"type": "status", "content": "error"})
                     await ws.close(code=4001, reason="Invalid token")
                     return
@@ -847,13 +1062,14 @@ async def websocket_endpoint(ws: WebSocket):
                     "[WS] closing connection, reason: not authenticated "
                     f"(first msg_type={msg_type!r}, expected 'auth')"
                 )
+                # Terminal pre-auth path: direct send then close (see above).
                 await ws.send_json({"type": "status", "content": "error"})
                 await ws.close(code=4001, reason="Not authenticated")
                 return
 
             # --- Conversation management ---
             if msg_type == "list_conversations":
-                await ws.send_json({
+                await out.send_json({
                     "type": "conversations",
                     "items": conversations.list_conversations(),
                 })
@@ -864,7 +1080,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # conversation" picker (WOR-24). list_conversations() is already
                 # sorted by updated_at descending; cap at the 50 most recent.
                 recent = conversations.list_conversations()[:50]
-                await ws.send_json({
+                await out.send_json({
                     "type": "conversations_list",
                     "conversations": [
                         {"id": c.get("id"), "title": c.get("title")}
@@ -885,12 +1101,12 @@ async def websocket_endpoint(ws: WebSocket):
                     f"[OSIA Server] New conversation: {active_conv_id} "
                     f"(title={conv['title']!r})"
                 )
-                await ws.send_json({
+                await out.send_json({
                     "type": "active_conversation",
                     "id": conv["id"],
                     "title": conv["title"],
                 })
-                await ws.send_json({
+                await out.send_json({
                     "type": "conversations",
                     "items": conversations.list_conversations(),
                 })
@@ -908,16 +1124,16 @@ async def websocket_endpoint(ws: WebSocket):
                     f"[OSIA Server] new_chat from mobile → reset, "
                     f"new conv {active_conv_id}"
                 )
-                await ws.send_json({
+                await out.send_json({
                     "type": "active_conversation",
                     "id": conv["id"],
                     "title": conv["title"],
                 })
-                await ws.send_json({
+                await out.send_json({
                     "type": "conversations",
                     "items": conversations.list_conversations(),
                 })
-                await _broadcast_new_chat(exclude=ws)
+                await _broadcast_new_chat(exclude=out)
                 continue
 
             if msg_type == "restart_server":
@@ -926,11 +1142,19 @@ async def websocket_endpoint(ws: WebSocket):
                 # re-exec the same interpreter + argv; os.execv replaces this
                 # process image, so nothing after the call runs.
                 print("[OSIA Server] restart_server requested → re-exec")
-                await ws.send_json({
+                await out.send_json({
                     "type": "status",
                     "status": "done",
                     "message": "restarting",
                 })
+                # Drain the writer so the ack actually leaves the socket before
+                # os.execv replaces this process image (nothing after execv
+                # runs). Best-effort: a dead socket just makes the writer exit.
+                try:
+                    await out.close()
+                    await writer_task
+                except Exception:
+                    pass
                 if sys.platform == "win32":
                     # os.execv on Windows does not reliably replace the process
                     # image; spawn a detached new process and exit instead.
@@ -947,17 +1171,26 @@ async def websocket_endpoint(ws: WebSocket):
                 conv_id = msg.get("id", "")
                 conv = conversations.get_conversation(conv_id)
                 if conv is None:
-                    await ws.send_json({
+                    await out.send_json({
                         "type": "status",
                         "content": "error",
                         "message": f"conversation {conv_id!r} not found",
                     })
                     continue
+                # Re-point the VIEW only. Any in-flight stream keeps writing to
+                # the conversation it captured at spawn — switching the view
+                # here can't redirect or corrupt it. Served immediately even
+                # mid-stream because the receive loop is no longer blocked.
                 active_conv_id = conv_id
                 session_history = list(conv.get("messages") or [])
-                await ws.send_json({
+                await out.send_json({
                     "type": "conversation_history",
                     "id": conv_id,
+                    # Additive routing field (mirrors response_chunk/done) so a
+                    # client can match this history to a conversation tab even
+                    # while another conversation is streaming. Old clients that
+                    # only read "id" keep working.
+                    "conversation_id": conv_id,
                     "title": conv.get("title"),
                     "messages": _displayable_history(session_history),
                 })
@@ -965,11 +1198,16 @@ async def websocket_endpoint(ws: WebSocket):
 
             if msg_type == "delete_conversation":
                 conv_id = msg.get("id", "")
+                # Cancel an in-flight stream for this conversation (if any) so
+                # it stops persisting to a file we're about to remove.
+                doomed = streaming_tasks.pop(conv_id, None)
+                if doomed is not None:
+                    doomed.cancel()
                 ok = conversations.delete_conversation(conv_id)
                 if active_conv_id == conv_id:
                     active_conv_id = None
                     session_history = []
-                await ws.send_json({
+                await out.send_json({
                     "type": "conversation_deleted",
                     "id": conv_id,
                     "success": ok,
@@ -986,7 +1224,7 @@ async def websocket_endpoint(ws: WebSocket):
                 except Exception as e:
                     print(f"[OSIA Server] get_models failed: {e}")
                     models, current = [], None
-                await ws.send_json({
+                await out.send_json({
                     "type": "models_list",
                     "models": models,
                     "current": current,
@@ -996,16 +1234,16 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "set_model":
                 model_id = (msg.get("model") or "").strip()
                 if not model_id:
-                    await ws.send_json({"type": "status", "content": "error"})
+                    await out.send_json({"type": "status", "content": "error"})
                     continue
                 try:
                     from osia.config import set_setting
                     set_setting("selected_model", model_id)
                     print(f"[OSIA Server] selected_model -> {model_id!r}")
-                    await ws.send_json({"type": "status", "content": "done"})
+                    await out.send_json({"type": "status", "content": "done"})
                 except Exception as e:
                     print(f"[OSIA Server] set_model({model_id!r}) failed: {e}")
-                    await ws.send_json({"type": "status", "content": "error"})
+                    await out.send_json({"type": "status", "content": "error"})
                 continue
 
             # --- API keys & settings (mobile "Configure APIs & Providers") ---
@@ -1017,7 +1255,7 @@ async def websocket_endpoint(ws: WebSocket):
                 provider = (msg.get("provider") or "").strip().lower()
                 key = (msg.get("key") or "").strip()
                 if not provider:
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                     continue
                 try:
                     from osia.config import (
@@ -1040,10 +1278,10 @@ async def websocket_endpoint(ws: WebSocket):
                             f"[OSIA Server] set_api_key provider={provider!r} "
                             f"(empty -> deleted)"
                         )
-                    await ws.send_json({"type": "status", "status": "done"})
+                    await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
                     print(f"[OSIA Server] set_api_key({provider!r}) failed: {e}")
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                 continue
 
             # delete_api_key removes a provider's key entirely from the canonical
@@ -1052,7 +1290,7 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "delete_api_key":
                 provider = (msg.get("provider") or "").strip().lower()
                 if not provider:
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                     continue
                 try:
                     from osia.config import load_api_keys, save_api_keys
@@ -1063,10 +1301,10 @@ async def websocket_endpoint(ws: WebSocket):
                         f"[OSIA Server] delete_api_key provider={provider!r} "
                         f"({'removed' if existed else 'absent'})"
                     )
-                    await ws.send_json({"type": "status", "status": "done"})
+                    await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
                     print(f"[OSIA Server] delete_api_key({provider!r}) failed: {e}")
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                 continue
 
             # --- API fallback keys (mobile fallback-keys editor, WOR-29) ---
@@ -1088,7 +1326,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # can't slip through as index 1/0 and clobber the wrong slot.
                 if (not provider or isinstance(index, bool)
                         or not isinstance(index, int) or not key):
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                     continue
                 try:
                     from osia.config import get_setting, set_setting
@@ -1103,7 +1341,7 @@ async def websocket_endpoint(ws: WebSocket):
                             f"[OSIA Server] set_api_fallback_key provider={provider!r} "
                             f"rejected out-of-range index={index} (len={len(chain)})"
                         )
-                        await ws.send_json({"type": "status", "status": "error"})
+                        await out.send_json({"type": "status", "status": "error"})
                         continue
                     fallbacks[provider] = chain
                     set_setting("api_key_fallbacks", fallbacks)
@@ -1111,12 +1349,12 @@ async def websocket_endpoint(ws: WebSocket):
                         f"[OSIA Server] set_api_fallback_key provider={provider!r} "
                         f"index={index} ({len(chain)} keys, len={len(key)})"
                     )
-                    await ws.send_json({"type": "status", "status": "done"})
+                    await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
                     print(
                         f"[OSIA Server] set_api_fallback_key({provider!r}) failed: {e}"
                     )
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                 continue
 
             # delete_api_fallback_key removes the fallback key at ``index`` for the
@@ -1129,7 +1367,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # bool is an int subclass: reject JSON true/false explicitly so it
                 # can't slip through as index 1/0 and delete the wrong slot.
                 if not provider or isinstance(index, bool) or not isinstance(index, int):
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                     continue
                 try:
                     from osia.config import get_setting, set_setting
@@ -1140,7 +1378,7 @@ async def websocket_endpoint(ws: WebSocket):
                             f"[OSIA Server] delete_api_fallback_key provider={provider!r} "
                             f"rejected out-of-range index={index} (len={len(chain)})"
                         )
-                        await ws.send_json({"type": "status", "status": "error"})
+                        await out.send_json({"type": "status", "status": "error"})
                         continue
                     chain.pop(index)
                     if chain:
@@ -1152,12 +1390,12 @@ async def websocket_endpoint(ws: WebSocket):
                         f"[OSIA Server] delete_api_fallback_key provider={provider!r} "
                         f"index={index} ({len(chain)} keys left)"
                     )
-                    await ws.send_json({"type": "status", "status": "done"})
+                    await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
                     print(
                         f"[OSIA Server] delete_api_fallback_key({provider!r}) failed: {e}"
                     )
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                 continue
 
             if msg_type == "set_setting":
@@ -1186,7 +1424,7 @@ async def websocket_endpoint(ws: WebSocket):
                         f"[OSIA Server] set_setting rejected non-whitelisted "
                         f"key={setting_key!r}"
                     )
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                     continue
                 try:
                     from osia.config import set_setting, get_setting
@@ -1211,10 +1449,10 @@ async def websocket_endpoint(ws: WebSocket):
                         f"[OSIA Server] set_setting {setting_key!r} -> "
                         f"{setting_value!r}"
                     )
-                    await ws.send_json({"type": "status", "status": "done"})
+                    await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
                     print(f"[OSIA Server] set_setting({setting_key!r}) failed: {e}")
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                 continue
 
             # --- Config snapshot (mobile "OSIA / Personality / Skills" screen) ---
@@ -1253,7 +1491,7 @@ async def websocket_endpoint(ws: WebSocket):
                     cfg["api_keys_set"] = {
                         p: bool(k) for p, k in load_api_keys().items()
                     }
-                    await ws.send_json({"type": "config", "config": cfg})
+                    await out.send_json({"type": "config", "config": cfg})
                     print(
                         f"[OSIA Server] get_config sent "
                         f"({len(cfg.get('skills', []))} skills)"
@@ -1261,7 +1499,7 @@ async def websocket_endpoint(ws: WebSocket):
                 except Exception as e:
                     print(f"[OSIA Server] get_config failed: {e}")
                     traceback.print_exc()
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                 continue
 
             # --- API keys (mobile "Configure APIs & Providers" editor) ---
@@ -1275,14 +1513,14 @@ async def websocket_endpoint(ws: WebSocket):
                     from osia.config import get_api_key
                     from osia.models import API_PROVIDERS
                     keys = {p: get_api_key(p) for p in API_PROVIDERS}
-                    await ws.send_json({"type": "api_keys", "keys": keys})
+                    await out.send_json({"type": "api_keys", "keys": keys})
                     print(
                         f"[OSIA Server] get_api_keys sent "
                         f"({sum(1 for v in keys.values() if v)}/{len(keys)} set)"
                     )
                 except Exception as e:
                     print(f"[OSIA Server] get_api_keys failed: {e}")
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                 continue
 
             # --- Heartbeat config (mobile live-metrics screen) ---
@@ -1297,7 +1535,7 @@ async def websocket_endpoint(ws: WebSocket):
                         interval = int(s.get("heartbeat_interval_seconds", 5) or 5)
                     except (TypeError, ValueError):
                         interval = 5
-                    await ws.send_json({
+                    await out.send_json({
                         "type": "heartbeat_config",
                         "config": {
                             "enabled": bool(s.get("heartbeat_enabled", False)),
@@ -1307,7 +1545,7 @@ async def websocket_endpoint(ws: WebSocket):
                     print("[OSIA Server] get_heartbeat_config sent")
                 except Exception as e:
                     print(f"[OSIA Server] get_heartbeat_config failed: {e}")
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                 continue
 
             # --- Personality document ---
@@ -1322,10 +1560,10 @@ async def websocket_endpoint(ws: WebSocket):
                         f"[OSIA Server] set_personality "
                         f"({len(persona_text)} chars)"
                     )
-                    await ws.send_json({"type": "status", "status": "done"})
+                    await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
                     print(f"[OSIA Server] set_personality failed: {e}")
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                 continue
 
             # --- Skills: update / create / delete ---
@@ -1336,7 +1574,7 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "set_skill":
                 skill_name = (msg.get("name") or "").strip()
                 if not skill_name:
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                     continue
                 try:
                     from osia import personality
@@ -1351,45 +1589,45 @@ async def websocket_endpoint(ws: WebSocket):
                         f"text={'text' in msg} "
                         f"enabled={msg.get('enabled') if 'enabled' in msg else '—'}"
                     )
-                    await ws.send_json({"type": "status", "status": "done"})
+                    await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
                     print(f"[OSIA Server] set_skill({skill_name!r}) failed: {e}")
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                 continue
 
             if msg_type == "create_skill":
                 skill_name = (msg.get("name") or "").strip()
                 if not skill_name:
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                     continue
                 try:
                     from osia import personality
                     created = personality.create_skill(skill_name)
                     if not created:
-                        await ws.send_json({"type": "status", "status": "error"})
+                        await out.send_json({"type": "status", "status": "error"})
                         continue
                     print(f"[OSIA Server] create_skill -> {created!r}")
-                    await ws.send_json({
+                    await out.send_json({
                         "type": "status", "status": "done", "name": created,
                     })
                 except Exception as e:
                     print(f"[OSIA Server] create_skill({skill_name!r}) failed: {e}")
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                 continue
 
             if msg_type == "delete_skill":
                 skill_name = (msg.get("name") or "").strip()
                 if not skill_name:
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                     continue
                 try:
                     from osia import personality
                     personality.delete_skill(skill_name)
                     print(f"[OSIA Server] delete_skill name={skill_name!r}")
-                    await ws.send_json({"type": "status", "status": "done"})
+                    await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
                     print(f"[OSIA Server] delete_skill({skill_name!r}) failed: {e}")
-                    await ws.send_json({"type": "status", "status": "error"})
+                    await out.send_json({"type": "status", "status": "error"})
                 continue
 
             # --- Speak on demand (read-aloud button on the phone) ---
@@ -1415,7 +1653,7 @@ async def websocket_endpoint(ws: WebSocket):
                     # source="speak" tells the client this audio was
                     # explicitly requested, so it plays even when the
                     # auto-TTS preference is off.
-                    await ws.send_json({
+                    await out.send_json({
                         "type": "audio",
                         "format": "mp3",
                         "data": mp3_b64,
@@ -1438,7 +1676,7 @@ async def websocket_endpoint(ws: WebSocket):
                 filename = (msg.get("filename") or "upload.bin").strip()
                 b64_data = msg.get("data", "")
                 if not b64_data:
-                    await ws.send_json({
+                    await out.send_json({
                         "type": "file_received",
                         "filename": filename,
                         "path": "",
@@ -1461,7 +1699,7 @@ async def websocket_endpoint(ws: WebSocket):
                         f"[OSIA Server] file received: {safe_name!r} -> {target} "
                         f"({target.stat().st_size} bytes)"
                     )
-                    await ws.send_json({
+                    await out.send_json({
                         "type": "file_received",
                         "filename": safe_name,
                         "path": str(target),
@@ -1482,12 +1720,21 @@ async def websocket_endpoint(ws: WebSocket):
                             f"[OSIA Server] image upload — triggering vision agent "
                             f"({image_mime}, {len(img_b64)} b64 chars)"
                         )
-                        session_history, active_conv_id = await _run_agent_and_respond(
-                            ws, vision_content, session_history, active_conv_id,
-                        )
+                        # Run the vision turn in its own task so the receive
+                        # loop stays responsive while the model analyses the
+                        # image (same head-of-line fix as text/audio). Resolve
+                        # the conversation FIRST so the turn is keyed by a real
+                        # id (no synthetic placeholder, no duplicate-conv race).
+                        _conv = await _ensure_active_conv(vision_content)
+                        if _conv is not None:
+                            _spawn_turn(
+                                _conv,
+                                lambda snap, _vc=vision_content, _c=_conv:
+                                    _run_agent_and_respond(out, _vc, snap, _c),
+                            )
                 except Exception as e:
                     print(f"[OSIA Server] file upload failed: {e}")
-                    await ws.send_json({
+                    await out.send_json({
                         "type": "file_received",
                         "filename": filename,
                         "path": "",
@@ -1500,10 +1747,19 @@ async def websocket_endpoint(ws: WebSocket):
                 user_text = msg.get("content", "").strip()
                 if not user_text:
                     continue
+                # Consume pending files synchronously (clears the shared list)
+                # so this turn — and only this turn — carries them. Resolve the
+                # conversation synchronously (creating it on the first message)
+                # so the turn is keyed by a real id, then run the agent in its
+                # own task so the receive loop stays free.
                 user_text = _consume_pending_files(user_text, pending_files)
-                session_history, active_conv_id = await _run_agent_and_respond(
-                    ws, user_text, session_history, active_conv_id,
-                )
+                _conv = await _ensure_active_conv(user_text)
+                if _conv is not None:
+                    _spawn_turn(
+                        _conv,
+                        lambda snap, _t=user_text, _c=_conv:
+                            _run_agent_and_respond(out, _t, snap, _c),
+                    )
 
             # --- Audio message ---
             elif msg_type == "audio":
@@ -1511,14 +1767,28 @@ async def websocket_endpoint(ws: WebSocket):
                 audio_format = msg.get("format", "wav")
                 if not b64_data:
                     continue
-                session_history, active_conv_id = await _handle_audio(
-                    ws, b64_data, audio_format,
-                    session_history, active_conv_id,
-                    pending_files=pending_files,
-                )
+                # Snapshot + clear pending files at spawn time so they attach
+                # to THIS turn regardless of uploads that arrive during STT.
+                _pf = list(pending_files)
+                pending_files.clear()
+                # Resolve the conversation synchronously (default title; the
+                # transcript upgrades it on first persist) so concurrent first
+                # messages serialise into ONE conversation.
+                # TRADE-OFF (accepted): a silent/blank first recording now
+                # leaves an empty conversation, since the id is reserved before
+                # STT runs. This is the cost of having a real id at spawn time
+                # (which fixes the duplicate-conversation race); the stray conv
+                # is harmless and reused by the next real message.
+                _conv = await _ensure_active_conv(None)
+                if _conv is not None:
+                    _spawn_turn(
+                        _conv,
+                        lambda snap, _b=b64_data, _f=audio_format, _c=_conv, _files=_pf:
+                            _handle_audio(out, _b, _f, snap, _c, pending_files=_files),
+                    )
 
             else:
-                await ws.send_json({"type": "status", "content": "error"})
+                await out.send_json({"type": "status", "content": "error"})
 
     except WebSocketDisconnect:
         print("[WS] closing connection, reason: client disconnected (WebSocketDisconnect)")
@@ -1527,14 +1797,28 @@ async def websocket_endpoint(ws: WebSocket):
         print(f"[WS] closing connection, reason: unexpected exception: {e!r}")
         print(f"[OSIA Server] Unexpected error: {e}")
         traceback.print_exc()
+        # Terminal teardown notice. Enqueue on the writer (NOT a direct ws
+        # send) so it never races an in-flight streaming write on the same
+        # socket; the finally block drains the writer, flushing this frame.
         try:
-            await ws.send_json({"type": "status", "content": "error"})
+            await out.send_json({"type": "status", "content": "error"})
         except Exception:
             pass
     finally:
         # Drop this client from the broadcast registry (WOR-10). discard() is
         # a no-op if it was never added (e.g. auth failed).
-        _WS_CLIENTS.discard(ws)
+        _WS_CLIENTS.discard(out)
+        # Cancel any in-flight streaming turns for this connection (WOR HOL
+        # fix). Each captured its own conversation target, so cancelling here
+        # only stops the dispatch — anything already persisted stays on disk.
+        for _task in list(streaming_tasks.values()):
+            _task.cancel()
+        for _task in list(streaming_tasks.values()):
+            try:
+                await _task
+            except (asyncio.CancelledError, Exception):
+                pass
+        streaming_tasks.clear()
         # Stop this client's live heartbeat push (no-op if never started).
         # Cancel then await so the task unwinds cleanly without a pending-task
         # warning; CancelledError on the await is expected.
@@ -1544,6 +1828,16 @@ async def websocket_endpoint(ws: WebSocket):
                 await heartbeat_task
             except (asyncio.CancelledError, Exception):
                 pass
+        # Stop the single writer last: drain whatever is still queued, then
+        # exit. On a dead socket the writer simply errors out and returns.
+        try:
+            await out.close()
+        except Exception:
+            pass
+        try:
+            await writer_task
+        except (asyncio.CancelledError, Exception):
+            pass
         # State is local to this function; on return it is garbage-collected.
         session_history = []
         active_conv_id = None
@@ -1681,7 +1975,7 @@ def _persist_new_messages(conv_id: str | None, full_history: list,
 # ---------------------------------------------------------------------------
 # Message handlers
 # ---------------------------------------------------------------------------
-async def _run_agent_and_respond(ws: WebSocket, text, history: list,
+async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                                  active_conv_id: str | None,
                                  *, t0: float | None = None) -> tuple[list, str]:
     """Run the agent with the given conversation history, persist the
@@ -1691,6 +1985,14 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
     Returns ``(updated_history, active_conv_id)``. If no conversation
     was active a new one is created (with a smart keyword title seeded
     from ``text``) so every interaction lives in a persisted file.
+
+    ``ws`` here is the per-connection OUTBOUND CHANNEL (``_OutboundChannel``),
+    NOT the raw WebSocket: it exposes ``send_json``/``send_text`` and funnels
+    every frame through the single writer task. The agent run itself is
+    unchanged — only how its output frames reach the socket. Every outgoing
+    frame carries ``conversation_id`` (the captured persistence target) so the
+    client can route a backgrounded stream to the right conversation even while
+    the user is viewing another one.
 
     ``t0`` is a ``time.perf_counter()`` reference for latency logging.
     The audio path passes its own t0 (set when the audio frame arrived)
@@ -1712,6 +2014,12 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
     # seeded with a smart keyword title so the sidebar reads naturally
     # right away. Also push a refreshed conversation list so any
     # subscribed UI updates immediately.
+    #
+    # DEFENSIVE FALLBACK ONLY: the live receive-loop flow resolves the
+    # conversation via ``_ensure_active_conv`` BEFORE spawning the turn, so
+    # ``active_conv_id`` is never None here in normal operation. This block is
+    # kept so the function stays correct if ever called with no conversation
+    # (it is the SOLE other creation path — they do not both run for one turn).
     if active_conv_id is None:
         seed_title = conversations.smart_title(text)
         conv = conversations.create_conversation(title=seed_title)
@@ -1730,7 +2038,10 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
 
     # Status: thinking (single small send before the agent kicks off —
     # cheap, fire-and-forget effectively, mobile uses it for UI state).
-    await ws.send_json({"type": "status", "content": "thinking"})
+    await ws.send_json({
+        "type": "status", "content": "thinking",
+        "conversation_id": active_conv_id,
+    })
 
     # ── Streaming plumbing ────────────────────────────────────────────
     # The agent runs in a worker thread (so it doesn't block the event
@@ -1787,8 +2098,16 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
                     f"({len(item)} chars: {item[:60]!r})")
             try:
                 print(f"[DEBUG] sending to mobile: {repr(item[:200])}", flush=True)
-                await ws.send_json({"type": "response_chunk", "content": item})
+                await ws.send_json({
+                    "type": "response_chunk", "content": item,
+                    "conversation_id": active_conv_id,
+                })
                 sent_chunks.append(item)
+                # Yield to the event loop after every chunk. Enqueuing a frame
+                # does NOT itself yield (unbounded queue put returns straight
+                # away), so without this the sender could monopolise the loop
+                # and starve the writer / receive loop — defeating the HOL fix.
+                await asyncio.sleep(0)
             except Exception as e:
                 print(f"[OSIA Server] response_chunk send failed: {e}")
                 return
@@ -1838,6 +2157,18 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
             f"[DEBUG] agent.run() returned: {repr((response_text or '')[:200])}",
             flush=True,
         )
+    except asyncio.CancelledError:
+        # Turn cancelled (client disconnected, or the conversation was
+        # deleted/superseded mid-stream). The agent worker thread is
+        # uncancellable and keeps feeding chunk_queue, so reap the child
+        # sender task explicitly here — `except Exception` below does NOT
+        # catch CancelledError — then propagate the cancellation.
+        sender_task.cancel()
+        try:
+            await sender_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        raise
     except Exception as e:
         print(f"[OSIA Server] Agent error: {e}")
         traceback.print_exc()
@@ -1849,8 +2180,14 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
                 pass
         await chunk_queue.put(_SENTINEL)
         await sender_task
-        await ws.send_json({"type": "response", "content": f"Erreur: {e}"})
-        await ws.send_json({"type": "status", "content": "error"})
+        await ws.send_json({
+            "type": "response", "content": f"Erreur: {e}",
+            "conversation_id": active_conv_id,
+        })
+        await ws.send_json({
+            "type": "status", "content": "error",
+            "conversation_id": active_conv_id,
+        })
         return history, active_conv_id
 
     # Wait for every scheduled put to actually land in the queue before
@@ -1901,7 +2238,10 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
             if tail:
                 try:
                     print(f"[DEBUG] sending to mobile: {repr(tail[:200])}", flush=True)
-                    await ws.send_json({"type": "response_chunk", "content": tail})
+                    await ws.send_json({
+                        "type": "response_chunk", "content": tail,
+                        "conversation_id": active_conv_id,
+                    })
                     sent_chunks.append(tail)
                     _ts(t0, "tail response_chunk flushed",
                         f"({len(tail)} chars: {tail[:60]!r})")
@@ -1972,6 +2312,7 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
                 )
                 await ws.send_json({
                     "type": "response_chunk", "content": response_text,
+                    "conversation_id": active_conv_id,
                 })
                 sent_chunks.append(response_text)
             except Exception as e:
@@ -1980,7 +2321,10 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
     # Send the canonical full text once (clients that don't track chunks
     # can rely on this; clients that do can ignore it).
     print(f"[DEBUG] sending to mobile: {repr(response_text[:200])}", flush=True)
-    await ws.send_json({"type": "response", "content": response_text})
+    await ws.send_json({
+        "type": "response", "content": response_text,
+        "conversation_id": active_conv_id,
+    })
 
     # Synthesize TTS off-thread so the event loop keeps serving.
     try:
@@ -2005,6 +2349,7 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
             "format": "mp3",
             "data": mp3_b64,
             "source": "response",
+            "conversation_id": active_conv_id,
         })
         _ts(t0, "first audio chunk sent to mobile", f"({len(mp3_bytes)} bytes)")
     except Exception as e:
@@ -2014,18 +2359,26 @@ async def _run_agent_and_respond(ws: WebSocket, text, history: list,
     # Brief settle so any chunks still in flight on the WebSocket land
     # before the client sees `done` and tears down the streaming UI.
     await asyncio.sleep(0.2)
-    await ws.send_json({"type": "status", "content": "done"})
+    await ws.send_json({
+        "type": "status", "content": "done",
+        "conversation_id": active_conv_id,
+    })
     _ts(t0, "request complete")
     return new_history, active_conv_id
 
 
-async def _handle_audio(ws: WebSocket, b64_data: str, audio_format: str,
+async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str,
                         history: list,
                         active_conv_id: str | None,
                         *, pending_files: list[str] | None = None) -> tuple[list, str | None]:
     """Process an audio command: transcribe, then run the agent on the
     transcript using the SAME path as text commands (so tools execute
     identically and the transcript ends up in the same conversation).
+
+    ``ws`` is the per-connection OUTBOUND CHANNEL (``_OutboundChannel``), not
+    the raw WebSocket — see ``_run_agent_and_respond``. Lifecycle frames carry
+    ``conversation_id`` for client-side routing (``None`` until a conversation
+    exists, which is fine: there is nothing to route to yet).
 
     Latency-optimized:
       * Whisper inference runs off-thread (``asyncio.to_thread``) so
@@ -2041,14 +2394,23 @@ async def _handle_audio(ws: WebSocket, b64_data: str, audio_format: str,
     _ts(t0, "audio received", f"({len(b64_data)} b64 chars, format={audio_format})")
 
     # Status: thinking
-    await ws.send_json({"type": "status", "content": "thinking"})
+    await ws.send_json({
+        "type": "status", "content": "thinking",
+        "conversation_id": active_conv_id,
+    })
 
     try:
         # Decode and resample
         audio, sr = decode_base64_wav(b64_data)
         if audio.size == 0 or float(np.max(np.abs(audio))) < 0.01:
-            await ws.send_json({"type": "transcript", "content": ""})
-            await ws.send_json({"type": "status", "content": "done"})
+            await ws.send_json({
+                "type": "transcript", "content": "",
+                "conversation_id": active_conv_id,
+            })
+            await ws.send_json({
+                "type": "status", "content": "done",
+                "conversation_id": active_conv_id,
+            })
             _ts(t0, "silent audio — short-circuit done")
             return history, active_conv_id
 
@@ -2062,17 +2424,26 @@ async def _handle_audio(ws: WebSocket, b64_data: str, audio_format: str,
             f"({len(transcript)} chars: {transcript[:60]!r})")
 
         if not transcript.strip():
-            await ws.send_json({"type": "transcript", "content": ""})
-            await ws.send_json({"type": "status", "content": "done"})
+            await ws.send_json({
+                "type": "transcript", "content": "",
+                "conversation_id": active_conv_id,
+            })
+            await ws.send_json({
+                "type": "status", "content": "done",
+                "conversation_id": active_conv_id,
+            })
             return history, active_conv_id
 
         # Fire transcript send in parallel with the agent start — don't
-        # await it. The send is just an enqueue onto the WebSocket's
-        # outgoing buffer, so it lands long before the agent's first
-        # response_chunk, but starting the agent immediately saves the
-        # ~1-50 ms a real-network round-trip would otherwise cost.
+        # await it. The send is just an enqueue onto the outbound channel,
+        # so it lands long before the agent's first response_chunk, but
+        # starting the agent immediately saves the ~1-50 ms a real-network
+        # round-trip would otherwise cost.
         transcript_send = asyncio.create_task(
-            ws.send_json({"type": "transcript", "content": transcript})
+            ws.send_json({
+                "type": "transcript", "content": transcript,
+                "conversation_id": active_conv_id,
+            })
         )
 
         agent_input = transcript
@@ -2094,7 +2465,10 @@ async def _handle_audio(ws: WebSocket, b64_data: str, audio_format: str,
     except Exception as e:
         print(f"[OSIA Server] Audio processing error: {e}")
         traceback.print_exc()
-        await ws.send_json({"type": "status", "content": "error"})
+        await ws.send_json({
+            "type": "status", "content": "error",
+            "conversation_id": active_conv_id,
+        })
         return history, active_conv_id
 
 
