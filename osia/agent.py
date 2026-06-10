@@ -676,6 +676,16 @@ def tool_open_application(name: str) -> str:
     wired — we fall through and launch as usual (no regression, no false error).
     This also removes the edge case where an already-open+focused app timed out in
     the post-launch window wait.
+
+    After a launch, the post-launch wait is ACTIVE on Windows (WOR-50 follow-up
+    #3): the new window is looked up by owning process (find_app_window — sees
+    BACKGROUND windows too) and raised + focus-confirmed (focus_app_window) the
+    moment it exists, so an app that opens behind other windows is brought to the
+    foreground instead of timing out into a false ERROR while a following
+    take_screenshot/desktop_click hits whatever window stayed in front. Apps whose
+    process name doesn't match the launch token (UWP frame hosts, `start`-style
+    indirections) are still caught by the interleaved passive foreground watcher
+    (wait_for_app_window, unchanged); Linux/Mac keep the passive wait only.
     """
     # Already open? Focus the existing window instead of relaunching.
     try:
@@ -762,7 +772,44 @@ def tool_open_application(name: str) -> str:
         # (mirrors the false-success guard above).
         try:
             from osia.tools import desktop_control as _dc
-            status, detail = _dc.wait_for_app_window(_before_fg)
+            if sys.platform == "win32":
+                # ACTIVE raise (WOR-50 follow-up #3): wait_for_app_window only
+                # OBSERVES the foreground, so an app whose window opened in the
+                # BACKGROUND was never brought forward (the next take_screenshot
+                # captured — and desktop_click clicked — whatever stayed in
+                # front) and the wait timed out into a false ERROR. So poll
+                # find_app_window, which enumerates ALL visible windows and thus
+                # sees a background window, and the moment the new app's window
+                # exists raise + focus-confirm it with focus_app_window — the
+                # exact helpers the already-open branch above uses. Interleaved
+                # with 1s slices of the passive wait so an app whose process
+                # name doesn't match the launch token (UWP frame hosts,
+                # `start`/script indirections) is still caught the instant it
+                # takes focus by itself — no added latency for today's working
+                # cases. Budget ~APP_WINDOW_TIMEOUT as before (a focus attempt
+                # straddling the deadline may overshoot by a few seconds, still
+                # well inside the 30s tool-execution cap).
+                status, detail = "timeout", ""
+                _no_raise = set()  # hwnds that refused focus -> one attempt each
+                _deadline = time.monotonic() + _dc.APP_WINDOW_TIMEOUT
+                while True:
+                    _win = _dc.find_app_window(name)
+                    if _win is not None and _win[0] not in _no_raise:
+                        _st, _dt = _dc.focus_app_window(_win)
+                        if _st == "ready":
+                            status, detail = "ready", _dt
+                            break
+                        # Focus refused/unconfirmed: don't fight over this hwnd
+                        # again; keep the passive watcher running — the window
+                        # may still take focus on its own before the deadline.
+                        _no_raise.add(_win[0])
+                    if time.monotonic() >= _deadline:
+                        break
+                    status, detail = _dc.wait_for_app_window(_before_fg, timeout=1.0)
+                    if status != "timeout":  # "ready" or "unavailable"
+                        break
+            else:
+                status, detail = _dc.wait_for_app_window(_before_fg)
         except Exception:
             status, detail = "unavailable", ""
         if status == "ready":

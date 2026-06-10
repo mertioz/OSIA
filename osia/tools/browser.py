@@ -730,6 +730,65 @@ def _page_url(page) -> str:
     return page.url
 
 
+# ── OS-window raise (Windows) ──────────────────────────────────────────────
+
+# Cap on the foreground confirm-poll when raising the browser's OS window, so a
+# refused focus can only ever add a short, bounded pause to a navigation.
+_RAISE_FOCUS_TIMEOUT_S = 2.0
+
+
+def _raise_browser_window() -> None:
+    """Best-effort, Windows-only: bring the automated browser's OS window to the
+    foreground after a successful connect/navigate.
+
+    ``page.bring_to_front()`` (kept, called just before this) only activates the
+    TAB inside the browser — it never raises the OS window above other apps.
+    Browser-only flows never needed more (``page.screenshot()`` is a CDP/BiDi
+    capture, independent of what is in front), but when the agent mixes the page
+    tools with the desktop tools, a background browser window means
+    take_screenshot captures — and desktop_click/desktop_type act on — whatever
+    app sits in front instead.
+
+    The window is identified by the process actually holding OSIA's dedicated
+    browser profile (``_processes_using_profile`` — never brand guessing), and it
+    is raised only when the matched window BELONGS to that process, so the user's
+    personal browser window (same brand, different profile) is never hijacked; if
+    the user's own same-brand window sits above OSIA's, this is a no-op. Raising
+    reuses desktop_control.find_app_window / focus_app_window — the same
+    machinery open_application uses. Never raises; a failed raise never blocks
+    or fails the navigation.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        from osia.tools import desktop_control as _dc
+
+        profile = (
+            FIREFOX_PROFILE_DIR if _active_browser_type == "bidi" else OSIA_PROFILE_DIR
+        )
+        pids, bases = set(), []
+        for proc in _processes_using_profile(profile):
+            try:
+                pids.add(int(proc.pid))
+                base = os.path.splitext(proc.info.get("name") or "")[0].strip().lower()
+            except Exception:
+                continue
+            if base and base not in bases:
+                bases.append(base)
+        if not pids:
+            return
+        fg = _dc.foreground_snapshot()
+        if fg is not None and fg[2] in pids:
+            return  # our browser window is already the foreground window
+        for base in bases:
+            win = _dc.find_app_window(base)  # topmost visible window of that exe
+            if win is not None and win[2] in pids:
+                _dc.focus_app_window(win, timeout=_RAISE_FOCUS_TIMEOUT_S)
+                return
+    except Exception:
+        pass
+
+
 # ── URL helper ─────────────────────────────────────────────────────────────
 
 def _normalize_url(url: str) -> str:
@@ -766,6 +825,10 @@ def navigate(url: str):
             page.goto(url, wait_until="commit", timeout=10000)
         except _TIMEOUT_ERRORS:
             # Slow server — the navigation keeps going in the browser.
+            # Still a success path, so raise the OS window now: this is often
+            # the FIRST navigate after a launch, and skipping it would leave
+            # the fresh browser in the background — the exact bug being fixed.
+            _raise_browser_window()
             return _result(
                 f"Navigated to: {_page_url(page)} (still loading — "
                 "page may still be loading resources)",
@@ -784,6 +847,7 @@ def navigate(url: str):
             page.bring_to_front()
         except Exception:
             pass
+        _raise_browser_window()
         return _result(f"Navigated to: {_page_url(page)}{note}", page)
 
 
@@ -950,6 +1014,7 @@ def _open_firefox_bidi(url: str | None):
             page.bring_to_front()
         except Exception:
             pass
+        _raise_browser_window()
         if not url:
             return _result("Opened Firefox (driven over WebDriver BiDi)", page)
         try:
@@ -1002,6 +1067,7 @@ def _open_cdp_browser(binary: str, url: str | None):
             page.bring_to_front()
         except Exception:
             pass
+        _raise_browser_window()
         if not url:
             return _result(f"{verb} {label} window (CDP on port {CDP_PORT})", page)
         try:
