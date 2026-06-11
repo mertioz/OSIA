@@ -8,10 +8,17 @@ Phase 3: listen_for_command() with retry loop — keeps listening until
 
 import io
 import re
+import threading
 
 import numpy as np
 from scipy.signal import resample as scipy_resample
-from faster_whisper import WhisperModel
+
+# faster-whisper is imported LAZILY inside ``_get_model`` (WOR-47) — never at
+# module import or server startup. Its native ctranslate2/torch extensions
+# intermittently deadlock or hard-crash (STATUS_ACCESS_VIOLATION 0xC0000005)
+# when loaded at cold boot, which used to take down the mobile server before it
+# could bind port 8765. Local STT is the only consumer; text + cloud STT never
+# touch it.
 
 # sounddevice loads PortAudio at import time; on a machine with no audio backend
 # or drivers (common on headless boxes and freshly-provisioned Windows) that
@@ -55,6 +62,10 @@ _calibrated_silence_rms: float | None = None  # set by calibrate_ambient_thresho
 # Lazy-loaded model (rebuilt when the configured local size changes)
 _model = None
 _model_size = None
+# Serializes the one-time lazy import + build. ``transcribe`` runs on worker
+# threads via ``asyncio.to_thread`` (server.py), so concurrent first requests
+# must not import faster-whisper or build the model twice (WOR-47).
+_model_lock = threading.Lock()
 
 # ── Groq Whisper (cloud) ────────────────────────────────────────────────────
 GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -63,19 +74,35 @@ GROQ_DEFAULT_MODEL = "whisper-large-v3-turbo"
 
 
 def _get_model(model_size: str = None):
-    """Return a cached faster-whisper model.
+    """Return ``(model, size)`` — a cached faster-whisper model and the size
+    it was built for.
 
     The size comes from the ``stt_local_model`` setting (read fresh) unless
     ``model_size`` is given. The cached model is rebuilt only when the
     requested size changes, so switching local model size in settings takes
     effect without a restart.
+
+    faster-whisper is imported **lazily here**, inside the lock, the first
+    time a local transcription actually runs — never at module import or
+    server startup (WOR-47): its native ctranslate2/torch extensions
+    intermittently deadlock or hard-crash at cold boot. The lock serializes
+    that one-time import + build because ``transcribe`` runs on worker threads
+    via ``asyncio.to_thread`` (server.py) — concurrent first requests must not
+    build the model twice. Returning ``size`` lets callers log without reading
+    the ``_model_size`` global outside the lock.
     """
     global _model, _model_size
     size = model_size or get_setting("stt_local_model", MODEL_SIZE) or MODEL_SIZE
-    if _model is None or _model_size != size:
-        _model = WhisperModel(size, device="cpu", compute_type="int8")
-        _model_size = size
-    return _model
+    # Fast path: already built for this size — no lock, no import.
+    if _model is not None and _model_size == size:
+        return _model, size
+    with _model_lock:
+        # Re-check under the lock: another thread may have built it meanwhile.
+        if _model is None or _model_size != size:
+            from faster_whisper import WhisperModel  # lazy: native ext, cold-boot-crash-prone (WOR-47)
+            _model = WhisperModel(size, device="cpu", compute_type="int8")
+            _model_size = size
+        return _model, size
 
 
 def record_audio(duration: int = RECORD_SECONDS, sample_rate: int = DEVICE_SAMPLE_RATE) -> np.ndarray:
@@ -333,8 +360,8 @@ def _transcribe_groq(audio_path_or_bytes, sample_rate: int = WHISPER_SAMPLE_RATE
 def _transcribe_local(audio: np.ndarray, sample_rate: int = DEVICE_SAMPLE_RATE,
                       language: str = None, model_size: str = None) -> str:
     """Transcribe with on-device faster-whisper (``stt_local_model``)."""
-    model = _get_model(model_size)
-    print(f"[STT] transcribed via local (faster-whisper {_model_size})")
+    model, size = _get_model(model_size)
+    print(f"[STT] transcribed via local (faster-whisper {size})")
     # Resample to 16kHz for Whisper
     audio_16k = resample_audio(audio, sample_rate, WHISPER_SAMPLE_RATE)
     # The initial_prompt is conditioning text — it biases decoding without

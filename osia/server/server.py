@@ -662,32 +662,17 @@ async def internal_new_chat(request: Request):
     return {"ok": True, "clients": len(_WS_CLIENTS)}
 
 
-@app.on_event("startup")
-async def _warm_models() -> None:
-    """Pre-load slow models in the background at server startup so the
-    first real audio request doesn't pay their cold-start cost.
-
-    faster-whisper's ``WhisperModel`` is module-level cached in
-    ``osia.voice.stt`` — calling ``_get_model()`` once here means every
-    subsequent ``transcribe()`` call (including the very first user
-    request) reuses the already-loaded model in memory.
-    """
-    async def _warm() -> None:
-        try:
-            from osia.voice.stt import _get_model, MODEL_SIZE
-            print(f"[OSIA Server] Warming faster-whisper '{MODEL_SIZE}'...")
-            t0 = time.perf_counter()
-            await asyncio.to_thread(_get_model)
-            elapsed = (time.perf_counter() - t0) * 1000
-            print(f"[OSIA Server] Whisper '{MODEL_SIZE}' loaded in {elapsed:.0f}ms")
-        except Exception as e:
-            print(
-                f"[OSIA Server] Whisper warm-up failed "
-                f"(will lazy-load on first request): {e}"
-            )
-
-    # Run in the background so /health responds immediately during warm-up.
-    asyncio.create_task(_warm())
+# NOTE (WOR-47): the startup ``_warm_models`` handler that eagerly pre-loaded
+# faster-whisper was REMOVED deliberately — do NOT reintroduce it. Importing
+# ``osia.voice.stt`` on the event-loop thread at cold boot pulled in
+# faster-whisper's native ctranslate2/torch extensions (its module-top
+# ``from faster_whisper import WhisperModel``), which intermittently deadlocked
+# or hard-crashed (STATUS_ACCESS_VIOLATION 0xC0000005) and took the whole
+# process down before it could bind port 8765. Whisper is now lazy-loaded on
+# the first local STT request (``osia.voice.stt._get_model``), so the server
+# binds immediately and never imports Whisper at boot. The watchdog /
+# faulthandler / port-guard in run_server.py + run_service.py (e1950f2) is the
+# complementary supervisor-side cause fix.
 
 
 @app.on_event("startup")
