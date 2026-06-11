@@ -15,7 +15,6 @@ PyQt6>=6.6.0
 
 # ── Speech-to-text ──────────────────────────────────────────────────────────
 faster-whisper>=1.0.0              # on-device Whisper (CTranslate2 backend)
-openai-whisper>=20231117           # reference Whisper implementation
 
 # ── Wake word ───────────────────────────────────────────────────────────────
 openwakeword>=0.6.0

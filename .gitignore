@@ -6,13 +6,19 @@ __pycache__/
 *.pkl
 osia/wake_training/positive/
 osia/wake_training/negative/
+# Offline-only synthetic training corpus (~85MB of WAVs, read solely by
+# train.py/generate_dataset.py). The runtime loads only osia_verifier.pkl, which
+# stays tracked — keep clones light by not committing this dataset.
+osia/wake_training/synthetic/
 .env
 build_osia.py
 config/mobile_token.txt
 config/desktop_calibration.json
 config/greeting_cache.json
 config/greeting_cache.wav
-# Windows tunnel runtime artifacts (cloudflared.exe is downloaded by install.bat;
-# tunnel.log is written at runtime by the tunnel service) — never commit these.
+# Windows runtime artifacts (cloudflared.exe and ffmpeg.exe are downloaded by
+# install.bat; tunnel.log is written at runtime by the tunnel service) — never
+# commit these.
 windows/cloudflared.exe
+windows/ffmpeg.exe
 windows/tunnel.log

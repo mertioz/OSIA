@@ -5,7 +5,7 @@ REM
 REM   * verifies Python 3.10+ is installed
 REM   * creates a venv in the project directory
 REM   * installs all dependencies from requirements.txt
-REM   * downloads cloudflared.exe to windows\
+REM   * downloads cloudflared.exe and ffmpeg.exe to windows\
 REM   * migrates any existing config\ into %USERPROFILE%\.osia and ensures a
 REM     mobile pairing token exists
 REM   * registers the mobile server + Cloudflare tunnel as per-user Scheduled
@@ -22,6 +22,8 @@ set "OSIA_HOME=%USERPROFILE%\.osia"
 set "WINDOWS_DIR=%PROJECT_DIR%windows"
 set "CLOUDFLARED=%WINDOWS_DIR%\cloudflared.exe"
 set "CF_URL=https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+set "FFMPEG_DST=%WINDOWS_DIR%\ffmpeg.exe"
+set "FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
 
 REM Run from the project root so the in-tree `osia` package is importable by the
 REM inline `python -c` token step below, regardless of the caller's directory.
@@ -67,7 +69,7 @@ if errorlevel 1 (
     goto :fail
 )
 
-REM --- 4. cloudflared.exe ----------------------------------------------------
+REM --- 4. Windows helper binaries (cloudflared + ffmpeg) --------------------
 if not exist "%WINDOWS_DIR%" mkdir "%WINDOWS_DIR%"
 if exist "%CLOUDFLARED%" (
     echo [4/7] cloudflared.exe deja present.
@@ -78,6 +80,22 @@ if exist "%CLOUDFLARED%" (
     powershell -NoProfile -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri $env:CF_URL -OutFile $env:CLOUDFLARED } catch { Write-Host $_.Exception.Message; exit 1 }"
     if errorlevel 1 (
         echo [ATTENTION] Telechargement de cloudflared echoue - vous pourrez relancer windows\install_tunnel.bat plus tard.
+    )
+)
+REM ffmpeg.exe -- needed by the mobile server for WAV->MP3 TTS (server.py
+REM _wav_to_mp3 falls back to windows\ffmpeg.exe when none is on PATH). Static
+REM win64 build with libmp3lame. Idempotent and non-fatal: the server tries
+REM shutil.which("ffmpeg") first, so a failed download only disables bundled
+REM TTS, not the install. The zip is extracted to a temp dir and the inner
+REM bin\ffmpeg.exe is located by name (folder name varies by build). Paths/URL
+REM are passed via env vars so apostrophes in them cannot break the string.
+if exist "%FFMPEG_DST%" (
+    echo [4/7] ffmpeg.exe deja present.
+) else (
+    echo [4/7] Telechargement de ffmpeg.exe...
+    powershell -NoProfile -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $zip = Join-Path $env:TEMP 'osia_ffmpeg.zip'; $tmp = Join-Path $env:TEMP 'osia_ffmpeg'; Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile $zip; if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }; Expand-Archive -Path $zip -DestinationPath $tmp -Force; $exe = Get-ChildItem -Path $tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1; if (-not $exe) { throw 'ffmpeg.exe introuvable dans archive' }; Copy-Item -Path $exe.FullName -Destination $env:FFMPEG_DST -Force; Remove-Item -Force $zip; Remove-Item -Recurse -Force $tmp } catch { Write-Host $_.Exception.Message; exit 1 }"
+    if errorlevel 1 (
+        echo [ATTENTION] Telechargement de ffmpeg echoue - le TTS du serveur mobile sera indisponible jusqu'a l'installation de ffmpeg ^(PATH ou windows\ffmpeg.exe^).
     )
 )
 
