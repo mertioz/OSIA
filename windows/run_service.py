@@ -34,6 +34,7 @@ failure is still diagnosable after the fact.
 import os
 import sys
 import time
+import socket
 import tempfile
 import subprocess
 from pathlib import Path
@@ -48,6 +49,8 @@ _TUNNEL_LOG = _HERE / "tunnel.log"
 _RESTART_SEC = 3.0      # delay before relaunching a crashed child (systemd RestartSec)
 _POLL_SEC = 2.0         # cadence for re-checking a live child / an external owner
 _STARTUP_GRACE = 2.0    # head start before re-checking a freshly launched child
+_HANG_TIMEOUT = 75.0    # max time a server child may be alive-but-not-listening on
+                        # 8765 before we treat it as HUNG and relaunch (WOR-47)
 
 # No console window for the child console apps (python.exe / cloudflared.exe).
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -157,6 +160,46 @@ def _other_owner_running(kind: str, exclude_pid: int) -> bool:
     return False
 
 
+# Common Windows NTSTATUS exit codes seen when a child dies during process/DLL
+# init — the usual face of a *crash* (vs. the WOR-47 *hang*, which leaves the
+# child alive). Mapped so the supervisor log names them instead of printing a
+# bare 0xC000xxxx the reader then has to look up.
+_NTSTATUS = {
+    0xC0000135: "STATUS_DLL_NOT_FOUND",
+    0xC0000142: "STATUS_DLL_INIT_FAILED",
+    0xC0000005: "STATUS_ACCESS_VIOLATION",
+    0xC0000409: "STATUS_STACK_BUFFER_OVERRUN",
+    0xC000007B: "STATUS_INVALID_IMAGE_FORMAT",
+}
+
+
+def _decode_rc(rc) -> str:
+    """Annotate a child exit code with its Windows NTSTATUS name when it is one
+    of the common startup-crash codes. Popen may surface these as a large
+    unsigned value or its signed-32-bit twin, so normalise via ``& 0xFFFFFFFF``
+    before lookup. Returns '' (nothing to add) for clean or unrecognised codes."""
+    try:
+        code = rc & 0xFFFFFFFF
+    except Exception:
+        return ""
+    name = _NTSTATUS.get(code)
+    return f" ({name} 0x{code:08X})" if name else ""
+
+
+def _port_listening(port: int) -> bool:
+    """True if something accepts a TCP connection on 127.0.0.1:port right now.
+
+    Distinguishes a *serving* server child from one that is alive but HUNG — the
+    WOR-47 cold-boot symptom where the worker blocks in the startup tail, 8765
+    never binds, yet poll() keeps reporting the process alive. The short timeout
+    keeps the supervisor's poll loop responsive."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
 def main() -> int:
     kind = (sys.argv[1] if len(sys.argv) > 1 else "").strip().lower()
     if kind not in ("server", "tunnel"):
@@ -195,14 +238,48 @@ def main() -> int:
     _say(f"child command: {cmd}  (cwd={cwd})")
     my_child = None
     deferring = False  # only log the defer decision on transitions, not every poll
+    launched_at = 0.0  # wall time of the current child's launch (for the hang check)
+    healthy = False    # set once a server child is observed LISTENING on 8765
     while True:
         # Our child is still alive — keep watching it.
         if my_child is not None:
             rc = my_child.poll()
             if rc is None:
+                # Alive is not the same as serving. The WOR-47 cold-boot hang
+                # leaves the server worker blocked in its startup tail: poll()
+                # reports it alive forever while 8765 never binds. Promote it to
+                # "healthy" only once it actually listens; if it never does within
+                # the hang window, kill it so the next iteration relaunches a fresh
+                # one (its stack is in osia_server_boot.log via faulthandler).
+                if kind == "server" and not healthy:
+                    if _port_listening(8765):
+                        healthy = True
+                        _say(f"child pid={my_child.pid} is serving on 8765 "
+                             f"({time.time() - launched_at:.1f}s after launch)")
+                    elif time.time() - launched_at > _HANG_TIMEOUT:
+                        _say(f"child pid={my_child.pid} alive but 8765 not "
+                             f"listening after {_HANG_TIMEOUT:.0f}s — HUNG; killing "
+                             f"for relaunch (stack in osia_server_boot.log)")
+                        try:
+                            my_child.kill()
+                            # Reap the corpse before relaunching, and deliberately
+                            # KEEP my_child set (do not null it here): the next loop
+                            # iteration then runs the normal exited-child path, which
+                            # captures the real dead_pid and EXCLUDES it from the
+                            # _other_owner_running defer check. Otherwise the just-
+                            # killed child (TerminateProcess is not an immediate reap)
+                            # could still be visible to psutil and match its own
+                            # "run_server.py" cmdline, making the supervisor defer to
+                            # its own corpse instead of relaunching — delaying the
+                            # self-heal this watchdog exists to deliver.
+                            my_child.wait(timeout=10)
+                        except Exception as e:
+                            _say(f"kill of hung child failed: {e!r}")
+                        time.sleep(_RESTART_SEC)
+                        continue
                 time.sleep(_POLL_SEC)
                 continue
-            _say(f"child pid={my_child.pid} exited rc={rc} "
+            _say(f"child pid={my_child.pid} exited rc={rc}{_decode_rc(rc)} "
                  f"(see {child_log_path.name} for its output)")
         dead_pid = my_child.pid if my_child is not None else -1
         my_child = None
@@ -223,7 +300,16 @@ def main() -> int:
                 stdout=(child_log or subprocess.DEVNULL),
                 stderr=subprocess.STDOUT,
                 creationflags=_NO_WINDOW,
+                # COPY os.environ (never replace it — a bare dict would drop PATH
+                # and break Windows DLL resolution at interpreter startup).
+                # PYTHONFAULTHANDLER arms faulthandler from the first instruction
+                # (belt-and-suspenders with run_server's own _init_boot_diag);
+                # PYTHONUNBUFFERED matches the `-u` flag so the child log keeps
+                # its tail even if the child is killed.
+                env={**os.environ, "PYTHONFAULTHANDLER": "1", "PYTHONUNBUFFERED": "1"},
             )
+            launched_at = time.time()
+            healthy = False
             _say(f"launched {kind} child pid={my_child.pid}")
         except Exception as e:
             _say(f"failed to launch {kind}: {e!r}")
@@ -234,8 +320,8 @@ def main() -> int:
         time.sleep(_STARTUP_GRACE)
         rc = my_child.poll()
         if rc is not None:
-            _say(f"child pid={my_child.pid} died within {_STARTUP_GRACE}s rc={rc} "
-                 f"(see {child_log_path.name})")
+            _say(f"child pid={my_child.pid} died within {_STARTUP_GRACE}s "
+                 f"rc={rc}{_decode_rc(rc)} (see {child_log_path.name})")
             time.sleep(_RESTART_SEC)
 
 
