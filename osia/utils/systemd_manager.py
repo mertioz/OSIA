@@ -38,6 +38,9 @@ _IS_WINDOWS = sys.platform == "win32"
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _WINDOWS_DIR = _REPO_ROOT / "windows"
 _RUN_SERVICE = _WINDOWS_DIR / "run_service.py"
+# Same path windows\run_service.py passes to cloudflared (--logfile). It is the
+# OSIA-specific signature used to kill exactly OSIA's quick tunnel (WOR-64).
+_TUNNEL_LOG = _WINDOWS_DIR / "tunnel.log"
 
 # Local port the OSIA mobile server listens on (see osia/server/run_server.py).
 _SERVER_PORT = 8765
@@ -352,20 +355,23 @@ def _win_kill_tunnel() -> bool:
     """Terminate the OSIA tunnel's leftover cloudflared.exe (belt-and-suspenders
     alongside ending the task).
 
-    Targets ONLY the named ``osia-windows`` tunnel by cmdline (like
-    ``_win_stop_server`` matches the server), so unrelated cloudflared instances
-    the user runs for other projects are never collaterally killed. No-op when
-    psutil is unavailable — the task's job object already reaped the child."""
+    Targets ONLY OSIA's *quick* tunnel by cmdline — matched on the unique
+    ``windows\\tunnel.log`` logfile path it always passes to cloudflared (the
+    quick tunnel has no named-tunnel arg) — like ``_win_stop_server`` matches the
+    server. Unrelated cloudflared instances the user runs for other projects are
+    never collaterally killed. No-op when psutil is unavailable — the task's job
+    object already reaped the child."""
     try:
         import psutil
     except Exception:
         return False
     killed = []
+    sig = str(_TUNNEL_LOG).lower()
     for proc in psutil.process_iter(["name", "cmdline"]):
         try:
             if (proc.info.get("name") or "").lower() != "cloudflared.exe":
                 continue
-            if "osia-windows" in " ".join(proc.info.get("cmdline") or []):
+            if sig in " ".join(proc.info.get("cmdline") or []).lower():
                 proc.terminate()
                 killed.append(proc)
         except Exception:

@@ -316,6 +316,19 @@ def load_mobile_token() -> str:
         return ""
 
 
+def rendezvous_proof(token: str) -> str:
+    """HMAC-SHA256(key=token_utf8, msg='osia-rdv-v1') -> 64-hex (WOR-64).
+
+    The PC publishes this ``proof`` (never the raw token) to the rendezvous
+    Worker so the phone can locate the current Cloudflare quick-tunnel URL; the
+    Worker derives the lookup key from the same HMAC itself. See
+    :mod:`osia.rendezvous`.
+    """
+    import hmac
+    import hashlib
+    return hmac.new(token.encode("utf-8"), b"osia-rdv-v1", hashlib.sha256).hexdigest()
+
+
 def regenerate_mobile_token() -> str:
     """Generate a fresh 20-char mobile token, persist it (0600), and return it."""
     _ensure_config_dir()
