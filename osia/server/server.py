@@ -81,7 +81,7 @@ import soundfile as sf
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 
 from osia import conversations
-from osia.config import CONFIG_DIR as _CONFIG_DIR
+from osia.config import CONFIG_DIR as _CONFIG_DIR, regenerate_mobile_token
 
 # Windows consoles default to cp1252, which raises UnicodeEncodeError the moment
 # a log line contains a non-ASCII char (e.g. the "▶" in "[OSIA Agent] ▶ tool:")
@@ -262,7 +262,16 @@ def _sanitize_upload_filename(filename: str) -> str:
 # Token management
 # ---------------------------------------------------------------------------
 def load_or_create_token() -> str:
-    """Read the mobile token from disk, or generate + persist a new one."""
+    """Read the mobile token from disk, or generate + persist a new one.
+
+    Creation of a *brand-new* token is delegated to
+    ``osia.config.regenerate_mobile_token`` so that module is the SINGLE source
+    of truth for token generation: a fresh install gets the same 20-char token
+    (``secrets.token_hex(10)``) whoever creates it first — this server,
+    ``config.ensure_config_files`` (bootstrap), or the GUI regenerate button.
+    WOR-64 key derivation relies on that exact on-disk length. Existing tokens
+    are read/compared unchanged; only the no-file creation path is affected.
+    """
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if TOKEN_FILE.exists():
         token = TOKEN_FILE.read_text().strip()
@@ -276,14 +285,11 @@ def load_or_create_token() -> str:
                 else:
                     print("[OSIA Server] ACL hardening (0o600) not applied on Windows")
             return token
-    # Generate a secure random token
-    token = secrets.token_hex(32)  # 64 hex chars
-    TOKEN_FILE.write_text(token)
-    if sys.platform != "win32":
-        TOKEN_FILE.chmod(0o600)
-    else:
-        print("[OSIA Server] ACL hardening (0o600) not applied on Windows")
-    return token
+    # Fresh box, no token file yet: delegate to config.regenerate_mobile_token
+    # (the single source of truth, 20-char token_hex(10)) instead of generating a
+    # divergent 64-char token here. It writes the same CONFIG_DIR/mobile_token.txt
+    # this function reads, with identical 0600 hardening, and returns the token.
+    return regenerate_mobile_token()
 
 
 MOBILE_TOKEN = load_or_create_token()
