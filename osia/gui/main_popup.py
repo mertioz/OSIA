@@ -3926,6 +3926,7 @@ class _SettingsPanel(QWidget):
             self.window().move(
                 event.globalPosition().toPoint() - self._drag_pos
             )
+            self.window().update()  # repaint after move so the translucent canvas can't smear
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -4504,6 +4505,12 @@ class MainPopup(QWidget):
         # popup expands around its centre and stays put under the capsule).
         self._width_anim = QPropertyAnimation(self, b"geometry", self)
         self._width_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        # Clean repaint once the 440<->640 tween settles: combined with the
+        # full-rect clear in paintEvent, this guarantees the settled window and
+        # the just-switched settings detail page repaint cleanly, so the first
+        # category click always registers (fixes the ~50% settings freeze).
+        # Adds an update only — it does not stop the tween.
+        self._width_anim.finished.connect(self.update)
 
         # The Dynamic Island capsule the popup anchors to (set_anchor) —
         # when set, the popup opens just below the capsule's CURRENT
@@ -4823,6 +4830,7 @@ class MainPopup(QWidget):
         if (self._drag_offset is not None
                 and event.buttons() & Qt.MouseButton.LeftButton):
             self.move(event.globalPosition().toPoint() - self._drag_offset)
+            self.update()  # repaint after move so the translucent canvas can't smear
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -4836,6 +4844,14 @@ class MainPopup(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Wipe the entire widget (corners + shadow margin) to fully
+        # transparent each frame before repainting. Without this, the
+        # semi-transparent BG_COLOR / BG_BLUR_LAYER wash accumulates residue
+        # on the translucent window (ghost rectangles, drag smear, and a
+        # stale settings detail page that swallows the first category click).
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(self.rect(), Qt.GlobalColor.transparent)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         rect = self.rect().adjusted(0, 0, -1, -1)
         path = QPainterPath()
         path.addRoundedRect(
