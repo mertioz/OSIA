@@ -46,7 +46,7 @@
    **chaque finding indépendamment**, et corriger les vrais problèmes.
 
 6. **Préserver les contrats existants** — les valeurs et mécanismes protégés ne
-   doivent **JAMAIS** régresser : `POPUP_W` (= `520`), la résolution `CONFIG_DIR`
+   doivent **JAMAIS** régresser : `POPUP_W` (= `440`), la résolution `CONFIG_DIR`
    (`_resolve_config_dir` + import dans `server.py`), l'**absence** de
    `MAX_RESPONSE_TOKENS`, le système `key_chain` (fallback de clés), le parser de
    tool-calls (`_extract_tool_calls` & co.), l'ordre du pipeline
@@ -66,11 +66,15 @@
 > réinitialiser ni réintroduire. Avant tout changement (et avant tout merge),
 > vérifier que chacune est préservée à l'identique.
 
-- **`POPUP_W = 520`** (`osia/gui/main_popup.py:71`) — largeur du popup principal,
-  consommée par `setFixedSize(POPUP_W, POPUP_H)` (`main_popup.py:4311`). Valeur
-  **délibérée** (WOR-28 l'avait passée de `480` → `560` ; réduite ensuite à `520`
-  pour un popup plus compact, sur demande explicite). **Ne JAMAIS** la « corriger »
-  ni la repasser à `480`/`560` sans demande explicite.
+- **`POPUP_W = 440`** (`osia/gui/main_popup.py:77`) — largeur **compacte** du menu
+  principal. Depuis WOR-48 la largeur de la fenêtre est **dynamique par page** :
+  COMPACT (`POPUP_W = 440`) pour le menu, puis élargie à `POPUP_W_WIDE = 640`
+  (`main_popup.py:85`) sur la page Settings via l'animation `_animate_width`
+  (440 ↔ 640, OutCubic), avec retour à `440` en quittant la page. Valeur
+  **délibérée** : WOR-28 avait fait `480` → `560` → `520` ; WOR-48 l'a réduite à
+  `440` pour un menu plus compact (refonte « fenêtre expansible »). **Ne JAMAIS**
+  la « corriger » ni la repasser à `480`/`520`/`560` sans demande explicite —
+  elle reste une valeur **protégée**.
 
 - **`CONFIG_DIR`** — **toujours** résolu via `_resolve_config_dir()`
   (`osia/config.py`), **jamais codé en dur**. Règle de résolution : si
@@ -110,7 +114,7 @@
 - **Règle de merge** — lors d'un merge depuis une branche, **ne JAMAIS** prendre
   un fichier entier en bloc (pas de « take theirs/ours » aveugle). Toujours
   **differ** et **vérifier** que les valeurs critiques ci-dessus sont préservées :
-  `POPUP_W = 520`, la résolution `CONFIG_DIR` (`_resolve_config_dir` + import dans
+  `POPUP_W = 440`, la résolution `CONFIG_DIR` (`_resolve_config_dir` + import dans
   `server.py`), l'**absence** de `MAX_RESPONSE_TOKENS`, et les gardes
   `sys.platform` (`xcb`, `X11BypassWindowManagerHint`).
 
