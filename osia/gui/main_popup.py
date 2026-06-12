@@ -27,14 +27,15 @@ from pathlib import Path
 
 from PyQt6.QtCore import (
     Qt, QEvent, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
-    QRectF, QPointF,
+    QRect, QRectF, QPointF,
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QScrollArea, QStackedWidget, QFrame, QGraphicsDropShadowEffect,
+    QLineEdit, QScrollArea, QStackedWidget, QListWidget, QFrame,
+    QGraphicsDropShadowEffect,
     QSizePolicy, QFileDialog, QCheckBox, QComboBox,
     QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog,
 )
@@ -75,7 +76,15 @@ except ImportError:
 # protection — do not "restore" it to 520 without a new explicit request.
 POPUP_W = 440
 POPUP_H = 560
-RADIUS = 20
+# WOR-48 P3 — the window width is dynamic per page: COMPACT (POPUP_W) for
+# chat/conversations/models/OSIA, WIDE for the Settings master-detail layout
+# (110px category nav + ~480px detail panel, so 300px-min fields fit without
+# clipping). Height never changes. The width tween lives in
+# MainPopup._animate_width; WIDTH_ANIM_MS <= 0 disables the animation and
+# snaps instantly (reduced-motion escape hatch).
+POPUP_W_WIDE = 640
+WIDTH_ANIM_MS = 280
+RADIUS = 16     # WOR-48 P3: 20 → 16, lightly-rounded rectangle (not pill-like)
 # Dark, semi-transparent glassmorphism fill so the popup reads as a floating
 # glass panel rather than an opaque window. Lower alpha → more transparent;
 # a second, slightly lighter layer painted on top fakes a soft blur/frost.
@@ -196,6 +205,21 @@ def _mask_token(token: str) -> str:
     if len(token) <= 6:
         return token[:1] + "*" * max(1, len(token) - 1)
     return token[:2] + "*" * (len(token) - 4) + token[-2:]
+
+
+def _cap_combo_width(combo: QComboBox) -> None:
+    """Stop a combo's minimum width from tracking its longest item text.
+
+    WOR-48 P3 — a QComboBox sizes its minimum to the longest item by default,
+    so one long "provider:model" id inflates the whole settings page's minimum
+    width past the master-detail viewport and clips it. With the policy below
+    the closed combo can compress (its text clips at the edge if truly
+    squeezed) while the dropdown list still shows every item full-width.
+    """
+    combo.setSizeAdjustPolicy(
+        QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+    )
+    combo.setMinimumContentsLength(12)
 
 
 # faster-whisper caches each model in the Hugging Face hub cache under a
@@ -1458,6 +1482,31 @@ class _SettingsPanel(QWidget):
         header.addStretch()
         outer.addLayout(header)
 
+        # WOR-48 P2 — master-detail layout. A category list on the LEFT drives a
+        # QStackedWidget on the RIGHT; each stack page groups several of the
+        # existing section frames. The section frames are built EXACTLY as before
+        # (same builders, same call order) and only reparented into pages — which
+        # is invisible to the handlers / _load_state / _retranslate_sections, all
+        # of which address widgets via the self._xxx attributes the builders set.
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(10)
+
+        # LEFT — category navigation.
+        self._settings_nav = QListWidget()
+        self._settings_nav.setObjectName("settingsNav")
+        self._settings_nav.setFixedWidth(110)
+        self._settings_nav.setWordWrap(True)
+        self._settings_nav.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._settings_nav.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        body.addWidget(self._settings_nav)
+
+        # RIGHT — keep a QScrollArea#panelScroll (so the transparent-bg QSS and
+        # ScrollBarAlwaysOff still apply) wrapping a QStackedWidget of pages.
         scroll = QScrollArea()
         scroll.setObjectName("panelScroll")
         scroll.setWidgetResizable(True)
@@ -1469,40 +1518,78 @@ class _SettingsPanel(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
 
-        host = QWidget()
-        # Same as the other panels: keep the scroll host transparent so the
-        # settings page shows the app's dark background, not the grey palette.
-        host.setObjectName("panelHost")
-        v = QVBoxLayout(host)
-        v.setContentsMargins(0, 0, 6, 0)
-        v.setSpacing(11)
+        self._settings_stack = QStackedWidget()
+        self._settings_stack.setObjectName("settingsStack")
 
-        v.addWidget(self._build_language_section())
-        v.addWidget(self._build_capsule_section())          # Capsule + autostart
-        v.addWidget(self._build_ai_providers_section())     # Section 1
-        v.addWidget(self._build_voice_section())            # Section 2 (TTS)
-        v.addWidget(self._build_wake_section())             # Wake-word greeting
-        v.addWidget(self._build_stt_section())              # Section 3 (STT)
-        v.addWidget(self._build_liveapi_section())          # Section 4 (Live API)
-        v.addWidget(self._build_ai_hierarchy_section())     # AI Task Hierarchy
-        v.addWidget(self._build_cron_section())             # Scheduled Tasks (Bloc 5)
-        v.addWidget(self._build_heartbeat_section())        # Heartbeat (Bloc 5)
-        v.addWidget(self._build_apikeys_section())          # API Key Fallback
-        v.addWidget(self._build_mobile_section())           # Mobile Connection
-        v.addWidget(self._build_startup_section())
-        v.addStretch(1)
+        # Build every section ONCE, in the original column order, so any
+        # construction-time ordering assumptions are preserved unchanged.
+        sec_language  = self._build_language_section()
+        sec_capsule   = self._build_capsule_section()       # Capsule + autostart
+        sec_ai_prov   = self._build_ai_providers_section()  # Section 1
+        sec_voice     = self._build_voice_section()         # Section 2 (TTS)
+        sec_wake      = self._build_wake_section()           # Wake-word greeting
+        sec_stt       = self._build_stt_section()           # Section 3 (STT)
+        sec_liveapi   = self._build_liveapi_section()       # Section 4 (Live API)
+        sec_hierarchy = self._build_ai_hierarchy_section()  # AI Task Hierarchy
+        sec_cron      = self._build_cron_section()          # Scheduled Tasks
+        sec_heartbeat = self._build_heartbeat_section()     # Heartbeat
+        sec_apikeys   = self._build_apikeys_section()       # API Key Fallback
+        sec_mobile    = self._build_mobile_section()        # Mobile Connection
+        sec_startup   = self._build_startup_section()       # Autostart services
 
-        scroll.setWidget(host)
-        outer.addWidget(scroll, 1)
+        # (nav i18n key, [sections on that page]) — 6 categories, all 13 frames,
+        # each frame used exactly once.
+        self._settings_pages = [
+            ("settings.cat.general",  [sec_language, sec_capsule]),
+            ("settings.cat.ai",       [sec_ai_prov, sec_hierarchy, sec_apikeys]),
+            ("settings.cat.voice",    [sec_voice, sec_stt, sec_liveapi]),
+            ("settings.cat.wake",     [sec_wake]),
+            ("settings.cat.mobile",   [sec_mobile, sec_startup]),
+            ("settings.cat.advanced", [sec_cron, sec_heartbeat]),
+        ]
+
+        for _key, _sections in self._settings_pages:
+            page = QWidget()
+            # Keep each stack page transparent like the old panelHost so the
+            # sections sit on the app's dark glass, not the grey palette.
+            page.setObjectName("panelHost")
+            pv = QVBoxLayout(page)
+            pv.setContentsMargins(0, 0, 6, 0)
+            pv.setSpacing(11)
+            for _sec in _sections:
+                pv.addWidget(_sec)
+            pv.addStretch(1)
+            self._settings_stack.addWidget(page)
+            self._settings_nav.addItem(i18n.t(_key))
+
+        scroll.setWidget(self._settings_stack)
+        body.addWidget(scroll, 1)
+        outer.addLayout(body, 1)
+
+        # Wire the nav -> stack, default to the first category.
+        self._settings_nav.currentRowChanged.connect(
+            self._settings_stack.setCurrentIndex
+        )
+        self._settings_nav.setCurrentRow(0)
 
         # Re-translate this panel's own section chrome on language change.
         i18n.add_listener(self._retranslate_sections)
+        # WOR-48 P2 — keep the category-nav labels in sync with the language too
+        # (its own small listener, so _retranslate_sections stays untouched).
+        i18n.add_listener(self._retranslate_nav)
         self.destroyed.connect(
-            lambda: i18n.remove_listener(self._retranslate_sections)
+            lambda: (i18n.remove_listener(self._retranslate_sections),
+                     i18n.remove_listener(self._retranslate_nav))
         )
 
         self._apply_style()
         self._load_state()
+
+        # WOR-48 P3 — cap every combo's minimum width so no page's minimum
+        # exceeds the WIDE master-detail viewport (see _cap_combo_width).
+        # Combos created later at runtime (_build_hier_row) apply it themselves.
+        for _combo in self.findChildren(QComboBox):
+            _cap_combo_width(_combo)
 
         # Refresh startup status while visible.
         self._startup_timer = QTimer(self)
@@ -2234,6 +2321,7 @@ class _SettingsPanel(QWidget):
 
         combo = QComboBox()
         combo.setObjectName("voiceCombo")
+        _cap_combo_width(combo)   # WOR-48 P3 — created at runtime, cap it here
         choices = self._hier_model_choices()
         # Preserve a stored model whose provider is no longer configured by
         # showing its raw "provider:model" value so the chain isn't silently
@@ -2957,11 +3045,20 @@ class _SettingsPanel(QWidget):
         self._mobile_regen_btn.setObjectName("ghostBtn")
         self._mobile_regen_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._mobile_regen_btn.clicked.connect(self._on_regenerate_token)
+        # WOR-48 P3 — the token line and its two action buttons used to share
+        # one row whose minimum (~650px incl. the unbreakable 20-char monospace
+        # token) clipped even the WIDE master-detail viewport. The buttons now
+        # sit on their own line below. Same widgets, same handlers — layout only.
         token_row.addWidget(self._mobile_token_label)
         token_row.addWidget(self._token_mask_label, 1)
-        token_row.addWidget(self._mobile_show_btn)
-        token_row.addWidget(self._mobile_regen_btn)
         l.addLayout(token_row)
+
+        token_btn_row = QHBoxLayout()
+        token_btn_row.setSpacing(8)
+        token_btn_row.addWidget(self._mobile_show_btn)
+        token_btn_row.addWidget(self._mobile_regen_btn)
+        token_btn_row.addStretch(1)
+        l.addLayout(token_btn_row)
 
         self._mobile_warn = QLabel(i18n.t("settings.mobile_token_warning"))
         self._mobile_warn.setObjectName("warnLabel")
@@ -3734,6 +3831,16 @@ class _SettingsPanel(QWidget):
         for _label, _label_key in self._startup_labels:
             _label.setText(i18n.t(_label_key))
 
+    def _retranslate_nav(self) -> None:
+        """Re-render the master-detail category-nav labels after a language
+        change. The QStackedWidget pages stay put; only the QListWidget row text
+        is refreshed from the i18n keys captured in ``self._settings_pages``.
+        """
+        for _row, (_key, _sections) in enumerate(self._settings_pages):
+            item = self._settings_nav.item(_row)
+            if item is not None:
+                item.setText(i18n.t(_key))
+
     def _on_startup_toggle_changed(self, unit: str, toggle: QCheckBox) -> None:
         if self._startup_refresh_guard:
             return
@@ -4199,7 +4306,7 @@ class _NavButton(QPushButton):
     itself switches to the violet accent; hover shows a softer violet wash.
     """
 
-    ICON_PX = 33
+    ICON_PX = 29    # WOR-48 P3: 33 → 29, slightly smaller nav glyphs
 
     def __init__(self, kind: str, tooltip: str):
         super().__init__()
@@ -4209,10 +4316,13 @@ class _NavButton(QPushButton):
         self._tip_key: str | None = None
         self.setObjectName("navBtn")
         self.setCheckable(True)
-        # 56px (was 48) so the painted glyphs — notably the speech-bubble tail,
-        # which reaches ~0.22*ICON_PX below the bubble body — have vertical room
-        # and no longer clip against the button's bottom edge.
-        self.setFixedSize(52, 56)
+        # The button must stay taller than the painted glyphs — notably the
+        # speech-bubble tail, which reaches ~0.22*ICON_PX below the bubble
+        # body — so they never clip against its bottom edge. WOR-48 P3:
+        # 52×56 → 46×50, slightly smaller buttons to match the smaller icons
+        # (ICON_PX 29: the tail bottoms out ~17px below centre, well inside
+        # the 25px half-height).
+        self.setFixedSize(46, 50)
         self.setToolTip(tooltip)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._hovered = False
@@ -4380,7 +4490,20 @@ class MainPopup(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(POPUP_W, POPUP_H)
+        # WOR-48 P3 — the width is dynamic per page (COMPACT ↔ WIDE, see
+        # _animate_width), so the window is no longer setFixedSize: the height
+        # stays locked at POPUP_H while the width is only bounded so the
+        # geometry animation can tween it. The window has no native resize
+        # edges (frameless Tool window), so only _animate_width changes it.
+        self.setFixedHeight(POPUP_H)
+        self.setMinimumWidth(POPUP_W)
+        self.setMaximumWidth(POPUP_W_WIDE)
+        self.resize(POPUP_W, POPUP_H)
+
+        # Width tween (geometry animation so x can shift while w grows — the
+        # popup expands around its centre and stays put under the capsule).
+        self._width_anim = QPropertyAnimation(self, b"geometry", self)
+        self._width_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
         # The Dynamic Island capsule the popup anchors to (set_anchor) —
         # when set, the popup opens just below the capsule's CURRENT
@@ -4425,7 +4548,9 @@ class MainPopup(QWidget):
 
         close_btn = QPushButton("✕")
         close_btn.setObjectName("closeBtn")
-        close_btn.setFixedSize(26, 26)
+        # WOR-48 P3: slightly larger, SQUARE with lightly rounded corners
+        # (radius in the #closeBtn QSS) instead of the previous 26px circle.
+        close_btn.setFixedSize(30, 30)
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.clicked.connect(self.hide)
 
@@ -4468,7 +4593,7 @@ class MainPopup(QWidget):
 
         # Bottom nav
         nav = QHBoxLayout()
-        nav.setSpacing(12)
+        nav.setSpacing(22)   # WOR-48 P3: 12 → 22, icons spaced further apart
         self._nav_group = QButtonGroup(self)
         self._nav_group.setExclusive(True)
 
@@ -4517,6 +4642,9 @@ class MainPopup(QWidget):
         self._anchor = widget
 
     def anchor_below_island(self, island_geom_bottom_y: int = 60) -> None:
+        # A still-running width tween would keep writing stale geometry over
+        # the position computed here — settle it first.
+        self._finish_width_anim()
         screen = self.screen() or QApplication.primaryScreen()
         geo = screen.availableGeometry()
 
@@ -4545,6 +4673,51 @@ class MainPopup(QWidget):
         y = geo.y() + max(island_geom_bottom_y, 60)
         self.move(x, y)
 
+    def _animate_width(self, target_w: int) -> None:
+        """Tween the window width to ``target_w`` (COMPACT or WIDE).
+
+        The height stays at POPUP_H; the window grows/shrinks symmetrically
+        around its current horizontal centre, which keeps it visually anchored
+        — when it sits centred under the capsule (anchor_below_island centres
+        x on the capsule), expanding around its own centre lands on exactly
+        the x the anchor logic would compute for the new width. The result is
+        clamped to the screen like anchor_below_island does, so growing near
+        an edge never pushes the popup off-screen.
+        """
+        if self.width() == target_w:
+            return
+        self._width_anim.stop()
+        cur = self.geometry()
+        x = cur.x() + (cur.width() - target_w) // 2
+        y = cur.y()
+        screen = self.screen() or QApplication.primaryScreen()
+        geo = screen.availableGeometry()
+        x = max(geo.x(), min(x, geo.x() + geo.width() - target_w))
+        y = max(geo.y(), min(y, geo.y() + geo.height() - cur.height()))
+        target = QRect(x, y, target_w, cur.height())
+        if not self.isVisible() or WIDTH_ANIM_MS <= 0:
+            # Hidden (no point animating) or reduced motion — snap instantly.
+            self.setGeometry(target)
+            return
+        self._width_anim.setDuration(WIDTH_ANIM_MS)
+        self._width_anim.setStartValue(cur)
+        self._width_anim.setEndValue(target)
+        self._width_anim.start()
+
+    def _finish_width_anim(self) -> None:
+        """If the width tween is mid-flight, jump it straight to its end state.
+
+        Called before anything that repositions the window wholesale
+        (re-anchoring on toggle, dragging) so a running animation never fights
+        the explicit move — or keeps interpolating toward stale coordinates
+        after it.
+        """
+        if self._width_anim.state() == QPropertyAnimation.State.Running:
+            end = self._width_anim.endValue()
+            self._width_anim.stop()
+            if isinstance(end, QRect):
+                self.setGeometry(end)
+
     def toggle(self) -> None:
         if self.isVisible():
             self.hide()
@@ -4560,6 +4733,8 @@ class MainPopup(QWidget):
         self._stack.setCurrentIndex(self.PAGE_CHAT)
         for b in self._nav_buttons.values():
             b.setChecked(False)
+        # Leaving settings via any "back to chat" path shrinks back to COMPACT.
+        self._animate_width(POPUP_W)
 
     def set_messages(self, messages: list[dict]) -> None:
         self._chat.set_messages(messages)
@@ -4601,6 +4776,11 @@ class MainPopup(QWidget):
                 self.show_chat()
                 return
             self._stack.setCurrentIndex(page_idx)
+            # WOR-48 P3: settings hosts the master-detail layout and needs the
+            # WIDE window; every other page uses the COMPACT width.
+            self._animate_width(
+                POPUP_W_WIDE if page_idx == self.PAGE_SETTINGS else POPUP_W
+            )
             if page_idx == self.PAGE_CONVS:
                 self._convs.refresh()
             elif page_idx == self.PAGE_MODELS:
@@ -4628,6 +4808,9 @@ class MainPopup(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            # Don't let an in-flight width tween fight the drag — settle it
+            # before capturing the grab offset.
+            self._finish_width_anim()
             self._drag_offset = (
                 event.globalPosition().toPoint()
                 - self.frameGeometry().topLeft()
@@ -4679,12 +4862,14 @@ class MainPopup(QWidget):
                              "Helvetica Neue", sans-serif;
             }
 
+            /* WOR-48 P3: square close button with lightly rounded corners
+               (was a 13px-radius circle); subtle hover kept. */
             QPushButton#closeBtn {
                 background: rgba(196, 181, 245, 0.06);
                 color: rgba(232, 230, 240, 0.7);
                 border: 1px solid rgba(196, 181, 245, 0.12);
-                border-radius: 13px;
-                font-size: 12px;
+                border-radius: 8px;
+                font-size: 13px;
             }
             QPushButton#closeBtn:hover {
                 background: rgba(196, 181, 245, 0.16);
@@ -4722,6 +4907,30 @@ class MainPopup(QWidget):
             QScrollArea#panelScroll > QWidget > QWidget {
                 background: transparent;
                 border: none;
+            }
+
+            /* WOR-48 P2 — settings category nav (master-detail). Transparent
+               list; selected row is a violet accent pill in the existing
+               rgba(196,181,245,…) palette, hover is a subtler wash. */
+            QListWidget#settingsNav {
+                background: transparent;
+                border: none;
+                outline: 0;
+                font-size: 12px;
+            }
+            QListWidget#settingsNav::item {
+                color: #9d9aad;
+                padding: 7px 8px;
+                margin: 2px 1px;
+                border-radius: 9px;
+            }
+            QListWidget#settingsNav::item:hover {
+                background: rgba(196, 181, 245, 0.08);
+                color: #e8e6f0;
+            }
+            QListWidget#settingsNav::item:selected {
+                background: rgba(196, 181, 245, 0.16);
+                color: #e8e6f0;
             }
 
             /* Chat ───────────────────────────────────────────────────── */
