@@ -70,14 +70,21 @@ except ImportError:
 
 # ── Visual constants ────────────────────────────────────────────────────────
 
-POPUP_W = 520
-POPUP_H = 640
+# WOR-48: the popup was intentionally made smaller / more minimalist here
+# (520×640 → 440×560). This deliberately overrides the CLAUDE.md POPUP_W=520
+# protection — do not "restore" it to 520 without a new explicit request.
+POPUP_W = 440
+POPUP_H = 560
 RADIUS = 20
 # Dark, semi-transparent glassmorphism fill so the popup reads as a floating
 # glass panel rather than an opaque window. Lower alpha → more transparent;
 # a second, slightly lighter layer painted on top fakes a soft blur/frost.
-BG_COLOR = QColor(13, 11, 18, 220)
-BG_BLUR_LAYER = QColor(26, 22, 37, 70)      # #1a1625 wash for a frosted feel
+# WOR-48: alpha lowered 220 → 160 → 125 for a clearly translucent "glass"
+# panel where the desktop shows through (Arch-Linux translucent-terminal look).
+# Inner surfaces (assistant bubble, input frame) keep a higher alpha so text
+# stays legible while this outer card is strongly translucent.
+BG_COLOR = QColor(13, 11, 18, 125)
+BG_BLUR_LAYER = QColor(26, 22, 37, 85)      # #1a1625 wash for a frosted feel
 BORDER_COLOR = QColor(196, 181, 245, 70)    # subtle violet edge
 PANEL_BG = QColor(255, 255, 255, 10)
 ACCENT = QColor(196, 181, 245)      # #c4b5f5
@@ -266,6 +273,11 @@ class _ChatPage(QWidget):
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        # WOR-48: hide the vertical bar too (scrolling stays fully functional
+        # via wheel/drag/trackpad); the QSS below makes it 0px/transparent.
+        self._scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
 
@@ -535,6 +547,9 @@ class _ConversationsPanel(QWidget):
         scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
 
         self._host = QWidget()
         # QScrollArea.setWidget() forces autoFillBackground(True) on the host,
@@ -754,6 +769,9 @@ class _ModelPanel(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self._host = QWidget()
@@ -1288,6 +1306,7 @@ class _CronConversationDialog(_PopoverDialog):
         scroll.setWidgetResizable(True)
         scroll.setObjectName("convScroll")
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setMaximumHeight(280)
         scroll.setMinimumWidth(320)
@@ -1444,6 +1463,9 @@ class _SettingsPanel(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
 
@@ -3870,6 +3892,9 @@ class _OsiaPanel(QWidget):
         scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
 
         host = QWidget()
         host.setObjectName("panelHost")
@@ -4365,16 +4390,16 @@ class MainPopup(QWidget):
         # popup itself and move the whole window.
         self._drag_offset = None
 
-        # Soft shadow
+        # Soft shadow — WOR-48: lighter/tighter for a more minimalist feel.
         shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(60)
-        shadow.setOffset(0, 12)
+        shadow.setBlurRadius(40)
+        shadow.setOffset(0, 8)
         shadow.setColor(QColor(0, 0, 0, 220))
         self.setGraphicsEffect(shadow)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(14, 14, 14, 14)
-        outer.setSpacing(8)
+        outer.setContentsMargins(11, 11, 11, 11)   # WOR-48: tighter margins
+        outer.setSpacing(6)
 
         # Header — OSIA logo on the left, close button on the right. The logo
         # alone represents OSIA, so no separate "OSIA" wordmark is shown.
@@ -4706,16 +4731,17 @@ class MainPopup(QWidget):
                 padding: 40px 12px;
             }
             QFrame#msgBubble {
-                border-radius: 16px;
+                border-radius: 14px;
                 padding: 0px;
             }
+            /* WOR-48: softer bubble borders for a lighter, glassier look. */
             QFrame#msgBubble[role="user"] {
-                background: rgba(196, 181, 245, 0.20);
-                border: 1px solid rgba(196, 181, 245, 0.30);
+                background: rgba(196, 181, 245, 0.18);
+                border: 1px solid rgba(196, 181, 245, 0.22);
             }
             QFrame#msgBubble[role="assistant"] {
-                background: #0f0d16;
-                border: 1px solid rgba(196, 181, 245, 0.12);
+                background: rgba(15, 13, 22, 0.62);
+                border: 1px solid rgba(196, 181, 245, 0.08);
             }
             QLabel#msgText {
                 color: #e8e6f0;
@@ -4723,13 +4749,14 @@ class MainPopup(QWidget):
                 background: transparent;
             }
 
+            /* WOR-48: lighter input frame — translucent fill, softer border. */
             QFrame#inputWrap {
-                background: #13111a;
-                border: 1px solid rgba(196, 181, 245, 0.12);
-                border-radius: 16px;
+                background: rgba(19, 17, 26, 0.62);
+                border: 1px solid rgba(196, 181, 245, 0.10);
+                border-radius: 14px;
             }
             QFrame#inputWrap:hover {
-                border: 1px solid rgba(196, 181, 245, 0.34);
+                border: 1px solid rgba(196, 181, 245, 0.26);
             }
             QLineEdit#chatInput {
                 background: transparent;
@@ -5022,7 +5049,7 @@ class MainPopup(QWidget):
                 background: rgba(196, 181, 245, 0.04);
                 border: 1px solid rgba(196, 181, 245, 0.12);
                 border-radius: 10px;
-                padding: 8px 16px;
+                padding: 6px 12px;          /* WOR-48: trimmed pill padding */
                 color: #e8e6f0;
                 font-size: 12px;
                 text-align: left;
@@ -5154,18 +5181,24 @@ class MainPopup(QWidget):
                 border: 1px solid rgba(196, 181, 245, 1.0);
             }
 
+            /* WOR-48: scrollbars are fully hidden everywhere (the per-area
+               ScrollBarAlwaysOff policy does the hiding). This QSS is a
+               belt-and-suspenders fallback so no bar ever renders — including
+               in child dialogs that don't set the policy: zero width and a
+               fully transparent track + handle. Scrolling stays functional
+               (wheel/drag/trackpad). */
             QScrollBar:vertical {
                 background: transparent;
-                width: 8px;
+                width: 0px;
                 margin: 0;
             }
             QScrollBar::handle:vertical {
-                background: rgba(196, 181, 245, 0.18);
-                border-radius: 4px;
-                min-height: 24px;
+                background: transparent;
+                border-radius: 0px;
+                min-height: 0px;
             }
             QScrollBar::handle:vertical:hover {
-                background: rgba(196, 181, 245, 0.30);
+                background: transparent;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0;
