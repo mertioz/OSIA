@@ -121,12 +121,20 @@ def _child_command(kind: str):
         # and any crash traceback reach the child log *immediately* instead of
         # dying block-buffered in the child's stdio when it exits.
         return [_venv_python(), "-u", str(_RUN_SERVER)], str(_REPO)
-    # tunnel — Cloudflare *quick* tunnel for http://localhost:8765 (identical
+    # tunnel — Cloudflare *quick* tunnel for http://127.0.0.1:8765 (identical
     # invocation to windows\start_tunnel.bat). The public trycloudflare.com URL
     # it prints to _TUNNEL_LOG is what osia.rendezvous publishes (WOR-64).
+    #
+    # WOR-67: ``--config NUL`` forces cloudflared to SKIP ~/.cloudflared/config.yml.
+    # That file's ingress only routes hostname: osia.space and 404s everything
+    # else, so without this the quick-tunnel URL returned 404 on every path. NUL
+    # is the Windows null device (the Linux wrapper must use ``/dev/null`` here,
+    # NOT NUL). Origin is 127.0.0.1 (not localhost) to force IPv4 — the server
+    # binds 0.0.0.0:8765 which is IPv4-only, so a localhost→::1 resolution would
+    # fail to connect.
     return (
-        [str(_CLOUDFLARED), "tunnel", "--no-autoupdate",
-         "--logfile", str(_TUNNEL_LOG), "--url", "http://localhost:8765"],
+        [str(_CLOUDFLARED), "tunnel", "--no-autoupdate", "--config", "NUL",
+         "--logfile", str(_TUNNEL_LOG), "--url", "http://127.0.0.1:8765"],
         str(_HERE),
     )
 
