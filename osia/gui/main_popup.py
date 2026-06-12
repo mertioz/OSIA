@@ -35,7 +35,6 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QStackedWidget, QListWidget, QFrame,
-    QGraphicsDropShadowEffect,
     QSizePolicy, QFileDialog, QCheckBox, QComboBox,
     QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog,
 )
@@ -78,13 +77,29 @@ POPUP_W = 440
 POPUP_H = 560
 # WOR-48 P3 — the window width is dynamic per page: COMPACT (POPUP_W) for
 # chat/conversations/models/OSIA, WIDE for the Settings master-detail layout
-# (110px category nav + ~480px detail panel, so 300px-min fields fit without
-# clipping). Height never changes. The width tween lives in
-# MainPopup._animate_width; WIDTH_ANIM_MS <= 0 disables the animation and
-# snaps instantly (reduced-motion escape hatch).
+# (110px category nav + ~415px detail panel; the settings form fields carry no
+# hard minimum width, so they adapt to this pane without clipping). Height never
+# changes. WOR-48 audit #2: the width now SNAPS to its target in
+# MainPopup._animate_width (no tween — the old animation slid the settings nav
+# under the cursor and swallowed the first category click). The ~415px figure is
+# narrower than the pre-audit ~470px because the card is now inset by
+# SHADOW_MARGIN for the hand-painted drop shadow (see below). WIDTH_ANIM_MS is
+# retained only as a legacy constant; it no longer gates any code path.
 POPUP_W_WIDE = 640
 WIDTH_ANIM_MS = 280
 RADIUS = 16     # WOR-48 P3: 20 → 16, lightly-rounded rectangle (not pill-like)
+# WOR-48 audit #2 — the drop shadow is painted BY HAND in MainPopup.paintEvent
+# (no QGraphicsDropShadowEffect, which makes Qt render the widget off-screen and
+# thereby defeats the per-frame transparent clear, leaving ghost rectangles on
+# the translucent moving/resizing window). SHADOW_MARGIN is the transparent
+# canvas band reserved around the card for that shadow: the card is inset by it,
+# and the window's outer layout margin = SHADOW_MARGIN + the card's own 11px
+# internal padding (so content keeps exactly the breathing room it had before).
+SHADOW_MARGIN = 27
+SHADOW_LAYERS = 9     # concentric rounded-rect outlines faking a blurred shadow
+SHADOW_STEP = 2       # px each successive ring expands outward from the card
+SHADOW_DY = 8         # downward shadow offset (light reads as coming from above)
+SHADOW_ALPHA = 45     # alpha of the innermost (darkest) ring; fades to 0 outward
 # Dark, semi-transparent glassmorphism fill so the popup reads as a floating
 # glass panel rather than an opaque window. Lower alpha → more transparent;
 # a second, slightly lighter layer painted on top fakes a soft blur/frost.
@@ -3911,13 +3926,20 @@ class _SettingsPanel(QWidget):
     # the panel can be repositioned anywhere on screen.
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
+        # WOR-48 audit #2 — only begin a window drag when the press is on the
+        # panel's own EMPTY chrome (no child widget under the cursor). A press a
+        # hair off a category row would otherwise be greedily swallowed as a
+        # drag-start and that first click lost, compounding the settings
+        # "freeze". childAt() is None ⟺ genuinely empty draggable background.
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self.childAt(event.position().toPoint()) is None):
             self._drag_pos = (
                 event.globalPosition().toPoint()
                 - self.window().frameGeometry().topLeft()
             )
             event.accept()
             return
+        self._drag_pos = None
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -4501,16 +4523,13 @@ class MainPopup(QWidget):
         self.setMaximumWidth(POPUP_W_WIDE)
         self.resize(POPUP_W, POPUP_H)
 
-        # Width tween (geometry animation so x can shift while w grows — the
-        # popup expands around its centre and stays put under the capsule).
+        # WOR-48 audit #2 — the 440<->640 width change now SNAPS instantly (see
+        # _animate_width). The old geometry tween slid the settings category nav
+        # under the cursor mid-flight, so the first category click frequently
+        # missed (~50% settings "freeze"). The QPropertyAnimation object is kept
+        # only so _finish_width_anim() stays a harmless no-op; it is never started.
         self._width_anim = QPropertyAnimation(self, b"geometry", self)
         self._width_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        # Clean repaint once the 440<->640 tween settles: combined with the
-        # full-rect clear in paintEvent, this guarantees the settled window and
-        # the just-switched settings detail page repaint cleanly, so the first
-        # category click always registers (fixes the ~50% settings freeze).
-        # Adds an update only — it does not stop the tween.
-        self._width_anim.finished.connect(self.update)
 
         # The Dynamic Island capsule the popup anchors to (set_anchor) —
         # when set, the popup opens just below the capsule's CURRENT
@@ -4520,15 +4539,21 @@ class MainPopup(QWidget):
         # popup itself and move the whole window.
         self._drag_offset = None
 
-        # Soft shadow — WOR-48: lighter/tighter for a more minimalist feel.
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(40)
-        shadow.setOffset(0, 8)
-        shadow.setColor(QColor(0, 0, 0, 220))
-        self.setGraphicsEffect(shadow)
+        # Soft shadow — WOR-48 audit #2: NO QGraphicsDropShadowEffect. An
+        # installed graphics effect makes Qt render the widget into an off-screen
+        # buffer, which defeats the per-frame transparent clear in paintEvent and
+        # leaves ghost rectangles when this translucent window is dragged/resized.
+        # The drop shadow is instead painted by hand in paintEvent, inside the
+        # SHADOW_MARGIN canvas band → it lives in the backing store and is wiped
+        # clean every frame (no ghosts). No setGraphicsEffect anywhere.
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(11, 11, 11, 11)   # WOR-48: tighter margins
+        # WOR-48 audit #2: outer margin = SHADOW_MARGIN (transparent canvas band
+        # for the hand-painted drop shadow that replaced QGraphicsDropShadowEffect)
+        # + the card's own 11px internal padding, preserved from before. Total
+        # ~38px; the card itself is inset by SHADOW_MARGIN in paintEvent.
+        _m = SHADOW_MARGIN + 11
+        outer.setContentsMargins(_m, _m, _m, _m)
         outer.setSpacing(6)
 
         # Header — OSIA logo on the left, close button on the right. The logo
@@ -4681,15 +4706,16 @@ class MainPopup(QWidget):
         self.move(x, y)
 
     def _animate_width(self, target_w: int) -> None:
-        """Tween the window width to ``target_w`` (COMPACT or WIDE).
+        """Resize the window to ``target_w`` (COMPACT or WIDE), instantly.
 
-        The height stays at POPUP_H; the window grows/shrinks symmetrically
-        around its current horizontal centre, which keeps it visually anchored
-        — when it sits centred under the capsule (anchor_below_island centres
-        x on the capsule), expanding around its own centre lands on exactly
-        the x the anchor logic would compute for the new width. The result is
-        clamped to the screen like anchor_below_island does, so growing near
-        an edge never pushes the popup off-screen.
+        WOR-48 audit #2: this used to TWEEN the geometry over WIDTH_ANIM_MS, but
+        while the 440↔640 tween was mid-flight the settings category nav slid
+        under the cursor, so the first category click frequently missed (the
+        ~50% settings "freeze"). The width now SNAPS to its final value in a
+        single setGeometry, so the window is never a moving target and the first
+        click always lands. It still grows/shrinks symmetrically around its
+        horizontal centre (so it stays put under the capsule) and is clamped
+        on-screen exactly as before — only the animated interpolation is gone.
         """
         if self.width() == target_w:
             return
@@ -4701,15 +4727,8 @@ class MainPopup(QWidget):
         geo = screen.availableGeometry()
         x = max(geo.x(), min(x, geo.x() + geo.width() - target_w))
         y = max(geo.y(), min(y, geo.y() + geo.height() - cur.height()))
-        target = QRect(x, y, target_w, cur.height())
-        if not self.isVisible() or WIDTH_ANIM_MS <= 0:
-            # Hidden (no point animating) or reduced motion — snap instantly.
-            self.setGeometry(target)
-            return
-        self._width_anim.setDuration(WIDTH_ANIM_MS)
-        self._width_anim.setStartValue(cur)
-        self._width_anim.setEndValue(target)
-        self._width_anim.start()
+        self.setGeometry(QRect(x, y, target_w, cur.height()))
+        self.update()  # repaint the resized translucent canvas cleanly
 
     def _finish_width_anim(self) -> None:
         """If the width tween is mid-flight, jump it straight to its end state.
@@ -4852,11 +4871,43 @@ class MainPopup(QWidget):
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         painter.fillRect(self.rect(), Qt.GlobalColor.transparent)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-        rect = self.rect().adjusted(0, 0, -1, -1)
+
+        # The card sits inside the SHADOW_MARGIN band; the band holds the
+        # hand-painted drop shadow drawn just below. Inset by SHADOW_MARGIN and
+        # -1px so the 1px border stroke stays crisp inside the widget.
+        card = self.rect().adjusted(
+            SHADOW_MARGIN, SHADOW_MARGIN, -SHADOW_MARGIN - 1, -SHADOW_MARGIN - 1
+        )
+
+        # Manual soft drop shadow — replaces the removed QGraphicsDropShadowEffect.
+        # Several concentric rounded-rect OUTLINES expand outward from the card and
+        # fade to transparent, offset down so the light reads from above. Stroked
+        # (not filled) so the translucent card body is never darkened. It is drawn
+        # into the backing store, which the transparent clear above wipes every
+        # frame → moving/resizing leaves no ghost rectangles.
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for i in range(SHADOW_LAYERS, 0, -1):
+            frac = (i - 1) / (SHADOW_LAYERS - 1)   # 0 = innermost/darkest, 1 = outer
+            alpha = int(round(SHADOW_ALPHA * (1.0 - frac)))
+            spread = (i - 1) * SHADOW_STEP
+            pen = QPen(QColor(0, 0, 0, alpha))
+            pen.setWidthF(2.0)
+            painter.setPen(pen)
+            ring = QRectF(
+                card.x() + 0.5 - spread,
+                card.y() + 0.5 - spread + SHADOW_DY,
+                card.width() + spread * 2,
+                card.height() + spread * 2,
+            )
+            ring_path = QPainterPath()
+            ring_path.addRoundedRect(ring, RADIUS + spread, RADIUS + spread)
+            painter.drawPath(ring_path)
+
+        # The glass card itself, painted ON TOP of the shadow.
         path = QPainterPath()
         path.addRoundedRect(
-            rect.x() + 0.5, rect.y() + 0.5,
-            rect.width(), rect.height(),
+            card.x() + 0.5, card.y() + 0.5,
+            card.width(), card.height(),
             RADIUS, RADIUS,
         )
         painter.fillPath(path, BG_COLOR)
