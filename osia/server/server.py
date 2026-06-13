@@ -31,6 +31,10 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "get_api_keys"}                                           # request the actual stored provider keys (mobile API-keys editor)
     {"type": "get_heartbeat_config"}                                   # request the live-heartbeat enable flag + push interval (seconds)
     {"type": "restart_server"}                                         # restart the server process in place via os.execv; acked with status "done" + "message": "restarting" first (WOR-28)
+    {"type": "autonomous_start",     "objective": "...", "model": "..."}  # WOR-45 P5: begin ONE machine-global autonomous run (planner→orchestrator); refused with autonomous_progress{event:"busy"} if a run already holds the single-runner lock
+    {"type": "autonomous_interrupt"}                                   # WOR-45 P5: pause the autonomous run — state stays in_progress (resumable)
+    {"type": "autonomous_abort"}                                       # WOR-45 P5: discard the autonomous run — marks state aborted then deletes the checkpoint
+    {"type": "get_autonomous_status"}                                  # WOR-45 P5: request the current autonomous snapshot (or {event:"idle"}); lets a phone reconnecting mid-run render progress
   Server → Client:
     {"type": "api_keys",             "keys": {provider: key, ...}}     # actual stored keys, one entry per models.API_PROVIDERS ("" if unset)
     {"type": "heartbeat_config",     "config": {"enabled": bool, "interval_seconds": int}}
@@ -57,6 +61,10 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "file_received",        "filename": "...", "path": "...", "success": true|false}
     {"type": "config",               "config": {...}}                  # full config snapshot (settings incl. api_key_fallbacks, personality, skills)
     {"type": "status",               "status": "done|error"}           # ack for the config-family setters (create_skill adds "name", restart_server adds "message": "restarting")
+    {"type": "autonomous_progress",  "event": "running|interrupted|aborted|plan_failed|busy|idle|task_done|task_failed|salvaged|done|failed",
+                                     "tasks_done": int, "tasks_total": int, "phase_name": "...", "objective": "...", "status": "..."}
+                                     # WOR-45 P5: autonomous-run progress. Broadcast to ALL clients on every engine/synthesized transition (the run is machine-global);
+                                     # the host synthesizes running/interrupted/aborted/plan_failed/busy/idle and enriches every frame with the live task_state snapshot.
 """
 
 import asyncio
@@ -69,6 +77,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from collections import OrderedDict
@@ -863,6 +872,373 @@ def _agent_needs_model_apply(agent, selected_model: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Autonomous-agent support (WOR-45 Phase 5 — SERVER side only)
+# ---------------------------------------------------------------------------
+# A mobile client can start / interrupt / abort / observe ONE long-running
+# autonomous task over the existing WebSocket. The planner + orchestrator +
+# state layer (osia.autonomous.*) are consumed strictly as BLACK BOXES — there
+# are ZERO edits to the engine. Everything below is purely additive and lives
+# off the chat streaming path, the per-connection conn_agents and the
+# single-writer _OutboundChannel/_writer model.
+import osia.autonomous.state as _astate
+from osia.autonomous import planner as _aplanner
+from osia.autonomous.orchestrator import Orchestrator as _Orchestrator
+
+# Layer 1 — STATE ISOLATION (collision fix). Redirect the engine's persistent
+# task-state file process-locally so the server never collides with the desktop
+# GUI's task_state.json. The engine resolves TASK_STATE_FILE lazily (every
+# load/save/clear reads this module global at call time), so reassigning it here
+# redirects ALL server-side state I/O with zero engine edits. CONFIG_DIR is the
+# same dir the GUI uses, resolved via osia.config (never recomputed).
+_astate.TASK_STATE_FILE = CONFIG_DIR / "task_state_mobile.json"
+
+# Layer 2 — SINGLE-RUNNER LOCK (collision fix). A machine-wide lockfile so at
+# most ONE autonomous run (GUI or mobile) exists at a time — they share the
+# browser, filesystem and LLM spend. Holds {owner, pid, task_id}. A stale lock
+# whose pid is dead is reclaimable.
+_AUTONOMOUS_LOCK_FILE = CONFIG_DIR / "autonomous.lock"
+
+# THE one server-side autonomous run. The dedicated agent + orchestrator are
+# built lazily on first start (a server that never runs an autonomous task pays
+# nothing) and are NEVER shared with the per-connection chat agents. `loop` is
+# the running event loop captured at start, used to hop progress frames from the
+# orchestrator's daemon thread back onto each connection's single writer.
+_autonomous: dict = {
+    "agent": None,    # dedicated OSIAAgent (lazy)
+    "orch": None,     # Orchestrator over `agent` (lazy)
+    "st": None,       # current task_state dict (the engine mutates it in place)
+    "loop": None,     # asyncio loop for run_coroutine_threadsafe broadcasts
+    "active": False,  # True while THIS process holds the single-runner slot
+    "gen": 0,         # acquisition generation — bumped on every successful
+                      # acquire so a start worker can tell whether ITS slot is
+                      # still the current one (a cancel-then-reacquire during the
+                      # multi-second planning window invalidates a stale worker).
+}
+# Guards `_autonomous` lifecycle mutations + the lockfile across the event-loop
+# thread and the orchestrator/worker daemon threads. Non-reentrant — the helpers
+# below NEVER nest acquisitions of it.
+_autonomous_lock = threading.Lock()
+
+# Sentinel so _autonomous_frame() can tell "snapshot the current run" (default)
+# apart from an explicit "no run → empty snapshot" (st=None).
+_AUTO_UNSET = object()
+
+
+def _autonomous_snapshot(st) -> dict:
+    """WS-contract snapshot (tasks_done/tasks_total + current phase/status)
+    computed from a task_state dict. Pure reads — safe on any thread. Mirrors
+    main.py's ``_orch_snapshot`` but emits the mobile WS field names."""
+    if not isinstance(st, dict):
+        return {}
+    phases = st.get("phases") or []
+    total = 0
+    done = 0
+    for ph in phases:
+        for tk in (ph.get("tasks") or []):
+            total += 1
+            if tk.get("status") == "done":
+                done += 1
+    cursor = st.get("cursor") or {}
+    p = int(cursor.get("phase", 0) or 0)
+    phase_name = ""
+    if 0 <= p < len(phases):
+        phase_name = phases[p].get("name", "") or ""
+    return {
+        "tasks_done": done,
+        "tasks_total": total,
+        "phase_name": phase_name,
+        "objective": st.get("objective", "") or "",
+        "status": st.get("status", "") or "",
+    }
+
+
+def _autonomous_frame(payload: dict, st=_AUTO_UNSET) -> dict:
+    """Build an outbound ``autonomous_progress`` frame: the event payload
+    enriched with the run snapshot. The engine only emits
+    task_done/task_failed/salvaged/done/failed; the host synthesizes
+    running/interrupted/aborted/plan_failed/busy/idle. Pass ``st=None`` to force
+    an empty snapshot (no run); omit ``st`` to snapshot the current run."""
+    if st is _AUTO_UNSET:
+        st = _autonomous.get("st")
+    return {
+        "type": "autonomous_progress",
+        **dict(payload),
+        **_autonomous_snapshot(st),
+    }
+
+
+def _snapshot_ws_clients() -> tuple:
+    """Race-tolerant snapshot of ``_WS_CLIENTS``. Broadcasts run on a daemon
+    thread while the event-loop thread may add (auth) / discard (disconnect) —
+    set iteration can raise "changed size during iteration"; retry briefly."""
+    for _ in range(3):
+        try:
+            return tuple(_WS_CLIENTS)
+        except RuntimeError:
+            continue
+    return ()
+
+
+def _broadcast_autonomous(frame: dict) -> None:
+    """Fan ``frame`` out to every connected client from a NON-loop thread. Never
+    touches ``ws.send_*`` directly (that corrupts Starlette's writer state — see
+    ``_OutboundChannel``); instead hops onto the captured event loop so each
+    connection's single writer task enqueues it (the same thread→loop pattern
+    the chat stream uses). Best-effort — a dead client is skipped, never fatal."""
+    loop = _autonomous.get("loop")
+    if loop is None:
+        return
+    for ch in _snapshot_ws_clients():
+        try:
+            asyncio.run_coroutine_threadsafe(ch.send_json(frame), loop)
+        except Exception:
+            pass
+
+
+def _read_autonomous_lock():
+    """Parse the single-runner lockfile, or ``None`` when absent/unreadable/
+    corrupt (e.g. a torn cross-process write) — graceful, never raises."""
+    try:
+        if not _AUTONOMOUS_LOCK_FILE.exists():
+            return None
+        return json.loads(_AUTONOMOUS_LOCK_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _write_autonomous_lock(task_id=None) -> None:
+    """Write OUR ownership record atomically (temp + ``os.replace``, like
+    state.py) so a concurrent cross-process reader never sees a torn file.
+    Best-effort — a write failure must not abort a start (the in-process
+    ``active`` flag still guards same-process re-entry). Callers hold
+    ``_autonomous_lock``."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _AUTONOMOUS_LOCK_FILE.with_name(_AUTONOMOUS_LOCK_FILE.name + ".tmp")
+        tmp.write_text(
+            json.dumps({"owner": "mobile", "pid": os.getpid(),
+                        "task_id": task_id}),
+            encoding="utf-8",
+        )
+        os.replace(tmp, _AUTONOMOUS_LOCK_FILE)
+    except OSError as e:
+        print(f"[WOR-45] could not write autonomous lockfile: {e}")
+
+
+def _acquire_single_runner(task_id=None):
+    """Reserve the machine-wide single autonomous-run slot. Returns the new
+    acquisition GENERATION (int ≥ 1) on success, or ``None`` if a run is already
+    active in THIS process OR a valid lock from another LIVE owner exists. A
+    stale lock whose pid is dead is reclaimed. Atomic under ``_autonomous_lock``
+    so two concurrent starts can't both win. The generation lets a start worker
+    detect that its slot was released-and-reacquired during planning (so a stale
+    worker never establishes/starts over a newer run)."""
+    with _autonomous_lock:
+        if _autonomous.get("active"):
+            return None  # this process already has a run in flight
+        existing = _read_autonomous_lock()
+        if isinstance(existing, dict):
+            pid = existing.get("pid")
+            if isinstance(pid, int) and pid != os.getpid():
+                try:
+                    alive = psutil.pid_exists(pid)
+                except Exception:
+                    alive = False
+                if alive:
+                    return None  # another live owner holds the slot
+        # No active run here and no foreign live owner ⇒ claim it.
+        gen = int(_autonomous.get("gen", 0)) + 1
+        _autonomous["gen"] = gen
+        _write_autonomous_lock(task_id)
+        _autonomous["active"] = True
+        return gen
+
+
+def _do_release_locked() -> None:
+    """Clear the in-process flag and delete OUR lockfile — never a foreign live
+    owner's (the pid guard). MUST be called holding ``_autonomous_lock``."""
+    _autonomous["active"] = False
+    existing = _read_autonomous_lock()
+    if isinstance(existing, dict) and existing.get("pid") != os.getpid():
+        return  # not ours — leave the other owner's lock intact
+    try:
+        if _AUTONOMOUS_LOCK_FILE.exists():
+            _AUTONOMOUS_LOCK_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _release_single_runner() -> None:
+    """Release the CURRENT run's slot unconditionally. Used by the terminal,
+    interrupt, abort and shutdown paths, which all act on the established run (no
+    new acquisition can race them — ``active`` stays True until they release)."""
+    with _autonomous_lock:
+        _do_release_locked()
+
+
+def _release_single_runner_if_gen(my_gen: int) -> None:
+    """Release the slot ONLY if generation ``my_gen`` is still the current one.
+    Used by a start worker's failure paths so a stale worker (whose slot was
+    already released and reacquired by a newer start during planning) can never
+    free the newer run's slot."""
+    with _autonomous_lock:
+        if int(_autonomous.get("gen", 0)) != my_gen:
+            return  # a newer acquisition owns the slot now — don't touch it
+        _do_release_locked()
+
+
+def _finalize_terminal_release(orch) -> None:
+    """Release the slot for a run that reached a TERMINAL engine event, on a
+    SEPARATE thread that JOINS the (now-finishing) orchestrator thread FIRST.
+
+    The terminal event fires synchronously on the orchestrator's own daemon
+    thread, which is therefore still ``is_alive()`` for a brief window. If we
+    cleared ``active`` from inside that callback, a back-to-back ``autonomous_start``
+    could acquire the freed slot and call ``orch.start()`` while the old thread is
+    still alive — ``Orchestrator._begin`` would silently no-op (its
+    ``is_alive()`` early-return), wedging the new run with the slot held but no
+    loop. ``orch.stop()`` joins the finishing thread (idempotent, ≤2 s), so by
+    the time we release, the loop thread is truly dead and the next start spawns
+    cleanly. A self-join can't happen — this always runs on a different thread."""
+    try:
+        if orch is not None:
+            orch.stop()  # joins the finishing loop thread; idempotent
+    except Exception as e:
+        print(f"[WOR-45] terminal orchestrator.stop failed: {e}")
+    _release_single_runner()
+
+
+def _on_autonomous_progress(payload: dict) -> None:
+    """Orchestrator ``progress_cb`` — runs on the orchestrator's daemon thread.
+    ONLY builds a plain frame and broadcasts it (never a ws/Qt touch). On a
+    TERMINAL engine event (done/failed) the run is over, so release the
+    single-runner slot — but OFF this (still-alive) thread, joining it first (see
+    ``_finalize_terminal_release``). Wrapped so a callback error never kills the
+    loop. ``active`` stays True until that release, so no start can race in."""
+    try:
+        frame = _autonomous_frame(dict(payload), _autonomous.get("st"))
+        _broadcast_autonomous(frame)
+        if payload.get("event") in ("done", "failed"):
+            threading.Thread(
+                target=_finalize_terminal_release,
+                args=(_autonomous.get("orch"),),
+                daemon=True,
+            ).start()
+    except Exception as e:
+        print(f"[WOR-45] autonomous progress_cb error: {e}")
+
+
+def _ensure_autonomous_engine():
+    """Lazily build (exactly once) the dedicated server-side autonomous agent
+    and its Orchestrator — NEVER shared with conn_agents. Returns
+    ``(agent, orchestrator)``."""
+    with _autonomous_lock:
+        if _autonomous.get("orch") is None:
+            from osia.agent import OSIAAgent
+            agent = OSIAAgent()
+            _autonomous["agent"] = agent
+            _autonomous["orch"] = _Orchestrator(
+                agent, progress_cb=_on_autonomous_progress
+            )
+        return _autonomous["agent"], _autonomous["orch"]
+
+
+def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
+    """Plan + launch OFF the event loop (planning blocks on an LLM run). The
+    single-runner slot (generation ``my_gen``) was already acquired by the
+    handler. Mirrors main.py's ``handle_autonomous_start``: set_model → resolve
+    provider → create_plan_state → save → start → emit running.
+
+    Two hardening rules around the long planning gap and the held slot:
+
+    * Wrap the WHOLE body so ANY failure (engine build, set_model, planning,
+      start) RELEASES the slot and tells clients — otherwise a raise would leave
+      ``active`` True forever and wedge every later start at ``busy``.
+    * Before starting, ESTABLISH atomically and only if generation ``my_gen`` is
+      still current. A cancel (abort/interrupt) during planning releases the slot
+      (and a later start may reacquire it, bumping the generation); a stale worker
+      must NOT persist or ``orch.start()`` the run the user cancelled — doing so
+      would run it UNLOCKED (single-runner invariant broken) and/or stomp a newer
+      run. ``orch.start()`` clears the stop signal, so this gate is load-bearing."""
+    try:
+        agent, orch = _ensure_autonomous_engine()
+        # Honour the requested model; fall back to the configured one so the run
+        # uses the user's selected model rather than the bare OSIAAgent() default.
+        if not model:
+            try:
+                from osia.config import load_settings
+                model = (load_settings().get("selected_model") or "").strip()
+            except Exception:
+                model = ""
+        if model:
+            try:
+                agent.set_model(model)
+            except Exception as e:
+                print(f"[WOR-45] autonomous set_model({model!r}) failed: {e}")
+        # Resolve the provider from the model id (osia.models), like the GUI passes.
+        try:
+            from osia.models import provider_for_model
+            provider = provider_for_model(model) if model else ""
+        except Exception:
+            provider = ""
+        try:
+            st = _aplanner.create_plan_state(objective, provider, model, agent)
+        except Exception as e:
+            print(f"[WOR-45] autonomous planning crashed: {e}")
+            st = None
+        if not st:
+            _broadcast_autonomous(_autonomous_frame({"event": "plan_failed"}, None))
+            _release_single_runner_if_gen(my_gen)
+            return
+
+        # ── Establish the run atomically — only if our slot is still current ──
+        established = False
+        with _autonomous_lock:
+            if _autonomous.get("active") and int(_autonomous.get("gen", 0)) == my_gen:
+                _autonomous["st"] = st
+                _write_autonomous_lock(st.get("task_id"))  # stamp the real id
+                established = True
+        if not established:
+            # A cancel landed during planning (and the cancel handler already
+            # released the slot, cleared any checkpoint and broadcast its
+            # outcome) — or a newer start reacquired. Do NOT persist or start the
+            # run the user cancelled; the slot is correctly owned by neither us
+            # nor a stale generation.
+            print("[WOR-45] autonomous start cancelled during planning — not starting")
+            return
+
+        try:
+            _astate.save_task_state(st)
+        except Exception as e:
+            print(f"[WOR-45] save_task_state failed: {e}")
+        orch.start(st)
+        # Flip "planning" → "running" only AFTER start() spawned the loop. The
+        # engine emits events only on task transitions, never on start, so this
+        # won't double-fire.
+        _broadcast_autonomous(_autonomous_frame({"event": "running"}, st))
+    except Exception as e:
+        # Any unexpected failure (e.g. OSIAAgent build error, or thread
+        # exhaustion in orch.start) must NOT wedge the slot at busy forever:
+        # release it (only if still ours) and tell clients the start failed.
+        print(f"[WOR-45] autonomous start worker crashed: {e}")
+        _broadcast_autonomous(_autonomous_frame({"event": "plan_failed"}, None))
+        _release_single_runner_if_gen(my_gen)
+
+
+@app.on_event("shutdown")
+async def _stop_autonomous_on_shutdown() -> None:
+    """Server cleanup: stop the autonomous loop (safe if never started) and
+    release the single-runner slot so a restart isn't wrongly seen as busy."""
+    orch = _autonomous.get("orch")
+    if orch is not None:
+        try:
+            orch.stop()
+        except Exception as e:
+            print(f"[WOR-45] orchestrator.stop on shutdown failed: {e}")
+    _release_single_runner()
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -1355,6 +1731,107 @@ async def websocket_endpoint(ws: WebSocket):
                 except Exception as e:
                     print(f"[OSIA Server] set_model({model_id!r}) failed: {e}")
                     await out.send_json({"type": "status", "content": "error"})
+                continue
+
+            # --- Autonomous agent (WOR-45 Phase 5) ---
+            # Start / interrupt / abort / observe ONE machine-global autonomous
+            # run over this WebSocket. The engine (planner/orchestrator/state) is
+            # consumed as a black box; progress frames are BROADCAST to every
+            # connected client (the run is machine-global, not per-connection).
+            if msg_type == "autonomous_start":
+                objective = (msg.get("objective") or "").strip()
+                model = (msg.get("model") or "").strip()
+                if not objective:
+                    # Malformed request from this client — reject it directly.
+                    await out.send_json(
+                        _autonomous_frame({"event": "plan_failed"}, None)
+                    )
+                    continue
+                # Acquire the single-runner slot BEFORE spending LLM tokens on
+                # planning; refuse (busy) if another run already owns it. The
+                # returned generation lets the worker detect a cancel-then-
+                # reacquire during the (long) planning window.
+                _gen = _acquire_single_runner()
+                if _gen is None:
+                    await out.send_json(_autonomous_frame({"event": "busy"}))
+                    continue
+                # Capture THIS event loop so the orchestrator's daemon thread can
+                # hop progress frames back onto each connection's writer.
+                _autonomous["loop"] = asyncio.get_running_loop()
+                # Plan + start OFF the event loop (planning blocks on an LLM run).
+                threading.Thread(
+                    target=_autonomous_start_worker,
+                    args=(objective, model, _gen),
+                    daemon=True,
+                ).start()
+                continue
+
+            if msg_type == "autonomous_interrupt":
+                # Pause (resumable): stop() joins ≤2 s, so run it off the loop.
+                # The persisted state stays in_progress ⇒ resumable on relaunch.
+                def _interrupt_worker():
+                    orch = _autonomous.get("orch")
+                    if orch is not None:
+                        try:
+                            orch.stop()
+                        except Exception as e:
+                            print(f"[WOR-45] orchestrator.stop (interrupt) failed: {e}")
+                    _broadcast_autonomous(
+                        _autonomous_frame({"event": "interrupted"},
+                                          _autonomous.get("st"))
+                    )
+                    _release_single_runner()
+
+                threading.Thread(target=_interrupt_worker, daemon=True).start()
+                continue
+
+            if msg_type == "autonomous_abort":
+                # Discard. Mark the SHARED state dict aborted FIRST — before
+                # stop() — so a late daemon checkpoint on its way out persists
+                # status="aborted" (never in_progress), which a resume ignores.
+                # Then stop the loop, delete the checkpoint, emit, release.
+                def _abort_worker():
+                    st = _autonomous.get("st")
+                    if isinstance(st, dict):
+                        st["status"] = "aborted"
+                    orch = _autonomous.get("orch")
+                    if orch is not None:
+                        try:
+                            orch.stop()
+                        except Exception as e:
+                            print(f"[WOR-45] orchestrator.stop (abort) failed: {e}")
+                    try:
+                        _astate.clear_task_state()
+                    except Exception as e:
+                        print(f"[WOR-45] clear_task_state failed: {e}")
+                    _broadcast_autonomous(
+                        _autonomous_frame({"event": "aborted"}, st)
+                    )
+                    _release_single_runner()
+
+                threading.Thread(target=_abort_worker, daemon=True).start()
+                continue
+
+            if msg_type == "get_autonomous_status":
+                # Let a phone that (re)connects mid-run render current progress.
+                # Prefer the in-memory state; fall back to the persisted mobile
+                # file so a fresh process still reports a known run. Unicast.
+                st = _autonomous.get("st")
+                if not isinstance(st, dict):
+                    try:
+                        st = _astate.load_task_state()
+                    except Exception:
+                        st = None
+                if isinstance(st, dict):
+                    ev = {
+                        "in_progress": "running",
+                        "done": "done",
+                        "failed": "failed",
+                        "aborted": "aborted",
+                    }.get(st.get("status", ""), "running")
+                    await out.send_json(_autonomous_frame({"event": ev}, st))
+                else:
+                    await out.send_json(_autonomous_frame({"event": "idle"}, None))
                 continue
 
             # --- API keys & settings (mobile "Configure APIs & Providers") ---
