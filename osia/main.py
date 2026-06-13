@@ -358,6 +358,10 @@ def wake_mode():
     from osia.models import discover_models_async
     from osia.cron import CronManager
     from osia.heartbeat import HeartbeatMonitor
+    # WOR-45 Phase 4 — wire the autonomous engine (consumed as black boxes).
+    from osia.autonomous.orchestrator import Orchestrator
+    from osia.autonomous import planner
+    from osia.autonomous.state import save_task_state, clear_task_state
     perf_mark("wake_mode: heavy imports done")
 
     class Bridge(QObject):
@@ -375,6 +379,10 @@ def wake_mode():
         # Toggle the popup from the global Ctrl+Alt+O hotkey thread (WOR-22).
         # Marshalled onto the GUI thread so popup.toggle() is Qt-safe.
         toggle_popup = pyqtSignal()
+        # Autonomous-agent progress (WOR-45 Phase 4). The Orchestrator's
+        # progress_cb runs on its daemon thread; it only ever emits this signal
+        # (never touches a widget). Carries the event dict + a state snapshot.
+        autonomous_progress = pyqtSignal(dict)
 
     bridge = Bridge()
 
@@ -620,6 +628,10 @@ def wake_mode():
     def handle_island_state(state: str):
         island.set_state(state)
 
+    def handle_autonomous_progress(payload: dict):
+        # GUI thread (queued from the Bridge signal) — safe to touch widgets.
+        popup.update_autonomous_progress(payload)
+
     # ── Conversation management ──────────────────────────────────────────
 
     def handle_new_conversation():
@@ -708,6 +720,7 @@ def wake_mode():
     bridge.wake_detected.connect(handle_wake)
     bridge.chat_message.connect(handle_chat_message)
     bridge.island_state.connect(handle_island_state)
+    bridge.autonomous_progress.connect(handle_autonomous_progress)
     bridge.remote_models_signal.connect(handle_remote_models)
     bridge.conversations_changed.connect(popup.refresh_conversations)
     bridge.new_chat.connect(handle_voice_new_chat)
@@ -813,6 +826,119 @@ def wake_mode():
     cron_manager.start()
     heartbeat_monitor.start()
 
+    # ── Autonomous agent (WOR-45 Phase 4) ────────────────────────────────
+    # A DEDICATED agent (never shared with the chat) drives the orchestrator;
+    # the planner + orchestrator + state layer are consumed as black boxes. The
+    # engine is created but NOT started — it runs only on an explicit "Start"
+    # from the panel, or on a user-confirmed "Resume" at startup (below). The
+    # popup signal handlers below reference `orchestrator` / `autonomous_state`,
+    # which are bound in this same scope before the Qt event loop starts, so the
+    # handlers (only ever invoked via signals after app.exec()) resolve them.
+    autonomous_agent = OSIAAgent()
+    # Mutable holder for the live task_state dict so the progress closure (run on
+    # the orchestrator's daemon thread) and the abort/interrupt workers can read
+    # the same reference the orchestrator mutates in place.
+    autonomous_state = {"st": None}
+
+    def _orch_snapshot(st) -> dict:
+        """Plain-dict snapshot (done/total tasks + current phase name) computed
+        from a task_state dict. Pure reads — safe inside progress_cb, which runs
+        on the orchestrator thread (the same thread that mutates `st`)."""
+        if not isinstance(st, dict):
+            return {}
+        phases = st.get("phases") or []
+        total = 0
+        done = 0
+        for ph in phases:
+            for tk in (ph.get("tasks") or []):
+                total += 1
+                if tk.get("status") == "done":
+                    done += 1
+        cursor = st.get("cursor") or {}
+        p = int(cursor.get("phase", 0) or 0)
+        phase_name = ""
+        if 0 <= p < len(phases):
+            phase_name = phases[p].get("name", "") or ""
+        return {
+            "done": done,
+            "total": total,
+            "phase_name": phase_name,
+            "objective": st.get("objective", "") or "",
+            "status": st.get("status", "") or "",
+        }
+
+    def _on_orch_progress(payload):
+        # Runs on the orchestrator daemon thread. ONLY compute a plain-dict
+        # snapshot and emit via the Bridge — NEVER touch a Qt widget here.
+        snap = _orch_snapshot(autonomous_state.get("st"))
+        bridge.autonomous_progress.emit({**payload, **snap})
+
+    orchestrator = Orchestrator(autonomous_agent, progress_cb=_on_orch_progress)
+
+    def handle_autonomous_start(objective: str, provider: str, model: str):
+        # Plan OFF the GUI thread (create_plan_state blocks on an LLM run), then
+        # persist + start the orchestrator. Mirrors the chat worker pattern.
+        def _plan_and_run():
+            if model:
+                try:
+                    autonomous_agent.set_model(model)
+                except Exception as e:
+                    print(f"[WOR-45] autonomous set_model({model!r}) failed: {e}")
+            try:
+                st = planner.create_plan_state(
+                    objective, provider, model, autonomous_agent
+                )
+            except Exception as e:
+                print(f"[WOR-45] planning crashed: {e}")
+                st = None
+            if not st:
+                bridge.autonomous_progress.emit({"event": "plan_failed"})
+                return
+            save_task_state(st)
+            autonomous_state["st"] = st
+            orchestrator.start(st)
+            # Flip the panel "Planning…" → "Running…" with the first snapshot, and
+            # ONLY now (after start() has spawned the loop) — this is what enables
+            # the panel's Interrupt/Abort, so a cancel can never race a start() that
+            # would clear the stop signal. The orchestrator emits its own events
+            # only on task transitions, never on start, so this won't double-fire.
+            bridge.autonomous_progress.emit({"event": "running", **_orch_snapshot(st)})
+
+        threading.Thread(target=_plan_and_run, daemon=True).start()
+
+    def handle_autonomous_interrupt():
+        # Pause: stop() joins ≤2s, so run it off the GUI thread. The persisted
+        # state stays "in_progress" → the task is resumable on the next launch.
+        def _pause():
+            orchestrator.stop()
+            st = autonomous_state.get("st")
+            bridge.autonomous_progress.emit(
+                {"event": "interrupted", **_orch_snapshot(st)}
+            )
+
+        threading.Thread(target=_pause, daemon=True).start()
+
+    def handle_autonomous_abort():
+        # Discard. Mark the SHARED state dict aborted FIRST — before stop() — so
+        # that if the engine daemon outlives stop()'s 2s join (mid agent.run) and
+        # checkpoints once more on its way out, it persists status="aborted"
+        # (never "in_progress"), which _offer_resume_if_pending ignores. Then stop
+        # the loop and delete the checkpoint (a late daemon re-save would only
+        # re-create it as "aborted", still not resumable).
+        def _abort():
+            st = autonomous_state.get("st")
+            if isinstance(st, dict):
+                st["status"] = "aborted"
+            orchestrator.stop()
+            clear_task_state()
+            bridge.autonomous_progress.emit({"event": "aborted", **_orch_snapshot(st)})
+
+        threading.Thread(target=_abort, daemon=True).start()
+
+    popup.autonomous_start_requested.connect(handle_autonomous_start)
+    popup.autonomous_interrupt_requested.connect(handle_autonomous_interrupt)
+    popup.autonomous_abort_requested.connect(handle_autonomous_abort)
+
     # Honour the saved "Enable wake word" preference at launch: when off, the
     # detector exists but isn't started (OSIA stays reachable via the capsule /
     # Ctrl+Alt+O window). The settings toggle can start it again at runtime.
@@ -836,6 +962,8 @@ def wake_mode():
         # Stop the Bloc 5 background threads cleanly before the app tears down.
         cron_manager.stop()
         heartbeat_monitor.stop()
+        # WOR-45 Phase 4 — stop the autonomous loop too (safe if never started).
+        orchestrator.stop()
         if detector:
             detector.stop()
         if stop_hotkey:
@@ -888,8 +1016,19 @@ def wake_mode():
             except Exception as e:
                 print(f"[WOR-45] could not persist abort: {e}")
         else:
-            # Phase 1 is detection-only; the orchestrator lands in a later phase.
-            print(f"[WOR-45] would resume task {task_id} at cursor "
+            # Phase 4 — actually resume on the dedicated orchestrator (the
+            # background loop is non-blocking; the re-check/salvage happens
+            # inside resume()). Seed the panel and surface it so the user sees it.
+            resume_model = state.get("model")
+            if resume_model:
+                try:
+                    autonomous_agent.set_model(resume_model)
+                except Exception as e:
+                    print(f"[WOR-45] resume set_model({resume_model!r}) failed: {e}")
+            autonomous_state["st"] = state
+            popup.show_autonomous(state)
+            orchestrator.resume(state)
+            print(f"[WOR-45] resuming task {task_id} at cursor "
                   f"(phase={phase}, task={task}).")
 
     QTimer.singleShot(0, _offer_resume_if_pending)
