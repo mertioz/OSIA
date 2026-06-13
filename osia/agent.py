@@ -1798,6 +1798,50 @@ def _descriptions_nearly_identical(a: str, b: str) -> bool:
     return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.92
 
 
+def _screens_changed(img_path_a: str, img_path_b: str, threshold: float = 1.0) -> bool:
+    """Pure-local check (NO vision/network call): did the screen visibly change
+    between two screenshots?
+
+    Both images are down-scaled to a small grayscale thumbnail and the mean
+    per-pixel absolute difference (0–255 scale) is computed; a value strictly
+    above ``threshold`` means the screen changed. A lossless capture of an
+    unchanged screen scores ~0, so the small default (1.0) cleanly separates
+    "nothing happened" from a real change (menu/dialog/navigation, even a
+    button-sized region) while ignoring trivial noise (caret blink, clock tick).
+
+    Used by :func:`tool_desktop_click` to flag a click that probably missed,
+    WITHOUT the two vision describe calls the old miss-check needed (those
+    dominated click latency at ~4–8s each). Uses numpy when available (fast
+    path) and falls back to a pure-Pillow ``ImageChops`` diff otherwise — both
+    are already project dependencies. Any failure (Pillow missing, file
+    unreadable) returns ``True`` (assume changed) so a genuine click is never
+    falsely flagged as a no-op — mirroring the old guard that skipped the
+    warning when a description was unavailable.
+    """
+    try:
+        from PIL import Image
+        size = (64, 64)
+        with Image.open(img_path_a) as ia, Image.open(img_path_b) as ib:
+            thumb_a = ia.convert("L").resize(size)
+            thumb_b = ib.convert("L").resize(size)
+        try:
+            import numpy as _np
+            arr_a = _np.asarray(thumb_a, dtype=_np.float32)
+            arr_b = _np.asarray(thumb_b, dtype=_np.float32)
+            mean_delta = float(_np.abs(arr_a - arr_b).mean())
+        except Exception:
+            # No numpy: mean of the per-pixel difference via its histogram.
+            from PIL import ImageChops
+            hist = ImageChops.difference(thumb_a, thumb_b).histogram()
+            count = sum(hist)
+            mean_delta = (
+                sum(i * c for i, c in enumerate(hist)) / count
+            ) if count else 0.0
+        return mean_delta > threshold
+    except Exception:
+        return True
+
+
 _REFINE_CROP_PX = 300   # side of the square crop used by the fine (2nd-pass) locate
 
 # Max distance (px) the 2nd-pass refinement may move the click from the coarse
@@ -1994,10 +2038,10 @@ def tool_desktop_click(description: str) -> str:
     """Vision-guided click on a NATIVE desktop element described in plain words.
 
     Captures the screen, asks the vision model for the element's pixel
-    coordinates, clicks there, then captures + describes the screen again so the
+    coordinates, clicks there, then captures the screen again and compares the
+    BEFORE/AFTER frames with a fast LOCAL pixel diff (no vision call) so the
     model can confirm the click actually changed something (anti-hallucination).
-    The result reports BEFORE and AFTER one-line summaries and warns when the
-    screen did not visibly change (the click probably missed).
+    Warns when the screen did not visibly change (the click probably missed).
     """
     if not description or not str(description).strip():
         return "ERROR: desktop_click: provide a description of what to click."
@@ -2050,11 +2094,10 @@ def tool_desktop_click(description: str) -> str:
                   f"clicking coarse ({cx}, {cy})")
             fx, fy, refined = cx, cy, False
 
-    # Describe the screen BEFORE the click (reuses the screenshot captured above,
-    # so no extra capture). Taken on BOTH the UIA-hit and vision paths. Vision
-    # call goes through key_chain rotation.
-    before_full = _describe_screenshot(shot)
-
+    # Click IMMEDIATELY once coordinates are resolved — no vision describe in
+    # front of the click. The BEFORE screenshot (`shot`, captured above) is
+    # still kept and compared to the AFTER screenshot below via a pure-local
+    # pixel diff (see _screens_changed), not a vision call.
     res = _dc.click_at(fx, fy)
     if isinstance(res, str) and res.upper().startswith("ERROR"):
         return res
@@ -2070,18 +2113,13 @@ def tool_desktop_click(description: str) -> str:
     if _capture_screen(verify) is not None:
         # Re-capture failed — report the click without a before/after compare.
         return note
-    after_full = _describe_screenshot(verify)
 
-    before = _summarize_description(before_full)
-    after = _summarize_description(after_full)
     lines = [note]
-    if before:
-        lines.append(f"BEFORE click: {before}")
-    if after:
-        lines.append(f"AFTER click: {after}")
-    # If the screen looks unchanged, the click likely missed — say so explicitly
-    # so a no-op click is never mistaken for success.
-    if before_full and after_full and _descriptions_nearly_identical(before_full, after_full):
+    # Miss-check via a PURE-LOCAL pixel diff between the BEFORE (`shot`) and
+    # AFTER (`verify`) screenshots — no vision call. If the screen looks
+    # unchanged, the click likely missed; say so explicitly so a no-op click is
+    # never mistaken for success.
+    if not _screens_changed(shot, verify):
         lines.append(
             "WARNING: the screen did not visibly change after the click — "
             "the target may have been missed."
