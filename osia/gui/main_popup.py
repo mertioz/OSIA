@@ -4312,6 +4312,413 @@ class _OsiaPanel(QWidget):
         super().mouseReleaseEvent(event)
 
 
+class _AutonomousPanel(QWidget):
+    """Autonomous-agent page (WOR-45 Phase 4) — launch and monitor a long,
+    multi-step objective that OSIA plans and executes on its own.
+
+    Two stacked sections, styled exactly like the OSIA page (same object names —
+    ``section`` / ``sectionTitle`` / ``sectionSub`` / ``mdEditor`` / ``saveBtn``
+    / ``ghostBtn`` — so the violet QSS cascades for free, no new stylesheet):
+
+    * **Input** — a Markdown-ish objective editor, a model picker, and a *Start*
+      button. While the objective is being planned / executed the button is
+      disabled and shows the live state ("Planning…" / "Running…").
+    * **Progress** — the live objective, the current phase, an "X / Y tasks"
+      counter and a one-line status, plus an *Interrupt* button (pause — the
+      task stays resumable on the next launch) and a quieter *Abandon task*
+      action (discard).
+
+    The panel is pure UI: it never imports or touches the orchestrator / planner
+    / state modules. It only emits intents (:attr:`start_requested`,
+    :attr:`interrupt_requested`, :attr:`abort_requested`) and renders the
+    snapshots the host feeds back via :meth:`apply_progress` /
+    :meth:`seed_from_state`. All engine work happens off the GUI thread in
+    ``main.py``.
+    """
+
+    # objective, provider, model
+    start_requested = pyqtSignal(str, str, str)
+    interrupt_requested = pyqtSignal()
+    abort_requested = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._drag_pos: QPoint | None = None
+        self._running = False
+        self._planning = False
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setSpacing(10)
+
+        header = QHBoxLayout()
+        self._title = QLabel(i18n.t("autonomous.title"))
+        self._title.setObjectName("panelTitle")
+        header.addWidget(self._title)
+        header.addStretch()
+        outer.addLayout(header)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("panelScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        host = QWidget()
+        host.setObjectName("panelHost")
+        v = QVBoxLayout(host)
+        v.setContentsMargins(0, 0, 6, 0)
+        v.setSpacing(14)
+        v.addWidget(self._build_input_section())
+        v.addWidget(self._build_progress_section())
+        v.addStretch(1)
+        scroll.setWidget(host)
+        outer.addWidget(scroll, 1)
+
+        # Re-translate this panel's chrome when the UI language changes.
+        i18n.add_listener(self._retranslate)
+        self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
+
+        self._set_running(False)
+        self._reset_progress()
+
+    # ── Input section ───────────────────────────────────────────────────────
+
+    def _build_input_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._input_title = QLabel(i18n.t("autonomous.objective_title"))
+        self._input_title.setObjectName("sectionTitle")
+        self._input_sub = QLabel(i18n.t("autonomous.objective_sub"))
+        self._input_sub.setObjectName("sectionSub")
+        self._input_sub.setWordWrap(True)
+        l.addWidget(self._input_title)
+        l.addWidget(self._input_sub)
+
+        self._objective_edit = QTextEdit()
+        self._objective_edit.setObjectName("mdEditor")
+        self._objective_edit.setAcceptRichText(False)
+        self._objective_edit.setMinimumHeight(110)
+        self._objective_edit.setPlaceholderText(
+            i18n.t("autonomous.objective_placeholder")
+        )
+        l.addWidget(self._objective_edit)
+
+        # Model picker — every known model (label shown, id stored as data); the
+        # provider is derived from the id on Start via provider_for_model().
+        self._model_label = QLabel(i18n.t("autonomous.model"))
+        self._model_label.setObjectName("sectionSub")
+        l.addWidget(self._model_label)
+        self._model_combo = QComboBox()
+        self._model_combo.setObjectName("voiceCombo")
+        _cap_combo_width(self._model_combo)
+        self._populate_models()
+        l.addWidget(self._model_combo)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self._start_btn = QPushButton(i18n.t("autonomous.start"))
+        self._start_btn.setObjectName("saveBtn")
+        self._start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._start_btn.clicked.connect(self._on_start)
+        btn_row.addWidget(self._start_btn)
+        btn_row.addStretch()
+        l.addLayout(btn_row)
+        return wrap
+
+    def _populate_models(self) -> None:
+        """Fill the model combo with the **configured** models only — providers
+        with a saved API key, plus keyless/local Ollama — using the SAME filter
+        as the chat model pickers (``_ModelPanel._build_grid`` /
+        ``_SettingsPanel._hier_model_choices``). Listing an unconfigured provider
+        would let the user launch a task that fails immediately. Defaults the
+        selection to the user's chat model when present; when nothing is
+        configured the combo stays empty and Start is guarded."""
+        self._model_combo.clear()
+        try:
+            models = get_all_models()
+        except Exception:
+            models = []
+        try:
+            keys = load_api_keys()
+        except Exception:
+            keys = {}
+        for m in models:
+            # Same rule as the rest of OSIA: only providers with a saved key are
+            # usable; Ollama is local/keyless so it always qualifies.
+            provider = m.get("provider")
+            if provider != "ollama" and not keys.get(provider):
+                continue
+            label = m.get("label") or m.get("id") or "?"
+            self._model_combo.addItem(label, m.get("id"))
+        try:
+            current = (load_settings() or {}).get("selected_model")
+        except Exception:
+            current = None
+        if current:
+            idx = self._model_combo.findData(current)
+            if idx >= 0:
+                self._model_combo.setCurrentIndex(idx)
+
+    # ── Progress section ────────────────────────────────────────────────────
+
+    def _build_progress_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._progress_title = QLabel(i18n.t("autonomous.progress_title"))
+        self._progress_title.setObjectName("sectionTitle")
+        l.addWidget(self._progress_title)
+
+        self._prog_objective = QLabel("—")
+        self._prog_objective.setObjectName("sectionSub")
+        self._prog_objective.setWordWrap(True)
+        l.addWidget(self._prog_objective)
+
+        self._prog_phase = QLabel("")
+        self._prog_phase.setObjectName("sectionSub")
+        self._prog_phase.setWordWrap(True)
+        l.addWidget(self._prog_phase)
+
+        self._prog_counter = QLabel("")
+        self._prog_counter.setObjectName("sectionSub")
+        l.addWidget(self._prog_counter)
+
+        self._prog_status = QLabel("")
+        self._prog_status.setObjectName("sectionSub")
+        self._prog_status.setWordWrap(True)
+        l.addWidget(self._prog_status)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self._interrupt_btn = QPushButton(i18n.t("autonomous.interrupt"))
+        self._interrupt_btn.setObjectName("ghostBtn")
+        self._interrupt_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._interrupt_btn.clicked.connect(self._on_interrupt)
+        # "Abandon" is the quieter, secondary action — same ghost pill, placed
+        # after Interrupt so the destructive choice never reads as primary.
+        self._abort_btn = QPushButton(i18n.t("autonomous.abort"))
+        self._abort_btn.setObjectName("ghostBtn")
+        self._abort_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._abort_btn.clicked.connect(self._on_abort)
+        btn_row.addWidget(self._interrupt_btn)
+        btn_row.addWidget(self._abort_btn)
+        btn_row.addStretch()
+        l.addLayout(btn_row)
+        return wrap
+
+    # ── User intents ────────────────────────────────────────────────────────
+
+    def _on_start(self) -> None:
+        if self._running:
+            return
+        objective = self._objective_edit.toPlainText().strip()
+        if not objective:
+            return
+        model = self._model_combo.currentData() or ""
+        if not model:
+            # Nothing configured to run with — the combo lists only configured
+            # providers, so an empty selection means no API key is set anywhere.
+            # Don't launch a task that would fail immediately.
+            return
+        provider = provider_for_model(model) if model else ""
+        self._prog_objective.setText(objective)
+        # Lock the panel immediately (planning runs off the GUI thread); the host
+        # flips us to "running" or re-opens us via a progress event.
+        self._set_running(True, planning=True)
+        self._set_status(i18n.t("autonomous.status_planning"))
+        self.start_requested.emit(objective, provider, model)
+
+    def _on_interrupt(self) -> None:
+        self.interrupt_requested.emit()
+
+    def _on_abort(self) -> None:
+        self.abort_requested.emit()
+
+    # ── Host-driven display updates ─────────────────────────────────────────
+
+    def apply_progress(self, payload: dict) -> None:
+        """Render a progress event the host marshalled onto the GUI thread.
+
+        ``payload`` is an orchestrator event dict (``event`` + optional
+        ``reason``) merged with a state snapshot (``objective`` / ``phase_name``
+        / ``done`` / ``total``). Terminal events release the panel back to the
+        input state; running / informational events keep it locked.
+        """
+        if not isinstance(payload, dict):
+            return
+        event = payload.get("event", "")
+        self._render_snapshot(payload)
+        reason = self._short(payload.get("reason"))
+
+        if event == "running":
+            self._set_running(True)
+            self._set_status(i18n.t("autonomous.status_running"))
+        elif event == "task_done":
+            self._set_status(i18n.t("autonomous.status_task_done", reason=reason))
+        elif event == "salvaged":
+            self._set_status(i18n.t("autonomous.status_salvaged"))
+        elif event == "task_failed":
+            self._set_status(i18n.t("autonomous.status_task_failed", reason=reason))
+        elif event == "done":
+            self._set_running(False)
+            self._set_status(i18n.t("autonomous.status_done"))
+        elif event == "failed":
+            self._set_running(False)
+            self._set_status(i18n.t("autonomous.status_failed", reason=reason))
+        elif event == "interrupted":
+            self._set_running(False)
+            self._set_status(i18n.t("autonomous.status_interrupted"))
+        elif event == "aborted":
+            self._set_running(False)
+            self._set_status(i18n.t("autonomous.status_aborted"))
+        elif event == "plan_failed":
+            self._set_running(False)
+            self._set_status(i18n.t("autonomous.status_plan_failed"))
+
+    def seed_from_state(self, state: dict) -> None:
+        """Seed the display from a persisted ``task_state`` dict — used when the
+        host resumes an interrupted task or opens the panel on one."""
+        if not isinstance(state, dict):
+            return
+        objective = state.get("objective") or ""
+        if objective:
+            self._objective_edit.setPlainText(objective)
+        self._render_snapshot(self._snapshot_from_state(state))
+        if (state.get("status") or "") == "in_progress":
+            self._set_running(True)
+            self._set_status(i18n.t("autonomous.status_running"))
+        else:
+            self._set_running(False)
+            self._set_status(i18n.t("autonomous.status_idle"))
+
+    # ── Internal display helpers ────────────────────────────────────────────
+
+    def _render_snapshot(self, payload: dict) -> None:
+        """Update the objective / phase / counter labels from a snapshot dict,
+        leaving any field the payload omits untouched."""
+        objective = payload.get("objective")
+        if objective:
+            self._prog_objective.setText(objective)
+        phase_name = payload.get("phase_name")
+        if phase_name:
+            self._prog_phase.setText(i18n.t("autonomous.phase", name=phase_name))
+        total = payload.get("total")
+        if total is not None:
+            done = payload.get("done", 0) or 0
+            self._prog_counter.setText(
+                i18n.t("autonomous.tasks", done=done, total=total)
+            )
+
+    @staticmethod
+    def _snapshot_from_state(state: dict) -> dict:
+        """Compute objective / phase_name / done / total from a task_state dict
+        (mirrors the host's snapshot so seed and live events render alike)."""
+        phases = state.get("phases") or []
+        total = 0
+        done = 0
+        for ph in phases:
+            for tk in (ph.get("tasks") or []):
+                total += 1
+                if tk.get("status") == "done":
+                    done += 1
+        cursor = state.get("cursor") or {}
+        p = int(cursor.get("phase", 0) or 0)
+        phase_name = ""
+        if 0 <= p < len(phases):
+            phase_name = phases[p].get("name", "") or ""
+        return {"objective": state.get("objective", "") or "",
+                "phase_name": phase_name, "done": done, "total": total}
+
+    def _set_running(self, running: bool, *, planning: bool = False) -> None:
+        """Toggle the input/progress controls between idle and busy states.
+
+        Interrupt / Abandon are enabled ONLY once the orchestrator is actually
+        running — NOT during the planning window. Planning happens off-thread
+        before ``orchestrator.start()``, and stop()/start() would race if a
+        cancel landed mid-plan (the start would clear the stop signal and run the
+        task the user just abandoned). Keeping them disabled until the host emits
+        the "running" event closes that window."""
+        self._running = running
+        self._planning = bool(running and planning)
+        self._start_btn.setEnabled(not running)
+        if running:
+            self._start_btn.setText(
+                i18n.t("autonomous.planning") if planning
+                else i18n.t("autonomous.running")
+            )
+        else:
+            self._start_btn.setText(i18n.t("autonomous.start"))
+        self._objective_edit.setReadOnly(running)
+        self._model_combo.setEnabled(not running)
+        controllable = running and not planning
+        self._interrupt_btn.setEnabled(controllable)
+        self._abort_btn.setEnabled(controllable)
+
+    def _reset_progress(self) -> None:
+        self._prog_objective.setText("—")
+        self._prog_phase.setText("")
+        self._prog_counter.setText("")
+        self._set_status(i18n.t("autonomous.status_idle"))
+
+    def _set_status(self, text: str) -> None:
+        self._prog_status.setText(text)
+
+    @staticmethod
+    def _short(text, limit: int = 120) -> str:
+        return " ".join((text or "").split())[:limit]
+
+    def _retranslate(self) -> None:
+        self._title.setText(i18n.t("autonomous.title"))
+        self._input_title.setText(i18n.t("autonomous.objective_title"))
+        self._input_sub.setText(i18n.t("autonomous.objective_sub"))
+        self._objective_edit.setPlaceholderText(
+            i18n.t("autonomous.objective_placeholder")
+        )
+        self._model_label.setText(i18n.t("autonomous.model"))
+        self._progress_title.setText(i18n.t("autonomous.progress_title"))
+        self._interrupt_btn.setText(i18n.t("autonomous.interrupt"))
+        self._abort_btn.setText(i18n.t("autonomous.abort"))
+        if not self._running:
+            self._start_btn.setText(i18n.t("autonomous.start"))
+        # The live status/phase/counter text reflects the last snapshot and
+        # re-renders (translated) on the next progress event.
+
+    # ── Dragging (mirrors _OsiaPanel) ───────────────────────────────────────
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = (
+                event.globalPosition().toPoint()
+                - self.window().frameGeometry().topLeft()
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._drag_pos is not None
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            self.window().move(
+                event.globalPosition().toPoint() - self._drag_pos
+            )
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+        super().mouseReleaseEvent(event)
+
+
 # ── Bottom-nav button ────────────────────────────────────────────────────────
 
 class _NavButton(QPushButton):
@@ -4320,10 +4727,11 @@ class _NavButton(QPushButton):
     Qt's emoji rendering is inconsistent across platforms, so each nav entry
     draws its own glyph via ``QPainterPath``:
 
-    * ``conv``     — a rounded speech bubble (Conversations)
-    * ``models``   — a four-point sparkle/star (Models)
-    * ``settings`` — a gear (Settings)
-    * ``osia``     — a person/identity silhouette (OSIA personality + skills)
+    * ``conv``       — a rounded speech bubble (Conversations)
+    * ``models``     — a four-point sparkle/star (Models)
+    * ``settings``   — a gear (Settings)
+    * ``osia``       — a person/identity silhouette (OSIA personality + skills)
+    * ``autonomous`` — a small robot head (Autonomous agent)
 
     The active tab gets a rounded violet pill behind the icon and the icon
     itself switches to the violet accent; hover shows a softer violet wash.
@@ -4392,6 +4800,8 @@ class _NavButton(QPushButton):
             self._paint_gear(p, cx, cy, s, color)
         elif self._kind == "osia":
             self._paint_person(p, cx, cy, s, color)
+        elif self._kind == "autonomous":
+            self._paint_robot(p, cx, cy, s, color)
         p.end()
 
     # ── Icon glyphs ───────────────────────────────────────────────────────
@@ -4477,6 +4887,31 @@ class _NavButton(QPushButton):
         path.closeSubpath()           # flat bottom
         p.drawPath(path)
 
+    def _paint_robot(self, p, cx, cy, s, color) -> None:
+        """A small robot head — a rounded-square face with two punched-out eyes
+        and a short top antenna — marking the Autonomous-agent section."""
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        # Antenna — a thin stalk topped by a small bulb, above the head.
+        bulb_cy = cy - s * 0.44
+        stalk_w = s * 0.06
+        p.drawRect(QRectF(cx - stalk_w / 2, bulb_cy, stalk_w, s * 0.16))
+        p.drawEllipse(QPointF(cx, bulb_cy), s * 0.075, s * 0.075)
+        # Head — a rounded square face, slightly below centre to clear the antenna.
+        head_w = s * 0.72
+        head_h = s * 0.58
+        head_cy = cy + s * 0.10
+        head = QRectF(cx - head_w / 2, head_cy - head_h / 2, head_w, head_h)
+        face = QPainterPath()
+        face.addRoundedRect(head, s * 0.14, s * 0.14)
+        # Eyes — punched out (like the gear's hub) so they read on any backdrop.
+        eye_r = s * 0.085
+        eye_dx = head_w * 0.24
+        eyes = QPainterPath()
+        eyes.addEllipse(QPointF(cx - eye_dx, head_cy), eye_r, eye_r)
+        eyes.addEllipse(QPointF(cx + eye_dx, head_cy), eye_r, eye_r)
+        p.drawPath(face.subtracted(eyes))
+
 
 # ── MainPopup ───────────────────────────────────────────────────────────────
 
@@ -4496,6 +4931,12 @@ class MainPopup(QWidget):
     # Re-emitted from the settings panel: the "Enable wake word" toggle. The
     # host wires it to the wake-word detector's start()/stop().
     wake_word_enabled_changed = pyqtSignal(bool)
+    # Re-emitted from the autonomous panel (WOR-45 Phase 4). The host wires these
+    # to the dedicated Orchestrator: start (objective, provider, model), pause
+    # (resumable next launch) and discard.
+    autonomous_start_requested = pyqtSignal(str, str, str)
+    autonomous_interrupt_requested = pyqtSignal()
+    autonomous_abort_requested = pyqtSignal()
 
     # Index of the chat page in the QStackedWidget.
     PAGE_CHAT = 0
@@ -4503,6 +4944,7 @@ class MainPopup(QWidget):
     PAGE_MODELS = 2
     PAGE_SETTINGS = 3
     PAGE_OSIA = 4
+    PAGE_AUTONOMOUS = 5
 
     def __init__(self):
         super().__init__()
@@ -4616,11 +5058,23 @@ class MainPopup(QWidget):
 
         self._osia = _OsiaPanel()
 
+        self._autonomous = _AutonomousPanel()
+        self._autonomous.start_requested.connect(
+            self.autonomous_start_requested.emit
+        )
+        self._autonomous.interrupt_requested.connect(
+            self.autonomous_interrupt_requested.emit
+        )
+        self._autonomous.abort_requested.connect(
+            self.autonomous_abort_requested.emit
+        )
+
         self._stack.addWidget(self._chat)
         self._stack.addWidget(self._convs)
         self._stack.addWidget(self._models)
         self._stack.addWidget(self._settings)
         self._stack.addWidget(self._osia)
+        self._stack.addWidget(self._autonomous)
         outer.addWidget(self._stack, 1)
 
         # Bottom nav
@@ -4633,10 +5087,11 @@ class MainPopup(QWidget):
         # "OSIA" is a proper noun (tip_key=None) — shown verbatim; the others
         # carry an i18n key so their tooltips re-translate on language change.
         for page_idx, kind, tip_key in [
-            (self.PAGE_CONVS,   "conv",     "nav.conversations"),
-            (self.PAGE_MODELS,  "models",   "nav.models"),
-            (self.PAGE_SETTINGS,"settings", "nav.settings"),
-            (self.PAGE_OSIA,    "osia",     None),
+            (self.PAGE_CONVS,      "conv",       "nav.conversations"),
+            (self.PAGE_MODELS,     "models",     "nav.models"),
+            (self.PAGE_SETTINGS,   "settings",   "nav.settings"),
+            (self.PAGE_OSIA,       "osia",       None),
+            (self.PAGE_AUTONOMOUS, "autonomous", "nav.autonomous"),
         ]:
             tooltip = i18n.t(tip_key) if tip_key else "OSIA"
             btn = _NavButton(kind, tooltip)
@@ -4786,6 +5241,28 @@ class MainPopup(QWidget):
 
     def set_remote_models(self, remote: list) -> None:
         self._models.set_remote_models(remote)
+
+    # ── Autonomous agent (WOR-45 Phase 4) ─────────────────────────────────
+
+    def show_autonomous(self, state) -> None:
+        """Switch to the autonomous page and seed it from a ``task_state`` dict
+        (used by the host when resuming an interrupted task). Surfaces the popup
+        if it is hidden so a resumed task is actually visible."""
+        self._stack.setCurrentIndex(self.PAGE_AUTONOMOUS)
+        btn = self._nav_buttons.get(self.PAGE_AUTONOMOUS)
+        if btn is not None:
+            btn.setChecked(True)
+        self._animate_width(POPUP_W)   # autonomous page uses the COMPACT width
+        self._autonomous.seed_from_state(state)
+        if not self.isVisible():
+            self.anchor_below_island()
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    def update_autonomous_progress(self, payload) -> None:
+        """Forward a progress snapshot (already on the GUI thread) to the panel."""
+        self._autonomous.apply_progress(payload)
 
     # ── Internal handlers ─────────────────────────────────────────────────
 
