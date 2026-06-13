@@ -334,7 +334,7 @@ def wake_mode():
     available.
     """
     from PyQt6.QtWidgets import QApplication
-    from PyQt6.QtCore import QObject, pyqtSignal, Qt
+    from PyQt6.QtCore import QObject, pyqtSignal, Qt, QTimer
     from PyQt6.QtGui import QGuiApplication, QIcon
 
     from osia.perf import perf_mark
@@ -844,6 +844,55 @@ def wake_mode():
             stop_popup_hotkey()
 
     app.aboutToQuit.connect(on_quit)
+
+    # ── WOR-45 Phase 1: resume a previously interrupted autonomous task ──
+    # DETECTION ONLY (non-blocking). If a persisted autonomous task is still
+    # "in_progress" — the process died / was restarted mid-run — offer the user
+    # Resume / Abort once the event loop is live. Phase 1 has no orchestrator
+    # yet, so "Resume" only LOGS what it *would* do; "Abort" marks the task
+    # aborted and atomically checkpoints it. The whole check is deferred via
+    # QTimer.singleShot(0, ...) so it NEVER blocks GUI startup (the modal prompt
+    # only appears after app.exec() has started the event loop).
+    def _offer_resume_if_pending() -> None:
+        try:
+            from osia.autonomous.state import load_task_state, save_task_state
+        except Exception as e:
+            print(f"[WOR-45] resume check skipped (import failed): {e}")
+            return
+        state = load_task_state()
+        if not isinstance(state, dict) or state.get("status") != "in_progress":
+            return  # no pending task — normal startup
+        task_id = state.get("task_id", "?")
+        cursor = state.get("cursor") or {}
+        phase = cursor.get("phase", 0)
+        task = cursor.get("task", 0)
+        objective = (state.get("objective") or "")[:200]
+        from PyQt6.QtWidgets import QMessageBox
+        box = QMessageBox()
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("OSIA")
+        box.setText("Une tâche autonome a été interrompue.")
+        box.setInformativeText(
+            (f"« {objective} »\n\n" if objective else "")
+            + f"Reprendre là où elle s'est arrêtée (phase {phase}, tâche {task}) ?"
+        )
+        resume_btn = box.addButton("Reprendre", QMessageBox.ButtonRole.AcceptRole)
+        abort_btn = box.addButton("Abandonner", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(resume_btn)
+        box.exec()
+        if box.clickedButton() is abort_btn:
+            state["status"] = "aborted"
+            try:
+                save_task_state(state)
+                print(f"[WOR-45] autonomous task {task_id} aborted by user.")
+            except Exception as e:
+                print(f"[WOR-45] could not persist abort: {e}")
+        else:
+            # Phase 1 is detection-only; the orchestrator lands in a later phase.
+            print(f"[WOR-45] would resume task {task_id} at cursor "
+                  f"(phase={phase}, task={task}).")
+
+    QTimer.singleShot(0, _offer_resume_if_pending)
 
     perf_mark("wake_mode: entering app.exec() (GUI now interactive)")
     sys.exit(app.exec())
