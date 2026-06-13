@@ -34,7 +34,8 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "autonomous_start",     "objective": "...", "model": "..."}  # WOR-45 P5: begin ONE machine-global autonomous run (planner→orchestrator); refused with autonomous_progress{event:"busy"} if a run already holds the single-runner lock
     {"type": "autonomous_interrupt"}                                   # WOR-45 P5: pause the autonomous run — state stays in_progress (resumable)
     {"type": "autonomous_abort"}                                       # WOR-45 P5: discard the autonomous run — marks state aborted then deletes the checkpoint
-    {"type": "get_autonomous_status"}                                  # WOR-45 P5: request the current autonomous snapshot (or {event:"idle"}); lets a phone reconnecting mid-run render progress
+    {"type": "get_autonomous_status"}                                  # WOR-45 P5: request the current autonomous snapshot (or {event:"idle"}); a paused run reports {event:"interrupted"}; lets a phone reconnecting mid-run render progress
+    {"type": "autonomous_resume"}                                      # WOR-45: resume a PAUSED (interrupted) autonomous run from its cursor (re-acquires the single-runner lock; refused with {event:"busy"} if another run holds it, {event:"idle"} if nothing is resumable)
   Server → Client:
     {"type": "api_keys",             "keys": {provider: key, ...}}     # actual stored keys, one entry per models.API_PROVIDERS ("" if unset)
     {"type": "heartbeat_config",     "config": {"enabled": bool, "interval_seconds": int}}
@@ -1088,7 +1089,7 @@ def _release_single_runner_if_gen(my_gen: int) -> None:
         _do_release_locked()
 
 
-def _finalize_terminal_release(orch) -> None:
+def _finalize_terminal_release(orch, term_gen: int) -> None:
     """Release the slot for a run that reached a TERMINAL engine event, on a
     SEPARATE thread that JOINS the (now-finishing) orchestrator thread FIRST.
 
@@ -1100,13 +1101,28 @@ def _finalize_terminal_release(orch) -> None:
     ``is_alive()`` early-return), wedging the new run with the slot held but no
     loop. ``orch.stop()`` joins the finishing thread (idempotent, ≤2 s), so by
     the time we release, the loop thread is truly dead and the next start spawns
-    cleanly. A self-join can't happen — this always runs on a different thread."""
+    cleanly. A self-join can't happen — this always runs on a different thread.
+
+    GENERATION GUARD (WOR-45) — ``term_gen`` is the acquisition generation that was
+    current when this terminal was OBSERVED (captured by the progress callback).
+    A stale/orphan run's LATE terminal must NEVER ``stop()`` or free a NEWER
+    generation's run: the engine checks its stop flag only ONCE per step, so a step
+    already past that check (inside the verifier ``agent.run()`` or a replan) can
+    still run through to a terminal emit AFTER a newer run took over the slot. So
+    BOTH the join and the release are gated on the generation still being
+    ``term_gen``: if a newer run has since acquired, this terminal belongs to a
+    superseded run ⇒ no-op (touching ``orch``/the slot would stop/free the newer
+    run). The release itself also goes through ``_release_single_runner_if_gen`` so
+    the gate is re-checked atomically under the lock at release time."""
+    with _autonomous_lock:
+        if int(_autonomous.get("gen", 0)) != term_gen:
+            return  # a newer generation owns the slot — this terminal is stale
     try:
         if orch is not None:
             orch.stop()  # joins the finishing loop thread; idempotent
     except Exception as e:
         print(f"[WOR-45] terminal orchestrator.stop failed: {e}")
-    _release_single_runner()
+    _release_single_runner_if_gen(term_gen)
 
 
 def _on_autonomous_progress(payload: dict) -> None:
@@ -1115,14 +1131,20 @@ def _on_autonomous_progress(payload: dict) -> None:
     TERMINAL engine event (done/failed) the run is over, so release the
     single-runner slot — but OFF this (still-alive) thread, joining it first (see
     ``_finalize_terminal_release``). Wrapped so a callback error never kills the
-    loop. ``active`` stays True until that release, so no start can race in."""
+    loop. For a live run ``active`` stays True until that release, so no start can
+    race in; the generation captured below makes a STALE orphan's late terminal a
+    no-op so it can never stop/free a newer run (see ``_finalize_terminal_release``)."""
     try:
         frame = _autonomous_frame(dict(payload), _autonomous.get("st"))
         _broadcast_autonomous(frame)
         if payload.get("event") in ("done", "failed"):
+            # Capture the generation NOW (terminal-observation time) so the
+            # release/stop can be gated to it — a superseded orphan's late
+            # terminal must not free/stomp whatever generation owns the slot later.
+            term_gen = int(_autonomous.get("gen", 0))
             threading.Thread(
                 target=_finalize_terminal_release,
-                args=(_autonomous.get("orch"),),
+                args=(_autonomous.get("orch"), term_gen),
                 daemon=True,
             ).start()
     except Exception as e:
@@ -1222,6 +1244,168 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
         # exhaustion in orch.start) must NOT wedge the slot at busy forever:
         # release it (only if still ours) and tell clients the start failed.
         print(f"[WOR-45] autonomous start worker crashed: {e}")
+        _broadcast_autonomous(_autonomous_frame({"event": "plan_failed"}, None))
+        _release_single_runner_if_gen(my_gen)
+
+
+def _orch_loop_alive() -> bool:
+    """True iff an orchestrator execution loop is still running IN THIS PROCESS.
+
+    Detected by THREAD NAME — the engine names its loop thread
+    ``"osia-orchestrator"`` (orchestrator.py). This is the only externally
+    observable handle on it: ``Orchestrator.stop()`` (called by
+    ``autonomous_interrupt``) nulls the engine's private ``_thread`` even when its
+    2 s join TIMES OUT mid ``agent.run()``, so the old loop can still be alive
+    while ``_begin``'s ``is_alive()`` idempotency guard is blind to it. The resume
+    worker uses this to avoid EVER spawning a second loop over the same agent/state
+    (see WOR-45 race note there). Read-only introspection — ZERO engine edits."""
+    return any(getattr(t, "name", "") == "osia-orchestrator" and t.is_alive()
+               for t in threading.enumerate())
+
+
+def _release_after_orphan_drained(my_gen: int, timeout: float = 120.0) -> None:
+    """Hold the single-runner slot until a still-draining orphan orchestrator loop
+    is truly dead, THEN release it — only if generation ``my_gen`` still owns it.
+
+    Used by the resume guard's "loop still alive after the bounded wait" branch.
+    PRIMARY defence: releasing the slot WHILE the orphan is alive would let a newer
+    run acquire it and then be stopped+freed by the orphan's LATE terminal event
+    (the engine checks ``_stop`` only ONCE per step, so an interrupted step already
+    past that check — inside the verifier ``agent.run()`` or a replan — still runs
+    through to a terminal ``done``/``failed`` emit). Keeping the slot ``busy`` until
+    the orphan drains means a newer run can NEVER coexist with it, so the question
+    of attributing that terminal never arises; it also honours the single-runner
+    invariant (the orphan is still using the shared agent). Bounded so a wedged
+    orphan can never hold the slot forever; runs on a daemon thread so it never
+    blocks the event loop. If the orphan instead drains via a terminal event,
+    :func:`_finalize_terminal_release` (now generation-gated — the second line of
+    defence) already released the slot under our generation, so the ``_if_gen``
+    release here is then a safe no-op (a newer generation owns it) or a harmless
+    idempotent re-release."""
+    waited = 0.0
+    while _orch_loop_alive() and waited < timeout:
+        time.sleep(0.2)
+        waited += 0.2
+    _release_single_runner_if_gen(my_gen)
+
+
+def _autonomous_resume_worker(my_gen: int) -> None:
+    """Resume a PAUSED autonomous run OFF the event loop. Mirrors
+    ``_autonomous_start_worker`` (engine build → set_model → establish under the
+    generation gate → orch.resume → emit running) and the GUI resume branch
+    (``main.py``: ``set_model(state["model"])`` → ``orchestrator.resume(state)``).
+    The single-runner slot (generation ``my_gen``) was re-acquired by the handler
+    — interrupt freed it. There is NO planning step: the plan already lives in the
+    persisted task_state, so resume picks up at the cursor (the engine re-checks
+    the interrupted task's success_criterion before re-executing — crash-salvage).
+
+    Hardening, exactly like the start worker:
+
+    * Wrap the WHOLE body so ANY failure RELEASES the slot (only if generation
+      ``my_gen`` is still current) — a raise must never wedge ``active`` True
+      forever and refuse every later start/resume at ``busy``.
+    * Resolve the state to resume: prefer the in-memory ``st``; on a FRESH process
+      (server restarted after the pause) fall back to the persisted mobile
+      task-state file. If it is not a resumable ``in_progress`` dict, tell clients
+      the run is ``idle`` and release.
+    * ESTABLISH atomically, only if generation ``my_gen`` is still current — a
+      newer start/resume that reacquired during this window must not be stomped
+      (the same load-bearing gate the start worker uses).
+    * NEVER spawn a SECOND loop. A timed-out interrupt ``stop()`` can leave the
+      old loop draining (see :func:`_orch_loop_alive`); resuming over it would run
+      two loops on one agent/state. Guard with a short bounded wait; if a loop is
+      still alive after it, step back — broadcast ``interrupted`` (the run is
+      paused/resumable, matching ``get_autonomous_status``) and defer the slot
+      release until the orphan is truly dead (:func:`_release_after_orphan_drained`)
+      so a newer run can't acquire the slot and be killed by the orphan's late
+      terminal. The terminal-release path itself is generation-guarded
+      (:func:`_finalize_terminal_release`) as a second line of defence."""
+    try:
+        agent, orch = _ensure_autonomous_engine()
+        st = _autonomous.get("st")
+        if not isinstance(st, dict):
+            # Fresh process after a restart — recover the run from disk (the
+            # mobile-isolated task_state file; CONFIG_DIR is the same dir).
+            try:
+                st = _astate.load_task_state()
+            except Exception:
+                st = None
+        if not isinstance(st, dict) or st.get("status") != "in_progress":
+            # Nothing resumable (no pending run, or it is done/failed/aborted).
+            _broadcast_autonomous(_autonomous_frame({"event": "idle"}, None))
+            _release_single_runner_if_gen(my_gen)
+            return
+
+        # Honour the model the run was planned with — exactly like the start
+        # worker and the GUI resume branch (main.py: set_model(state["model"])).
+        model = st.get("model")
+        if model:
+            try:
+                agent.set_model(model)
+            except Exception as e:
+                print(f"[WOR-45] autonomous resume set_model({model!r}) failed: {e}")
+
+        # ── Establish the run atomically — only if our slot is still current ──
+        established = False
+        with _autonomous_lock:
+            if _autonomous.get("active") and int(_autonomous.get("gen", 0)) == my_gen:
+                _autonomous["st"] = st
+                _write_autonomous_lock(st.get("task_id"))  # stamp the real id
+                established = True
+        if not established:
+            # A cancel landed during this window (its handler already released
+            # the slot and broadcast its outcome) or a newer start/resume
+            # reacquired — do NOT resume over the run the user cancelled / a
+            # newer run; the slot is owned by neither us nor a stale generation.
+            print("[WOR-45] autonomous resume superseded/cancelled — not resuming")
+            return
+
+        # ── Race guard: NEVER respawn while an orchestrator loop is still alive ──
+        # autonomous_interrupt's orch.stop() nulls the engine's _thread handle even
+        # when its 2 s join times out mid agent.run(), so _begin's is_alive()
+        # idempotency guard can be blind to a still-draining old loop. Calling
+        # orch.resume() then would spawn a SECOND loop over the same agent/state and
+        # clear _stop (un-cancelling the orphan). A clean interrupt→resume leaves NO
+        # live loop, so this is a no-op there. Otherwise the old loop exits on its
+        # own (it still sees _stop set), usually within one in-flight agent.run() —
+        # so wait briefly and re-check.
+        if _orch_loop_alive():
+            waited = 0.0
+            while _orch_loop_alive() and waited < 3.0:  # bounded ~3 s
+                time.sleep(0.1)
+                waited += 0.1
+            if _orch_loop_alive():
+                # Still alive after the wait — a loop already owns the execution.
+                # Do NOT start a second one. Report INTERRUPTED (not "running"):
+                # the orphan usually exits WITHOUT a terminal, leaving the run
+                # paused/resumable, which is exactly what get_autonomous_status
+                # reports for this in_progress + inactive state — so a "running"
+                # frame here would permanently desync broadcast-only clients.
+                # Release our slot only AFTER the orphan is truly dead (deferred
+                # poller): freeing it while the orphan is alive would let a newer
+                # run acquire the slot and then be stopped/freed by the orphan's
+                # late terminal (the engine can emit one past its single stop
+                # check). A later resume (orphan now gone) takes the clean
+                # orch.resume() path below.
+                print("[WOR-45] autonomous resume: orchestrator loop still draining "
+                      "— reporting interrupted; deferring slot release until it exits")
+                _broadcast_autonomous(_autonomous_frame({"event": "interrupted"}, st))
+                threading.Thread(
+                    target=_release_after_orphan_drained,
+                    args=(my_gen,),
+                    daemon=True,
+                ).start()
+                return
+
+        orch.resume(st)
+        # Flip to "running" only AFTER resume() spawned the loop. The engine emits
+        # events only on task transitions, never on resume, so this won't double-fire.
+        _broadcast_autonomous(_autonomous_frame({"event": "running"}, st))
+    except Exception as e:
+        # Any unexpected failure (engine build, orch.resume thread exhaustion)
+        # must NOT wedge the slot at busy forever: release it (only if still ours)
+        # and tell clients the resume did not take.
+        print(f"[WOR-45] autonomous resume worker crashed: {e}")
         _broadcast_autonomous(_autonomous_frame({"event": "plan_failed"}, None))
         _release_single_runner_if_gen(my_gen)
 
@@ -1766,6 +1950,28 @@ async def websocket_endpoint(ws: WebSocket):
                 ).start()
                 continue
 
+            if msg_type == "autonomous_resume":
+                # Resume a PAUSED (interrupted) autonomous run from its cursor.
+                # interrupt already released the single-runner slot, so this
+                # re-acquire normally succeeds; if a DIFFERENT run now holds it,
+                # refuse (busy) — unicast to the requester, exactly like
+                # autonomous_start (NOT a broadcast: only this client asked).
+                _gen = _acquire_single_runner()
+                if _gen is None:
+                    await out.send_json(_autonomous_frame({"event": "busy"}))
+                    continue
+                # Capture THIS event loop so the orchestrator's daemon thread can
+                # hop progress frames back onto each connection's writer.
+                _autonomous["loop"] = asyncio.get_running_loop()
+                # Resume OFF the event loop (resume() spawns the loop thread and
+                # joins ≤2 s on its first checkpoint save — never block the loop).
+                threading.Thread(
+                    target=_autonomous_resume_worker,
+                    args=(_gen,),
+                    daemon=True,
+                ).start()
+                continue
+
             if msg_type == "autonomous_interrupt":
                 # Pause (resumable): stop() joins ≤2 s, so run it off the loop.
                 # The persisted state stays in_progress ⇒ resumable on relaunch.
@@ -1823,12 +2029,22 @@ async def websocket_endpoint(ws: WebSocket):
                     except Exception:
                         st = None
                 if isinstance(st, dict):
-                    ev = {
-                        "in_progress": "running",
-                        "done": "done",
-                        "failed": "failed",
-                        "aborted": "aborted",
-                    }.get(st.get("status", ""), "running")
+                    status = st.get("status", "")
+                    if status == "in_progress":
+                        # A LIVE run keeps active=True; interrupt cleared it (the
+                        # run is PAUSED but state stays in_progress ⇒ resumable),
+                        # and a fresh process recovering st from disk has no
+                        # in-memory active run either. Report "interrupted" in
+                        # both cases so a reconnecting phone can offer resume
+                        # (consistent with the GUI offering resume on launch);
+                        # only a genuinely live run (active True) is "running".
+                        ev = "running" if _autonomous.get("active") else "interrupted"
+                    else:
+                        ev = {
+                            "done": "done",
+                            "failed": "failed",
+                            "aborted": "aborted",
+                        }.get(status, "running")
                     await out.send_json(_autonomous_frame({"event": ev}, st))
                 else:
                     await out.send_json(_autonomous_frame({"event": "idle"}, None))

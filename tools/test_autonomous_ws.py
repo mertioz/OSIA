@@ -37,7 +37,16 @@ MANUAL TEST (end-to-end)
        python tools/test_autonomous_ws.py --action status      # render current progress
        python tools/test_autonomous_ws.py --action interrupt    # pause (resumable)
        python tools/test_autonomous_ws.py --action abort        # discard the run
+       python tools/test_autonomous_ws.py --action resume       # resume a paused run from its cursor
    A second --action start while one is running should get event=busy.
+
+5. Resume flow (WOR-45 server-side resume):
+       # start a task, let a task or two complete, then in another terminal:
+       python tools/test_autonomous_ws.py --action interrupt    # -> event=interrupted
+       python tools/test_autonomous_ws.py --action status       # -> event=interrupted (was wrongly "running" before)
+       python tools/test_autonomous_ws.py --action resume       # -> event=running, then re-runs from the cursor to done
+   Resume re-acquires the single-runner lock (interrupt freed it); if another run
+   holds it you get event=busy, and if nothing is resumable you get event=idle.
 
 The token is read from <CONFIG_DIR>/mobile_token.txt (same resolution the server
 uses) unless you pass --token. Override host/port with --host/--port.
@@ -152,6 +161,9 @@ async def _run(args) -> int:
         elif args.action == "abort":
             payload = {"type": "autonomous_abort"}
             print("--> autonomous_abort")
+        elif args.action == "resume":
+            payload = {"type": "autonomous_resume"}
+            print("--> autonomous_resume")
         else:  # status
             payload = {"type": "get_autonomous_status"}
             print("--> get_autonomous_status")
@@ -189,7 +201,7 @@ def main() -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--token", default=None, help="mobile token (default: read mobile_token.txt)")
-    ap.add_argument("--action", choices=["start", "interrupt", "abort", "status"],
+    ap.add_argument("--action", choices=["start", "interrupt", "abort", "status", "resume"],
                     default="start")
     ap.add_argument("--objective",
                     default="Create a folder named osia_p5_test and write a file "
