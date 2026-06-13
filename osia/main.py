@@ -20,6 +20,32 @@ if sys.platform == "win32":
         except Exception:
             pass
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+# WOR-46 (Windows UI Automation click backend): pin the process DPI awareness
+# ONCE, here at startup — BEFORE Qt's QApplication is ever constructed and BEFORE
+# the `uiautomation` library can be imported (it sets DPI awareness itself at
+# import time). DPI awareness can only be set once per process, so fixing it
+# FIRST means Qt (which would otherwise enable Per-Monitor-v2 on its own) and
+# uiautomation both inherit THIS mode instead of racing to set divergent ones.
+# The payoff: UIA BoundingRectangle, Pillow ImageGrab (vision capture) and
+# pyautogui clicks then all share ONE physical-pixel coordinate space, so a rect
+# center resolved by UIA lands exactly where the click is sent. We request
+# Per-Monitor-Aware-v2, which is already Qt6's default — so the GUI renders
+# identically (no regression) and stays coherent with the PassThrough rounding
+# policy wake_mode() sets before its QApplication. Best-effort: every call is
+# wrapped in try/except so a missing API on older Windows never crashes startup.
+if sys.platform == "win32":
+    try:
+        import ctypes
+        try:
+            # Windows 10 1703+: modern per-monitor-v2 context (== Qt6's default).
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(
+                ctypes.c_void_p(-4)  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+            )
+        except Exception:
+            # Windows 8.1+ fallback: 2 == PROCESS_PER_MONITOR_DPI_AWARE.
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        pass
 """
 OSIA main entry point — supports text mode, voice mode, wake-word mode.
 

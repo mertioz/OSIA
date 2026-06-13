@@ -24,6 +24,7 @@ Wayland). Cross-platform: every OS-specific branch is guarded by ``sys.platform`
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -1390,3 +1391,230 @@ def focus_app_window(window, timeout=APP_FOCUS_TIMEOUT,
         if time.monotonic() >= deadline:
             return ("timeout", "")
         time.sleep(poll)
+
+
+# ---------------------------------------------------------------------------
+# WOR-46 — Accessibility-API click backend (Windows UI Automation).
+#
+# resolve_element_rect() resolves a native UI element's EXACT bounding-rect
+# center by walking the foreground window's accessibility tree (Windows UI
+# Automation via the `uiautomation` library, which pulls comtypes). It is tried
+# FIRST by agent.tool_desktop_click; on any miss it returns None and the caller
+# falls back to the existing vision-guided locate. Pixel-exact coordinates mean
+# the click needs no vision model and no 2-pass refinement.
+#
+# Cross-platform + safe by construction:
+#   * Windows-only — returns None immediately on Linux/Mac/headless (sys.platform
+#     guard), so the mobile server and the Linux GUI are pure no-ops.
+#   * `uiautomation`/`comtypes` are imported LAZILY inside _load_uiautomation()
+#     (never at module scope), mirroring the _load_pyautogui/_load_win32 guards —
+#     a box without them is unaffected, and even on Windows the (heavy) import
+#     only happens on the first UIA-backed click.
+#   * COM is initialised per-call for the current thread via
+#     UIAutomationInitializerInThread() (the agent runs on worker threads in BOTH
+#     the GUI and the mobile-server process), and NO Control object is cached
+#     across calls (stale-element safety).
+#   * Bounded walk: shallow depth + node cap + a hard wall-clock deadline, so it
+#     never stalls the click path on a huge tree — it just returns None and lets
+#     vision take over.
+#   * NEVER raises and NEVER returns an "ERROR:" string (the whole body is in
+#     try/except → None), so the anti-hallucination tool contract is preserved
+#     (None simply means "UIA could not resolve it — use vision").
+# ---------------------------------------------------------------------------
+_UIA_MAX_DEPTH = 6          # how deep below the foreground window we descend
+_UIA_MAX_NODES = 300        # hard cap on elements inspected per call
+_UIA_MIN_SCORE = 0.55       # below this a candidate is too weak to trust
+
+# Control types that are typically the real click target — used only to break
+# near-ties toward a clickable leaf over a same-named container (e.g. a Button
+# nested in a Pane that carries the same Name).
+_UIA_CLICKABLE_TYPES = frozenset({
+    "ButtonControl", "MenuItemControl", "ListItemControl",
+    "HyperlinkControl", "TextControl",
+})
+
+# Article / descriptor tokens stripped during normalisation, so "the Save button"
+# / "le bouton Enregistrer" match an element simply named "Save" / "Enregistrer".
+_UIA_STOPWORDS = frozenset({
+    # articles (en / fr) — "l'" becomes the token "l" once punctuation is split
+    "the", "a", "an", "le", "la", "les", "l", "un", "une", "des", "du", "de",
+    # surrounding descriptor words (en / fr)
+    "button", "bouton", "btn", "menu", "item", "icon", "icone", "icône",
+    "link", "lien", "tab", "onglet", "field", "champ", "checkbox", "case",
+})
+
+_uiautomation = None
+_uiautomation_loaded = False
+
+
+def _load_uiautomation():
+    """Import the ``uiautomation`` library once (Windows only), caching the module
+    or ``None`` on failure. Lazy + cached, mirroring :func:`_load_pyautogui` /
+    :func:`_load_win32`: the heavy comtypes-backed import happens only on the first
+    UIA-backed click — never at module import — and a missing/broken package
+    degrades gracefully to ``None`` (→ vision fallback)."""
+    global _uiautomation, _uiautomation_loaded
+    if _uiautomation_loaded:
+        return _uiautomation
+    _uiautomation_loaded = True
+    if sys.platform != "win32":
+        _uiautomation = None
+        return None
+    try:
+        import uiautomation as _uia
+        _uiautomation = _uia
+    except Exception:
+        _uiautomation = None
+    return _uiautomation
+
+
+def _normalize_label(text) -> str:
+    """Lowercase ``text``, drop punctuation and article/descriptor stopwords, then
+    collapse whitespace — so a loose target like "the Save button" reduces to the
+    same token string as an element literally named "Save". Accented Latin letters
+    (é, ç, …) are preserved so French labels survive."""
+    s = text if isinstance(text, str) else str(text or "")
+    # Any non-alphanumeric run -> space (handles "l'ouvrir", "OK!", "File/Edit").
+    s = re.sub("[^0-9a-zA-ZÀ-ɏ]+", " ", s).lower()
+    tokens = [t for t in s.split() if t and t not in _UIA_STOPWORDS]
+    return " ".join(tokens)
+
+
+def _label_score(target_norm, target_tokens, cand_text) -> float:
+    """Fuzzy 0..1 match of a candidate element's text (Name or AutomationId)
+    against the normalised target, favouring PRECISION — a UIA hit BYPASSES the
+    vision fallback, so on any doubt we score low and let vision locate instead.
+
+    Tiers: exact normalised match = 1.0; the full target present as a contiguous
+    WORD phrase (e.g. "save" in "Save (Ctrl+S)", "save as" in "Save As…") = 0.9;
+    all target tokens present as whole words but scattered/reordered = 0.8.
+    Matching is strictly WORD-level — NEVER a raw character substring — so a short
+    label like "file"/"ok" can no longer match "profile"/"book". A residual
+    character ratio is returned only as a weak signal, deliberately scaled to stay
+    BELOW ``_UIA_MIN_SCORE`` so a near-miss never bypasses vision on its own (a
+    typo'd label simply falls through to the vision locate)."""
+    cand_norm = _normalize_label(cand_text)
+    if not cand_norm or not target_norm:
+        return 0.0
+    if cand_norm == target_norm:
+        return 1.0
+    cand_tokens = frozenset(cand_norm.split())
+    if target_tokens and target_tokens <= cand_tokens:
+        # Whole-word containment (word-boundary safe). A contiguous phrase
+        # ("save" inside "save ctrl s") is stronger than scattered tokens.
+        phrase = (" " + cand_norm + " ").find(" " + target_norm + " ") >= 0
+        return 0.9 if phrase else 0.8
+    # No whole-word match: a raw character ratio only, capped below the accept
+    # threshold so it can never, by itself, short-circuit the vision path.
+    ratio = difflib.SequenceMatcher(None, target_norm, cand_norm).ratio()
+    return round(ratio * 0.5, 4)
+
+
+def _rect_center_if_valid(rect):
+    """Integer center ``(cx, cy)`` of a UIA BoundingRectangle, or ``None`` when the
+    rect is empty/zero-area or belongs to a minimised/off-screen window (which
+    reports sentinel negatives around -32000).
+
+    Merely-negative coordinates are NOT rejected: a real secondary monitor placed
+    left of / above the primary uses small negative virtual-screen coordinates
+    (e.g. -1920..0) that are legitimately clickable — UIA BoundingRectangle and
+    pyautogui share that one signed coordinate space (unified by the WOR-46 DPI
+    pin). Never raises."""
+    try:
+        left, top = int(rect.left), int(rect.top)
+        right, bottom = int(rect.right), int(rect.bottom)
+    except Exception:
+        return None
+    if right <= left or bottom <= top:          # empty / zero-area
+        return None
+    if left <= -10000 or top <= -10000:         # minimised-window sentinel (~ -32000)
+        return None
+    return ((left + right) // 2, (top + bottom) // 2)
+
+
+def resolve_element_rect(target_label: str, timeout_s: float = 0.6) -> "tuple[int, int] | None":
+    """Resolve the exact click point of the native UI element described by
+    ``target_label`` via Windows UI Automation, returning its bounding-rect center
+    ``(x, y)`` in physical screen pixels, or ``None`` when it cannot be resolved.
+
+    Tried FIRST by ``agent.tool_desktop_click`` (accessibility-first); ``None``
+    routes the caller to its existing vision-guided locate (graceful fallback).
+
+    Returns ``None`` — fast, never raising — on every non-resolution path: not on
+    Windows, ``uiautomation`` unavailable, no foreground window, no element whose
+    Name/AutomationId fuzzy-matches, a COM error, an empty/zero/off-screen rect, or
+    the wall-clock ``timeout_s`` budget elapsing before a match is found. It NEVER
+    returns an ``"ERROR:"`` string, so the anti-hallucination contract holds and a
+    headless / Linux / Mac call is a pure no-op.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        auto = _load_uiautomation()
+        if auto is None:
+            return None
+        target_norm = _normalize_label(target_label)
+        if not target_norm:
+            return None
+        target_tokens = frozenset(target_norm.split())
+        deadline = time.monotonic() + max(0.1, float(timeout_s))
+
+        # COM is initialised for THIS thread (the agent runs on a worker thread in
+        # both the GUI and the mobile-server process). No Control is cached across
+        # calls — every element below is freshly walked inside this block.
+        with auto.UIAutomationInitializerInThread():
+            fg = auto.GetForegroundControl()
+            if not fg:
+                return None
+            try:
+                children = fg.GetChildren()
+            except Exception:
+                children = []
+            # Breadth-first, shallow. The foreground WINDOW itself is never a click
+            # target (you click an element INSIDE it), so we seed the frontier with
+            # its children at depth 1 and score outward from there.
+            frontier = [(c, 1) for c in children]
+            best_key = -1.0
+            best_center = None
+            visited = 0
+            while frontier:
+                if time.monotonic() >= deadline or visited >= _UIA_MAX_NODES:
+                    break
+                ctrl, depth = frontier.pop(0)
+                visited += 1
+                try:
+                    name = ctrl.Name or ""
+                except Exception:
+                    name = ""
+                try:
+                    aid = ctrl.AutomationId or ""
+                except Exception:
+                    aid = ""
+                # Match Name first; only consult AutomationId if Name was too weak.
+                score = _label_score(target_norm, target_tokens, name)
+                if score < _UIA_MIN_SCORE and aid:
+                    score = max(score, _label_score(target_norm, target_tokens, aid))
+                if score >= _UIA_MIN_SCORE:
+                    try:
+                        ctype = ctrl.ControlTypeName or ""
+                    except Exception:
+                        ctype = ""
+                    key = score + (0.05 if ctype in _UIA_CLICKABLE_TYPES else 0.0)
+                    if key > best_key:
+                        try:
+                            rect = ctrl.BoundingRectangle
+                        except Exception:
+                            rect = None
+                        center = _rect_center_if_valid(rect) if rect is not None else None
+                        if center is not None:
+                            best_key, best_center = key, center
+                if depth < _UIA_MAX_DEPTH:
+                    try:
+                        kids = ctrl.GetChildren()
+                    except Exception:
+                        kids = []
+                    for ch in kids:
+                        frontier.append((ch, depth + 1))
+            return best_center
+    except Exception:
+        return None

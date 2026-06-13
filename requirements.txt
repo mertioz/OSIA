@@ -51,6 +51,16 @@ tqdm>=4.65.0
 # where the package is unavailable (cross-platform rule, WOR-11).
 pywin32>=306; sys_platform == "win32"
 
+# WOR-46 — Accessibility-API (Windows UI Automation) click backend. `uiautomation`
+# (yinkaisheng) resolves a native element's exact bounding-rect center, tried
+# before the vision fallback in agent.tool_desktop_click; it pulls `comtypes`,
+# declared explicitly so the WOR-36 installer always provisions it. Both are
+# marker-guarded to Windows. NOTE: a PyInstaller build must add `comtypes.gen` (and
+# `comtypes`) hidden imports — the UIAutomationClient typelib cache is generated at
+# runtime and won't be picked up by static analysis.
+comtypes; sys_platform == "win32"
+uiautomation; sys_platform == "win32"
+
 # ── Optional ────────────────────────────────────────────────────────────────
 # NVIDIA GPU temperature in the heartbeat monitor; safely skipped at runtime
 # when absent or when there is no NVIDIA GPU. Remove if not needed.

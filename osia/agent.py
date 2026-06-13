@@ -2008,36 +2008,52 @@ def tool_desktop_click(description: str) -> str:
     if err:
         return err
 
-    loc = _vision_locate(shot, description)
-    if loc.get("error"):
-        return loc["error"]
-    if not loc.get("found"):
-        return (
-            f"ERROR: could not find \"{description}\" on screen "
-            f"({loc.get('reason', 'not visible')}). Take a screenshot to see what "
-            "is currently displayed, then try a different description."
-        )
-
-    # Describe the screen BEFORE the click (reuses the screenshot we located on,
-    # so no extra capture). Vision call goes through key_chain rotation.
-    before_full = _describe_screenshot(shot)
-
     from osia.tools import desktop_control as _dc
-    cx, cy = loc["x"], loc["y"]
 
-    # Two-pass precision refinement: coarse full-screen locate -> move the cursor
-    # there (no click) -> fine locate on a 300x300 crop around it -> click the
-    # corrected point. Sharpens small targets (text links, tiny icons). Best-
-    # effort: any hiccup (quota, vision error, not-found) falls back to the coarse
-    # coordinates rather than failing the whole click. Gated by the
-    # DESKTOP_CLICK_REFINE A/B flag (default OFF — coarse-only) so the refinement
-    # can be toggled without code changes while its drift bug is investigated.
-    if DESKTOP_CLICK_REFINE:
-        fx, fy, refined = _refine_click_target(cx, cy, description, _dc)
-    else:
-        print(f"[DESKTOP-REFINE] disabled (DESKTOP_CLICK_REFINE=off) — "
-              f"clicking coarse ({cx}, {cy})")
+    # WOR-46 — accessibility-first / vision-fallback. On Windows, resolve the
+    # element's EXACT bounding-rect center through the UI Automation backend
+    # FIRST. A hit gives pixel-exact coordinates, so we skip the vision locate AND
+    # the 2-pass refinement entirely (the rect center is already precise). The
+    # resolver returns None on non-Windows, when uiautomation is unavailable, on
+    # any fuzzy-match miss / COM error, or headless — and NEVER raises or returns
+    # an "ERROR:" string — so None cleanly routes us to the existing vision path
+    # below. Either way the BEFORE/AFTER verification screenshots are still taken.
+    hit = _dc.resolve_element_rect(description)
+    if hit is not None:
+        cx, cy = hit
         fx, fy, refined = cx, cy, False
+        print(f"[WOR-46] UIA resolved \"{description}\" -> ({cx}, {cy}) "
+              f"— skipping vision locate + refine.")
+    else:
+        loc = _vision_locate(shot, description)
+        if loc.get("error"):
+            return loc["error"]
+        if not loc.get("found"):
+            return (
+                f"ERROR: could not find \"{description}\" on screen "
+                f"({loc.get('reason', 'not visible')}). Take a screenshot to see what "
+                "is currently displayed, then try a different description."
+            )
+        cx, cy = loc["x"], loc["y"]
+
+        # Two-pass precision refinement: coarse full-screen locate -> move the cursor
+        # there (no click) -> fine locate on a 300x300 crop around it -> click the
+        # corrected point. Sharpens small targets (text links, tiny icons). Best-
+        # effort: any hiccup (quota, vision error, not-found) falls back to the coarse
+        # coordinates rather than failing the whole click. Gated by the
+        # DESKTOP_CLICK_REFINE A/B flag (default OFF — coarse-only) so the refinement
+        # can be toggled without code changes while its drift bug is investigated.
+        if DESKTOP_CLICK_REFINE:
+            fx, fy, refined = _refine_click_target(cx, cy, description, _dc)
+        else:
+            print(f"[DESKTOP-REFINE] disabled (DESKTOP_CLICK_REFINE=off) — "
+                  f"clicking coarse ({cx}, {cy})")
+            fx, fy, refined = cx, cy, False
+
+    # Describe the screen BEFORE the click (reuses the screenshot captured above,
+    # so no extra capture). Taken on BOTH the UIA-hit and vision paths. Vision
+    # call goes through key_chain rotation.
+    before_full = _describe_screenshot(shot)
 
     res = _dc.click_at(fx, fy)
     if isinstance(res, str) and res.upper().startswith("ERROR"):
