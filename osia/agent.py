@@ -2041,7 +2041,9 @@ def tool_desktop_click(description: str) -> str:
     coordinates, clicks there, then captures the screen again and compares the
     BEFORE/AFTER frames with a fast LOCAL pixel diff (no vision call) so the
     model can confirm the click actually changed something (anti-hallucination).
-    Warns when the screen did not visibly change (the click probably missed).
+    A no-change result is returned as a FAILURE (ERROR:-prefixed) so the model
+    sees the ⚠️ banner, knows the click likely MISSED, and re-locates/retries
+    instead of assuming success (WOR-59).
     """
     if not description or not str(description).strip():
         return "ERROR: desktop_click: provide a description of what to click."
@@ -2114,17 +2116,24 @@ def tool_desktop_click(description: str) -> str:
         # Re-capture failed — report the click without a before/after compare.
         return note
 
-    lines = [note]
     # Miss-check via a PURE-LOCAL pixel diff between the BEFORE (`shot`) and
     # AFTER (`verify`) screenshots — no vision call. If the screen looks
-    # unchanged, the click likely missed; say so explicitly so a no-op click is
-    # never mistaken for success.
+    # unchanged, the click likely missed. Surface the miss as a real FAILURE:
+    # the result is ERROR:-prefixed so `_is_tool_error` classifies it as an error,
+    # which (1) wraps it in the ⚠️ TOOL FAILED banner and (2) counts it toward the
+    # anti-loop error streak — a weak model can no longer skim a no-op click as if
+    # it had worked; it must re-locate and retry (WOR-59). The wording makes clear
+    # the cursor DID click (it just didn't land), so the model re-locates instead
+    # of assuming the tool crashed. A click that DID change the screen stays a
+    # normal success (plain `note`, no banner, resets the streak).
     if not _screens_changed(shot, verify):
-        lines.append(
-            "WARNING: the screen did not visibly change after the click — "
-            "the target may have been missed."
+        return (
+            f"ERROR: clicked \"{description}\" at ({fx}, {fy}) but the screen "
+            "did not visibly change — the click likely MISSED. Take a "
+            "screenshot to re-locate the target, then retry once or try an "
+            "alternative."
         )
-    return "\n".join(lines)
+    return note
 
 
 def tool_desktop_type(text: str) -> str:
