@@ -588,6 +588,17 @@ app = FastAPI(title="OSIA Mobile Server", version="1.0.0")
 _WS_CLIENTS: set["_OutboundChannel"] = set()
 
 
+# WOR-62: in-flight turns DETACHED on client disconnect so they run to
+# completion and persist (instead of being cancelled, which dropped the reply
+# when a phone slept mid-generation). Held here at module scope so the event
+# loop keeps a STRONG reference — a task whose only reference is the local
+# ``streaming_tasks`` dict would be eligible for GC the moment that dict is
+# cleared in the disconnect ``finally``, and could vanish mid-run. Each task
+# removes itself via an ``add_done_callback`` so this set can never grow
+# unbounded.
+_DETACHED_TURNS: set["asyncio.Task"] = set()
+
+
 # Sentinel pushed onto an _OutboundChannel to tell its writer task to stop.
 _WRITER_STOP = object()
 
@@ -2765,16 +2776,29 @@ async def websocket_endpoint(ws: WebSocket):
         # Drop this client from the broadcast registry (WOR-10). discard() is
         # a no-op if it was never added (e.g. auth failed).
         _WS_CLIENTS.discard(out)
-        # Cancel any in-flight streaming turns for this connection (WOR HOL
-        # fix). Each captured its own conversation target, so cancelling here
-        # only stops the dispatch — anything already persisted stays on disk.
+        # WOR-62: DETACH any in-flight streaming turn for this connection
+        # instead of cancelling it. Cancelling raised CancelledError inside the
+        # turn (at the ``await asyncio.to_thread(...)`` agent run) BEFORE it
+        # reached its single persist point (_persist_new_messages), so a phone
+        # that slept mid-generation lost BOTH the reply and the user message —
+        # the conversation was left empty on disk. The agent's worker thread is
+        # uncancellable and runs ``agent.run`` to completion EITHER way (the
+        # compute is identical); detaching simply stops throwing the result
+        # away. The turn finishes on the shared server event loop and persists
+        # via its normal path. Its remaining frames target the now-dead socket,
+        # but every send is enqueue-only on the _OutboundChannel and the writer
+        # swallows the failed flush, so nothing raises before persistence.
+        #
+        # Move each task into the module-level set so a strong reference keeps
+        # it alive (the loop only weakly references tasks; clearing
+        # ``streaming_tasks`` below would otherwise make it GC-eligible
+        # mid-run), and register a done-callback so it removes itself on
+        # completion — the set stays bounded. Do NOT await them here: that would
+        # block this receive-loop teardown until the agent finishes. They run
+        # independently and persist on their own.
         for _task in list(streaming_tasks.values()):
-            _task.cancel()
-        for _task in list(streaming_tasks.values()):
-            try:
-                await _task
-            except (asyncio.CancelledError, Exception):
-                pass
+            _DETACHED_TURNS.add(_task)
+            _task.add_done_callback(_DETACHED_TURNS.discard)
         streaming_tasks.clear()
         # Dispose this connection's reused agents (perf fix #3): close each
         # idle agent's OpenAI/httpx client so its sockets + SSL context are
