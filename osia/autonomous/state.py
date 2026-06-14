@@ -231,6 +231,41 @@ def append_log(state: dict, event: str, ref=None, note=None) -> dict:
     return state
 
 
+# ── Projections (read-only — pure derived views, never mutate) ───────────────
+
+def count_progress(st: dict) -> "tuple[int, int, str]":
+    """Progress counters for a task_state: ``(done, total, phase_name)``.
+
+    The single source of truth shared by the GUI panel (``main.py``) and the
+    mobile WS snapshot (``server.py``) so the two can never drift apart.
+
+    ``done`` counts every task whose ``status == "done"``. ``total`` counts a
+    task only when it is **done** *or* sits in a phase **at/after the cursor**
+    (the live tail). Replan-superseded phases — the failed / never-run phases
+    ``_replan`` leaves behind when it APPENDS a fresh tail without pruning — sit
+    *before* the cursor and hold no done tasks, so they are excluded and the
+    counter no longer inflates (WOR-45: ``5 / 5`` instead of ``5 / 12``).
+    ``phase_name`` is the name of the phase under the cursor (``""`` when the
+    cursor is out of range). Pure reads — safe on any thread.
+    """
+    phases = st.get("phases") or []
+    cursor = st.get("cursor") or {}
+    cur_p = int(cursor.get("phase", 0) or 0)
+    done = 0
+    total = 0
+    for i, ph in enumerate(phases):
+        for tk in (ph.get("tasks") or []):
+            is_done = tk.get("status") == "done"
+            if is_done:
+                done += 1
+            if is_done or i >= cur_p:  # live tail + all completed; excludes superseded
+                total += 1
+    phase_name = ""
+    if 0 <= cur_p < len(phases):
+        phase_name = phases[cur_p].get("name", "") or ""
+    return done, total, phase_name
+
+
 # ── Persistence ────────────────────────────────────────────────────────────
 
 def load_task_state() -> "dict | None":

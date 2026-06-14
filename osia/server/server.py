@@ -939,19 +939,7 @@ def _autonomous_snapshot(st) -> dict:
     main.py's ``_orch_snapshot`` but emits the mobile WS field names."""
     if not isinstance(st, dict):
         return {}
-    phases = st.get("phases") or []
-    total = 0
-    done = 0
-    for ph in phases:
-        for tk in (ph.get("tasks") or []):
-            total += 1
-            if tk.get("status") == "done":
-                done += 1
-    cursor = st.get("cursor") or {}
-    p = int(cursor.get("phase", 0) or 0)
-    phase_name = ""
-    if 0 <= p < len(phases):
-        phase_name = phases[p].get("name", "") or ""
+    done, total, phase_name = _astate.count_progress(st)
     return {
         "tasks_done": done,
         "tasks_total": total,

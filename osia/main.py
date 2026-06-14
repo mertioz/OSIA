@@ -361,7 +361,7 @@ def wake_mode():
     # WOR-45 Phase 4 — wire the autonomous engine (consumed as black boxes).
     from osia.autonomous.orchestrator import Orchestrator
     from osia.autonomous import planner
-    from osia.autonomous.state import save_task_state, clear_task_state
+    from osia.autonomous.state import save_task_state, clear_task_state, count_progress
     perf_mark("wake_mode: heavy imports done")
 
     class Bridge(QObject):
@@ -846,19 +846,7 @@ def wake_mode():
         on the orchestrator thread (the same thread that mutates `st`)."""
         if not isinstance(st, dict):
             return {}
-        phases = st.get("phases") or []
-        total = 0
-        done = 0
-        for ph in phases:
-            for tk in (ph.get("tasks") or []):
-                total += 1
-                if tk.get("status") == "done":
-                    done += 1
-        cursor = st.get("cursor") or {}
-        p = int(cursor.get("phase", 0) or 0)
-        phase_name = ""
-        if 0 <= p < len(phases):
-            phase_name = phases[p].get("name", "") or ""
+        done, total, phase_name = count_progress(st)
         return {
             "done": done,
             "total": total,
