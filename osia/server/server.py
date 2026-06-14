@@ -915,6 +915,13 @@ _autonomous: dict = {
                       # acquire so a start worker can tell whether ITS slot is
                       # still the current one (a cancel-then-reacquire during the
                       # multi-second planning window invalidates a stale worker).
+    "interrupting": False,  # ORPHAN-LOOP RACE gate (WOR-45). Set True by
+                      # autonomous_interrupt; cleared ONLY once the (possibly
+                      # still-draining) orchestrator loop is confirmed dead. While
+                      # set, a terminal event from that paused/superseded loop is
+                      # neither broadcast as the run outcome (R1) nor allowed to
+                      # stop()/release a newer run (R2) — see
+                      # _on_autonomous_progress and _autonomous_resume_worker.
 }
 # Guards `_autonomous` lifecycle mutations + the lockfile across the event-loop
 # thread and the orchestrator/worker daemon threads. Non-reentrant — the helpers
@@ -1133,11 +1140,33 @@ def _on_autonomous_progress(payload: dict) -> None:
     ``_finalize_terminal_release``). Wrapped so a callback error never kills the
     loop. For a live run ``active`` stays True until that release, so no start can
     race in; the generation captured below makes a STALE orphan's late terminal a
-    no-op so it can never stop/free a newer run (see ``_finalize_terminal_release``)."""
+    no-op so it can never stop/free a newer run (see ``_finalize_terminal_release``).
+
+    ORPHAN-LOOP RACE GATE (WOR-45) — a timed-out ``autonomous_interrupt`` stop()
+    leaves the old loop draining: the engine checks its stop flag only ONCE per
+    step (loop top + after ``agent.run``), NEVER inside ``_verify``/``_llm_judge``/
+    ``_replan``, so an interrupted step already past that check still runs through
+    to a terminal ``done``/``failed`` emit on THIS thread — AFTER the slot was
+    freed (interrupt) or re-acquired by a resume. Such a terminal is NOT the
+    outcome of a live, owned run. Gate it: when we are mid-interrupt
+    (``interrupting``) OR no run owns the slot (``active`` False), DROP it — do
+    NOT broadcast it (closes R1: the spurious "failed" reaching the phone) and do
+    NOT spawn the finalizer (closes R2: stopping/freeing a newer run). The
+    drain/resume logic (:func:`_autonomous_resume_worker`) decides the real state
+    from disk. A genuinely live run keeps ``active`` True and ``interrupting``
+    False, so its terminal still broadcasts + finalizes exactly as before."""
     try:
-        frame = _autonomous_frame(dict(payload), _autonomous.get("st"))
-        _broadcast_autonomous(frame)
-        if payload.get("event") in ("done", "failed"):
+        event = payload.get("event")
+        if event in ("done", "failed"):
+            # ── Terminal: gate a paused/superseded orphan's late terminal ──
+            if _autonomous.get("interrupting") or not _autonomous.get("active"):
+                print(f"[WOR-45] gating stale autonomous terminal {event!r} "
+                      f"(interrupting={_autonomous.get('interrupting')}, "
+                      f"active={_autonomous.get('active')}) — orphan-loop race; "
+                      "drain/resume decides the real state from disk")
+                return
+            frame = _autonomous_frame(dict(payload), _autonomous.get("st"))
+            _broadcast_autonomous(frame)
             # Capture the generation NOW (terminal-observation time) so the
             # release/stop can be gated to it — a superseded orphan's late
             # terminal must not free/stomp whatever generation owns the slot later.
@@ -1147,6 +1176,11 @@ def _on_autonomous_progress(payload: dict) -> None:
                 args=(_autonomous.get("orch"), term_gen),
                 daemon=True,
             ).start()
+        else:
+            # Non-terminal progress (running/task_done/task_failed/salvaged/…) is
+            # never the run OUTCOME — broadcast it unchanged, as before.
+            frame = _autonomous_frame(dict(payload), _autonomous.get("st"))
+            _broadcast_autonomous(frame)
     except Exception as e:
         print(f"[WOR-45] autonomous progress_cb error: {e}")
 
@@ -1182,9 +1216,43 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
       (and a later start may reacquire it, bumping the generation); a stale worker
       must NOT persist or ``orch.start()`` the run the user cancelled — doing so
       would run it UNLOCKED (single-runner invariant broken) and/or stomp a newer
-      run. ``orch.start()`` clears the stop signal, so this gate is load-bearing."""
+      run. ``orch.start()`` clears the stop signal, so this gate is load-bearing.
+
+    ORPHAN-LOOP RACE (WOR-45) — like the resume worker, DRAIN any orphan loop
+    BEFORE spawning. A timed-out ``autonomous_interrupt`` can leave the previous
+    loop draining (the engine never checks its stop flag inside ``_verify``/
+    ``_llm_judge``/``_replan``); ``orch.start()`` would then spawn a SECOND loop on
+    the shared agent (``Orchestrator._begin``'s ``is_alive`` guard is blind once
+    ``stop()`` nulled ``_thread``), AND this fresh run's terminal would be dropped
+    by the ``interrupting`` gate still up for the orphan (a WEDGE). So drain first,
+    then reopen the gate — exactly as the resume path does."""
     try:
         agent, orch = _ensure_autonomous_engine()
+
+        # ── DRAIN before spawning (never two loops on the shared agent) ──
+        # Wait (GENEROUS bound) until no orchestrator loop remains, so start
+        # happens only against a dead/idle engine. If a prior interrupt's orphan
+        # is wedged past the bound, do NOT spawn a second loop: report the start
+        # failed and defer the slot release until the orphan truly dies.
+        waited = 0.0
+        while _orch_loop_alive() and waited < 120.0:
+            time.sleep(0.2)
+            waited += 0.2
+        if _orch_loop_alive():
+            print("[WOR-45] autonomous start: orchestrator loop wedged past the "
+                  "drain bound — not spawning a second loop; reporting plan_failed")
+            _broadcast_autonomous(_autonomous_frame({"event": "plan_failed"}, None))
+            threading.Thread(
+                target=_release_after_orphan_drained,
+                args=(my_gen,),
+                daemon=True,
+            ).start()
+            return
+        # Orphan drained (engine dead/idle) — reopen the gate (self-heal: a prior
+        # interrupt's bounded poller may have given up while the orphan was alive).
+        # Safe: no loop is alive, so no terminal can fire in between.
+        _autonomous["interrupting"] = False
+
         # Honour the requested model; fall back to the configured one so the run
         # uses the user's selected model rather than the bare OSIAAgent() default.
         if not model:
@@ -1246,6 +1314,12 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
         print(f"[WOR-45] autonomous start worker crashed: {e}")
         _broadcast_autonomous(_autonomous_frame({"event": "plan_failed"}, None))
         _release_single_runner_if_gen(my_gen)
+        # ORPHAN-LOOP RACE (WOR-45): a crash BEFORE the drain reopened the gate
+        # (e.g. _ensure_autonomous_engine raised) must not leave it stuck — but
+        # only reopen if no orphan is alive (else its terminal must stay gated;
+        # the interrupt backstop / next drain reopens it once the orphan dies).
+        if not _orch_loop_alive():
+            _autonomous["interrupting"] = False
 
 
 def _orch_loop_alive() -> bool:
@@ -1281,63 +1355,151 @@ def _release_after_orphan_drained(my_gen: int, timeout: float = 120.0) -> None:
     :func:`_finalize_terminal_release` (now generation-gated — the second line of
     defence) already released the slot under our generation, so the ``_if_gen``
     release here is then a safe no-op (a newer generation owns it) or a harmless
-    idempotent re-release."""
+    idempotent re-release.
+
+    ORPHAN-LOOP RACE (WOR-45) — this is one of the drain-completion sites, so it
+    also CLEARS the ``interrupting`` gate, but ONLY once the orphan is truly DEAD
+    (see below): clearing it while the orphan is still alive would let its late
+    terminal breach the gate and be broadcast as a newer run's outcome."""
     waited = 0.0
     while _orch_loop_alive() and waited < timeout:
         time.sleep(0.2)
         waited += 0.2
+    # Reopen terminals ONLY if the orphan is truly DEAD. If the bound elapsed with
+    # it still alive (pathological), leave the gate UP — its late terminal stays
+    # gated, and the next start/resume drain (or the orphan's eventual death)
+    # reopens it (self-heal). The SLOT release below stays bounded so a wedged
+    # orphan can never hold the slot forever; a still-draining orphan still can't
+    # spawn a 2nd loop because BOTH start and resume drain before spawning.
+    if not _orch_loop_alive():
+        _autonomous["interrupting"] = False
     _release_single_runner_if_gen(my_gen)
 
 
+def _clear_interrupting_after_orphan_drained(timeout: float = 120.0) -> None:
+    """Clear the ``interrupting`` gate once a still-draining orphan orchestrator
+    loop is dead — WITHOUT releasing the slot (the caller already released it).
+
+    ORPHAN-LOOP RACE (WOR-45) — used by ``autonomous_interrupt`` for the
+    NO-RESUME case: a timed-out stop() can leave the old loop draining, so the
+    gate must stay set until that loop's late terminal has been observed (and
+    dropped). The wait is BOUNDED (daemon thread, never blocks the loop), but the
+    flag is cleared ONLY if the orphan is truly DEAD — clearing it while the orphan
+    is still alive (bound exceeded) would let its late terminal breach the gate.
+    If the bound elapses with the orphan still alive, the gate is left UP; it is a
+    harmless stuck-True (there is no live owned run whose terminal it could
+    swallow) and the NEXT start/resume drain reopens it once the orphan dies
+    (self-heal). Idempotent: the resume worker may clear the same flag concurrently."""
+    waited = 0.0
+    while _orch_loop_alive() and waited < timeout:
+        time.sleep(0.2)
+        waited += 0.2
+    if not _orch_loop_alive():
+        _autonomous["interrupting"] = False
+
+
 def _autonomous_resume_worker(my_gen: int) -> None:
-    """Resume a PAUSED autonomous run OFF the event loop. Mirrors
-    ``_autonomous_start_worker`` (engine build → set_model → establish under the
-    generation gate → orch.resume → emit running) and the GUI resume branch
-    (``main.py``: ``set_model(state["model"])`` → ``orchestrator.resume(state)``).
-    The single-runner slot (generation ``my_gen``) was re-acquired by the handler
-    — interrupt freed it. There is NO planning step: the plan already lives in the
-    persisted task_state, so resume picks up at the cursor (the engine re-checks
-    the interrupted task's success_criterion before re-executing — crash-salvage).
+    """Resume a PAUSED autonomous run OFF the event loop, converging BYTE-FOR-BYTE
+    onto the PROVEN GUI resume flow (``main.py``: ``load_task_state()`` →
+    ``set_model(state["model"])`` → ``orchestrator.resume(state)``): resume ONLY
+    against a dead/idle engine, against the on-disk state. The single-runner slot
+    (generation ``my_gen``) was re-acquired by the handler — interrupt freed it.
+    There is NO planning step: the plan already lives in the persisted task_state,
+    so resume picks up at the cursor (the engine re-checks the interrupted task's
+    success_criterion before re-executing — crash-salvage).
+
+    ORPHAN-LOOP RACE FIX (WOR-45). A timed-out ``autonomous_interrupt`` stop()
+    can leave the old orchestrator loop alive (the engine never checks its stop
+    flag inside ``_verify``/``_llm_judge``/``_replan``); the GUI never hits this
+    because it resumes on a FRESH process where no loop exists. So we make the
+    server path the same by DRAINING the orphan first:
+
+    * Fix #1 — DRAIN BEFORE the resumable generation acts. Before any
+      generation-sensitive establish/resume, wait (GENEROUS bound, not the old
+      3 s cap) until no live ``osia-orchestrator`` thread remains. This
+      guarantees the orphan's terminal is observed (and dropped by the
+      ``interrupting`` gate in :func:`_on_autonomous_progress`) while the loop is
+      unambiguously its own — never a SECOND concurrent loop on the shared agent.
+      If the orphan is wedged past the bound, step back: report ``interrupted``
+      (resumable, as ``get_autonomous_status`` reports) and defer the slot
+      release until it truly dies (:func:`_release_after_orphan_drained`).
+    * Fix #2 — re-read the (mobile-isolated) task state FROM DISK and branch on
+      its REAL status, mirroring the GUI exactly: ``in_progress`` ⇒
+      ``orch.resume(st)`` (the proven idle-engine + disk-state path); a TERMINAL
+      status (done/failed/aborted) ⇒ surface it TRUTHFULLY (broadcast it) and do
+      NOT start a loop. This is the orphan's genuine result when it really ran the
+      task to completion before draining — NOT the mis-attributed terminal the
+      old code wrongly broadcast onto the just-resumed run.
 
     Hardening, exactly like the start worker:
 
     * Wrap the WHOLE body so ANY failure RELEASES the slot (only if generation
       ``my_gen`` is still current) — a raise must never wedge ``active`` True
       forever and refuse every later start/resume at ``busy``.
-    * Resolve the state to resume: prefer the in-memory ``st``; on a FRESH process
-      (server restarted after the pause) fall back to the persisted mobile
-      task-state file. If it is not a resumable ``in_progress`` dict, tell clients
-      the run is ``idle`` and release.
     * ESTABLISH atomically, only if generation ``my_gen`` is still current — a
       newer start/resume that reacquired during this window must not be stomped
-      (the same load-bearing gate the start worker uses).
-    * NEVER spawn a SECOND loop. A timed-out interrupt ``stop()`` can leave the
-      old loop draining (see :func:`_orch_loop_alive`); resuming over it would run
-      two loops on one agent/state. Guard with a short bounded wait; if a loop is
-      still alive after it, step back — broadcast ``interrupted`` (the run is
-      paused/resumable, matching ``get_autonomous_status``) and defer the slot
-      release until the orphan is truly dead (:func:`_release_after_orphan_drained`)
-      so a newer run can't acquire the slot and be killed by the orphan's late
-      terminal. The terminal-release path itself is generation-guarded
-      (:func:`_finalize_terminal_release`) as a second line of defence."""
+      (the same load-bearing gate the start worker uses)."""
     try:
         agent, orch = _ensure_autonomous_engine()
-        st = _autonomous.get("st")
+
+        # ── Fix #1: DRAIN the orphan BEFORE the resumable generation acts ──
+        # Resume must run only against a dead/idle engine (the GUI flow). Wait,
+        # with a GENEROUS bound, until no orchestrator loop remains in-process so
+        # the orphan's late terminal lands while the loop is still unambiguously
+        # its own (and is dropped by the interrupting gate) — never a 2nd loop.
+        waited = 0.0
+        while _orch_loop_alive() and waited < 120.0:
+            time.sleep(0.2)
+            waited += 0.2
+        if _orch_loop_alive():
+            # Orphan wedged past the drain bound — do NOT spawn a second loop.
+            # Report INTERRUPTED (the run stays paused/resumable, matching
+            # get_autonomous_status) and release our slot only AFTER the orphan is
+            # truly dead: freeing it now would let a newer run acquire the slot and
+            # then be stopped/freed by the orphan's late terminal. That poller also
+            # clears the interrupting gate when the drain completes.
+            print("[WOR-45] autonomous resume: orchestrator loop wedged past the "
+                  "drain bound — reporting interrupted; deferring slot release "
+                  "until it exits")
+            _broadcast_autonomous(
+                _autonomous_frame({"event": "interrupted"}, _autonomous.get("st")))
+            threading.Thread(
+                target=_release_after_orphan_drained,
+                args=(my_gen,),
+                daemon=True,
+            ).start()
+            return
+
+        # ── Orphan drained: the engine is dead/idle. This is a drain-completion
+        # site, so reopen terminals (clear the interrupting gate) — the resumed
+        # run's OWN terminals must broadcast normally. Safe here: no loop is alive
+        # (orphan dead, resume not started), so no terminal can fire in between. ──
+        _autonomous["interrupting"] = False
+
+        # ── Fix #2: re-read the persisted (mobile-isolated) state from DISK and
+        # branch on its REAL status — mirror the GUI's _offer_resume_if_pending. ──
+        try:
+            st = _astate.load_task_state()
+        except Exception:
+            st = None
         if not isinstance(st, dict):
-            # Fresh process after a restart — recover the run from disk (the
-            # mobile-isolated task_state file; CONFIG_DIR is the same dir).
-            try:
-                st = _astate.load_task_state()
-            except Exception:
-                st = None
-        if not isinstance(st, dict) or st.get("status") != "in_progress":
-            # Nothing resumable (no pending run, or it is done/failed/aborted).
+            # Nothing on disk to resume (no pending run).
             _broadcast_autonomous(_autonomous_frame({"event": "idle"}, None))
             _release_single_runner_if_gen(my_gen)
             return
+        status = st.get("status", "")
+        if status != "in_progress":
+            # Disk shows a TERMINAL outcome — surface it truthfully and start NO
+            # loop (the GUI only resumes an in_progress run). When the drained
+            # orphan genuinely failed/finished the task, this is its REAL result.
+            ev = {"done": "done", "failed": "failed",
+                  "aborted": "aborted"}.get(status, "idle")
+            _broadcast_autonomous(_autonomous_frame({"event": ev}, st))
+            _release_single_runner_if_gen(my_gen)
+            return
 
-        # Honour the model the run was planned with — exactly like the start
-        # worker and the GUI resume branch (main.py: set_model(state["model"])).
+        # ── status == in_progress ⇒ resume EXACTLY like the GUI ──
+        # Honour the model the run was planned with (main.py: set_model(state["model"])).
         model = st.get("model")
         if model:
             try:
@@ -1360,43 +1522,6 @@ def _autonomous_resume_worker(my_gen: int) -> None:
             print("[WOR-45] autonomous resume superseded/cancelled — not resuming")
             return
 
-        # ── Race guard: NEVER respawn while an orchestrator loop is still alive ──
-        # autonomous_interrupt's orch.stop() nulls the engine's _thread handle even
-        # when its 2 s join times out mid agent.run(), so _begin's is_alive()
-        # idempotency guard can be blind to a still-draining old loop. Calling
-        # orch.resume() then would spawn a SECOND loop over the same agent/state and
-        # clear _stop (un-cancelling the orphan). A clean interrupt→resume leaves NO
-        # live loop, so this is a no-op there. Otherwise the old loop exits on its
-        # own (it still sees _stop set), usually within one in-flight agent.run() —
-        # so wait briefly and re-check.
-        if _orch_loop_alive():
-            waited = 0.0
-            while _orch_loop_alive() and waited < 3.0:  # bounded ~3 s
-                time.sleep(0.1)
-                waited += 0.1
-            if _orch_loop_alive():
-                # Still alive after the wait — a loop already owns the execution.
-                # Do NOT start a second one. Report INTERRUPTED (not "running"):
-                # the orphan usually exits WITHOUT a terminal, leaving the run
-                # paused/resumable, which is exactly what get_autonomous_status
-                # reports for this in_progress + inactive state — so a "running"
-                # frame here would permanently desync broadcast-only clients.
-                # Release our slot only AFTER the orphan is truly dead (deferred
-                # poller): freeing it while the orphan is alive would let a newer
-                # run acquire the slot and then be stopped/freed by the orphan's
-                # late terminal (the engine can emit one past its single stop
-                # check). A later resume (orphan now gone) takes the clean
-                # orch.resume() path below.
-                print("[WOR-45] autonomous resume: orchestrator loop still draining "
-                      "— reporting interrupted; deferring slot release until it exits")
-                _broadcast_autonomous(_autonomous_frame({"event": "interrupted"}, st))
-                threading.Thread(
-                    target=_release_after_orphan_drained,
-                    args=(my_gen,),
-                    daemon=True,
-                ).start()
-                return
-
         orch.resume(st)
         # Flip to "running" only AFTER resume() spawned the loop. The engine emits
         # events only on task transitions, never on resume, so this won't double-fire.
@@ -1408,6 +1533,12 @@ def _autonomous_resume_worker(my_gen: int) -> None:
         print(f"[WOR-45] autonomous resume worker crashed: {e}")
         _broadcast_autonomous(_autonomous_frame({"event": "plan_failed"}, None))
         _release_single_runner_if_gen(my_gen)
+        # ORPHAN-LOOP RACE (WOR-45): a crash BEFORE the drain reopened the gate
+        # (engine build / disk load) must not leave it stuck. Reopen only if no
+        # orphan is alive; otherwise the interrupt backstop / next drain reopens
+        # it once the orphan dies (its terminal must stay gated until then).
+        if not _orch_loop_alive():
+            _autonomous["interrupting"] = False
 
 
 @app.on_event("shutdown")
@@ -1976,17 +2107,37 @@ async def websocket_endpoint(ws: WebSocket):
                 # Pause (resumable): stop() joins ≤2 s, so run it off the loop.
                 # The persisted state stays in_progress ⇒ resumable on relaunch.
                 def _interrupt_worker():
-                    orch = _autonomous.get("orch")
-                    if orch is not None:
-                        try:
-                            orch.stop()
-                        except Exception as e:
-                            print(f"[WOR-45] orchestrator.stop (interrupt) failed: {e}")
-                    _broadcast_autonomous(
-                        _autonomous_frame({"event": "interrupted"},
-                                          _autonomous.get("st"))
-                    )
-                    _release_single_runner()
+                    # ORPHAN-LOOP RACE (WOR-45) — RAISE the gate BEFORE stop():
+                    # stop()'s 2 s join can TIME OUT mid _verify/_replan, leaving
+                    # the old loop draining to a terminal emit. While the gate is
+                    # up, that terminal is dropped (not broadcast as the outcome,
+                    # not allowed to stop/free a newer run) — see
+                    # _on_autonomous_progress.
+                    _autonomous["interrupting"] = True
+                    try:
+                        orch = _autonomous.get("orch")
+                        if orch is not None:
+                            try:
+                                orch.stop()
+                            except Exception as e:
+                                print(f"[WOR-45] orchestrator.stop (interrupt) failed: {e}")
+                        _broadcast_autonomous(
+                            _autonomous_frame({"event": "interrupted"},
+                                              _autonomous.get("st"))
+                        )
+                        _release_single_runner()
+                    finally:
+                        # ALWAYS arm the backstop that clears the gate once the
+                        # (possibly still-draining) orphan is confirmed dead — even
+                        # if stop/broadcast/release raised. Otherwise the gate could
+                        # stick True and swallow a FUTURE run's terminal (the
+                        # NO-RESUME case; a resume/start would also clear it via its
+                        # own drain). The clear is gated on the orphan being dead;
+                        # the poller is bounded so it never blocks forever.
+                        threading.Thread(
+                            target=_clear_interrupting_after_orphan_drained,
+                            daemon=True,
+                        ).start()
 
                 threading.Thread(target=_interrupt_worker, daemon=True).start()
                 continue
