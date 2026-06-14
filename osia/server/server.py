@@ -598,6 +598,23 @@ _WS_CLIENTS: set["_OutboundChannel"] = set()
 # unbounded.
 _DETACHED_TURNS: set["asyncio.Task"] = set()
 
+# WOR-62 follow-up: conv_id -> its DETACHED in-flight turn. Held in PARALLEL
+# with ``_DETACHED_TURNS`` (which only keeps a strong GC ref, keyed by nothing)
+# so a reconnecting client's ``load_conversation`` can find and AWAIT the turn
+# still finishing for that conversation BEFORE reading disk. Without this the
+# mobile woke, reloaded, and read an empty/stale history because a detached turn
+# persists the reply only at END of turn (after load_conversation had already
+# read disk). Keyed by conversation id and cleaned by the SAME done-callback as
+# the set, so it can never grow unbounded nor keep a stale entry.
+_DETACHED_BY_CONV: dict[str, "asyncio.Task"] = {}
+
+# Upper bound (seconds) a ``load_conversation`` will wait for an in-flight
+# detached turn to finish (and persist) before reading disk anyway. Best-effort:
+# on timeout the turn keeps running and its reply shows up on a later reload.
+# Bounded so a slow turn can never stall the receive loop indefinitely. Mirrors
+# the existing 30s lower bound used elsewhere in this module.
+_LOAD_CONV_AWAIT_TIMEOUT = 30.0
+
 
 # Sentinel pushed onto an _OutboundChannel to tell its writer task to stop.
 _WRITER_STOP = object()
@@ -1961,6 +1978,45 @@ async def websocket_endpoint(ws: WebSocket):
 
             if msg_type == "load_conversation":
                 conv_id = msg.get("id", "")
+                # WOR-62 follow-up (reconnect race): if a turn for THIS
+                # conversation was DETACHED when a previous connection dropped
+                # (phone slept mid-generation), it may still be finishing — and
+                # it persists the reply only at END of turn. Reading disk now
+                # would return an empty/stale history (the original bug). So
+                # AWAIT that in-flight detached turn (bounded) before reading
+                # disk: on a SUCCESSFUL turn its single persist
+                # (_persist_new_messages) runs before the coroutine returns —
+                # i.e. before the task is done — so awaiting the task guarantees
+                # the reply is on disk. (An agent error returns earlier WITHOUT
+                # persisting — pre-existing behaviour, out of scope here; we then
+                # just read disk and show no new reply, exactly as we would
+                # without this await, so the wait never makes that case worse.)
+                # ``shield`` so the timeout cancels only OUR wait, never the turn
+                # — it must run to completion to persist (the whole point of
+                # WOR-62). Per-conv and bounded: only this conversation's load
+                # waits; unrelated turns and the outbound writer are untouched.
+                # On timeout/error we read disk anyway (best-effort — the turn
+                # keeps running and its reply appears on a later reload).
+                _inflight = _DETACHED_BY_CONV.get(conv_id)
+                if _inflight is not None and not _inflight.done():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(_inflight),
+                            _LOAD_CONV_AWAIT_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        pass  # still running; read disk, reply lands on reload
+                    except asyncio.CancelledError:
+                        # The detached turn itself was cancelled -> best-effort,
+                        # read disk. But if WE (the receive loop) are being
+                        # cancelled, re-raise so teardown is never masked.
+                        if not _inflight.cancelled():
+                            raise
+                    except Exception:
+                        # Defensive catch-all: _run_turn swallows turn errors
+                        # and returns normally, so awaiting rarely raises here;
+                        # on any unexpected await error, read disk (best-effort).
+                        pass
                 conv = conversations.get_conversation(conv_id)
                 if conv is None:
                     await out.send_json({
@@ -2796,9 +2852,21 @@ async def websocket_endpoint(ws: WebSocket):
         # completion — the set stays bounded. Do NOT await them here: that would
         # block this receive-loop teardown until the agent finishes. They run
         # independently and persist on their own.
-        for _task in list(streaming_tasks.values()):
+        for _cid, _task in list(streaming_tasks.items()):
             _DETACHED_TURNS.add(_task)
-            _task.add_done_callback(_DETACHED_TURNS.discard)
+            # Also index by conversation id (WOR-62 follow-up) so a reconnecting
+            # client's load_conversation can await THIS turn before reading disk.
+            _DETACHED_BY_CONV[_cid] = _task
+
+            def _detached_done(t, _cid=_cid):
+                _DETACHED_TURNS.discard(t)
+                # Clear the index only if it still points at THIS task: a later
+                # reconnect may have detached a NEWER turn for the same
+                # conversation — never drop that newer entry.
+                if _DETACHED_BY_CONV.get(_cid) is t:
+                    _DETACHED_BY_CONV.pop(_cid, None)
+
+            _task.add_done_callback(_detached_done)
         streaming_tasks.clear()
         # Dispose this connection's reused agents (perf fix #3): close each
         # idle agent's OpenAI/httpx client so its sockets + SSL context are
