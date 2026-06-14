@@ -1483,7 +1483,6 @@ class _SettingsPanel(QWidget):
         # Guards the autostart toggle against re-entrant stateChanged while it is
         # being reverted (e.g. on an unsupported platform). See WOR-22.
         self._autostart_guard = False
-        self._drag_pos: QPoint | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 12, 14, 12)
@@ -3921,42 +3920,6 @@ class _SettingsPanel(QWidget):
                 toggle.setChecked(enabled)
         self._startup_refresh_guard = False
 
-    # ── Dragging ──────────────────────────────────────────────────────────
-    # Dragging an empty area of the settings panel moves the whole window so
-    # the panel can be repositioned anywhere on screen.
-
-    def mousePressEvent(self, event):
-        # WOR-48 audit #2 — only begin a window drag when the press is on the
-        # panel's own EMPTY chrome (no child widget under the cursor). A press a
-        # hair off a category row would otherwise be greedily swallowed as a
-        # drag-start and that first click lost, compounding the settings
-        # "freeze". childAt() is None ⟺ genuinely empty draggable background.
-        if (event.button() == Qt.MouseButton.LeftButton
-                and self.childAt(event.position().toPoint()) is None):
-            self._drag_pos = (
-                event.globalPosition().toPoint()
-                - self.window().frameGeometry().topLeft()
-            )
-            event.accept()
-            return
-        self._drag_pos = None
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if (self._drag_pos is not None
-                and event.buttons() & Qt.MouseButton.LeftButton):
-            self.window().move(
-                event.globalPosition().toPoint() - self._drag_pos
-            )
-            self.window().update()  # repaint after move so the translucent canvas can't smear
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        self._drag_pos = None
-        super().mouseReleaseEvent(event)
-
     # ── Visibility hooks ──────────────────────────────────────────────────
 
     def showEvent(self, event):
@@ -4001,7 +3964,6 @@ class _OsiaPanel(QWidget):
 
     def __init__(self):
         super().__init__()
-        self._drag_pos: QPoint | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 12, 14, 12)
@@ -4285,32 +4247,6 @@ class _OsiaPanel(QWidget):
         # language changes, and they re-translate on the next refresh() (every
         # time the OSIA tab is opened).
 
-    # ── Dragging (mirrors _SettingsPanel) ──────────────────────────────────
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = (
-                event.globalPosition().toPoint()
-                - self.window().frameGeometry().topLeft()
-            )
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if (self._drag_pos is not None
-                and event.buttons() & Qt.MouseButton.LeftButton):
-            self.window().move(
-                event.globalPosition().toPoint() - self._drag_pos
-            )
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        self._drag_pos = None
-        super().mouseReleaseEvent(event)
-
 
 class _AutonomousPanel(QWidget):
     """Autonomous-agent page (WOR-45 Phase 4) — launch and monitor a long,
@@ -4343,7 +4279,6 @@ class _AutonomousPanel(QWidget):
 
     def __init__(self):
         super().__init__()
-        self._drag_pos: QPoint | None = None
         self._running = False
         self._planning = False
 
@@ -4692,32 +4627,6 @@ class _AutonomousPanel(QWidget):
         # The live status/phase/counter text reflects the last snapshot and
         # re-renders (translated) on the next progress event.
 
-    # ── Dragging (mirrors _OsiaPanel) ───────────────────────────────────────
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = (
-                event.globalPosition().toPoint()
-                - self.window().frameGeometry().topLeft()
-            )
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if (self._drag_pos is not None
-                and event.buttons() & Qt.MouseButton.LeftButton):
-            self.window().move(
-                event.globalPosition().toPoint() - self._drag_pos
-            )
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        self._drag_pos = None
-        super().mouseReleaseEvent(event)
-
 
 # ── Bottom-nav button ────────────────────────────────────────────────────────
 
@@ -4972,9 +4881,8 @@ class MainPopup(QWidget):
         # when set, the popup opens just below the capsule's CURRENT
         # position instead of a fixed screen coordinate.
         self._anchor: QWidget | None = None
-        # Drag state — presses that no child widget consumed land on the
-        # popup itself and move the whole window.
-        self._drag_offset = None
+        # WOR-74: window dragging is delegated to the OS via startSystemMove()
+        # (see mousePressEvent) — there is no Python-side drag state to hold.
 
         # Soft shadow — WOR-48 audit #2: NO QGraphicsDropShadowEffect. An
         # installed graphics effect makes Qt render the widget into an off-screen
@@ -5299,36 +5207,40 @@ class MainPopup(QWidget):
         # Show the new selection state immediately.
         self._models.set_current(model_id)
 
-    # ── Dragging ──────────────────────────────────────────────────────────
+    # ── Dragging (WOR-74) ─────────────────────────────────────────────────
     # Buttons, inputs and list rows accept their own mouse presses, so any
     # press that reaches the popup itself is on an "empty" area — dragging
-    # there moves the whole window (same pattern as _SettingsPanel).
+    # there moves the whole window. The stacked pages have no drag handlers of
+    # their own: an empty-area press propagates up to here, so the window is
+    # dragged the same way from every page.
+    #
+    # The move is delegated to the OS/compositor via QWindow.startSystemMove()
+    # — the popup NEVER moves or repaints itself during a drag. The previous
+    # implementation moved the window by hand (self.move() + repaint) on every
+    # mouse-move; on this frameless + WA_TranslucentBackground + always-on-top
+    # window that flooded the GUI thread and ultimately crashed Qt's C++ layer
+    # (Windows fatal access violation 0xC0000005 in mouseMoveEvent), worst at
+    # the 640px Settings width. startSystemMove hands the ENTIRE drag to the OS:
+    # zero per-event move()/update() on the GUI thread → no repaint flood, no
+    # capsule expose storm, no crash. There is therefore no mouseMoveEvent /
+    # mouseReleaseEvent override and no Python-side drag state to track or clean
+    # up — the OS ends the move on button release by itself.
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             # Don't let an in-flight width tween fight the drag — settle it
-            # before capturing the grab offset.
+            # before handing the move to the OS.
             self._finish_width_anim()
-            self._drag_offset = (
-                event.globalPosition().toPoint()
-                - self.frameGeometry().topLeft()
-            )
+            # WOR-74: delegate the drag to the OS instead of moving the window
+            # by hand. Guard windowHandle(): it is None until the native window
+            # exists (the popup is always shown before it can be dragged, so in
+            # practice it is non-None here).
+            wh = self.windowHandle()
+            if wh is not None:
+                wh.startSystemMove()
             event.accept()
             return
         super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if (self._drag_offset is not None
-                and event.buttons() & Qt.MouseButton.LeftButton):
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
-            self.update()  # repaint after move so the translucent canvas can't smear
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        self._drag_offset = None
-        super().mouseReleaseEvent(event)
 
     # ── Painting ──────────────────────────────────────────────────────────
 
@@ -5357,6 +5269,13 @@ class MainPopup(QWidget):
         # (not filled) so the translucent card body is never darkened. It is drawn
         # into the backing store, which the transparent clear above wipes every
         # frame → moving/resizing leaves no ghost rectangles.
+        #
+        # WOR-74: the window is dragged via the OS (startSystemMove), which moves
+        # the existing backing store — paintEvent no longer fires per mouse-move
+        # during a drag, so there is no repaint flood to optimise against and the
+        # 9-ring shadow is ALWAYS painted (the old drag-time shadow-skip branch is
+        # gone). The transparent clear at the top of this method still wipes the
+        # entire widget rect each frame, so there is no ghost/smear concern.
         painter.setBrush(Qt.BrushStyle.NoBrush)
         for i in range(SHADOW_LAYERS, 0, -1):
             frac = (i - 1) / (SHADOW_LAYERS - 1)   # 0 = innermost/darkest, 1 = outer

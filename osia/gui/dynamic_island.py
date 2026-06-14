@@ -26,7 +26,7 @@ import sys
 
 from PyQt6.QtCore import (
     Qt, QTimer, QRect, QRectF, QPointF, pyqtSignal, QPropertyAnimation,
-    QEasingCurve, QVariantAnimation,
+    QEasingCurve, QVariantAnimation, QAbstractAnimation,
 )
 from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont, QPen, QPixmap
 from PyQt6.QtWidgets import QApplication, QWidget
@@ -360,9 +360,36 @@ class DynamicIsland(QWidget):
         if self._phase > 2 * math.pi:
             self._phase -= 2 * math.pi
         self._anim_ms += self._timer.interval()
-        # No need to repaint idle very often, but at 30 FPS the cost is
-        # negligible and we avoid having to stop/start the timer.
-        self.update()
+        # WOR-74: a steady-idle capsule renders a pixel-identical frame every
+        # tick — the idle paints (_paint_idle / _paint_circle_idle /
+        # _paint_docked_ear) depend only on _launch_t and geometry, never on
+        # _phase/_anim_ms — so repainting it at 30 FPS just piles avoidable load
+        # onto the shared GUI thread (the saturation that froze the 640px popup
+        # drag). Skip ONLY the steady-idle repaint:
+        #   • the active states (listening/thinking/speaking) animate here;
+        #   • launch / morph (dock slide) drive their own repaints via
+        #     _on_launch_value / _on_morph_value, but gate on them being live
+        #     too so a tick never drops a real animation frame;
+        #   • keep repainting while the capsule itself is being dragged so its
+        #     drag stays as smooth as before this change (its mouseMoveEvent
+        #     move()s without repainting, relying on this tick);
+        #   • repaint once when the display's device-pixel ratio changes IN PLACE
+        #     (a DPI/scale change or monitor hot-plug with no move/launch/morph):
+        #     only paintEvent rebuilds the DPR-scaled logo (_ensure_logo_dpr), so
+        #     without this the idle logo would render at the stale DPR until the
+        #     next interaction. The clause is gated on a logo actually existing —
+        #     with a null logo there is nothing DPR-dependent to rebuild (the rest
+        #     is vector and auto-scales), and _ensure_logo_dpr would never sync
+        #     self._dpr, so an ungated check would repaint every tick forever.
+        #     With a logo, the repaint runs _ensure_logo_dpr → self._dpr matches
+        #     again → the clause falls quiet (exactly one repaint per DPR change).
+        if (self._state != "idle"
+                or self._dragging
+                or self._launch_anim.state() == QAbstractAnimation.State.Running
+                or self._morph_anim.state() == QAbstractAnimation.State.Running
+                or (not self._logo_src.isNull()
+                    and self.devicePixelRatioF() != self._dpr)):
+            self.update()
 
     def _on_launch_value(self, value) -> None:
         self._launch_t = float(value)
