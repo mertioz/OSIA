@@ -615,6 +615,19 @@ _DETACHED_BY_CONV: dict[str, "asyncio.Task"] = {}
 # the existing 30s lower bound used elsewhere in this module.
 _LOAD_CONV_AWAIT_TIMEOUT = 30.0
 
+# WOR-62 regression fix (restores WOR-53 concurrency): background
+# ``load_conversation`` tasks. When a reconnect's load_conversation finds a LIVE
+# detached turn for that conversation, the reply isn't on disk yet (a detached
+# turn persists only at END of turn), so we must wait for it — but NEVER inline
+# on the serial receive loop. Awaiting there parks the loop, so a SUBSEQUENT
+# load_conversation (e.g. switching to another chat) sits UNREAD in the socket
+# buffer until the first turn finishes (the WOR-53 break). Instead the wait +
+# disk read + history send run in a background task held here by a STRONG
+# reference (asyncio only weakly tracks tasks, so without this it could be GC'd
+# mid-flight). Each task removes itself via a done-callback, so the set stays
+# bounded — same pattern as ``_DETACHED_TURNS`` / ``_detached_done``.
+_DEFERRED_LOADS: set["asyncio.Task"] = set()
+
 
 # Sentinel pushed onto an _OutboundChannel to tell its writer task to stop.
 _WRITER_STOP = object()
@@ -1768,6 +1781,65 @@ async def websocket_endpoint(ws: WebSocket):
 
         task.add_done_callback(_clear)
 
+    async def _deferred_load_history(conv_id, inflight):
+        """Finish a ``load_conversation`` that hit a LIVE DETACHED turn — OFF the
+        receive loop (WOR-62 recovery WITHOUT the WOR-53 regression).
+
+        ``inflight`` is the detached turn still finishing for ``conv_id``; it
+        persists its reply only at END of turn, so disk is stale until it
+        completes. We therefore wait for it before reading disk. Doing that wait
+        inline on the receive loop parked the loop and blocked every later frame
+        (the WOR-53 break); doing it HERE keeps the loop free. ``shield`` so our
+        bounded wait's timeout cancels only the wait, never the turn — the turn
+        must run to completion to persist (the whole point of WOR-62).
+        """
+        nonlocal session_history, active_conv_id
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(inflight),
+                _LOAD_CONV_AWAIT_TIMEOUT,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            # Best-effort: on timeout the turn keeps running and its reply shows
+            # on a later reload; on a turn-cancel or any unexpected await error we
+            # read disk anyway. Swallowing CancelledError is safe HERE (unlike the
+            # old inline version) because this is a standalone task — never the
+            # receive loop — so it can't mask connection teardown.
+            pass
+        try:
+            conv = conversations.get_conversation(conv_id)
+            if conv is None:
+                # Deleted during recovery (e.g. delete_conversation arrived while
+                # we awaited): nothing to show and the user has moved on —
+                # best-effort, emit no frame.
+                return
+            messages = list(conv.get("messages") or [])
+            # Adopt this history as the live in-memory session ONLY if the user is
+            # STILL viewing conv_id (mirrors _run_turn's active_conv_id guard).
+            # If they switched to another conversation while we awaited, its
+            # session_history must NOT be clobbered by this background completion.
+            # (active_conv_id is already == conv_id inside this guard, so only
+            # session_history needs refreshing — exactly like _run_turn.)
+            if active_conv_id == conv_id:
+                session_history = list(messages)
+            # ALWAYS send the history frame regardless of the guard: it carries
+            # ``conversation_id`` so the client routes it to conv_id's tab even
+            # while viewing another conversation (WOR-53 per-conv routing). Send
+            # the disk ``messages`` (not session_history, which may now be
+            # another conversation's).
+            await out.send_json({
+                "type": "conversation_history",
+                "id": conv_id,
+                "conversation_id": conv_id,
+                "title": conv.get("title"),
+                "messages": _displayable_history(messages),
+            })
+        except Exception:
+            # Best-effort background recovery: never surface an error here as an
+            # unretrieved-task warning. The turn already persisted; a later
+            # reload re-sends the history.
+            pass
+
     first_message_logged = False
     try:
         async for raw_msg in ws.iter_text():
@@ -1978,45 +2050,53 @@ async def websocket_endpoint(ws: WebSocket):
 
             if msg_type == "load_conversation":
                 conv_id = msg.get("id", "")
-                # WOR-62 follow-up (reconnect race): if a turn for THIS
-                # conversation was DETACHED when a previous connection dropped
-                # (phone slept mid-generation), it may still be finishing — and
-                # it persists the reply only at END of turn. Reading disk now
-                # would return an empty/stale history (the original bug). So
-                # AWAIT that in-flight detached turn (bounded) before reading
-                # disk: on a SUCCESSFUL turn its single persist
-                # (_persist_new_messages) runs before the coroutine returns —
-                # i.e. before the task is done — so awaiting the task guarantees
-                # the reply is on disk. (An agent error returns earlier WITHOUT
-                # persisting — pre-existing behaviour, out of scope here; we then
-                # just read disk and show no new reply, exactly as we would
-                # without this await, so the wait never makes that case worse.)
-                # ``shield`` so the timeout cancels only OUR wait, never the turn
-                # — it must run to completion to persist (the whole point of
-                # WOR-62). Per-conv and bounded: only this conversation's load
-                # waits; unrelated turns and the outbound writer are untouched.
-                # On timeout/error we read disk anyway (best-effort — the turn
-                # keeps running and its reply appears on a later reload).
+                # WOR-62 / WOR-53 (reconnect race, WITHOUT parking the receive
+                # loop): if a turn for THIS conversation was DETACHED when a
+                # previous connection dropped (phone slept mid-generation), it may
+                # still be finishing — and it persists the reply only at END of
+                # turn. Reading disk now would return an empty/stale history (the
+                # original WOR-62 bug). So we must WAIT for that in-flight detached
+                # turn (bounded) before reading disk — but the wait must NOT run on
+                # this serial receive loop. Awaiting it inline here (the original
+                # WOR-62 follow-up) parked the loop: every later frame — e.g. a
+                # switch to ANOTHER conversation — sat UNREAD in the socket buffer
+                # until the turn finished, breaking WOR-53 concurrency. So we
+                # DEFER: switch the view now (a cheap local assignment) and hand
+                # the await + disk-read + history-send to a background task, then
+                # fall through to RETURN so the loop reads the next frame at once.
+                #
+                # The common case — no LIVE detached turn for this conv, i.e. ALL
+                # normal switches (WOR-53) — skips this branch and uses the
+                # UNCHANGED synchronous fast path below: no task, no await,
+                # byte-for-byte the pre-WOR-62 inline read.
                 _inflight = _DETACHED_BY_CONV.get(conv_id)
                 if _inflight is not None and not _inflight.done():
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.shield(_inflight),
-                            _LOAD_CONV_AWAIT_TIMEOUT,
-                        )
-                    except asyncio.TimeoutError:
-                        pass  # still running; read disk, reply lands on reload
-                    except asyncio.CancelledError:
-                        # The detached turn itself was cancelled -> best-effort,
-                        # read disk. But if WE (the receive loop) are being
-                        # cancelled, re-raise so teardown is never masked.
-                        if not _inflight.cancelled():
-                            raise
-                    except Exception:
-                        # Defensive catch-all: _run_turn swallows turn errors
-                        # and returns normally, so awaiting rarely raises here;
-                        # on any unexpected await error, read disk (best-effort).
-                        pass
+                    # Re-point the VIEW to conv_id now so a follow-up turn the user
+                    # types during recovery targets this conversation (not a
+                    # freshly-created one via _ensure_active_conv). Also seed
+                    # ``session_history`` synchronously from disk — a cheap sync
+                    # file read, exactly what the fast path below does — so a
+                    # follow-up turn typed during the (bounded) recovery window
+                    # snapshots the PRIOR on-disk context instead of an empty
+                    # list. The in-flight reply isn't persisted yet, so the
+                    # deferred task REFRESHES session_history (and sends the
+                    # user-facing history frame) once the detached turn finishes;
+                    # this seed is internal state only and is NEVER sent, so the
+                    # WOR-62 "show empty/stale history on wake" bug is not
+                    # reintroduced. We do NOT await the turn here — awaiting it on
+                    # this serial loop is exactly what broke WOR-53.
+                    active_conv_id = conv_id
+                    _seed = conversations.get_conversation(conv_id)
+                    session_history = list(_seed.get("messages") or []) if _seed else []
+                    _dload = asyncio.create_task(
+                        _deferred_load_history(conv_id, _inflight)
+                    )
+                    # Strong ref so the loop's weak task-tracking can't GC it
+                    # mid-flight; the done-callback keeps the set bounded (same
+                    # pattern as _DETACHED_TURNS / _detached_done).
+                    _DEFERRED_LOADS.add(_dload)
+                    _dload.add_done_callback(_DEFERRED_LOADS.discard)
+                    continue
                 conv = conversations.get_conversation(conv_id)
                 if conv is None:
                     await out.send_json({
