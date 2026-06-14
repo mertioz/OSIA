@@ -4731,7 +4731,7 @@ class _NavButton(QPushButton):
     * ``models``     — a four-point sparkle/star (Models)
     * ``settings``   — a gear (Settings)
     * ``osia``       — a person/identity silhouette (OSIA personality + skills)
-    * ``autonomous`` — a small robot head (Autonomous agent)
+    * ``autonomous`` — an infinity symbol / lemniscate (Autonomous agent)
 
     The active tab gets a rounded violet pill behind the icon and the icon
     itself switches to the violet accent; hover shows a softer violet wash.
@@ -4801,7 +4801,7 @@ class _NavButton(QPushButton):
         elif self._kind == "osia":
             self._paint_person(p, cx, cy, s, color)
         elif self._kind == "autonomous":
-            self._paint_robot(p, cx, cy, s, color)
+            self._paint_infinity(p, cx, cy, s, color)
         p.end()
 
     # ── Icon glyphs ───────────────────────────────────────────────────────
@@ -4887,30 +4887,25 @@ class _NavButton(QPushButton):
         path.closeSubpath()           # flat bottom
         p.drawPath(path)
 
-    def _paint_robot(self, p, cx, cy, s, color) -> None:
-        """A small robot head — a rounded-square face with two punched-out eyes
-        and a short top antenna — marking the Autonomous-agent section."""
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(color)
-        # Antenna — a thin stalk topped by a small bulb, above the head.
-        bulb_cy = cy - s * 0.44
-        stalk_w = s * 0.06
-        p.drawRect(QRectF(cx - stalk_w / 2, bulb_cy, stalk_w, s * 0.16))
-        p.drawEllipse(QPointF(cx, bulb_cy), s * 0.075, s * 0.075)
-        # Head — a rounded square face, slightly below centre to clear the antenna.
-        head_w = s * 0.72
-        head_h = s * 0.58
-        head_cy = cy + s * 0.10
-        head = QRectF(cx - head_w / 2, head_cy - head_h / 2, head_w, head_h)
-        face = QPainterPath()
-        face.addRoundedRect(head, s * 0.14, s * 0.14)
-        # Eyes — punched out (like the gear's hub) so they read on any backdrop.
-        eye_r = s * 0.085
-        eye_dx = head_w * 0.24
-        eyes = QPainterPath()
-        eyes.addEllipse(QPointF(cx - eye_dx, head_cy), eye_r, eye_r)
-        eyes.addEllipse(QPointF(cx + eye_dx, head_cy), eye_r, eye_r)
-        p.drawPath(face.subtracted(eyes))
+    def _paint_infinity(self, p, cx, cy, s, color) -> None:
+        """A lemniscate (∞) — two small loops meeting at a central crossing,
+        traced as one continuous stroke. Marks the Autonomous-agent section
+        and mirrors the infinity glyph now used by the mobile app."""
+        ox = s * 0.42      # half-width: centre → outer edge of each loop
+        oy = s * 0.28      # vertical control reach (true height ≈ 1.5·oy)
+        ix = s * 0.20      # inner control reach — sets loop fullness & crossing
+        path = QPainterPath()
+        path.moveTo(cx, cy)
+        # Right loop: over the top out to the far-right point, back under to centre.
+        path.cubicTo(cx + ix, cy - oy, cx + ox, cy - oy, cx + ox, cy)
+        path.cubicTo(cx + ox, cy + oy, cx + ix, cy + oy, cx, cy)
+        # Left loop: continues smoothly through the crossing, mirrored on x.
+        path.cubicTo(cx - ix, cy - oy, cx - ox, cy - oy, cx - ox, cy)
+        path.cubicTo(cx - ox, cy + oy, cx - ix, cy + oy, cx, cy)
+        # Stroked like the speech-bubble glyph: same pen width, no fill.
+        p.setPen(QPen(color, 2.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
 
 
 # ── MainPopup ───────────────────────────────────────────────────────────────
