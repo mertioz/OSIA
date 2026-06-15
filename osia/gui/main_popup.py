@@ -493,6 +493,7 @@ class _ConvRow(QFrame):
     """One row in the conversations list."""
 
     open_clicked = pyqtSignal(str)
+    rename_clicked = pyqtSignal(str, str)   # (conv_id, new_title)
     delete_clicked = pyqtSignal(str)
 
     def __init__(self, conv: dict, is_active: bool = False):
@@ -531,6 +532,13 @@ class _ConvRow(QFrame):
         open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         open_btn.clicked.connect(lambda: self.open_clicked.emit(self._conv_id))
 
+        rename_btn = QPushButton("✎")
+        rename_btn.setObjectName("convRename")
+        rename_btn.setFixedSize(26, 26)
+        rename_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        rename_btn.setToolTip(i18n.t("conversations.rename"))
+        rename_btn.clicked.connect(self._prompt_rename)
+
         del_btn = QPushButton("✕")
         del_btn.setObjectName("convDel")
         del_btn.setFixedSize(26, 26)
@@ -539,7 +547,25 @@ class _ConvRow(QFrame):
 
         row.addLayout(title_col, 1)
         row.addWidget(open_btn)
+        row.addWidget(rename_btn)
         row.addWidget(del_btn)
+
+    def _prompt_rename(self) -> None:
+        # Prompt for a new title, pre-filled with the current one. Emit only on
+        # accept with a non-empty trimmed value; the store layer trims + caps
+        # again, so this is just an early UX guard against blank renames.
+        new_title, ok = QInputDialog.getText(
+            self,
+            i18n.t("conversations.rename_title"),
+            i18n.t("conversations.rename_prompt"),
+            text=self._full_title,
+        )
+        if not ok:
+            return
+        new_title = new_title.strip()
+        if not new_title:
+            return
+        self.rename_clicked.emit(self._conv_id, new_title)
 
     def resizeEvent(self, event):
         fm = self._title_label.fontMetrics()
@@ -557,6 +583,7 @@ class _ConversationsPanel(QWidget):
 
     new_conversation = pyqtSignal()
     open_conversation = pyqtSignal(str)
+    rename_conversation = pyqtSignal(str, str)
     delete_conversation = pyqtSignal(str)
 
     def __init__(self):
@@ -639,6 +666,7 @@ class _ConversationsPanel(QWidget):
         for i, conv in enumerate(items):
             row = _ConvRow(conv, is_active=(conv.get("id") == self._active_id))
             row.open_clicked.connect(self.open_conversation.emit)
+            row.rename_clicked.connect(self.rename_conversation.emit)
             row.delete_clicked.connect(self.delete_conversation.emit)
             self._host_layout.insertWidget(i, row)
 
@@ -4826,6 +4854,7 @@ class MainPopup(QWidget):
     pick_file = pyqtSignal(str)
     new_conversation = pyqtSignal()
     open_conversation = pyqtSignal(str)
+    rename_conversation = pyqtSignal(str, str)
     delete_conversation = pyqtSignal(str)
     model_changed = pyqtSignal(str)
     api_keys_saved = pyqtSignal(dict)
@@ -4945,6 +4974,7 @@ class MainPopup(QWidget):
         self._convs = _ConversationsPanel()
         self._convs.new_conversation.connect(self._on_new_conv)
         self._convs.open_conversation.connect(self._on_open_conv)
+        self._convs.rename_conversation.connect(self.rename_conversation.emit)
         self._convs.delete_conversation.connect(self.delete_conversation.emit)
 
         self._models = _ModelPanel()

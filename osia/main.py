@@ -690,6 +690,16 @@ def wake_mode():
                 pass
         popup.refresh_conversations(active_conv["id"] if active_conv else None)
 
+    def handle_rename_conversation(conv_id: str, title: str):
+        # WOR-76: PC rename. Persist to disk (trim + non-empty + TITLE_MAX_LEN
+        # cap + manual_title flag all enforced in the store) then refresh the PC
+        # panel in-process — exactly like PC delete. The store re-reads from disk
+        # on the next add_message, so active_conv's stale in-memory title is
+        # harmless (only its id is ever consumed).
+        ok = conversations.rename_conversation(conv_id, title)
+        print(f"✏️  Renamed conversation {conv_id}: {'ok' if ok else 'rejected'}")
+        popup.refresh_conversations(active_conv["id"] if active_conv else None)
+
     # ── Model + settings wiring ─────────────────────────────────────────
 
     def handle_model_change(model: str):
@@ -733,6 +743,7 @@ def wake_mode():
     popup.pick_file.connect(handle_pick_file)
     popup.new_conversation.connect(handle_new_conversation)
     popup.open_conversation.connect(handle_open_conversation)
+    popup.rename_conversation.connect(handle_rename_conversation)
     popup.delete_conversation.connect(handle_delete_conversation)
     popup.model_changed.connect(handle_model_change)
     popup.api_keys_saved.connect(handle_keys_saved)

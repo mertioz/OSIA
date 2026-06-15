@@ -253,6 +253,7 @@ def add_message(conv_id: str, role: str, content: str) -> dict | None:
         })
         conv["updated_at"] = _now_iso()
         if (conv.get("title") in (None, "", DEFAULT_TITLE)
+                and not conv.get("manual_title")
                 and role == "user"
                 and not _is_tool_envelope(content)):
             conv["title"] = _make_title(content)
@@ -275,3 +276,30 @@ def delete_conversation(conv_id: str) -> bool:
             return True
         except OSError:
             return False
+
+
+def rename_conversation(conv_id: str, title: str) -> bool:
+    """Rename a conversation to a user-chosen title (WOR-76).
+
+    The title is trimmed and capped at ``TITLE_MAX_LEN``. Sets the
+    ``manual_title`` flag so the auto-titler in ``add_message`` never
+    overwrites a manual rename later. Atomic write under ``_lock``,
+    mirroring ``delete_conversation``'s shape.
+
+    Returns True on success; False if the conversation doesn't exist or
+    the title is empty/whitespace after trimming.
+    """
+    if not conv_id or not isinstance(title, str):
+        return False
+    with _lock:
+        conv = get_conversation(conv_id)
+        if conv is None:
+            return False
+        title = title.strip()[:TITLE_MAX_LEN]
+        if not title:
+            return False
+        conv["title"] = title
+        conv["manual_title"] = True
+        conv["updated_at"] = _now_iso()
+        _write_atomic(_path_for(conv_id), conv)
+        return True

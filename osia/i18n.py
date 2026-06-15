@@ -1253,6 +1253,30 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Öffnen",
         "es": "Abrir",
     },
+    "conversations.rename": {
+        "en": "Rename",
+        "fr": "Renommer",
+        "zh": "重命名",
+        "ja": "名前を変更",
+        "de": "Umbenennen",
+        "es": "Renombrar",
+    },
+    "conversations.rename_title": {
+        "en": "Rename conversation",
+        "fr": "Renommer la conversation",
+        "zh": "重命名对话",
+        "ja": "会話の名前を変更",
+        "de": "Unterhaltung umbenennen",
+        "es": "Renombrar conversación",
+    },
+    "conversations.rename_prompt": {
+        "en": "New name:",
+        "fr": "Nouveau nom :",
+        "zh": "新名称：",
+        "ja": "新しい名前：",
+        "de": "Neuer Name:",
+        "es": "Nuevo nombre:",
+    },
     # — Model panel (two-level picker) —
     "models.title": {
         "en": "Models",

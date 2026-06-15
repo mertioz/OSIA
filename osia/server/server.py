@@ -13,6 +13,7 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "new_conversation"}
     {"type": "new_chat"}                                               # "Nouveau chat" voice command relayed from mobile; resets server state like new_conversation, then broadcasts new_chat to other devices (WOR-10)
     {"type": "delete_conversation",  "id": "..."}
+    {"type": "rename_conversation",  "id": "...", "title": "..."}       # WOR-76: rename a conversation; acks {conversation_renamed, success}, then sends the refreshed list to the caller and broadcasts it to other devices
     {"type": "get_models"}
     {"type": "set_model",            "model": "..."}
     {"type": "file",                 "filename": "...", "data": "<base64>"}
@@ -703,6 +704,26 @@ async def _broadcast_new_chat(exclude: "_OutboundChannel | None" = None) -> None
             continue
         try:
             await client.send_json({"type": "new_chat"})
+        except Exception:
+            _WS_CLIENTS.discard(client)
+
+
+async def _broadcast_conversations(exclude: "_OutboundChannel | None" = None) -> None:
+    """Best-effort fan-out of the refreshed conversation LIST to every connected
+    client (WOR-76). Used after a rename so all devices' sidebars update.
+
+    Like ``_broadcast_new_chat``, each frame is enqueued onto the connection's
+    outbound channel — the real send is performed by that connection's own
+    writer task (never from here). Unlike ``new_chat``, this carries the
+    ``conversations`` list and does NOT clear the chat view; it only refreshes
+    the sidebar.
+    """
+    items = conversations.list_conversations()
+    for client in list(_WS_CLIENTS):
+        if client is exclude:
+            continue
+        try:
+            await client.send_json({"type": "conversations", "items": items})
         except Exception:
             _WS_CLIENTS.discard(client)
 
@@ -2149,6 +2170,30 @@ async def websocket_endpoint(ws: WebSocket):
                     "id": conv_id,
                     "success": ok,
                 })
+                continue
+
+            if msg_type == "rename_conversation":
+                # WOR-76: rename a conversation. Validation (trim / non-empty /
+                # TITLE_MAX_LEN cap / manual_title flag / atomic write) lives in
+                # conversations.rename_conversation, so an empty title simply
+                # acks success:false and never crashes the loop.
+                conv_id = msg.get("id", "")
+                new_title = msg.get("title", "")
+                ok = conversations.rename_conversation(conv_id, new_title)
+                await out.send_json({
+                    "type": "conversation_renamed",
+                    "id": conv_id,
+                    "success": ok,
+                })
+                # Refresh the caller's sidebar, then fan the updated list out to
+                # every OTHER connected device (NOT new_chat — that would wrongly
+                # clear the chat view). All sends go through the outbound channel,
+                # honouring the single-writer rule.
+                await out.send_json({
+                    "type": "conversations",
+                    "items": conversations.list_conversations(),
+                })
+                await _broadcast_conversations(exclude=out)
                 continue
 
             # --- Models ---
