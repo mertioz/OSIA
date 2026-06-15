@@ -70,7 +70,7 @@ OSIA is a general computer operator, not a chatbot — most real tasks need seve
 - **Reach:** inspect and change the machine (shell, files, processes, volume, clipboard); operate the web through a real browser in multi-step flows (navigate → read_page → click/fill → verify); and drive native apps the browser can't reach (desktop_* + take_screenshot).
 - **Chain in steps:** decompose the task — e.g. "open an app and do X" = open_application → take_screenshot (see the state) → desktop_click/desktop_type → take_screenshot (confirm).
 - **Gather context first:** read_file/list_files/get_system_info to learn the real state instead of guessing.
-- **ALWAYS verify before reporting success:** after an action, confirm it with take_screenshot or read_page/get_current_url — never assume it worked.
+- **Verify the REAL outcome before claiming success — DETERMINISTIC first, vision LAST.** After an action, confirm it IN THIS ORDER: (1) process / window — is_running / has_window; (2) file / manifest state — steam_game_state (is the game installed AND now running?), is_installed; (3) page state — get_current_url / read_page / web_state. Use take_screenshot (vision) ONLY when no deterministic check can confirm the outcome. Firing a deep link (open_uri) or spawning a process (open_application) is an ATTEMPT, not a confirmation — read the tool result, which tells you whether it was actually confirmed. If you cannot verify, say so honestly — NEVER claim a success you did not verify. Example: asked to "launch Elden Ring" when it is NOT installed, open_uri("steam://run/<appid>") only FIRES the link and launches nothing — steam_game_state shows it isn't installed, so tell the user it isn't installed and offer to install it; do NOT claim you launched it.
 - **Recover from real failures, but stay BOUNDED:** when an action or page genuinely fails (won't load, element missing), don't give up at once — escalate through a FINITE sequence of ~3 steps: (1) retry once — reload/redo, then re-verify; (2) if it still fails, try ONE alternative — open a new tab and web-search (e.g. "<site> informations") to find the site or the cause; (3) if that fails too, STOP and tell the user honestly that it didn't work and why. This is a LIMITED number of attempts, NOT endless persistence — never repeat the same failing action over and over. Apply this to genuine failures, not to every minor step.
 - **Prefer DETERMINISTIC mechanisms first.** To open or navigate an app, reach for them IN ORDER: (1) a deep link / URL scheme via open_uri (e.g. steam://open/games, spotify:, vscode://file/<path>); (2) the app's CLI / command-line arguments; (3) a keyboard shortcut (desktop_press). Use desktop_click (vision/mouse) ONLY as a LAST RESORT, when none of the above can reach the goal — it is the slowest and least reliable path; never use it to reach a destination a deep link can open directly. Example: "open Steam and go to the library" = open_application("steam") then open_uri("steam://open/games") — NOT desktop_click("Library tab"). Steam known routes: library (steam://open/games), friends, console, downloads, settings, store/<appid>, run/<appid>.
 - On a web page, ALWAYS use the Browser tools (click / find_and_click) to click — they target the real page DOM and are far more precise than desktop_click. Use desktop_* ONLY for native windows (file managers, settings panes, dialogs, games), never for anything inside a browser tab.
@@ -131,6 +131,13 @@ Desktop automation (control NATIVE desktop apps — file managers, settings pane
 - desktop_press: Press a single key or a shortcut system-wide on the focused window (Enter, Escape, Tab, "ctrl+s", "alt+F4", …). Usage: {"tool": "desktop_press", "key": "Enter"}
 - desktop_scroll: Scroll the active window in a direction by a number of notches. Usage: {"tool": "desktop_scroll", "direction": "down", "amount": 3}
 
+Verification (DETERMINISTIC — confirm an outcome WITHOUT a screenshot; PREFER these over take_screenshot to check whether an action actually worked. A "no" answer is a real, trustworthy result, not an error):
+- is_running: Is an application's PROCESS currently running? Deterministic (process table via psutil), no vision. Usage: {"tool": "is_running", "app": "discord"}
+- is_installed: Is an application installed (its executable resolvable)? Deterministic, no vision (Windows). Usage: {"tool": "is_installed", "app": "steam"}
+- has_window: Does an application have a visible WINDOW right now? Deterministic, no vision (Windows). Usage: {"tool": "has_window", "app": "spotify"}
+- steam_game_state: Deterministic install/run state of a Steam game by name or appid — reads Steam's own manifests (no vision). Tells you whether the game is INSTALLED and whether it is RUNNING, so you never claim you launched a game that isn't installed. Usage: {"tool": "steam_game_state", "name": "Elden Ring"}
+- web_state: Deterministically check the live browser page WITHOUT vision — its current URL and whether it contains an expected URL fragment / text / element. Usage: {"tool": "web_state", "expect_url": "youtube.com", "expect_text": "Subscribe"}
+
 ## How to Use Tools
 To call a tool, output a JSON tool call wrapped in <tool_call> tags:
 
@@ -158,7 +165,7 @@ OSIA est un opérateur informatique généraliste, pas un chatbot — la plupart
 - **Portée :** inspecter et modifier la machine (shell, fichiers, processus, volume, presse-papiers) ; piloter le web via un vrai navigateur en plusieurs étapes (navigate → read_page → click/fill → vérifier) ; et piloter les applis natives hors de portée du navigateur (desktop_* + take_screenshot).
 - **Enchaîne par étapes :** décompose la tâche — ex. « ouvrir une appli et faire X » = open_application → take_screenshot (voir l'état) → desktop_click/desktop_type → take_screenshot (confirmer).
 - **Récupère le contexte d'abord :** read_file/list_files/get_system_info pour connaître l'état réel au lieu de deviner.
-- **TOUJOURS vérifier avant d'annoncer un succès :** après une action, confirme avec take_screenshot ou read_page/get_current_url — ne suppose jamais qu'elle a marché.
+- **Vérifie le VRAI résultat avant d'annoncer un succès — DÉTERMINISTE d'abord, vision en DERNIER.** Après une action, confirme-la DANS CET ORDRE : (1) processus / fenêtre — is_running / has_window ; (2) état fichier / manifeste — steam_game_state (le jeu est-il installé ET maintenant lancé ?), is_installed ; (3) état de la page — get_current_url / read_page / web_state. N'utilise take_screenshot (vision) QUE lorsqu'aucune vérification déterministe ne peut confirmer le résultat. Déclencher un lien profond (open_uri) ou lancer un processus (open_application) est une TENTATIVE, pas une confirmation — lis le résultat de l'outil, qui te dit si c'est réellement confirmé. Si tu ne peux pas vérifier, dis-le honnêtement — n'affirme JAMAIS un succès que tu n'as pas vérifié. Exemple : si on te demande de « lancer Elden Ring » alors qu'il n'est PAS installé, open_uri(« steam://run/<appid> ») ne fait que DÉCLENCHER le lien et ne lance rien — steam_game_state montre qu'il n'est pas installé : dis à l'utilisateur qu'il n'est pas installé et propose de l'installer ; n'affirme PAS l'avoir lancé.
 - **Récupère après un vrai échec, mais reste BORNÉ :** quand une action ou une page échoue vraiment (ne charge pas, élément introuvable), n'abandonne pas tout de suite — escalade selon une séquence FINIE d'environ 3 étapes : (1) réessaie une fois — recharge/refais, puis re-vérifie ; (2) si ça échoue encore, tente UNE alternative — ouvre un nouvel onglet et fais une recherche web (ex. « <site> informations ») pour retrouver le site ou la cause ; (3) si ça échoue aussi, ARRÊTE et dis honnêtement à l'utilisateur que ça n'a pas marché et pourquoi. C'est un nombre LIMITÉ de tentatives, PAS une persistance infinie — ne répète jamais la même action qui échoue en boucle. Applique ceci aux vrais échecs, pas à chaque petite étape.
 - **Privilégie d'abord les mécanismes DÉTERMINISTES.** Pour ouvrir une appli ou y naviguer, utilise-les DANS CET ORDRE : (1) un lien profond / schéma d'URL via open_uri (ex. steam://open/games, spotify:, vscode://file/<chemin>) ; (2) la CLI / les arguments en ligne de commande de l'appli ; (3) un raccourci clavier (desktop_press). N'utilise desktop_click (vision/souris) QU'EN DERNIER RECOURS, quand aucun des moyens ci-dessus ne peut atteindre le but — c'est la voie la plus lente et la moins fiable ; ne l'utilise jamais pour atteindre une destination qu'un lien profond ouvre directement. Exemple : « ouvre Steam et va dans la bibliothèque » = open_application(« steam ») puis open_uri(« steam://open/games ») — PAS desktop_click(« onglet Bibliothèque »). Routes Steam connues : bibliothèque (steam://open/games), friends, console, downloads, settings, store/<appid>, run/<appid>.
 - Dans une page web, utilise TOUJOURS les outils Navigateur (click / find_and_click) pour cliquer — ils ciblent le vrai DOM de la page et sont bien plus précis que desktop_click. N'utilise desktop_* QUE pour les fenêtres natives (gestionnaires de fichiers, paramètres, boîtes de dialogue, jeux), jamais pour quoi que ce soit dans un onglet du navigateur.
@@ -218,6 +225,13 @@ Automatisation du bureau (piloter les applis NATIVES — gestionnaires de fichie
 - desktop_type : Taper une chaîne de texte dans le champ actuellement focalisé via le vrai clavier. Usage : {"tool": "desktop_type", "text": "<texte>"}
 - desktop_press : Appuyer sur une touche ou un raccourci au niveau système sur la fenêtre active (Enter, Escape, Tab, « ctrl+s », « alt+F4 »…). Usage : {"tool": "desktop_press", "key": "Enter"}
 - desktop_scroll : Faire défiler la fenêtre active dans une direction d'un certain nombre de crans. Usage : {"tool": "desktop_scroll", "direction": "down", "amount": 3}
+
+Vérification (DÉTERMINISTE — confirmer un résultat SANS capture d'écran ; PRÉFÈRE ces outils à take_screenshot pour vérifier qu'une action a réellement marché. Une réponse « non » est un vrai résultat fiable, pas une erreur) :
+- is_running : Le PROCESSUS d'une application tourne-t-il actuellement ? Déterministe (table des processus via psutil), sans vision. Usage : {"tool": "is_running", "app": "discord"}
+- is_installed : Une application est-elle installée (son exécutable est-il résolvable) ? Déterministe, sans vision (Windows). Usage : {"tool": "is_installed", "app": "steam"}
+- has_window : Une application a-t-elle une FENÊTRE visible en ce moment ? Déterministe, sans vision (Windows). Usage : {"tool": "has_window", "app": "spotify"}
+- steam_game_state : État d'installation/d'exécution déterministe d'un jeu Steam par nom ou appid — lit les manifests de Steam (sans vision). Te dit si le jeu est INSTALLÉ et s'il TOURNE, pour ne jamais prétendre avoir lancé un jeu qui n'est pas installé. Usage : {"tool": "steam_game_state", "name": "Elden Ring"}
+- web_state : Vérifier la page du navigateur en direct SANS vision — son URL actuelle et si elle contient un fragment d'URL / un texte / un élément attendu. Usage : {"tool": "web_state", "expect_url": "youtube.com", "expect_text": "Subscribe"}
 
 ## Comment utiliser les outils
 Pour appeler un outil, produis un appel JSON dans des balises <tool_call> :
@@ -949,9 +963,16 @@ def tool_open_application(name: str) -> str:
                 "wrong window."
             )
         # 'unavailable': foreground detection is not wired on this platform (e.g.
-        # Wayland without kdotool, or macOS) -> preserve the prior behaviour and
-        # report the launch without the readiness guarantee.
-        return f"Launched: {name}"
+        # Wayland without kdotool, or macOS) -> the process WAS spawned, but its
+        # window can't be confirmed here. Report honestly as UNVERIFIED instead of
+        # asserting success (WOR-87). This is NOT an ERROR (the app most likely
+        # launched), but the model must verify before claiming it did.
+        return (
+            f"Launched: {name} — process spawned, but this platform can't confirm "
+            "its window appeared (foreground detection isn't wired here). "
+            "UNVERIFIED: confirm with is_running / take_screenshot before claiming "
+            "success."
+        )
 
     # Non-zero exit within the grace window AND no matching process is running →
     # genuine failure. Surface the shell's stderr (the "is not recognized" /
@@ -970,6 +991,76 @@ def tool_open_application(name: str) -> str:
         f"ERROR: could not launch application '{name}' — not found or failed to "
         f"start (exit code {rc}){detail}"
     )
+
+
+# steam://run/<appid>, steam://rungameid/<appid>, steam://install/<appid> — the
+# deep links whose REAL outcome OSIA can confirm deterministically (WOR-87).
+_STEAM_RUN_RE = re.compile(r"^\s*steam://(run|rungameid|install)/(\d+)",
+                           re.IGNORECASE)
+
+
+def _verify_open_uri(uri: str):
+    """Confirm a FIRED deep link's REAL outcome where OSIA can do so
+    deterministically (WOR-87). Currently Steam run/install: read the install
+    manifest + process state so the model is handed what ACTUALLY happened, not
+    just that the URI fired (an uninstalled game's ``steam://run`` fires fine but
+    launches nothing). Returns a confirmation string, or ``None`` when no
+    deterministic check applies (the caller then returns the honest
+    FIRED-not-confirmed message). Never raises.
+    """
+    try:
+        m = _STEAM_RUN_RE.match(uri or "")
+        if not m:
+            return None
+        action, appid = m.group(1).lower(), m.group(2)
+        from osia.tools import steam as _steam
+        if _steam.steam_path() is None:
+            return (f"{uri} fired, but Steam is not installed/detected on this "
+                    "machine — cannot confirm anything launched. Tell the user "
+                    "honestly; do NOT claim it launched.")
+        state = _steam.steam_game_state(appid)
+        label = (f"{state['name']} (appid {appid})"
+                 if state and state.get("name") else f"appid {appid}")
+
+        if action == "install":
+            if state and state.get("installed"):
+                return (f"{uri} fired — {label} is ALREADY fully installed; Steam "
+                        "will just show its page, no download is needed.")
+            return (f"{uri} fired — Steam will prompt to install {label}. The "
+                    "install is NOT instant or confirmed yet: the download must "
+                    "finish before the game can launch. Don't claim it's installed.")
+
+        # run / rungameid
+        if state is None:
+            return (f"{uri} fired, but {label} is NOT installed (no Steam "
+                    "appmanifest for it) — nothing will launch. Tell the user it "
+                    "must be installed first; offer to install it. Do NOT claim "
+                    "you launched it.")
+        if not state.get("installed"):
+            return (f"{uri} fired, but {label} is NOT fully installed "
+                    "(download/update incomplete) — it will not launch yet. Tell "
+                    "the user honestly; offer to finish installing it.")
+        # Installed. Give the process a brief, BOUNDED moment to appear (a warm
+        # Steam launches fast). We never wait out a cold-start (Steam can take
+        # ~30s) — past the short budget we report 'starting', honestly.
+        running = bool(state.get("running"))
+        if not running:
+            _deadline = time.monotonic() + 3.0
+            while time.monotonic() < _deadline:
+                time.sleep(0.5)
+                _re_state = _steam.steam_game_state(appid)
+                if _re_state and _re_state.get("running"):
+                    running = True
+                    break
+        if running:
+            return (f"{uri} fired — {label} is installed and its process is now "
+                    "running: launch CONFIRMED.")
+        return (f"{uri} fired — {label} is installed, but its process hasn't "
+                "appeared yet (the game may still be starting). Do NOT claim it is "
+                "running until confirmed — re-check with is_running, or take a "
+                "screenshot.")
+    except Exception:
+        return None
 
 
 def tool_open_uri(uri: str) -> str:
@@ -1010,9 +1101,18 @@ def tool_open_uri(uri: str) -> str:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-        return f"opened {uri}"
     except Exception as e:
         return f"ERROR: open_uri launching {uri}: {e}"
+    # The URI was handed to the OS handler — but FIRING a deep link is an ATTEMPT,
+    # not a confirmation (WOR-87). Where OSIA can verify the real outcome
+    # deterministically (Steam run/install), fold THAT into the reply; otherwise
+    # say so honestly so the model never reads "opened" as "succeeded".
+    verdict = _verify_open_uri(uri)
+    if verdict:
+        return verdict
+    return (f"{uri} fired (handed to the OS handler). This is an ATTEMPT, not a "
+            "confirmation — verify the real result (is_running / has_window / "
+            "get_current_url, vision last) before claiming success.")
 
 
 def tool_list_files(path: str) -> str:
@@ -2344,6 +2444,84 @@ def tool_desktop_scroll(direction: str = "down", amount=3) -> str:
     return _dc.scroll(direction, amount)
 
 
+# ---------------------------------------------------------------------------
+# Deterministic verification tools (WOR-87) — confirm an outcome WITHOUT vision.
+# Each returns a clear deterministic answer ("running: yes/no", …); these are NOT
+# errors, so they never use the ``ERROR:`` prefix (a "no" is a successful check).
+# ---------------------------------------------------------------------------
+
+def tool_is_running(app: str) -> str:
+    """Is the app's process currently running? Deterministic (psutil), no vision."""
+    from osia.tools import verify
+    yes = verify.app_running(app)
+    return f"running: {'yes' if yes else 'no'} — process for '{app}'"
+
+
+def tool_is_installed(app: str) -> str:
+    """Is the app installed (executable resolvable)? Deterministic, no vision."""
+    from osia.tools import verify
+    res = verify.app_installed(app)
+    if res is None:
+        return (f"installed: unknown — OSIA can only verify installation "
+                f"deterministically on Windows here. Try is_running('{app}').")
+    if res:
+        return f"installed: yes — '{app}' resolves to a real executable."
+    return (f"installed: no — '{app}' did not resolve via App Paths / Start menu / "
+            "common install folders / Store.")
+
+
+def tool_has_window(app: str) -> str:
+    """Does the app have a visible window right now? Deterministic, no vision."""
+    from osia.tools import verify
+    win = verify.app_window(app)
+    if win is None:
+        if sys.platform != "win32":
+            return (f"window: unknown — window detection is Windows-only here; "
+                    f"use is_running('{app}') instead.")
+        return f"window: no — no visible window owned by '{app}' was found."
+    _hwnd, title, _pid = win
+    return f"window: yes — '{app}' has a visible window titled '{title}'."
+
+
+def tool_steam_game_state(name: str) -> str:
+    """Deterministic install/run state of a Steam game (by name or appid), read
+    from Steam's own manifests — no vision. Tells the model whether the game is
+    installed and whether it is running, so it never claims it launched a game
+    that isn't installed (WOR-87)."""
+    from osia.tools import verify
+    st = verify.steam_game_state(name)
+    if st is None:
+        from osia.tools import steam as _steam
+        if _steam.steam_path() is None:
+            return (f"steam: Steam is not installed/detected on this machine — "
+                    f"cannot verify '{name}'.")
+        return (f"steam: '{name}' is NOT installed (no Steam appmanifest matches "
+                "it). It must be installed before it can launch.")
+    return (f"steam: '{st['name']}' (appid {st['appid']}) — "
+            f"installed: {'yes' if st['installed'] else 'no'}, "
+            f"running: {'yes' if st['running'] else 'no'}.")
+
+
+def tool_web_state(expect_url: str = None, expect_text: str = None,
+                   expect_selector: str = None) -> str:
+    """Deterministically check the live browser page WITHOUT vision: its current
+    URL and whether it contains an expected URL fragment / text / element. Gated
+    on OSIA driving its own browser in the foreground (WOR-87)."""
+    from osia.tools import verify
+    st = verify.web_state(expect_url, expect_text, expect_selector)
+    if not st.get("available"):
+        return (f"web_state: unavailable — {st.get('reason', 'no live page')}. "
+                "If OSIA's browser is in front use get_current_url / read_page, "
+                "otherwise take_screenshot.")
+    parts = [f"url: {st.get('url')}"]
+    checks = st.get("checks") or {}
+    for key, val in checks.items():
+        parts.append(f"{key}: {'yes' if val else 'no'}")
+    if not checks:
+        parts.append("(no expectation given — current URL only)")
+    return "web_state: " + " | ".join(parts)
+
+
 TOOL_MAP = {
     # Shell & launchers
     "bash": tool_bash,
@@ -2394,6 +2572,12 @@ TOOL_MAP = {
     "desktop_type": tool_desktop_type,
     "desktop_press": tool_desktop_press,
     "desktop_scroll": tool_desktop_scroll,
+    # Deterministic verification (confirm outcomes WITHOUT vision, WOR-87)
+    "is_running": tool_is_running,
+    "is_installed": tool_is_installed,
+    "has_window": tool_has_window,
+    "steam_game_state": tool_steam_game_state,
+    "web_state": tool_web_state,
 }
 
 # Known tool names — bare-JSON candidates (priority 3 of the universal
