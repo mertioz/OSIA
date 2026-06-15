@@ -754,20 +754,25 @@ def tool_open_application(name: str) -> str:
                     f"'{name}' is already open — brought its window '{_dt}' to the "
                     "foreground and focused it (ready; did not launch a second instance)."
                 )
-        # Tray-resident: the app's process is already running but exposes no window
-        # we could focus (minimized / closed to the system tray). Report it as
-        # already running instead of relaunching or ERRORing (WOR-80 Fix B). Gated
-        # on a CONFIDENT resolution: without one, candidates is just the raw token,
-        # which could collide with an unrelated running process and falsely report a
-        # genuinely-missing app as "already running" (review #2).
-        try:
-            if resolved is not None and _dc.is_app_running(candidates):
-                return (
-                    f"'{name}' is already running (in the system tray or without a "
-                    "foreground window) — did not launch a second instance."
-                )
-        except Exception:
-            pass
+        # Tray-resident (WOR-80 follow-up): we reach here only when no focusable
+        # window exists (find_app_window_multi above already foregrounded one if it
+        # did). The app's process may still be running closed to the system tray —
+        # an earlier fix early-returned "already running" here, but that left OSIA
+        # with NO usable window to navigate, so it would say "already running" and
+        # never act. We now intentionally do NOT early-return: fall through to STEP 3
+        # and RELAUNCH the already-resolved exe. Single-instance tray apps (Steam,
+        # Discord, Spotify, Slack, …) re-surface their existing main window when
+        # their exe is re-run rather than spawning a second instance; the post-launch
+        # active-raise loop below then polls find_app_window_multi for that surfaced
+        # window and foregrounds it, returning "window '…' is ready and focused".
+        # The ERROR contract stays intact: if the process is running but its window
+        # is slow to surface, the launched-on-running-process (852) and
+        # timeout-with-running-process (924) checks keep this a SUCCESS, never a
+        # false ERROR; a genuinely-missing app (no resolution, no process) still
+        # ERRORs via the unchanged shell fallback. (No extra surfacing mechanism is
+        # needed — re-running the single-instance exe IS the surface-don't-duplicate
+        # behaviour; the rare non-single-instance tray app spawning a 2nd copy is an
+        # acceptable, strictly-better-than-no-window residual risk.)
 
     # Snapshot the foreground window BEFORE launching so the post-launch readiness
     # wait can tell when focus has moved to the NEW app window (WOR-50 follow-up).
