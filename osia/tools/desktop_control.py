@@ -956,6 +956,12 @@ def scroll(direction: str = "down", amount=3):
 # Every branch is guarded by ``sys.platform`` (cross-platform rule).
 # ---------------------------------------------------------------------------
 APP_WINDOW_TIMEOUT = 14.0          # generous cap: heavy apps can take >10s to show
+# WOR-80: open_application uses a LONGER launch wait — cold/heavy apps (Steam,
+# games, IDEs) can take well over 14s to draw their first window, which used to
+# time out into a FALSE ERROR. The caller clamps the effective deadline to stay
+# inside the 30s tool-execution budget, and never ERRORs while the app's process
+# is actually running (see agent.tool_open_application).
+APP_LAUNCH_WINDOW_TIMEOUT = 25.0
 _APP_WINDOW_POLL = 0.2             # poll interval (~200ms)
 _APP_WINDOW_STABLE_POLLS = 2       # consecutive polls a new fg window must persist
 
@@ -1391,6 +1397,519 @@ def focus_app_window(window, timeout=APP_FOCUS_TIMEOUT,
         if time.monotonic() >= deadline:
             return ("timeout", "")
         time.sleep(poll)
+
+
+# ---------------------------------------------------------------------------
+# WOR-80 — Generic Windows app name -> executable resolution.
+#
+# subprocess.Popen(name, shell=True) is `cmd /c <name>`, which only finds apps on
+# PATH. Per-user installs (Discord under %LocalAppData%, Steam/most games under
+# Program Files, Store apps, …) are NOT on PATH, so a bare-name launch ALWAYS
+# fails and OSIA only ever "worked" when the app already had a visible window to
+# focus (tray/closed -> fail). resolve_windows_app() finds ANY installed app's
+# real executable + arguments from its name, with NO per-app hardcoding, by
+# consulting the same sources the shell / Start menu use, cheapest-and-most-
+# reliable first:
+#   1. App Paths registry  (HKLM + HKCU, incl. WOW6432Node) — many apps register
+#      `<name>.exe` -> full path here.
+#   2. Start menu .lnk scan (the general workhorse — covers nearly every installed
+#      app) — fuzzy-match the requested name against every shortcut under the
+#      per-user + all-users Start menu and resolve the best match's TargetPath +
+#      Arguments (so a launcher shortcut like Discord's
+#      `Update.exe --processStart Discord.exe` is honoured verbatim).
+#   3. Common install roots — probe %LocalAppData% / %ProgramFiles% /
+#      %ProgramFiles(x86)% for a matching folder/exe.
+#   4. UWP / Store apps — Get-StartApps -> AppUserModelID, launched via
+#      `explorer.exe shell:AppsFolder\<AUMID>`.
+# The caller keeps its existing `cmd /c <name>` as tier 5 (PATH fallback), so apps
+# already on PATH are unaffected. Windows-only: returns None on Linux/Mac (the
+# caller keeps its current shell launch). Every function never raises.
+# ---------------------------------------------------------------------------
+
+# Launcher / shell-host process bases that are never "the app itself": excluded
+# from window-focus + process-running matching so we never focus the desktop
+# shell, claim a generic updater/installer stub as the launched app, or
+# (critically) treat always-present explorer.exe as proof a UWP launch succeeded
+# (which would break the anti-hallucination contract). Generic, not per-app.
+_GENERIC_PROC_BASES = {
+    "explorer", "cmd", "conhost", "powershell", "pwsh", "rundll32",
+    "wscript", "cscript", "applicationframehost", "sihost", "dllhost",
+    "svchost", "update", "updater", "setup", "install", "installer",
+    "launcher", "stub", "bootstrap", "bootstrapper",
+}
+
+# A Start-menu / Store match below this fuzzy score is too weak to trust.
+_FUZZY_MIN = 0.70
+
+
+def _norm_alnum(s) -> str:
+    """Lowercase, strip everything but [a-z0-9]: 'VS Code' -> 'vscode'."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def _name_tokens(s):
+    """Lowercase alphanumeric word tokens: 'Visual Studio Code' -> ['visual',
+    'studio', 'code']."""
+    return [t for t in re.split(r"[^a-z0-9]+", (s or "").lower()) if t]
+
+
+def _initials(s) -> str:
+    """First letter of each token: 'Visual Studio Code' -> 'vsc'."""
+    return "".join(t[0] for t in _name_tokens(s))
+
+
+# Exe / shortcut stem tokens that mark a helper, NOT the app the user wants —
+# uninstallers, crash/error reporters, updaters, setup stubs. A sibling .exe whose
+# name contains one of these is never chosen over the real app (WOR-80 review):
+# 'discord' must not resolve to 'Uninstall Discord.exe', 'steam' not to
+# 'steamerrorreporter.exe'. Generic, not per-app.
+_HELPER_STEM_TOKENS = (
+    "uninstall", "uninst", "unins", "remove", "setup", "install", "installer",
+    "update", "updater", "upgrade", "repair", "crash", "error", "report",
+    "reporter", "helper", "service", "daemon", "diagnostic", "cleanup",
+)
+
+# Narrower set for human-readable Start-menu LABELS: only the words that
+# unambiguously mark a non-launch shortcut as a whole word (so 'Uninstall Discord'
+# is skipped but 'Reporter Pro' / 'X Service' legit apps are kept).
+_HELPER_LABEL_TOKENS = (
+    "uninstall", "uninstaller", "remove", "setup", "installer", "repair",
+)
+
+
+def _is_helper_stem(stem) -> bool:
+    """SUBSTRING test for an exe basename (glued names like 'steamerrorreporter',
+    'DiscordSetup'): looks like an uninstaller / reporter / updater, not the app."""
+    low = (stem or "").lower()
+    return any(tok in low for tok in _HELPER_STEM_TOKENS)
+
+
+def _is_helper_label(label) -> bool:
+    """WHOLE-WORD test for a human-readable Start-menu shortcut stem ('Uninstall
+    Discord'): a helper token must appear as its own word, so legit apps like
+    'ServiceNow' / 'Reporter Pro' are not over-filtered."""
+    toks = set(_name_tokens(label))
+    return any(tok in toks for tok in _HELPER_LABEL_TOKENS)
+
+
+def _acronym_seq_match(qtoks, ttoks) -> bool:
+    """True when the query token sequence maps onto the target token sequence where
+    each query token either equals a target token OR spells the initials of a run of
+    consecutive target tokens — e.g. ['vs','code'] -> 'Visual Studio Code'
+    (vs=Visual+Studio, code=Code). Requires at least one query token to be a FULL
+    target word (an anchor) so a pure-initials coincidence ('git' ->
+    'Google Input Tools') does NOT match. Specific, low false-positive."""
+    if not qtoks or not ttoks:
+        return False
+    i = 0
+    for qt in qtoks:
+        if i >= len(ttoks):
+            return False
+        if qt == ttoks[i]:
+            i += 1
+            continue
+        init, j = "", i                              # try a run whose initials == qt
+        while j < len(ttoks) and len(init) < len(qt):
+            init += ttoks[j][0]
+            j += 1
+            if init == qt:
+                break
+        if init == qt:
+            i = j
+            continue
+        return False
+    return any(qt in ttoks for qt in qtoks)          # needs a full-word anchor
+
+
+def _fuzzy_score(query, target) -> float:
+    """Heuristic 0..1 match of a requested app name against a candidate label (a
+    Start-menu shortcut stem or a Store-app display name). Built to RESOLVE the
+    real app (exact name, whole-word 'chrome'->'Google Chrome', acronym
+    'vs code'->'Visual Studio Code') while NOT cross-resolving to a different
+    product that merely shares a prefix ('word'->'WordPad', 'steam'->'SteamVR') —
+    a wrong-app launch would be reported as success and break the
+    anti-hallucination contract. Carries NO per-app knowledge. Higher is closer; a
+    score below the caller's threshold means 'not confident, do not launch this'."""
+    qraw = (query or "").strip().lower()
+    traw = (target or "").strip().lower()
+    q = _norm_alnum(query)
+    t = _norm_alnum(target)
+    if not q or not t:
+        return 0.0
+    if qraw == traw:                                 # true case-insensitive exact
+        return 1.0
+    if q == t:
+        # Alnum-equal but the raw forms differ only by spacing/punctuation. High,
+        # but BELOW a true exact, and penalised when the target dropped
+        # identity-bearing symbols so 'notepad' does not tie 'Notepad' with
+        # 'Notepad++' (review #5). Pure spacing differences ('VS Code') keep ~0.95.
+        stripped = sum(1 for ch in traw if not ch.isalnum() and not ch.isspace())
+        return max(0.80, 0.95 - 0.08 * stripped)
+    qtoks = _name_tokens(query)
+    ttoks = _name_tokens(target)
+    score = 0.0
+    # Whole-word: every query token is also a target token (order-independent).
+    # SAFE — 'chrome'->'Google Chrome', 'obs'->'OBS Studio', 'word'->'Microsoft
+    # Word' — and crucially 'word' is NOT a token of the single token 'wordpad'.
+    if qtoks and all(qt in ttoks for qt in qtoks):
+        score = max(score, 0.86)
+    # Acronym sequence ('vs code' -> 'Visual Studio Code'), anchored on a full word.
+    if len(qtoks) >= 2 and _acronym_seq_match(qtoks, ttoks):
+        score = max(score, 0.84)
+    # Single-token glued acronym ('vscode' -> 'vsc'+ode of Visual Studio Code):
+    # the query must START WITH the target's initials AND spell out MORE than them
+    # (len(q) > len(ini)), and be >= 4 chars. A bare initials-equality ('git' ==
+    # 'Google Input Tools') is intentionally NOT accepted — that is a coincidence,
+    # not an abbreviation — and short tokens cannot collide (review #1/#7).
+    if len(qtoks) == 1:
+        ini = _initials(target)
+        if (ini and len(ini) >= 2 and len(q) >= 4
+                and len(q) > len(ini) and q.startswith(ini)):
+            score = max(score, 0.82)
+    # Floor: difflib on the RAW forms, scaled so a weak similarity ('word' vs
+    # 'wordpad' ~0.73) stays well under the launch threshold.
+    score = max(score, difflib.SequenceMatcher(None, qraw, traw).ratio() * 0.65)
+    return score
+
+
+def _split_lnk_args(s):
+    """Split a Windows shortcut argument string into a list, honouring quotes and
+    preserving backslashes (so paths survive). Best-effort; never raises."""
+    s = (s or "").strip()
+    if not s:
+        return []
+    try:
+        import shlex
+        toks = shlex.split(s, posix=False)          # posix=False keeps backslashes
+    except Exception:
+        toks = s.split()
+    out = []
+    for tok in toks:
+        if len(tok) >= 2 and tok[0] == '"' and tok[-1] == '"':
+            tok = tok[1:-1]
+        out.append(tok)
+    return out
+
+
+def _read_lnk_target(path):
+    """Resolve a .lnk shortcut to ``(target_exe, [args])`` via pywin32's COM
+    WScript.Shell, or ``None`` when it has no usable filesystem target (e.g. a
+    Store-app shortcut) or COM is unavailable. COM is initialised on the calling
+    worker thread (the tool runs in a ThreadPoolExecutor), mirroring the existing
+    UIA per-thread COM init. Never raises."""
+    try:
+        import pythoncom
+        import win32com.client
+    except Exception:
+        return None
+    initialized = False
+    try:
+        try:
+            pythoncom.CoInitialize()
+            initialized = True
+        except Exception:
+            initialized = False
+        shell = win32com.client.Dispatch("WScript.Shell")
+        sc = shell.CreateShortcut(path)
+        target = (sc.TargetPath or "").strip()
+        if not target or not os.path.isfile(target):
+            return None
+        return (target, _split_lnk_args(sc.Arguments or ""))
+    except Exception:
+        return None
+    finally:
+        if initialized:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+
+def _resolve_app_paths_registry(name):
+    """Tier 1 — the App Paths registry (HKCU + HKLM + WOW6432Node). ``(path, [])``
+    or None. Never raises."""
+    try:
+        import winreg
+    except Exception:
+        return None
+    base = _norm_app_token(name)                    # 'discord' from 'Discord.exe'
+    if not base:
+        return None
+    key_leaf = base + ".exe"
+    locations = [
+        (winreg.HKEY_CURRENT_USER,
+         r"Software\Microsoft\Windows\CurrentVersion\App Paths"),
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"Software\Microsoft\Windows\CurrentVersion\App Paths"),
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths"),
+    ]
+    for root, sub in locations:
+        try:
+            with winreg.OpenKey(root, sub + "\\" + key_leaf) as k:
+                val, _typ = winreg.QueryValueEx(k, None)    # default value = exe
+                path = (val or "").strip().strip('"')
+                # App Paths values are often REG_EXPAND_SZ ('%ProgramFiles%\…');
+                # winreg does NOT expand them, so expand before the isfile check
+                # or a legitimately-registered app is missed (review #8).
+                if path and _typ == winreg.REG_EXPAND_SZ:
+                    path = os.path.expandvars(path)
+                if path and os.path.isfile(path):
+                    return (path, [])
+        except OSError:
+            continue
+    return None
+
+
+def _start_menu_dirs():
+    """Per-user + all-users Start-menu Programs folders that exist."""
+    out = []
+    pd = os.environ.get("ProgramData")
+    ad = os.environ.get("APPDATA")
+    if pd:
+        out.append(os.path.join(pd, "Microsoft", "Windows", "Start Menu", "Programs"))
+    if ad:
+        out.append(os.path.join(ad, "Microsoft", "Windows", "Start Menu", "Programs"))
+    return [d for d in out if os.path.isdir(d)]
+
+
+def _resolve_start_menu_lnk(name):
+    """Tier 2 — the general workhorse. Fuzzy-match ``name`` against every shortcut
+    stem under the Start menu, then COM-resolve the best matches' TargetPath +
+    Arguments. ``(target, [args])`` or None. Never raises."""
+    scored = []
+    for d in _start_menu_dirs():
+        try:
+            walker = os.walk(d)
+        except Exception:
+            continue
+        for root, _dirs, files in walker:
+            for fn in files:
+                if not fn.lower().endswith(".lnk"):
+                    continue
+                stem = fn[:-4]
+                if _is_helper_label(stem):           # skip 'Uninstall X', 'Setup …'
+                    continue
+                sc = _fuzzy_score(name, stem)
+                if sc >= _FUZZY_MIN:
+                    scored.append((sc, len(_norm_alnum(stem)), os.path.join(root, fn)))
+    if not scored:
+        return None
+    # Best score first; on ties prefer the shortest (closest-to-exact) label.
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    for _sc, _ln, path in scored[:6]:
+        resolved = _read_lnk_target(path)
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _find_exe_in_dir(folder, base):
+    """Best exe inside ``folder`` for ``base`` (exact name, else a fuzzy-matching
+    .exe, else one level of subfolders). Bounded + shallow. None if nothing fits."""
+    cand = os.path.join(folder, base + ".exe")
+    if os.path.isfile(cand):
+        return cand
+    best, best_sc = None, 0.0
+    try:
+        for entry in os.listdir(folder):
+            if not entry.lower().endswith(".exe"):
+                continue
+            stem = entry[:-4]
+            if _is_helper_stem(stem):                # never an uninstaller/reporter
+                continue
+            sc = _fuzzy_score(base, stem)
+            if sc > best_sc:
+                best, best_sc = os.path.join(folder, entry), sc
+    except OSError:
+        pass
+    # Require a strong (whole-word/exact-grade) sibling match, not a weak fuzzy one,
+    # so we never launch an unrelated exe that merely shares a few letters.
+    if best and best_sc >= 0.86:
+        return best
+    try:
+        for entry in os.listdir(folder):           # one level down: <folder>\*\<base>.exe
+            sub = os.path.join(folder, entry)
+            if os.path.isdir(sub):
+                c = os.path.join(sub, base + ".exe")
+                if os.path.isfile(c):
+                    return c
+    except OSError:
+        pass
+    return None
+
+
+def _resolve_common_locations(name):
+    """Tier 3 — probe the common per-user / all-users install roots for a folder or
+    exe matching ``name``. ``(path, [])`` or None. Never raises."""
+    base = _norm_app_token(name)
+    if not base:
+        return None
+    roots = []
+    for env in ("LocalAppData", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        v = os.environ.get(env)
+        if v and os.path.isdir(v) and v not in roots:
+            roots.append(v)
+    for root in roots:
+        direct = os.path.join(root, base + ".exe")
+        if os.path.isfile(direct):
+            return (direct, [])
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            continue
+        for entry in entries:
+            full = os.path.join(root, entry)
+            if not os.path.isdir(full):
+                continue
+            if _fuzzy_score(name, entry) >= 0.85:
+                exe = _find_exe_in_dir(full, base)
+                if exe:
+                    return (exe, [])
+    return None
+
+
+def _resolve_uwp(name):
+    """Tier 4 — UWP / Store apps via PowerShell Get-StartApps. Returns
+    ``("explorer.exe", ["shell:AppsFolder\\<AUMID>"])`` for the best name match, or
+    None. Never raises."""
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # 5s cap: this tier runs LAST (only when registry/Start-menu/common-paths
+        # all miss, e.g. a typo'd / missing app), so it sits on the honest-ERROR
+        # latency path — keep it short while staying well inside the 30s budget.
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-StartApps | ConvertTo-Json -Compress"],
+            capture_output=True, text=True, timeout=5, creationflags=flags,
+        )
+    except Exception:
+        return None
+    out = (r.stdout or "").strip()
+    if not out:
+        return None
+    try:
+        data = json.loads(out)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        data = [data]
+    best, best_sc = None, 0.0
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        aid = item.get("AppID") or ""
+        if not aid:
+            continue
+        sc = _fuzzy_score(name, item.get("Name") or "")
+        if sc > best_sc:
+            best, best_sc = aid, sc
+    if best and best_sc >= _FUZZY_MIN:
+        return ("explorer.exe", ["shell:AppsFolder\\" + best])
+    return None
+
+
+def resolve_windows_app(name):
+    """Resolve an app ``name`` to ``(executable_path, [args])`` for a DIRECT launch,
+    or None when no concrete target is found (the caller then keeps its `cmd /c
+    <name>` PATH fallback). Tiers, cheapest/most-reliable first: an explicit
+    existing path, App Paths registry, Start-menu .lnk scan, common install roots,
+    UWP/Store. Windows-only; never raises. See the section header above."""
+    if sys.platform != "win32":
+        return None
+    s = (name or "").strip()
+    if not s:
+        return None
+    explicit = s.strip('"')
+    if os.path.isabs(explicit) and os.path.isfile(explicit):
+        return (explicit, [])
+    for resolver in (_resolve_app_paths_registry,
+                     _resolve_start_menu_lnk,
+                     _resolve_common_locations,
+                     _resolve_uwp):
+        try:
+            res = resolver(s)
+        except Exception:
+            res = None
+        if res is not None:
+            path, args = res
+            if path:
+                return (path, list(args or []))
+    return None
+
+
+def windows_app_candidates(name, resolved):
+    """The set of process bases that identify THIS app's window / process — used to
+    detect the launch reliably even when a bootstrapper hands off to a differently
+    named process (e.g. Discord's Update.exe -> Discord.exe, 'vs code' -> Code.exe).
+    Built from the raw name token, the resolved executable's base, and any .exe
+    referenced in the resolved arguments. Generic launcher/host bases are dropped so
+    they can never be mistaken for the app. Windows-only callers."""
+    cands = set()
+    tok = _norm_app_token(name)
+    if tok:
+        cands.add(tok)
+    if resolved:
+        path, args = resolved
+        b = _proc_base(os.path.basename((path or "").replace("\\", "/")))
+        if b:
+            cands.add(b)
+        for a in (args or []):
+            a = str(a)
+            if a.lower().endswith(".exe"):
+                ab = _proc_base(os.path.basename(a.replace("\\", "/")))
+                if ab:
+                    cands.add(ab)
+    return {c for c in cands if c and c not in _GENERIC_PROC_BASES}
+
+
+def find_app_window_multi(candidates):
+    """(hwnd, title, pid) of the topmost visible window whose owning PROCESS base is
+    in ``candidates``, or None. Like :func:`find_app_window` but matches a SET of
+    bases (the resolved-name candidates) instead of one raw token, so a window
+    opened by a differently-named process than the user typed is still found.
+    Windows-only; never raises."""
+    if sys.platform != "win32" or _load_win32() is None:
+        return None
+    cands = {c for c in (candidates or set()) if c and c not in _GENERIC_PROC_BASES}
+    if not cands:
+        return None
+    try:
+        import psutil
+    except Exception:
+        return None
+    for hwnd, title, pid, _cls in _enum_app_windows_win32():       # topmost first
+        try:
+            pname = psutil.Process(pid).name()
+        except Exception:
+            continue
+        if _proc_base(pname) in cands:
+            return (hwnd, title, pid)
+    return None
+
+
+def is_app_running(candidates):
+    """True when a process whose base is in ``candidates`` is currently running —
+    the signal that an app DID launch (heavy/cold app still drawing, launcher
+    handed off, or app sitting in the tray) so the caller never false-ERRORs a real
+    launch. Generic launcher/host bases are ignored. Never raises."""
+    cands = {c for c in (candidates or set()) if c and c not in _GENERIC_PROC_BASES}
+    if not cands:
+        return False
+    try:
+        import psutil
+    except Exception:
+        return False
+    try:
+        for proc in psutil.process_iter(["name"]):
+            try:
+                if _proc_base(proc.info.get("name") or "") in cands:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
 
 
 # ---------------------------------------------------------------------------

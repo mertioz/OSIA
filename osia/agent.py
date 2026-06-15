@@ -80,7 +80,7 @@ You have these tools available:
 System & shell:
 - bash: Execute a bash command (on Windows it runs in PowerShell — use PowerShell syntax there). Usage: {"tool": "bash", "command": "<command>"}
 - run_command: Run any shell command and return its output. Usage: {"tool": "run_command", "command": "<command>"}
-- open_application: Launch an application by name. Usage: {"tool": "open_application", "name": "<app_name>"}
+- open_application: Launch an installed application by its common name — OSIA finds the real executable automatically (Start menu, registry, common install folders, Store apps), so just pass a plain name like "Discord", "Spotify", "Steam", "Chrome", "VS Code", "OBS" or "Word"; no path needed (an absolute path also works). Usage: {"tool": "open_application", "name": "<app_name>"}
 - take_screenshot: Capture the desktop and return a description of what is visible on screen (the screenshot is analyzed by the vision model — you CAN see the screen with this). Usage: {"tool": "take_screenshot"}
 - get_system_info: Snapshot of CPU, RAM and disk usage. Usage: {"tool": "get_system_info"}
 - list_running_processes: Top processes by CPU/memory. Usage: {"tool": "list_running_processes", "limit": 20}
@@ -166,7 +166,7 @@ Tu disposes des outils suivants :
 Système & shell :
 - bash : Exécuter une commande bash (sous Windows elle s'exécute dans PowerShell — utilise la syntaxe PowerShell). Usage : {"tool": "bash", "command": "<commande>"}
 - run_command : Exécuter n'importe quelle commande shell et retourner sa sortie. Usage : {"tool": "run_command", "command": "<commande>"}
-- open_application : Lancer une application par son nom. Usage : {"tool": "open_application", "name": "<nom_app>"}
+- open_application : Lancer une application installée par son nom courant — OSIA retrouve automatiquement l'exécutable réel (menu Démarrer, registre, dossiers d'installation courants, applis du Store) : passe simplement un nom comme « Discord », « Spotify », « Steam », « Chrome », « VS Code », « OBS » ou « Word » ; aucun chemin requis (un chemin absolu fonctionne aussi). Usage : {"tool": "open_application", "name": "<nom_app>"}
 - take_screenshot : Capturer le bureau et retourner une description de ce qui est visible à l'écran (la capture est analysée par le modèle de vision — tu PEUX voir l'écran avec cet outil). Usage : {"tool": "take_screenshot"}
 - get_system_info : Aperçu de l'utilisation CPU, RAM et disque. Usage : {"tool": "get_system_info"}
 - list_running_processes : Top des processus par CPU/mémoire. Usage : {"tool": "list_running_processes", "limit": 20}
@@ -688,8 +688,23 @@ def tool_open_application(name: str) -> str:
     process name doesn't match the launch token (UWP frame hosts, `start`-style
     indirections) are still caught by the interleaved passive foreground watcher
     (wait_for_app_window, unchanged); Linux/Mac keep the passive wait only.
+
+    On Windows the bare name is first RESOLVED to the app's real executable +
+    arguments (WOR-80: desktop_control.resolve_windows_app — App Paths registry,
+    Start-menu .lnk scan, common install roots, UWP/Store), so per-user apps that
+    are not on PATH (Discord, Steam, Spotify, …) launch reliably; only when nothing
+    resolves do we fall back to the `cmd /c <name>` PATH launch. Launch success is
+    then keyed on the RESOLVED process bases, and a running process counts as
+    launched even if its window never grabbed the foreground in time — so a heavy
+    or tray-bound app is never falsely ERRORed. A genuinely missing app (no
+    resolution, no process, shell reports "not recognized") still ERRORs
+    (anti-hallucination contract). All of this is Windows-gated; Linux/Mac are
+    unchanged.
     """
-    # Already open? Focus the existing window instead of relaunching.
+    _t_enter = time.monotonic()
+    # ---- STEP 1 (unchanged, FIRST): already-open visible window -> focus it -----
+    # Matched by the raw token's owning PROCESS name; brings an existing window to
+    # the foreground instead of starting a second instance (WOR-50 follow-up #2).
     try:
         from osia.tools import desktop_control as _dc
         _existing = _dc.find_app_window(name)
@@ -708,16 +723,68 @@ def tool_open_application(name: str) -> str:
         # focus unconfirmed -> fall through and launch normally (safer than
         # claiming success on a window we could not confirm focused).
 
-    # Capture the shell's stderr to a temp file rather than a PIPE so a
-    # long-running app that chatters on stderr can never deadlock on a full pipe
-    # buffer (we'd never be draining it).
-    err_path = None
+    # ---- STEP 2 (Windows): resolve the real executable + broadened already-open /
+    # tray detection (WOR-80). On Linux/Mac this whole block is skipped and the
+    # launch below stays the existing `cmd /c <name>` behaviour, byte-for-byte. ----
+    resolved = None            # (exe_path, [args]) when a concrete target is found
+    candidates = set()         # process bases that identify THIS app's window/proc
+    if sys.platform == "win32" and _dc is not None:
+        try:
+            resolved = _dc.resolve_windows_app(name)
+        except Exception:
+            resolved = None
+        try:
+            candidates = _dc.windows_app_candidates(name, resolved)
+        except Exception:
+            candidates = set()
+        # Broadened already-open check: a visible window owned by ANY resolved
+        # process base (catches names the raw token misses, e.g. "vs code" ->
+        # Code.exe) -> focus it instead of starting a second instance.
+        try:
+            _win = _dc.find_app_window_multi(candidates)
+        except Exception:
+            _win = None
+        if _win is not None:
+            try:
+                _st, _dt = _dc.focus_app_window(_win)
+            except Exception:
+                _st, _dt = "unavailable", ""
+            if _st == "ready":
+                return (
+                    f"'{name}' is already open — brought its window '{_dt}' to the "
+                    "foreground and focused it (ready; did not launch a second instance)."
+                )
+        # Tray-resident: the app's process is already running but exposes no window
+        # we could focus (minimized / closed to the system tray). Report it as
+        # already running instead of relaunching or ERRORing (WOR-80 Fix B). Gated
+        # on a CONFIDENT resolution: without one, candidates is just the raw token,
+        # which could collide with an unrelated running process and falsely report a
+        # genuinely-missing app as "already running" (review #2).
+        try:
+            if resolved is not None and _dc.is_app_running(candidates):
+                return (
+                    f"'{name}' is already running (in the system tray or without a "
+                    "foreground window) — did not launch a second instance."
+                )
+        except Exception:
+            pass
+
+    # Snapshot the foreground window BEFORE launching so the post-launch readiness
+    # wait can tell when focus has moved to the NEW app window (WOR-50 follow-up).
+    _before_fg = None
+    if _dc is not None:
+        try:
+            _before_fg = _dc.foreground_snapshot()
+        except Exception:
+            _before_fg = None
+
+    # ---- STEP 3: launch. A resolved concrete path is launched DIRECTLY with its
+    # arguments (so per-user installs off PATH, and launcher shortcuts like
+    # Discord's `Update.exe --processStart Discord.exe`, start reliably); otherwise
+    # fall back to the existing `cmd /c <name>` PATH launch (no regression for apps
+    # already on PATH — and the only path on Linux/Mac). ----
+    err_path = None            # only used by the shell fallback (capture its stderr)
     err_fh = None
-    try:
-        fd, err_path = tempfile.mkstemp(prefix="osia_launch_", suffix=".log")
-        err_fh = os.fdopen(fd, "w+b")
-    except Exception:
-        err_path, err_fh = None, None
 
     def _cleanup():
         if err_fh is not None:
@@ -734,28 +801,40 @@ def tool_open_application(name: str) -> str:
             except OSError:
                 pass
 
-    # Snapshot the foreground window BEFORE launching so the post-launch readiness
-    # wait can tell when focus has moved to the NEW app window (WOR-50 follow-up).
-    _before_fg = None
-    try:
-        from osia.tools import desktop_control as _dc
-        _before_fg = _dc.foreground_snapshot()
-    except Exception:
-        _before_fg = None
-
-    try:
-        proc = subprocess.Popen(
-            name,
-            shell=True,
-            stdout=subprocess.DEVNULL,
-            stderr=(err_fh if err_fh is not None else subprocess.DEVNULL),
-        )
-    except Exception as e:
-        _cleanup()
-        return f"ERROR: launching {name}: {e}"
+    proc = None
+    if resolved is not None:
+        _path, _args = resolved
+        try:
+            proc = subprocess.Popen(
+                [_path, *[str(a) for a in (_args or [])]],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            proc = None  # resolved path failed to spawn -> fall back to the shell
+    if proc is None:
+        # Capture the shell's stderr to a temp file rather than a PIPE so a
+        # long-running app that chatters on stderr can never deadlock on a full
+        # pipe buffer (we'd never be draining it).
+        try:
+            fd, err_path = tempfile.mkstemp(prefix="osia_launch_", suffix=".log")
+            err_fh = os.fdopen(fd, "w+b")
+        except Exception:
+            err_path, err_fh = None, None
+        try:
+            proc = subprocess.Popen(
+                name,
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=(err_fh if err_fh is not None else subprocess.DEVNULL),
+            )
+        except Exception as e:
+            _cleanup()
+            return f"ERROR: launching {name}: {e}"
 
     # Watch briefly: a not-found/typo'd command dies in milliseconds; a real
-    # GUI/CLI app is still running when the grace window elapses.
+    # GUI/CLI app is still running when the grace window elapses. A launcher that
+    # exits cleanly (code 0) after spawning the real process also counts.
     grace, step, waited = 1.5, 0.05, 0.0
     rc = proc.poll()
     while rc is None and waited < grace:
@@ -763,41 +842,60 @@ def tool_open_application(name: str) -> str:
         waited += step
         rc = proc.poll()
 
-    if rc is None or rc == 0:
+    launched = rc is None or rc == 0
+    # Even on a non-zero launcher exit, if a matching app process is now running the
+    # app DID start (bootstrapper handed off) -> treat as launched, never a false
+    # ERROR (WOR-80 Fix B). Windows-only and only with a CONFIDENT resolution, so an
+    # unresolved name whose raw token collides with an unrelated process is never
+    # falsely reported as launched (review #2); the cmd /c fallback then keeps its
+    # original honest-ERROR behaviour.
+    if (not launched and sys.platform == "win32" and resolved is not None
+            and candidates and _dc is not None):
+        try:
+            if _dc.is_app_running(candidates):
+                launched = True
+        except Exception:
+            pass
+
+    # Number of seconds the readiness wait below budgets, for honest messaging.
+    _wait_secs = 14
+    if _dc is not None:
+        _wait_secs = int(
+            _dc.APP_LAUNCH_WINDOW_TIMEOUT if sys.platform == "win32"
+            else _dc.APP_WINDOW_TIMEOUT
+        )
+
+    if launched:
         _cleanup()
         # The process is alive (or a launcher exited cleanly) -> now ACTIVELY WAIT
         # for the app's window to appear and take foreground focus before reporting
         # success, so a following desktop_type/desktop_click cannot fire into the
         # void or the wrong window (WOR-50 follow-up). No fixed sleep: poll and
-        # return the instant the window is ready (fast apps are not slowed), ERROR
-        # if none appears within the timeout so the model knows not to type blindly
-        # (mirrors the false-success guard above).
+        # return the instant the window is ready (fast apps are not slowed). A
+        # timeout is NOT a failure when the process is running (WOR-80 Fix B).
         try:
-            from osia.tools import desktop_control as _dc
-            if sys.platform == "win32":
+            if sys.platform == "win32" and _dc is not None:
                 # ACTIVE raise (WOR-50 follow-up #3): wait_for_app_window only
                 # OBSERVES the foreground, so an app whose window opened in the
-                # BACKGROUND was never brought forward (the next take_screenshot
-                # captured — and desktop_click clicked — whatever stayed in
-                # front) and the wait timed out into a false ERROR. So poll
-                # find_app_window, which enumerates ALL visible windows and thus
-                # sees a background window, and the moment the new app's window
-                # exists raise + focus-confirm it with focus_app_window — the
-                # exact helpers the already-open branch above uses. Interleaved
-                # with 1s slices of the passive wait so an app whose process
-                # name doesn't match the launch token (UWP frame hosts,
-                # `start`/script indirections) is still caught the instant it
-                # takes focus by itself — no added latency for today's working
-                # cases. Budget ~APP_WINDOW_TIMEOUT as before (a focus attempt
-                # straddling the deadline may overshoot by a few seconds, still
-                # well inside the 30s tool-execution cap).
+                # BACKGROUND was never brought forward. Poll find_app_window_multi
+                # — which enumerates ALL visible windows and matches the RESOLVED
+                # process bases (so a bootstrapper that hands off to a differently
+                # named process is still caught) — and the moment the new app's
+                # window exists raise + focus-confirm it. Interleaved with 1s slices
+                # of the passive wait so apps whose process name matches nothing in
+                # `candidates` (UWP frame hosts) are still caught when they take
+                # focus by themselves. The deadline is clamped to stay inside the
+                # 30s tool-execution cap even if resolution/grace already ran.
                 status, detail = "timeout", ""
                 _no_raise = set()  # hwnds that refused focus -> one attempt each
-                _deadline = time.monotonic() + _dc.APP_WINDOW_TIMEOUT
+                _deadline = min(time.monotonic() + _dc.APP_LAUNCH_WINDOW_TIMEOUT,
+                                _t_enter + 26.0)
                 while True:
-                    _win = _dc.find_app_window(name)
+                    _win = _dc.find_app_window_multi(candidates)
                     if _win is not None and _win[0] not in _no_raise:
-                        _st, _dt = _dc.focus_app_window(_win)
+                        _remaining = max(0.5, _deadline - time.monotonic())
+                        _st, _dt = _dc.focus_app_window(
+                            _win, timeout=min(_dc.APP_FOCUS_TIMEOUT, _remaining))
                         if _st == "ready":
                             status, detail = "ready", _dt
                             break
@@ -810,27 +908,46 @@ def tool_open_application(name: str) -> str:
                     status, detail = _dc.wait_for_app_window(_before_fg, timeout=1.0)
                     if status != "timeout":  # "ready" or "unavailable"
                         break
-            else:
+            elif _dc is not None:
                 status, detail = _dc.wait_for_app_window(_before_fg)
+            else:
+                status, detail = "unavailable", ""
         except Exception:
             status, detail = "unavailable", ""
         if status == "ready":
             return f"Launched: {name} — window '{detail}' is ready and focused"
         if status == "timeout":
+            # The window never grabbed the foreground in time. On Windows, if the
+            # app's process IS running the launch SUCCEEDED (heavy/cold app still
+            # drawing, or it lives in the tray) -> report success, NOT a false
+            # ERROR (WOR-80 Fix B; this also fixes Steam's old 14s false timeout).
+            if (sys.platform == "win32" and resolved is not None and candidates
+                    and _dc is not None):
+                try:
+                    if _dc.is_app_running(candidates):
+                        return (
+                            f"Launched: {name} — the app is running (its window did "
+                            f"not take the foreground within {_wait_secs}s; take a "
+                            "screenshot to see the current state before typing)."
+                        )
+                except Exception:
+                    pass
             return (
                 f"ERROR: launched '{name}' but no application window appeared and "
-                f"took focus within {int(_dc.APP_WINDOW_TIMEOUT)}s — the app may have "
-                "failed to open a window. Take a screenshot to see the current state "
-                "before doing anything else; do NOT type yet — the keystrokes would "
-                "land in the wrong window."
+                f"took focus within {_wait_secs}s — the app may have failed to open "
+                "a window. Take a screenshot to see the current state before doing "
+                "anything else; do NOT type yet — the keystrokes would land in the "
+                "wrong window."
             )
         # 'unavailable': foreground detection is not wired on this platform (e.g.
         # Wayland without kdotool, or macOS) -> preserve the prior behaviour and
         # report the launch without the readiness guarantee.
         return f"Launched: {name}"
 
-    # Non-zero exit within the grace window → real failure. Surface the shell's
-    # stderr (the "is not recognized" / "command not found" line) before cleanup.
+    # Non-zero exit within the grace window AND no matching process is running →
+    # genuine failure. Surface the shell's stderr (the "is not recognized" /
+    # "command not found" line) so OSIA tells the user honestly (anti-hallucination
+    # contract: a real missing app must still ERROR).
     err_text = ""
     if err_fh is not None:
         try:
