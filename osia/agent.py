@@ -72,6 +72,7 @@ OSIA is a general computer operator, not a chatbot — most real tasks need seve
 - **Gather context first:** read_file/list_files/get_system_info to learn the real state instead of guessing.
 - **ALWAYS verify before reporting success:** after an action, confirm it with take_screenshot or read_page/get_current_url — never assume it worked.
 - **Recover from real failures, but stay BOUNDED:** when an action or page genuinely fails (won't load, element missing), don't give up at once — escalate through a FINITE sequence of ~3 steps: (1) retry once — reload/redo, then re-verify; (2) if it still fails, try ONE alternative — open a new tab and web-search (e.g. "<site> informations") to find the site or the cause; (3) if that fails too, STOP and tell the user honestly that it didn't work and why. This is a LIMITED number of attempts, NOT endless persistence — never repeat the same failing action over and over. Apply this to genuine failures, not to every minor step.
+- **Prefer DETERMINISTIC mechanisms first.** To open or navigate an app, reach for them IN ORDER: (1) a deep link / URL scheme via open_uri (e.g. steam://open/games, spotify:, vscode://file/<path>); (2) the app's CLI / command-line arguments; (3) a keyboard shortcut (desktop_press). Use desktop_click (vision/mouse) ONLY as a LAST RESORT, when none of the above can reach the goal — it is the slowest and least reliable path; never use it to reach a destination a deep link can open directly. Example: "open Steam and go to the library" = open_application("steam") then open_uri("steam://open/games") — NOT desktop_click("Library tab"). Steam known routes: library (steam://open/games), friends, console, downloads, settings, store/<appid>, run/<appid>.
 - On a web page, ALWAYS use the Browser tools (click / find_and_click) to click — they target the real page DOM and are far more precise than desktop_click. Use desktop_* ONLY for native windows (file managers, settings panes, dialogs, games), never for anything inside a browser tab.
 
 ## Available Tools
@@ -81,6 +82,7 @@ System & shell:
 - bash: Execute a bash command (on Windows it runs in PowerShell — use PowerShell syntax there). Usage: {"tool": "bash", "command": "<command>"}
 - run_command: Run any shell command and return its output. Usage: {"tool": "run_command", "command": "<command>"}
 - open_application: Launch an installed application by its common name — OSIA finds the real executable automatically (Start menu, registry, common install folders, Store apps), so just pass a plain name like "Discord", "Spotify", "Steam", "Chrome", "VS Code", "OBS" or "Word"; no path needed (an absolute path also works). Usage: {"tool": "open_application", "name": "<app_name>"}
+- open_uri: Open an app DESTINATION directly via its URL scheme / deep link — the FAST, deterministic way (no mouse, no vision). E.g. "steam://open/games" jumps Steam to the library; "steam://open/friends" / "steam://open/console" / "steam://open/downloads" / "steam://settings" / "steam://store/<appid>" / "steam://run/<appid>" reach those views; "spotify:" focuses Spotify and "spotify:search:<query>" searches it; "vscode://file/<path>" opens a file in VS Code. PREFER this over desktop_click whenever a deep link can reach the destination. Only whitelisted schemes are allowed; file:/javascript:/data:/vbscript: and bare paths are refused. Usage: {"tool": "open_uri", "uri": "steam://open/games"}
 - take_screenshot: Capture the desktop and return a description of what is visible on screen (the screenshot is analyzed by the vision model — you CAN see the screen with this). Usage: {"tool": "take_screenshot"}
 - get_system_info: Snapshot of CPU, RAM and disk usage. Usage: {"tool": "get_system_info"}
 - list_running_processes: Top processes by CPU/memory. Usage: {"tool": "list_running_processes", "limit": 20}
@@ -158,6 +160,7 @@ OSIA est un opérateur informatique généraliste, pas un chatbot — la plupart
 - **Récupère le contexte d'abord :** read_file/list_files/get_system_info pour connaître l'état réel au lieu de deviner.
 - **TOUJOURS vérifier avant d'annoncer un succès :** après une action, confirme avec take_screenshot ou read_page/get_current_url — ne suppose jamais qu'elle a marché.
 - **Récupère après un vrai échec, mais reste BORNÉ :** quand une action ou une page échoue vraiment (ne charge pas, élément introuvable), n'abandonne pas tout de suite — escalade selon une séquence FINIE d'environ 3 étapes : (1) réessaie une fois — recharge/refais, puis re-vérifie ; (2) si ça échoue encore, tente UNE alternative — ouvre un nouvel onglet et fais une recherche web (ex. « <site> informations ») pour retrouver le site ou la cause ; (3) si ça échoue aussi, ARRÊTE et dis honnêtement à l'utilisateur que ça n'a pas marché et pourquoi. C'est un nombre LIMITÉ de tentatives, PAS une persistance infinie — ne répète jamais la même action qui échoue en boucle. Applique ceci aux vrais échecs, pas à chaque petite étape.
+- **Privilégie d'abord les mécanismes DÉTERMINISTES.** Pour ouvrir une appli ou y naviguer, utilise-les DANS CET ORDRE : (1) un lien profond / schéma d'URL via open_uri (ex. steam://open/games, spotify:, vscode://file/<chemin>) ; (2) la CLI / les arguments en ligne de commande de l'appli ; (3) un raccourci clavier (desktop_press). N'utilise desktop_click (vision/souris) QU'EN DERNIER RECOURS, quand aucun des moyens ci-dessus ne peut atteindre le but — c'est la voie la plus lente et la moins fiable ; ne l'utilise jamais pour atteindre une destination qu'un lien profond ouvre directement. Exemple : « ouvre Steam et va dans la bibliothèque » = open_application(« steam ») puis open_uri(« steam://open/games ») — PAS desktop_click(« onglet Bibliothèque »). Routes Steam connues : bibliothèque (steam://open/games), friends, console, downloads, settings, store/<appid>, run/<appid>.
 - Dans une page web, utilise TOUJOURS les outils Navigateur (click / find_and_click) pour cliquer — ils ciblent le vrai DOM de la page et sont bien plus précis que desktop_click. N'utilise desktop_* QUE pour les fenêtres natives (gestionnaires de fichiers, paramètres, boîtes de dialogue, jeux), jamais pour quoi que ce soit dans un onglet du navigateur.
 
 ## Outils disponibles
@@ -167,6 +170,7 @@ Système & shell :
 - bash : Exécuter une commande bash (sous Windows elle s'exécute dans PowerShell — utilise la syntaxe PowerShell). Usage : {"tool": "bash", "command": "<commande>"}
 - run_command : Exécuter n'importe quelle commande shell et retourner sa sortie. Usage : {"tool": "run_command", "command": "<commande>"}
 - open_application : Lancer une application installée par son nom courant — OSIA retrouve automatiquement l'exécutable réel (menu Démarrer, registre, dossiers d'installation courants, applis du Store) : passe simplement un nom comme « Discord », « Spotify », « Steam », « Chrome », « VS Code », « OBS » ou « Word » ; aucun chemin requis (un chemin absolu fonctionne aussi). Usage : {"tool": "open_application", "name": "<nom_app>"}
+- open_uri : Ouvrir directement une DESTINATION d'appli via son schéma d'URL / lien profond — la voie RAPIDE et déterministe (sans souris ni vision). Ex. « steam://open/games » amène Steam à la bibliothèque ; « steam://open/friends » / « steam://open/console » / « steam://open/downloads » / « steam://settings » / « steam://store/<appid> » / « steam://run/<appid> » atteignent ces vues ; « spotify: » met Spotify au premier plan et « spotify:search:<requête> » y lance une recherche ; « vscode://file/<chemin> » ouvre un fichier dans VS Code. PRÉFÈRE cet outil à desktop_click dès qu'un lien profond peut atteindre la destination. Seuls les schémas autorisés passent ; file:/javascript:/data:/vbscript: et les chemins nus sont refusés. Usage : {"tool": "open_uri", "uri": "steam://open/games"}
 - take_screenshot : Capturer le bureau et retourner une description de ce qui est visible à l'écran (la capture est analysée par le modèle de vision — tu PEUX voir l'écran avec cet outil). Usage : {"tool": "take_screenshot"}
 - get_system_info : Aperçu de l'utilisation CPU, RAM et disque. Usage : {"tool": "get_system_info"}
 - list_running_processes : Top des processus par CPU/mémoire. Usage : {"tool": "list_running_processes", "limit": 20}
@@ -966,6 +970,49 @@ def tool_open_application(name: str) -> str:
         f"ERROR: could not launch application '{name}' — not found or failed to "
         f"start (exit code {rc}){detail}"
     )
+
+
+def tool_open_uri(uri: str) -> str:
+    """Open a deterministic deep link / URL scheme (WOR-85).
+
+    OSIA's FAST, reliable way to reach an app DESTINATION — no mouse, no vision.
+    ``steam://open/games`` jumps Steam straight to the library, ``spotify:``
+    focuses Spotify, ``vscode://file/<path>`` opens a file in VS Code. The URI is
+    validated against a NARROW whitelist (``deep_links.is_allowed``: the scheme
+    must be allowed; file:/javascript:/data:/vbscript: and bare paths are
+    refused) BEFORE launching, then handed to the OS URL handler per platform —
+    mirroring ``tool_open_in_editor``'s three branches: Windows ``os.startfile``,
+    macOS ``open``, Linux ``xdg-open``. The URI is ALWAYS passed as a SINGLE
+    argument (never through a shell) so it can't be used for command injection,
+    and the launch is detached so it never blocks the tool timeout. A disallowed
+    URI or a launch failure returns ``ERROR:`` (anti-hallucination contract).
+    """
+    from osia.tools import deep_links as _dl
+    if uri is None:
+        return "ERROR: open_uri: no uri provided."
+    uri = str(uri).strip()
+    if not _dl.is_allowed(uri):
+        return (
+            f"ERROR: open_uri refused '{uri}' — not an allowed deep link. Allowed "
+            f"schemes: {', '.join(sorted(_dl.ALLOWED_SCHEMES))} (e.g. "
+            "steam://open/games, spotify:, vscode://file/<path>). file:, "
+            "javascript:, data:, vbscript: and bare paths are blocked."
+        )
+    try:
+        if sys.platform == "win32":
+            os.startfile(uri)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", uri])
+        else:
+            subprocess.Popen(
+                ["xdg-open", uri],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        return f"opened {uri}"
+    except Exception as e:
+        return f"ERROR: open_uri launching {uri}: {e}"
 
 
 def tool_list_files(path: str) -> str:
@@ -2302,6 +2349,7 @@ TOOL_MAP = {
     "bash": tool_bash,
     "run_command": tool_run_command,
     "open_application": tool_open_application,
+    "open_uri": tool_open_uri,
     "take_screenshot": tool_take_screenshot,
     # Files
     "read_file": tool_read_file,
