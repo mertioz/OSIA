@@ -1167,23 +1167,289 @@ def open_new_tab(url: str) -> str:
 # ── New tools ──────────────────────────────────────────────────────────────
 
 def find_and_click(text: str):
-    """Find the first visible element whose text matches ``text`` and click it.
+    """Find the best visible element whose label matches ``text`` and click it.
 
-    Uses Playwright's text locator, which matches button labels, links,
-    list items, etc. — handy when you don't know the CSS selector but
-    can see the label on the page. Returns a screenshot so the agent
-    can verify the right element was clicked.
+    Prefers a PRECISE ARIA role + accessible-name match (button / link / menu
+    item / …) scored with the WOR-84/WOR-46 fuzzy matcher, so a label like
+    "Suivant" lands on the right control instead of the first stray substring
+    node; falls back to a plain visible-text match, then to the original
+    first-text-match so nothing the old resolver could click is lost. Returns a
+    screenshot so the agent can verify the click, with a soft note when the page
+    did not visibly change (a basic miss check, mirroring the spirit of
+    desktop_click's BEFORE/AFTER diff). Signature and return contract are
+    unchanged (success → {text, screenshot} dict; failure → "ERROR ..." string).
     """
     if not text:
         return "ERROR find_and_click: text is required"
     with _lock:
         try:
             page = _ensure_browser()
-            locator = page.get_by_text(text, exact=False).first
-            locator.click(timeout=5000)
-            return _result(f"Clicked element with text: {text!r}", page)
         except Exception as e:
             return f"ERROR clicking element with text {text!r}: {e}"
+
+        # Precise resolution first (role + accessible name, fuzzy-scored). Any
+        # failure (desktop_control unavailable, no confident match) leaves
+        # ``locator`` None and routes to the original text-first behavior below,
+        # so this is strictly additive — never a regression.
+        locator, label = None, ""
+        try:
+            from osia.tools import desktop_control as _dc
+            target_norm = _dc._normalize_label(text)
+            if target_norm:
+                target_tokens = frozenset(target_norm.split())
+                locator, label, _score = _resolve_clickable(
+                    page, target_norm, target_tokens, _dc)
+        except Exception:
+            locator = None
+
+        try:
+            try:
+                before = page.screenshot(type="png", full_page=False)
+            except Exception:
+                before = None
+            what = None
+            if locator is not None:
+                try:
+                    locator.click(timeout=5000)
+                    what = (f"{text!r} (matched {label!r})"
+                            if label else f"{text!r}")
+                except Exception:
+                    # Role match was found but not actionable (disabled, covered,
+                    # detached mid-animation). Do NOT hard-fail — fall back to the
+                    # original text click, which may resolve a DIFFERENT actionable
+                    # node with the same label. Keeps the role path strictly
+                    # additive (Finding WOR-84/1).
+                    what = None
+            if what is None:
+                # Original behavior preserved: first visible text match.
+                page.get_by_text(text, exact=False).first.click(timeout=5000)
+                what = f"{text!r}"
+            try:
+                after = page.screenshot(type="png", full_page=False)
+            except Exception:
+                after = None
+            # Basic miss check: byte-identical BEFORE/AFTER → warn softly (still a
+            # success, so a legitimate no-visible-change click is never turned
+            # into a false failure).
+            note = ""
+            if before is not None and after is not None and before == after:
+                note = (" — but the page did not visibly change; the click may "
+                        "have missed.")
+            shot = (base64.b64encode(after).decode("ascii")
+                    if after else _screenshot_b64(page))
+            return {"text": f"Clicked element with text: {what}.{note}",
+                    "screenshot": shot}
+        except Exception as e:
+            return f"ERROR clicking element with text {text!r}: {e}"
+
+
+# ── WOR-84: web DOM-first clicking ──────────────────────────────────────────
+# When OSIA's OWN browser is the foreground window and a live Playwright page is
+# driving it, a click intent the model expresses in plain words ("the Suivant
+# button") is resolved and clicked THROUGH the DOM — a real ``locator.click()``
+# in the visible browser, pixel-exact, no coordinate guessing. ``dom_click`` is
+# called by ``agent.tool_desktop_click`` BEFORE its vision locate and WOR-46 UIA
+# branch; it returns a success string on a confident DOM resolution, or ``None``
+# on ANY miss so the caller falls through to those native paths unchanged. It
+# reuses the live ``_page`` under ``_lock`` — it never opens a CDP connection,
+# never launches a browser, and never touches the profile-isolation code.
+
+# Interactive ARIA roles a "click" intent can target, most-clickable first.
+_DOM_CLICK_ROLES = (
+    "button", "link", "menuitem", "tab", "option",
+    "checkbox", "radio", "switch", "treeitem", "combobox", "textbox",
+)
+# Roles that are *primary* click targets — a tiny score bonus breaks a near-tie
+# toward one of these (mirrors the UIA _UIA_CLICKABLE_TYPES tie-break).
+_DOM_PRIMARY_ROLES = frozenset({"button", "link", "menuitem", "tab", "option"})
+# Cap matches scored per role / text query so a generic target can't trigger a
+# huge per-element IPC walk; a real control is among the first few matches.
+_DOM_MAX_MATCHES = 12
+# JS approximating an element's ACCESSIBLE NAME for fuzzy scoring, in the order
+# the platform computes it: aria-label / aria-labelledby, then an associated
+# <label>, then visible text, then placeholder — and only LAST the field's value
+# or title. Reading `value` before the label would score a text input by what the
+# user TYPED instead of its name (Finding WOR-84/4); keeping it last fixes that
+# while still letting an <input type=submit value="Send"> button match on value.
+_DOM_LABEL_JS = (
+    "el => { const t = s => (s || '').trim();"
+    " let n = t(el.getAttribute && el.getAttribute('aria-label')); if (n) return n;"
+    " const lb = el.getAttribute && el.getAttribute('aria-labelledby');"
+    " if (lb && el.ownerDocument) { const p = lb.split(/\\s+/)"
+    "   .map(id => { const e = el.ownerDocument.getElementById(id);"
+    "                return e ? t(e.innerText || e.textContent) : ''; })"
+    "   .filter(Boolean); if (p.length) return p.join(' '); }"
+    " if (el.labels && el.labels.length) { const s = t(el.labels[0].innerText"
+    "   || el.labels[0].textContent); if (s) return s; }"
+    " let s = t(el.innerText) || t(el.textContent); if (s) return s;"
+    " s = t(el.getAttribute && el.getAttribute('placeholder')); if (s) return s;"
+    " s = t(el.value); if (s) return s;"
+    " s = t(el.getAttribute && el.getAttribute('title')); if (s) return s;"
+    " return ''; }"
+)
+
+
+def _resolve_clickable(page, target_norm, target_tokens, _dc):
+    """Best visible clickable element on ``page`` matching the normalised target,
+    scored by accessible name with the WOR-46 fuzzy matcher. Returns
+    ``(locator, label, score)`` or ``(None, "", 0.0)``. Pure resolution — no
+    click, no browser launch. Assumes the caller holds ``_lock``.
+
+    Role matches are accepted at ``_UIA_MIN_SCORE`` (genuine interactive elements
+    with short accessible names). The text fallback is accepted only on an EXACT
+    normalised match, so a large container whose innerText merely CONTAINS the
+    word can never be picked.
+    """
+    best = {"loc": None, "score": 0.0, "label": ""}
+
+    def _consider(locator, primary, min_accept):
+        try:
+            count = locator.count()
+        except Exception:
+            return
+        for i in range(min(count, _DOM_MAX_MATCHES)):
+            nth = locator.nth(i)
+            try:
+                if not nth.is_visible():
+                    continue
+            except Exception:
+                continue
+            try:
+                label = (nth.evaluate(_DOM_LABEL_JS) or "").strip()
+            except Exception:
+                label = ""
+            if not label:
+                continue
+            score = _dc._label_score(target_norm, target_tokens, label)
+            if primary and score > 0:
+                score += 0.05
+            if score < min_accept:
+                continue
+            if (score > best["score"]
+                    or (score == best["score"] and best["loc"] is not None
+                        and 0 < len(label) < len(best["label"]))):
+                best.update(loc=nth, score=score, label=label)
+
+    for role in _DOM_CLICK_ROLES:
+        try:
+            loc = page.get_by_role(role, name=target_norm)
+        except Exception:
+            continue
+        _consider(loc, role in _DOM_PRIMARY_ROLES, _dc._UIA_MIN_SCORE)
+        if best["score"] >= 1.0:
+            break
+
+    if best["loc"] is None:
+        try:
+            _consider(page.get_by_text(target_norm), False, 1.0)
+        except Exception:
+            pass
+
+    return best["loc"], best["label"], best["score"]
+
+
+def _foreground_is_osia_browser() -> bool:
+    """True only when the OS foreground window belongs to OSIA's OWN automated
+    browser — the one holding OSIA's dedicated profile. This is the half of the
+    WOR-84 DOM-first gate that guarantees a DOM click on the live ``_page`` acts
+    on the window the user is actually looking at.
+
+    It is NOT enough that the foreground is *a* browser: the user's personal
+    Chrome/Brave/Firefox shares the same process name, and clicking ``_page``
+    (OSIA's possibly-backgrounded automated browser) while the user's own window
+    is in front would click the wrong surface. So we require the foreground
+    window's PID to be one of the processes whose command line references OSIA's
+    dedicated profile dir (``_processes_using_profile`` — the same identity scan
+    the launcher uses), for the profile of the ACTIVE backend (Firefox/BiDi vs
+    Chromium/CDP).
+
+    Conservative by design: when no reliable PID is exposed (e.g. Wayland, where
+    ``_foreground_window`` returns pid 0) or psutil is unavailable, OSIA's own
+    browser cannot be positively identified, so this returns False and the caller
+    uses the vision path (unchanged pre-WOR-84 behavior — never a wrong click).
+    Never raises.
+    """
+    if not _PSUTIL_OK:
+        return False
+    try:
+        from osia.tools import desktop_control as _dc
+        fw = _dc._foreground_window()
+    except Exception:
+        return False
+    if not fw:
+        return False
+    _wid, _title, pid = fw
+    if not pid:
+        return False
+    profile = (FIREFOX_PROFILE_DIR if _active_browser_type == "bidi"
+               else OSIA_PROFILE_DIR)
+    try:
+        own_pids = {p.pid for p in _processes_using_profile(profile)}
+        return int(pid) in own_pids
+    except Exception:
+        return False
+
+
+def _dom_gate_ok() -> bool:
+    """True when a DOM-first click is safe: OSIA is driving a live Playwright
+    page (CDP debugger up, or a BiDi/Firefox session) AND OSIA's OWN browser is
+    the foreground window. Any condition false → the caller uses vision."""
+    if _page is None:
+        return False
+    if not (_is_cdp_alive() or _active_browser_type == "bidi"):
+        return False
+    return _foreground_is_osia_browser()
+
+
+def dom_click(description: str):
+    """WOR-84 — resolve and click ``description`` through the live page DOM.
+
+    Returns a success string when OSIA's own browser is in front and the target
+    resolves to a confident DOM element (clicked via a real ``locator.click()``).
+    Returns ``None`` on ANY miss — gate not satisfied, no live page, element not
+    found / ambiguous, an inaccessible canvas / cross-origin iframe, or any
+    exception — so ``tool_desktop_click`` falls through to its existing WOR-46
+    UIA and vision paths UNCHANGED. Never raises.
+    """
+    try:
+        if not description or not str(description).strip():
+            return None
+        description = str(description).strip()
+        if not _dom_gate_ok():
+            return None
+        from osia.tools import desktop_control as _dc
+        target_norm = _dc._normalize_label(description)
+        if not target_norm:
+            return None
+        target_tokens = frozenset(target_norm.split())
+        with _lock:
+            page = _page
+            if page is None:
+                return None
+            try:
+                if page.is_closed():
+                    return None
+            except Exception:
+                return None
+            locator, label, _score = _resolve_clickable(
+                page, target_norm, target_tokens, _dc)
+            if locator is None:
+                return None
+            try:
+                locator.click(timeout=5000)
+            except Exception:
+                # Found but not actionable (covered, detached, mid-animation):
+                # let the vision path try rather than reporting a hard failure.
+                return None
+            try:
+                url = _page_url(page)
+            except Exception:
+                url = ""
+            where = f" on {url}" if url else ""
+            matched = f" (matched {label!r})" if label else ""
+            return f"Clicked \"{description}\" via the page DOM{matched}{where}."
+    except Exception:
+        return None
 
 
 def wait_for_load() -> str:
