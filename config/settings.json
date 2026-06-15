@@ -1,12 +1,12 @@
 {
   "selected_model": "deepseek-v4-pro",
   "tts_provider": "google",
-  "tts_voice": "Leda",
+  "tts_voice": "Kore",
   "stt_provider": "groq",
   "stt_fallback_provider": "local",
   "stt_local_model": "small",
   "stt_groq_model": "whisper-large-v3-turbo",
-  "language": "fr",
+  "language": "en",
   "show_capsule": true,
   "time_format": "24h",
   "ai_hierarchy": {
@@ -17,19 +17,18 @@
       "groq:llama-3.3-70b-versatile"
     ],
     "medium": [
-      "google:gemini-2.5-flash-lite",
-      "google:gemini-2.5-flash",
       "deepseek:deepseek-v4-flash",
+      "google:gemini-3-flash-preview",
       "groq:llama-3.3-70b-versatile"
     ]
   },
   "ai_hierarchy_enabled": false,
   "vision_provider": "google",
-  "vision_model": "gemini-2.5-flash-lite",
+  "vision_model": "gemini-3.5-flash",
   "liveapi_enabled": false,
   "liveapi_provider": "google",
   "liveapi_model": "gemini-2.5-flash-live",
-  "wake_word_enabled": true,
+  "wake_word_enabled": false,
   "wake_greeting_enabled": true,
   "wake_greeting_text": "bonjour, monsieur !",
   "cron_jobs": [],
@@ -54,12 +53,16 @@
     }
   },
   "api_fallbacks": {},
-  "api_key_fallbacks": {},
+  "api_key_fallbacks": {
+    "google": [
+      "AQ.Ab8RN6L6KDglxV5JrbbNWplYxfgF03gcy4LvMYxAydQLrEzEUA"
+    ]
+  },
   "skills_enabled": {},
   "island_shape": "capsule",
   "island_dock_side": null,
-  "island_x": 829,
-  "island_y": 427,
+  "island_x": 874,
+  "island_y": 273,
   "smart_routing": false,
   "parler_voice_description": null
 }
