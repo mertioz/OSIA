@@ -2113,19 +2113,39 @@ def _screens_changed(img_path_a: str, img_path_b: str, threshold: float = 1.0) -
 
 _REFINE_CROP_PX = 300   # side of the square crop used by the fine (2nd-pass) locate
 
+# Zoom factor for the 2nd-pass crop (WOR-46 vol2). The crop is upscaled by this
+# factor with LANCZOS before being sent to the vision model, so the element is
+# genuinely LARGER on the image the model sees (a 30px button becomes 60px at
+# Z=2) — that is what gives the refinement pass real sub-pixel precision over the
+# coarse full-screen locate. The model then answers in UPSCALED-crop pixel space,
+# so the crop→screen remap MUST divide the model's coordinates by this factor
+# (see _vision_refine_crop: fx = x0 + cx/Z). The two MUST stay in lockstep: an
+# off-by-Z here would send the click to Z× the intended offset. Single tunable
+# constant; 2 is a safe default (3 zooms harder but enlarges the file / latency).
+_REFINE_ZOOM = 2
+
 # Max distance (px) the 2nd-pass refinement may move the click from the coarse
 # point. A genuine refinement only NUDGES the target (a few px to a few tens of
 # px) — the crop is only 300px wide, so a centred crop can never honestly move
 # the point more than ~150px. Anything beyond that means the refinement drifted
 # (vision returned bad/absolute coords) → discard it and keep the coarse point.
+# This is measured in SCREEN pixels AFTER the /Z remap (never on upscaled coords).
+# Near a screen edge _crop_window clamps the origin so the coarse point sits
+# off-centre and the crop legitimately reaches further on one side — the guard is
+# relaxed for that case in _refine_click_target (max of this and the crop's real
+# per-axis reach) so a genuine far-side refinement isn't falsely rejected.
 _MAX_REFINE_DRIFT_PX = 150
 
 # A/B toggle for the 2nd-pass fine-locate refinement in tool_desktop_click.
 # Override at runtime with the env var DESKTOP_CLICK_REFINE (1/true/yes/on to
-# enable, 0/false/no/off to disable). Default is currently FALSE: the coarse
-# full-screen locate lands within a few px of the target, while the refinement
-# pass was observed DRIFTING FURTHER away — keeping it off isolates (and lets us
-# verify) the accurate coarse-only path. Flip the env var to re-enable for A/B.
+# enable, 0/false/no/off to disable). Default is FALSE pending live A/B
+# validation: WOR-46 vol2 added the missing real ZOOM (the crop is now upscaled
+# by _REFINE_ZOOM so the model sees the element genuinely larger) and made the
+# crop→screen remap zoom-aware (divide by Z, in lockstep with the upscale), which
+# is what the earlier "drifts further away" observation was caused by (no zoom →
+# no added precision). The default stays OFF until that fix is confirmed reliably
+# better than coarse-only on a real no-accessibility app (e.g. Steam); enable via
+# the env var to run the A/B without a code change.
 _REFINE_DEFAULT = False
 
 
@@ -2160,6 +2180,13 @@ def _vision_refine_crop(path: str, description: str, x0: int, y0: int,
     ANY failure / not-found / out-of-crop result so the caller keeps the coarse
     coordinates (best-effort refinement — it must never fail the click).
 
+    ``cw``/``ch`` are the NATIVE (screen-space) crop dimensions. The image saved
+    at ``path`` was upscaled by ``_REFINE_ZOOM`` (Z), so the model sees a
+    ``(cw*Z) x (ch*Z)`` image and answers in that UPSCALED pixel space. The
+    remap therefore divides by Z to return to screen pixels — kept in lockstep
+    with the upscale in :func:`_refine_click_target`: ``fx = x0 + cx/Z``,
+    ``fy = y0 + cy/Z``.
+
     Mirrors :func:`_vision_locate`'s key_chain rotation and strict-JSON contract,
     on a small crop and with a refinement prompt (CLAUDE.md: every new vision
     call site rotates keys via ``with_key_rotation``)."""
@@ -2177,13 +2204,18 @@ def _vision_refine_crop(path: str, description: str, x0: int, y0: int,
         with open(path, "rb") as fh:
             b64 = base64.b64encode(fh.read()).decode("ascii")
 
+        # The crop on disk was upscaled by Z (LANCZOS) in _refine_click_target, so
+        # the model sees a (cw*Z) x (ch*Z) image and must answer in that space.
+        zoom = _REFINE_ZOOM
+        uw, uh = cw * zoom, ch * zoom
+
         prompt = (
-            f"You are looking at a zoomed-in {cw}x{ch}-pixel CROP of a computer "
+            f"You are looking at a zoomed-in {uw}x{uh}-pixel CROP of a computer "
             "screen; the top-left of this crop is (0,0). The mouse cursor needs to "
             f"click on this element: \"{description}\".\n"
             "Give the corrected coordinates of the CENTER of that element, measured "
-            "WITHIN this crop (relative to the crop's own top-left). For reference, "
-            f"the crop's top-left (0,0) is at screen position ({x0},{y0}).\n"
+            "WITHIN this crop image (relative to the crop's own top-left, in this "
+            f"image's own {uw}x{uh} pixels).\n"
             "Reply with ONLY a JSON object — no prose, no markdown fences.\n"
             "If you can see it: {\"found\": true, \"x\": <int>, \"y\": <int>} "
             "(crop-relative pixels).\n"
@@ -2234,16 +2266,21 @@ def _vision_refine_crop(path: str, description: str, x0: int, y0: int,
             return None
         cx = int(round(float(xv)))
         cy = int(round(float(yv)))
-        # The corrected point must land inside the crop; otherwise the refinement
-        # is bogus (model hallucinated) -> discard and keep the coarse target.
-        if not (0 <= cx < cw and 0 <= cy < ch):
+        # The corrected point must land inside the UPSCALED crop the model saw
+        # (cw*Z x ch*Z); otherwise the refinement is bogus (model hallucinated /
+        # leaked absolute coords) -> discard and keep the coarse target.
+        if not (0 <= cx < uw and 0 <= cy < uh):
             print(f"[DESKTOP-REFINE] vision crop-relative ({cx},{cy}) outside "
-                  f"crop {cw}x{ch} — discarding refinement")
+                  f"upscaled crop {uw}x{uh} (Z={zoom}) — discarding refinement")
             return None
-        fx, fy = x0 + cx, y0 + cy
-        # Crop→screen conversion: crop top-left (x0,y0) + crop-relative (cx,cy).
-        print(f"[DESKTOP-REFINE] crop origin=({x0},{y0}) size={cw}x{ch} "
-              f"vision crop-relative=({cx},{cy}) -> screen=({fx},{fy})")
+        # Crop→screen conversion (zoom-aware, LOCKSTEP with the Z upscale): the
+        # model answered in upscaled-crop pixels, so divide by Z before adding the
+        # crop origin. fx = x0 + cx/Z, fy = y0 + cy/Z.
+        fx = int(round(x0 + cx / zoom))
+        fy = int(round(y0 + cy / zoom))
+        print(f"[DESKTOP-REFINE] crop origin=({x0},{y0}) native={cw}x{ch} "
+              f"upscaled={uw}x{uh} (Z={zoom}) vision upscaled-relative=({cx},{cy}) "
+              f"-> screen=({fx},{fy})")
         return (fx, fy)
     except Exception:
         return None
@@ -2274,30 +2311,57 @@ def _refine_click_target(x: int, y: int, description: str, _dc):
             return x, y, False
         crop_path = str(Path(tempfile.gettempdir()) / "osia_desktop_crop.png")
         try:
+            # Pillow ≥9.1 moved the resampling enum to Image.Resampling; fall back
+            # to the (deprecated) top-level alias on older Pillow.
+            _lanczos = getattr(Image, "Resampling", Image).LANCZOS
             with Image.open(refine_shot) as im:
                 iw, ih = im.size
                 x0, cw = _crop_window(x, _REFINE_CROP_PX, iw)
                 y0, ch = _crop_window(y, _REFINE_CROP_PX, ih)
-                im.crop((x0, y0, x0 + cw, y0 + ch)).save(crop_path)
+                crop = im.crop((x0, y0, x0 + cw, y0 + ch))
+                # Real ZOOM (WOR-46 vol2): upscale the crop so the element is
+                # genuinely larger to the vision model — the precision the 2nd
+                # pass needs. The remap in _vision_refine_crop divides by the same
+                # _REFINE_ZOOM (lockstep). cw/ch stay NATIVE here; the model is
+                # told the upscaled cw*Z x ch*Z dims.
+                if _REFINE_ZOOM != 1:
+                    crop = crop.resize(
+                        (cw * _REFINE_ZOOM, ch * _REFINE_ZOOM), _lanczos)
+                crop.save(crop_path)
         except Exception:
             return x, y, False
         print(f"[DESKTOP-REFINE] coarse=({x},{y}) screenshot={iw}x{ih} "
-              f"crop origin=({x0},{y0}) size={cw}x{ch}")
+              f"crop origin=({x0},{y0}) native={cw}x{ch} "
+              f"upscaled={cw*_REFINE_ZOOM}x{ch*_REFINE_ZOOM} (Z={_REFINE_ZOOM})")
         refined = _vision_refine_crop(crop_path, description, x0, y0, cw, ch)
         if refined is None:
             return x, y, False
         fx, fy = refined
         # Sanity check: a real refinement only NUDGES the coarse point. If it
-        # jumped further than _MAX_REFINE_DRIFT_PX, the refinement drifted
-        # (bad conversion / hallucinated coords) -> discard, keep coarse.
+        # jumped further than the allowed drift, the refinement drifted (bad
+        # conversion / hallucinated coords) -> discard, keep coarse. Measured in
+        # SCREEN pixels, AFTER the /Z remap (refined is already screen-space).
+        #
+        # Edge-clamp handling: _crop_window centres the crop on the coarse point
+        # EXCEPT near a screen edge, where it clamps the origin so the point sits
+        # off-centre and the crop reaches further on one side. The honest per-axis
+        # reach of the crop from the coarse point is then max(point→origin,
+        # point→far-edge); for a centred 300px crop that is exactly 150 on each
+        # axis, so the guard stays _MAX_REFINE_DRIFT_PX (=150) in the common case
+        # and only WIDENS for a clamped crop — a genuine far-side refinement in a
+        # clamped crop is no longer falsely rejected, while gross jumps still are.
+        reach_x = max(x - x0, (x0 + cw) - x)
+        reach_y = max(y - y0, (y0 + ch) - y)
+        max_drift = max(_MAX_REFINE_DRIFT_PX, reach_x, reach_y)
         drift = ((fx - x) ** 2 + (fy - y) ** 2) ** 0.5
-        if drift > _MAX_REFINE_DRIFT_PX:
+        if drift > max_drift:
             print(f"[DESKTOP-REFINE] refined=({fx},{fy}) drifts {drift:.0f}px "
-                  f"from coarse ({x},{y}) > {_MAX_REFINE_DRIFT_PX}px — "
-                  f"discarding refinement, keeping coarse")
+                  f"from coarse ({x},{y}) > {max_drift:.0f}px "
+                  f"(base {_MAX_REFINE_DRIFT_PX}, crop reach {reach_x}x{reach_y}) "
+                  f"— discarding refinement, keeping coarse")
             return x, y, False
         print(f"[DESKTOP-REFINE] coarse=({x},{y}) -> refined=({fx},{fy}) "
-              f"drift={drift:.0f}px (accepted)")
+              f"drift={drift:.0f}px (max {max_drift:.0f}px, accepted)")
         return fx, fy, True
     except Exception:
         return x, y, False
@@ -2373,8 +2437,9 @@ def tool_desktop_click(description: str) -> str:
         # corrected point. Sharpens small targets (text links, tiny icons). Best-
         # effort: any hiccup (quota, vision error, not-found) falls back to the coarse
         # coordinates rather than failing the whole click. Gated by the
-        # DESKTOP_CLICK_REFINE A/B flag (default OFF — coarse-only) so the refinement
-        # can be toggled without code changes while its drift bug is investigated.
+        # DESKTOP_CLICK_REFINE A/B flag (default OFF — coarse-only) so the zoom
+        # refinement (WOR-46 vol2) can be toggled without code changes during live
+        # A/B validation on a real no-accessibility app.
         if DESKTOP_CLICK_REFINE:
             fx, fy, refined = _refine_click_target(cx, cy, description, _dc)
         else:
