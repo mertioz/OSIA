@@ -2421,6 +2421,29 @@ def tool_desktop_click(description: str) -> str:
         print(f"[WOR-46] UIA resolved \"{description}\" -> ({cx}, {cy}) "
               f"— skipping vision locate + refine.")
     else:
+        # WOR-90 — KEYBOARD-NAVIGATION tier (Windows-only), between UIA-direct
+        # (above) and vision (below). When UIA could not resolve a clickable rect,
+        # try to ACTIVATE the element by driving the keyboard: Tab/Shift+Tab across
+        # the focusable controls (and the arrows within an already-open list/menu/
+        # tree), reading the focused element via UIA after each keypress and pressing
+        # Enter/Space on the fuzzy-matched target. It ACTIVATES (rather than
+        # returning coordinates), so it runs its OWN BEFORE/AFTER screen-diff verify
+        # — it returns a success string on a VERIFIED activation, or None on ANY
+        # miss / non-Windows / no-op. None falls through UNCHANGED to the vision
+        # locate below (the last resort), so every miss reaches vision as today.
+        kbd = _dc.activate_by_keyboard(description)
+        if kbd is not None:
+            return kbd
+        # The keyboard tier presses navigation keys (Tab / arrows) before it
+        # misses, so the live screen may differ from `shot` (captured above, before
+        # the tier ran). Re-capture on Windows so the vision locate AND the
+        # BEFORE/AFTER miss-check below both run against the CURRENT screen — without
+        # this a tier-induced change (e.g. moved selection) would desync the stale
+        # `shot` and could make a missed vision click read as a false success. The
+        # tier is a pure no-op off Windows, so this is gated to keep Linux/Mac
+        # byte-identical to today; a re-capture failure leaves the prior `shot`.
+        if sys.platform == "win32":
+            _capture_screen(shot)
         loc = _vision_locate(shot, description)
         if loc.get("error"):
             return loc["error"]

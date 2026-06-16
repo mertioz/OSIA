@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import namedtuple
 
 # ---------------------------------------------------------------------------
 # Optional backend: pyautogui (Windows / Mac).
@@ -2135,5 +2136,348 @@ def resolve_element_rect(target_label: str, timeout_s: float = 0.6) -> "tuple[in
                     for ch in kids:
                         frontier.append((ch, depth + 1))
             return best_center
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# WOR-90 — KEYBOARD-NAVIGATION activation tier (Windows-only).
+#
+# A deterministic tier BETWEEN UIA-direct-click (WOR-46 resolve_element_rect) and
+# the vision fallback. When the target cannot be resolved to a clickable rect
+# (a control UIA exposes by Name but without a usable BoundingRectangle, or a
+# list / menu / tree ITEM reached by arrowing rather than by a point), drive
+# the keyboard the way a human would: Tab / Shift+Tab between focusable controls
+# (and the arrows within an already-open composite), reading the FOCUSED element via UI
+# Automation after each keypress, and ACTIVATE (Enter, or Space for a toggle) the
+# one whose Name / AutomationId fuzzy-matches the request.
+#
+# Hierarchy: deep-link -> DOM (WOR-84) -> UIA-direct (WOR-46) -> KEYBOARD-NAV
+# (here) -> vision (last resort). Safe by construction, exactly like the two tiers
+# it sits between:
+#   * Windows-only — returns None immediately on Linux / Mac / headless, so the
+#     mobile server and the Linux GUI are pure no-ops (-> vision everywhere else).
+#   * Best-effort — NEVER raises and NEVER returns an "ERROR:" string. It returns
+#     a success string only after a VERIFIED activation, otherwise None so the
+#     caller falls through to vision UNCHANGED (anti-hallucination contract held).
+#   * It ACTIVATES rather than returning coordinates, so it runs its OWN
+#     BEFORE/AFTER screen-diff (reusing agent._capture_screen / _screens_changed):
+#     the BEFORE frame is captured IMMEDIATELY before the activation keypress so
+#     the diff isolates the activation's effect from the Tab focus-ring movement —
+#     an activation that changes nothing is reported as a MISS (-> vision), never a
+#     false success.
+#   * Positive identification: it only sends keys when the foreground window AND
+#     the focused control belong to the intended app and NOT to OSIA itself (pid
+#     checks, mirroring WOR-84), so it can never Tab-spam OSIA's own popup.
+#   * Bounded: hard caps on Tab / arrow presses, plus "focus didn't move" and
+#     "cycled back to start" aborts, so it can never loop forever.
+# ---------------------------------------------------------------------------
+_KBD_MAX_TABS = 40            # hard cap on Tab presses while scanning the focus ring
+_KBD_MAX_ARROWS = 30          # hard cap on arrow presses within a composite control
+_KBD_SETTLE_S = 0.06          # let focus settle after each navigation keypress (~60ms)
+_KBD_ACTIVATE_SETTLE_S = 0.2  # let the UI react after an activation before re-capturing
+
+# Focused control types activated with SPACE (a confirmed checkbox / toggle).
+# Everything else clickable (button / link / menu item / tab / list item) uses
+# ENTER — Space only ever toggles a confirmed toggle, never "clicks" a button.
+_KBD_TOGGLE_TYPES = frozenset({"CheckBoxControl", "RadioButtonControl"})
+
+# Composite control types whose ITEMS are reached by the ARROWS rather than Tab,
+# mapped (via _kbd_arrow_keys) to the (forward, backward) arrow pair used to sweep
+# them: vertical lists/menus/trees -> Down/Up; a menu bar -> Right/Left. These move
+# a SELECTION HIGHLIGHT between named items and only COMMIT on Enter, which fits the
+# navigate-then-activate model and leaves the screen essentially unchanged on a miss.
+# Deliberately EXCLUDED: SliderControl (Right/Left changes the value, no matchable
+# items) and TabControl/TabItemControl (Right/Left switches the active page) — both
+# would mutate state with no upside; and ComboBoxControl (would require OPENING the
+# dropdown — a screen mutation — and a classic Win32 combobox keeps focus on itself
+# rather than exposing focusable options). All of these fall to the Tab ring / vision.
+_KBD_VERTICAL_TYPES = frozenset({
+    "ListControl", "ListItemControl", "MenuControl", "MenuItemControl",
+    "TreeControl", "TreeItemControl",
+})
+_KBD_HORIZONTAL_TYPES = frozenset({"MenuBarControl"})
+
+# Control types this tier is allowed to ACTIVATE (press Enter / Space on). A loose
+# fuzzy match on anything else (an EditControl, a static TextControl, a PaneControl,
+# a bare ListControl container, ...) must NOT be activated: e.g. Enter in a focused
+# text field inserts a newline, which would change the screen and be misread as a
+# successful activation. Mirrors the spec's "Enter for button/link/menuitem" intent.
+_KBD_ACTIVATABLE_TYPES = frozenset({
+    "ButtonControl", "SplitButtonControl", "HyperlinkControl",
+    "MenuItemControl", "ListItemControl", "TreeItemControl", "TabItemControl",
+    "CheckBoxControl", "RadioButtonControl",
+})
+
+# Lightweight value object for the keyboard-focused element. ``rect`` is the
+# validated bounding-rect CENTER (x, y) or None — used only as part of the focus
+# identity for the anti-loop guards, never to click.
+_FocusedElement = namedtuple(
+    "_FocusedElement",
+    "name automation_id control_type_name rect hwnd pid",
+)
+
+
+def get_focused_element():
+    """Return the currently keyboard-focused UI element as a ``_FocusedElement``
+    ``(name, automation_id, control_type_name, rect, hwnd, pid)``, or ``None`` on
+    any failure, when not on Windows, or when ``uiautomation`` is unavailable.
+
+    ``rect`` is the element's validated bounding-rect CENTER ``(cx, cy)`` (via
+    :func:`_rect_center_if_valid`, so an empty / off-screen rect yields ``None``);
+    it is used only as part of the focus identity for the anti-loop guards in
+    :func:`activate_by_keyboard`, never to click. Mirrors
+    :func:`resolve_element_rect`'s safety verbatim: Windows-only, lazy+cached
+    ``uiautomation``, per-thread COM via ``UIAutomationInitializerInThread`` and no
+    Control cached across calls — and it NEVER raises (the whole body is wrapped in
+    try/except -> ``None``)."""
+    if sys.platform != "win32":
+        return None
+    auto = _load_uiautomation()
+    if auto is None:
+        return None
+    try:
+        # COM is initialised for THIS thread (the agent runs on a worker thread in
+        # both the GUI and the mobile-server process); no Control is cached.
+        with auto.UIAutomationInitializerInThread():
+            ctrl = auto.GetFocusedControl()
+            if not ctrl:
+                return None
+            try:
+                name = ctrl.Name or ""
+            except Exception:
+                name = ""
+            try:
+                aid = ctrl.AutomationId or ""
+            except Exception:
+                aid = ""
+            try:
+                ctype = ctrl.ControlTypeName or ""
+            except Exception:
+                ctype = ""
+            try:
+                rect = _rect_center_if_valid(ctrl.BoundingRectangle)
+            except Exception:
+                rect = None
+            try:
+                hwnd = int(ctrl.NativeWindowHandle or 0)
+            except Exception:
+                hwnd = 0
+            try:
+                pid = int(ctrl.ProcessId or 0)
+            except Exception:
+                pid = 0
+            return _FocusedElement(name, aid, ctype, rect, hwnd, pid)
+    except Exception:
+        return None
+
+
+def _kbd_identity(foc):
+    """Opaque identity of a focused element for the "focus moved?" anti-loop
+    guards: window handle + validated rect-center + Name + AutomationId + control
+    type. All five fields are stable across re-reads of the SAME control, so a Tab
+    that does not move focus re-reads the same identity; including AutomationId and
+    the control type (both already populated, no extra COM cost) keeps two DISTINCT
+    nameless/rectless controls (hwnd 0, rect None, name "") from being conflated and
+    aborting the sweep prematurely."""
+    return (foc.hwnd, foc.rect, foc.name, foc.automation_id, foc.control_type_name)
+
+
+def _kbd_match_score(target_norm, target_tokens, foc) -> float:
+    """Best fuzzy 0..1 score of a focused element against the normalised target —
+    its Name first, then its AutomationId only when the Name was too weak (mirrors
+    :func:`resolve_element_rect`'s Name-then-AutomationId scoring, reusing
+    :func:`_label_score`'s word-level precision so a doubtful match stays below
+    ``_UIA_MIN_SCORE`` and falls to vision instead of pressing Enter blindly).
+
+    Returns ``0.0`` for any control type this tier must not activate (text fields,
+    static text, panes, bare list/menu containers): pressing Enter on those would
+    either do nothing or, worse, edit content (a newline in a text field) that the
+    screen-diff would misread as a successful activation."""
+    if foc.control_type_name not in _KBD_ACTIVATABLE_TYPES:
+        return 0.0
+    score = _label_score(target_norm, target_tokens, foc.name)
+    if score < _UIA_MIN_SCORE and foc.automation_id:
+        score = max(score, _label_score(target_norm, target_tokens, foc.automation_id))
+    return score
+
+
+def _kbd_arrow_keys(control_type_name):
+    """(forward, backward) arrow pair to sweep an ALREADY-OPEN composite control's
+    items, or ``None`` when the focused control is not arrow-navigable (-> use the
+    Tab ring). Only controls whose arrows move a selection HIGHLIGHT between named
+    items (committed on Enter) are handled here."""
+    if control_type_name in _KBD_VERTICAL_TYPES:
+        return ("down", "up")
+    if control_type_name in _KBD_HORIZONTAL_TYPES:
+        return ("right", "left")
+    return None
+
+
+def activate_by_keyboard(description: str) -> "str | None":
+    """Best-effort keyboard activation of the native element described by
+    ``description`` (Windows-only). Returns a short SUCCESS string after a verified
+    activation, or ``None`` on EVERY non-resolution path — not on Windows,
+    ``uiautomation`` unavailable, no confident foreground / focus target, no
+    fuzzy-matched control, a focus loop, a no-op (unverified) activation, or any
+    error. ``None`` routes :func:`agent.tool_desktop_click` to its vision fallback.
+
+    It NEVER raises and NEVER returns an ``"ERROR:"`` string, so the
+    anti-hallucination tool contract holds and a Linux / Mac / headless call is a
+    pure no-op. Unlike :func:`resolve_element_rect` it ACTIVATES the target
+    (presses Enter, or Space for a confirmed toggle) instead of returning
+    coordinates, so it owns its BEFORE/AFTER screen-diff verification."""
+    if sys.platform != "win32" or _load_uiautomation() is None:
+        return None
+    try:
+        target_norm = _normalize_label(description)
+        if not target_norm:
+            return None
+        target_tokens = frozenset(target_norm.split())
+        own = os.getpid()
+
+        # Foreground-is-intended-app guard: require a real, titled, visible
+        # foreground window owned by a process that is NOT OSIA's own. Mirrors
+        # wait_for_app_window's is_new_app test (minus the before-id). Without a
+        # confident foreground target we never send keys (-> vision).
+        fg = _foreground_window()
+        if not fg:
+            return None
+        fg_id, fg_title, fg_pid = fg
+        if not fg_id or not str(fg_title).strip() or not fg_pid or fg_pid == own:
+            return None
+
+        # Reuse the agent's capture + pure-local screen-diff for the activation
+        # verify. Lazy import: this Windows-only click path only ever runs well
+        # after osia.agent is fully imported (agent.tool_desktop_click is the sole
+        # caller), so there is no import cycle.
+        try:
+            from osia.agent import _capture_screen, _screens_changed
+        except Exception:
+            return None
+
+        before = os.path.join(tempfile.gettempdir(), "osia_kbd_before.png")
+        after = os.path.join(tempfile.gettempdir(), "osia_kbd_after.png")
+
+        def _confirmed(foc):
+            # Positive identification (WOR-84 style): a real focused control that
+            # lives in the foreground, non-OSIA app — never OSIA's own window.
+            return (bool(foc) and bool(foc.pid)
+                    and foc.pid != own and foc.pid == fg_pid)
+
+        def _activate(foc):
+            """Capture BEFORE, press the activation key, capture AFTER, and return a
+            SUCCESS string iff the screen visibly changed — else ``None`` (the
+            activation was a no-op, i.e. a MISS, so the caller falls to vision).
+            Space ONLY for a confirmed checkbox/toggle; Enter for everything else.
+            The BEFORE frame is captured here, immediately before the keypress, so
+            the diff isolates the activation from the Tab focus-ring movement."""
+            key = "space" if foc.control_type_name in _KBD_TOGGLE_TYPES else "enter"
+            if _capture_screen(before) is not None:   # cannot verify -> don't risk it
+                return None
+            # Re-confirm focus AFTER the (latency-heavy) full-screen BEFORE capture
+            # and IMMEDIATELY before the keypress: press_key targets whatever the OS
+            # currently focuses, and focus could have moved during the capture (a
+            # toast / dialog stealing it). If focus is no longer confidently on the
+            # very control we matched, abort to vision rather than send a key blind.
+            recheck = get_focused_element()
+            if not _confirmed(recheck) or _kbd_identity(recheck) != _kbd_identity(foc):
+                return None
+            r = press_key(key)
+            if isinstance(r, str) and r.upper().startswith("ERROR"):
+                return None
+            time.sleep(_KBD_ACTIVATE_SETTLE_S)
+            if _capture_screen(after) is not None:
+                return None
+            if _screens_changed(before, after):
+                label = foc.name or foc.control_type_name or description
+                return f'Activated "{description}" by keyboard ({key} on "{label}").'
+            return None                               # no visible change -> MISS
+
+        def _sweep(fwd, bwd, max_steps):
+            """Sweep the focus ring with ``fwd`` (Tab / Down / Right), tracking the
+            BEST fuzzy match. An EXACT match is activated on the spot; otherwise the
+            best above-threshold match is recovered with ``bwd`` (Shift+Tab / Up /
+            Left) and activated. Bounded by ``max_steps`` plus "focus didn't move"
+            and "cycled back to start" aborts. Returns a success string or None.
+
+            Why best-of-ring rather than first-above-threshold: activation is
+            irreversible, and a loose request ("save") matches both "Save" (1.0) and
+            "Save As" (0.9) — picking the best avoids pressing Enter on the wrong
+            control."""
+            foc = get_focused_element()
+            if not _confirmed(foc):
+                return None
+            start_id = _kbd_identity(foc)
+            best_score = _kbd_match_score(target_norm, target_tokens, foc)
+            best_id = start_id
+            if best_score >= 0.999:                   # exact at the start -> done
+                return _activate(foc)
+            prev_id = start_id
+            for _ in range(max_steps):
+                r = press_key(fwd)
+                if isinstance(r, str) and r.upper().startswith("ERROR"):
+                    return None
+                time.sleep(_KBD_SETTLE_S)
+                foc = get_focused_element()
+                if not _confirmed(foc):
+                    break
+                cur_id = _kbd_identity(foc)
+                if cur_id == prev_id:                 # focus didn't move -> stuck/end
+                    break
+                if cur_id == start_id:                # full ring traversed
+                    break
+                score = _kbd_match_score(target_norm, target_tokens, foc)
+                if score >= 0.999:                    # exact -> activate now
+                    return _activate(foc)
+                if score > best_score:
+                    best_score, best_id = score, cur_id
+                prev_id = cur_id
+            if best_score < _UIA_MIN_SCORE:
+                return None
+            # Overshoot recovery: the best match was passed during the forward
+            # sweep — step back toward it and activate once focus lands on it again
+            # (identity match, bounded, with its own "focus didn't move" abort).
+            foc = get_focused_element()
+            if foc is not None and _confirmed(foc) and _kbd_identity(foc) == best_id:
+                return _activate(foc)
+            prev_id = _kbd_identity(foc) if foc is not None else None
+            for _ in range(max_steps + 3):
+                r = press_key(bwd)
+                if isinstance(r, str) and r.upper().startswith("ERROR"):
+                    return None
+                time.sleep(_KBD_SETTLE_S)
+                foc = get_focused_element()
+                if not _confirmed(foc):
+                    return None
+                cur_id = _kbd_identity(foc)
+                if cur_id == best_id:
+                    return _activate(foc)
+                if cur_id == prev_id:                 # backward focus stuck -> give up
+                    return None
+                prev_id = cur_id
+            return None
+
+        # Keyboard focus must already sit inside the intended foreground, non-OSIA
+        # app before we drive the keyboard (positive identification). If not, the
+        # focus is somewhere we must not Tab-spam -> fall to vision.
+        first = get_focused_element()
+        if not _confirmed(first):
+            return None
+
+        # (A) In-element navigation when focus already rests on a composite control
+        # whose items are reached by the ARROWS (an already-open menu / list / tree,
+        # or a menu bar). The arrows only move a selection HIGHLIGHT between named
+        # items (Enter commits), so a miss leaves the screen essentially as we found
+        # it; on a miss we go straight to vision rather than Tab-spamming out of the
+        # composite. We deliberately do NOT open closed comboboxes here (opening
+        # mutates the screen, and a focus-retaining classic combobox can't be matched
+        # item-by-item) — a focused combobox falls to the Tab ring / vision instead.
+        arrows = _kbd_arrow_keys(first.control_type_name)
+        if arrows:
+            return _sweep(arrows[0], arrows[1], _KBD_MAX_ARROWS)
+
+        # (B) Tab ring across the top-level focusable controls.
+        return _sweep("tab", "shift+tab", _KBD_MAX_TABS)
     except Exception:
         return None
