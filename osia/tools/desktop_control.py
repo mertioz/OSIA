@@ -2172,8 +2172,8 @@ def resolve_element_rect(target_label: str, timeout_s: float = 0.6) -> "tuple[in
 #   * Bounded: hard caps on Tab / arrow presses, plus "focus didn't move" and
 #     "cycled back to start" aborts, so it can never loop forever.
 # ---------------------------------------------------------------------------
-_KBD_MAX_TABS = 40            # hard cap on Tab presses while scanning the focus ring
-_KBD_MAX_ARROWS = 30          # hard cap on arrow presses within a composite control
+_KBD_MAX_TABS = 120           # hard cap on Tab presses while scanning the focus ring
+_KBD_MAX_ARROWS = 60          # hard cap on arrow presses within a composite control
 _KBD_SETTLE_S = 0.06          # let focus settle after each navigation keypress (~60ms)
 _KBD_ACTIVATE_SETTLE_S = 0.2  # let the UI react after an activation before re-capturing
 
