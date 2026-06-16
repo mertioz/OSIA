@@ -160,6 +160,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Sprache der Oberfläche.",
         "es": "Idioma de la interfaz.",
     },
+    "settings.language_desc": {
+        "en": "Sets the language of every menu and spoken reply, plus how clocks are shown. Pick your language and time format — the interface updates instantly.",
+        "fr": "Définit la langue de tous les menus et des réponses vocales, ainsi que l'affichage de l'heure. Choisissez votre langue et votre format horaire — l'interface se met à jour aussitôt.",
+        "zh": "设置所有菜单和语音回复的语言，以及时间的显示方式。选择您的语言和时间格式 — 界面会立即更新。",
+        "ja": "すべてのメニューと音声応答の言語、および時刻の表示方法を設定します。言語と時刻形式を選ぶと、インターフェースが即座に更新されます。",
+        "de": "Legt die Sprache aller Menüs und gesprochenen Antworten sowie die Uhrzeitanzeige fest. Wählen Sie Ihre Sprache und Ihr Zeitformat — die Oberfläche wird sofort aktualisiert.",
+        "es": "Define el idioma de todos los menús y las respuestas habladas, además de cómo se muestra la hora. Elige tu idioma y formato de hora — la interfaz se actualiza al instante.",
+    },
     "settings.time_format": {
         "en": "Time format",
         "fr": "Format de l'heure",
@@ -200,6 +208,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ja": "テキスト・チャットモデル用の API キー。",
         "de": "API-Schlüssel für Text- und Chat-Modelle.",
         "es": "Claves API para modelos de texto y chat.",
+    },
+    "settings.ai_providers_desc": {
+        "en": "These are the language models that power OSIA's conversation, reasoning, and tool use. Choose your main provider and paste its API key; add a paired vision model if your main model can't read images.",
+        "fr": "Ce sont les modèles de langage qui alimentent la conversation, le raisonnement et l'utilisation d'outils d'OSIA. Choisissez votre fournisseur principal et collez sa clé API ; ajoutez un modèle vision associé si votre modèle principal ne lit pas les images.",
+        "zh": "这些是为 OSIA 的对话、推理和工具使用提供动力的语言模型。选择您的主要提供商并粘贴其 API 密钥；如果主模型无法处理图像，请添加一个配套的视觉模型。",
+        "ja": "これらは OSIA の会話・推論・ツール利用を支える言語モデルです。メインプロバイダーを選んで API キーを貼り付けてください。メインモデルが画像を読めない場合は、連携ビジョンモデルを追加します。",
+        "de": "Dies sind die Sprachmodelle, die OSIAs Konversation, Schlussfolgern und Werkzeugnutzung antreiben. Wählen Sie Ihren Hauptanbieter und fügen Sie dessen API-Schlüssel ein; ergänzen Sie ein verknüpftes Vision-Modell, falls Ihr Hauptmodell keine Bilder lesen kann.",
+        "es": "Estos son los modelos de lenguaje que impulsan la conversación, el razonamiento y el uso de herramientas de OSIA. Elige tu proveedor principal y pega su clave API; añade un modelo de visión asociado si tu modelo principal no puede leer imágenes.",
     },
     # — Vision companion model (WOR-25): shown when the main model can't see —
     "settings.vision_model": {
@@ -247,6 +263,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Sprachausgabe — wie OSIA spricht.",
         "es": "Texto a voz — cómo habla OSIA.",
     },
+    "settings.voice_providers_desc": {
+        "en": "This controls the voice OSIA uses to speak back to you. Local (Kokoro) is free, private, and needs no key; OpenAI and Google offer more natural cloud voices but require an API key.",
+        "fr": "Ceci contrôle la voix qu'OSIA utilise pour vous répondre. Local (Kokoro) est gratuit, confidentiel et ne nécessite aucune clé ; OpenAI et Google proposent des voix cloud plus naturelles mais demandent une clé API.",
+        "zh": "这里控制 OSIA 回复时使用的语音。本地 (Kokoro) 免费、私密且无需密钥；OpenAI 和 Google 提供更自然的云端语音，但需要 API 密钥。",
+        "ja": "OSIA が返答に使う音声を選びます。ローカル (Kokoro) は無料でプライベート、キーも不要です。OpenAI と Google はより自然なクラウド音声を提供しますが、API キーが必要です。",
+        "de": "Hier legen Sie die Stimme fest, mit der OSIA antwortet. Lokal (Kokoro) ist kostenlos, privat und benötigt keinen Schlüssel; OpenAI und Google bieten natürlichere Cloud-Stimmen, erfordern aber einen API-Schlüssel.",
+        "es": "Esto controla la voz que OSIA usa para responderte. Local (Kokoro) es gratis, privada y no necesita clave; OpenAI y Google ofrecen voces en la nube más naturales pero requieren una clave API.",
+    },
     "tts.local_option": {
         "en": "Local (Kokoro)",
         "fr": "Local (Kokoro)",
@@ -279,6 +303,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ja": "音声認識 — マイクの文字起こし。",
         "de": "Spracherkennung — Mikrofon-Transkription.",
         "es": "Voz a texto — transcripción del micrófono.",
+    },
+    "settings.whisper_providers_desc": {
+        "en": "This decides how OSIA turns your speech into text. Local runs free and offline; Groq is faster in the cloud but needs its key — set a fallback so transcription keeps working if one fails.",
+        "fr": "Ceci détermine comment OSIA transforme votre parole en texte. Local fonctionne gratuitement et hors ligne ; Groq est plus rapide dans le cloud mais nécessite sa clé — définissez un secours pour que la transcription continue si l'un échoue.",
+        "zh": "这里决定 OSIA 如何将您的语音转换为文字。本地免费且可离线运行；Groq 在云端速度更快但需要密钥 — 设置备用提供商以便其中一个失败时转录能继续进行。",
+        "ja": "OSIA が音声をどのように文字へ変換するかを決めます。ローカルは無料でオフラインでも動作し、Groq はクラウドで高速ですがキーが必要です。どちらかが失敗しても文字起こしが続くよう、フォールバックを設定してください。",
+        "de": "Hier wird festgelegt, wie OSIA Ihre Sprache in Text umwandelt. Lokal läuft kostenlos und offline; Groq ist in der Cloud schneller, benötigt aber seinen Schlüssel — legen Sie ein Ausweichsystem fest, damit die Transkription weiterläuft, wenn einer ausfällt.",
+        "es": "Esto decide cómo OSIA convierte tu voz en texto. Local funciona gratis y sin conexión; Groq es más rápido en la nube pero necesita su clave — define un respaldo para que la transcripción siga funcionando si uno falla.",
     },
     "stt.local_name": {
         "en": "faster-whisper (local)",
@@ -378,6 +410,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Kopplungstoken für die OSIA-Mobil-App.",
         "es": "Token de emparejamiento para la app móvil OSIA.",
     },
+    "settings.mobile_desc": {
+        "en": "This token pairs the OSIA mobile app with this computer so you can talk to OSIA from your phone. Treat it like a password; tap Show to pair, or Regenerate to revoke it everywhere if it may have leaked.",
+        "fr": "Ce jeton associe l'application mobile OSIA à cet ordinateur pour que vous puissiez parler à OSIA depuis votre téléphone. Traitez-le comme un mot de passe ; appuyez sur Afficher pour l'appairer, ou sur Régénérer pour le révoquer partout s'il a pu être compromis.",
+        "zh": "此令牌将 OSIA 移动应用与这台电脑配对，让您可以通过手机与 OSIA 对话。请像对待密码一样对待它；点击「显示」进行配对，或点击「重新生成」以在可能泄露时在所有设备上吊销它。",
+        "ja": "このトークンは OSIA モバイルアプリをこのコンピューターと連携させ、スマートフォンから OSIA と話せるようにします。パスワードのように扱ってください。「表示」をタップしてペアリングし、漏えいの恐れがある場合は「再生成」ですべての端末から無効化できます。",
+        "de": "Dieses Token koppelt die OSIA-Mobil-App mit diesem Computer, damit Sie vom Telefon aus mit OSIA sprechen können. Behandeln Sie es wie ein Passwort; tippen Sie auf Anzeigen zum Koppeln oder auf Neu generieren, um es überall zu widerrufen, falls es durchgesickert sein könnte.",
+        "es": "Este token vincula la app móvil de OSIA con esta computadora para que puedas hablar con OSIA desde tu teléfono. Trátalo como una contraseña; toca Mostrar para emparejar, o Regenerar para revocarlo en todas partes si pudo filtrarse.",
+    },
     "settings.mobile_token": {
         "en": "Token",
         "fr": "Jeton",
@@ -473,6 +513,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "es": "Cadenas de respaldo ordenadas. OSIA dirige cada tarea al primer "
               "modelo y baja por la lista si encuentra un error técnico.",
     },
+    "settings.ai_hierarchy_desc": {
+        "en": "OSIA can route each task down an ordered list of models, falling back to the next one on a technical error like a rate limit or outage. Leave it off to use a single model, or turn it on for resilience across the Heavy and Medium tiers.",
+        "fr": "OSIA peut acheminer chaque tâche le long d'une liste ordonnée de modèles, en passant au suivant en cas d'erreur technique comme une limite de débit ou une panne. Laissez-le désactivé pour n'utiliser qu'un seul modèle, ou activez-le pour plus de robustesse sur les niveaux Heavy et Medium.",
+        "zh": "OSIA 可以按顺序尝试多个模型执行每项任务，在遇到限流或宕机等技术错误时自动切换到下一个。不需要时可保持关闭，或启用它以在 Heavy 和 Medium 两个层级获得更强的容错能力。",
+        "ja": "OSIA は各タスクを順序付きのモデルリストに沿って処理し、レート制限や障害などの技術的エラー時には次のモデルへ切り替えます。単一モデルだけを使う場合はオフのままにし、Heavy と Medium の各階層で耐障害性を高めたい場合はオンにします。",
+        "de": "OSIA kann jede Aufgabe durch eine geordnete Liste von Modellen leiten und bei einem technischen Fehler wie einem Ratenlimit oder Ausfall zum nächsten wechseln. Lassen Sie es aus, um ein einziges Modell zu nutzen, oder aktivieren Sie es für erhöhte Ausfallsicherheit über die Stufen Heavy und Medium.",
+        "es": "OSIA puede encaminar cada tarea por una lista ordenada de modelos, pasando al siguiente ante un error técnico como un límite de tasa o una caída. Déjalo desactivado para usar un único modelo, o actívalo para mayor resiliencia en los niveles Heavy y Medium.",
+    },
     "settings.hierarchy_heavy": {
         "en": "Heavy tasks",
         "fr": "Tâches lourdes",
@@ -546,6 +594,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Natives Sprache-zu-Sprache — umgeht Whisper und TTS.",
         "es": "Voz a voz nativa — omite Whisper y la síntesis de voz.",
     },
+    "settings.liveapi_desc": {
+        "en": "Live API is a real-time, speech-to-speech mode where the model listens and speaks directly, skipping separate transcription and synthesis. It feels more natural but uses more API quota, and your STT and TTS settings are bypassed while it's on.",
+        "fr": "Live API est un mode voix-à-voix en temps réel où le modèle écoute et parle directement, sans étape distincte de transcription ni de synthèse. C'est plus naturel mais cela consomme davantage de quota d'API, et vos réglages STT et TTS sont contournés lorsqu'il est actif.",
+        "zh": "Live API 是一种实时的语音对语音模式，模型直接聆听和说话，跳过单独的转录与合成步骤。它更自然，但会消耗更多 API 配额，启用时您的 STT 和 TTS 设置将被绕过。",
+        "ja": "Live API はリアルタイムの音声対音声モードで、モデルが直接聞いて話し、別個の文字起こしや音声合成を省きます。より自然に感じられますが API の使用量は増え、有効な間は STT と TTS の設定はバイパスされます。",
+        "de": "Live-API ist ein Echtzeit-Sprache-zu-Sprache-Modus, in dem das Modell direkt zuhört und spricht und separate Transkription und Synthese überspringt. Das wirkt natürlicher, verbraucht aber mehr API-Kontingent, und Ihre STT- und TTS-Einstellungen werden währenddessen umgangen.",
+        "es": "Live API es un modo de voz a voz en tiempo real en el que el modelo escucha y habla directamente, omitiendo la transcripción y la síntesis por separado. Resulta más natural pero consume más cuota de API, y tus ajustes de STT y TTS se omiten mientras está activo.",
+    },
     "liveapi.enabled": {
         "en": "Enable Live API voice-to-voice",
         "fr": "Activer la Live API voix-à-voix",
@@ -596,6 +652,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
               "zugehört wird.",
         "es": "Decir un breve saludo cuando dices «OSIA», antes de escuchar.",
     },
+    "settings.wake_greeting_desc": {
+        "en": "OSIA can listen in the background for the wake word “OSIA” so you can start hands-free. When this is on, it speaks a short greeting to confirm it heard you before listening — write your own or use the default.",
+        "fr": "OSIA peut écouter en arrière-plan le mot d'activation « OSIA » pour que vous puissiez démarrer sans les mains. Lorsque c'est activé, il prononce une courte phrase pour confirmer qu'il vous a entendu avant d'écouter — rédigez la vôtre ou gardez celle par défaut.",
+        "zh": "OSIA 可以在后台聆听唤醒词「OSIA」，让您无需动手即可开始。开启后，它会先说一句简短的问候以确认听到了您，然后再开始聆听 — 您可以自定义内容或使用默认值。",
+        "ja": "OSIA はウェイクワード「OSIA」をバックグラウンドで聞き取り、手を使わずに始められます。オンにすると、聞き取りを始める前に短い挨拶を話して聞こえたことを知らせます — 自分で文章を書くか、デフォルトを使えます。",
+        "de": "OSIA kann im Hintergrund auf das Aktivierungswort „OSIA“ hören, damit Sie freihändig starten können. Wenn dies aktiviert ist, spricht es eine kurze Begrüßung, um zu bestätigen, dass es Sie gehört hat, bevor es zuhört — schreiben Sie eine eigene oder nutzen Sie die Standardvorgabe.",
+        "es": "OSIA puede escuchar en segundo plano la palabra de activación «OSIA» para que empieces sin usar las manos. Cuando está activado, dice un breve saludo para confirmar que te oyó antes de escuchar — escribe el tuyo o usa el predeterminado.",
+    },
     "wake.greeting_enabled": {
         "en": "Speak greeting on wake",
         "fr": "Dire un message à l'activation",
@@ -642,6 +706,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
               "führt die Beschreibung wie einen Sprachbefehl aus.",
         "es": "Ejecuta una tarea automáticamente según un horario. OSIA ejecuta "
               "la descripción como un comando de voz.",
+    },
+    "settings.cron_desc": {
+        "en": "Schedule OSIA to run a task on its own — write it in plain language and OSIA executes it like a spoken command. Choose a repeating interval or a one-time date, and link each task to a conversation if you like.",
+        "fr": "Planifiez OSIA pour qu'il exécute une tâche de lui-même — rédigez-la en langage courant et OSIA l'exécute comme une commande vocale. Choisissez un intervalle récurrent ou une date unique, et reliez chaque tâche à une conversation si vous le souhaitez.",
+        "zh": "安排 OSIA 自动执行任务 — 用日常语言编写任务，OSIA 会像执行语音命令一样执行它。选择重复间隔或一次性日期，也可选择将每个任务关联到某个对话。",
+        "ja": "OSIA がタスクを自動で実行するようにスケジュールします — 普段の言葉で書けば、OSIA はそれを音声コマンドのように実行します。繰り返し間隔か一度きりの日時を選び、必要に応じて各タスクを会話に紐づけられます。",
+        "de": "Planen Sie, dass OSIA eine Aufgabe selbstständig ausführt — formulieren Sie sie in normaler Sprache, und OSIA führt sie wie einen Sprachbefehl aus. Wählen Sie ein wiederkehrendes Intervall oder ein einmaliges Datum und verknüpfen Sie jede Aufgabe bei Bedarf mit einer Unterhaltung.",
+        "es": "Programa a OSIA para que ejecute una tarea por sí solo — escríbela en lenguaje natural y OSIA la ejecuta como un comando de voz. Elige un intervalo repetido o una fecha única, y vincula cada tarea a una conversación si lo deseas.",
     },
     "cron.add": {
         "en": "Add task",
@@ -800,6 +872,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
               "ein Messwert seinen Schwellenwert überschreitet.",
         "es": "Supervisa el estado del sistema y emite una alerta de voz cuando "
               "una métrica supera su umbral.",
+    },
+    "settings.heartbeat_desc": {
+        "en": "Heartbeat watches your computer's CPU, RAM, disk, and network, and speaks an alert when a metric crosses the threshold you set. Turn it on and pick the metrics to monitor, or leave it off if you don't need background checks.",
+        "fr": "La surveillance système suit le processeur, la mémoire, le disque et le réseau de votre ordinateur, et émet une alerte vocale lorsqu'une métrique dépasse le seuil que vous avez fixé. Activez-la et choisissez les métriques à surveiller, ou laissez-la désactivée si vous n'avez pas besoin de vérifications en arrière-plan.",
+        "zh": "系统监控会跟踪电脑的 CPU、内存、磁盘和网络，当某项指标超过您设定的阈值时发出语音警报。开启它并选择要监控的指标，如果不需要后台检查，则可保持关闭。",
+        "ja": "システム監視はコンピューターの CPU・メモリ・ディスク・ネットワークを監視し、指標が設定したしきい値を超えると音声で警告します。オンにして監視する指標を選んでください。バックグラウンドのチェックが不要ならオフのままにします。",
+        "de": "Die Systemüberwachung beobachtet CPU, Arbeitsspeicher, Festplatte und Netzwerk Ihres Computers und gibt eine Sprachwarnung aus, wenn ein Messwert den von Ihnen festgelegten Schwellenwert überschreitet. Schalten Sie sie ein und wählen Sie die zu überwachenden Messwerte, oder lassen Sie sie aus, wenn Sie keine Hintergrundprüfungen benötigen.",
+        "es": "El monitor del sistema vigila la CPU, la memoria, el disco y la red de tu computadora, y emite una alerta de voz cuando una métrica supera el umbral que fijaste. Actívalo y elige las métricas a vigilar, o déjalo desactivado si no necesitas comprobaciones en segundo plano.",
     },
     "heartbeat.enabled": {
         "en": "Enable system monitoring",
@@ -982,6 +1062,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "es": "Añade claves API de respaldo por proveedor. Si una clave alcanza "
               "un límite de tasa o un error de autenticación, OSIA prueba la "
               "siguiente clave antes de cambiar de modelo.",
+    },
+    "settings.api_keys_desc": {
+        "en": "Add several API keys for the same provider so OSIA keeps working when one is rate-limited or rejected. It rotates to the next key automatically before switching models — useful if you juggle multiple or free-tier keys.",
+        "fr": "Ajoutez plusieurs clés API pour un même fournisseur afin qu'OSIA continue de fonctionner lorsqu'une clé est limitée ou refusée. Il passe automatiquement à la clé suivante avant de changer de modèle — pratique si vous jonglez avec plusieurs clés ou des clés gratuites.",
+        "zh": "为同一提供商添加多个 API 密钥，这样当某个密钥被限流或拒绝时 OSIA 仍能继续工作。它会在切换模型之前自动轮换到下一个密钥 — 当您使用多个密钥或免费额度密钥时很有用。",
+        "ja": "同じプロバイダーに複数の API キーを追加しておくと、あるキーがレート制限や拒否に遭っても OSIA は動作を続けられます。モデルを切り替える前に自動的に次のキーへ切り替わるため、複数のキーや無料枠のキーを使い分ける場合に便利です。",
+        "de": "Fügen Sie mehrere API-Schlüssel für denselben Anbieter hinzu, damit OSIA weiterarbeitet, wenn einer ein Ratenlimit oder einen Authentifizierungsfehler erreicht. Es wechselt automatisch zum nächsten Schlüssel, bevor das Modell gewechselt wird — praktisch, wenn Sie mehrere oder kostenlose Schlüssel nutzen.",
+        "es": "Añade varias claves API para el mismo proveedor para que OSIA siga funcionando cuando una alcanza su límite o es rechazada. Rota automáticamente a la siguiente clave antes de cambiar de modelo, útil si manejas varias claves o claves gratuitas.",
     },
     "api_keys.select_provider": {
         "en": "Select a provider to manage its keys…",
@@ -1433,6 +1521,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Mobilen Server und Cloudflare-Tunnel beim Start ausführen.",
         "es": "Iniciar el servidor móvil y el túnel de Cloudflare al arrancar.",
     },
+    "settings.startup_desc": {
+        "en": "These services let your phone reach OSIA: the mobile server accepts the app's connection and the Cloudflare tunnel exposes it securely over the internet. Enable them to start automatically with your computer, or leave them off if you only use OSIA on this desktop.",
+        "fr": "Ces services permettent à votre téléphone d'atteindre OSIA : le serveur mobile accepte la connexion de l'application et le tunnel Cloudflare l'expose en toute sécurité sur Internet. Activez-les pour qu'ils démarrent automatiquement avec votre ordinateur, ou laissez-les désactivés si vous n'utilisez OSIA que sur ce poste.",
+        "zh": "这些服务让您的手机能够连接 OSIA：移动服务器接受应用的连接，Cloudflare 隧道则通过互联网安全地将其暴露出来。启用它们可随电脑自动启动，或如果您只在这台电脑上使用 OSIA，则保持关闭。",
+        "ja": "これらのサービスはスマートフォンから OSIA に接続できるようにします。モバイルサーバーがアプリの接続を受け付け、Cloudflare トンネルがインターネット上に安全に公開します。コンピューターと一緒に自動起動したい場合は有効にし、このデスクトップだけで OSIA を使う場合はオフのままにします。",
+        "de": "Diese Dienste ermöglichen es Ihrem Telefon, OSIA zu erreichen: Der mobile Server nimmt die Verbindung der App an, und der Cloudflare-Tunnel stellt ihn sicher über das Internet bereit. Aktivieren Sie sie, damit sie automatisch mit Ihrem Computer starten, oder lassen Sie sie aus, wenn Sie OSIA nur auf diesem Desktop nutzen.",
+        "es": "Estos servicios permiten que tu teléfono llegue a OSIA: el servidor móvil acepta la conexión de la app y el túnel de Cloudflare lo expone de forma segura por internet. Actívalos para que arranquen automáticamente con tu computadora, o déjalos desactivados si solo usas OSIA en este escritorio.",
+    },
     "settings.startup_mobile_server": {
         "en": "Mobile server",
         "fr": "Serveur mobile",
@@ -1457,6 +1553,22 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ja": "フローティングカプセル",
         "de": "Schwebende Kapsel",
         "es": "Cápsula flotante",
+    },
+    "settings.capsule_sub": {
+        "en": "Show the capsule; launch at login.",
+        "fr": "Afficher la capsule ; lancer au démarrage.",
+        "zh": "显示胶囊；登录时启动。",
+        "ja": "カプセルを表示、ログイン時に起動。",
+        "de": "Kapsel anzeigen; beim Anmelden starten.",
+        "es": "Mostrar la cápsula; lanzar al iniciar sesión.",
+    },
+    "settings.capsule_desc": {
+        "en": "The floating capsule is the small always-on-top button you click to talk to OSIA. Turn it off to keep OSIA in the tray only, or enable launch-at-login to start OSIA automatically.",
+        "fr": "La capsule flottante est le petit bouton toujours au premier plan sur lequel vous cliquez pour parler à OSIA. Désactivez-la pour garder OSIA uniquement dans la barre des tâches, ou activez le lancement au démarrage pour ouvrir OSIA automatiquement.",
+        "zh": "浮动胶囊是始终置顶的小按钮，点击它即可与 OSIA 对话。关闭它可让 OSIA 仅驻留在系统托盘中，或启用登录时启动以自动打开 OSIA。",
+        "ja": "フローティングカプセルは常に最前面に表示される小さなボタンで、クリックすると OSIA と話せます。オフにすると OSIA はトレイのみに常駐し、ログイン時に起動を有効にすると OSIA が自動的に開きます。",
+        "de": "Die schwebende Kapsel ist die kleine, stets im Vordergrund liegende Schaltfläche, die Sie anklicken, um mit OSIA zu sprechen. Schalten Sie sie aus, um OSIA nur im Infobereich zu behalten, oder aktivieren Sie den Start bei der Anmeldung, damit OSIA automatisch öffnet.",
+        "es": "La cápsula flotante es el pequeño botón siempre visible que pulsas para hablar con OSIA. Desactívala para mantener OSIA solo en la bandeja, o activa el lanzamiento al iniciar sesión para abrir OSIA automáticamente.",
     },
     "settings.show_capsule": {
         "en": "Show the floating capsule",

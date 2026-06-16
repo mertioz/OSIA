@@ -1655,6 +1655,10 @@ class _SettingsPanel(QWidget):
         self._language_sub.setWordWrap(True)
         l.addWidget(self._language_title)
         l.addWidget(self._language_sub)
+        self._language_desc = QLabel(i18n.t("settings.language_desc"))
+        self._language_desc.setObjectName("sectionDesc")
+        self._language_desc.setWordWrap(True)
+        l.addWidget(self._language_desc)
 
         self._language_combo = QComboBox()
         self._language_combo.setObjectName("voiceCombo")
@@ -1686,6 +1690,7 @@ class _SettingsPanel(QWidget):
     def _retranslate_language_section(self) -> None:
         self._language_title.setText(i18n.t("settings.language"))
         self._language_sub.setText(i18n.t("settings.language_sub"))
+        self._language_desc.setText(i18n.t("settings.language_desc"))
         self._timefmt_label.setText(i18n.t("settings.time_format"))
         self._timefmt_combo.setItemText(0, i18n.t("settings.time_format_24h"))
         self._timefmt_combo.setItemText(1, i18n.t("settings.time_format_12h"))
@@ -1715,7 +1720,15 @@ class _SettingsPanel(QWidget):
         self._capsule_title = QLabel(i18n.t("settings.capsule"))
         self._capsule_title.setObjectName("sectionTitle")
         self._capsule_title.setWordWrap(True)
+        self._capsule_sub = QLabel(i18n.t("settings.capsule_sub"))
+        self._capsule_sub.setObjectName("sectionSub")
+        self._capsule_sub.setWordWrap(True)
+        self._capsule_desc = QLabel(i18n.t("settings.capsule_desc"))
+        self._capsule_desc.setObjectName("sectionDesc")
+        self._capsule_desc.setWordWrap(True)
         l.addWidget(self._capsule_title)
+        l.addWidget(self._capsule_sub)
+        l.addWidget(self._capsule_desc)
 
         # Toggle: show / hide the floating capsule window.
         show_row = QHBoxLayout()
@@ -1779,6 +1792,10 @@ class _SettingsPanel(QWidget):
         self._startup_sub.setWordWrap(True)
         l.addWidget(self._startup_title)
         l.addWidget(self._startup_sub)
+        self._startup_desc = QLabel(i18n.t("settings.startup_desc"))
+        self._startup_desc.setObjectName("sectionDesc")
+        self._startup_desc.setWordWrap(True)
+        l.addWidget(self._startup_desc)
 
         # (unit, i18n key) — the label widget + key are tracked in
         # self._startup_labels so they re-translate on language change.
@@ -1838,6 +1855,10 @@ class _SettingsPanel(QWidget):
         self._voice_sub.setWordWrap(True)
         l.addWidget(self._voice_title)
         l.addWidget(self._voice_sub)
+        self._voice_desc = QLabel(i18n.t("settings.voice_providers_desc"))
+        self._voice_desc.setObjectName("sectionDesc")
+        self._voice_desc.setWordWrap(True)
+        l.addWidget(self._voice_desc)
 
         # Active provider selector.
         prov_row = QHBoxLayout()
@@ -1924,6 +1945,10 @@ class _SettingsPanel(QWidget):
         self._wake_sub.setWordWrap(True)
         l.addWidget(self._wake_title)
         l.addWidget(self._wake_sub)
+        self._wake_desc = QLabel(i18n.t("settings.wake_greeting_desc"))
+        self._wake_desc.setObjectName("sectionDesc")
+        self._wake_desc.setWordWrap(True)
+        l.addWidget(self._wake_desc)
 
         # Master switch for the always-on "OSIA" wake-word listener. When off,
         # the detector loop is stopped (OSIA stays reachable via the capsule
@@ -1998,6 +2023,10 @@ class _SettingsPanel(QWidget):
         self._stt_sub.setWordWrap(True)
         l.addWidget(self._stt_title)
         l.addWidget(self._stt_sub)
+        self._stt_desc = QLabel(i18n.t("settings.whisper_providers_desc"))
+        self._stt_desc.setObjectName("sectionDesc")
+        self._stt_desc.setWordWrap(True)
+        l.addWidget(self._stt_desc)
 
         # Active provider selector: faster-whisper (local) or Groq Whisper.
         prov_row = QHBoxLayout()
@@ -2102,6 +2131,10 @@ class _SettingsPanel(QWidget):
         self._liveapi_sub.setWordWrap(True)
         l.addWidget(self._liveapi_title)
         l.addWidget(self._liveapi_sub)
+        self._liveapi_desc = QLabel(i18n.t("settings.liveapi_desc"))
+        self._liveapi_desc.setObjectName("sectionDesc")
+        self._liveapi_desc.setWordWrap(True)
+        l.addWidget(self._liveapi_desc)
 
         # Master toggle — the configuration body below stays hidden until ON.
         enable_row = QHBoxLayout()
@@ -2259,6 +2292,10 @@ class _SettingsPanel(QWidget):
         self._hier_sub.setWordWrap(True)
         l.addWidget(self._hier_title)
         l.addWidget(self._hier_sub)
+        self._hier_desc = QLabel(i18n.t("settings.ai_hierarchy_desc"))
+        self._hier_desc.setObjectName("sectionDesc")
+        self._hier_desc.setWordWrap(True)
+        l.addWidget(self._hier_desc)
 
         # Per-category editor state.
         self._hier_values = {"heavy": [], "medium": []}
@@ -2478,6 +2515,10 @@ class _SettingsPanel(QWidget):
         self._cron_sub.setWordWrap(True)
         l.addWidget(self._cron_title)
         l.addWidget(self._cron_sub)
+        self._cron_desc = QLabel(i18n.t("settings.cron_desc"))
+        self._cron_desc.setObjectName("sectionDesc")
+        self._cron_desc.setWordWrap(True)
+        l.addWidget(self._cron_desc)
 
         # Source-of-truth job list + the layout its row widgets render into.
         self._cron_jobs: list[dict] = []
@@ -2843,6 +2884,10 @@ class _SettingsPanel(QWidget):
         self._hb_sub.setWordWrap(True)
         l.addWidget(self._hb_title)
         l.addWidget(self._hb_sub)
+        self._hb_desc = QLabel(i18n.t("settings.heartbeat_desc"))
+        self._hb_desc.setObjectName("sectionDesc")
+        self._hb_desc.setWordWrap(True)
+        l.addWidget(self._hb_desc)
 
         # Master toggle — the body below stays hidden until ON.
         enable_row = QHBoxLayout()
@@ -2983,6 +3028,10 @@ class _SettingsPanel(QWidget):
         self._apikeys_sub.setWordWrap(True)
         l.addWidget(self._apikeys_title)
         l.addWidget(self._apikeys_sub)
+        self._apikeys_desc = QLabel(i18n.t("settings.api_keys_desc"))
+        self._apikeys_desc.setObjectName("sectionDesc")
+        self._apikeys_desc.setWordWrap(True)
+        l.addWidget(self._apikeys_desc)
 
         self._apikeys_combo = QComboBox()
         self._apikeys_combo.setObjectName("voiceCombo")
@@ -3066,6 +3115,10 @@ class _SettingsPanel(QWidget):
         self._mobile_sub.setWordWrap(True)
         l.addWidget(self._mobile_title)
         l.addWidget(self._mobile_sub)
+        self._mobile_desc = QLabel(i18n.t("settings.mobile_desc"))
+        self._mobile_desc.setObjectName("sectionDesc")
+        self._mobile_desc.setWordWrap(True)
+        l.addWidget(self._mobile_desc)
 
         token_row = QHBoxLayout()
         token_row.setSpacing(8)
@@ -3126,6 +3179,10 @@ class _SettingsPanel(QWidget):
         self._ai_sub.setWordWrap(True)
         l.addWidget(self._ai_title)
         l.addWidget(self._ai_sub)
+        self._ai_desc = QLabel(i18n.t("settings.ai_providers_desc"))
+        self._ai_desc.setObjectName("sectionDesc")
+        self._ai_desc.setWordWrap(True)
+        l.addWidget(self._ai_desc)
 
         # Compact "Choose provider" dropdown: picking a provider reveals only
         # that provider's configuration card below, instead of stacking every
@@ -3766,11 +3823,14 @@ class _SettingsPanel(QWidget):
         self._settings_title.setText(i18n.t("settings.title"))
 
         self._capsule_title.setText(i18n.t("settings.capsule"))
+        self._capsule_sub.setText(i18n.t("settings.capsule_sub"))
+        self._capsule_desc.setText(i18n.t("settings.capsule_desc"))
         self._show_capsule_label.setText(i18n.t("settings.show_capsule"))
         self._autostart_label.setText(i18n.t("settings.autostart_gui"))
 
         self._ai_title.setText(i18n.t("settings.ai_providers"))
         self._ai_sub.setText(i18n.t("settings.ai_providers_sub"))
+        self._ai_desc.setText(i18n.t("settings.ai_providers_desc"))
         self._ai_prov_label.setText(i18n.t("settings.choose_provider"))
 
         # Vision companion (WOR-25)
@@ -3789,6 +3849,7 @@ class _SettingsPanel(QWidget):
 
         self._voice_title.setText(i18n.t("settings.voice_providers"))
         self._voice_sub.setText(i18n.t("settings.voice_providers_sub"))
+        self._voice_desc.setText(i18n.t("settings.voice_providers_desc"))
         self._voice_prov_label.setText(i18n.t("settings.active_provider"))
         self._voice_voice_label.setText(i18n.t("settings.voice"))
         self._kokoro_tag.setText(i18n.t("tts.kokoro_desc"))
@@ -3796,6 +3857,7 @@ class _SettingsPanel(QWidget):
 
         self._wake_title.setText(i18n.t("settings.wake_greeting"))
         self._wake_sub.setText(i18n.t("settings.wake_greeting_sub"))
+        self._wake_desc.setText(i18n.t("settings.wake_greeting_desc"))
         self._wake_word_label.setText(i18n.t("settings.wake_word_enabled"))
         self._wake_enabled_label.setText(i18n.t("wake.greeting_enabled"))
         self._wake_text_input.setPlaceholderText(i18n.t("wake.greeting_placeholder"))
@@ -3805,6 +3867,7 @@ class _SettingsPanel(QWidget):
 
         self._stt_title.setText(i18n.t("settings.whisper_providers"))
         self._stt_sub.setText(i18n.t("settings.whisper_providers_sub"))
+        self._stt_desc.setText(i18n.t("settings.whisper_providers_desc"))
         self._stt_prov_label.setText(i18n.t("settings.active_provider"))
         self._stt_model_label.setText(i18n.t("settings.model"))
         self._stt_groq_hint.setText(i18n.t("stt.groq_hint"))
@@ -3818,6 +3881,7 @@ class _SettingsPanel(QWidget):
 
         self._liveapi_title.setText(i18n.t("settings.liveapi"))
         self._liveapi_sub.setText(i18n.t("settings.liveapi_sub"))
+        self._liveapi_desc.setText(i18n.t("settings.liveapi_desc"))
         self._liveapi_enabled_label.setText(i18n.t("liveapi.enabled"))
         self._liveapi_prov_label.setText(i18n.t("settings.active_provider"))
         self._liveapi_model_label.setText(i18n.t("settings.model"))
@@ -3826,6 +3890,7 @@ class _SettingsPanel(QWidget):
 
         self._hier_title.setText(i18n.t("settings.ai_hierarchy"))
         self._hier_sub.setText(i18n.t("settings.ai_hierarchy_sub"))
+        self._hier_desc.setText(i18n.t("settings.ai_hierarchy_desc"))
         self._hier_labels["heavy"].setText(i18n.t("settings.hierarchy_heavy"))
         self._hier_labels["medium"].setText(i18n.t("settings.hierarchy_medium"))
         self._hier_sublabels["heavy"].setText(i18n.t("settings.hierarchy_heavy_sub"))
@@ -3841,12 +3906,14 @@ class _SettingsPanel(QWidget):
         # "no tasks" placeholder re-translate too.
         self._cron_title.setText(i18n.t("settings.cron"))
         self._cron_sub.setText(i18n.t("settings.cron_sub"))
+        self._cron_desc.setText(i18n.t("settings.cron_desc"))
         self._cron_add_btn.setText("＋ " + i18n.t("cron.add"))
         self._render_cron()
 
         # Heartbeat (Bloc 5)
         self._hb_title.setText(i18n.t("settings.heartbeat"))
         self._hb_sub.setText(i18n.t("settings.heartbeat_sub"))
+        self._hb_desc.setText(i18n.t("settings.heartbeat_desc"))
         self._hb_enabled_label.setText(i18n.t("heartbeat.enabled"))
         self._hb_interval_label.setText(i18n.t("heartbeat.interval"))
         for _name, _label_key, _hint_key, _ht in self._HB_METRICS:
@@ -3857,11 +3924,13 @@ class _SettingsPanel(QWidget):
         # the "Select a provider…" placeholder re-translates too.
         self._apikeys_title.setText(i18n.t("settings.api_keys"))
         self._apikeys_sub.setText(i18n.t("settings.api_keys_sub"))
+        self._apikeys_desc.setText(i18n.t("settings.api_keys_desc"))
         self._apikeys_hint.setText(i18n.t("api_keys.no_providers"))
         self._refresh_apikeys_providers()
 
         self._mobile_title.setText(i18n.t("settings.mobile"))
         self._mobile_sub.setText(i18n.t("settings.mobile_sub"))
+        self._mobile_desc.setText(i18n.t("settings.mobile_desc"))
         self._mobile_token_label.setText(i18n.t("settings.mobile_token"))
         self._mobile_show_btn.setText(i18n.t("settings.show"))
         self._mobile_regen_btn.setText(i18n.t("settings.regenerate"))
@@ -3870,6 +3939,7 @@ class _SettingsPanel(QWidget):
         # Startup section (autostart services)
         self._startup_title.setText(i18n.t("settings.startup"))
         self._startup_sub.setText(i18n.t("settings.startup_sub"))
+        self._startup_desc.setText(i18n.t("settings.startup_desc"))
         for _label, _label_key in self._startup_labels:
             _label.setText(i18n.t(_label_key))
 
@@ -5645,6 +5715,11 @@ class MainPopup(QWidget):
             QLabel#sectionSub {
                 font-size: 11px;
                 color: #9d9aad;
+            }
+            QLabel#sectionDesc {
+                font-size: 11px;
+                color: #8a8798;
+                line-height: 1.35;
             }
             QLabel#fieldLabel {
                 font-size: 12px;
