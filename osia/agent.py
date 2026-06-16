@@ -3540,8 +3540,23 @@ ERROR_STREAK_LIMIT = 8
 STALL_CYCLE_REPEATS = 3
 # Longest cycle length (in tool calls) the stall detector looks for.
 STALL_MAX_CYCLE_LEN = 4
+def _turn_time_limit() -> float:
+    """Wall-clock budget for a single agent turn, in seconds. Defaults to
+    300s (5 min); ``OSIA_TURN_TIME_LIMIT_SECONDS`` overrides it when set to a
+    positive number (env takes precedence)."""
+    raw = os.environ.get("OSIA_TURN_TIME_LIMIT_SECONDS")
+    if raw and raw.strip():
+        try:
+            val = float(raw.strip())
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return 300.0
+
+
 # Wall-clock budget for a single agent turn (model calls + tool execution).
-TURN_TIME_LIMIT_SECONDS = 180.0
+TURN_TIME_LIMIT_SECONDS = _turn_time_limit()
 
 
 class _AntiLoopGuard:
