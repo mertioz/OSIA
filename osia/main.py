@@ -149,6 +149,16 @@ def _persist_agent_delta(conv_id, agent, prev_history_len):
     try:
         new_msgs = agent.messages[1:][prev_history_len:]
         for m in new_msgs:
+            # WOR-83: internal model-steering frames (anti-loop / hallucination
+            # / empty-response guards) carry an _internal marker and must NEVER
+            # be persisted. add_message stores only role+content, so a stored
+            # steering frame loses its marker and resurfaces on reload as the
+            # user's own bubble — in the desktop popup AND on mobile, which
+            # share this conversation store. This is the desktop counterpart of
+            # the server's exported_history() filter (the single persistence
+            # boundary for the local app).
+            if isinstance(m, dict) and m.get("_internal"):
+                continue
             conversations.add_message(
                 conv_id, m.get("role"), m.get("content", ""),
             )

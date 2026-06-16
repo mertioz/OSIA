@@ -3056,6 +3056,13 @@ def _displayable_history(history: list) -> list[dict]:
     for msg in history:
         if not isinstance(msg, dict):
             continue
+        # WOR-83: belt-and-suspenders — never render an internal model-steering
+        # frame as a chat bubble. The primary guard is exported_history() (these
+        # are filtered before persistence, so the stored history fed here never
+        # carries the marker), but drop it here too in case one ever reaches a
+        # frame straight from in-memory history.
+        if msg.get("_internal"):
+            continue
         role = msg.get("role")
         if role not in ("user", "assistant"):
             continue

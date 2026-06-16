@@ -3842,6 +3842,15 @@ class OSIAAgent:
         for m in self.messages[1:]:
             if not isinstance(m, dict):
                 continue
+            # WOR-83: internal model-steering frames (anti-loop / hallucination
+            # / empty-response guards) live in self.messages so the model reads
+            # them, but must NEVER be persisted — once stored they lose the
+            # _internal marker (add_message keeps only role+content) and would
+            # resurface on reload as a user bubble. This is the single
+            # persistence boundary, so dropping them here keeps them out of the
+            # store AND every conversation_history frame at once.
+            if m.get("_internal"):
+                continue
             if m.get("role") == "system":
                 continue
             content = str(m.get("content", ""))
@@ -4079,6 +4088,70 @@ class OSIAAgent:
             return str(status)
         return type(e).__name__
 
+    def _wire_messages(self) -> list:
+        """Build the exact message list sent to the provider.
+
+        Two wire-only normalisations are applied to a SHALLOW copy — never to
+        ``self.messages`` itself, so conversation history, persistence and what
+        the model reads stay untouched:
+
+        1. **Strip internal-only keys (WOR-83).** Model-steering frames added by
+           the anti-loop / hallucination / empty-response guards carry an
+           ``_internal`` marker (and, defensively, any future ``_``-prefixed
+           bookkeeping key). The OpenAI-compatible client forwards unknown
+           message keys to the provider and several reject them with a 400, so
+           every ``_``-prefixed key is removed here. ``role`` and ``content``
+           are kept verbatim — the model still reads the steering text.
+
+        2. **Coalesce consecutive same-role text frames.** Those steering frames
+           are role:``"user"`` purely to keep provider-required user/assistant
+           alternation. Once they are filtered out of the PERSISTED history
+           (see ``exported_history``), a reloaded conversation can place two
+           ``assistant`` frames back to back (tool-call record + summary), which
+           strict providers reject (DeepSeek: "does not support successive
+           user or assistant messages"; Anthropic OpenAI-compat: "Multiple
+           assistant messages in block"). Merging adjacent same-role STRING
+           frames restores the alternation invariant the codebase already
+           maintains. Frames with non-string (vision/list) content are never
+           merged, and the merge only fires when such a duplicate exists, so
+           normal turns are unaffected.
+
+        Returns ``self.messages`` unchanged (same object) when neither
+        normalisation is needed, so the common path allocates nothing.
+        """
+        msgs = self.messages
+        has_internal = any(
+            isinstance(m, dict) and any(str(k).startswith("_") for k in m)
+            for m in msgs
+        )
+        has_adjacent_dupes = any(
+            isinstance(a, dict) and isinstance(b, dict)
+            and a.get("role") == b.get("role")
+            and isinstance(a.get("content"), str)
+            and isinstance(b.get("content"), str)
+            for a, b in zip(msgs, msgs[1:])
+        )
+        if not has_internal and not has_adjacent_dupes:
+            return msgs
+
+        wire: list = []
+        for m in msgs:
+            if isinstance(m, dict):
+                m = {k: v for k, v in m.items() if not str(k).startswith("_")}
+                prev = wire[-1] if wire else None
+                if (
+                    isinstance(prev, dict)
+                    and prev.get("role") == m.get("role")
+                    and isinstance(prev.get("content"), str)
+                    and isinstance(m.get("content"), str)
+                ):
+                    prev["content"] = "\n\n".join(
+                        p for p in (prev["content"], m["content"]) if p
+                    )
+                    continue
+            wire.append(m)
+        return wire
+
     def _stream_deltas(self):
         """Yield text deltas from the OpenAI-compatible chat-completions
         stream, abstracting it so the sentence-splitting loop stays simple.
@@ -4088,7 +4161,7 @@ class OSIAAgent:
         """
         create_kwargs = {
             "model": self.model,
-            "messages": self.messages,
+            "messages": self._wire_messages(),
             "stream": True,
         }
         stream = self.client.chat.completions.create(**create_kwargs)
@@ -4299,7 +4372,7 @@ class OSIAAgent:
             else:
                 create_kwargs = {
                     "model": self.model,
-                    "messages": self.messages,
+                    "messages": self._wire_messages(),
                 }
                 response = self.client.chat.completions.create(**create_kwargs)
                 content = response.choices[0].message.content or ""
@@ -4567,7 +4640,7 @@ class OSIAAgent:
                 else:
                     create_kwargs = {
                         "model": self.model,
-                        "messages": self.messages,
+                        "messages": self._wire_messages(),
                     }
                     response = self.client.chat.completions.create(**create_kwargs)
                     # Keep the message object: native providers may return
@@ -4737,6 +4810,12 @@ class OSIAAgent:
                     )
                     self.messages.append({
                         "role": "user",
+                        # WOR-83: model-steering frame, role:"user" only so the
+                        # provider sees user/assistant alternation. Internal —
+                        # never persisted nor shown to the user (filtered by
+                        # exported_history / _displayable_history); the _internal
+                        # key is stripped from the wire by _wire_messages.
+                        "_internal": True,
                         "content": f"{notice}\n\n{guard.stop_instruction()}",
                     })
                     return self._finish_anti_loop_stop(
@@ -4948,6 +5027,9 @@ class OSIAAgent:
                     self.messages.append({"role": "assistant", "content": content})
                     self.messages.append({
                         "role": "user",
+                        # WOR-83: internal model-steering frame (see _wire_messages
+                        # / exported_history) — kept out of persistence + display.
+                        "_internal": True,
                         "content": (
                             "Your previous reply described a tool action, but it "
                             "contained no valid structured tool call, so NOTHING was "
@@ -5003,6 +5085,9 @@ class OSIAAgent:
                     })
                     self.messages.append({
                         "role": "user",
+                        # WOR-83: internal model-steering frame (see _wire_messages
+                        # / exported_history) — kept out of persistence + display.
+                        "_internal": True,
                         "content": (
                             "Ta réponse précédente était vide une fois le "
                             "balisage retiré (bloc <think> non fermé ou "
