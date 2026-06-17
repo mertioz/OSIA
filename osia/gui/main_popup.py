@@ -20,6 +20,7 @@ GUI knowing about threads or persistence.
 
 import math
 import re
+import shlex
 import threading
 import webbrowser
 from datetime import datetime, timedelta
@@ -49,6 +50,7 @@ from osia.models import (
 from osia.config import (
     load_api_keys, save_api_keys, load_settings, set_setting, set_api_key,
     get_api_key, load_mobile_token, regenerate_mobile_token,
+    get_setting, get_mcp_token, set_mcp_token, delete_mcp_token,
 )
 from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
@@ -1411,6 +1413,115 @@ class _CronConversationDialog(_PopoverDialog):
         self.accept()
 
 
+class _McpCustomDialog(_PopoverDialog):
+    """Add a custom MCP server (WOR-44 Phase 3).
+
+    Captures a name, a transport (a stdio *command* — split on spaces into
+    command + args — OR an *https URL*), an optional token and (for stdio) the
+    env-var the token should be injected into. Validates locally and exposes the
+    NON-secret server config in ``self.result_cfg`` plus ``self.result_token``;
+    the caller persists the config to ``mcp_servers`` and the token to the
+    gitignored store. It never connects — that is an explicit, separate action.
+    """
+
+    def __init__(self, parent, anchor=None):
+        super().__init__(parent, anchor=anchor)
+        self.result_cfg = None
+        self.result_token = ""
+
+        title = QLabel(i18n.t("mcp.custom_title"))
+        title.setObjectName("dialogTitle")
+        self._card_layout.addWidget(title)
+
+        hint = QLabel(i18n.t("mcp.custom_hint"))
+        hint.setObjectName("providerSub")
+        hint.setWordWrap(True)
+        self._card_layout.addWidget(hint)
+
+        def _field(label_key, placeholder_key="", password=False):
+            lab = QLabel(i18n.t(label_key))
+            lab.setObjectName("providerSub")
+            self._card_layout.addWidget(lab)
+            le = QLineEdit()
+            le.setObjectName("keyInput")
+            le.setMinimumWidth(320)
+            if placeholder_key:
+                le.setPlaceholderText(i18n.t(placeholder_key))
+            if password:
+                le.setEchoMode(QLineEdit.EchoMode.Password)
+            self._card_layout.addWidget(le)
+            return le
+
+        self._name = _field("mcp.field_name", "mcp.field_name_ph")
+        self._command = _field("mcp.field_command", "mcp.field_command_ph")
+        self._url = _field("mcp.field_url", "mcp.field_url_ph")
+        self._token = _field("mcp.field_token_optional", "mcp.field_token_ph", password=True)
+        self._token_env = _field("mcp.field_token_env_optional", "mcp.field_token_env_ph")
+
+        self._error = QLabel("")
+        self._error.setObjectName("providerSub")
+        self._error.setWordWrap(True)
+        self._error.setStyleSheet("color: #e0a3a3;")
+        self._card_layout.addWidget(self._error)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton(i18n.t("settings.close"))
+        cancel.setObjectName("ghostBtn")
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton(i18n.t("mcp.add_custom"))
+        ok.setObjectName("primaryBtn")
+        ok.setCursor(Qt.CursorShape.PointingHandCursor)
+        ok.clicked.connect(self._on_ok)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        self._card_layout.addLayout(row)
+
+    def _on_ok(self) -> None:
+        name = self._name.text().strip()
+        command = self._command.text().strip()
+        url = self._url.text().strip()
+        token = self._token.text().strip()
+        token_env = self._token_env.text().strip()
+
+        if not name:
+            self._error.setText(i18n.t("mcp.err_name"))
+            return
+        if bool(command) == bool(url):
+            # need exactly one of command / url
+            self._error.setText(i18n.t("mcp.err_transport"))
+            return
+        # Derive a stable id from the name (the namespace forbids "__").
+        sid = re.sub(r"[^A-Za-z0-9.-]+", "-", name).strip("-").lower() or "custom"
+
+        if url:
+            if not (url.startswith("https://") or url.startswith("http://")):
+                self._error.setText(i18n.t("mcp.err_url"))
+                return
+            # The manager only speaks stdio so far — a remote (HTTP) server
+            # could be saved but never connected, a silent dead-end. Refuse it
+            # (and don't store its token) until HTTP transport lands (Phase 5).
+            self._error.setText(i18n.t("mcp.err_http_soon"))
+            return
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            parts = command.split()
+        if not parts:
+            self._error.setText(i18n.t("mcp.err_transport"))
+            return
+        cfg = {
+            "id": sid, "name": name, "transport": "stdio",
+            "command": parts[0], "args": parts[1:], "url": None, "env": {},
+            "auth_type": "token" if token else "none", "enabled": False,
+            "token_env": token_env or None, "custom": True,
+        }
+        self.result_cfg = cfg
+        self.result_token = token
+        self.accept()
+
+
 class _SettingsPanel(QWidget):
     """Settings page — organised into three clearly separated provider
     sections plus mobile-token management.
@@ -1578,14 +1689,18 @@ class _SettingsPanel(QWidget):
         sec_apikeys   = self._build_apikeys_section()       # API Key Fallback
         sec_mobile    = self._build_mobile_section()        # Mobile Connection
         sec_startup   = self._build_startup_section()       # Autostart services
+        sec_mcp       = self._build_mcp_section()           # MCP / Connectors (WOR-44)
 
-        # (nav i18n key, [sections on that page]) — 6 categories, all 13 frames,
-        # each frame used exactly once.
+        # (nav i18n key, [sections on that page]) — 7 categories, all 14 frames,
+        # each frame used exactly once. MCP/Connectors gets its OWN category (not
+        # folded into Advanced) — it is a central, growing capability that
+        # warrants top-level discoverability.
         self._settings_pages = [
             ("settings.cat.general",  [sec_language, sec_capsule]),
             ("settings.cat.ai",       [sec_ai_prov, sec_hierarchy, sec_apikeys]),
             ("settings.cat.voice",    [sec_voice, sec_stt, sec_liveapi]),
             ("settings.cat.wake",     [sec_wake]),
+            ("settings.cat.mcp",      [sec_mcp]),
             ("settings.cat.mobile",   [sec_mobile, sec_startup]),
             ("settings.cat.advanced", [sec_cron, sec_heartbeat]),
         ]
@@ -1637,6 +1752,13 @@ class _SettingsPanel(QWidget):
         self._startup_timer = QTimer(self)
         self._startup_timer.setInterval(5000)
         self._startup_timer.timeout.connect(self._refresh_startup_status)
+
+        # WOR-44 — poll live MCP per-server status (a cheap in-memory snapshot
+        # from the manager) while the settings panel is visible, so a pill flips
+        # connecting→connected/failed without blocking the UI thread.
+        self._mcp_timer = QTimer(self)
+        self._mcp_timer.setInterval(1200)
+        self._mcp_timer.timeout.connect(self._refresh_mcp_status)
 
     # ── Section builders ──────────────────────────────────────────────────
 
@@ -3006,6 +3128,505 @@ class _SettingsPanel(QWidget):
             checks[name] = entry
         set_setting("heartbeat_checks", checks)
 
+    # ── MCP / Connectors (WOR-44 Phase 3) ───────────────────────────────────
+    # A preconfigured catalog of popular MCP servers (one-tap Connect) plus any
+    # user-added custom servers, each rendered as a card with a live status pill
+    # and a Connect/Disconnect toggle. Connecting drives osia.mcp.get_manager()
+    # on a BACKGROUND thread (connect() blocks until the handshake completes), so
+    # the UI never freezes; a QTimer polls the manager's in-memory status
+    # snapshot to flip pills. Non-secret config persists to the ``mcp_servers``
+    # setting; tokens go to the gitignored api_keys.json via set_mcp_token (never
+    # to settings.json, never logged). OAuth servers (and transports the manager
+    # does not yet support) are shown but disabled until a later phase.
+
+    # Catalog entry: id (mcp__<id>__ namespace — no "__"), display name, short
+    # descriptor key, transport, command/args (stdio) or url (http), auth_type,
+    # token_env (env var the token is injected into for stdio token servers),
+    # needs_dir (Filesystem needs an allowed-directory arg).
+    _MCP_CATALOG = [
+        {"id": "filesystem", "name": "Filesystem", "desc_key": "mcp.desc.filesystem",
+         "transport": "stdio", "command": "npx",
+         "args": ["-y", "@modelcontextprotocol/server-filesystem"], "url": None,
+         "auth_type": "none", "token_env": None, "needs_dir": True},
+        {"id": "brave-search", "name": "Brave Search", "desc_key": "mcp.desc.brave",
+         "transport": "stdio", "command": "npx",
+         "args": ["-y", "@modelcontextprotocol/server-brave-search"], "url": None,
+         "auth_type": "token", "token_env": "BRAVE_API_KEY", "needs_dir": False},
+        {"id": "github", "name": "GitHub", "desc_key": "mcp.desc.github",
+         "transport": "stdio", "command": "npx",
+         "args": ["-y", "@modelcontextprotocol/server-github"], "url": None,
+         "auth_type": "token", "token_env": "GITHUB_PERSONAL_ACCESS_TOKEN",
+         "needs_dir": False},
+        {"id": "slack", "name": "Slack", "desc_key": "mcp.desc.slack",
+         "transport": "stdio", "command": "npx",
+         "args": ["-y", "@modelcontextprotocol/server-slack"], "url": None,
+         "auth_type": "token", "token_env": "SLACK_BOT_TOKEN", "needs_dir": False,
+         # Slack's stdio server needs a SECOND (non-secret) env var beside the
+         # bot token — generic extra_env fields render as plain inputs and are
+         # injected into the connect env alongside the token (WOR-44 review).
+         "extra_env": [{"var": "SLACK_TEAM_ID", "label_key": "mcp.field_slack_team",
+                        "ph_key": "mcp.field_slack_team_ph", "required": True}]},
+        {"id": "notion", "name": "Notion", "desc_key": "mcp.desc.notion",
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "https://mcp.notion.com/mcp", "auth_type": "token",
+         "token_env": None, "needs_dir": False},
+        {"id": "linear", "name": "Linear", "desc_key": "mcp.desc.linear",
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "https://mcp.linear.app/mcp", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False},
+        {"id": "google-drive", "name": "Google Drive", "desc_key": "mcp.desc.gdrive",
+         "transport": "streamable_http", "command": None, "args": [], "url": "",
+         "auth_type": "oauth", "token_env": None, "needs_dir": False},
+        {"id": "gmail", "name": "Gmail", "desc_key": "mcp.desc.gmail",
+         "transport": "streamable_http", "command": None, "args": [], "url": "",
+         "auth_type": "oauth", "token_env": None, "needs_dir": False},
+    ]
+
+    # (background, foreground) per status — inline-styled so no global QSS edit.
+    _MCP_PILL_COLORS = {
+        "connected":    ("#6fcf97", "#10241a"),
+        "connecting":   ("#e6c878", "#2a2410"),
+        "failed":       ("#e0a3a3", "#2a1414"),
+        "disconnected": ("rgba(255,255,255,0.10)", "rgba(255,255,255,0.65)"),
+    }
+
+    def _build_mcp_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._mcp_title = QLabel(i18n.t("settings.mcp"))
+        self._mcp_title.setObjectName("sectionTitle")
+        self._mcp_title.setWordWrap(True)
+        self._mcp_sub = QLabel(i18n.t("settings.mcp_sub"))
+        self._mcp_sub.setObjectName("sectionSub")
+        self._mcp_sub.setWordWrap(True)
+        self._mcp_desc = QLabel(i18n.t("settings.mcp_desc"))
+        self._mcp_desc.setObjectName("sectionDesc")
+        self._mcp_desc.setWordWrap(True)
+        l.addWidget(self._mcp_title)
+        l.addWidget(self._mcp_sub)
+        l.addWidget(self._mcp_desc)
+
+        # Card host + per-id widget refs (updated in place by the status timer,
+        # so a refresh never rebuilds cards / steals focus from a token field).
+        host_wrap = QWidget()
+        self._mcp_host = QVBoxLayout(host_wrap)
+        self._mcp_host.setContentsMargins(0, 0, 0, 0)
+        self._mcp_host.setSpacing(8)
+        l.addWidget(host_wrap)
+
+        self._mcp_pills: dict = {}
+        self._mcp_buttons: dict = {}
+        self._mcp_token_inputs: dict = {}
+        self._mcp_dir_inputs: dict = {}
+        self._mcp_extra_inputs: dict = {}   # {id: {env_var: QLineEdit}}
+        # Optimistic transient state per id: {id: (visual_state, resolve_set, ticks)}
+        self._mcp_pending: dict = {}
+
+        self._mcp_add_btn = QPushButton("＋ " + i18n.t("mcp.add_custom"))
+        self._mcp_add_btn.setObjectName("primaryBtn")
+        self._mcp_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mcp_add_btn.clicked.connect(self._on_mcp_add_custom)
+        l.addWidget(self._mcp_add_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        return wrap
+
+    def _mcp_connectable(self, entry: dict) -> bool:
+        """A server is connectable now iff the manager supports its transport
+        AND it is not OAuth (OAuth lands in Phase 5)."""
+        try:
+            from osia.mcp import SUPPORTED_TRANSPORTS
+        except Exception:
+            SUPPORTED_TRANSPORTS = ("stdio",)
+        return (
+            entry.get("transport") in SUPPORTED_TRANSPORTS
+            and entry.get("auth_type") != "oauth"
+        )
+
+    def _mcp_saved_servers(self) -> list:
+        out = []
+        for s in (get_setting("mcp_servers", []) or []):
+            if isinstance(s, dict) and s.get("id"):
+                out.append(s)
+        return out
+
+    def _mcp_upsert_server(self, cfg: dict) -> None:
+        """Persist a NON-secret server config into the mcp_servers setting
+        (replace by id, else append). Never stores tokens (env is {})."""
+        clean = {
+            "id": cfg["id"], "name": cfg.get("name", cfg["id"]),
+            "transport": cfg.get("transport", "stdio"),
+            "command": cfg.get("command"), "args": list(cfg.get("args") or []),
+            "url": cfg.get("url"), "env": {},
+            "auth_type": cfg.get("auth_type", "none"),
+            "enabled": bool(cfg.get("enabled", False)),
+            "token_env": cfg.get("token_env"),
+            # Non-secret extra env values (e.g. SLACK_TEAM_ID) round-trip here so
+            # the field re-prefills on reopen; tokens NEVER live here.
+            "extra_env": dict(cfg.get("extra_env") or {}),
+            "custom": bool(cfg.get("custom", False)),
+        }
+        servers = [s for s in self._mcp_saved_servers() if s.get("id") != cfg["id"]]
+        servers.append(clean)
+        set_setting("mcp_servers", servers)
+
+    def _mcp_set_enabled(self, server_id: str, enabled: bool) -> None:
+        servers = self._mcp_saved_servers()
+        changed = False
+        for s in servers:
+            if s.get("id") == server_id:
+                s["enabled"] = enabled
+                changed = True
+        if changed:
+            set_setting("mcp_servers", servers)
+
+    def _mcp_remove_saved(self, server_id: str) -> None:
+        servers = [s for s in self._mcp_saved_servers() if s.get("id") != server_id]
+        set_setting("mcp_servers", servers)
+
+    def _render_mcp(self) -> None:
+        host = self._mcp_host
+        while host.count():
+            item = host.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._mcp_pills = {}
+        self._mcp_buttons = {}
+        self._mcp_token_inputs = {}
+        self._mcp_dir_inputs = {}
+        self._mcp_extra_inputs = {}
+
+        catalog_ids = {e["id"] for e in self._MCP_CATALOG}
+        saved = {s["id"]: s for s in self._mcp_saved_servers()}
+
+        # Catalog cards (always shown), then any custom (non-catalog) saved ones.
+        for entry in self._MCP_CATALOG:
+            host.addWidget(self._build_mcp_card(entry, saved.get(entry["id"]), False))
+        for sid, s in saved.items():
+            if sid in catalog_ids:
+                continue
+            entry = {
+                "id": sid, "name": s.get("name", sid),
+                "transport": s.get("transport", "stdio"),
+                "command": s.get("command"), "args": list(s.get("args") or []),
+                "url": s.get("url"), "auth_type": s.get("auth_type", "none"),
+                "token_env": s.get("token_env"), "needs_dir": False,
+                "custom": True, "desc_key": None,
+            }
+            host.addWidget(self._build_mcp_card(entry, s, True))
+
+        self._refresh_mcp_status()
+
+    def _build_mcp_card(self, entry: dict, saved: dict, is_custom: bool) -> QWidget:
+        sid = entry["id"]
+        row = QFrame()
+        row.setObjectName("providerCard")
+        v = QVBoxLayout(row)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(6)
+
+        # Header — name + status pill.
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        name = QLabel(entry.get("name", sid))
+        name.setObjectName("providerName")
+        head.addWidget(name)
+        head.addStretch(1)
+        pill = QLabel("")
+        pill.setObjectName("mcpPill")
+        self._set_mcp_pill(pill, "disconnected")
+        self._mcp_pills[sid] = pill
+        head.addWidget(pill)
+        v.addLayout(head)
+
+        # Descriptor.
+        if is_custom:
+            target = entry.get("command") or entry.get("url") or ""
+            desc_txt = f"{entry.get('transport', 'stdio')} · {target}"
+        else:
+            desc_txt = i18n.t(entry["desc_key"]) if entry.get("desc_key") else ""
+        if desc_txt:
+            desc = QLabel(desc_txt)
+            desc.setObjectName("providerSub")
+            desc.setWordWrap(True)
+            v.addWidget(desc)
+
+        connectable = self._mcp_connectable(entry)
+
+        # Filesystem needs an allowed directory. Default to ~/Documents when it
+        # exists (NEVER the whole home dir — that would expose ~/.osia, which
+        # holds api_keys.json); otherwise leave empty to force a deliberate
+        # choice. The model can read/write everything under the chosen folder.
+        if entry.get("needs_dir"):
+            saved_args = (saved or {}).get("args") or []
+            base = len(entry.get("args") or [])
+            if len(saved_args) > base:
+                cur_dir = saved_args[base]
+            else:
+                docs = Path.home() / "Documents"
+                cur_dir = str(docs) if docs.is_dir() else ""
+            dlab = QLabel(i18n.t("mcp.lbl_dir"))
+            dlab.setObjectName("providerSub")
+            v.addWidget(dlab)
+            din = QLineEdit(cur_dir)
+            din.setObjectName("keyInput")
+            din.setPlaceholderText(i18n.t("mcp.ph_dir"))
+            self._mcp_dir_inputs[sid] = din
+            v.addWidget(din)
+
+        # Token + extra-env fields only for CONNECTABLE token servers — a field
+        # the user can't act on (a disabled OAuth/HTTP card) would be misleading
+        # and its value would never be saved.
+        if connectable and entry.get("auth_type") == "token":
+            tlab = QLabel(i18n.t("mcp.lbl_token"))
+            tlab.setObjectName("providerSub")
+            v.addWidget(tlab)
+            tin = QLineEdit(get_mcp_token(sid))
+            tin.setObjectName("keyInput")
+            tin.setEchoMode(QLineEdit.EchoMode.Password)
+            tin.setPlaceholderText(i18n.t("mcp.ph_token"))
+            self._mcp_token_inputs[sid] = tin
+            v.addWidget(tin)
+
+        if connectable:
+            saved_extra = (saved or {}).get("extra_env") or {}
+            for spec in entry.get("extra_env") or []:
+                var = spec.get("var")
+                if not var:
+                    continue
+                elab = QLabel(i18n.t(spec.get("label_key", "")))
+                elab.setObjectName("providerSub")
+                v.addWidget(elab)
+                ein = QLineEdit(str(saved_extra.get(var, "")))
+                ein.setObjectName("keyInput")
+                if spec.get("ph_key"):
+                    ein.setPlaceholderText(i18n.t(spec["ph_key"]))
+                self._mcp_extra_inputs.setdefault(sid, {})[var] = ein
+                v.addWidget(ein)
+
+        # Action row.
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        actions.addStretch(1)
+        if connectable:
+            btn = QPushButton(i18n.t("mcp.connect"))
+            btn.setObjectName("primaryBtn")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, e=entry: self._on_mcp_toggle(e))
+            self._mcp_buttons[sid] = btn
+            actions.addWidget(btn)
+        else:
+            reason = "mcp.oauth_soon" if entry.get("auth_type") == "oauth" else "mcp.transport_soon"
+            soon = QPushButton(i18n.t(reason))
+            soon.setObjectName("ghostBtn")
+            soon.setEnabled(False)
+            actions.addWidget(soon)
+        if is_custom:
+            rm = QPushButton("✕")
+            rm.setObjectName("convDel")
+            rm.setFixedSize(28, 28)
+            rm.setCursor(Qt.CursorShape.PointingHandCursor)
+            rm.setToolTip(i18n.t("mcp.remove"))
+            rm.clicked.connect(lambda _=False, i=sid: self._on_mcp_remove_custom(i))
+            actions.addWidget(rm)
+        v.addLayout(actions)
+        return row
+
+    def _set_mcp_pill(self, pill: QLabel, state: str) -> None:
+        if state not in self._MCP_PILL_COLORS:
+            state = "disconnected"
+        bg, fg = self._MCP_PILL_COLORS[state]
+        pill.setText(i18n.t("mcp.status_" + state))
+        pill.setStyleSheet(
+            f"QLabel{{background:{bg};color:{fg};border-radius:8px;"
+            "padding:2px 9px;font-size:11px;font-weight:600;}}"
+        )
+
+    @staticmethod
+    def _mcp_flag_required(widget) -> None:
+        """Outline a required-but-empty input in red so a no-op Connect is not
+        silent. Cleared on the next render."""
+        if widget is not None:
+            widget.setStyleSheet("QLineEdit{border:1px solid #e0a3a3;}")
+
+    def _mcp_build_connect_cfg(self, entry: dict):
+        """Return ``(connect_cfg, persist_cfg, token)``. ``connect_cfg`` carries
+        the token + any extra env in ``env`` (in-memory only, passed to the
+        manager); ``persist_cfg`` never carries secrets (``env`` is always {} —
+        non-secret extra-env values round-trip under ``extra_env``). Returns
+        ``(None, None, "")`` on a validation failure (an empty required field is
+        flagged red)."""
+        sid = entry["id"]
+        args = list(entry.get("args") or [])
+        if entry.get("needs_dir"):
+            din = self._mcp_dir_inputs.get(sid)
+            d = din.text().strip() if din else ""
+            if not d:
+                # Never silently fall back to the whole home dir — require a
+                # deliberate choice.
+                self._mcp_flag_required(din)
+                return None, None, ""
+            args = args + [d]
+
+        # Extra (non-secret) env fields, e.g. Slack's SLACK_TEAM_ID.
+        extra_env: dict = {}
+        for spec in entry.get("extra_env") or []:
+            var = spec.get("var")
+            ein = self._mcp_extra_inputs.get(sid, {}).get(var)
+            val = ein.text().strip() if ein else ""
+            if not val and spec.get("required"):
+                self._mcp_flag_required(ein)
+                return None, None, ""
+            if val:
+                extra_env[var] = val
+
+        persist = {
+            "id": sid, "name": entry.get("name", sid),
+            "transport": entry.get("transport", "stdio"),
+            "command": entry.get("command"), "args": args,
+            "url": entry.get("url"), "env": {},
+            "auth_type": entry.get("auth_type", "none"), "enabled": True,
+            "token_env": entry.get("token_env"),
+            "extra_env": extra_env,
+            "custom": bool(entry.get("custom", False)),
+        }
+
+        # Build the in-memory connect env: the token (authoritative from the
+        # field — empty means none) plus any extra-env values.
+        env: dict = {}
+        token = ""
+        if entry.get("auth_type") == "token":
+            tin = self._mcp_token_inputs.get(sid)
+            token = tin.text().strip() if tin else ""
+            if token and entry.get("token_env"):
+                env[entry["token_env"]] = token
+        env.update(extra_env)
+        connect = dict(persist)
+        if env:
+            connect["env"] = env
+        return connect, persist, token
+
+    def _on_mcp_toggle(self, entry: dict) -> None:
+        sid = entry["id"]
+        try:
+            from osia.mcp import get_manager
+            status = get_manager().status(sid)
+        except Exception:
+            status = "disconnected"
+        if status == "connected":
+            self._on_mcp_disconnect(sid)
+        else:
+            self._on_mcp_connect(entry)
+
+    def _on_mcp_connect(self, entry: dict) -> None:
+        connect_cfg, persist_cfg, token = self._mcp_build_connect_cfg(entry)
+        if connect_cfg is None:
+            return
+        sid = entry["id"]
+        self._mcp_upsert_server(persist_cfg)
+        # The token field is AUTHORITATIVE: write it unconditionally so blanking
+        # the field and reconnecting actually CLEARS the stored secret (empty
+        # string clears it via set_mcp_token). Only for connectable token cards
+        # (which is where the field is rendered).
+        if entry.get("auth_type") == "token" and sid in self._mcp_token_inputs:
+            set_mcp_token(sid, token)
+        # Optimistic, immediate feedback; the timer settles it on the real status
+        # (~60 ticks ≈ 72s cap, comfortably past the manager's ~45s connect
+        # timeout, after which status resolves to connected/failed).
+        self._mcp_pending[sid] = ("connecting", {"connected", "failed"}, 50)
+        if sid in self._mcp_pills:
+            self._set_mcp_pill(self._mcp_pills[sid], "connecting")
+
+        def _bg():
+            try:
+                from osia.mcp import get_manager
+                get_manager().connect(connect_cfg)
+            except Exception:
+                pass
+        threading.Thread(target=_bg, name="osia-mcp-connect", daemon=True).start()
+
+    def _on_mcp_disconnect(self, server_id: str) -> None:
+        self._mcp_set_enabled(server_id, False)
+        # Overwrites any prior (connect) pending for this id — the latest user
+        # action wins; the disconnect bg thread drives the manager to the
+        # terminal state the resolve set waits for.
+        self._mcp_pending[server_id] = ("disconnected", {"disconnected", "failed"}, 25)
+        if server_id in self._mcp_pills:
+            self._set_mcp_pill(self._mcp_pills[server_id], "disconnected")
+
+        def _bg():
+            try:
+                from osia.mcp import get_manager
+                get_manager().disconnect(server_id)
+            except Exception:
+                pass
+        threading.Thread(target=_bg, name="osia-mcp-disconnect", daemon=True).start()
+
+    def _on_mcp_remove_custom(self, server_id: str) -> None:
+        self._on_mcp_disconnect(server_id)
+        self._mcp_remove_saved(server_id)
+        try:
+            delete_mcp_token(server_id)
+        except Exception:
+            pass
+        self._mcp_pending.pop(server_id, None)
+        self._render_mcp()
+
+    def _on_mcp_add_custom(self) -> None:
+        dlg = _McpCustomDialog(self, anchor=self._mcp_add_btn)
+        if not dlg.exec() or not dlg.result_cfg:
+            return
+        cfg = dlg.result_cfg
+        # Ensure a unique id across catalog + saved servers.
+        taken = {e["id"] for e in self._MCP_CATALOG} | {
+            s["id"] for s in self._mcp_saved_servers()
+        }
+        base_id, sid, n = cfg["id"], cfg["id"], 2
+        while sid in taken:
+            sid = f"{base_id}-{n}"
+            n += 1
+        cfg["id"] = sid
+        self._mcp_upsert_server(cfg)            # NOT connected — explicit action
+        if dlg.result_token:
+            set_mcp_token(sid, dlg.result_token)
+        self._render_mcp()
+
+    def _refresh_mcp_status(self) -> None:
+        if not getattr(self, "_mcp_pills", None):
+            return
+        try:
+            from osia.mcp import get_manager
+            snap = get_manager().servers()
+        except Exception:
+            snap = {}
+        for sid, pill in self._mcp_pills.items():
+            info = snap.get(sid, {}) if isinstance(snap, dict) else {}
+            ms = info.get("status", "disconnected")
+            err = info.get("error", "")
+            pend = self._mcp_pending.get(sid)
+            if pend:
+                visual, resolve, ticks = pend
+                ticks -= 1
+                if ms in resolve or ticks <= 0:
+                    self._mcp_pending.pop(sid, None)
+                    state = ms
+                else:
+                    self._mcp_pending[sid] = (visual, resolve, ticks)
+                    state = visual
+            else:
+                state = ms
+            self._set_mcp_pill(pill, state)
+            btn = self._mcp_buttons.get(sid)
+            if btn is not None:
+                btn.setText(
+                    i18n.t("mcp.disconnect") if state == "connected"
+                    else i18n.t("mcp.connect")
+                )
+                btn.setToolTip(err if (state == "failed" and err) else "")
+
     # ── API key fallback hierarchy ──────────────────────────────────────────
     # A dropdown of configured providers; picking one opens a dark popover
     # (_ApiKeyFallbackDialog) with an ordered list of masked key inputs —
@@ -3577,6 +4198,11 @@ class _SettingsPanel(QWidget):
         ]
         self._render_cron()
 
+        # MCP / Connectors (WOR-44) — rebuild the catalog + custom server cards
+        # from the saved list, then paint each pill with the manager's live
+        # status (so a connection persists visually across reopen).
+        self._render_mcp()
+
         # Heartbeat (Bloc 5) — master toggle, interval, per-metric checks.
         self._hb_enabled_toggle.blockSignals(True)
         self._hb_enabled_toggle.setChecked(
@@ -3943,6 +4569,15 @@ class _SettingsPanel(QWidget):
         for _label, _label_key in self._startup_labels:
             _label.setText(i18n.t(_label_key))
 
+        # MCP / Connectors — section chrome + add button, then rebuild the cards
+        # so every per-card string (descriptors, status pills, Connect/Disconnect,
+        # field labels) re-translates with the new language.
+        self._mcp_title.setText(i18n.t("settings.mcp"))
+        self._mcp_sub.setText(i18n.t("settings.mcp_sub"))
+        self._mcp_desc.setText(i18n.t("settings.mcp_desc"))
+        self._mcp_add_btn.setText("＋ " + i18n.t("mcp.add_custom"))
+        self._render_mcp()
+
     def _retranslate_nav(self) -> None:
         """Re-render the master-detail category-nav labels after a language
         change. The QStackedWidget pages stay put; only the QListWidget row text
@@ -4027,10 +4662,13 @@ class _SettingsPanel(QWidget):
         with perf_timer("settings.showEvent: _refresh_startup_status (async)"):
             self._refresh_startup_status()
         self._startup_timer.start()
+        self._refresh_mcp_status()
+        self._mcp_timer.start()
 
     def hideEvent(self, event):
         super().hideEvent(event)
         self._startup_timer.stop()
+        self._mcp_timer.stop()
 
     # ── Style ─────────────────────────────────────────────────────────────
 
