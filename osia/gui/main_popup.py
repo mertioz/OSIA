@@ -3148,11 +3148,13 @@ class _SettingsPanel(QWidget):
     # needs_dir (a stdio server needing an allowed-directory arg — the mechanism
     # is retained for custom servers though no catalog entry uses it: Filesystem
     # was removed because it duplicates OSIA's native file_read/bash tools).
+    # NOTE: Brave Search and Filesystem are intentionally ABSENT from this
+    # catalog — each duplicates a native OSIA capability (Brave Search → native
+    # web browsing via Playwright/read_page; Filesystem → native file_read/bash
+    # tools), so exposing them as MCP connectors would only add a redundant path.
+    # The MCP core stays fully capable; this is purely a curated-catalog choice
+    # (a user can still add either as a custom stdio server via "+ Add custom").
     _MCP_CATALOG = [
-        {"id": "brave-search", "name": "Brave Search", "desc_key": "mcp.desc.brave",
-         "transport": "stdio", "command": "npx",
-         "args": ["-y", "@modelcontextprotocol/server-brave-search"], "url": None,
-         "auth_type": "token", "token_env": "BRAVE_API_KEY", "needs_dir": False},
         {"id": "github", "name": "GitHub", "desc_key": "mcp.desc.github",
          "transport": "stdio", "command": "npx",
          "args": ["-y", "@modelcontextprotocol/server-github"], "url": None,
@@ -3314,9 +3316,9 @@ class _SettingsPanel(QWidget):
 
     def _mcp_all_entries(self) -> list:
         """Ordered connector entries for the dropdown: every catalog server,
-        then any user-added custom (non-catalog) saved servers. (Filesystem is
-        intentionally absent from the catalog — it duplicates OSIA's native
-        file_read/bash tools.)"""
+        then any user-added custom (non-catalog) saved servers. (Filesystem and
+        Brave Search are intentionally absent from the catalog — each duplicates
+        a native OSIA capability; see _MCP_CATALOG.)"""
         catalog_ids = {e["id"] for e in self._MCP_CATALOG}
         out = list(self._MCP_CATALOG)
         for s in self._mcp_saved_servers():

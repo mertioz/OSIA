@@ -728,6 +728,143 @@ async def _broadcast_conversations(exclude: "_OutboundChannel | None" = None) ->
             _WS_CLIENTS.discard(client)
 
 
+# ── MCP / Connectors server-side plumbing (WOR-44 Phase 4) ──────────────────
+# Mobile mirrors the desktop GUI's connector controls through the WS handlers
+# (mcp_connect / mcp_disconnect / mcp_status, below). The server owns its OWN
+# process-wide MCPManager singleton (osia.mcp.get_manager) — distinct from the
+# desktop app's, since each process bridges its connected MCP tools into ITS
+# OWN agent. So this fan-out keeps every connected MOBILE client in sync with
+# THIS process's manager; it does not (and cannot) reach the desktop GUI, which
+# is not a WebSocket client and drives its own in-process manager. Cross-process
+# (desktop ↔ server) MCP state is intentionally independent.
+#
+# SECRET DISCIPLINE: a server's config round-trips as the `mcp_servers` setting
+# (non-secret — env is always {}); its token lives ONLY in the gitignored
+# api_keys.json under `mcp:<id>`. _mcp_build_connect_cfg injects the token into
+# an IN-MEMORY env for the handshake — it is never persisted to settings.json
+# nor echoed in any frame. The status frames carry only {status, error
+# (sanitized by the manager), tools (a count)} — never env/token.
+
+def _mcp_find_saved_server(server_id: str):
+    """Return the saved (non-secret) config dict for ``server_id`` from the
+    ``mcp_servers`` setting, or ``None`` if absent / malformed."""
+    if not server_id:
+        return None
+    try:
+        from osia.config import get_setting
+        servers = get_setting("mcp_servers", []) or []
+    except Exception:
+        servers = []
+    if not isinstance(servers, list):
+        return None
+    for s in servers:
+        if isinstance(s, dict) and s.get("id") == server_id:
+            return s
+    return None
+
+
+def _mcp_connectable(saved: dict) -> bool:
+    """True iff the manager can connect this server now: a supported transport
+    (stdio in Phase 1) AND not OAuth (OAuth lands later). Mirrors the desktop
+    GUI's _mcp_connectable so PC and mobile agree on what is connectable."""
+    try:
+        from osia.mcp import SUPPORTED_TRANSPORTS
+    except Exception:
+        SUPPORTED_TRANSPORTS = ("stdio",)
+    return (
+        isinstance(saved, dict)
+        and saved.get("transport") in SUPPORTED_TRANSPORTS
+        and saved.get("auth_type") != "oauth"
+    )
+
+
+def _mcp_build_connect_cfg(saved: dict) -> dict:
+    """Build the IN-MEMORY connect config for one saved server: a copy of the
+    non-secret saved cfg with the per-server token (from the gitignored
+    api_keys.json ``mcp:<id>`` store) injected into ``env[token_env]`` plus any
+    non-secret ``extra_env`` values. The env exists only for the manager
+    handshake — it is NEVER persisted (settings.json keeps env={}) nor echoed in
+    a frame. Mirrors the desktop GUI's _mcp_build_connect_cfg."""
+    cfg = dict(saved)
+    sid = str(saved.get("id") or "")
+    env: dict = {}
+    if saved.get("auth_type") == "token":
+        try:
+            from osia.config import get_mcp_token
+            token = get_mcp_token(sid)
+        except Exception:
+            token = ""
+        token_env = saved.get("token_env")
+        if token and token_env:
+            env[str(token_env)] = token
+    extra = saved.get("extra_env")
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if isinstance(k, str) and isinstance(v, str) and v:
+                env[k] = v
+    cfg["env"] = env
+    return cfg
+
+
+def _mcp_status_frame(server_id=None) -> dict:
+    """Build an ``mcp_status`` frame from the MCPManager snapshot. Carries only
+    per-server ``{status, error, tools}`` (a count) — never any env/token: the
+    manager's servers() snapshot is secret-free and its error strings are
+    sanitized at the source. With ``server_id`` set, reports just that server
+    (DISCONNECTED if the manager has never seen it, so the client gets a
+    definitive answer); otherwise reports every server the manager knows."""
+    try:
+        from osia.mcp import get_manager
+        snap = get_manager().servers()
+    except Exception:
+        snap = {}
+    if not isinstance(snap, dict):
+        snap = {}
+
+    def _one(info: dict) -> dict:
+        err = info.get("error", "") or ""
+        if len(err) > 300:
+            err = err[:299] + "…"
+        return {
+            "status": info.get("status", "disconnected") or "disconnected",
+            "error": err,
+            "tools": int(info.get("tools", 0) or 0),
+        }
+
+    if server_id:
+        info = snap.get(server_id)
+        servers = {
+            server_id: _one(info) if isinstance(info, dict)
+            else {"status": "disconnected", "error": "", "tools": 0}
+        }
+    else:
+        servers = {
+            sid: _one(info) for sid, info in snap.items()
+            if isinstance(info, dict)
+        }
+    return {"type": "mcp_status", "servers": servers}
+
+
+async def _broadcast_mcp_status(
+    frame: dict, exclude: "_OutboundChannel | None" = None
+) -> None:
+    """Best-effort fan-out of an ``mcp_status`` frame to every connected client
+    (WOR-44 Phase 4). Like ``_broadcast_conversations``, each frame is enqueued
+    onto the connection's outbound channel — the real send is performed by that
+    connection's own writer task (never from here). Keeps every mobile client in
+    sync with the server's MCPManager as connect/disconnect transitions occur.
+    Called either awaited on the loop, or hopped from a connect/disconnect
+    worker thread via ``run_coroutine_threadsafe`` (the _broadcast_autonomous
+    thread→loop pattern)."""
+    for client in list(_WS_CLIENTS):
+        if client is exclude:
+            continue
+        try:
+            await client.send_json(frame)
+        except Exception:
+            _WS_CLIENTS.discard(client)
+
+
 @app.post("/internal/new_chat")
 async def internal_new_chat(request: Request):
     """Localhost-only trigger used by the desktop app (osia/main.py) when the
@@ -2561,6 +2698,11 @@ async def websocket_endpoint(ws: WebSocket):
                     "heartbeat_enabled", "heartbeat_interval_seconds",
                     # Cooperation IA vision provider/model (WOR-25).
                     "vision_provider", "vision_model",
+                    # MCP / Connectors server list (WOR-44 Phase 4). The list is
+                    # NON-SECRET (env is always {} — see the mcp_servers write
+                    # branch below); per-server tokens live only in the
+                    # gitignored api_keys.json under `mcp:<id>`.
+                    "mcp_servers",
                 }
                 if setting_key not in allowed_settings:
                     print(
@@ -2586,6 +2728,23 @@ async def websocket_endpoint(ws: WebSocket):
                             v for v in chain if isinstance(v, str) and v
                         ]
                         set_setting("ai_hierarchy", hierarchy)
+                    elif setting_key == "mcp_servers":
+                        # mcp_servers is a list of NON-SECRET server configs. A
+                        # token must NEVER reach the git-tracked settings.json —
+                        # it lives only in the gitignored api_keys.json under
+                        # `mcp:<id>`. Defensively force env={} on every entry so
+                        # a buggy/malicious client cannot persist a secret here
+                        # even if it sends one (upholds the WOR-44 secret-storage
+                        # contract; mirrors the desktop _mcp_upsert_server, which
+                        # also always writes env={}).
+                        clean = []
+                        if isinstance(setting_value, list):
+                            for s in setting_value:
+                                if isinstance(s, dict) and s.get("id"):
+                                    e = dict(s)
+                                    e["env"] = {}
+                                    clean.append(e)
+                        set_setting("mcp_servers", clean)
                     else:
                         set_setting(setting_key, setting_value)
                     print(
@@ -2664,6 +2823,126 @@ async def websocket_endpoint(ws: WebSocket):
                 except Exception as e:
                     print(f"[OSIA Server] get_api_keys failed: {e}")
                     await out.send_json({"type": "status", "status": "error"})
+                continue
+
+            # --- MCP / Connectors: connect / disconnect / status (WOR-44 P4) ---
+            # ACTIONS (not settings) that drive THIS process's MCPManager
+            # singleton (osia.mcp.get_manager — the server's own; see the helpers
+            # near _broadcast_mcp_status). The server LIST round-trips as the
+            # `mcp_servers` setting (set_setting allowlist + get_config); the
+            # per-server SECRET token lives only in api_keys.json under
+            # `mcp:<id>` and is injected IN-MEMORY at connect time — never in a
+            # frame, never in settings.json.
+            #
+            # IMPORTANT: MCPManager.connect()/disconnect() BLOCK the calling
+            # thread until the handshake (or teardown) resolves — they schedule
+            # work onto the manager's OWN loop but then wait on a future. Calling
+            # them inline here would stall the server event loop for up to the
+            # connect timeout, freezing every other client. So we offload to a
+            # short-lived daemon thread (mirroring the desktop GUI's connect
+            # worker), ack immediately, and broadcast the resulting status to
+            # every client from that thread via run_coroutine_threadsafe.
+            if msg_type in ("mcp_connect", "mcp_disconnect", "mcp_status"):
+                raw_id = msg.get("id")
+                server_id = raw_id.strip() if isinstance(raw_id, str) else ""
+
+                if msg_type == "mcp_status":
+                    # Pure, non-blocking read of the manager snapshot (never
+                    # leaks secrets — see _mcp_status_frame). One id, or all.
+                    try:
+                        await out.send_json(_mcp_status_frame(server_id or None))
+                    except Exception as e:
+                        print(f"[OSIA Server] mcp_status failed: {e}")
+                        await out.send_json({"type": "status", "status": "error"})
+                    continue
+
+                # connect / disconnect require a known, saved server id.
+                if not server_id:
+                    await out.send_json(
+                        {"type": "status", "status": "error", "error": "missing id"}
+                    )
+                    continue
+                saved = _mcp_find_saved_server(server_id)
+                if saved is None:
+                    print(
+                        f"[OSIA Server] {msg_type} rejected unknown id={server_id!r}"
+                    )
+                    await out.send_json(
+                        {"type": "status", "status": "error",
+                         "error": "unknown server"}
+                    )
+                    continue
+
+                loop = asyncio.get_running_loop()
+
+                if msg_type == "mcp_connect":
+                    if not _mcp_connectable(saved):
+                        # stdio + non-OAuth only in this phase (mirrors the GUI,
+                        # which hides the connect button otherwise). Clean error,
+                        # no thread spawned, no FAILED entry left in the manager.
+                        print(
+                            f"[OSIA Server] mcp_connect id={server_id!r} not "
+                            f"connectable (transport={saved.get('transport')!r}, "
+                            f"auth={saved.get('auth_type')!r})"
+                        )
+                        await out.send_json(
+                            {"type": "status", "status": "error",
+                             "error": "not connectable yet"}
+                        )
+                        continue
+                    connect_cfg = _mcp_build_connect_cfg(saved)
+
+                    def _connect_worker(cfg=connect_cfg, sid=server_id, loop=loop):
+                        try:
+                            from osia.mcp import get_manager
+                            get_manager().connect(cfg)
+                        except Exception as e:
+                            print(f"[OSIA Server] mcp_connect worker {sid!r}: {e}")
+                        # Broadcast the RESOLVED status (connected/failed) to all.
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                _broadcast_mcp_status(_mcp_status_frame(sid)), loop
+                            )
+                        except Exception:
+                            pass
+
+                    threading.Thread(
+                        target=_connect_worker, name="osia-mcp-connect", daemon=True
+                    ).start()
+                    # Optimistic "connecting" so every client flips at once; the
+                    # worker broadcasts the terminal status when the handshake
+                    # resolves. Enqueued synchronously here (before the worker can
+                    # finish the handshake), so it always precedes that frame.
+                    try:
+                        await _broadcast_mcp_status(
+                            {"type": "mcp_status",
+                             "servers": {server_id: {"status": "connecting",
+                                                     "error": "", "tools": 0}}}
+                        )
+                    except Exception:
+                        pass
+                    await out.send_json({"type": "status", "status": "done"})
+                    continue
+
+                # mcp_disconnect
+                def _disconnect_worker(sid=server_id, loop=loop):
+                    try:
+                        from osia.mcp import get_manager
+                        get_manager().disconnect(sid)
+                    except Exception as e:
+                        print(f"[OSIA Server] mcp_disconnect worker {sid!r}: {e}")
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            _broadcast_mcp_status(_mcp_status_frame(sid)), loop
+                        )
+                    except Exception:
+                        pass
+
+                threading.Thread(
+                    target=_disconnect_worker,
+                    name="osia-mcp-disconnect", daemon=True,
+                ).start()
+                await out.send_json({"type": "status", "status": "done"})
                 continue
 
             # --- Heartbeat config (mobile live-metrics screen) ---
