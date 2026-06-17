@@ -143,6 +143,15 @@ DEFAULT_SETTINGS = {
     # recorded flag defaults to enabled. Enabled skills are appended to the
     # system prompt — see osia.personality and osia.agent.get_system_prompt.
     "skills_enabled": {},
+    # MCP / Connectors (WOR-44): list of Model-Context-Protocol servers OSIA can
+    # use as ADDITIONAL agent tools. Each entry is non-secret config only —
+    # ``{"id", "name", "transport", "url", "command", "args", "env",
+    # "auth_type", "enabled"}``. ``transport`` is one of "stdio" |
+    # "streamable_http" | "sse" (Phase 1 wires stdio). ``auth_type`` is "none" |
+    # "token" | "oauth". Any token/secret lives in the gitignored api_keys.json
+    # under an ``mcp:<id>`` key (see get_mcp_token/set_mcp_token) — NEVER here,
+    # because settings.json is git-tracked. See osia.mcp.MCPManager.
+    "mcp_servers": [],
     "island_shape": "capsule",  # adaptive shape: "capsule", "circle", "docked"
     "island_dock_side": "right",  # docked screen edge: "left", "right"
     "island_x": None,          # last dragged capsule position; None = top-centre
@@ -193,6 +202,41 @@ def set_api_key(provider: str, key: str) -> None:
     else:
         keys.pop(provider, None)
     save_api_keys(keys)
+
+
+# ── MCP / Connectors secret storage (WOR-44) ───────────────────────────────
+# MCP server tokens are secrets, so they live in the gitignored api_keys.json
+# (0600 on Unix) — NEVER in settings.json (git-tracked). They are namespaced
+# under ``mcp:<server_id>`` so they share the existing api-keys plumbing and
+# masking discipline (callers must never log the token itself). The MCPManager
+# stays secret-free: the caller fetches a token here and injects it into the
+# server config's ``env`` (stdio) or auth header (HTTP) at connect time.
+_MCP_TOKEN_PREFIX = "mcp:"
+
+
+def get_mcp_token(server_id: str) -> str:
+    """Return the stored token for an MCP server id, or '' if unset."""
+    if not server_id:
+        return ""
+    return load_api_keys().get(f"{_MCP_TOKEN_PREFIX}{server_id}", "") or ""
+
+
+def set_mcp_token(server_id: str, token: str) -> None:
+    """Set or clear an MCP server's token (empty string clears it)."""
+    if not server_id:
+        return
+    keys = load_api_keys()
+    name = f"{_MCP_TOKEN_PREFIX}{server_id}"
+    if token:
+        keys[name] = token
+    else:
+        keys.pop(name, None)
+    save_api_keys(keys)
+
+
+def delete_mcp_token(server_id: str) -> None:
+    """Remove an MCP server's stored token, if any."""
+    set_mcp_token(server_id, "")
 
 
 # ── settings.json read cache (mtime+size based) ────────────────────────────
