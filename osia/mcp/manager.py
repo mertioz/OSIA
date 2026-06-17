@@ -341,6 +341,27 @@ class MCPManager:
         except RuntimeError:
             pass
 
+    # ── Agent-tool bridge (WOR-44 Phase 2) ────────────────────────────────────
+    # Soft, lazy coupling to the agent. The actual mutation of TOOL_MAP /
+    # KNOWN_TOOL_NAMES and the lazy ``osia.agent`` import live in
+    # ``osia.mcp.registry`` — imported here lazily and wrapped in try/except so
+    # this manager stays standalone-importable (no agent, no circular import):
+    # if the agent is absent, registration is simply a no-op.
+
+    def _register_tools(self, server_id: str, tools: list) -> None:
+        try:
+            from osia.mcp import registry
+            registry.register_server_tools(self, server_id, tools)
+        except Exception:
+            pass
+
+    def _unregister_tools(self, server_id: str) -> None:
+        try:
+            from osia.mcp import registry
+            registry.unregister_server_tools(server_id)
+        except Exception:
+            pass
+
     # ── The long-lived per-server coroutine ──────────────────────────────────
 
     async def _serve(
@@ -388,6 +409,12 @@ class MCPManager:
                         conn.tools = tools
                         conn.status = STATUS_CONNECTED
                         conn.error = ""
+                    # WOR-44 Phase 2: register the discovered tools into the
+                    # agent's TOOL_MAP / KNOWN_TOOL_NAMES BEFORE signalling
+                    # connected, so they are callable the moment connect()
+                    # returns. Best-effort: a missing/closed agent never breaks
+                    # the connection (the manager stays a usable MCP client).
+                    self._register_tools(server_id, tools)
                     self._safe_set_future(ready, STATUS_CONNECTED)
                     # Keep the session (and its subprocess) alive until asked to
                     # stop. Enter AND exit of the async-with blocks both happen
@@ -417,6 +444,10 @@ class MCPManager:
                 if conn.status == STATUS_CONNECTED:
                     # Normal stop_event path (no exception): mark disconnected.
                     conn.status = STATUS_DISCONNECTED
+            # WOR-44 Phase 2: the server is going away by ANY path (graceful
+            # stop, cancel, or error after connect) — drop its tools from the
+            # agent maps so the model can no longer call a dead server.
+            self._unregister_tools(server_id)
             self._safe_set_future(ready, conn.status)
             conn.done_event.set()
 

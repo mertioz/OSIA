@@ -299,6 +299,24 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
             body = body + "\n\n" + skills
     except Exception:
         pass
+    # WOR-44 Phase 2 — list the tools exposed by connected MCP servers so the
+    # model can see and call them like native tools. Built FRESH on every
+    # get_system_prompt() call. On the SERVER path run(history=...) rebuilds the
+    # system message each turn, so newly-connected/disconnected MCP tools are
+    # reflected without restarting a conversation; the desktop in-process path
+    # (run() with no history) refreshes only on reset()/set_model()/new
+    # conversation, so a mid-conversation MCP change shows up on the next such
+    # refresh (a disconnected tool still listed there returns a clean ERROR via
+    # its stub — see osia.mcp.registry). Soft + lazy (mirrors the
+    # personality/skills block above): any failure (mcp package absent, no
+    # servers connected) yields no block and never breaks prompt construction.
+    try:
+        from osia.mcp.registry import mcp_tool_prompt_block
+        mcp_block = mcp_tool_prompt_block(lang)
+        if mcp_block:
+            body = body + "\n\n" + mcp_block
+    except Exception:
+        pass
     return body
 
 
