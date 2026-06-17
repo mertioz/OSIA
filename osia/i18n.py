@@ -1529,6 +1529,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "MCP-Server (Model Context Protocol) stellen Werkzeuge bereit, die OSIA nutzen kann — im Web suchen, Dateien lesen, Repos verwalten und mehr. Verbinden Sie einen vorkonfigurierten Server mit einem Tippen (einige benötigen ein API-Token) oder fügen Sie einen eigenen hinzu. Verbundene Werkzeuge stehen OSIA mit derselben Sicherheit wie integrierte Werkzeuge zur Verfügung.",
         "es": "Los servidores MCP (Model Context Protocol) exponen herramientas que OSIA puede usar: buscar en la web, leer archivos, gestionar repos y más. Conecta un servidor preconfigurado con un toque (algunos requieren un token de API), o añade el tuyo. Las herramientas conectadas quedan disponibles para OSIA con la misma seguridad que las integradas.",
     },
+    "mcp.select_label": {
+        "en": "Connector", "fr": "Connecteur", "zh": "连接器",
+        "ja": "コネクタ", "de": "Konnektor", "es": "Conector",
+    },
     "mcp.connect": {
         "en": "Connect", "fr": "Connecter", "zh": "连接",
         "ja": "接続", "de": "Verbinden", "es": "Conectar",

@@ -3130,24 +3130,25 @@ class _SettingsPanel(QWidget):
 
     # ── MCP / Connectors (WOR-44 Phase 3) ───────────────────────────────────
     # A preconfigured catalog of popular MCP servers (one-tap Connect) plus any
-    # user-added custom servers, each rendered as a card with a live status pill
-    # and a Connect/Disconnect toggle. Connecting drives osia.mcp.get_manager()
-    # on a BACKGROUND thread (connect() blocks until the handshake completes), so
-    # the UI never freezes; a QTimer polls the manager's in-memory status
-    # snapshot to flip pills. Non-secret config persists to the ``mcp_servers``
-    # setting; tokens go to the gitignored api_keys.json via set_mcp_token (never
-    # to settings.json, never logged). OAuth servers (and transports the manager
-    # does not yet support) are shown but disabled until a later phase.
+    # user-added custom servers, surfaced through a single connector DROPDOWN
+    # (mirrors the AI/voice provider selectors): pick a connector and only THAT
+    # one's panel renders below — a live status pill and a Connect/Disconnect
+    # toggle. Connecting drives osia.mcp.get_manager() on a BACKGROUND thread
+    # (connect() blocks until the handshake completes), so the UI never freezes;
+    # a QTimer polls the manager's in-memory status snapshot to flip the visible
+    # pill. Non-secret config persists to the ``mcp_servers`` setting; tokens go
+    # to the gitignored api_keys.json via set_mcp_token (never to settings.json,
+    # never logged). OAuth servers (and transports the manager does not yet
+    # support) appear in the dropdown but their panel is disabled until a later
+    # phase.
 
     # Catalog entry: id (mcp__<id>__ namespace — no "__"), display name, short
     # descriptor key, transport, command/args (stdio) or url (http), auth_type,
     # token_env (env var the token is injected into for stdio token servers),
-    # needs_dir (Filesystem needs an allowed-directory arg).
+    # needs_dir (a stdio server needing an allowed-directory arg — the mechanism
+    # is retained for custom servers though no catalog entry uses it: Filesystem
+    # was removed because it duplicates OSIA's native file_read/bash tools).
     _MCP_CATALOG = [
-        {"id": "filesystem", "name": "Filesystem", "desc_key": "mcp.desc.filesystem",
-         "transport": "stdio", "command": "npx",
-         "args": ["-y", "@modelcontextprotocol/server-filesystem"], "url": None,
-         "auth_type": "none", "token_env": None, "needs_dir": True},
         {"id": "brave-search", "name": "Brave Search", "desc_key": "mcp.desc.brave",
          "transport": "stdio", "command": "npx",
          "args": ["-y", "@modelcontextprotocol/server-brave-search"], "url": None,
@@ -3210,14 +3211,35 @@ class _SettingsPanel(QWidget):
         l.addWidget(self._mcp_sub)
         l.addWidget(self._mcp_desc)
 
-        # Card host + per-id widget refs (updated in place by the status timer,
-        # so a refresh never rebuilds cards / steals focus from a token field).
-        host_wrap = QWidget()
-        self._mcp_host = QVBoxLayout(host_wrap)
-        self._mcp_host.setContentsMargins(0, 0, 0, 0)
-        self._mcp_host.setSpacing(8)
-        l.addWidget(host_wrap)
+        # WOR-44 P3 (refine) — connector DROPDOWN instead of a long stacked card
+        # list (mirrors the AI/voice provider selectors): a label + combo row,
+        # then ONE panel below for the selected connector only. Keeping a single
+        # panel live at a time keeps the page compact (no width/height blowout
+        # past POPUP_W / the 640 max) and means the status poll only ever
+        # repaints the one visible pill.
+        sel_row = QHBoxLayout()
+        self._mcp_select_label = QLabel(i18n.t("mcp.select_label"))
+        self._mcp_select_label.setObjectName("fieldLabel")
+        self._mcp_select_label.setMinimumWidth(96)
+        self._mcp_select_label.setWordWrap(True)
+        self._mcp_combo = QComboBox()
+        self._mcp_combo.setObjectName("voiceCombo")
+        _cap_combo_width(self._mcp_combo)   # never let a long name inflate width
+        self._mcp_combo.currentIndexChanged.connect(self._on_mcp_select)
+        sel_row.addWidget(self._mcp_select_label)
+        sel_row.addWidget(self._mcp_combo, 1)
+        l.addLayout(sel_row)
 
+        # Single selected-connector panel host (rebuilt in place on selection
+        # change / add / remove / language switch — never a stacked list).
+        panel_wrap = QWidget()
+        self._mcp_panel_host = QVBoxLayout(panel_wrap)
+        self._mcp_panel_host.setContentsMargins(0, 0, 0, 0)
+        self._mcp_panel_host.setSpacing(8)
+        l.addWidget(panel_wrap)
+
+        # Per-id widget refs — only the SELECTED connector's widgets are live at
+        # a time (the panel holds one connector); handlers index by id.
         self._mcp_pills: dict = {}
         self._mcp_buttons: dict = {}
         self._mcp_token_inputs: dict = {}
@@ -3225,6 +3247,10 @@ class _SettingsPanel(QWidget):
         self._mcp_extra_inputs: dict = {}   # {id: {env_var: QLineEdit}}
         # Optimistic transient state per id: {id: (visual_state, resolve_set, ticks)}
         self._mcp_pending: dict = {}
+        # Catalog + custom entries by id (rebuilt by _render_mcp) and the
+        # currently-selected connector id (UI-only state; survives rebuilds).
+        self._mcp_entries: dict = {}
+        self._mcp_selected_id = None
 
         self._mcp_add_btn = QPushButton("＋ " + i18n.t("mcp.add_custom"))
         self._mcp_add_btn.setObjectName("primaryBtn")
@@ -3286,8 +3312,58 @@ class _SettingsPanel(QWidget):
         servers = [s for s in self._mcp_saved_servers() if s.get("id") != server_id]
         set_setting("mcp_servers", servers)
 
+    def _mcp_all_entries(self) -> list:
+        """Ordered connector entries for the dropdown: every catalog server,
+        then any user-added custom (non-catalog) saved servers. (Filesystem is
+        intentionally absent from the catalog — it duplicates OSIA's native
+        file_read/bash tools.)"""
+        catalog_ids = {e["id"] for e in self._MCP_CATALOG}
+        out = list(self._MCP_CATALOG)
+        for s in self._mcp_saved_servers():
+            sid = s["id"]
+            if sid in catalog_ids:
+                continue
+            out.append({
+                "id": sid, "name": s.get("name", sid),
+                "transport": s.get("transport", "stdio"),
+                "command": s.get("command"), "args": list(s.get("args") or []),
+                "url": s.get("url"), "auth_type": s.get("auth_type", "none"),
+                "token_env": s.get("token_env"), "needs_dir": False,
+                "custom": True, "desc_key": None,
+            })
+        return out
+
     def _render_mcp(self) -> None:
-        host = self._mcp_host
+        """Repopulate the connector dropdown (catalog + custom) and render the
+        selected connector's panel. Safe to call repeatedly (load, add, remove,
+        language change). The poll then tracks every connector's status via the
+        manager snapshot, but only the visible pill is painted."""
+        entries = self._mcp_all_entries()
+        self._mcp_entries = {e["id"]: e for e in entries}
+        combo = self._mcp_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for e in entries:
+            combo.addItem(e.get("name", e["id"]), e["id"])
+        # Keep the prior selection if it still exists, else default to the first.
+        sel = self._mcp_selected_id
+        if sel not in self._mcp_entries:
+            sel = entries[0]["id"] if entries else None
+        self._mcp_selected_id = sel
+        if sel is not None:
+            for i in range(combo.count()):
+                if combo.itemData(i) == sel:
+                    combo.setCurrentIndex(i)
+                    break
+        combo.blockSignals(False)
+        self._render_mcp_panel(sel)
+
+    def _render_mcp_panel(self, sid) -> None:
+        """Rebuild the single selected-connector panel in place, resetting the
+        per-id widget refs to just this connector (only one panel is ever live).
+        Reuses _build_mcp_card so every field / token / extra-env / Connect path
+        is byte-identical to before — only how many cards exist changed."""
+        host = self._mcp_panel_host
         while host.count():
             item = host.takeAt(0)
             w = item.widget()
@@ -3298,27 +3374,21 @@ class _SettingsPanel(QWidget):
         self._mcp_token_inputs = {}
         self._mcp_dir_inputs = {}
         self._mcp_extra_inputs = {}
-
-        catalog_ids = {e["id"] for e in self._MCP_CATALOG}
-        saved = {s["id"]: s for s in self._mcp_saved_servers()}
-
-        # Catalog cards (always shown), then any custom (non-catalog) saved ones.
-        for entry in self._MCP_CATALOG:
-            host.addWidget(self._build_mcp_card(entry, saved.get(entry["id"]), False))
-        for sid, s in saved.items():
-            if sid in catalog_ids:
-                continue
-            entry = {
-                "id": sid, "name": s.get("name", sid),
-                "transport": s.get("transport", "stdio"),
-                "command": s.get("command"), "args": list(s.get("args") or []),
-                "url": s.get("url"), "auth_type": s.get("auth_type", "none"),
-                "token_env": s.get("token_env"), "needs_dir": False,
-                "custom": True, "desc_key": None,
-            }
-            host.addWidget(self._build_mcp_card(entry, s, True))
-
+        entry = self._mcp_entries.get(sid)
+        if entry is None:
+            return
+        saved = next(
+            (s for s in self._mcp_saved_servers() if s.get("id") == sid), None
+        )
+        host.addWidget(
+            self._build_mcp_card(entry, saved, bool(entry.get("custom")))
+        )
         self._refresh_mcp_status()
+
+    def _on_mcp_select(self, _idx: int) -> None:
+        sid = self._mcp_combo.currentData()
+        self._mcp_selected_id = sid
+        self._render_mcp_panel(sid)
 
     def _build_mcp_card(self, entry: dict, saved: dict, is_custom: bool) -> QWidget:
         sid = entry["id"]
@@ -3438,11 +3508,23 @@ class _SettingsPanel(QWidget):
     def _set_mcp_pill(self, pill: QLabel, state: str) -> None:
         if state not in self._MCP_PILL_COLORS:
             state = "disconnected"
+        # Re-apply ONLY when the state actually changed. The status poll calls
+        # this every ~1.2s; re-setting an identical stylesheet forces Qt to
+        # re-parse it each tick — the source of the "Could not parse stylesheet"
+        # console spam. The last-applied state is cached on the pill itself; a
+        # freshly rebuilt pill has no cache, so a new panel always paints once,
+        # and a language switch rebuilds the pill so its text re-translates.
+        if getattr(pill, "_mcp_state", None) == state:
+            return
+        pill._mcp_state = state
         bg, fg = self._MCP_PILL_COLORS[state]
         pill.setText(i18n.t("mcp.status_" + state))
+        # Single closing brace: the trailing fragment was previously a NON-f
+        # literal ending in "}}", so Qt saw a stray extra "}" and rejected the
+        # whole rule as invalid QSS. One "}" closes the f-string's "{{" block.
         pill.setStyleSheet(
             f"QLabel{{background:{bg};color:{fg};border-radius:8px;"
-            "padding:2px 9px;font-size:11px;font-weight:600;}}"
+            "padding:2px 9px;font-size:11px;font-weight:600;}"
         )
 
     @staticmethod
@@ -3592,6 +3674,9 @@ class _SettingsPanel(QWidget):
         self._mcp_upsert_server(cfg)            # NOT connected — explicit action
         if dlg.result_token:
             set_mcp_token(sid, dlg.result_token)
+        # Surface the new server straight away: select it so the dropdown lands
+        # on its panel after _render_mcp rebuilds the item list.
+        self._mcp_selected_id = sid
         self._render_mcp()
 
     def _refresh_mcp_status(self) -> None:
@@ -4575,6 +4660,7 @@ class _SettingsPanel(QWidget):
         self._mcp_title.setText(i18n.t("settings.mcp"))
         self._mcp_sub.setText(i18n.t("settings.mcp_sub"))
         self._mcp_desc.setText(i18n.t("settings.mcp_desc"))
+        self._mcp_select_label.setText(i18n.t("mcp.select_label"))
         self._mcp_add_btn.setText("＋ " + i18n.t("mcp.add_custom"))
         self._render_mcp()
 
