@@ -52,7 +52,9 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import sys
 import threading
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -196,6 +198,65 @@ def _sanitize_error(text: str, cfg: Optional[dict]) -> str:
     except Exception:
         pass
     return text
+
+
+# ``BaseExceptionGroup`` is a builtin on Python 3.11+ (PEP 654). Resolve it once
+# so the unwrap below degrades gracefully (to "no groups") on older runtimes.
+try:  # pragma: no cover - trivial version probe
+    _EXC_GROUP = BaseExceptionGroup  # type: ignore[name-defined]
+except NameError:  # pragma: no cover - Python < 3.11
+    _EXC_GROUP = None
+
+
+def _leaf_exception(exc: BaseException) -> "tuple[BaseException, int]":
+    """Unwrap a PEP-654 ExceptionGroup down to its leaf causes and return
+    ``(first_leaf, leaf_count)``.
+
+    anyio wraps a transport/handshake failure (httpx.ConnectError, TLS, etc.)
+    inside a ``BaseExceptionGroup`` ("unhandled errors in a TaskGroup"), whose
+    own ``str()`` hides the real cause. This recurses through nested groups and
+    returns the FIRST leaf plus the total leaf count. A plain exception (or any
+    runtime without ExceptionGroups) returns ``(exc, 1)`` unchanged.
+    """
+    if _EXC_GROUP is None or not isinstance(exc, _EXC_GROUP):
+        return exc, 1
+    leaves: list = []
+
+    def _walk(e: BaseException) -> None:
+        if _EXC_GROUP is not None and isinstance(e, _EXC_GROUP):
+            for sub in e.exceptions:
+                _walk(sub)
+        else:
+            leaves.append(e)
+
+    _walk(exc)
+    if not leaves:
+        return exc, 1
+    return leaves[0], len(leaves)
+
+
+def _print_connect_failure(
+    server_id: str, leaf: BaseException, count: int, cfg: Optional[dict]
+) -> None:
+    """Print the LEAF cause of a failed connect to stderr, grep-prefixed with the
+    connector id. The traceback text is run through ``_sanitize_error`` first, so
+    any secret value the caller injected into the config (stdio ``env`` / HTTP
+    ``headers`` / ``token``) is redacted exactly as it is in ``conn.error`` —
+    diagnostics never leak a token. Best-effort: any formatting/I-O error is
+    swallowed so this can never disturb the failure-handling path.
+    """
+    try:
+        suffix = f" (1 of {count} leaf errors)" if count > 1 else ""
+        tb = "".join(
+            traceback.format_exception(type(leaf), leaf, leaf.__traceback__)
+        )
+        sys.stderr.write(
+            f"[MCP {server_id}] connect failed{suffix}:\n"
+            + _sanitize_error(tb, cfg)
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def _tool_annotations(t: Any) -> dict:
@@ -564,6 +625,11 @@ class MCPManager:
             # status, resolve `ready`, then re-raise CancelledError so the task
             # ends cancelled; swallow ordinary exceptions as a `failed` status.
             is_cancel = isinstance(e, asyncio.CancelledError)
+            # Unwrap anyio's ExceptionGroup to the real leaf cause so both the
+            # stored status AND the console show what actually failed (httpx
+            # ConnectError, TLS, etc.) instead of the useless "unhandled errors
+            # in a TaskGroup" wrapper. Only needed on the failure path.
+            leaf, leaf_count = (e, 1) if is_cancel else _leaf_exception(e)
             with self._lock:
                 conn.session = None
                 if is_cancel:
@@ -572,8 +638,12 @@ class MCPManager:
                 else:
                     conn.status = STATUS_FAILED
                     conn.error = _sanitize_error(
-                        f"{type(e).__name__}: {e}", conn.cfg
+                        f"{type(leaf).__name__}: {leaf}", conn.cfg
                     )
+            # Surface the leaf traceback on stderr (redacted) — outside the lock,
+            # never for a normal cancel/teardown. Best-effort, never raises.
+            if not is_cancel:
+                _print_connect_failure(server_id, leaf, leaf_count, conn.cfg)
             self._safe_set_future(ready, conn.status)
             if is_cancel:
                 raise
