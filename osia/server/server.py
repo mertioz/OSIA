@@ -71,6 +71,8 @@ Protocol (JSON over WebSocket, port 8765):
 
 import asyncio
 import base64
+import concurrent.futures
+import contextvars
 import io
 import json
 import os
@@ -900,6 +902,139 @@ async def internal_new_chat(request: Request):
 # binds immediately and never imports Whisper at boot. The watchdog /
 # faulthandler / port-guard in run_server.py + run_service.py (e1950f2) is the
 # complementary supervisor-side cause fix.
+
+
+# ── MCP write-tool confirmation provider (WOR-44 Phase 5, 5-conf-c) ──────────
+# The headless gate (osia.mcp.registry, 5-conf-a) calls a registered provider
+# ``provider(server_id, tool_name, summary) -> bool`` before every write/
+# destructive MCP tool. THIS server registers a provider that does a WS round-
+# trip to the mobile client that ORIGINATED the current turn: send an
+# ``mcp_confirm_request``, block the agent's worker thread on a Future, then
+# resolve it when the matching ``mcp_confirm_response`` arrives (or deny on
+# timeout / disconnect / no client / send failure).
+#
+# Correlating the worker-thread provider call back to the originating connection:
+# ``_turn_target`` is a ContextVar holding ``(channel, loop)``, set ONCE per
+# connection in the WebSocket endpoint. asyncio.create_task (the turn task),
+# asyncio.to_thread (the agent run) and the tool executor's
+# ``contextvars.copy_context`` (osia.agent._execute_tool_once) all PROPAGATE the
+# context, so the provider reads the right ``(channel, loop)`` even three
+# thread-hops away — and a confirm is always routed to the device that asked.
+# No secret rides these frames: only the server id, tool name, and an
+# arg-NAMES-only summary (osia.mcp.registry._confirm_summary).
+#
+# Process isolation: the DESKTOP process registers a Qt provider in osia.main;
+# THIS provider is registered only in the server process (the startup hook
+# below). Different processes => different registry singletons => no conflict.
+_turn_target: "contextvars.ContextVar" = contextvars.ContextVar(
+    "osia_mcp_turn_target", default=None
+)
+
+# request_id -> (concurrent.futures.Future, originating _OutboundChannel).
+_pending_confirms: dict = {}
+_pending_confirms_lock = threading.Lock()
+
+# Confirmation wait budget. Kept UNDER the per-call MCP tool budget granted in
+# 5-conf-a (osia.agent._MCP_CONFIRM_TOOL_TIMEOUT == 150 s) so the worker returns
+# (deny) BEFORE the tool executor would kill the call.
+_MCP_CONFIRM_WS_TIMEOUT = 120.0
+
+
+def _resolve_confirm(request_id: str, approved: bool) -> bool:
+    """Resolve a pending confirmation Future by id and remove it. Returns True if
+    a pending entry was found and resolved, False if the id was unknown/expired
+    (a late / duplicate / foreign response — ignored cleanly). Thread-safe; never
+    raises."""
+    with _pending_confirms_lock:
+        entry = _pending_confirms.pop(request_id, None)
+    if entry is None:
+        return False
+    fut, _channel = entry
+    if not fut.done():
+        try:
+            fut.set_result(bool(approved))
+        except Exception:
+            pass
+    return True
+
+
+def _deny_confirms_for_channel(channel) -> None:
+    """Deny (resolve False) + drop every pending confirmation targeting
+    ``channel`` — called when that connection disconnects so a blocked worker
+    thread wakes immediately (deny) instead of hanging until the timeout.
+    Thread-safe; never raises."""
+    with _pending_confirms_lock:
+        victims = [
+            rid for rid, (_f, ch) in _pending_confirms.items() if ch is channel
+        ]
+        for rid in victims:
+            fut, _ch = _pending_confirms.pop(rid)
+            if not fut.done():
+                try:
+                    fut.set_result(False)
+                except Exception:
+                    pass
+
+
+def _ws_confirm_provider(server_id: str, tool_name: str, summary: str) -> bool:
+    """MCP confirmation provider for the SERVER process. CALLED ON THE AGENT'S
+    WORKER THREAD. Sends an ``mcp_confirm_request`` to the turn's originating
+    client and blocks until the user answers or the timeout elapses. Returns True
+    ONLY on an explicit approve; denies (False) on timeout / no client / send
+    failure / disconnect / any error. Never raises (the provider contract)."""
+    try:
+        target = _turn_target.get()
+        if not target:
+            return False  # no originating channel (unattended) -> deny
+        channel, loop = target
+        if channel is None or loop is None or not loop.is_running():
+            return False
+        request_id = secrets.token_hex(8)
+        fut: "concurrent.futures.Future" = concurrent.futures.Future()
+        with _pending_confirms_lock:
+            _pending_confirms[request_id] = (fut, channel)
+        frame = {
+            "type": "mcp_confirm_request",
+            "id": request_id,
+            "server": str(server_id),
+            "tool": str(tool_name),
+            "summary": str(summary or ""),
+        }
+        try:
+            # Enqueue the request onto the originating connection's single-writer
+            # channel from this worker thread (the established bridge).
+            asyncio.run_coroutine_threadsafe(channel.send_json(frame), loop)
+        except Exception:
+            with _pending_confirms_lock:
+                _pending_confirms.pop(request_id, None)
+            return False
+        try:
+            approved = fut.result(timeout=_MCP_CONFIRM_WS_TIMEOUT)
+        except Exception:  # TimeoutError or any -> deny
+            approved = False
+        finally:
+            # Idempotent drop: a resolve already popped it; a timeout pops it here
+            # so a late response finds nothing and is ignored (no double-resolve).
+            with _pending_confirms_lock:
+                _pending_confirms.pop(request_id, None)
+        return bool(approved)
+    except Exception:
+        return False  # any failure -> deny (safe)
+
+
+@app.on_event("startup")
+async def _register_mcp_confirm_provider() -> None:
+    """WOR-44 Phase 5 (5-conf-c): register the SERVER's WS confirmation provider
+    so a write/destructive MCP tool prompts the ORIGINATING mobile client before
+    it runs. Server-process only (this module's app); the desktop process
+    registers its OWN Qt provider in osia.main, and the two never share a
+    registry. Without this, server-side writes are hard-denied (5-conf-a)."""
+    try:
+        from osia.mcp import registry as _mcp_registry
+        _mcp_registry.set_confirmation_provider(_ws_confirm_provider)
+        print("[OSIA Server] MCP write-tool confirmation provider registered (WS).")
+    except Exception as e:
+        print(f"[OSIA Server] MCP confirm provider not registered: {e}")
 
 
 @app.on_event("startup")
@@ -1766,6 +1901,15 @@ async def websocket_endpoint(ws: WebSocket):
     # is active yet / the process is about to be replaced.
     out = _OutboundChannel()
     writer_task: asyncio.Task = asyncio.create_task(_writer(ws, out))
+    # WOR-44 Phase 5 (5-conf-c): bind THIS connection's outbound channel + loop to
+    # the turn-target ContextVar so a write/destructive MCP tool's confirmation
+    # provider (_ws_confirm_provider) routes its prompt to THIS originating client.
+    # Set ONCE per connection, in the endpoint's own context: every turn task
+    # (asyncio.create_task) copies this context, and it propagates onward through
+    # asyncio.to_thread (agent run) and the tool executor's copy_context, so the
+    # worker-thread provider reads the right (channel, loop). Each connection has
+    # its own context, so a confirm never reaches the wrong device.
+    _turn_target.set((out, asyncio.get_running_loop()))
     # Per-session state.
     # ``session_history`` is the OpenAI-format message list (sans system
     # prompt) handed to the agent each turn. ``active_conv_id`` is the
@@ -2975,6 +3119,22 @@ async def websocket_endpoint(ws: WebSocket):
                 await out.send_json({"type": "status", "status": "done"})
                 continue
 
+            # --- MCP write-tool confirmation response (WOR-44 Phase 5, 5-conf-c) ---
+            # The mobile user tapped Approve/Decline on an mcp_confirm_request we
+            # sent during a write/destructive MCP tool. Resolve the matching pending
+            # Future so the blocked agent worker thread proceeds (approve) or gets a
+            # deny. Non-blocking (just resolves a Future), so the receive loop keeps
+            # serving other frames while a confirm is pending. An unknown/expired id
+            # is ignored cleanly. Additive — mirrors the Phase-4 mcp_* handlers; the
+            # frame carries no secret.
+            if msg_type == "mcp_confirm_response":
+                raw_cid = msg.get("id")
+                cid = raw_cid.strip() if isinstance(raw_cid, str) else ""
+                approved = bool(msg.get("approved", False))
+                if cid:
+                    _resolve_confirm(cid, approved)
+                continue
+
             # --- Heartbeat config (mobile live-metrics screen) ---
             # enable flag + the seconds-granularity push cadence used by the
             # heartbeat_data stream (distinct from the desktop monitor's
@@ -3266,6 +3426,11 @@ async def websocket_endpoint(ws: WebSocket):
         # Drop this client from the broadcast registry (WOR-10). discard() is
         # a no-op if it was never added (e.g. auth failed).
         _WS_CLIENTS.discard(out)
+        # WOR-44 Phase 5 (5-conf-c): deny + drop any MCP confirmation still pending
+        # for THIS connection so a blocked agent worker thread (a detached turn's
+        # write tool awaiting approval) wakes immediately with a deny instead of
+        # hanging until the timeout. No-op if none are pending.
+        _deny_confirms_for_channel(out)
         # WOR-62: DETACH any in-flight streaming turn for this connection
         # instead of cancelling it. Cancelling raised CancelledError inside the
         # turn (at the ``await asyncio.to_thread(...)`` agent run) BEFORE it
