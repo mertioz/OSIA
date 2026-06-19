@@ -796,37 +796,14 @@ def _mcp_build_connect_cfg(saved: dict) -> dict:
     an ``Authorization: Bearer`` header (streamable_http), plus any non-secret
     ``extra_env`` values. The env/headers exist only for the manager handshake —
     they are NEVER persisted (settings.json keeps env={} and strips any headers)
-    nor echoed in a frame. Mirrors the desktop GUI's _mcp_build_connect_cfg."""
-    cfg = dict(saved)
-    sid = str(saved.get("id") or "")
-    transport = str(saved.get("transport") or "stdio").strip().lower()
-    env: dict = {}
-    headers: dict = {}
-    if saved.get("auth_type") == "token":
-        try:
-            from osia.config import get_mcp_token
-            token = get_mcp_token(sid)
-        except Exception:
-            token = ""
-        token_env = saved.get("token_env")
-        if token and token_env:
-            env[str(token_env)] = token
-        # WOR-44 Phase 5: a remote (streamable-HTTP) server has no subprocess
-        # env — its token rides an in-memory Authorization header instead. Built
-        # here for the manager handshake ONLY; never persisted (the mcp_servers
-        # write path strips any 'headers' key) nor echoed in a frame
-        # (_mcp_status_frame carries no env/headers/token).
-        if token and transport == "streamable_http":
-            headers["Authorization"] = f"Bearer {token}"
-    extra = saved.get("extra_env")
-    if isinstance(extra, dict):
-        for k, v in extra.items():
-            if isinstance(k, str) and isinstance(v, str) and v:
-                env[k] = v
-    cfg["env"] = env
-    if headers:
-        cfg["headers"] = headers
-    return cfg
+    nor echoed in a frame. Mirrors the desktop GUI's _mcp_build_connect_cfg.
+
+    WOR-44: the body now lives in
+    ``osia.mcp_client.reconnect.build_headless_connect_cfg`` so the startup
+    auto-reconnect routine shares ONE headless (no-Qt) builder. This wrapper
+    preserves the existing call site and behaviour byte-for-byte."""
+    from osia.mcp_client.reconnect import build_headless_connect_cfg
+    return build_headless_connect_cfg(saved)
 
 
 def _mcp_status_frame(server_id=None) -> dict:
@@ -1056,6 +1033,45 @@ async def _resolve_x11_on_startup() -> None:
     Linux-only effect; see ``_ensure_x11_env``.
     """
     _ensure_x11_env()
+
+
+@app.on_event("startup")
+async def _reconnect_mcp_connectors_on_startup() -> None:
+    """WOR-44: auto-reconnect every ``enabled`` MCP connector this SERVER owns,
+    reusing the SAME ``MCPManager.connect()`` path as the ``mcp_connect`` WS
+    handler (idempotent; tools register inside connect()).
+
+    OAuth is SKIPPED (``allow_oauth=False``): the interactive login opens a
+    browser ON THE PC with nobody there — the same rationale as the mobile
+    ``mcp_connect`` OAuth refusal above. Only stdio + token connectors reconnect
+    headlessly, from the stored ``api_keys.json`` token.
+
+    ``connect()`` blocks (bounded) and must NEVER run on the event loop, so the
+    whole sweep runs on a daemon worker thread; each ATTEMPTED connector
+    broadcasts the existing ``_mcp_status_frame`` (protocol unchanged) so every
+    connected phone repaints. Best-effort: a failure here never crashes the
+    server."""
+    loop = asyncio.get_running_loop()
+
+    def _worker() -> None:
+        def _on_connected(sid: str, status: str) -> None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _broadcast_mcp_status(_mcp_status_frame(sid)), loop
+                )
+            except Exception:
+                pass
+        try:
+            from osia.mcp_client.reconnect import reconnect_enabled_connectors
+            reconnect_enabled_connectors(
+                allow_oauth=False, on_connected=_on_connected
+            )
+        except Exception as e:
+            print(f"[OSIA Server] MCP auto-reconnect skipped: {e}")
+
+    threading.Thread(
+        target=_worker, name="osia-mcp-reconnect", daemon=True
+    ).start()
 
 
 @app.get("/")

@@ -475,6 +475,27 @@ def wake_mode():
     except Exception as e:
         print(f"[OSIA] MCP confirm provider not registered: {e}")
 
+    # WOR-44: auto-reconnect every ``enabled`` MCP connector at launch, so a
+    # connector the user previously connected (its token / OAuth blob persisted)
+    # is live again WITHOUT reopening Settings and clicking Connect. Reuses the
+    # SAME MCPManager.connect() path as the Connect button — idempotent, and the
+    # discovered tools register into the agent maps inside connect(), so they are
+    # callable on the next turn. OAuth is allowed here (allow_oauth=True), but the
+    # routine only attempts an OAuth connector whose stored token is still
+    # comfortably valid; a stale token is SKIPPED rather than popping a browser at
+    # startup (the SDK has no headless refresh on a restart 401). connect() blocks
+    # (bounded), so the whole sweep runs on a daemon thread and never touches the
+    # Qt main thread. Best-effort: a failure must never block GUI startup.
+    def _reconnect_mcp_connectors() -> None:
+        try:
+            from osia.mcp_client.reconnect import reconnect_enabled_connectors
+            reconnect_enabled_connectors(allow_oauth=True)
+        except Exception as e:
+            print(f"[OSIA] MCP auto-reconnect skipped: {e}")
+    threading.Thread(
+        target=_reconnect_mcp_connectors, name="osia-mcp-reconnect", daemon=True
+    ).start()
+
     # WOR-22: honour the saved "show the floating capsule" preference at launch.
     island.set_capsule_visible(settings.get("show_capsule", True))
 
