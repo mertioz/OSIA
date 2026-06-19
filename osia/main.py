@@ -458,6 +458,23 @@ def wake_mode():
             print(f"[DEBUG] set_model({initial_model!r}) failed: {e}")
     popup.set_current_model(agent.model)
 
+    # WOR-44 Phase 5 (5-conf-b): register the DESKTOP confirmation provider so a
+    # write/destructive MCP tool prompts the user (modal) before it runs. The
+    # provider is invoked on the agent's worker thread and bridges to THIS Qt
+    # main thread. Registered ONLY on the desktop path — the mobile server keeps
+    # NO provider (hard-deny) until 5-conf-c. Done BEFORE app.exec(), so it is
+    # set before any user-triggered agent turn can run. Best-effort: a failure
+    # must never block GUI startup (the gate then hard-denies writes, which is
+    # the safe default). The controller is kept alive for wake_mode's lifetime.
+    mcp_confirm_controller = None
+    try:
+        from osia.gui.mcp_confirm import MCPConfirmController
+        from osia.mcp import registry as _mcp_registry
+        mcp_confirm_controller = MCPConfirmController(popup)
+        _mcp_registry.set_confirmation_provider(mcp_confirm_controller.confirm)
+    except Exception as e:
+        print(f"[OSIA] MCP confirm provider not registered: {e}")
+
     # WOR-22: honour the saved "show the floating capsule" preference at launch.
     island.set_capsule_visible(settings.get("show_capsule", True))
 

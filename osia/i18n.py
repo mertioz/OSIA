@@ -1573,6 +1573,36 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Remote-Server (HTTP) können noch nicht verbunden werden — kommt in einem späteren Update. Verwenden Sie vorerst einen stdio-Befehl.",
         "es": "Los servidores remotos (HTTP) aún no se pueden conectar — llegará en una actualización posterior. Usa un comando stdio por ahora.",
     },
+    # WOR-44 Phase 5 (5-conf-b): desktop confirmation dialog for write MCP tools.
+    "mcp.confirm.title": {
+        "en": "Allow this action?", "fr": "Autoriser cette action ?",
+        "zh": "允许此操作？", "ja": "この操作を許可しますか？",
+        "de": "Diese Aktion zulassen?", "es": "¿Permitir esta acción?",
+    },
+    "mcp.confirm.body": {
+        "en": "{server} wants to run “{tool}”.",
+        "fr": "{server} veut exécuter « {tool} ».",
+        "zh": "{server} 想要运行“{tool}”。",
+        "ja": "{server} が「{tool}」を実行しようとしています。",
+        "de": "{server} möchte „{tool}“ ausführen.",
+        "es": "{server} quiere ejecutar «{tool}».",
+    },
+    "mcp.confirm.warn": {
+        "en": "This is a write action that may change or delete data.",
+        "fr": "C'est une action d'écriture qui peut modifier ou supprimer des données.",
+        "zh": "这是一项写入操作，可能会更改或删除数据。",
+        "ja": "これはデータを変更または削除する可能性のある書き込み操作です。",
+        "de": "Dies ist eine Schreibaktion, die Daten ändern oder löschen kann.",
+        "es": "Esta es una acción de escritura que puede cambiar o eliminar datos.",
+    },
+    "mcp.confirm.approve": {
+        "en": "Approve", "fr": "Approuver", "zh": "批准",
+        "ja": "承認", "de": "Zulassen", "es": "Aprobar",
+    },
+    "mcp.confirm.decline": {
+        "en": "Decline", "fr": "Refuser", "zh": "拒绝",
+        "ja": "拒否", "de": "Ablehnen", "es": "Rechazar",
+    },
     "mcp.field_slack_team": {
         "en": "Slack team ID", "fr": "ID d'équipe Slack", "zh": "Slack 团队 ID",
         "ja": "Slack チーム ID", "de": "Slack-Team-ID", "es": "ID de equipo de Slack",
