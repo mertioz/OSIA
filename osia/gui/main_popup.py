@@ -3172,7 +3172,7 @@ class _SettingsPanel(QWidget):
                         "ph_key": "mcp.field_slack_team_ph", "required": True}]},
         {"id": "notion", "name": "Notion", "desc_key": "mcp.desc.notion",
          "transport": "streamable_http", "command": None, "args": [],
-         "url": "https://mcp.notion.com/mcp", "auth_type": "token",
+         "url": "https://mcp.notion.com/mcp", "auth_type": "oauth",
          "token_env": None, "needs_dir": False},
         {"id": "linear", "name": "Linear", "desc_key": "mcp.desc.linear",
          "transport": "streamable_http", "command": None, "args": [],
