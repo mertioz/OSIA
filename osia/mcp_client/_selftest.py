@@ -4,10 +4,10 @@
 NOT wired into the app. Run it directly from the repo root:
 
     # Linux / Mac (venv active, `mcp` installed):
-    python -m osia.mcp._selftest
+    python -m osia.mcp_client._selftest
 
     # Windows (venv active):
-    python -m osia.mcp._selftest
+    python -m osia.mcp_client._selftest
 
 Two modes, auto-selected:
 
@@ -39,12 +39,12 @@ import shutil
 import sys
 import tempfile
 
-# Allow running both as a module (`python -m osia.mcp._selftest`) and as a
+# Allow running both as a module (`python -m osia.mcp_client._selftest`) and as a
 # script from arbitrary CWDs.
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from osia.mcp.manager import (  # noqa: E402
+from osia.mcp_client.manager import (  # noqa: E402
     MCPManager,
     _ServerConn,
     _calltoolresult_to_text,

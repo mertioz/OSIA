@@ -469,7 +469,7 @@ def wake_mode():
     mcp_confirm_controller = None
     try:
         from osia.gui.mcp_confirm import MCPConfirmController
-        from osia.mcp import registry as _mcp_registry
+        from osia.mcp_client import registry as _mcp_registry
         mcp_confirm_controller = MCPConfirmController(popup)
         _mcp_registry.set_confirmation_provider(mcp_confirm_controller.confirm)
     except Exception as e:

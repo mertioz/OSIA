@@ -452,14 +452,14 @@ class MCPManager:
 
     def _register_tools(self, server_id: str, tools: list) -> None:
         try:
-            from osia.mcp import registry
+            from osia.mcp_client import registry
             registry.register_server_tools(self, server_id, tools)
         except Exception:
             pass
 
     def _unregister_tools(self, server_id: str) -> None:
         try:
-            from osia.mcp import registry
+            from osia.mcp_client import registry
             registry.unregister_server_tools(server_id)
         except Exception:
             pass
@@ -518,7 +518,7 @@ class MCPManager:
                     # IDENTICAL to the token/no-auth branch — only how the client
                     # is opened differs (auth=provider vs headers=). Refresh is
                     # fully SDK-internal in this long-lived session (no OSIA loop).
-                    from osia.mcp.oauth import (
+                    from osia.mcp_client.oauth import (
                         OAuthCallbackServer,
                         build_oauth_provider,
                     )

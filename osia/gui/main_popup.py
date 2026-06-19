@@ -3271,7 +3271,7 @@ class _SettingsPanel(QWidget):
         Gmail/Google Drive — therefore stay non-connectable, showing the
         disabled OAuth label, until their URL is wired in a later sub-step.)"""
         try:
-            from osia.mcp import SUPPORTED_TRANSPORTS
+            from osia.mcp_client import SUPPORTED_TRANSPORTS
         except Exception:
             SUPPORTED_TRANSPORTS = ("stdio",)
         return (
@@ -3623,7 +3623,7 @@ class _SettingsPanel(QWidget):
     def _on_mcp_toggle(self, entry: dict) -> None:
         sid = entry["id"]
         try:
-            from osia.mcp import get_manager
+            from osia.mcp_client import get_manager
             status = get_manager().status(sid)
         except Exception:
             status = "disconnected"
@@ -3653,7 +3653,7 @@ class _SettingsPanel(QWidget):
 
         def _bg():
             try:
-                from osia.mcp import get_manager
+                from osia.mcp_client import get_manager
                 get_manager().connect(connect_cfg)
             except Exception:
                 pass
@@ -3670,7 +3670,7 @@ class _SettingsPanel(QWidget):
 
         def _bg():
             try:
-                from osia.mcp import get_manager
+                from osia.mcp_client import get_manager
                 get_manager().disconnect(server_id)
             except Exception:
                 pass
@@ -3717,7 +3717,7 @@ class _SettingsPanel(QWidget):
         if not getattr(self, "_mcp_pills", None):
             return
         try:
-            from osia.mcp import get_manager
+            from osia.mcp_client import get_manager
             snap = get_manager().servers()
         except Exception:
             snap = {}

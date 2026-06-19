@@ -311,7 +311,7 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
     # personality/skills block above): any failure (mcp package absent, no
     # servers connected) yields no block and never breaks prompt construction.
     try:
-        from osia.mcp.registry import mcp_tool_prompt_block
+        from osia.mcp_client.registry import mcp_tool_prompt_block
         mcp_block = mcp_tool_prompt_block(lang)
         if mcp_block:
             body = body + "\n\n" + mcp_block

@@ -776,7 +776,7 @@ def _mcp_connectable(saved: dict) -> bool:
     is desktop-only in this sub-step, so the mobile ``mcp_connect`` handler below
     rejects OAuth with a "connect on PC" hint (5-oauth-c adds the phone flow)."""
     try:
-        from osia.mcp import SUPPORTED_TRANSPORTS
+        from osia.mcp_client import SUPPORTED_TRANSPORTS
     except Exception:
         SUPPORTED_TRANSPORTS = ("stdio",)
     return (
@@ -837,7 +837,7 @@ def _mcp_status_frame(server_id=None) -> dict:
     (DISCONNECTED if the manager has never seen it, so the client gets a
     definitive answer); otherwise reports every server the manager knows."""
     try:
-        from osia.mcp import get_manager
+        from osia.mcp_client import get_manager
         snap = get_manager().servers()
     except Exception:
         snap = {}
@@ -1039,7 +1039,7 @@ async def _register_mcp_confirm_provider() -> None:
     registers its OWN Qt provider in osia.main, and the two never share a
     registry. Without this, server-side writes are hard-denied (5-conf-a)."""
     try:
-        from osia.mcp import registry as _mcp_registry
+        from osia.mcp_client import registry as _mcp_registry
         _mcp_registry.set_confirmation_provider(_ws_confirm_provider)
         print("[OSIA Server] MCP write-tool confirmation provider registered (WS).")
     except Exception as e:
@@ -3093,7 +3093,7 @@ async def websocket_endpoint(ws: WebSocket):
 
                     def _connect_worker(cfg=connect_cfg, sid=server_id, loop=loop):
                         try:
-                            from osia.mcp import get_manager
+                            from osia.mcp_client import get_manager
                             get_manager().connect(cfg)
                         except Exception as e:
                             print(f"[OSIA Server] mcp_connect worker {sid!r}: {e}")
@@ -3126,7 +3126,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # mcp_disconnect
                 def _disconnect_worker(sid=server_id, loop=loop):
                     try:
-                        from osia.mcp import get_manager
+                        from osia.mcp_client import get_manager
                         get_manager().disconnect(sid)
                     except Exception as e:
                         print(f"[OSIA Server] mcp_disconnect worker {sid!r}: {e}")
