@@ -3214,6 +3214,63 @@ class _SettingsPanel(QWidget):
         l.addWidget(self._mcp_sub)
         l.addWidget(self._mcp_desc)
 
+        # WOR-44 Phase 5 (5-conf) — global "Write safety" gate for WRITE MCP
+        # tools, above the per-connector UI (mirrors the mobile card). Both
+        # toggles persist to settings.json via set_setting; the gate reads them
+        # LIVE (osia.mcp_client.registry._confirm_gate) so a change takes effect
+        # with no reconnect, and the server process picks the new value up via
+        # its settings mtime cache — so flipping a toggle here also governs
+        # mobile-initiated writes. NO backend change: the settings, gate and
+        # server whitelist already exist.
+        ws_box = QFrame()
+        ws_box.setObjectName("providerCard")
+        ws = QVBoxLayout(ws_box)
+        ws.setContentsMargins(10, 8, 10, 8)
+        ws.setSpacing(8)
+
+        # Confirm write actions — the user-facing "stop asking" switch. ON
+        # (default) prompts before any write; OFF runs writes with no prompt.
+        cw_row = QHBoxLayout()
+        cw_row.setSpacing(6)
+        self._mcp_confirm_writes_label = QLabel(i18n.t("mcp.confirm_writes"))
+        self._mcp_confirm_writes_label.setObjectName("providerName")
+        self._mcp_confirm_writes_label.setWordWrap(True)
+        self._mcp_confirm_writes_toggle = QCheckBox()
+        self._mcp_confirm_writes_toggle.setObjectName("smartToggle")
+        self._mcp_confirm_writes_toggle.stateChanged.connect(
+            self._on_mcp_confirm_writes_changed)
+        cw_row.addWidget(self._mcp_confirm_writes_label)
+        cw_row.addStretch()
+        cw_row.addWidget(self._mcp_confirm_writes_toggle)
+        ws.addLayout(cw_row)
+        self._mcp_confirm_writes_sub = QLabel(i18n.t("mcp.confirm_writes_sub"))
+        self._mcp_confirm_writes_sub.setObjectName("sectionSub")
+        self._mcp_confirm_writes_sub.setWordWrap(True)
+        ws.addWidget(self._mcp_confirm_writes_sub)
+
+        # Allow unattended writes — secondary; only consulted on the headless /
+        # no-UI branch of the gate (e.g. scheduled tasks with no device to
+        # confirm). It never bypasses the interactive prompt above.
+        uw_row = QHBoxLayout()
+        uw_row.setSpacing(6)
+        self._mcp_unattended_label = QLabel(i18n.t("mcp.unattended_writes"))
+        self._mcp_unattended_label.setObjectName("providerName")
+        self._mcp_unattended_label.setWordWrap(True)
+        self._mcp_unattended_toggle = QCheckBox()
+        self._mcp_unattended_toggle.setObjectName("smartToggle")
+        self._mcp_unattended_toggle.stateChanged.connect(
+            self._on_mcp_unattended_changed)
+        uw_row.addWidget(self._mcp_unattended_label)
+        uw_row.addStretch()
+        uw_row.addWidget(self._mcp_unattended_toggle)
+        ws.addLayout(uw_row)
+        self._mcp_unattended_sub = QLabel(i18n.t("mcp.unattended_writes_sub"))
+        self._mcp_unattended_sub.setObjectName("sectionSub")
+        self._mcp_unattended_sub.setWordWrap(True)
+        ws.addWidget(self._mcp_unattended_sub)
+
+        l.addWidget(ws_box)
+
         # WOR-44 P3 (refine) — connector DROPDOWN instead of a long stacked card
         # list (mirrors the AI/voice provider selectors): a label + combo row,
         # then ONE panel below for the selected connector only. Keeping a single
@@ -3261,6 +3318,23 @@ class _SettingsPanel(QWidget):
         self._mcp_add_btn.clicked.connect(self._on_mcp_add_custom)
         l.addWidget(self._mcp_add_btn, 0, Qt.AlignmentFlag.AlignLeft)
         return wrap
+
+    def _on_mcp_confirm_writes_changed(self, _state) -> None:
+        """Persist the write-confirmation gate (WOR-44 Phase 5, 5-conf). ON
+        (default) prompts before any write MCP tool; OFF runs writes with no
+        prompt. The gate reads this LIVE, so it takes effect with no reconnect;
+        the server process picks the new value up via its settings mtime cache,
+        so mobile-initiated writes honour it too. No gate/refresh call needed."""
+        set_setting(
+            "mcp_confirm_writes", self._mcp_confirm_writes_toggle.isChecked())
+
+    def _on_mcp_unattended_changed(self, _state) -> None:
+        """Persist the unattended-writes allowance (WOR-44 Phase 5, 5-conf).
+        Only consulted on the headless / no-UI branch of the gate (e.g.
+        scheduled tasks with no device connected to confirm); it never bypasses
+        the interactive prompt."""
+        set_setting(
+            "mcp_allow_unattended_writes", self._mcp_unattended_toggle.isChecked())
 
     def _mcp_connectable(self, entry: dict) -> bool:
         """A server is connectable now iff the manager supports its transport
@@ -4331,6 +4405,19 @@ class _SettingsPanel(QWidget):
         # status (so a connection persists visually across reopen).
         self._render_mcp()
 
+        # MCP write-safety toggles (WOR-44 Phase 5, 5-conf) — seed both from
+        # settings (confirm-writes default ON, allow-unattended default OFF).
+        # blockSignals so seeding never re-persists via the stateChanged
+        # handlers.
+        self._mcp_confirm_writes_toggle.blockSignals(True)
+        self._mcp_confirm_writes_toggle.setChecked(
+            bool(settings.get("mcp_confirm_writes", True)))
+        self._mcp_confirm_writes_toggle.blockSignals(False)
+        self._mcp_unattended_toggle.blockSignals(True)
+        self._mcp_unattended_toggle.setChecked(
+            bool(settings.get("mcp_allow_unattended_writes", False)))
+        self._mcp_unattended_toggle.blockSignals(False)
+
         # Heartbeat (Bloc 5) — master toggle, interval, per-metric checks.
         self._hb_enabled_toggle.blockSignals(True)
         self._hb_enabled_toggle.setChecked(
@@ -4703,6 +4790,10 @@ class _SettingsPanel(QWidget):
         self._mcp_title.setText(i18n.t("settings.mcp"))
         self._mcp_sub.setText(i18n.t("settings.mcp_sub"))
         self._mcp_desc.setText(i18n.t("settings.mcp_desc"))
+        self._mcp_confirm_writes_label.setText(i18n.t("mcp.confirm_writes"))
+        self._mcp_confirm_writes_sub.setText(i18n.t("mcp.confirm_writes_sub"))
+        self._mcp_unattended_label.setText(i18n.t("mcp.unattended_writes"))
+        self._mcp_unattended_sub.setText(i18n.t("mcp.unattended_writes_sub"))
         self._mcp_select_label.setText(i18n.t("mcp.select_label"))
         self._mcp_add_btn.setText("＋ " + i18n.t("mcp.add_custom"))
         self._render_mcp()

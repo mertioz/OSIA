@@ -1609,6 +1609,42 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Decline", "fr": "Refuser", "zh": "拒绝",
         "ja": "拒否", "de": "Ablehnen", "es": "Rechazar",
     },
+    # WOR-44 Phase 5 (5-conf): PC "Write safety" toggles in the MCP settings
+    # section — the global gate for WRITE MCP tools (mirrors the mobile card).
+    # Wording is kept verbatim with osia-mobile l10n.dart (mcpConfirmWrites* /
+    # mcpUnattendedWrites*) so PC and mobile read identically.
+    "mcp.confirm_writes": {
+        "en": "Confirm write actions",
+        "fr": "Confirmer les actions d'écriture",
+        "zh": "确认写入操作",
+        "ja": "書き込み操作を確認する",
+        "de": "Schreibaktionen bestätigen",
+        "es": "Confirmar acciones de escritura",
+    },
+    "mcp.confirm_writes_sub": {
+        "en": "Ask before a connector creates, changes or deletes anything.",
+        "fr": "Demander avant qu'un connecteur crée, modifie ou supprime quelque chose.",
+        "zh": "在连接器创建、修改或删除任何内容前先询问。",
+        "ja": "コネクターが作成・変更・削除を行う前に確認します。",
+        "de": "Nachfragen, bevor ein Connector etwas erstellt, ändert oder löscht.",
+        "es": "Preguntar antes de que un conector cree, modifique o elimine algo.",
+    },
+    "mcp.unattended_writes": {
+        "en": "Allow unattended writes",
+        "fr": "Autoriser les écritures sans surveillance",
+        "zh": "允许无人值守写入",
+        "ja": "無人での書き込みを許可",
+        "de": "Unbeaufsichtigte Schreibvorgänge erlauben",
+        "es": "Permitir escrituras desatendidas",
+    },
+    "mcp.unattended_writes_sub": {
+        "en": "Let write actions run with no device connected to confirm (e.g. scheduled tasks).",
+        "fr": "Laisser les actions d'écriture s'exécuter sans appareil connecté pour confirmer (ex. tâches planifiées).",
+        "zh": "在没有设备连接确认时，也允许写入操作运行（例如计划任务）。",
+        "ja": "確認する端末が接続されていなくても書き込みを実行します（例：予約タスク）。",
+        "de": "Schreibaktionen ausführen, auch wenn kein Gerät zum Bestätigen verbunden ist (z. B. geplante Aufgaben).",
+        "es": "Permitir que las acciones de escritura se ejecuten sin un dispositivo conectado para confirmar (p. ej. tareas programadas).",
+    },
     "mcp.field_slack_team": {
         "en": "Slack team ID", "fr": "ID d'équipe Slack", "zh": "Slack 团队 ID",
         "ja": "Slack チーム ID", "de": "Slack-Team-ID", "es": "ID de equipo de Slack",
