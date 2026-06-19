@@ -1,6 +1,7 @@
 venv/
 config/api_keys.json
 config/oauth_tokens.json
+config/oauth_tokens.json.tmp
 __pycache__/
 *.pyc
 *.pkl

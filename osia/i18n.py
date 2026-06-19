@@ -1537,6 +1537,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Connect", "fr": "Connecter", "zh": "连接",
         "ja": "接続", "de": "Verbinden", "es": "Conectar",
     },
+    # WOR-44 Phase 5 (5-oauth-a): connect button for OAuth connectors (Linear).
+    "mcp.connect_oauth": {
+        "en": "Connect with OAuth", "fr": "Connecter via OAuth",
+        "zh": "通过 OAuth 连接", "ja": "OAuth で接続",
+        "de": "Mit OAuth verbinden", "es": "Conectar con OAuth",
+    },
     "mcp.disconnect": {
         "en": "Disconnect", "fr": "Déconnecter", "zh": "断开",
         "ja": "切断", "de": "Trennen", "es": "Desconectar",

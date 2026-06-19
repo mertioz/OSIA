@@ -249,6 +249,92 @@ def delete_mcp_token(server_id: str) -> None:
     set_mcp_token(server_id, "")
 
 
+# ── MCP / Connectors OAuth token storage (WOR-44 Phase 5, 5-oauth-a) ─────────
+# OAuth 2.1 tokens for MCP connectors (e.g. Linear) live in their OWN gitignored
+# file ``oauth_tokens.json`` (already listed in .gitignore as
+# ``config/oauth_tokens.json``) — NEVER in settings.json (git-tracked) and NEVER
+# routed through api_keys.json / key_chain (these are SDK-managed OAuth blobs,
+# not OSIA-rotated API keys). Each entry is a per-server blob
+# ``{"token": {access_token, refresh_token, expires_in, scope, token_type},
+# "expires_at": <unix>, "client": {client_id, client_secret?, redirect_uris, …}}``
+# written by ``osia.mcp.oauth.OsiaTokenStorage`` (the MCP SDK's TokenStorage).
+#
+# CRITICAL: writes are IMMEDIATE and ATOMIC. Linear rotates the refresh token
+# (~24h) and invalidates the old one, so a stale or half-written on-disk token
+# after a restart/crash forces a full re-auth. ``_save_oauth_store`` writes to a
+# temp file, fsyncs, chmods 0600, then ``os.replace``s it into place (atomic on
+# POSIX and Windows). Token VALUES are never logged here (only the Windows ACL
+# notice, matching ``save_api_keys``).
+OAUTH_TOKENS_FILE = os.path.join(CONFIG_DIR, "oauth_tokens.json")
+_oauth_lock = threading.Lock()
+
+
+def _load_oauth_store() -> dict:
+    """Return the whole ``oauth_tokens.json`` dict, or {} if missing/corrupt."""
+    if not os.path.exists(OAUTH_TOKENS_FILE):
+        return {}
+    try:
+        with open(OAUTH_TOKENS_FILE, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_oauth_store(store: dict) -> None:
+    """Persist the OAuth token store atomically and chmod it to 0600.
+
+    Temp-file + fsync + ``os.replace`` so a crash mid-write can never corrupt
+    the live file and lose a rotated refresh token (see the note above)."""
+    _ensure_config_dir()
+    tmp = OAUTH_TOKENS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(store, f, indent=2)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    if sys.platform != "win32":
+        try:
+            os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+        except Exception:
+            pass
+    else:
+        print("[config] ACL hardening (0o600) not applied on Windows")
+    os.replace(tmp, OAUTH_TOKENS_FILE)
+
+
+def get_mcp_oauth(server_id: str) -> dict:
+    """Return the stored OAuth blob for an MCP server id, or {} if unset."""
+    if not server_id:
+        return {}
+    with _oauth_lock:
+        blob = _load_oauth_store().get(server_id)
+    return dict(blob) if isinstance(blob, dict) else {}
+
+
+def set_mcp_oauth(server_id: str, blob: dict) -> None:
+    """Set (or clear, when ``blob`` is falsy) an MCP server's OAuth blob.
+
+    Read-modify-write of the shared store is guarded by ``_oauth_lock`` so two
+    connectors writing concurrently can't clobber each other's entry."""
+    if not server_id:
+        return
+    with _oauth_lock:
+        store = _load_oauth_store()
+        if blob:
+            store[server_id] = blob
+        else:
+            store.pop(server_id, None)
+        _save_oauth_store(store)
+
+
+def delete_mcp_oauth(server_id: str) -> None:
+    """Remove an MCP server's stored OAuth blob, if any."""
+    set_mcp_oauth(server_id, {})
+
+
 # ── settings.json read cache (mtime+size based) ────────────────────────────
 # load_settings() is on the hot per-message server path and was opening
 # settings.json on EVERY call (config.py callers: get_setting, iter_keys, the

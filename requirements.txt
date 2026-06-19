@@ -42,10 +42,13 @@ requests>=2.31.0
 # Python (Python 3.10+), so it is left unguarded — it installs on every OS.
 # Phase 1 uses the stdio client transport; WOR-44 Phase 5 adds the remote
 # streamable-HTTP transport (mcp.client.streamable_http.streamablehttp_client,
-# available since mcp 1.1). For local stdio servers like
-# @modelcontextprotocol/server-filesystem a Node toolchain (npx) must also be
-# present, but that is a runtime/user dependency, not a pip one.
-mcp>=1.1.0
+# available since mcp 1.1) and, in sub-step 5-oauth-a, desktop OAuth 2.1 for
+# connectors (mcp.client.auth.OAuthClientProvider + streamablehttp_client(auth=),
+# which add PKCE + RFC 9728/8414 discovery + RFC 7591 DCR + automatic refresh +
+# RFC 8707 resource-binding — introduced in mcp 1.28). For local stdio servers
+# like @modelcontextprotocol/server-filesystem a Node toolchain (npx) must also
+# be present, but that is a runtime/user dependency, not a pip one.
+mcp>=1.28.0
 
 # ── System / input / utilities ──────────────────────────────────────────────
 psutil>=5.9.0                      # heartbeat metrics + Windows service control

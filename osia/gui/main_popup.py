@@ -51,6 +51,7 @@ from osia.config import (
     load_api_keys, save_api_keys, load_settings, set_setting, set_api_key,
     get_api_key, load_mobile_token, regenerate_mobile_token,
     get_setting, get_mcp_token, set_mcp_token, delete_mcp_token,
+    delete_mcp_oauth,
 )
 from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
@@ -3263,14 +3264,22 @@ class _SettingsPanel(QWidget):
 
     def _mcp_connectable(self, entry: dict) -> bool:
         """A server is connectable now iff the manager supports its transport
-        AND it is not OAuth (OAuth lands in Phase 5)."""
+        AND, for OAuth servers (WOR-44 Phase 5, 5-oauth-a), it has a non-empty
+        URL (the OAuth flow needs an endpoint). Kept in lockstep with the
+        server's _mcp_connectable (osia/server/server.py) so PC and mobile agree
+        on what the manager can connect. (URL-less OAuth catalog entries —
+        Gmail/Google Drive — therefore stay non-connectable, showing the
+        disabled OAuth label, until their URL is wired in a later sub-step.)"""
         try:
             from osia.mcp import SUPPORTED_TRANSPORTS
         except Exception:
             SUPPORTED_TRANSPORTS = ("stdio",)
         return (
             entry.get("transport") in SUPPORTED_TRANSPORTS
-            and entry.get("auth_type") != "oauth"
+            and (
+                entry.get("auth_type") != "oauth"
+                or bool(str(entry.get("url") or "").strip())
+            )
         )
 
     def _mcp_saved_servers(self) -> list:
@@ -3484,7 +3493,16 @@ class _SettingsPanel(QWidget):
         actions.setSpacing(6)
         actions.addStretch(1)
         if connectable:
-            btn = QPushButton(i18n.t("mcp.connect"))
+            # WOR-44 Phase 5 (5-oauth-a): OAuth connectors get a distinct
+            # "Connect with OAuth" label (the click still routes through the
+            # same _on_mcp_toggle → _on_mcp_connect path; the manager opens the
+            # browser and the loopback callback completes the login).
+            connect_label = (
+                i18n.t("mcp.connect_oauth")
+                if entry.get("auth_type") == "oauth"
+                else i18n.t("mcp.connect")
+            )
+            btn = QPushButton(connect_label)
             btn.setObjectName("primaryBtn")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda _=False, e=entry: self._on_mcp_toggle(e))
@@ -3663,6 +3681,11 @@ class _SettingsPanel(QWidget):
         self._mcp_remove_saved(server_id)
         try:
             delete_mcp_token(server_id)
+            # WOR-44 Phase 5 (5-oauth-a): also drop any stored OAuth blob so a
+            # removed server leaves no orphaned secret behind (mirrors the token
+            # cleanup; a plain disconnect intentionally KEEPS the blob for silent
+            # reconnect — only an explicit removal clears it).
+            delete_mcp_oauth(server_id)
         except Exception:
             pass
         self._mcp_pending.pop(server_id, None)
@@ -3717,9 +3740,18 @@ class _SettingsPanel(QWidget):
             self._set_mcp_pill(pill, state)
             btn = self._mcp_buttons.get(sid)
             if btn is not None:
+                # Keep the OAuth-specific connect label when disconnected (the
+                # card built it as "Connect with OAuth"); the poll would
+                # otherwise revert it to the generic "Connect".
+                entry = self._mcp_entries.get(sid) or {}
+                connect_label = (
+                    i18n.t("mcp.connect_oauth")
+                    if entry.get("auth_type") == "oauth"
+                    else i18n.t("mcp.connect")
+                )
                 btn.setText(
                     i18n.t("mcp.disconnect") if state == "connected"
-                    else i18n.t("mcp.connect")
+                    else connect_label
                 )
                 btn.setToolTip(err if (state == "failed" and err) else "")
 

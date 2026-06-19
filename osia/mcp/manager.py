@@ -64,6 +64,18 @@ DEFAULT_CONNECT_TIMEOUT = 45.0
 DEFAULT_CALL_TIMEOUT = 60.0
 DEFAULT_DISCONNECT_TIMEOUT = 10.0
 _LOOP_START_TIMEOUT = 5.0
+# WOR-44 Phase 5 (5-oauth-a): an interactive OAuth connect blocks on the user
+# completing a browser login. connect() bounds the WHOLE handshake with one
+# budget, but session.initialize() runs the SDK flow serially: PRM+ASM discovery
+# and RFC 7591 DCR (each an httpx leg at the ~30s streamablehttp default) run
+# BEFORE the loopback callback wait (osia.mcp.oauth.OAUTH_CALLBACK_TIMEOUT=300s),
+# and the token-exchange POST (~30s) runs AFTER it. So this ceiling must exceed
+# 300s + those surrounding network legs (~2×30 discovery + 30 DCR + 30 token)
+# or a login finishing near the 300s mark could be cancelled mid-exchange and a
+# SUCCESSFUL auth wrongly marked FAILED — hence 420s, not just 300+slack.
+# connect() applies it to the ready-future timeout for oauth servers only; the
+# wait is on an asyncio Event off the loop, so it never blocks the loop.
+OAUTH_CONNECT_TIMEOUT = 420.0
 
 # ── Per-server connection status values ─────────────────────────────────────
 STATUS_DISCONNECTED = "disconnected"
@@ -430,37 +442,81 @@ class MCPManager:
 
                 cfg = conn.cfg
                 url = str(cfg.get("url") or "")
-                headers = cfg.get("headers") or None
+                auth_type = str(cfg.get("auth_type") or "").strip().lower()
 
-                async with streamablehttp_client(url, headers=headers) as (read, write, _sid):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        listed = await session.list_tools()
-                        tools = [
-                            {
-                                "name": getattr(t, "name", ""),
-                                "description": getattr(t, "description", "") or "",
-                                "inputSchema": getattr(t, "inputSchema", None) or {},
-                                "annotations": _tool_annotations(t),
-                            }
-                            for t in getattr(listed, "tools", []) or []
-                        ]
-                        with self._lock:
-                            conn.session = session
-                            conn.tools = tools
-                            conn.status = STATUS_CONNECTED
-                            conn.error = ""
-                        # WOR-44 Phase 2: register the discovered tools into the
-                        # agent's TOOL_MAP / KNOWN_TOOL_NAMES BEFORE signalling
-                        # connected, so they are callable the moment connect()
-                        # returns. Best-effort: a missing/closed agent never breaks
-                        # the connection (the manager stays a usable MCP client).
-                        self._register_tools(server_id, tools)
-                        self._safe_set_future(ready, STATUS_CONNECTED)
-                        # Keep the session alive until asked to stop. Enter AND
-                        # exit of the async-with blocks both happen on THIS task —
-                        # required for anyio cancel-scope safety.
-                        await stop_event.wait()
+                if auth_type == "oauth":
+                    # WOR-44 Phase 5 (5-oauth-a): OAuth 2.1 branch. The SDK's
+                    # OAuthClientProvider (an httpx.Auth) drives the ENTIRE flow —
+                    # PKCE + RFC 9728/8414 discovery + RFC 7591 DCR + RFC 8707
+                    # resource-binding + automatic refresh + Bearer injection;
+                    # OSIA supplies only token storage, a fixed-port loopback
+                    # callback server, and the browser launch (osia.mcp.oauth).
+                    # OAuthCallbackServer is an async context manager so its
+                    # listener is ALWAYS closed (no leak) and the interactive
+                    # login is bounded. The session body below is byte-for-byte
+                    # IDENTICAL to the token/no-auth branch — only how the client
+                    # is opened differs (auth=provider vs headers=). Refresh is
+                    # fully SDK-internal in this long-lived session (no OSIA loop).
+                    from osia.mcp.oauth import (
+                        OAuthCallbackServer,
+                        build_oauth_provider,
+                    )
+
+                    async with OAuthCallbackServer() as _cb:
+                        provider = build_oauth_provider(server_id, url, _cb)
+                        async with streamablehttp_client(url, auth=provider) as (read, write, _sid):
+                            async with ClientSession(read, write) as session:
+                                await session.initialize()
+                                listed = await session.list_tools()
+                                tools = [
+                                    {
+                                        "name": getattr(t, "name", ""),
+                                        "description": getattr(t, "description", "") or "",
+                                        "inputSchema": getattr(t, "inputSchema", None) or {},
+                                        "annotations": _tool_annotations(t),
+                                    }
+                                    for t in getattr(listed, "tools", []) or []
+                                ]
+                                with self._lock:
+                                    conn.session = session
+                                    conn.tools = tools
+                                    conn.status = STATUS_CONNECTED
+                                    conn.error = ""
+                                self._register_tools(server_id, tools)
+                                self._safe_set_future(ready, STATUS_CONNECTED)
+                                await stop_event.wait()
+                else:
+                    headers = cfg.get("headers") or None
+
+                    async with streamablehttp_client(url, headers=headers) as (read, write, _sid):
+                        async with ClientSession(read, write) as session:
+                            await session.initialize()
+                            listed = await session.list_tools()
+                            tools = [
+                                {
+                                    "name": getattr(t, "name", ""),
+                                    "description": getattr(t, "description", "") or "",
+                                    "inputSchema": getattr(t, "inputSchema", None) or {},
+                                    "annotations": _tool_annotations(t),
+                                }
+                                for t in getattr(listed, "tools", []) or []
+                            ]
+                            with self._lock:
+                                conn.session = session
+                                conn.tools = tools
+                                conn.status = STATUS_CONNECTED
+                                conn.error = ""
+                            # WOR-44 Phase 2: register the discovered tools into the
+                            # agent's TOOL_MAP / KNOWN_TOOL_NAMES BEFORE signalling
+                            # connected, so they are callable the moment connect()
+                            # returns. Best-effort: a missing/closed agent never breaks
+                            # the connection (the manager stays a usable MCP client).
+                            self._register_tools(server_id, tools)
+                            self._safe_set_future(ready, STATUS_CONNECTED)
+                            # Keep the session alive until asked to stop. Enter AND
+                            # exit of the async-with blocks both happen on THIS task —
+                            # required for anyio cancel-scope safety.
+                            await stop_event.wait()
             else:
                 # Lazy import so this module imports cleanly even when the `mcp` SDK
                 # is not installed (keeps the package import-safe and standalone).
@@ -547,6 +603,16 @@ class MCPManager:
         if not server_id:
             return STATUS_FAILED
         transport = str(server_cfg.get("transport") or "stdio").strip().lower()
+        auth_type = str(server_cfg.get("auth_type") or "").strip().lower()
+
+        # WOR-44 Phase 5 (5-oauth-a): an OAuth connect blocks on an interactive
+        # browser login, so extend the ready-future budget past the loopback
+        # callback wait. Only oauth servers are affected; the default (45s) is
+        # unchanged for stdio / token / no-auth. ``max`` preserves any larger
+        # caller-supplied timeout.
+        effective_connect_timeout = connect_timeout
+        if transport == "streamable_http" and auth_type == "oauth":
+            effective_connect_timeout = max(connect_timeout, OAUTH_CONNECT_TIMEOUT)
 
         loop = self._ensure_loop()
         if loop is None:
@@ -603,12 +669,12 @@ class MCPManager:
                 c.serve_future = serve_future
 
         try:
-            ready.result(timeout=connect_timeout)
+            ready.result(timeout=effective_connect_timeout)
         except concurrent.futures.TimeoutError:
             self._set_status(
                 server_id,
                 STATUS_FAILED,
-                f"connect timed out after {connect_timeout:.0f}s",
+                f"connect timed out after {effective_connect_timeout:.0f}s",
             )
             # Abort the (possibly hung) handshake so its subprocess is reaped,
             # then briefly wait for _serve's async-with blocks to finish

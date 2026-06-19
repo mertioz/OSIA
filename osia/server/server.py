@@ -767,8 +767,14 @@ def _mcp_find_saved_server(server_id: str):
 
 def _mcp_connectable(saved: dict) -> bool:
     """True iff the manager can connect this server now: a supported transport
-    (stdio in Phase 1) AND not OAuth (OAuth lands later). Mirrors the desktop
-    GUI's _mcp_connectable so PC and mobile agree on what is connectable."""
+    AND, for OAuth servers (WOR-44 Phase 5, 5-oauth-a), a non-empty URL (the
+    OAuth flow needs an endpoint to discover against). Mirrors the desktop GUI's
+    _mcp_connectable so PC and mobile agree on what the MANAGER can connect.
+
+    NOTE: this predicate says the manager *can* connect an OAuth server — it does
+    NOT mean a mobile client may TRIGGER it. The interactive OAuth browser login
+    is desktop-only in this sub-step, so the mobile ``mcp_connect`` handler below
+    rejects OAuth with a "connect on PC" hint (5-oauth-c adds the phone flow)."""
     try:
         from osia.mcp import SUPPORTED_TRANSPORTS
     except Exception:
@@ -776,7 +782,10 @@ def _mcp_connectable(saved: dict) -> bool:
     return (
         isinstance(saved, dict)
         and saved.get("transport") in SUPPORTED_TRANSPORTS
-        and saved.get("auth_type") != "oauth"
+        and (
+            saved.get("auth_type") != "oauth"
+            or bool(str(saved.get("url") or "").strip())
+        )
     )
 
 
@@ -3051,7 +3060,7 @@ async def websocket_endpoint(ws: WebSocket):
 
                 if msg_type == "mcp_connect":
                     if not _mcp_connectable(saved):
-                        # stdio + non-OAuth only in this phase (mirrors the GUI,
+                        # Unsupported transport / url-less OAuth (mirrors the GUI,
                         # which hides the connect button otherwise). Clean error,
                         # no thread spawned, no FAILED entry left in the manager.
                         print(
@@ -3062,6 +3071,22 @@ async def websocket_endpoint(ws: WebSocket):
                         await out.send_json(
                             {"type": "status", "status": "error",
                              "error": "not connectable yet"}
+                        )
+                        continue
+                    if saved.get("auth_type") == "oauth":
+                        # WOR-44 Phase 5 (5-oauth-a): the OAuth login opens a
+                        # browser ON THE PC, so a phone cannot drive it yet. Do
+                        # NOT spawn the connect (which would pop a browser on the
+                        # PC with nobody there) — tell the client to connect on
+                        # the PC. The mobile app surfaces this as "Connect on PC";
+                        # the phone-driven flow lands in 5-oauth-c.
+                        print(
+                            f"[OSIA Server] mcp_connect id={server_id!r} is OAuth "
+                            f"— deferred to PC (mobile flow lands in 5-oauth-c)"
+                        )
+                        await out.send_json(
+                            {"type": "status", "status": "error",
+                             "error": "oauth_connect_on_pc"}
                         )
                         continue
                     connect_cfg = _mcp_build_connect_cfg(saved)
