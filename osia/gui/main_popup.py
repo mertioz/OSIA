@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QStackedWidget, QListWidget, QFrame,
     QSizePolicy, QFileDialog, QCheckBox, QComboBox,
-    QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog,
+    QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog, QLayout,
 )
 
 from osia import conversations
@@ -5850,6 +5850,26 @@ class MainPopup(QWidget):
         # clean every frame (no ghosts). No setGraphicsEffect anywhere.
 
         outer = QVBoxLayout(self)
+        # Settings-reopen hit-test fix (root cause). MainPopup is a top-level
+        # window, so this top-level layout defaults to SetDefaultConstraint —
+        # whose activate() does `window.setMinimumSize(layout.totalMinimumSize())`
+        # on every layout pass. totalMinimumSize() is dominated by the central
+        # QStackedWidget's minimumSize (= MAX over ALL pages = the Settings
+        # master-detail page, ~800x700). Once Settings has been laid out once its
+        # heavy minimumSize is cached, so on the NEXT reopen the layout forces the
+        # window minimum to ~800x700 — overriding setFixedHeight(POPUP_H) (min-h
+        # 700 > max-h 560 ⇒ the native window grows to ~775) and setMaximumWidth
+        # (POPUP_W_WIDE). That oversized native top-level (~800x775 around 640x560
+        # of painted content) is what mis-routes mouse events: clicks/hover land
+        # in the dead oversized region and never reach the inner widgets. It also
+        # re-fires AFTER anchor_below_island()'s setGeometry on the post-show
+        # LayoutRequest, so pinning geometry / WA_Resized there cannot hold it.
+        # SetNoConstraint makes activate() a no-op for the window's min/max, so
+        # the explicit setFixedHeight/min/max-width below are the SOLE size
+        # authority and the per-page setGeometry (440 or 640 × 560) always wins.
+        # Settings content that exceeds the height scrolls inside its own
+        # QScrollArea exactly as before — the window never grows to fit it.
+        outer.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         # WOR-48 audit #2: outer margin = SHADOW_MARGIN (transparent canvas band
         # for the hand-painted drop shadow that replaced QGraphicsDropShadowEffect)
         # + the card's own 11px internal padding, preserved from before. Total
@@ -5996,6 +6016,23 @@ class MainPopup(QWidget):
         screen = self.screen() or QApplication.primaryScreen()
         geo = screen.availableGeometry()
 
+        # Place the window at the ACTIVE PAGE's width + the fixed height and set
+        # its geometry explicitly (not just move()), so reopen maps in-bounds.
+        # The DEFINITIVE cure for the Settings-reopen oversize (native window
+        # ~800x775 swallowing mouse events around the 640x560 content) is the
+        # SetNoConstraint on the outer layout in __init__ — that stops the
+        # top-level layout from forcing the window minimum up to the Settings
+        # page's cached ~800x700 minimumSize. This setGeometry just supplies the
+        # correct in-bounds per-page geometry: WIDE for the Settings master-detail
+        # page, COMPACT for every other page; target_h is always the fixed
+        # POPUP_H. First-open is unaffected — it opens on PAGE_CHAT (COMPACT) and
+        # still snaps 440→640 in-place via _animate_width when the Settings nav is
+        # clicked on the mapped window.
+        target_w = (POPUP_W_WIDE
+                    if self._stack.currentIndex() == self.PAGE_SETTINGS
+                    else POPUP_W)
+        target_h = POPUP_H
+
         if self._anchor is not None:
             # Follow the capsule's current position: horizontally centred
             # under it, just below it — on the capsule's screen. When there
@@ -6006,20 +6043,20 @@ class MainPopup(QWidget):
             island_screen = self._anchor.screen()
             if island_screen is not None:
                 geo = island_screen.availableGeometry()
-            x = island_geo.center().x() - self.width() // 2
+            x = island_geo.center().x() - target_w // 2
             y = island_geo.bottom() + 10
-            if (y + self.height() > geo.y() + geo.height()
-                    and island_geo.top() - 10 - self.height() >= geo.y()):
-                y = island_geo.top() - 10 - self.height()
-            x = max(geo.x(), min(x, geo.x() + geo.width() - self.width()))
-            y = max(geo.y(), min(y, geo.y() + geo.height() - self.height()))
-            self.move(x, y)
+            if (y + target_h > geo.y() + geo.height()
+                    and island_geo.top() - 10 - target_h >= geo.y()):
+                y = island_geo.top() - 10 - target_h
+            x = max(geo.x(), min(x, geo.x() + geo.width() - target_w))
+            y = max(geo.y(), min(y, geo.y() + geo.height() - target_h))
+            self.setGeometry(x, y, target_w, target_h)
             return
 
         # No anchor — legacy fixed placement at the top-centre of the screen.
-        x = geo.x() + (geo.width() - self.width()) // 2
+        x = geo.x() + (geo.width() - target_w) // 2
         y = geo.y() + max(island_geom_bottom_y, 60)
-        self.move(x, y)
+        self.setGeometry(x, y, target_w, target_h)
 
     def _animate_width(self, target_w: int) -> None:
         """Resize the window to ``target_w`` (COMPACT or WIDE), instantly.
