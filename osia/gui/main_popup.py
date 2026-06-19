@@ -3581,16 +3581,25 @@ class _SettingsPanel(QWidget):
         # Build the in-memory connect env: the token (authoritative from the
         # field — empty means none) plus any extra-env values.
         env: dict = {}
+        headers: dict = {}
         token = ""
         if entry.get("auth_type") == "token":
             tin = self._mcp_token_inputs.get(sid)
             token = tin.text().strip() if tin else ""
             if token and entry.get("token_env"):
                 env[entry["token_env"]] = token
+            # WOR-44 Phase 5: a streamable-HTTP server carries its token in an
+            # in-memory Authorization header (no subprocess env). Built only for
+            # the manager handshake — persist_cfg never gets a 'headers' key, so
+            # the secret never reaches the git-tracked settings.json.
+            if token and entry.get("transport") == "streamable_http":
+                headers["Authorization"] = f"Bearer {token}"
         env.update(extra_env)
         connect = dict(persist)
         if env:
             connect["env"] = env
+        if headers:
+            connect["headers"] = headers
         return connect, persist, token
 
     def _on_mcp_toggle(self, entry: dict) -> None:

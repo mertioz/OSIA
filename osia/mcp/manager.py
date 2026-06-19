@@ -31,11 +31,12 @@ The async-loop-thread ↔ sync-call bridge
   will wrap into a native-style ``TOOL_MAP`` callable, so it already honours the
   string / ``ERROR:`` contract.
 
-Phase 1 supports the ``stdio`` transport only (local subprocess servers such as
-the reference ``@modelcontextprotocol/server-filesystem``). ``streamable_http``
-/ ``sse`` are recognised but report a clear ``failed`` status until a later
-phase wires them — an unknown / unsupported transport never crashes the
-manager.
+The manager supports the ``stdio`` transport (local subprocess servers such as
+the reference ``@modelcontextprotocol/server-filesystem``) and, since WOR-44
+Phase 5, the ``streamable_http`` transport (remote HTTP servers addressed by a
+URL with optional auth headers, e.g. Notion). ``sse`` is recognised but reports
+a clear ``failed`` status until a later phase wires it — an unknown /
+unsupported transport never crashes the manager.
 
 Thread-safety
 -------------
@@ -70,9 +71,10 @@ STATUS_CONNECTING = "connecting"
 STATUS_CONNECTED = "connected"
 STATUS_FAILED = "failed"
 
-# Transports recognised by the config schema vs. those actually wired in
-# Phase 1. A config naming a known-but-unsupported transport fails cleanly.
-SUPPORTED_TRANSPORTS = ("stdio",)
+# Transports recognised by the config schema vs. those actually wired. Phase 1
+# wired stdio; WOR-44 Phase 5 wired streamable_http (remote HTTP). A config
+# naming a known-but-unsupported transport (e.g. sse) fails cleanly.
+SUPPORTED_TRANSPORTS = ("stdio", "streamable_http")
 KNOWN_TRANSPORTS = ("stdio", "streamable_http", "sse")
 
 # Non-error sentinel for a successful-but-empty tool result. Matches the native
@@ -380,46 +382,98 @@ class MCPManager:
             conn.stop_event = stop_event
 
         try:
-            # Lazy import so this module imports cleanly even when the `mcp` SDK
-            # is not installed (keeps the package import-safe and standalone).
-            from mcp import ClientSession, StdioServerParameters
-            from mcp.client.stdio import stdio_client
+            # WOR-44 Phase 5: pick the transport. ``streamable_http`` opens a
+            # remote HTTP session (URL + optional in-memory auth headers);
+            # everything else takes the original Phase-1 ``stdio`` path (local
+            # subprocess), byte-for-byte unchanged in the ``else`` branch.
+            # Everything downstream of the ``read``/``write`` streams — the
+            # ClientSession handshake, tool discovery, registration into the
+            # agent maps, and the hold-open until disconnect — is transport-
+            # agnostic and DUPLICATED verbatim in each branch (no shared-block
+            # refactor) so the stdio bytes never move.
+            transport = str(conn.cfg.get("transport") or "stdio").strip().lower()
+            if transport == "streamable_http":
+                # ``streamablehttp_client`` yields a 3-TUPLE (read, write,
+                # get_session_id) — note the extra element vs stdio's 2-tuple.
+                # ``headers`` carries the in-memory Authorization header the
+                # caller injected for the handshake (None when absent); it is
+                # never persisted nor echoed in a frame.
+                from mcp import ClientSession
+                from mcp.client.streamable_http import streamablehttp_client
 
-            cfg = conn.cfg
-            params = StdioServerParameters(
-                command=str(cfg.get("command") or ""),
-                args=[str(a) for a in (cfg.get("args") or [])],
-                env=(dict(cfg["env"]) if cfg.get("env") else None),
-            )
+                cfg = conn.cfg
+                url = str(cfg.get("url") or "")
+                headers = cfg.get("headers") or None
 
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    listed = await session.list_tools()
-                    tools = [
-                        {
-                            "name": getattr(t, "name", ""),
-                            "description": getattr(t, "description", "") or "",
-                            "inputSchema": getattr(t, "inputSchema", None) or {},
-                        }
-                        for t in getattr(listed, "tools", []) or []
-                    ]
-                    with self._lock:
-                        conn.session = session
-                        conn.tools = tools
-                        conn.status = STATUS_CONNECTED
-                        conn.error = ""
-                    # WOR-44 Phase 2: register the discovered tools into the
-                    # agent's TOOL_MAP / KNOWN_TOOL_NAMES BEFORE signalling
-                    # connected, so they are callable the moment connect()
-                    # returns. Best-effort: a missing/closed agent never breaks
-                    # the connection (the manager stays a usable MCP client).
-                    self._register_tools(server_id, tools)
-                    self._safe_set_future(ready, STATUS_CONNECTED)
-                    # Keep the session (and its subprocess) alive until asked to
-                    # stop. Enter AND exit of the async-with blocks both happen
-                    # on THIS task — required for anyio cancel-scope safety.
-                    await stop_event.wait()
+                async with streamablehttp_client(url, headers=headers) as (read, write, _sid):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        listed = await session.list_tools()
+                        tools = [
+                            {
+                                "name": getattr(t, "name", ""),
+                                "description": getattr(t, "description", "") or "",
+                                "inputSchema": getattr(t, "inputSchema", None) or {},
+                            }
+                            for t in getattr(listed, "tools", []) or []
+                        ]
+                        with self._lock:
+                            conn.session = session
+                            conn.tools = tools
+                            conn.status = STATUS_CONNECTED
+                            conn.error = ""
+                        # WOR-44 Phase 2: register the discovered tools into the
+                        # agent's TOOL_MAP / KNOWN_TOOL_NAMES BEFORE signalling
+                        # connected, so they are callable the moment connect()
+                        # returns. Best-effort: a missing/closed agent never breaks
+                        # the connection (the manager stays a usable MCP client).
+                        self._register_tools(server_id, tools)
+                        self._safe_set_future(ready, STATUS_CONNECTED)
+                        # Keep the session alive until asked to stop. Enter AND
+                        # exit of the async-with blocks both happen on THIS task —
+                        # required for anyio cancel-scope safety.
+                        await stop_event.wait()
+            else:
+                # Lazy import so this module imports cleanly even when the `mcp` SDK
+                # is not installed (keeps the package import-safe and standalone).
+                from mcp import ClientSession, StdioServerParameters
+                from mcp.client.stdio import stdio_client
+
+                cfg = conn.cfg
+                params = StdioServerParameters(
+                    command=str(cfg.get("command") or ""),
+                    args=[str(a) for a in (cfg.get("args") or [])],
+                    env=(dict(cfg["env"]) if cfg.get("env") else None),
+                )
+
+                async with stdio_client(params) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        listed = await session.list_tools()
+                        tools = [
+                            {
+                                "name": getattr(t, "name", ""),
+                                "description": getattr(t, "description", "") or "",
+                                "inputSchema": getattr(t, "inputSchema", None) or {},
+                            }
+                            for t in getattr(listed, "tools", []) or []
+                        ]
+                        with self._lock:
+                            conn.session = session
+                            conn.tools = tools
+                            conn.status = STATUS_CONNECTED
+                            conn.error = ""
+                        # WOR-44 Phase 2: register the discovered tools into the
+                        # agent's TOOL_MAP / KNOWN_TOOL_NAMES BEFORE signalling
+                        # connected, so they are callable the moment connect()
+                        # returns. Best-effort: a missing/closed agent never breaks
+                        # the connection (the manager stays a usable MCP client).
+                        self._register_tools(server_id, tools)
+                        self._safe_set_future(ready, STATUS_CONNECTED)
+                        # Keep the session (and its subprocess) alive until asked to
+                        # stop. Enter AND exit of the async-with blocks both happen
+                        # on THIS task — required for anyio cancel-scope safety.
+                        await stop_event.wait()
         except BaseException as e:  # noqa: BLE001 - isolate every failure
             # Includes CancelledError (disconnect/shutdown teardown): record a
             # status, resolve `ready`, then re-raise CancelledError so the task
@@ -497,6 +551,11 @@ class MCPManager:
             return STATUS_FAILED
         if transport == "stdio" and not str(server_cfg.get("command") or "").strip():
             self._fail_unserved(server_id, "stdio transport requires a 'command'")
+            return STATUS_FAILED
+        if transport == "streamable_http" and not str(server_cfg.get("url") or "").strip():
+            self._fail_unserved(
+                server_id, "streamable_http transport requires a 'url'"
+            )
             return STATUS_FAILED
 
         ready: concurrent.futures.Future = concurrent.futures.Future()

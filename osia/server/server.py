@@ -781,13 +781,16 @@ def _mcp_connectable(saved: dict) -> bool:
 def _mcp_build_connect_cfg(saved: dict) -> dict:
     """Build the IN-MEMORY connect config for one saved server: a copy of the
     non-secret saved cfg with the per-server token (from the gitignored
-    api_keys.json ``mcp:<id>`` store) injected into ``env[token_env]`` plus any
-    non-secret ``extra_env`` values. The env exists only for the manager
-    handshake — it is NEVER persisted (settings.json keeps env={}) nor echoed in
-    a frame. Mirrors the desktop GUI's _mcp_build_connect_cfg."""
+    api_keys.json ``mcp:<id>`` store) injected into ``env[token_env]`` (stdio) or
+    an ``Authorization: Bearer`` header (streamable_http), plus any non-secret
+    ``extra_env`` values. The env/headers exist only for the manager handshake —
+    they are NEVER persisted (settings.json keeps env={} and strips any headers)
+    nor echoed in a frame. Mirrors the desktop GUI's _mcp_build_connect_cfg."""
     cfg = dict(saved)
     sid = str(saved.get("id") or "")
+    transport = str(saved.get("transport") or "stdio").strip().lower()
     env: dict = {}
+    headers: dict = {}
     if saved.get("auth_type") == "token":
         try:
             from osia.config import get_mcp_token
@@ -797,12 +800,21 @@ def _mcp_build_connect_cfg(saved: dict) -> dict:
         token_env = saved.get("token_env")
         if token and token_env:
             env[str(token_env)] = token
+        # WOR-44 Phase 5: a remote (streamable-HTTP) server has no subprocess
+        # env — its token rides an in-memory Authorization header instead. Built
+        # here for the manager handshake ONLY; never persisted (the mcp_servers
+        # write path strips any 'headers' key) nor echoed in a frame
+        # (_mcp_status_frame carries no env/headers/token).
+        if token and transport == "streamable_http":
+            headers["Authorization"] = f"Bearer {token}"
     extra = saved.get("extra_env")
     if isinstance(extra, dict):
         for k, v in extra.items():
             if isinstance(k, str) and isinstance(v, str) and v:
                 env[k] = v
     cfg["env"] = env
+    if headers:
+        cfg["headers"] = headers
     return cfg
 
 
@@ -2732,24 +2744,35 @@ async def websocket_endpoint(ws: WebSocket):
                         # mcp_servers is a list of NON-SECRET server configs. A
                         # token must NEVER reach the git-tracked settings.json —
                         # it lives only in the gitignored api_keys.json under
-                        # `mcp:<id>`. Defensively force env={} on every entry so
-                        # a buggy/malicious client cannot persist a secret here
-                        # even if it sends one (upholds the WOR-44 secret-storage
-                        # contract; mirrors the desktop _mcp_upsert_server, which
-                        # also always writes env={}).
+                        # `mcp:<id>`. Defensively force env={} AND drop any
+                        # `headers` key on every entry (WOR-44 Phase 5: a
+                        # streamable-HTTP server's token rides an in-memory
+                        # Authorization header at connect time — it must never be
+                        # persisted) so a buggy/malicious client cannot persist a
+                        # secret here even if it sends one (upholds the WOR-44
+                        # secret-storage contract; mirrors the desktop
+                        # _mcp_upsert_server, which writes env={} and no headers).
                         clean = []
                         if isinstance(setting_value, list):
                             for s in setting_value:
                                 if isinstance(s, dict) and s.get("id"):
                                     e = dict(s)
                                     e["env"] = {}
+                                    e.pop("headers", None)
                                     clean.append(e)
                         set_setting("mcp_servers", clean)
                     else:
                         set_setting(setting_key, setting_value)
+                    # WOR-44 Phase 5: for mcp_servers log the SANITIZED `clean`
+                    # list (env={} + headers stripped), never the raw value — a
+                    # malicious/buggy client could embed a token in env/headers,
+                    # and the raw value would otherwise leak it to the journal in
+                    # plaintext. `clean` is only referenced on the mcp_servers
+                    # branch, where it is always bound.
+                    logged_value = clean if setting_key == "mcp_servers" else setting_value
                     print(
                         f"[OSIA Server] set_setting {setting_key!r} -> "
-                        f"{setting_value!r}"
+                        f"{logged_value!r}"
                     )
                     await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
