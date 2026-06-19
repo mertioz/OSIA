@@ -3525,7 +3525,7 @@ class _SettingsPanel(QWidget):
         # literal ending in "}}", so Qt saw a stray extra "}" and rejected the
         # whole rule as invalid QSS. One "}" closes the f-string's "{{" block.
         pill.setStyleSheet(
-            f"QLabel{{background:{bg};color:{fg};border-radius:8px;"
+            f"QLabel{{background:{bg};color:{fg};border-radius:4px;"
             "padding:2px 9px;font-size:11px;font-weight:600;}"
         )
 
