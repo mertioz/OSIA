@@ -5773,6 +5773,48 @@ class _NavButton(QPushButton):
         p.drawPath(path)
 
 
+# ── Central page stack ────────────────────────────────────────────────────────
+
+class _CentralStack(QStackedWidget):
+    """The QStackedWidget that hosts MainPopup's pages, with ONE behavioural
+    tweak that completes the Settings-reopen hit-test fix (see the
+    ``SetNoConstraint`` / Ignored-vertical notes in ``MainPopup.__init__``).
+
+    Root cause (proven by headless sizeHint instrumentation): the Settings page
+    carries a word-wrapped title ``QLabel#panelTitle`` — the only panel title
+    that wraps — so that page, and therefore THIS stack, reports
+    ``hasHeightForWidth() == True``. When a top-level ``QVBoxLayout`` sizes a
+    child that has height-for-width it sizes it via ``heightForWidth()`` instead
+    of ``sizeHint()``, and that path is IMMUNE to the ``QSizePolicy.Ignored``
+    vertical zeroing applied to this stack. So with Settings active the stack's
+    tall max-page content height (≈337 with these fonts, ≈440 with Windows
+    fonts) leaks straight into ``MainPopup.sizeHint()`` (≈620 on Windows). On
+    the frameless + translucent Win32 window the native HWND then maps to that
+    oversized hint PAST ``setFixedHeight(POPUP_H)`` — the ~60px dead native
+    strip that mis-routes clicks/hover on reopen. Other pages (osia/autonomous)
+    tie that height via their own ``QScrollArea`` but do NOT trigger the bug
+    because their titles do not wrap, so they have no height-for-width and the
+    Ignored vertical policy already nulls them.
+
+    Reporting ``hasHeightForWidth() == False`` here forces the top-level layout
+    back onto the (zeroable) ``sizeHint`` path, so the Ignored vertical policy
+    set in ``__init__`` can null this stack's height contribution for EVERY
+    page, Settings included → ``MainPopup.sizeHint()`` collapses to its chrome
+    height (well under ``POPUP_H``) and the explicit ``setFixedHeight(POPUP_H)``
+    minimum becomes the sole authority, so the native HWND maps to POPUP_H.
+
+    Nothing else changes: the stack is given its height by its stretch factor in
+    the outer layout (``addWidget(self._stack, 1)``) and distributes it to the
+    current page exactly as before, so every page — and the Settings
+    ``QScrollArea`` — is sized and scrolls unchanged. Each page's OWN internal
+    layout still honours height-for-width for its word-wrapped labels (this
+    override only affects how the TOP-LEVEL layout measures the stack).
+    """
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802 (Qt method name)
+        return False
+
+
 # ── MainPopup ───────────────────────────────────────────────────────────────
 
 class MainPopup(QWidget):
@@ -5914,7 +5956,25 @@ class MainPopup(QWidget):
         outer.addLayout(header)
 
         # Central stack
-        self._stack = QStackedWidget()
+        # Settings-reopen hit-test fix (APPROACH A — the Qt-recommended lever).
+        # Two cooperating measures stop the central stack's tall max-page content
+        # height from inflating MainPopup.sizeHint() (and thus the native HWND on
+        # the frameless+translucent Win32 window) past setFixedHeight(POPUP_H):
+        #   1. _CentralStack.hasHeightForWidth() -> False (see that class) keeps
+        #      the Settings page's word-wrapped-title height-for-width OFF the
+        #      top-level layout's height-for-width path.
+        #   2. The Ignored VERTICAL size policy below makes this stack's height
+        #      sizeHint a no-op for the top-level layout's totalSizeHint.
+        # The stack still FILLS the window via its stretch factor (addWidget
+        # below) and clips/scrolls each page's content exactly as before — only
+        # the sizeHint propagation to the top level changes. This pairs with the
+        # outer-layout SetNoConstraint above (which caps the window MINIMUM); the
+        # two together leave setFixedHeight(POPUP_H) / min/max-width as the sole
+        # size authority, so the native HWND maps to POPUP_W(_WIDE) x POPUP_H.
+        self._stack = _CentralStack()
+        _stack_sp = self._stack.sizePolicy()
+        _stack_sp.setVerticalPolicy(QSizePolicy.Policy.Ignored)
+        self._stack.setSizePolicy(_stack_sp)
         self._chat = _ChatPage()
         self._chat.send_text.connect(self.send_text.emit)
         self._chat.pick_file.connect(self.pick_file.emit)
