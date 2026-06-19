@@ -186,6 +186,33 @@ def _sanitize_error(text: str, cfg: Optional[dict]) -> str:
     return text
 
 
+def _tool_annotations(t: Any) -> dict:
+    """Extract an MCP Tool's behavioural hints (``readOnlyHint`` /
+    ``destructiveHint`` / ``idempotentHint`` / ``openWorldHint``) into a PLAIN
+    dict, or ``{}`` when absent.
+
+    These optional, server-supplied hints (MCP ``ToolAnnotations``) let a caller
+    classify a tool as read-only vs write/destructive (WOR-44 Phase 5 confirm
+    gate). We flatten them to a plain dict at the SDK boundary so downstream
+    consumers (``osia.mcp.registry``) never touch SDK types. Duck-typed and
+    defensive: tolerates a missing field, a ``None`` annotations object, and the
+    (older-SDK) case where ``annotations`` is already a dict. Only non-``None``
+    hints are copied, so an unset hint is simply absent.
+    """
+    ann = getattr(t, "annotations", None)
+    if ann is None:
+        return {}
+    out: dict = {}
+    for key in ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"):
+        try:
+            val = ann.get(key) if isinstance(ann, dict) else getattr(ann, key, None)
+        except Exception:
+            val = None
+        if val is not None:
+            out[key] = val
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Per-server connection record
 # ---------------------------------------------------------------------------
@@ -414,6 +441,7 @@ class MCPManager:
                                 "name": getattr(t, "name", ""),
                                 "description": getattr(t, "description", "") or "",
                                 "inputSchema": getattr(t, "inputSchema", None) or {},
+                                "annotations": _tool_annotations(t),
                             }
                             for t in getattr(listed, "tools", []) or []
                         ]
@@ -455,6 +483,7 @@ class MCPManager:
                                 "name": getattr(t, "name", ""),
                                 "description": getattr(t, "description", "") or "",
                                 "inputSchema": getattr(t, "inputSchema", None) or {},
+                                "annotations": _tool_annotations(t),
                             }
                             for t in getattr(listed, "tools", []) or []
                         ]

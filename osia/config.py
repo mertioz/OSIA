@@ -152,6 +152,16 @@ DEFAULT_SETTINGS = {
     # under an ``mcp:<id>`` key (see get_mcp_token/set_mcp_token) — NEVER here,
     # because settings.json is git-tracked. See osia.mcp.MCPManager.
     "mcp_servers": [],
+    # MCP write-tool confirmation gate (WOR-44 Phase 5, 5-conf-a). Both are
+    # NON-secret global toggles. ``mcp_confirm_writes`` (default True): a
+    # write/destructive MCP tool must be confirmed before it runs (read-only MCP
+    # tools and ALL native tools are unaffected; turning this OFF runs writes
+    # unchanged). ``mcp_allow_unattended_writes`` (default False): governs
+    # UNATTENDED runs (cron/autonomous, no confirmation UI registered) — False
+    # hard-denies the write, True lets it run without confirmation. See
+    # osia.mcp.registry (classify_tool / _confirm_gate).
+    "mcp_confirm_writes": True,
+    "mcp_allow_unattended_writes": False,
     "island_shape": "capsule",  # adaptive shape: "capsule", "circle", "docked"
     "island_dock_side": "right",  # docked screen edge: "left", "right"
     "island_x": None,          # last dragged capsule position; None = top-centre

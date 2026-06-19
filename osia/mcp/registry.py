@@ -75,6 +75,167 @@ def _valid_server_id(server_id: str) -> bool:
     return _valid_tool_name(server_id) and _SEP not in server_id
 
 
+# ── Write/destructive classification + confirmation gate (WOR-44 Phase 5) ────
+# A write/destructive MCP tool (create/update/delete/send/…) can have real side
+# effects, and MCP tool metadata is third-party text. Before such a tool runs we
+# may require a user confirmation. Classification prefers the server-supplied MCP
+# annotations (readOnlyHint / destructiveHint); when absent it falls back to a
+# name-verb heuristic. The heuristic is WRITE-BIASED: any write verb present wins
+# over a read verb (so e.g. "list_and_delete" is treated as write), and a name
+# matching neither is treated as write — the SAFE default, since a false "write"
+# only costs an extra confirmation while a false "read" would skip the gate on a
+# destructive call.
+# The write list is deliberately BROAD (mutation + execution + destructive
+# verbs): a false "write" only costs an extra confirmation, while a missing write
+# verb is a dangerous false-READ that skips the gate on a destructive call. It
+# covers state-change, lifecycle, sharing/permission, and EXECUTION verbs
+# (run/execute/invoke/trigger/dispatch) — a tool that "runs" something can mutate.
+_WRITE_VERBS = frozenset({
+    # core CRUD / messaging (original set)
+    "create", "update", "delete", "remove", "send", "post", "put", "patch",
+    "write", "merge", "archive", "move", "add", "edit", "insert", "upload",
+    "set", "cancel", "close", "comment", "append",
+    # execution (can mutate — e.g. an SQL "run"/"query" runner)
+    "run", "execute", "exec", "invoke", "trigger", "dispatch", "import",
+    # destructive / lifecycle
+    "purge", "drop", "truncate", "reset", "revoke", "disable", "enable",
+    "kill", "terminate", "destroy", "wipe", "clear", "flush", "prune",
+    "deactivate", "activate", "deploy", "rollback", "restore", "overwrite",
+    "replace", "rename", "duplicate", "clone", "sync", "push", "commit",
+    "revert", "format", "install", "uninstall", "start", "stop", "restart",
+    "reboot", "schedule", "transfer", "publish", "unpublish",
+    # approval / membership / sharing / metadata mutation
+    "approve", "reject", "grant", "assign", "unassign", "charge", "pay",
+    "refund", "share", "unshare", "lock", "unlock", "mute", "unmute", "ban",
+    "unban", "invite", "subscribe", "unsubscribe", "mark", "flag", "pin",
+    "unpin", "tag", "untag", "complete", "reopen", "resolve", "register",
+    "unregister",
+    # additional destructive / lifecycle / infra verbs (red-team residual
+    # closure — a false write here only costs a confirmation, so erring broad).
+    "void", "invalidate", "escalate", "rotate", "decommission", "deprecate",
+    "settle", "dismiss", "quarantine", "scale", "expire", "provision",
+    "acknowledge", "evict", "redeem", "detach", "drain", "suspend", "resume",
+    "pause", "abort", "halt", "regenerate", "rebuild", "reindex", "block",
+    "unblock", "deny", "withdraw", "deposit", "reverse",
+})
+# NOTE: "query" is intentionally NOT a read verb — an SQL/database "query" can
+# INSERT/UPDATE/DELETE/DROP (e.g. d1_database_query), so a query-named tool falls
+# through to the safe default (write) unless its name also carries a read verb.
+_READ_VERBS = frozenset({
+    "get", "list", "search", "read", "fetch", "find", "describe",
+    "view", "export",
+})
+
+
+def classify_tool(name: str, annotations: Optional[dict] = None) -> bool:
+    """Return ``True`` if a tool is WRITE/destructive (gate it), ``False`` if
+    READ-only (run it freely).
+
+    Order of evidence (annotations are authoritative when present):
+      1. ``readOnlyHint is True``                                  -> read.
+      2. ``destructiveHint`` truthy OR ``readOnlyHint is False``   -> write.
+         (``bool(dh)`` coerces a truthy non-bool hint toward write — a dropped
+         destructive signal would be unsafe.)
+      3. Name-verb heuristic, WRITE-biased: any write verb (token OR name
+         prefix) -> write; else any read verb -> read; else -> write (the safe
+         default for an ambiguous name).
+    """
+    ann = annotations if isinstance(annotations, dict) else {}
+    ro = ann.get("readOnlyHint")
+    dh = ann.get("destructiveHint")
+    if ro is True:
+        return False
+    if (dh is not None and bool(dh)) or ro is False:
+        return True
+    low = str(name or "").lower()
+    tokens = {tok for tok in re.split(r"[^a-z0-9]+", low) if tok}
+    # WRITE wins: an exact write-verb token, or a name starting with one. (Write
+    # is checked BEFORE read so a name pairing both — e.g. "list_and_delete" —
+    # is gated.)
+    if tokens & _WRITE_VERBS or any(low.startswith(v) for v in _WRITE_VERBS):
+        return True
+    if tokens & _READ_VERBS or any(low.startswith(v) for v in _READ_VERBS):
+        return False
+    return True  # ambiguous -> write (safe)
+
+
+# Process-wide confirmation provider. A UI (desktop Qt dialog / mobile WS round-
+# trip — later sub-steps) registers ONE provider; the gate calls it for write
+# tools when confirmation is enabled. Signature:
+# ``provider(server_id, tool_name, summary) -> bool`` (True = approved).
+# ``None`` means no provider is registered (an unattended cron/autonomous run).
+_confirmation_provider = None
+
+
+def set_confirmation_provider(fn) -> None:
+    """Register (or clear, with ``None``) the process-wide confirmation provider.
+    Idempotent; last writer wins. Assignment is atomic under the GIL."""
+    global _confirmation_provider
+    _confirmation_provider = fn
+
+
+def get_confirmation_provider():
+    """Return the registered confirmation provider, or ``None`` if unset."""
+    return _confirmation_provider
+
+
+def _setting_bool(key: str, default: bool) -> bool:
+    """Read a boolean setting LIVE (so a toggle takes effect without
+    reconnecting). Falls back to ``default`` if config is unavailable."""
+    try:
+        from osia.config import get_setting
+        return bool(get_setting(key, default))
+    except Exception:
+        return default
+
+
+def _confirm_summary(server_id: str, tool_name: str, kwargs: dict) -> str:
+    """A short, bounded, human-facing description of a pending write call for the
+    confirmation UI. Best-effort; never raises (and never inlines arg VALUES,
+    which may be large or sensitive — only the arg names)."""
+    try:
+        keys = ", ".join(list(kwargs.keys())[:8]) if isinstance(kwargs, dict) else ""
+    except Exception:
+        keys = ""
+    base = f"{tool_name} on {server_id}"
+    return f"{base} (args: {keys})" if keys else base
+
+
+def _confirm_gate(server_id: str, tool_name: str, kwargs: dict) -> Optional[str]:
+    """Decide whether a WRITE tool may run. Returns ``None`` to ALLOW the call,
+    or an ``ERROR: ...`` string to BLOCK it (declined / no approver). Reads the
+    two gate settings LIVE. Never raises.
+
+    Decision table (only ever reached for is_write tools):
+      * mcp_confirm_writes False                -> allow.
+      * confirm True + provider registered      -> ask; approved -> allow,
+        declined/raised -> block ("user declined").
+      * confirm True + NO provider (unattended) -> mcp_allow_unattended_writes
+        True -> allow, else block ("no approver available").
+    """
+    if not _setting_bool("mcp_confirm_writes", True):
+        return None
+    provider = get_confirmation_provider()
+    if provider is not None:
+        try:
+            approved = bool(provider(
+                server_id, tool_name,
+                _confirm_summary(server_id, tool_name, kwargs),
+            ))
+        except Exception:
+            approved = False  # a provider failure is treated as a decline (safe)
+        if approved:
+            return None
+        return f"ERROR: mcp/{server_id}/{tool_name}: user declined"
+    # Unattended: no UI/provider present.
+    if _setting_bool("mcp_allow_unattended_writes", False):
+        return None
+    return (
+        f"ERROR: mcp/{server_id}/{tool_name}: write tool blocked "
+        "(confirmation required, no approver available)"
+    )
+
+
 # Guards the registry's own bookkeeping AND the batched mutation of the agent
 # maps. The MCP loop thread writes here (on connect/disconnect); agent threads
 # only READ agent.TOOL_MAP / KNOWN_TOOL_NAMES (atomic dict/set ops under the
@@ -114,14 +275,25 @@ def _agent_maps():
         return None, None
 
 
-def _make_wrapper(manager: Any, server_id: str, tool_name: str):
+def _make_wrapper(manager: Any, server_id: str, tool_name: str, is_write: bool = False):
     """Build the SYNC tool callable registered into TOOL_MAP.
 
     Matches the native ``tool_*`` contract: accepts ``**kwargs`` (the parser
     passes parsed args as kwargs), returns a ``str`` (or ``ERROR: ...``), and
     never raises (``MCPManager.call_tool`` guarantees this from Phase 1).
+
+    ``is_write`` is baked in at registration. When set, the call passes through
+    the confirmation gate (``_confirm_gate``) BEFORE ``manager.call_tool``: a
+    block returns an ``ERROR: ...`` string (honouring the tool contract) and the
+    real call never happens. Read tools skip the gate entirely (one bool check),
+    so their hot path is unchanged. The gate reads its settings LIVE, so toggling
+    confirmation takes effect without re-registering tools.
     """
     def _mcp_tool(**kwargs) -> str:
+        if is_write:
+            blocked = _confirm_gate(server_id, tool_name, kwargs)
+            if blocked is not None:
+                return blocked
         return manager.call_tool(
             server_id, tool_name, kwargs, timeout=WRAPPER_CALL_TIMEOUT
         )
@@ -203,12 +375,19 @@ def register_server_tools(manager: Any, server_id: str, tools) -> list:
         if not _valid_tool_name(name):
             continue
         full = tool_full_name(server_id, name)
-        new_callables[full] = _make_wrapper(manager, server_id, name)
+        raw_ann = t.get("annotations")
+        annotations = raw_ann if isinstance(raw_ann, dict) else {}
+        # Classify ONCE at registration; the result is baked into the wrapper
+        # closure (the hot path never re-classifies).
+        is_write = classify_tool(name, annotations)
+        new_callables[full] = _make_wrapper(manager, server_id, name, is_write)
         new_meta[full] = {
             "server": server_id,
             "tool": name,
             "description": t.get("description") or "",
             "inputSchema": t.get("inputSchema") or {},
+            "annotations": annotations,
+            "is_write": is_write,
         }
 
     with _lock:

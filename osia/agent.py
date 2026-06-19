@@ -2697,6 +2697,13 @@ KNOWN_TOOL_NAMES = set(TOOL_MAP.keys())
 # ---------------------------------------------------------------------------
 
 TOOL_TIMEOUT_SECONDS = 30
+# WOR-44 Phase 5 (5-conf-a): an MCP tool may pause for a human confirmation (the
+# write/destructive gate in osia.mcp.registry) before it executes. Give MCP tools
+# (``mcp__*``) a longer executor budget so a user has time to approve without the
+# executor's generic timeout killing the call. The inner per-call bound in the MCP
+# wrapper (registry.WRAPPER_CALL_TIMEOUT, 25 s) still bounds the actual request,
+# so a hung read tool is NOT held for this whole budget. Native tools unaffected.
+_MCP_CONFIRM_TOOL_TIMEOUT = 150
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="osia-tool")
 
 _ERROR_PREFIXES = ("ERROR", "ERREUR", "[ERROR]", "[ERREUR]")
@@ -2737,6 +2744,9 @@ def _tool_timeout_seconds(tool_name: str, kwargs: dict) -> float:
     each can traverse several key rotations when keys are rate-limited; every
     other tool keeps the default 30 s.
     """
+    # WOR-44 Phase 5 (5-conf-a): MCP tools may block on a confirmation prompt.
+    if tool_name.startswith("mcp__"):
+        return _MCP_CONFIRM_TOOL_TIMEOUT
     if tool_name in ("bash", "run_command"):
         if _is_long_running_command(kwargs.get("command", "") or ""):
             return LONG_RUNNING_TIMEOUT_SECONDS + 30
@@ -2794,11 +2804,22 @@ def _execute_tool_with_retry(tool_name: str, kwargs: dict):
     # ``desktop_click`` is also NOT auto-retried: a blind retry doubles the
     # (already long) wait and can double-click. Fast tools keep the
     # retry-once-on-error behavior.
+    # MCP tools (``mcp__*``) are also NOT auto-retried (WOR-44 Phase 5,
+    # 5-conf-a): (1) a confirmation DECLINE/BLOCK must be DURABLE — a blind retry
+    # would re-prompt the user and a mis-approved second prompt could execute a
+    # write the agent already presented as declined; (2) MCP write tools are
+    # frequently non-idempotent (send/create/delete), so retrying a call that
+    # errored AFTER its side effect landed would double it. The model still sees
+    # the error result and can deliberately re-issue the call if appropriate.
     long_running = (
         tool_name in ("bash", "run_command")
         and _is_long_running_command(kwargs.get("command", "") or "")
     )
-    no_retry = long_running or tool_name == "desktop_click"
+    no_retry = (
+        long_running
+        or tool_name == "desktop_click"
+        or tool_name.startswith("mcp__")
+    )
     if _is_tool_error(result) and not no_retry:
         preview = _result_text(result).replace("\n", " ")[:120]
         print(f"[OSIA Agent] ↻ retry tool: {tool_name} (first attempt: {preview!r})")

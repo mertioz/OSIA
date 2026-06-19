@@ -2715,6 +2715,13 @@ async def websocket_endpoint(ws: WebSocket):
                     # branch below); per-server tokens live only in the
                     # gitignored api_keys.json under `mcp:<id>`.
                     "mcp_servers",
+                    # MCP write-tool confirmation gate (WOR-44 Phase 5, 5-conf-a):
+                    # NON-secret global bool toggles. mcp_confirm_writes gates
+                    # write/destructive MCP tools; mcp_allow_unattended_writes
+                    # governs unattended runs. Both flow through the generic
+                    # set_setting path (no special handling).
+                    "mcp_confirm_writes",
+                    "mcp_allow_unattended_writes",
                 }
                 if setting_key not in allowed_settings:
                     print(
