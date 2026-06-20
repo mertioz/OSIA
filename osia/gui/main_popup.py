@@ -3456,6 +3456,7 @@ class _SettingsPanel(QWidget):
                 w.deleteLater()
         self._mcp_pills = {}
         self._mcp_buttons = {}
+        self._mcp_cancel_buttons = {}   # WOR-97: OAuth "Cancel" btns (per id)
         self._mcp_token_inputs = {}
         self._mcp_dir_inputs = {}
         self._mcp_extra_inputs = {}
@@ -3582,6 +3583,20 @@ class _SettingsPanel(QWidget):
             btn.clicked.connect(lambda _=False, e=entry: self._on_mcp_toggle(e))
             self._mcp_buttons[sid] = btn
             actions.addWidget(btn)
+            # WOR-97: a "Cancel" control for OAuth connectors only, shown ONLY
+            # while the pill is "connecting" (an interactive login can be
+            # abandoned — create-account/closed-browser/Error 1033). Built hidden;
+            # _refresh_mcp_status toggles its visibility per tick on the pill state.
+            if entry.get("auth_type") == "oauth":
+                cancel_btn = QPushButton(i18n.t("mcp.cancel"))
+                cancel_btn.setObjectName("ghostBtn")
+                cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                cancel_btn.clicked.connect(
+                    lambda _=False, e=entry: self._on_mcp_cancel(e)
+                )
+                cancel_btn.setVisible(False)
+                self._mcp_cancel_buttons[sid] = cancel_btn
+                actions.addWidget(cancel_btn)
         else:
             reason = "mcp.oauth_soon" if entry.get("auth_type") == "oauth" else "mcp.transport_soon"
             soon = QPushButton(i18n.t(reason))
@@ -3773,6 +3788,44 @@ class _SettingsPanel(QWidget):
                 pass
         threading.Thread(target=_bg, name="osia-mcp-disconnect", daemon=True).start()
 
+    def _on_mcp_cancel(self, entry: dict) -> None:
+        """WOR-97: abort an in-flight OAuth login. The Cancel control is visible
+        only while the pill is "connecting" (see _refresh_mcp_status), and only
+        for OAuth connectors. A LOOPBACK (PC-initiated) login runs in THIS
+        desktop manager → cancel it directly; a TUNNEL/PART-1 flow runs in the
+        SERVER process (the desktop manager never had it CONNECTING) → bridge to
+        the server's loopback /internal/mcp_oauth_cancel. Branch is chosen by the
+        desktop manager's own status. Runs on a bg thread so the cancel (bounded
+        ≤10s) never blocks the Qt UI thread."""
+        sid = entry["id"]
+        # Optimistic feedback (mirrors _on_mcp_disconnect): flip the pill toward
+        # disconnected; the ~1.2s poll settles it on the real manager status. Hide
+        # the Cancel button at once so a second click can't double-fire (harmless
+        # anyway — cancel_pending / the route are both idempotent).
+        self._mcp_pending[sid] = ("disconnected", {"disconnected", "failed"}, 25)
+        if sid in self._mcp_pills:
+            self._set_mcp_pill(self._mcp_pills[sid], "disconnected")
+        if sid in self._mcp_cancel_buttons:
+            self._mcp_cancel_buttons[sid].setVisible(False)
+
+        def _bg():
+            try:
+                from osia.mcp_client import get_manager
+                mgr = get_manager()
+                # The desktop manager owns a loopback (PC-initiated) login → cancel
+                # it directly. Otherwise it's a server-process tunnel flow → POST
+                # the loopback bridge so the server cancels it.
+                if mgr.status(sid) == "connecting":
+                    mgr.cancel_pending(sid)
+                else:
+                    from osia.main import request_oauth_cancel
+                    request_oauth_cancel(sid)
+            except Exception:
+                pass
+        threading.Thread(
+            target=_bg, name="osia-mcp-oauth-cancel", daemon=True
+        ).start()
+
     def _on_mcp_remove_custom(self, server_id: str) -> None:
         self._on_mcp_disconnect(server_id)
         self._mcp_remove_saved(server_id)
@@ -3851,6 +3904,10 @@ class _SettingsPanel(QWidget):
                     else connect_label
                 )
                 btn.setToolTip(err if (state == "failed" and err) else "")
+            # WOR-97: surface the OAuth Cancel control ONLY while connecting.
+            cancel_btn = self._mcp_cancel_buttons.get(sid)
+            if cancel_btn is not None:
+                cancel_btn.setVisible(state == "connecting")
 
     # ── API key fallback hierarchy ──────────────────────────────────────────
     # A dropdown of configured providers; picking one opens a dark popover

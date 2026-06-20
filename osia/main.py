@@ -91,6 +91,10 @@ _SERVER_MCP_SYNC_URL = "http://127.0.0.1:8765/internal/mcp_sync"
 # process as the PKCE state) and opens the returned authorize URL in the PC
 # browser. Separate from the existing loopback Connect button, which is unchanged.
 _SERVER_MCP_OAUTH_TUNNEL_URL = "http://127.0.0.1:8765/internal/mcp_oauth_tunnel_connect"
+# WOR-97 — desktop entry point to abort an in-flight OAuth login running in the
+# SERVER process (tunnel/PART-1 flow). The desktop POSTs {id} to this loopback
+# route, which calls MCPManager.cancel_pending server-side and rebroadcasts.
+_SERVER_MCP_OAUTH_CANCEL_URL = "http://127.0.0.1:8765/internal/mcp_oauth_cancel"
 
 
 def _notify_mobile_new_chat() -> None:
@@ -177,6 +181,34 @@ def request_oauth_tunnel_connect(server_id: str) -> bool:
         return True
     except Exception as e:
         print(f"[WOR-96] could not open browser for OAuth tunnel flow: {e}")
+        return False
+
+
+def request_oauth_cancel(server_id: str) -> bool:
+    """WOR-97 — desktop→server bridge to abort an in-flight OAuth login that runs
+    in the SERVER process (a tunnel/PART-1 flow the desktop manager can't cancel
+    locally). POSTs ``{id}`` to the loopback ``/internal/mcp_oauth_cancel``; the
+    server calls ``MCPManager.cancel_pending`` and broadcasts the reset so every
+    pill repaints to disconnected.
+
+    Carries only an id (no secret). Best-effort, never raises; a silent no-op when
+    the server isn't running. Call OFF the Qt main thread (the 1.5s timeout never
+    blocks the UI). Returns True iff the server acked ok. The desktop only uses
+    this for connectors the LOOPBACK manager doesn't own — a PC-initiated login is
+    cancelled directly via ``get_manager().cancel_pending``."""
+    import json
+    import urllib.request
+    try:
+        payload = json.dumps({"id": server_id}).encode("utf-8")
+        req = urllib.request.Request(
+            _SERVER_MCP_OAUTH_CANCEL_URL, data=payload, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return bool(isinstance(data, dict) and data.get("ok"))
+    except Exception as e:
+        print(f"[WOR-97] oauth cancel request skipped: {e}")
         return False
 
 

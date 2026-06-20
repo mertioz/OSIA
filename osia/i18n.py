@@ -1547,6 +1547,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Disconnect", "fr": "Déconnecter", "zh": "断开",
         "ja": "切断", "de": "Trennen", "es": "Desconectar",
     },
+    # WOR-97: abort an in-flight OAuth login (shown only while "connecting…").
+    "mcp.cancel": {
+        "en": "Cancel", "fr": "Annuler", "zh": "取消",
+        "ja": "キャンセル", "de": "Abbrechen", "es": "Cancelar",
+    },
     "mcp.status_disconnected": {
         "en": "Disconnected", "fr": "Déconnecté", "zh": "未连接",
         "ja": "未接続", "de": "Getrennt", "es": "Desconectado",

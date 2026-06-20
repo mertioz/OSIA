@@ -1476,6 +1476,54 @@ async def internal_mcp_oauth_tunnel_connect(request: Request):
     return await _begin_oauth_tunnel_connect(server_id, saved)
 
 
+@app.post("/internal/mcp_oauth_cancel")
+async def internal_mcp_oauth_cancel(request: Request):
+    """Localhost-only trigger — WOR-97. The DESKTOP posts ``{id}`` here to abort an
+    in-flight OAuth login that runs in THIS server process (a tunnel/PART-1 flow:
+    the desktop manager never had it CONNECTING, so it cannot cancel it locally).
+    Routes to ``MCPManager.cancel_pending`` on a daemon thread (it BLOCKS ≤10s) and
+    broadcasts the reset so every connected pill repaints to disconnected.
+
+    Loopback-only (same host guard as ``/internal/mcp_sync``); carries only an id
+    (no secret); idempotent no-op unless the connector is CONNECTING; never sets
+    ``enabled``. Not part of the public mobile WS protocol (mobile uses the
+    ``mcp_oauth_cancel`` WS frame instead)."""
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    raw_id = body.get("id")
+    server_id = raw_id.strip() if isinstance(raw_id, str) else ""
+    if not server_id:
+        return {"ok": False, "error": "bad request"}
+
+    loop = asyncio.get_running_loop()
+
+    def _cancel_worker(sid=server_id, loop=loop):
+        try:
+            from osia.mcp_client import get_manager
+            get_manager().cancel_pending(sid)
+        except Exception as e:
+            print(f"[OSIA Server] internal mcp_oauth_cancel worker {sid!r}: {e}")
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _broadcast_mcp_status(_mcp_status_frame(sid)), loop
+            )
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=_cancel_worker,
+        name="osia-mcp-oauth-cancel-internal", daemon=True,
+    ).start()
+    return {"ok": True}
+
+
 # NOTE (WOR-47): the startup ``_warm_models`` handler that eagerly pre-loaded
 # faster-whisper was REMOVED deliberately — do NOT reintroduce it. Importing
 # ``osia.voice.stt`` on the event-loop thread at cold boot pulled in
