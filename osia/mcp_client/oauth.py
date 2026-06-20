@@ -473,6 +473,171 @@ def discard_oauth_state(state: str) -> None:
         _OAUTH_STATE_FLOWS.pop(state, None)
 
 
+# ---------------------------------------------------------------------------
+# RFC 7009 token revocation (WOR-96 PART 2a) — best-effort "truly disconnect"
+# ---------------------------------------------------------------------------
+#
+# The MCP SDK (1.28) drives discovery + refresh + Bearer injection but exposes NO
+# client-side token-revocation helper, and the AS metadata it discovers lives only
+# in the provider's IN-MEMORY context (gone once the session closes). So to TRULY
+# disconnect an OAuth connector — invalidate the grant at the authorization server
+# so a later reconnect / account-switch is a clean re-auth — we re-discover the
+# ``revocation_endpoint`` from the well-knowns and POST per RFC 7009 ourselves.
+#
+# Best-effort BY CONTRACT: these helpers NEVER raise and NEVER log token values.
+# If the endpoint can't be discovered (the provider advertises none) revocation is
+# a no-op — the disconnect handler still clears the local token, so OSIA forgets
+# it regardless. httpx is imported lazily (kept off the module's import-safe-
+# without-mcp path; it is always present wherever the OAuth SDK runs).
+
+async def _discover_revocation_endpoint(server_url: str) -> Optional[str]:
+    """Best-effort: return the AS ``revocation_endpoint`` for ``server_url`` (RFC
+    9728 protected-resource metadata → RFC 8414 / OpenID AS metadata), or None.
+    Never raises."""
+    try:
+        import httpx
+    except Exception:
+        return None
+    if not server_url:
+        return None
+    try:
+        parts = urlsplit(server_url)
+        origin = f"{parts.scheme}://{parts.netloc}"
+    except Exception:
+        return None
+    if not parts.scheme or not parts.netloc:
+        return None
+
+    async def _get_json(client, url):
+        try:
+            r = await client.get(url, headers={"Accept": "application/json"})
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            return None
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            # RFC 9728: the resource may name its authorization server(s). Probe
+            # that first, then fall back to the resource origin acting as its own
+            # AS (common for MCP servers).
+            as_issuers: list = []
+            prm = await _get_json(
+                client, f"{origin}/.well-known/oauth-protected-resource"
+            )
+            if isinstance(prm, dict):
+                servers = prm.get("authorization_servers")
+                if isinstance(servers, list):
+                    as_issuers.extend(s for s in servers if isinstance(s, str) and s)
+            as_issuers.append(origin)
+
+            seen: set = set()
+            for issuer in as_issuers:
+                iss = issuer.rstrip("/")
+                if not iss or iss in seen:
+                    continue
+                seen.add(iss)
+                ip = urlsplit(iss)
+                if not ip.scheme or not ip.netloc:
+                    continue
+                iss_origin = f"{ip.scheme}://{ip.netloc}"
+                iss_path = ip.path.rstrip("/")
+                # RFC 8414 inserts the well-known segment BEFORE any issuer path;
+                # also try the OpenID layout and the bare issuer. All best-effort.
+                candidates = [
+                    f"{iss_origin}/.well-known/oauth-authorization-server{iss_path}",
+                    f"{iss}/.well-known/oauth-authorization-server",
+                    f"{iss_origin}/.well-known/openid-configuration{iss_path}",
+                    f"{iss}/.well-known/openid-configuration",
+                ]
+                for url in candidates:
+                    md = await _get_json(client, url)
+                    if isinstance(md, dict):
+                        rev = md.get("revocation_endpoint")
+                        if isinstance(rev, str) and rev:
+                            return rev
+    except Exception:
+        return None
+    return None
+
+
+async def revoke_oauth_token(server_id: str, server_url: str) -> bool:
+    """RFC 7009 best-effort revocation of a connector's OAuth grant.
+
+    Reads the stored refresh token (preferred — revoking it SHOULD cascade to its
+    access tokens at the AS per RFC 7009 §2.1) or, failing that, the access token,
+    plus the DCR ``client_id`` / optional ``client_secret`` from
+    ``oauth_tokens.json``, then re-discovers the ``revocation_endpoint`` and POSTs
+    the standard ``application/x-www-form-urlencoded`` revocation request. Returns
+    True iff a revocation request was sent and accepted (2xx), else False.
+
+    NEVER raises and NEVER logs token values. A missing token or an undiscoverable
+    revocation endpoint is a benign no-op (returns False) — the caller still drops
+    the local token, so OSIA forgets the connector either way."""
+    try:
+        import httpx
+    except Exception:
+        return False
+    try:
+        blob = get_mcp_oauth(server_id)
+    except Exception:
+        blob = {}
+    if not isinstance(blob, dict):
+        return False
+    tok = blob.get("token") if isinstance(blob.get("token"), dict) else {}
+    refresh = tok.get("refresh_token")
+    access = tok.get("access_token")
+    token = refresh or access
+    if not isinstance(token, str) or not token:
+        return False
+    hint = "refresh_token" if refresh else "access_token"
+
+    client = blob.get("client") if isinstance(blob.get("client"), dict) else {}
+    client_id = client.get("client_id")
+    client_secret = client.get("client_secret")
+    # RFC 7009 inherits the connector's TOKEN-ENDPOINT client-auth method, so we
+    # must authenticate revocation the SAME way the SDK authenticated the token
+    # exchange. The DCR response persisted that method into the client blob (via
+    # OsiaTokenStorage.set_client_info); mirror the SDK's three-way branch (mcp
+    # 1.28 client/auth/oauth2.py) instead of inferring it from secret presence —
+    # a "client_secret_post" client sends the secret in the BODY, and a strict AS
+    # rejects HTTP Basic for it (which would leave the grant alive at the AS).
+    auth_method = client.get("token_endpoint_auth_method")
+
+    endpoint = await _discover_revocation_endpoint(server_url)
+    if not endpoint:
+        return False
+
+    data = {"token": token, "token_type_hint": hint}
+    auth = None
+    has_secret = isinstance(client_secret, str) and bool(client_secret)
+    if auth_method == "client_secret_post" and has_secret:
+        # Confidential, secret in the BODY (what the AS registered this client for).
+        if isinstance(client_id, str) and client_id:
+            data["client_id"] = client_id
+        data["client_secret"] = client_secret
+    elif has_secret:
+        # client_secret_basic (or unspecified-with-secret) → HTTP Basic. A single
+        # auth method only: do NOT also put client_id in the body.
+        auth = (str(client_id or ""), client_secret)
+    elif isinstance(client_id, str) and client_id:
+        # Public / PKCE client ("none") → identify with client_id in the body.
+        data["client_id"] = client_id
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as http:
+            r = await http.post(
+                endpoint, data=data, auth=auth,
+                headers={"Accept": "application/json"},
+            )
+        # RFC 7009 §2.2: the AS returns 200 for success AND for an already-invalid
+        # token. Treat any 2xx as done; never inspect or log the response body.
+        return 200 <= r.status_code < 300
+    except Exception:
+        return False
+
+
 class TunnelOAuthCallback:
     """Server-process OAuth callback transport for the HTTPS tunnel redirect.
 

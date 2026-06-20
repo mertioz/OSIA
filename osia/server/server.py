@@ -590,6 +590,13 @@ app = FastAPI(title="OSIA Mobile Server", version="1.0.0")
 # disconnect.
 _WS_CLIENTS: set["_OutboundChannel"] = set()
 
+# WOR-96 PART 2a: strong references to in-flight "drive OAuth" background tasks
+# spawned by the mobile mcp_connect handler. asyncio keeps only a WEAK reference
+# to a bare create_task() result, so a fire-and-forget task can be garbage
+# collected mid-await ("Task was destroyed but it is pending"). Holding the task
+# here until it completes prevents that; the done-callback prunes it.
+_OAUTH_DRIVE_TASKS: set = set()
+
 
 # WOR-62: in-flight turns DETACHED on client disconnect so they run to
 # completion and persist (instead of being cancelled, which dropped the reply
@@ -1244,35 +1251,24 @@ async def oauth_callback(request: Request):
     return HTMLResponse(_CLOSE_TAB_HTML, status_code=200)
 
 
-@app.post("/internal/mcp_oauth_tunnel_connect")
-async def internal_mcp_oauth_tunnel_connect(request: Request):
-    """Localhost-only trigger — WOR-96 PART 1. The DESKTOP posts ``{id}`` here to
-    start an OAuth connect that completes via the HTTPS tunnel callback, IN THIS
-    server process (so the redirect lands in the same process that holds the PKCE
-    state). We start the connect on a daemon thread (it blocks up to
-    OAUTH_CONNECT_TIMEOUT), wait briefly for the provider to surface the authorize
-    URL, and return it so the DESKTOP opens it in the PC browser (this process's
-    ``webbrowser`` is neutralised by the headless guard). The token exchange
-    completes later when the user finishes login and the provider redirects to
-    ``/oauth/callback``.
+async def _begin_oauth_tunnel_connect(server_id: str, saved: dict) -> dict:
+    """WOR-96 PART 2a — start an OAuth connect that completes via the HTTPS tunnel
+    callback (server process) and return the authorize URL the provider surfaces.
 
-    Loopback-only (same host guard as ``/internal/mcp_sync``); carries only an id
-    (no secret). Not part of the public mobile WS protocol."""
-    host = request.client.host if request.client else ""
-    if host not in ("127.0.0.1", "::1", "localhost"):
-        return {"ok": False, "error": "forbidden"}
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
-    raw_id = body.get("id")
-    server_id = raw_id.strip() if isinstance(raw_id, str) else ""
-    if not server_id:
-        return {"ok": False, "error": "bad request"}
+    Shared core of BOTH triggers: the loopback POST
+    ``/internal/mcp_oauth_tunnel_connect`` (PART 1 — the desktop opens the returned
+    URL in the PC browser) and the mobile WS ``mcp_connect`` handler for OAuth
+    connectors (PART 2a — the URL is pushed to the requesting phone). The OAuth
+    provider runs IN THIS process — where the tunnel redirect lands and the SDK's
+    in-memory PKCE verifier/state live — on a daemon thread; we wait (bounded, off
+    the event loop) for the authorize URL the provider surfaces.
 
-    saved = _mcp_find_saved_server(server_id)
+    Returns ``{"ok": True, "auth_url": ..., "flow_id": ...}`` on success, or
+    ``{"ok": False, "error": ...}`` — including ``"already connected"/"already
+    connecting"`` so a SECOND trigger for the same connector returns at once
+    instead of hanging the full 30s wait. Carries NO secret (only the public
+    authorize URL). The token exchange completes later, server-side, when the user
+    finishes login and the provider redirects to ``/oauth/callback``."""
     if not isinstance(saved, dict):
         return {"ok": False, "error": "unknown server"}
     if str(saved.get("auth_type") or "").strip().lower() != "oauth":
@@ -1361,6 +1357,40 @@ async def internal_mcp_oauth_tunnel_connect(request: Request):
     if auth_url:
         return {"ok": True, "auth_url": auth_url, "flow_id": flow_id}
     return {"ok": False, "error": err or "timed out waiting for authorize url"}
+
+
+@app.post("/internal/mcp_oauth_tunnel_connect")
+async def internal_mcp_oauth_tunnel_connect(request: Request):
+    """Localhost-only trigger — WOR-96 PART 1. The DESKTOP posts ``{id}`` here to
+    start an OAuth connect that completes via the HTTPS tunnel callback, IN THIS
+    server process (so the redirect lands in the same process that holds the PKCE
+    state). The flow itself lives in the shared ``_begin_oauth_tunnel_connect``
+    (reused by the mobile WS ``mcp_connect`` handler in PART 2a); this route adds
+    only the loopback host guard + body parse and returns the authorize URL so the
+    DESKTOP opens it in the PC browser (this process's ``webbrowser`` is
+    neutralised by the headless guard). The token exchange completes later when the
+    user finishes login and the provider redirects to ``/oauth/callback``.
+
+    Loopback-only (same host guard as ``/internal/mcp_sync``); carries only an id
+    (no secret). Not part of the public mobile WS protocol."""
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    raw_id = body.get("id")
+    server_id = raw_id.strip() if isinstance(raw_id, str) else ""
+    if not server_id:
+        return {"ok": False, "error": "bad request"}
+
+    saved = _mcp_find_saved_server(server_id)
+    if not isinstance(saved, dict):
+        return {"ok": False, "error": "unknown server"}
+    return await _begin_oauth_tunnel_connect(server_id, saved)
 
 
 # NOTE (WOR-47): the startup ``_warm_models`` handler that eagerly pre-loaded
@@ -3603,20 +3633,48 @@ async def websocket_endpoint(ws: WebSocket):
                         )
                         continue
                     if saved.get("auth_type") == "oauth":
-                        # WOR-44 Phase 5 (5-oauth-a): the OAuth login opens a
-                        # browser ON THE PC, so a phone cannot drive it yet. Do
-                        # NOT spawn the connect (which would pop a browser on the
-                        # PC with nobody there) — tell the client to connect on
-                        # the PC. The mobile app surfaces this as "Connect on PC";
-                        # the phone-driven flow lands in 5-oauth-c.
-                        print(
-                            f"[OSIA Server] mcp_connect id={server_id!r} is OAuth "
-                            f"— deferred to PC (mobile flow lands in 5-oauth-c)"
-                        )
-                        await out.send_json(
-                            {"type": "status", "status": "error",
-                             "error": "oauth_connect_on_pc"}
-                        )
+                        # WOR-96 PART 2a: drive the PART-1 tunnel OAuth flow FROM
+                        # the phone and push the authorize URL back over THIS
+                        # connection — no PC browser. The flow runs entirely
+                        # server-side (TunnelOAuthCallback + cross-loop registry +
+                        # public /oauth/callback); the token is minted + stored
+                        # server-side, so only the PUBLIC authorize URL (client_id /
+                        # redirect / state / PKCE challenge — no secret) rides the
+                        # WS. Run it as a detached task so the up-to-30s discovery
+                        # wait never parks this connection's receive loop, and ack
+                        # immediately (the URL arrives later as ``mcp_oauth_url``).
+                        async def _drive_oauth(out=out, sid=server_id, saved=saved):
+                            try:
+                                res = await _begin_oauth_tunnel_connect(sid, saved)
+                            except Exception as e:
+                                res = {"ok": False,
+                                       "error": f"{type(e).__name__}: {e}"}
+                            # The phone may have dropped during the discovery wait —
+                            # don't push onto an orphaned channel.
+                            if out not in _WS_CLIENTS:
+                                return
+                            try:
+                                if res.get("ok") and res.get("auth_url"):
+                                    # Pushed to the REQUESTING connection only (the
+                                    # auth_url is bound to one phone's browser
+                                    # session) — never broadcast. Additive frame.
+                                    await out.send_json(
+                                        {"type": "mcp_oauth_url",
+                                         "id": sid, "url": res["auth_url"]}
+                                    )
+                                else:
+                                    await out.send_json(
+                                        {"type": "status", "status": "error",
+                                         "error": res.get("error")
+                                         or "oauth start failed"}
+                                    )
+                            except Exception:
+                                pass
+
+                        task = asyncio.create_task(_drive_oauth())
+                        _OAUTH_DRIVE_TASKS.add(task)
+                        task.add_done_callback(_OAUTH_DRIVE_TASKS.discard)
+                        await out.send_json({"type": "status", "status": "done"})
                         continue
                     connect_cfg = _mcp_build_connect_cfg(saved)
 
@@ -3667,12 +3725,60 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
 
                 # mcp_disconnect
-                def _disconnect_worker(sid=server_id, loop=loop):
+                # WOR-96 PART 2a: opt-in revocation for OAuth connectors. BOTH flags
+                # default to False → today's behaviour is BYTE-IDENTICAL (session
+                # torn down, token KEPT on disk, silent reconnect intact). revoke=
+                # True performs RFC 7009 revocation then drops the stored token;
+                # forget_client=True additionally drops the DCR client blob (full
+                # account-switch / clean re-auth). Only meaningful for OAuth.
+                _disc_revoke = (
+                    bool(msg.get("revoke")) if isinstance(msg, dict) else False
+                )
+                _disc_forget = (
+                    bool(msg.get("forget_client")) if isinstance(msg, dict) else False
+                )
+                _disc_is_oauth = (
+                    str(saved.get("auth_type") or "").strip().lower() == "oauth"
+                )
+                _disc_url = str(saved.get("url") or "").strip()
+
+                def _disconnect_worker(sid=server_id, loop=loop,
+                                       revoke=_disc_revoke, forget=_disc_forget,
+                                       is_oauth=_disc_is_oauth, url=_disc_url):
                     try:
                         from osia.mcp_client import get_manager
                         get_manager().disconnect(sid)
                     except Exception as e:
                         print(f"[OSIA Server] mcp_disconnect worker {sid!r}: {e}")
+                    # WOR-96 PART 2a: with the session DOWN, optionally revoke the
+                    # grant at the AS (RFC 7009, best-effort) and clear what the user
+                    # asked to forget. Order: revoke → clear → enabled=False →
+                    # broadcast. revoke_oauth_token NEVER raises and NEVER logs token
+                    # values; an undiscoverable revocation_endpoint degrades to a
+                    # local clear only (OSIA forgets the token regardless).
+                    if is_oauth and revoke:
+                        try:
+                            from osia.mcp_client.oauth import revoke_oauth_token
+                            asyncio.run(revoke_oauth_token(sid, url))
+                        except Exception:
+                            pass
+                        try:
+                            from osia.config import (
+                                get_mcp_oauth, set_mcp_oauth, delete_mcp_oauth,
+                            )
+                            if forget:
+                                # Switch account: drop the whole blob (token + DCR
+                                # client) so the next connect re-registers + re-logs.
+                                delete_mcp_oauth(sid)
+                            else:
+                                # Sign out: drop only the token, keep the DCR client.
+                                blob = get_mcp_oauth(sid)
+                                if isinstance(blob, dict) and blob:
+                                    blob.pop("token", None)
+                                    blob.pop("expires_at", None)
+                                    set_mcp_oauth(sid, blob)
+                        except Exception:
+                            pass
                     # WOR-44 Phase 2 (direction B): persist enabled=False so the
                     # shared mcp_servers[].enabled flag is authoritative and the
                     # desktop reconcile daemon disconnects the PC manager to match.
