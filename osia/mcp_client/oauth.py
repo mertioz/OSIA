@@ -33,6 +33,8 @@ simply not printed).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import threading
 import time
 import webbrowser
 from typing import Any, Optional
@@ -50,6 +52,19 @@ OAUTH_CALLBACK_HOST = "127.0.0.1"
 OAUTH_CALLBACK_PORT = 8975
 OAUTH_REDIRECT_PATH = "/callback"
 OAUTH_REDIRECT_URI = f"http://{OAUTH_CALLBACK_HOST}:{OAUTH_CALLBACK_PORT}{OAUTH_REDIRECT_PATH}"
+
+# WOR-96 PART 1: the PUBLIC HTTPS callback, reached through the Cloudflare named
+# tunnel (osia.space → the SERVER process on :8765, which serves GET
+# /oauth/callback). Used IN ADDITION to the loopback URI above so a PC-initiated
+# (later, PART 2: phone-initiated) OAuth flow can complete via the tunnel. The
+# flow that USES this redirect MUST run in the server process — that is where the
+# redirect lands AND where the SDK's in-memory PKCE verifier/state live (the SDK
+# never persists them), so the same process/instance that started the flow must
+# perform the token exchange. See the ``oauth_callback_mode == "tunnel"`` branch
+# in ``osia.mcp_client.manager._serve`` and the server's ``/oauth/callback`` route
+# + cross-loop registry below.
+OAUTH_TUNNEL_REDIRECT_URI = "https://osia.space/oauth/callback"
+
 OAUTH_CLIENT_NAME = "OSIA"
 
 # How long we wait for the user to finish the interactive browser login before
@@ -288,24 +303,268 @@ class OAuthCallbackServer:
 
 
 # ---------------------------------------------------------------------------
+# Cross-loop OAuth flow registry (server process) + tunnel callback transport
+# ---------------------------------------------------------------------------
+#
+# WOR-96 PART 1. The HTTPS tunnel callback (OAUTH_TUNNEL_REDIRECT_URI) lands on
+# the SERVER process's FastAPI event loop (GET /oauth/callback), but the OAuth
+# provider that issued the request — and therefore the PKCE verifier and the
+# awaiting ``callback_handler`` — runs on the MCPManager's OWN asyncio loop (a
+# different thread in the SAME process). So delivery crosses TWO event loops
+# within one process. The bridge is a ``concurrent.futures.Future`` per in-flight
+# ``state``:
+#   * GET /oauth/callback (FastAPI loop) calls ``resolve_oauth_flow`` →
+#     ``future.set_result(...)`` — thread-safe, needs no loop reference.
+#   * the MCPManager-loop ``callback_handler`` does ``await
+#     asyncio.wrap_future(future, loop=<mcp loop>)`` — adopting the concurrent
+#     future onto ITS loop (the done-callback hops back via call_soon_threadsafe).
+# A bare ``asyncio.Future`` would be bound to one loop and could not be resolved
+# safely from the other; that is why this is a ``concurrent.futures.Future``.
+#
+# These registries are MODULE singletons, so each live in whichever process
+# imported this module. Only the server process ever runs a tunnel flow (the
+# manager branch is gated on cfg ``oauth_callback_mode == "tunnel"``, set ONLY by
+# the server's trigger route), so the desktop process's copies stay empty and
+# unused. No secret is held at rest: only the single-use ``code`` transits a
+# future to the waiting handler; entries auto-expire (OAUTH_CALLBACK_TIMEOUT) and
+# are removed on resolve / timeout / connect completion.
+
+_OAUTH_REG_LOCK = threading.Lock()
+# state -> {"future": concurrent.futures.Future, "created_at": float}
+_OAUTH_STATE_FLOWS: dict = {}
+# flow_id -> {"auth_url": Optional[str], "error": Optional[str],
+#             "event": threading.Event, "created_at": float}
+_OAUTH_TRIGGER_FLOWS: dict = {}
+
+
+def _prune_oauth_flows(now: Optional[float] = None) -> None:
+    """Drop registry entries older than OAUTH_CALLBACK_TIMEOUT. Caller MUST hold
+    ``_OAUTH_REG_LOCK``. Bounds memory if a flow is abandoned (user never finishes
+    the login, or a stray /oauth/callback arrives for an expired state)."""
+    now = time.time() if now is None else now
+    horizon = now - OAUTH_CALLBACK_TIMEOUT
+    for st in [k for k, v in _OAUTH_STATE_FLOWS.items()
+               if v.get("created_at", 0.0) < horizon]:
+        _OAUTH_STATE_FLOWS.pop(st, None)
+    for fid in [k for k, v in _OAUTH_TRIGGER_FLOWS.items()
+                if v.get("created_at", 0.0) < horizon]:
+        _OAUTH_TRIGGER_FLOWS.pop(fid, None)
+
+
+def register_oauth_trigger_flow(flow_id: str) -> None:
+    """Trigger-side: open a pending flow keyed by the OSIA-generated ``flow_id``
+    BEFORE starting connect(), so the authorize URL the provider's
+    ``redirect_handler`` surfaces later has somewhere to land and a waiter to
+    wake. No-op on an empty id."""
+    if not flow_id:
+        return
+    with _OAUTH_REG_LOCK:
+        _prune_oauth_flows()
+        _OAUTH_TRIGGER_FLOWS[flow_id] = {
+            "auth_url": None, "error": None,
+            "event": threading.Event(), "created_at": time.time(),
+        }
+
+
+def publish_oauth_auth_url(flow_id: str, auth_url: str) -> None:
+    """``redirect_handler``-side: surface the authorize URL for ``flow_id`` and
+    wake the trigger waiting on it. No-op if the flow was never registered or has
+    expired (the connect still proceeds; only the URL hand-off is lost)."""
+    if not flow_id:
+        return
+    ev: Optional[threading.Event] = None
+    with _OAUTH_REG_LOCK:
+        entry = _OAUTH_TRIGGER_FLOWS.get(flow_id)
+        if entry is None:
+            return
+        entry["auth_url"] = auth_url
+        ev = entry["event"]
+    if ev is not None:
+        ev.set()
+
+
+def fail_oauth_trigger_flow(flow_id: str, error: str) -> None:
+    """Worker-side: mark a flow failed BEFORE the authorize URL was surfaced (e.g.
+    discovery/DCR failed, or connect resolved non-CONNECTED) and wake the trigger
+    so it returns promptly instead of blocking the full wait. Never clobbers an
+    already-surfaced auth_url."""
+    if not flow_id:
+        return
+    ev: Optional[threading.Event] = None
+    with _OAUTH_REG_LOCK:
+        entry = _OAUTH_TRIGGER_FLOWS.get(flow_id)
+        if entry is None:
+            return
+        if entry.get("auth_url") is None and not entry.get("error"):
+            entry["error"] = error or "oauth flow failed"
+        ev = entry["event"]
+    if ev is not None:
+        ev.set()
+
+
+def wait_oauth_auth_url(flow_id: str, timeout: float):
+    """Trigger-side: BLOCK (off any event loop — call via run_in_executor) until
+    the authorize URL is ready or the flow errors / times out. Returns
+    ``(auth_url, error)``; both ``None`` on timeout."""
+    with _OAUTH_REG_LOCK:
+        entry = _OAUTH_TRIGGER_FLOWS.get(flow_id)
+    if entry is None:
+        return None, "flow not registered"
+    entry["event"].wait(timeout=timeout)
+    with _OAUTH_REG_LOCK:
+        entry = _OAUTH_TRIGGER_FLOWS.get(flow_id)
+        if entry is None:
+            return None, "flow expired"
+        return entry.get("auth_url"), entry.get("error")
+
+
+def cleanup_oauth_trigger_flow(flow_id: str) -> None:
+    """Worker-side: drop the trigger entry once connect() has resolved (the
+    authorize URL has been consumed by then; the state→future entry is freed
+    separately by ``TunnelOAuthCallback.callback_handler``)."""
+    if not flow_id:
+        return
+    with _OAUTH_REG_LOCK:
+        _OAUTH_TRIGGER_FLOWS.pop(flow_id, None)
+
+
+def register_oauth_state(state: str) -> "concurrent.futures.Future":
+    """``redirect_handler``-side: register a ``state`` → cross-loop future the
+    public callback route will resolve. Returns the ``concurrent.futures.Future``
+    (unstored if ``state`` is empty — it then simply times out in the handler)."""
+    fut: concurrent.futures.Future = concurrent.futures.Future()
+    if not state:
+        return fut
+    with _OAUTH_REG_LOCK:
+        _prune_oauth_flows()
+        _OAUTH_STATE_FLOWS[state] = {"future": fut, "created_at": time.time()}
+    return fut
+
+
+def resolve_oauth_flow(state: str, code: Optional[str],
+                       error: Optional[str] = None) -> bool:
+    """Public-callback-side: deliver ``(code, state)`` (or an error) to the
+    waiting future for ``state``. Returns True iff a live, unresolved flow matched
+    — False for an unknown / expired / already-resolved state (the route then
+    404s). Thread-safe: resolves a ``concurrent.futures.Future``, so it may be
+    called from the FastAPI loop while the awaiter runs on the MCP loop."""
+    if not state:
+        return False
+    with _OAUTH_REG_LOCK:
+        entry = _OAUTH_STATE_FLOWS.get(state)
+        fut = entry.get("future") if entry else None
+        if fut is None or fut.done():
+            return False
+    try:
+        if error:
+            fut.set_exception(RuntimeError(f"OAuth authorization failed: {error}"))
+        else:
+            fut.set_result((code, state))
+        return True
+    except Exception:
+        return False
+
+
+def discard_oauth_state(state: str) -> None:
+    """``callback_handler``-side: remove the state→future entry once consumed."""
+    if not state:
+        return
+    with _OAUTH_REG_LOCK:
+        _OAUTH_STATE_FLOWS.pop(state, None)
+
+
+class TunnelOAuthCallback:
+    """Server-process OAuth callback transport for the HTTPS tunnel redirect.
+
+    Drop-in alternative to :class:`OAuthCallbackServer` exposing the SAME two SDK
+    hooks (``redirect_handler``/``callback_handler``) but, instead of a loopback
+    socket, bridging the provider (on the MCPManager loop) to the public
+    ``GET /oauth/callback`` route (on the FastAPI loop) via the cross-loop registry
+    above. It owns NO socket, so — unlike OAuthCallbackServer — it is NOT a context
+    manager (nothing to open/close).
+
+    One instance per connect, carrying the OSIA-generated ``flow_id`` so the
+    trigger route can retrieve the authorize URL surfaced in ``redirect_handler``.
+    """
+
+    def __init__(self, flow_id: str) -> None:
+        self._flow_id = str(flow_id or "")
+        self._state: Optional[str] = None
+        self._future: Optional[concurrent.futures.Future] = None
+
+    async def redirect_handler(self, url: str) -> None:
+        """Register the SDK-generated ``state`` (parsed out of the authorize URL —
+        the SDK embeds it there), then surface the URL to the waiting trigger.
+        Does NOT open a browser: the server process neutralises
+        ``webbrowser.open`` and, in PART 1, the desktop opens the URL on the PC
+        (PART 2 will push it to the phone)."""
+        state: Optional[str] = None
+        try:
+            state = (parse_qs(urlsplit(url).query).get("state") or [None])[0]
+        except Exception:
+            state = None
+        self._state = state
+        self._future = register_oauth_state(state) if state else None
+        publish_oauth_auth_url(self._flow_id, url)
+
+    async def callback_handler(self) -> tuple:
+        """Await the ``(code, state)`` delivered by the public callback route,
+        bounded by OAUTH_CALLBACK_TIMEOUT, then free the registry entry. Adopts the
+        cross-loop ``concurrent.futures.Future`` onto THIS (MCP) loop via
+        ``asyncio.wrap_future``."""
+        fut = self._future
+        if fut is None:
+            # No state was parsed from the authorize URL — fail fast rather than
+            # hang; the SDK turns this into an OAuthFlowError → connect FAILED.
+            raise RuntimeError("OAuth tunnel callback: no state to await")
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(fut, loop=loop),
+                timeout=OAUTH_CALLBACK_TIMEOUT,
+            )
+        finally:
+            discard_oauth_state(self._state or "")
+
+
+# ---------------------------------------------------------------------------
 # Provider factory
 # ---------------------------------------------------------------------------
 
 def build_oauth_provider(
-    server_id: str, server_url: str, callback: "OAuthCallbackServer"
+    server_id: str,
+    server_url: str,
+    callback: Any,
+    *,
+    redirect_uris: Optional[list] = None,
 ) -> Any:
     """Return a configured ``OAuthClientProvider`` for ``server_url``.
 
-    Scope is left unset: the SDK negotiates it from the server's protected-
-    resource metadata / ``WWW-Authenticate`` header during the flow. The
-    token-endpoint auth method is likewise left to DCR (the registered
-    ``client_info`` dictates it). ``redirect_uris`` is the fixed loopback URI.
+    ``callback`` supplies the SDK's two hooks (``redirect_handler`` /
+    ``callback_handler``); it is an :class:`OAuthCallbackServer` for the loopback
+    PC flow or a :class:`TunnelOAuthCallback` for the HTTPS-tunnel flow — both
+    expose the same interface, so this factory is transport-agnostic.
+
+    ``redirect_uris`` selects the registered/used redirect URIs. Default
+    (``None``) → ``[OAUTH_REDIRECT_URI, OAUTH_TUNNEL_REDIRECT_URI]``: the loopback
+    URI stays index 0, and the SDK uses ``redirect_uris[0]`` for BOTH the
+    authorize request and the token exchange (mcp 1.28 ``oauth2.py``), so the
+    existing PC loopback flow is byte-for-byte unchanged — while DCR (RFC 7591)
+    now ALSO registers the tunnel URI, so a freshly-connected connector is
+    tunnel-ready with no re-registration. The tunnel flow passes
+    ``[OAUTH_TUNNEL_REDIRECT_URI, OAUTH_REDIRECT_URI]`` so the tunnel URI is index
+    0 (used) while the loopback URI stays registered. Scope is left unset (the SDK
+    negotiates it from protected-resource metadata / ``WWW-Authenticate``); the
+    token-endpoint auth method is left to DCR.
     """
     from mcp.client.auth import OAuthClientProvider
     from mcp.shared.auth import OAuthClientMetadata
 
+    if redirect_uris is None:
+        redirect_uris = [OAUTH_REDIRECT_URI, OAUTH_TUNNEL_REDIRECT_URI]
+
     metadata = OAuthClientMetadata(
-        redirect_uris=[OAUTH_REDIRECT_URI],
+        redirect_uris=list(redirect_uris),
         client_name=OAUTH_CLIENT_NAME,
         grant_types=["authorization_code", "refresh_token"],
         response_types=["code"],

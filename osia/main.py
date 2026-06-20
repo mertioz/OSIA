@@ -85,6 +85,12 @@ _SERVER_NEW_CHAT_URL = "http://127.0.0.1:8765/internal/new_chat"
 # manager and repaints every phone. Same loopback host as new_chat; carries only
 # {id, action} (no secret); localhost-only on the server side.
 _SERVER_MCP_SYNC_URL = "http://127.0.0.1:8765/internal/mcp_sync"
+# WOR-96 PART 1 — desktop entry point for an OAuth connect that completes via the
+# HTTPS tunnel callback (osia.space → the SERVER process). The desktop kicks the
+# server (which runs the OAuth provider so the tunnel redirect lands in the same
+# process as the PKCE state) and opens the returned authorize URL in the PC
+# browser. Separate from the existing loopback Connect button, which is unchanged.
+_SERVER_MCP_OAUTH_TUNNEL_URL = "http://127.0.0.1:8765/internal/mcp_oauth_tunnel_connect"
 
 
 def _notify_mobile_new_chat() -> None:
@@ -121,6 +127,57 @@ def _notify_mobile_mcp_sync(server_id: str, action: str) -> None:
         urllib.request.urlopen(req, timeout=1.5).close()
     except Exception as e:
         print(f"[MCP sync] mobile mcp_sync notify skipped: {e}")
+
+
+def request_oauth_tunnel_connect(server_id: str) -> bool:
+    """WOR-96 PART 1 — start an OAuth connect that completes via the HTTPS tunnel
+    callback (osia.space → the SERVER process), and open the authorize URL in the
+    PC browser.
+
+    POSTs ``{id}`` to the loopback trigger ``/internal/mcp_oauth_tunnel_connect``.
+    The SERVER runs the OAuth provider IN ITS OWN process — where the tunnel
+    redirect lands and the SDK's in-memory PKCE verifier/state live — and returns
+    the authorize URL, which we open HERE in the PC browser (the desktop process
+    is the one allowed to open a browser; the server neutralises
+    ``webbrowser.open``). The token exchange completes server-side when the user
+    finishes login and the provider redirects to ``/oauth/callback``.
+
+    Returns True iff the browser was opened. Best-effort; never raises. This is a
+    SEPARATE path from the existing loopback Connect button (unchanged): it runs no
+    provider in the desktop process and gives the desktop no HTTP listener — it
+    only kicks the server and opens the returned URL. Call OFF the Qt main thread
+    (it blocks up to ~35s waiting for discovery+DCR)."""
+    import json
+    import urllib.request
+    import webbrowser
+    try:
+        payload = json.dumps({"id": server_id}).encode("utf-8")
+        req = urllib.request.Request(
+            _SERVER_MCP_OAUTH_TUNNEL_URL, data=payload, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        # The server waits ~30s for discovery+DCR before returning the URL, so
+        # allow a slightly larger read timeout than that bound.
+        with urllib.request.urlopen(req, timeout=35.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[WOR-96] oauth tunnel connect request failed: {e}")
+        return False
+    if not isinstance(data, dict) or not data.get("ok"):
+        reason = data.get("error") if isinstance(data, dict) else data
+        print(f"[WOR-96] oauth tunnel connect not started: {reason}")
+        return False
+    auth_url = data.get("auth_url")
+    if not isinstance(auth_url, str) or not auth_url:
+        print("[WOR-96] oauth tunnel connect: no authorize URL returned")
+        return False
+    try:
+        webbrowser.open(auth_url)
+        print("[WOR-96] opened OAuth authorize URL in the PC browser (tunnel flow).")
+        return True
+    except Exception as e:
+        print(f"[WOR-96] could not open browser for OAuth tunnel flow: {e}")
+        return False
 
 
 def _ensure_mobile_server_windows() -> None:
@@ -521,6 +578,35 @@ def wake_mode():
             print(f"[OSIA] MCP auto-reconnect skipped: {e}")
     threading.Thread(
         target=_reconnect_mcp_connectors, name="osia-mcp-reconnect", daemon=True
+    ).start()
+
+    # WOR-44 Phase 2 (direction B, mobile→PC): an ALWAYS-ON daemon that reconciles
+    # THIS desktop process's MCPManager to the shared mcp_servers[].enabled flag.
+    # When the user connects/disconnects an MCP connector FROM THE MOBILE app, the
+    # server drives its own manager AND now persists enabled (Phase-2 server-side
+    # write); this loop (~3s) sees the delta and connects/disconnects the desktop
+    # manager to match — so the desktop mirrors mobile-side changes even when the
+    # popup is CLOSED (the Settings QTimer stops then, and the desktop has no HTTP
+    # listener, so polling on that timer is insufficient). reconcile_to_enabled
+    # keeps the STRICT OAuth gate (trust_present_token=False), so this UNATTENDED
+    # daemon NEVER pops a browser: a non-fresh OAuth connector simply stays
+    # disconnected until the user re-auths on the PC. Cheap when idle (an
+    # os.stat-cached settings read + per-server status lookups; no manager work
+    # unless a flag changed) and idempotent (overlapping a boot reconnect / manual
+    # Connect can't double-connect). Off the Qt main thread; a failure never
+    # blocks GUI startup. When the popup is open, the existing Settings QTimer
+    # repaints the pills from this SAME manager, so a daemon-driven change shows up
+    # within its poll interval — no GUI change needed.
+    def _reconcile_mcp_loop() -> None:
+        while True:
+            try:
+                from osia.mcp_client.reconnect import reconcile_to_enabled
+                reconcile_to_enabled(allow_oauth=True)
+            except Exception as e:
+                print(f"[OSIA] MCP reconcile tick skipped: {e}")
+            time.sleep(3.0)
+    threading.Thread(
+        target=_reconcile_mcp_loop, name="osia-mcp-reconcile", daemon=True
     ).start()
 
     # WOR-22: honour the saved "show the floating capsule" preference at launch.

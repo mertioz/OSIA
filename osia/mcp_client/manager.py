@@ -744,7 +744,57 @@ class MCPManager:
                 url = str(cfg.get("url") or "")
                 auth_type = str(cfg.get("auth_type") or "").strip().lower()
 
-                if auth_type == "oauth":
+                if auth_type == "oauth" and str(
+                    cfg.get("oauth_callback_mode") or ""
+                ).strip().lower() == "tunnel":
+                    # WOR-96 PART 1: OAuth 2.1 via the PUBLIC HTTPS tunnel callback
+                    # (osia.space → THIS server process's GET /oauth/callback).
+                    # Identical to the loopback branch below EXCEPT the callback
+                    # transport is the cross-loop TunnelOAuthCallback (no socket —
+                    # the redirect lands on the server's public route and is
+                    # bridged here via a concurrent.futures.Future) and the provider
+                    # registers/uses the TUNNEL redirect URI at index 0. Runs ONLY
+                    # when the server's trigger route sets cfg
+                    # oauth_callback_mode="tunnel"; every other caller (desktop GUI,
+                    # boot sweep, mobile mcp_connect, /internal/mcp_sync) omits the
+                    # flag and takes the loopback elif below, byte-for-byte
+                    # unchanged. The PKCE verifier/state and the token exchange stay
+                    # in THIS process/instance — required, since the SDK never
+                    # persists the verifier.
+                    from osia.mcp_client.oauth import (
+                        TunnelOAuthCallback,
+                        build_oauth_provider,
+                        OAUTH_REDIRECT_URI,
+                        OAUTH_TUNNEL_REDIRECT_URI,
+                    )
+
+                    _cb = TunnelOAuthCallback(str(cfg.get("oauth_flow_id") or ""))
+                    provider = build_oauth_provider(
+                        server_id, url, _cb,
+                        redirect_uris=[OAUTH_TUNNEL_REDIRECT_URI, OAUTH_REDIRECT_URI],
+                    )
+                    async with streamablehttp_client(url, auth=provider) as (read, write, _sid):
+                        async with ClientSession(read, write) as session:
+                            await session.initialize()
+                            listed = await session.list_tools()
+                            tools = [
+                                {
+                                    "name": getattr(t, "name", ""),
+                                    "description": getattr(t, "description", "") or "",
+                                    "inputSchema": getattr(t, "inputSchema", None) or {},
+                                    "annotations": _tool_annotations(t),
+                                }
+                                for t in getattr(listed, "tools", []) or []
+                            ]
+                            with self._lock:
+                                conn.session = session
+                                conn.tools = tools
+                                conn.status = STATUS_CONNECTED
+                                conn.error = ""
+                            self._register_tools(server_id, tools)
+                            self._safe_set_future(ready, STATUS_CONNECTED)
+                            await stop_event.wait()
+                elif auth_type == "oauth":
                     # WOR-44 Phase 5 (5-oauth-a): OAuth 2.1 branch. The SDK's
                     # OAuthClientProvider (an httpx.Auth) drives the ENTIRE flow —
                     # PKCE + RFC 9728/8414 discovery + RFC 7591 DCR + RFC 8707

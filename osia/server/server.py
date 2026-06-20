@@ -1131,6 +1131,238 @@ async def internal_mcp_sync(request: Request):
     return {"ok": True}
 
 
+# ── WOR-96 PART 1: OAuth-via-HTTPS-tunnel callback (public) + PC trigger ──────
+# An OAuth MCP connect can complete via https://osia.space/oauth/callback (routed
+# by the Cloudflare named tunnel to THIS server on :8765) IN ADDITION to the PC
+# loopback (127.0.0.1:8975). The flow runs ENTIRELY in this server process: the
+# tunnel redirect lands here AND the SDK's in-memory PKCE verifier/state live here
+# (the SDK never persists them), so the same process/instance that started the
+# flow performs the token exchange. The cross-loop state registry + transport live
+# in ``osia.mcp_client.oauth`` (imported lazily below) so that package stays
+# standalone (it must not import ``osia.server``); the registry instance is a
+# module singleton in THIS process.
+
+# /oauth/callback is the ONE route intentionally reachable from the public
+# internet, so it carries a small in-memory token-bucket rate limit (global +
+# per-IP) as defence-in-depth. ``state`` is 256-bit and the registry rejects any
+# unknown/expired state (the SDK also re-checks it via secrets.compare_digest), so
+# brute force is already infeasible; this just caps abuse / log-spam.
+_OAUTH_CB_LOCK = threading.Lock()
+_OAUTH_CB_HITS_GLOBAL: list = []        # recent hit timestamps, all IPs
+_OAUTH_CB_HITS_PER_IP: dict = {}        # ip -> recent hit timestamps
+_OAUTH_CB_WINDOW_S = 60.0
+_OAUTH_CB_MAX_GLOBAL = 120              # callbacks/min across all IPs
+_OAUTH_CB_MAX_PER_IP = 30              # callbacks/min per IP
+
+_OAUTH_CB_NOT_FOUND_HTML = (
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<title>OSIA</title></head><body style='font-family:sans-serif;"
+    "background:#15151a;color:#e8e8ea;text-align:center;padding-top:18vh'>"
+    "<h2>Not found</h2><p>This authorization link is invalid or has expired. "
+    "Start the connection again from OSIA.</p></body></html>"
+)
+_OAUTH_CB_BUSY_HTML = (
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<title>OSIA</title></head><body style='font-family:sans-serif;"
+    "background:#15151a;color:#e8e8ea;text-align:center;padding-top:18vh'>"
+    "<h2>Please wait</h2><p>Too many requests — try again in a moment.</p>"
+    "</body></html>"
+)
+
+
+def _oauth_cb_rate_ok(ip: str) -> bool:
+    """True iff a /oauth/callback hit from ``ip`` is within budget. Sliding 60s
+    window, global + per-IP. Best-effort, never raises."""
+    now = time.time()
+    cutoff = now - _OAUTH_CB_WINDOW_S
+    with _OAUTH_CB_LOCK:
+        g = [t for t in _OAUTH_CB_HITS_GLOBAL if t >= cutoff]
+        per = [t for t in _OAUTH_CB_HITS_PER_IP.get(ip, []) if t >= cutoff]
+        if len(g) >= _OAUTH_CB_MAX_GLOBAL or len(per) >= _OAUTH_CB_MAX_PER_IP:
+            _OAUTH_CB_HITS_GLOBAL[:] = g
+            _OAUTH_CB_HITS_PER_IP[ip] = per
+            return False
+        g.append(now)
+        per.append(now)
+        _OAUTH_CB_HITS_GLOBAL[:] = g
+        _OAUTH_CB_HITS_PER_IP[ip] = per
+        # Bound the per-IP dict: drop IPs with no hits in the window.
+        if len(_OAUTH_CB_HITS_PER_IP) > 1024:
+            for k in [k for k, v in _OAUTH_CB_HITS_PER_IP.items()
+                      if not any(t >= cutoff for t in v)]:
+                _OAUTH_CB_HITS_PER_IP.pop(k, None)
+        return True
+
+
+@app.get("/oauth/callback")
+async def oauth_callback(request: Request):
+    """PUBLIC OAuth 2.1 redirect endpoint — WOR-96 PART 1.
+
+    Reached through the Cloudflare named tunnel (osia.space → this server). An
+    OAuth provider redirects the user's browser here with ``?code=&state=`` after
+    an interactive login that an MCP connect flow started IN THIS PROCESS (the
+    tunnel branch of ``MCPManager._serve``). We match ``state`` to the in-flight
+    flow and hand ``(code, state)`` to the waiting provider's ``callback_handler``
+    — across the FastAPI ↔ MCP-manager event loops via a
+    ``concurrent.futures.Future`` — then show a neutral close-tab page.
+
+    This is the ONLY route intentionally exposed to the public internet (so it has
+    NO loopback host guard, unlike every /internal/* route). It is deliberately
+    defensive: it resolves ONLY a ``state`` already registered by an in-flight flow
+    (unknown / expired / replayed → 404, no side effect), is rate-limited, returns
+    NO secret in the body, and never logs the code/state values. The SDK still
+    performs the authoritative PKCE ``state`` check (secrets.compare_digest) on the
+    receiving side."""
+    from fastapi.responses import HTMLResponse
+
+    ip = request.client.host if request.client else ""
+    if not _oauth_cb_rate_ok(ip):
+        return HTMLResponse(_OAUTH_CB_BUSY_HTML, status_code=429)
+
+    params = request.query_params
+    state = (params.get("state") or "").strip()
+    code = (params.get("code") or "").strip()
+    error = (params.get("error") or "").strip()
+
+    # Well-formed-input gate before touching the registry.
+    if not state or (not code and not error):
+        return HTMLResponse(_OAUTH_CB_NOT_FOUND_HTML, status_code=404)
+
+    try:
+        from osia.mcp_client.oauth import resolve_oauth_flow, _CLOSE_TAB_HTML
+        matched = resolve_oauth_flow(state, code or None, error or None)
+    except Exception:
+        matched = False
+        _CLOSE_TAB_HTML = ""  # noqa: F841 (only used on the success path below)
+
+    if not matched:
+        # Unknown / expired / already-consumed state — reveal nothing.
+        return HTMLResponse(_OAUTH_CB_NOT_FOUND_HTML, status_code=404)
+    if error:
+        # Provider returned an error; the waiting flow was failed. Neutral page.
+        return HTMLResponse(_OAUTH_CB_NOT_FOUND_HTML, status_code=400)
+    return HTMLResponse(_CLOSE_TAB_HTML, status_code=200)
+
+
+@app.post("/internal/mcp_oauth_tunnel_connect")
+async def internal_mcp_oauth_tunnel_connect(request: Request):
+    """Localhost-only trigger — WOR-96 PART 1. The DESKTOP posts ``{id}`` here to
+    start an OAuth connect that completes via the HTTPS tunnel callback, IN THIS
+    server process (so the redirect lands in the same process that holds the PKCE
+    state). We start the connect on a daemon thread (it blocks up to
+    OAUTH_CONNECT_TIMEOUT), wait briefly for the provider to surface the authorize
+    URL, and return it so the DESKTOP opens it in the PC browser (this process's
+    ``webbrowser`` is neutralised by the headless guard). The token exchange
+    completes later when the user finishes login and the provider redirects to
+    ``/oauth/callback``.
+
+    Loopback-only (same host guard as ``/internal/mcp_sync``); carries only an id
+    (no secret). Not part of the public mobile WS protocol."""
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    raw_id = body.get("id")
+    server_id = raw_id.strip() if isinstance(raw_id, str) else ""
+    if not server_id:
+        return {"ok": False, "error": "bad request"}
+
+    saved = _mcp_find_saved_server(server_id)
+    if not isinstance(saved, dict):
+        return {"ok": False, "error": "unknown server"}
+    if str(saved.get("auth_type") or "").strip().lower() != "oauth":
+        return {"ok": False, "error": "not an oauth connector"}
+    if str(saved.get("transport") or "").strip().lower() != "streamable_http":
+        return {"ok": False, "error": "unsupported transport"}
+    if not str(saved.get("url") or "").strip():
+        return {"ok": False, "error": "missing url"}
+
+    # Already up / in-flight → don't start a redundant flow (connect() would be an
+    # idempotent no-op that never surfaces a new URL, so the wait would just time
+    # out). Report the current state instead.
+    try:
+        from osia.mcp_client import (
+            get_manager, STATUS_CONNECTED, STATUS_CONNECTING,
+        )
+        cur = get_manager().status(server_id)
+        if cur in (STATUS_CONNECTED, STATUS_CONNECTING):
+            return {"ok": False, "error": f"already {cur}"}
+    except Exception:
+        pass
+
+    from osia.mcp_client.oauth import (
+        register_oauth_trigger_flow,
+        wait_oauth_auth_url,
+        fail_oauth_trigger_flow,
+        cleanup_oauth_trigger_flow,
+    )
+    from osia.mcp_client.reconnect import build_headless_connect_cfg
+
+    flow_id = secrets.token_urlsafe(16)
+    loop = asyncio.get_running_loop()
+    register_oauth_trigger_flow(flow_id)
+
+    def _worker(sid=server_id, fid=flow_id, saved=saved, loop=loop):
+        status = "failed"
+        try:
+            cfg = build_headless_connect_cfg(saved)
+            cfg["oauth_callback_mode"] = "tunnel"
+            cfg["oauth_flow_id"] = fid
+            from osia.mcp_client import get_manager
+            status = get_manager().connect(cfg)
+        except Exception as e:
+            print(f"[OSIA Server] mcp_oauth_tunnel_connect worker {sid!r}: {e}")
+            try:
+                fail_oauth_trigger_flow(fid, f"{type(e).__name__}: {e}")
+            except Exception:
+                pass
+        # If connect resolved WITHOUT ever surfacing the authorize URL (e.g.
+        # discovery/DCR failed before redirect_handler), release the waiter so the
+        # trigger returns promptly. No-op once a URL was surfaced.
+        try:
+            from osia.mcp_client import STATUS_CONNECTED
+            if status != STATUS_CONNECTED:
+                fail_oauth_trigger_flow(fid, "connect did not complete")
+            else:
+                # Parity with the other connect paths: a successful connect marks
+                # the connector enabled so the shared mcp_servers[].enabled flag is
+                # authoritative and the desktop reconcile daemon mirrors it.
+                _mcp_set_enabled(sid, True)
+        except Exception:
+            pass
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _broadcast_mcp_status(_mcp_status_frame(sid)), loop
+            )
+        except Exception:
+            pass
+        # Drop the trigger entry (the state→future entry is freed by the
+        # callback_handler). Best-effort.
+        try:
+            cleanup_oauth_trigger_flow(fid)
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=_worker, name="osia-mcp-oauth-tunnel", daemon=True
+    ).start()
+
+    # Wait (bounded) OFF the event loop for the provider to surface the authorize
+    # URL (discovery + DCR run first; usually a few seconds). The connect keeps
+    # running on its daemon thread regardless.
+    auth_url, err = await loop.run_in_executor(
+        None, wait_oauth_auth_url, flow_id, 30.0
+    )
+    if auth_url:
+        return {"ok": True, "auth_url": auth_url, "flow_id": flow_id}
+    return {"ok": False, "error": err or "timed out waiting for authorize url"}
+
+
 # NOTE (WOR-47): the startup ``_warm_models`` handler that eagerly pre-loaded
 # faster-whisper was REMOVED deliberately — do NOT reintroduce it. Importing
 # ``osia.voice.stt`` on the event-loop thread at cold boot pulled in
