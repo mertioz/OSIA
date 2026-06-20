@@ -865,6 +865,71 @@ async def _broadcast_mcp_status(
             _WS_CLIENTS.discard(client)
 
 
+def _build_config_snapshot() -> dict:
+    """Build the mobile config snapshot — the ``config`` payload of a
+    ``{"type": "config", "config": {...}}`` frame. ONE source of truth shared by
+    the ``get_config`` WS request/response handler and the unsolicited config
+    broadcast (the MCP mirror, Fix 2), so a pushed snapshot is BYTE-FOR-BYTE the
+    same shape the mobile already repaints from after a ``get_config`` — no new
+    frame type, no partial frame that could clobber unrelated config state on the
+    phone.
+
+    Carries NO secret beyond what ``get_config`` already ships on the
+    authenticated+TLS connection (the raw ``api_key_fallbacks`` keys, identical to
+    the existing ``get_config`` path); the per-server MCP token is NOT here
+    (``mcp_servers`` env is always ``{}``). Synchronous file reads — callers run
+    it OFF the event loop (the mirror worker thread) where possible. May raise;
+    callers handle (``get_config`` already wraps it)."""
+    from osia.config import load_settings, load_api_keys, get_setting
+    from osia import personality
+    cfg = load_settings()
+    # api_key_fallbacks holds the raw ordered fallback keys per provider (WOR-29).
+    # The mobile fallback-keys editor needs the actual keys, so ship them as-is —
+    # the connection is already authenticated + TLS, identical to get_api_keys.
+    cfg["api_key_fallbacks"] = get_setting("api_key_fallbacks", {})
+    # Desktop-only capsule position is meaningless to the phone.
+    cfg.pop("island_x", None)
+    cfg.pop("island_y", None)
+    # Mirror the two hierarchy chains under the flat names the mobile app writes
+    # back via set_setting, so the round-trip is symmetric.
+    hierarchy = cfg.get("ai_hierarchy") or {}
+    cfg["heavy_chain"] = list(hierarchy.get("heavy") or [])
+    cfg["medium_chain"] = list(hierarchy.get("medium") or [])
+    cfg["personality"] = personality.load_personality()
+    cfg["skills"] = [
+        {
+            "name": n,
+            "enabled": personality.is_skill_enabled(n),
+            "text": personality.read_skill(n),
+        }
+        for n in personality.list_skills()
+    ]
+    cfg["api_keys_set"] = {
+        p: bool(k) for p, k in load_api_keys().items()
+    }
+    return cfg
+
+
+async def _broadcast_config(
+    frame: dict, exclude: "_OutboundChannel | None" = None
+) -> None:
+    """Best-effort fan-out of a ``config`` frame to every connected client —
+    same enqueue-onto-the-connection's-channel pattern as
+    ``_broadcast_mcp_status`` / ``_broadcast_conversations``. Used by the MCP
+    mirror (Fix 2) to PUSH a fresh config snapshot when the PC connects/
+    disconnects a connector, so phones refresh their connector list + enabled
+    state (config is otherwise pull-only via ``get_config``). Reuses the existing
+    ``{"type": "config"}`` shape the mobile already repaints from; introduces no
+    new message type."""
+    for client in list(_WS_CLIENTS):
+        if client is exclude:
+            continue
+        try:
+            await client.send_json(frame)
+        except Exception:
+            _WS_CLIENTS.discard(client)
+
+
 @app.post("/internal/new_chat")
 async def internal_new_chat(request: Request):
     """Localhost-only trigger used by the desktop app (osia/main.py) when the
@@ -888,15 +953,23 @@ async def internal_mcp_sync(request: Request):
     an id + action); not part of the public mobile WS protocol; never exposed
     beyond localhost (same loopback host guard as ``/internal/new_chat``).
 
-    ``connect``  → ``reconnect_enabled_connectors(allow_oauth=True, only_id=id)``:
-        the EXACT headless connect path the boot sweep / mcp_connect handler use,
-        scoped to one id. OAuth is gated by ``_oauth_token_fresh`` — a stale
-        token is SKIPPED, never a browser (and the server-process webbrowser
-        guard below makes a pop structurally impossible regardless). The desktop
-        only sends ``connect`` AFTER its own ``connect()`` returned CONNECTED, so
-        the SDK has already persisted a FRESH OAuth token to disk by then.
+    ``connect``  → ``reconnect_enabled_connectors(allow_oauth=True, only_id=id,
+        trust_present_token=True)``: the EXACT headless connect path the boot
+        sweep / mcp_connect handler use, scoped to one id. The desktop only sends
+        ``connect`` AFTER its own ``connect()`` returned CONNECTED, so the SDK has
+        already persisted a working OAuth token to disk by then —
+        ``trust_present_token=True`` therefore relaxes the OAuth freshness gate to
+        accept a present token even when the provider issued no numeric expiry
+        (e.g. Linear), while a genuinely EXPIRED token is still SKIPPED. A browser
+        pop is impossible regardless (the server-process webbrowser guard below).
     ``disconnect`` → ``get_manager().disconnect(id)`` (idempotent no-op if the
         server never had it connected).
+
+    After the connect/disconnect resolves, the worker broadcasts BOTH an
+    ``mcp_status`` frame (the live pill) AND a fresh ``config`` snapshot (so phones
+    refresh their connector LIST + enabled state, which is otherwise pull-only via
+    ``get_config`` — Fix 2). Both reuse frame shapes the mobile already repaints
+    from; no new message type is introduced.
 
     ``connect()``/``disconnect()`` BLOCK, so the work runs on a short-lived
     daemon thread (never the event loop); the resolved status is broadcast to
@@ -925,20 +998,45 @@ async def internal_mcp_sync(request: Request):
                 from osia.mcp_client.reconnect import reconnect_enabled_connectors
                 # only_id scopes the EXISTING headless sweep to this one id; all
                 # gates (enabled / _connectable / _oauth_token_fresh) still apply.
-                reconnect_enabled_connectors(allow_oauth=True, only_id=sid)
+                # trust_present_token=True: this is the EXPLICIT mirror path — the
+                # desktop just proved the token works (its connect() returned
+                # CONNECTED) and the server's webbrowser guard makes a pop
+                # impossible, so an OAuth token with no numeric expiry (e.g.
+                # Linear, which issues no expires_in) is TRUSTED here instead of
+                # skipped. A genuinely EXPIRED token is still skipped (Fix 1).
+                reconnect_enabled_connectors(
+                    allow_oauth=True, only_id=sid, trust_present_token=True
+                )
             else:
                 from osia.mcp_client import get_manager
                 get_manager().disconnect(sid)
         except Exception as e:
             print(f"[OSIA Server] mcp_sync worker {sid!r} ({act}): {e}")
         # Broadcast the RESOLVED status (connected/disconnected/failed) to every
-        # connected phone — the existing mobile repaint path, unchanged.
+        # connected phone — the existing mobile repaint path, unchanged (the live
+        # status pill).
         try:
             asyncio.run_coroutine_threadsafe(
                 _broadcast_mcp_status(_mcp_status_frame(sid)), loop
             )
         except Exception:
             pass
+        # Fix 2: config is otherwise pull-only (mobile learns mcp_servers via
+        # get_config), so a PC connect/disconnect would leave the phone's
+        # connector LIST + enabled state stale. PUSH a fresh config snapshot too
+        # (reusing the existing {"type":"config"} shape the mobile already
+        # repaints from) so the list/enabled view matches the PC. The desktop
+        # persisted the new mcp_servers[].enabled to settings.json BEFORE POSTing
+        # here, and settings reads are mtime-invalidated cross-process, so this
+        # snapshot reflects the just-applied change. Built on THIS worker thread
+        # (off the event loop); only the fan-out hops to the loop.
+        try:
+            cfg = _build_config_snapshot()
+            asyncio.run_coroutine_threadsafe(
+                _broadcast_config({"type": "config", "config": cfg}), loop
+            )
+        except Exception as e:
+            print(f"[OSIA Server] mcp_sync config broadcast {sid!r}: {e}")
 
     threading.Thread(
         target=_worker, name="osia-mcp-sync", daemon=True
@@ -3057,35 +3155,10 @@ async def websocket_endpoint(ws: WebSocket):
             # personality document, and the full skill list (name/enabled/prose).
             if msg_type == "get_config":
                 try:
-                    from osia.config import load_settings, load_api_keys, get_setting
-                    from osia import personality
-                    cfg = load_settings()
-                    # api_key_fallbacks holds the raw ordered fallback keys per
-                    # provider (WOR-29). The mobile fallback-keys editor needs the
-                    # actual keys, so ship them as-is — the connection is already
-                    # authenticated + TLS, identical to the get_api_keys path.
-                    cfg["api_key_fallbacks"] = get_setting("api_key_fallbacks", {})
-                    # Desktop-only capsule position is meaningless to the phone.
-                    cfg.pop("island_x", None)
-                    cfg.pop("island_y", None)
-                    # Mirror the two hierarchy chains under the flat names the
-                    # mobile app writes back via set_setting, so the round-trip
-                    # is symmetric (read heavy_chain → write heavy_chain).
-                    hierarchy = cfg.get("ai_hierarchy") or {}
-                    cfg["heavy_chain"] = list(hierarchy.get("heavy") or [])
-                    cfg["medium_chain"] = list(hierarchy.get("medium") or [])
-                    cfg["personality"] = personality.load_personality()
-                    cfg["skills"] = [
-                        {
-                            "name": n,
-                            "enabled": personality.is_skill_enabled(n),
-                            "text": personality.read_skill(n),
-                        }
-                        for n in personality.list_skills()
-                    ]
-                    cfg["api_keys_set"] = {
-                        p: bool(k) for p, k in load_api_keys().items()
-                    }
+                    # Built by the shared _build_config_snapshot() so an
+                    # unsolicited config PUSH (the MCP mirror, Fix 2) ships the
+                    # EXACT same shape this request/response path does.
+                    cfg = _build_config_snapshot()
                     await out.send_json({"type": "config", "config": cfg})
                     print(
                         f"[OSIA Server] get_config sent "

@@ -114,16 +114,34 @@ def _connectable(saved: dict) -> bool:
     return True
 
 
-def _oauth_token_fresh(server_id: str, margin_s: float) -> bool:
-    """True iff a stored OAuth blob for ``server_id`` has a token AND its
-    bookkeeping ``expires_at`` is comfortably (> ``margin_s``) in the future.
+def _oauth_token_fresh(
+    server_id: str, margin_s: float, trust_present_token: bool = False
+) -> bool:
+    """True iff a stored OAuth blob for ``server_id`` has a token AND (strict
+    path) its bookkeeping ``expires_at`` is comfortably (> ``margin_s``) in the
+    future.
 
-    Conservative by design: a MISSING blob, a blob with no ``token``, or an
-    ``expires_at`` that is absent / non-numeric / not far enough ahead all return
-    False — so the connector is SKIPPED rather than risk a boot-time browser. A
-    future-dated token can still have been server-revoked (the SDK would then pop
-    a browser on a 401); that residual case is the SDK's honest limitation and is
-    accepted here — the bounded, off-thread connect keeps it from blocking boot.
+    Conservative by design on the BOOT-SWEEP path (``trust_present_token`` False,
+    the default): a MISSING blob, a blob with no ``token``, or an ``expires_at``
+    that is absent / non-numeric / not far enough ahead all return False — so the
+    connector is SKIPPED rather than risk a boot-time browser. A future-dated
+    token can still have been server-revoked (the SDK would then pop a browser on
+    a 401); that residual case is the SDK's honest limitation and is accepted here
+    — the bounded, off-thread connect keeps it from blocking boot.
+
+    ``trust_present_token`` — set ONLY by the EXPLICIT direction-A mirror path
+    (the ``/internal/mcp_sync`` connect, i.e. ``only_id`` is set). On that path the
+    desktop JUST proved the token works (its ``connect()`` returned CONNECTED) and
+    the server process has a hard ``webbrowser.open`` no-op guard, so the boot-
+    browser risk the strict gate exists to avoid cannot apply. With it True the
+    gate relaxes to: a present token with an ABSENT / non-numeric ``expires_at``
+    (e.g. a provider like Linear that issues no ``expires_in``) is TRUSTED instead
+    of skipped, and a present token with a numeric ``expires_at`` is trusted as
+    long as it is not already PAST (margin 0 — the token was just minted on the
+    PC). A present-but-EXPIRED token (numeric ``expires_at`` in the past) and an
+    ABSENT token are STILL skipped, exactly as on the strict path. Summary:
+    present+no-expiry ⇒ trust; present+future ⇒ trust; present+past ⇒ skip;
+    absent token ⇒ skip.
     """
     try:
         from osia.config import get_mcp_oauth
@@ -131,10 +149,16 @@ def _oauth_token_fresh(server_id: str, margin_s: float) -> bool:
     except Exception:
         return False
     if not isinstance(blob, dict) or not blob.get("token"):
-        return False
+        return False  # absent token -> skip (both paths)
     exp = blob.get("expires_at")
     if not isinstance(exp, (int, float)) or isinstance(exp, bool):
-        return False
+        # No numeric expiry recorded (provider issued no expires_in). Strict
+        # boot path SKIPS; the explicit-mirror path TRUSTS the just-proved token.
+        return bool(trust_present_token)
+    if trust_present_token:
+        # Present + numeric expiry on the mirror path: trust unless genuinely PAST
+        # (margin 0 — the desktop just minted/validated this token).
+        return float(exp) > time.time()
     return float(exp) > time.time() + float(margin_s)
 
 
@@ -143,6 +167,7 @@ def reconnect_enabled_connectors(
     on_connected: Optional[Callable[[str, str], None]] = None,
     oauth_margin_s: float = OAUTH_FRESH_MARGIN_S,
     only_id: Optional[str] = None,
+    trust_present_token: bool = False,
 ) -> list:
     """Reconnect every ``enabled`` MCP connector via ``MCPManager.connect()``.
 
@@ -165,9 +190,19 @@ def reconnect_enabled_connectors(
         desktop→server MCP state mirror (Phase 1, direction A) to reconcile a
         SINGLE connector the PC just connected. Every existing gate still applies
         (``enabled is True``, ``_connectable``, and ``_oauth_token_fresh`` for
-        OAuth — so a stale token is SKIPPED, never a browser). ``None`` (default)
-        preserves the boot-sweep behaviour byte-for-byte: every enabled connector
-        is considered.
+        OAuth — so a genuinely EXPIRED or absent token is SKIPPED, never a
+        browser). ``None`` (default) preserves the boot-sweep behaviour
+        byte-for-byte: every enabled connector is considered.
+    trust_present_token:
+        OAuth freshness policy for the EXPLICIT mirror path ONLY (paired with
+        ``only_id``). ``False`` (default — every boot-sweep caller) keeps the
+        strict gate: an OAuth token with no numeric ``expires_at`` is SKIPPED. The
+        ``/internal/mcp_sync`` connect passes ``True`` so a connector the desktop
+        JUST connected (whose provider issued no ``expires_in``, e.g. Linear) is
+        TRUSTED and reconnected headlessly instead of being skipped — the server's
+        ``webbrowser`` no-op guard makes a browser pop impossible regardless. A
+        present-but-EXPIRED token stays skipped on both paths. See
+        ``_oauth_token_fresh``.
 
     Returns a list of per-connector result dicts
     ``{"id", "status", "reason"}`` (status is the ``connect()`` result, or
@@ -203,7 +238,7 @@ def reconnect_enabled_connectors(
                 results.append({"id": sid, "status": "skipped",
                                 "reason": "oauth disabled for this process"})
                 continue
-            if not _oauth_token_fresh(sid, oauth_margin_s):
+            if not _oauth_token_fresh(sid, oauth_margin_s, trust_present_token):
                 # Leave the connector untouched in a quiet "needs reconnect"
                 # state — NEVER pop a browser at startup.
                 results.append({"id": sid, "status": "skipped",
