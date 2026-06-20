@@ -1552,6 +1552,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Cancel", "fr": "Annuler", "zh": "取消",
         "ja": "キャンセル", "de": "Abbrechen", "es": "Cancelar",
     },
+    # WOR-98: switch account on a CONNECTED OAuth connector — revoke the grant
+    # AND forget the DCR client so the next Connect re-runs DCR + a fresh login.
+    "mcp.switch_account": {
+        "en": "Switch account", "fr": "Changer de compte", "zh": "切换账户",
+        "ja": "アカウントを切り替え", "de": "Konto wechseln", "es": "Cambiar de cuenta",
+    },
     "mcp.status_disconnected": {
         "en": "Disconnected", "fr": "Déconnecté", "zh": "未连接",
         "ja": "未接続", "de": "Getrennt", "es": "Desconectado",

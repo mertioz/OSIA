@@ -3457,6 +3457,7 @@ class _SettingsPanel(QWidget):
         self._mcp_pills = {}
         self._mcp_buttons = {}
         self._mcp_cancel_buttons = {}   # WOR-97: OAuth "Cancel" btns (per id)
+        self._mcp_switch_buttons = {}   # WOR-98: OAuth "Switch account" btns (per id)
         self._mcp_token_inputs = {}
         self._mcp_dir_inputs = {}
         self._mcp_extra_inputs = {}
@@ -3597,6 +3598,21 @@ class _SettingsPanel(QWidget):
                 cancel_btn.setVisible(False)
                 self._mcp_cancel_buttons[sid] = cancel_btn
                 actions.addWidget(cancel_btn)
+                # WOR-98: a "Switch account" control for OAuth connectors only,
+                # shown ONLY while the pill is "connected" (revoke the grant +
+                # forget the DCR client → next Connect re-runs DCR + a fresh
+                # login / different account). Built hidden; _refresh_mcp_status
+                # toggles its visibility per tick on the pill state (never shown
+                # at the same time as Cancel, which is "connecting"-only).
+                switch_btn = QPushButton(i18n.t("mcp.switch_account"))
+                switch_btn.setObjectName("ghostBtn")
+                switch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                switch_btn.clicked.connect(
+                    lambda _=False, e=entry: self._on_mcp_switch_account(e)
+                )
+                switch_btn.setVisible(False)
+                self._mcp_switch_buttons[sid] = switch_btn
+                actions.addWidget(switch_btn)
         else:
             reason = "mcp.oauth_soon" if entry.get("auth_type") == "oauth" else "mcp.transport_soon"
             soon = QPushButton(i18n.t(reason))
@@ -3826,6 +3842,83 @@ class _SettingsPanel(QWidget):
             target=_bg, name="osia-mcp-oauth-cancel", daemon=True
         ).start()
 
+    def _on_mcp_switch_account(self, entry: dict) -> None:
+        """WOR-98: switch the account on a CONNECTED OAuth connector. The control
+        is visible only while the pill is "connected" (see _refresh_mcp_status) and
+        only for OAuth connectors. Unlike a plain Disconnect (which KEEPS the token
+        for a silent reconnect), this REVOKES the grant (RFC 7009) AND forgets the
+        DCR client so the next Connect re-runs DCR + a fresh login — a clean slate
+        for a different account. Does NOT auto-reconnect.
+
+        Mirrors _on_mcp_disconnect/_on_mcp_cancel: persist enabled=False so the
+        reconcile daemon won't reconnect, flip the pill + hide the button on the Qt
+        UI thread, then do the bounded network work on a daemon bg thread. The
+        revoke (RFC 7009) + forget (delete_mcp_oauth) are done IN-PROCESS here — like
+        _on_mcp_disconnect / _on_mcp_remove_custom keep their core teardown local —
+        so the clean slate holds even when the mobile server process is down. The bg
+        thread then ALSO posts the /internal/mcp_oauth_switch bridge (best-effort) so
+        the server tears down its OWN mirrored/tunnel session and repaints connected
+        phones; that POST is now redundant for the revoke+forget (the shared
+        oauth_tokens.json is already cleared), so a down server no longer defeats the
+        feature. disconnect() is idempotent (a no-op when the manager doesn't own the
+        id)."""
+        sid = entry["id"]
+        # Authoritative intent: enabled=False so the ~3s desktop reconcile daemon
+        # won't reconnect this id after the teardown (mirrors _on_mcp_disconnect).
+        self._mcp_set_enabled(sid, False)
+        # Optimistic feedback: flip the pill toward disconnected (the ~1.2s poll
+        # settles it on the real manager status) and hide the button at once so a
+        # second click can't double-fire (harmless anyway — the route is idempotent).
+        self._mcp_pending[sid] = ("disconnected", {"disconnected", "failed"}, 25)
+        if sid in self._mcp_pills:
+            self._set_mcp_pill(self._mcp_pills[sid], "disconnected")
+        if sid in self._mcp_switch_buttons:
+            self._mcp_switch_buttons[sid].setVisible(False)
+
+        url = str(entry.get("url") or "").strip()
+
+        def _bg():
+            # Drop the desktop manager's own (loopback) session first; idempotent
+            # no-op for a tunnel connector the desktop manager never owned.
+            try:
+                from osia.mcp_client import get_manager
+                get_manager().disconnect(sid)
+            except Exception:
+                pass
+            # AUTHORITATIVE revoke + forget done IN-PROCESS (mirrors how
+            # _on_mcp_disconnect / _on_mcp_remove_custom keep their core teardown
+            # local): the mobile server (:8975/:8765) is a SEPARATE process and may
+            # be down while this GUI is up, so doing the clean-slate here guarantees
+            # the next Connect re-runs DCR + a fresh login regardless. Order is
+            # critical — revoke reads the token BEFORE delete_mcp_oauth removes the
+            # whole blob (token + DCR client). Both best-effort; revoke_oauth_token
+            # never raises and never logs token values. delete_mcp_oauth /
+            # oauth_tokens.json are shared with the server via CONFIG_DIR, so the
+            # server's mirror below sees the deletion (its own revoke/delete then
+            # no-op, harmlessly idempotent).
+            try:
+                import asyncio
+                from osia.mcp_client.oauth import revoke_oauth_token
+                asyncio.run(revoke_oauth_token(sid, url))
+            except Exception:
+                pass
+            try:
+                delete_mcp_oauth(sid)
+            except Exception:
+                pass
+            # Mirror to the server (best-effort): tear down ITS own (mirrored or
+            # tunnel) session for this id and repaint every connected phone to
+            # disconnected. The revoke+forget above already secured the clean slate,
+            # so a server that is down no longer defeats the feature.
+            try:
+                from osia.main import request_oauth_switch
+                request_oauth_switch(sid)
+            except Exception:
+                pass
+        threading.Thread(
+            target=_bg, name="osia-mcp-oauth-switch", daemon=True
+        ).start()
+
     def _on_mcp_remove_custom(self, server_id: str) -> None:
         self._on_mcp_disconnect(server_id)
         self._mcp_remove_saved(server_id)
@@ -3908,6 +4001,11 @@ class _SettingsPanel(QWidget):
             cancel_btn = self._mcp_cancel_buttons.get(sid)
             if cancel_btn is not None:
                 cancel_btn.setVisible(state == "connecting")
+            # WOR-98: surface the OAuth "Switch account" control ONLY while
+            # connected (mutually exclusive with Cancel, which is connecting-only).
+            switch_btn = self._mcp_switch_buttons.get(sid)
+            if switch_btn is not None:
+                switch_btn.setVisible(state == "connected")
 
     # ── API key fallback hierarchy ──────────────────────────────────────────
     # A dropdown of configured providers; picking one opens a dark popover

@@ -1524,6 +1524,89 @@ async def internal_mcp_oauth_cancel(request: Request):
     return {"ok": True}
 
 
+@app.post("/internal/mcp_oauth_switch")
+async def internal_mcp_oauth_switch(request: Request):
+    """Localhost-only trigger — WOR-98 (PC "Switch account"). The DESKTOP posts
+    ``{id}`` here to switch the account on a CONNECTED OAuth connector: tear the
+    session down, REVOKE the grant at the AS (RFC 7009, best-effort) AND forget the
+    DCR client blob (``delete_mcp_oauth``) so the next Connect re-runs DCR + a fresh
+    login (clean slate / different account). This is the loopback-bridge twin of the
+    mobile ``mcp_disconnect`` WS frame carrying ``revoke=True, forget_client=True``
+    — it runs the SAME server-side path (``_disconnect_worker``'s revoke+forget
+    branch). Because ``oauth_tokens.json`` is shared with the desktop via
+    CONFIG_DIR, this one route serves BOTH loopback and tunnel connectors. After
+    the teardown it broadcasts the reset so every connected pill repaints to
+    disconnected.
+
+    Loopback-only (same host guard as ``/internal/mcp_sync``); carries only an id
+    (no secret); persists ``enabled=False`` (no auto-reconnect). Not part of the
+    public mobile WS protocol (mobile uses the ``mcp_disconnect`` WS frame)."""
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    raw_id = body.get("id")
+    server_id = raw_id.strip() if isinstance(raw_id, str) else ""
+    if not server_id:
+        return {"ok": False, "error": "bad request"}
+
+    # Read the saved connector to gate the OAuth revoke (only OAuth has a grant)
+    # and supply the AS URL for revocation endpoint discovery. A missing/unknown
+    # server still clears local state below (idempotent), it just skips revoke.
+    saved = _mcp_find_saved_server(server_id)
+    _sw_is_oauth = (
+        isinstance(saved, dict)
+        and str(saved.get("auth_type") or "").strip().lower() == "oauth"
+    )
+    _sw_url = str(saved.get("url") or "").strip() if isinstance(saved, dict) else ""
+
+    loop = asyncio.get_running_loop()
+
+    def _switch_worker(sid=server_id, loop=loop, is_oauth=_sw_is_oauth, url=_sw_url):
+        # Mirror _disconnect_worker's revoke=True, forget=True path: session DOWN
+        # → revoke at the AS (RFC 7009) → drop the WHOLE OAuth blob (token + DCR
+        # client) → enabled=False → broadcast. Order matters: revoke reads the
+        # token BEFORE delete_mcp_oauth removes it. Each step best-effort;
+        # revoke_oauth_token NEVER raises and NEVER logs token values.
+        try:
+            from osia.mcp_client import get_manager
+            get_manager().disconnect(sid)
+        except Exception as e:
+            print(f"[OSIA Server] internal mcp_oauth_switch worker {sid!r}: {e}")
+        if is_oauth:
+            try:
+                from osia.mcp_client.oauth import revoke_oauth_token
+                asyncio.run(revoke_oauth_token(sid, url))
+            except Exception:
+                pass
+            try:
+                from osia.config import delete_mcp_oauth
+                delete_mcp_oauth(sid)
+            except Exception:
+                pass
+        try:
+            _mcp_set_enabled(sid, False)
+        except Exception:
+            pass
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _broadcast_mcp_status(_mcp_status_frame(sid)), loop
+            )
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=_switch_worker,
+        name="osia-mcp-oauth-switch-internal", daemon=True,
+    ).start()
+    return {"ok": True}
+
+
 # NOTE (WOR-47): the startup ``_warm_models`` handler that eagerly pre-loaded
 # faster-whisper was REMOVED deliberately — do NOT reintroduce it. Importing
 # ``osia.voice.stt`` on the event-loop thread at cold boot pulled in

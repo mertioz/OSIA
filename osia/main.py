@@ -95,6 +95,11 @@ _SERVER_MCP_OAUTH_TUNNEL_URL = "http://127.0.0.1:8765/internal/mcp_oauth_tunnel_
 # SERVER process (tunnel/PART-1 flow). The desktop POSTs {id} to this loopback
 # route, which calls MCPManager.cancel_pending server-side and rebroadcasts.
 _SERVER_MCP_OAUTH_CANCEL_URL = "http://127.0.0.1:8765/internal/mcp_oauth_cancel"
+# WOR-98 — desktop entry point to "switch account" on a CONNECTED OAuth connector.
+# The desktop POSTs {id} to this loopback route, which tears the session down,
+# REVOKES the grant (RFC 7009) AND forgets the DCR client (delete_mcp_oauth) so the
+# next Connect re-runs DCR + a fresh login, then rebroadcasts the reset.
+_SERVER_MCP_OAUTH_SWITCH_URL = "http://127.0.0.1:8765/internal/mcp_oauth_switch"
 
 
 def _notify_mobile_new_chat() -> None:
@@ -209,6 +214,37 @@ def request_oauth_cancel(server_id: str) -> bool:
         return bool(isinstance(data, dict) and data.get("ok"))
     except Exception as e:
         print(f"[WOR-97] oauth cancel request skipped: {e}")
+        return False
+
+
+def request_oauth_switch(server_id: str) -> bool:
+    """WOR-98 — desktop→server bridge for "Switch account" on a CONNECTED OAuth
+    connector. POSTs ``{id}`` to the loopback ``/internal/mcp_oauth_switch``; the
+    server tears the session down, REVOKES the grant (RFC 7009) AND forgets the DCR
+    client blob (``delete_mcp_oauth``) so the next Connect re-runs DCR + a fresh
+    login (a different account), then broadcasts the reset so every pill repaints to
+    disconnected.
+
+    Carries only an id (no secret). Best-effort, never raises; a silent no-op when
+    the server isn't running. Call OFF the Qt main thread (the timeout never blocks
+    the UI). Returns True iff the server acked ok. Used for BOTH loopback and tunnel
+    OAuth connectors — the revoke+forget logic lives server-side and
+    ``oauth_tokens.json`` is shared via CONFIG_DIR, so one bridge route serves both.
+    The route returns immediately (the revoke/forget runs on a server daemon
+    thread), so the short timeout is ample."""
+    import json
+    import urllib.request
+    try:
+        payload = json.dumps({"id": server_id}).encode("utf-8")
+        req = urllib.request.Request(
+            _SERVER_MCP_OAUTH_SWITCH_URL, data=payload, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return bool(isinstance(data, dict) and data.get("ok"))
+    except Exception as e:
+        print(f"[WOR-98] oauth switch request skipped: {e}")
         return False
 
 
