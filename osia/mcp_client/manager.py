@@ -52,6 +52,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import re
 import sys
 import threading
 import traceback
@@ -287,6 +288,188 @@ def _tool_annotations(t: Any) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Credential validation — connect-time auth probe + demote-on-auth-error
+# ---------------------------------------------------------------------------
+# A token/Bearer connector's handshake (``initialize`` + ``list_tools``) is LOCAL
+# protocol negotiation — for stdio it never leaves the subprocess, and many
+# remote servers serve ``tools/list`` unauthenticated — so it does NOT exercise
+# the credential. A garbage/expired token would therefore show CONNECTED and only
+# fail on the first real tool call. These helpers let ``connect`` run a strictly
+# read-only probe that DOES exercise the credential, and let ``call_tool`` demote
+# a connector the moment a real call proves the token invalid.
+
+# Curated read-only probes per catalog connector id (lower-cased): an ORDERED
+# list of (tool_name, args) candidates, tried first, the first whose tool the
+# connected server actually exposes AND whose required args are all supplied. A
+# curated entry MAY carry args because some servers expose no no-arg identity
+# tool: the archived npm ``@modelcontextprotocol/server-github`` has no ``get_me``
+# and every read tool needs a required arg, so without an args-bearing probe a
+# garbage PAT would still reach CONNECTED there. Every curated tool MUST be
+# strictly read-only (search/identity), and the args MUST be innocuous.
+_AUTH_PROBES = {
+    "github": [
+        ("get_me", {}),                                   # newer Go / hosted server
+        ("search_repositories", {"query": "octocat"}),    # npm reference server
+        ("search_users", {"q": "octocat"}),               # npm reference fallback
+    ],
+}
+
+# Generic identity/"whoami" read tools to try when no per-server probe matches.
+# Each is a credential-exercising read with (typically) no required arguments.
+_IDENTITY_PROBE_CANDIDATES = (
+    "get_me", "whoami", "get_current_user", "get_authenticated_user",
+    "get_viewer", "get_user_info", "current_user", "me",
+)
+
+# Bounded probe budget, comfortably under the 45s connect budget: a slow probe
+# must NEVER fail an otherwise-good connect — on timeout we fall through to
+# CONNECTED and let the demote-on-auth-error fallback catch a bad token on use.
+PROBE_CALL_TIMEOUT = 15.0
+
+# Clear authentication/authorization failure phrases. DELIBERATELY conservative:
+# only unambiguous auth verdicts, so a 404 / bad-arg / generic tool error never
+# trips it. Rate-limiting frequently rides a 403 but is NOT an auth failure (the
+# credential is valid, just throttled) and is excluded below. The 401/403 status
+# codes are matched separately with word boundaries (``_AUTH_CODE_RE``) so a digit
+# embedded in unrelated data can't false-positive.
+_AUTH_FAIL_KEYWORDS = (
+    "unauthorized", "forbidden", "bad credentials", "invalid credentials",
+    "invalid token", "invalid access token", "invalid authentication",
+    "authentication failed", "authentication required", "requires authentication",
+    "not authenticated", "permission denied", "access denied",
+    "invalid api key", "invalid_grant", "invalid_token", "token expired",
+    "expired token",
+)
+_RATE_LIMIT_HINTS = ("rate limit", "rate-limit", "ratelimit", "too many requests")
+_AUTH_CODE_RE = re.compile(r"\b40[13]\b")
+
+
+def _looks_like_error(text: str) -> bool:
+    """True iff a tool-result string carries the native ``ERROR``/``ERREUR``
+    failure marker (same convention as ``osia.agent._is_tool_error``), checked
+    locally so this module stays standalone (no agent import)."""
+    s = (text or "").lstrip()
+    up = s[:6].upper()
+    return up.startswith("ERROR") or up.startswith("ERREUR")
+
+
+def _auth_failure_signal(text: str) -> bool:
+    """Conservatively decide whether an error string means the CREDENTIAL was
+    rejected (401/403/unauthorized/bad-credentials/…). Returns False for
+    rate-limiting (a throttled but valid credential) and for any non-auth error,
+    so a healthy connector is never demoted by a 404 / bad-arg / transient fault."""
+    if not text:
+        return False
+    low = text.lower()
+    if any(h in low for h in _RATE_LIMIT_HINTS):
+        return False  # throttled, not an auth failure — never demote
+    if _AUTH_CODE_RE.search(low):
+        return True
+    return any(kw in low for kw in _AUTH_FAIL_KEYWORDS)
+
+
+def _strip_mcp_prefix(text: str, server_id: str, tool_name: str) -> str:
+    """Drop the leading ``ERROR: mcp/<server>/<tool>:`` namespace wrapper that
+    ``_calltoolresult_to_text`` / ``call_tool`` prepend, so an auth-signal scan
+    sees only the tool's actual error TEXT — never the user-chosen server/tool id
+    (which could itself contain '401'/'403'/an auth word and false-demote)."""
+    prefix = f"ERROR: mcp/{server_id}/{tool_name}:"
+    s = text or ""
+    return s[len(prefix):] if s.startswith(prefix) else s
+
+
+def _probe_no_required_args(tool: dict) -> bool:
+    """True iff a tool's inputSchema declares NO required arguments, so the probe
+    can safely call it with ``{}``."""
+    return _probe_args_satisfy_required(tool, {})
+
+
+def _probe_args_satisfy_required(tool: dict, args: dict) -> bool:
+    """True iff every REQUIRED arg the tool declares is present in ``args`` — so a
+    curated probe call exercises the CREDENTIAL rather than failing on a missing
+    required-arg error (which would look like a non-auth error and let a bad token
+    pass). With ``args={}`` this is exactly the no-required-args check."""
+    schema = tool.get("inputSchema") if isinstance(tool, dict) else None
+    if not isinstance(schema, dict):
+        return True
+    req = schema.get("required")
+    if not isinstance(req, list):
+        return True
+    args = args or {}
+    return all((not isinstance(x, str)) or (not x) or (x in args) for x in req)
+
+
+def _resolve_probe(server_id: str, tools: list):
+    """Pick a strictly read-only probe for a token-auth connector as a
+    ``(tool_name, args)`` pair, or ``("", {})`` when none is safe. Priority:
+    (1) a curated per-server probe whose tool the server exposes AND whose required
+    args are all supplied; (2) a known identity/whoami read with no required args;
+    (3) any server-declared ``readOnlyHint`` tool with no required args (called
+    with ``{}``)."""
+    by_name: dict = {}
+    for t in tools or []:
+        try:
+            n = (t.get("name") or "").strip()
+        except Exception:
+            continue
+        if n and n not in by_name:
+            by_name[n] = t
+
+    for name, args in _AUTH_PROBES.get(str(server_id or "").strip().lower(), []):
+        t = by_name.get(name)
+        if t is not None and _probe_args_satisfy_required(t, args):
+            return name, dict(args)
+    for cand in _IDENTITY_PROBE_CANDIDATES:
+        t = by_name.get(cand)
+        if t is not None and _probe_no_required_args(t):
+            return cand, {}
+    for name, t in by_name.items():
+        ann = t.get("annotations") if isinstance(t, dict) else None
+        if (
+            isinstance(ann, dict)
+            and ann.get("readOnlyHint") is True
+            and _probe_no_required_args(t)
+        ):
+            return name, {}
+    return "", {}
+
+
+# ---------------------------------------------------------------------------
+# Optional process-wide status-change listener (demote-on-auth-error broadcast)
+# ---------------------------------------------------------------------------
+# The demote path flips a connector to FAILED from a TOOL-CALL thread — outside
+# any ``connect``/``disconnect`` the host (mobile server) drives — so the host
+# cannot otherwise learn it changed. A host MAY register ONE listener
+# ``fn(server_id, status)`` to fan the new status out to its clients. The desktop
+# GUI does not need it (it polls ``servers()``); ``None`` = no listener. The
+# manager stays standalone: it only ever CALLS an opaque callback, never imports a
+# host.
+_status_listener = None
+_status_listener_lock = threading.Lock()
+
+
+def set_status_listener(fn) -> None:
+    """Register (or clear, with ``None``) the process-wide MCP status-change
+    listener. Idempotent; last writer wins. The callback ``fn(server_id, status)``
+    must not raise (it is wrapped) and must not block (hop onto your own loop)."""
+    global _status_listener
+    with _status_listener_lock:
+        _status_listener = fn
+
+
+def _emit_status_change(server_id: str, status: str) -> None:
+    """Best-effort notify the registered status listener; never raises."""
+    with _status_listener_lock:
+        fn = _status_listener
+    if fn is None:
+        return
+    try:
+        fn(server_id, status)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Per-server connection record
 # ---------------------------------------------------------------------------
 
@@ -464,6 +647,62 @@ class MCPManager:
         except Exception:
             pass
 
+    # ── Credential validation (auth probe + demote-on-auth-error) ─────────────
+
+    async def _auth_probe(
+        self, session: Any, server_id: str, tools: list, auth_type: str
+    ) -> str:
+        """Exercise a token-auth connector's CREDENTIAL after a successful
+        handshake, so a garbage/expired token is rejected AT CONNECT instead of
+        deferred to the first real tool call. Runs ON the MCP loop using the
+        just-opened ``session``. Returns ``""`` to ALLOW the connect (probe
+        passed, none is known, or it merely timed out / errored non-auth) or a
+        short reason to FAIL it. Strictly read-only and bounded by
+        ``PROBE_CALL_TIMEOUT`` — a slow network never fails an otherwise-good
+        connect (the demote-on-auth-error fallback still guards first use)."""
+        if auth_type != "token":
+            return ""
+        probe, probe_args = _resolve_probe(server_id, tools)
+        if not probe:
+            return ""
+        try:
+            res = await asyncio.wait_for(
+                session.call_tool(probe, probe_args), timeout=PROBE_CALL_TIMEOUT
+            )
+            text = _calltoolresult_to_text(res, server_id, probe)
+        except asyncio.TimeoutError:
+            return ""  # network slowness — don't hard-fail; demote-on-call covers it
+        except asyncio.CancelledError:
+            raise  # disconnect/shutdown teardown — propagate to the serve handler
+        except Exception as e:  # noqa: BLE001 - a transport error here is data
+            text = f"ERROR: {type(e).__name__}: {e}"
+        # Scan ONLY the tool's error TEXT, not the ``ERROR: mcp/<server>/<tool>:``
+        # namespace wrapper — the user-chosen server/tool id could itself contain
+        # '401'/'403'/an auth word and cause a false "token rejected".
+        if _looks_like_error(text) and _auth_failure_signal(
+            _strip_mcp_prefix(text, server_id, probe)
+        ):
+            return "token rejected"
+        return ""
+
+    def _demote_auth_failed(self, server_id: str) -> None:
+        """The moment a real tool call proves a connector's credential invalid
+        (401/403/auth), flip it from the optimistic CONNECTED to FAILED, drop its
+        tools, wind the now-dead session down, and notify the status listener so
+        the PC + mobile pills self-correct. Only demotes a currently-CONNECTED
+        server; idempotent; never raises."""
+        with self._lock:
+            conn = self._servers.get(server_id)
+            if conn is None or conn.status != STATUS_CONNECTED:
+                return
+            conn.status = STATUS_FAILED
+            conn.error = "token rejected (auth failed)"
+        # Outside the lock: unadvertise the tools, ask the serve coroutine to wind
+        # the session/subprocess down gracefully, and emit the new status.
+        self._unregister_tools(server_id)
+        self._signal_stop(server_id)
+        _emit_status_change(server_id, STATUS_FAILED)
+
     # ── The long-lived per-server coroutine ──────────────────────────────────
 
     async def _serve(
@@ -562,6 +801,22 @@ class MCPManager:
                                 }
                                 for t in getattr(listed, "tools", []) or []
                             ]
+                            # FIX 1(a/b): EXERCISE the credential before declaring
+                            # CONNECTED. A remote server may serve initialize/
+                            # list_tools unauthenticated (the existing 401-at-
+                            # initialize guard only catches servers that enforce
+                            # auth there), so a strictly read-only probe confirms a
+                            # token-auth credential. Bounded; "" = pass/skip.
+                            probe_err = await self._auth_probe(
+                                session, server_id, tools, auth_type
+                            )
+                            if probe_err:
+                                with self._lock:
+                                    conn.session = None
+                                    conn.status = STATUS_FAILED
+                                    conn.error = _sanitize_error(probe_err, conn.cfg)
+                                self._safe_set_future(ready, STATUS_FAILED)
+                                return
                             with self._lock:
                                 conn.session = session
                                 conn.tools = tools
@@ -604,6 +859,23 @@ class MCPManager:
                             }
                             for t in getattr(listed, "tools", []) or []
                         ]
+                        # FIX 1(a/b): EXERCISE the credential before declaring
+                        # CONNECTED. initialize()/list_tools() are local protocol
+                        # only (the stdio subprocess never hit the auth boundary),
+                        # so a garbage/expired token would otherwise show CONNECTED
+                        # and fail only on first use. Bounded, strictly read-only;
+                        # "" = pass/skip, else fail the connect cleanly.
+                        auth_type = str(cfg.get("auth_type") or "").strip().lower()
+                        probe_err = await self._auth_probe(
+                            session, server_id, tools, auth_type
+                        )
+                        if probe_err:
+                            with self._lock:
+                                conn.session = None
+                                conn.status = STATUS_FAILED
+                                conn.error = _sanitize_error(probe_err, conn.cfg)
+                            self._safe_set_future(ready, STATUS_FAILED)
+                            return
                         with self._lock:
                             conn.session = session
                             conn.tools = tools
@@ -722,6 +994,28 @@ class MCPManager:
                 server_id, "streamable_http transport requires a 'url'"
             )
             return STATUS_FAILED
+        # Gap #2 (credential hardening): a token-auth connector MUST carry a
+        # non-empty credential to even ATTEMPT a connect — otherwise the local
+        # handshake succeeds and shows a misleading CONNECTED with no auth
+        # exercised. The caller injects the token into env[token_env] (stdio) or an
+        # ``Authorization: Bearer`` header (streamable_http); an empty/missing one
+        # fails fast. (OAuth carries its bearer via the SDK provider, not here.)
+        if auth_type == "token":
+            env = server_cfg.get("env") if isinstance(server_cfg.get("env"), dict) else {}
+            headers = (
+                server_cfg.get("headers")
+                if isinstance(server_cfg.get("headers"), dict) else {}
+            )
+            token_env = str(server_cfg.get("token_env") or "").strip()
+            has_token = False
+            if transport == "stdio":
+                has_token = bool(token_env and str(env.get(token_env) or "").strip())
+            elif transport == "streamable_http":
+                auth_h = str((headers or {}).get("Authorization") or "").strip()
+                has_token = bool(auth_h) and auth_h.lower() != "bearer"
+            if not has_token:
+                self._fail_unserved(server_id, "token required")
+                return STATUS_FAILED
 
         ready: concurrent.futures.Future = concurrent.futures.Future()
         try:
@@ -852,12 +1146,30 @@ class MCPManager:
                 pass
             return f"{prefix} timed out after {timeout:.0f}s"
         except Exception as e:  # noqa: BLE001
-            return f"{prefix} {type(e).__name__}: {e}"
+            detail = f"{type(e).__name__}: {e}"
+            msg = f"{prefix} {detail}"
+            # FIX 1(c): a transport-level auth rejection (e.g. a streamable_http
+            # 401 raised by the SDK) demotes the connector so it stops showing a
+            # false CONNECTED. Scan only ``detail`` (not the server/tool-id prefix).
+            if _auth_failure_signal(detail):
+                self._demote_auth_failed(server_id)
+            return msg
 
         try:
-            return _calltoolresult_to_text(res, server_id, tool_name)
+            out = _calltoolresult_to_text(res, server_id, tool_name)
         except Exception as e:  # noqa: BLE001 - conversion backstop
             return f"{prefix} result conversion failed: {type(e).__name__}: {e}"
+        # FIX 1(c): demote-on-auth-error. If the credential was rejected at CALL
+        # time (the handshake could not catch it — e.g. an unknown connector with
+        # no safe probe), flip the connector to FAILED so the PC + mobile pills
+        # self-correct. Conservative: only an ERROR-shaped result carrying a clear
+        # auth signal — never a 404 / bad-arg / rate-limit / generic tool error,
+        # and scanning only the post-prefix detail so the server/tool id can't trip.
+        if _looks_like_error(out) and _auth_failure_signal(
+            _strip_mcp_prefix(out, server_id, tool_name)
+        ):
+            self._demote_auth_failed(server_id)
+        return out
 
     def list_tools(self, server_id: str) -> list:
         """Return the cached discovered tools for a connected server (a list of

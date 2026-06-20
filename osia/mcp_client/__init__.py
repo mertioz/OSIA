@@ -15,6 +15,7 @@ Agent/UI wiring is intentionally NOT here (later phases).
 from .manager import (  # noqa: F401
     MCPManager,
     get_manager,
+    set_status_listener,
     STATUS_CONNECTED,
     STATUS_CONNECTING,
     STATUS_DISCONNECTED,
@@ -26,6 +27,7 @@ from .manager import (  # noqa: F401
 __all__ = [
     "MCPManager",
     "get_manager",
+    "set_status_listener",
     "STATUS_CONNECTED",
     "STATUS_CONNECTING",
     "STATUS_DISCONNECTED",

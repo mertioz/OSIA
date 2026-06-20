@@ -806,6 +806,68 @@ def _mcp_build_connect_cfg(saved: dict) -> dict:
     return build_headless_connect_cfg(saved)
 
 
+def _mcp_set_enabled(server_id: str, enabled: bool) -> bool:
+    """Persist ``mcp_servers[id].enabled = enabled`` to settings.json (atomic),
+    making the shared flag AUTHORITATIVE for the desktop↔server MCP mirror
+    (WOR-44 Phase 2, direction B).
+
+    A mobile ``mcp_connect`` / ``mcp_disconnect`` drives THIS server's manager
+    AND now writes the user's intent here, so the desktop reconcile daemon
+    (``osia.mcp_client.reconnect.reconcile_to_enabled``) mirrors the change onto
+    the PC even though the mobile sent no separate ``set_setting``. Reuses the
+    existing atomic write (``set_setting`` → ``save_settings`` = temp + fsync +
+    ``os.replace``), so a concurrent reader never sees a torn file. Idempotent:
+    writing the same value is a harmless no-op (we skip the disk write when the
+    flag already matches). We flip ONLY ``enabled`` on the matching entry and
+    preserve every other field, EXCEPT that — defence-in-depth — we re-enforce the
+    WOR-44 secret-storage contract on every entry at this write boundary
+    (``env={}`` + no ``headers``), like the ``set_setting`` mcp_servers handler and
+    the desktop ``_mcp_upsert_server``: normally a no-op (the list is already
+    secret-free), but it keeps this path self-contained-safe rather than trusting a
+    global "on-disk is clean" invariant — a token can never land in the git-tracked
+    settings.json here.
+
+    NOTE on cross-process writes: ``set_setting`` is atomic per write but spans no
+    read-to-write lock, so two writers racing on ``mcp_servers`` (this worker and
+    the desktop GUI, on different ids) can last-writer-wins. A lost ENABLE
+    self-heals (the desktop reconcile keeps converging toward ``enabled``); a lost
+    DISABLE would be re-connected by the reconcile until the user re-acts. Both
+    need two simultaneous human-paced actions inside a sub-ms window — rare,
+    recoverable, and out of scope (the boundary ``save_settings`` documents).
+
+    Returns True iff a saved server with that id existed AND the value changed;
+    False otherwise (unknown id, already at the target value, or a write error)."""
+    if not server_id:
+        return False
+    try:
+        from osia.config import get_setting, set_setting
+        servers = get_setting("mcp_servers", []) or []
+        if not isinstance(servers, list):
+            return False
+        changed = False
+        for s in servers:
+            if not isinstance(s, dict):
+                continue
+            # Defence-in-depth: re-enforce the WOR-44 secret-storage contract at
+            # THIS write boundary (no-op for the already-clean list) so a token can
+            # never reach git-tracked settings.json through this path — mirrors the
+            # set_setting mcp_servers handler and the desktop _mcp_upsert_server.
+            if s.get("env") != {}:
+                s["env"] = {}
+            s.pop("headers", None)
+            if s.get("id") == server_id and bool(s.get("enabled")) != bool(enabled):
+                s["enabled"] = bool(enabled)
+                changed = True
+        if changed:
+            set_setting("mcp_servers", servers)
+        return changed
+    except Exception as e:
+        print(
+            f"[OSIA Server] _mcp_set_enabled({server_id!r}, {enabled}) failed: {e}"
+        )
+        return False
+
+
 def _mcp_status_frame(server_id=None) -> dict:
     """Build an ``mcp_status`` frame from the MCPManager snapshot. Carries only
     per-server ``{status, error, tools}`` (a count) — never any env/token: the
@@ -907,6 +969,31 @@ def _build_config_snapshot() -> dict:
     cfg["api_keys_set"] = {
         p: bool(k) for p, k in load_api_keys().items()
     }
+    # FIX 3 — MCP token parity (BUG 2). Provider keys already travel raw to the
+    # mobile editor over this authenticated+TLS WS (api_keys_set above is only a
+    # boolean; api_key_fallbacks ships raw values). MCP Bearer/stdio tokens live in
+    # the SAME api_keys.json (namespaced mcp:<id>) but were stripped here — ship
+    # them too, raw, ADDITIVELY in this existing config frame, so mobile can render
+    # them half-masked + copyable exactly like provider/fallback keys (same path,
+    # same posture — no new WS message type). ONLY token-auth connectors that have
+    # a stored token; OAuth blobs are NEVER shipped (SDK-managed, not OSIA keys).
+    try:
+        from osia.config import get_mcp_token
+        mcp_tokens: dict = {}
+        for s in (get_setting("mcp_servers", []) or []):
+            if not isinstance(s, dict):
+                continue
+            if str(s.get("auth_type") or "").strip().lower() != "token":
+                continue
+            sid = str(s.get("id") or "").strip()
+            if not sid:
+                continue
+            tok = get_mcp_token(sid)
+            if tok:
+                mcp_tokens[sid] = tok
+        cfg["mcp_tokens"] = mcp_tokens
+    except Exception:
+        cfg["mcp_tokens"] = {}
     return cfg
 
 
@@ -1188,6 +1275,33 @@ async def _register_mcp_confirm_provider() -> None:
         print("[OSIA Server] MCP write-tool confirmation provider registered (WS).")
     except Exception as e:
         print(f"[OSIA Server] MCP confirm provider not registered: {e}")
+
+
+@app.on_event("startup")
+async def _register_mcp_status_listener() -> None:
+    """FIX 1(c): when the MCPManager demotes a connector to FAILED on an
+    auth-failing tool call — outside any connect/disconnect this server drives —
+    push the corrected status to every connected phone, so a token that proves
+    invalid on first use stops showing a false CONNECTED. The listener fires from
+    an arbitrary tool-call thread, so it hops back onto THIS event loop to fan out
+    the existing ``_mcp_status_frame`` (protocol unchanged). Server-process only;
+    the desktop GUI reflects its OWN manager via polling. Best-effort."""
+    loop = asyncio.get_running_loop()
+
+    def _on_status_change(sid: str, status: str) -> None:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _broadcast_mcp_status(_mcp_status_frame(sid)), loop
+            )
+        except Exception:
+            pass
+
+    try:
+        from osia.mcp_client import set_status_listener
+        set_status_listener(_on_status_change)
+        print("[OSIA Server] MCP status-change listener registered.")
+    except Exception as e:
+        print(f"[OSIA Server] MCP status listener not registered: {e}")
 
 
 @app.on_event("startup")
@@ -3275,11 +3389,25 @@ async def websocket_endpoint(ws: WebSocket):
                     connect_cfg = _mcp_build_connect_cfg(saved)
 
                     def _connect_worker(cfg=connect_cfg, sid=server_id, loop=loop):
+                        status = None
                         try:
                             from osia.mcp_client import get_manager
-                            get_manager().connect(cfg)
+                            status = get_manager().connect(cfg)
                         except Exception as e:
                             print(f"[OSIA Server] mcp_connect worker {sid!r}: {e}")
+                        # WOR-44 Phase 2 (direction B): persist enabled=True on a
+                        # SUCCESSFUL connect so the shared mcp_servers[].enabled flag
+                        # is authoritative and the desktop reconcile daemon mirrors
+                        # this onto the PC — even with no separate set_setting from
+                        # the mobile. Only on success: a failed handshake must not
+                        # mark the connector enabled (the desktop would then try to
+                        # connect a connector the user never got working).
+                        try:
+                            from osia.mcp_client import STATUS_CONNECTED
+                            if status == STATUS_CONNECTED:
+                                _mcp_set_enabled(sid, True)
+                        except Exception:
+                            pass
                         # Broadcast the RESOLVED status (connected/failed) to all.
                         try:
                             asyncio.run_coroutine_threadsafe(
@@ -3313,6 +3441,15 @@ async def websocket_endpoint(ws: WebSocket):
                         get_manager().disconnect(sid)
                     except Exception as e:
                         print(f"[OSIA Server] mcp_disconnect worker {sid!r}: {e}")
+                    # WOR-44 Phase 2 (direction B): persist enabled=False so the
+                    # shared mcp_servers[].enabled flag is authoritative and the
+                    # desktop reconcile daemon disconnects the PC manager to match.
+                    # Unconditional (the user explicitly asked to disconnect);
+                    # idempotent (a no-op write when already False).
+                    try:
+                        _mcp_set_enabled(sid, False)
+                    except Exception:
+                        pass
                     try:
                         asyncio.run_coroutine_threadsafe(
                             _broadcast_mcp_status(_mcp_status_frame(sid)), loop
