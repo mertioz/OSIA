@@ -3726,11 +3726,25 @@ class _SettingsPanel(QWidget):
             self._set_mcp_pill(self._mcp_pills[sid], "connecting")
 
         def _bg():
+            status = "failed"
             try:
                 from osia.mcp_client import get_manager
-                get_manager().connect(connect_cfg)
+                status = get_manager().connect(connect_cfg)
             except Exception:
                 pass
+            # Phase 1 (direction A): mirror a successful connect to the mobile WS
+            # server so connected phones repaint to the true PC state. Fired from
+            # THIS background thread (never the Qt main thread), AFTER the manager
+            # resolves — for OAuth the SDK has already persisted the fresh token to
+            # disk by the time connect() returns CONNECTED, so the server
+            # reconnects that id headlessly (no browser). Gated on a real
+            # "connected" so a failed handshake never tells mobile "connected".
+            if status == "connected":
+                try:
+                    from osia.main import _notify_mobile_mcp_sync
+                    _notify_mobile_mcp_sync(sid, "connect")
+                except Exception:
+                    pass
         threading.Thread(target=_bg, name="osia-mcp-connect", daemon=True).start()
 
     def _on_mcp_disconnect(self, server_id: str) -> None:
@@ -3746,6 +3760,15 @@ class _SettingsPanel(QWidget):
             try:
                 from osia.mcp_client import get_manager
                 get_manager().disconnect(server_id)
+            except Exception:
+                pass
+            # Phase 1 (direction A): mirror the disconnect to the mobile WS server
+            # so phones repaint. Unconditional — disconnect is idempotent on the
+            # server (a no-op when it never had this id connected). Best-effort,
+            # silent no-op when the server is down. From this bg thread only.
+            try:
+                from osia.main import _notify_mobile_mcp_sync
+                _notify_mobile_mcp_sync(server_id, "disconnect")
             except Exception:
                 pass
         threading.Thread(target=_bg, name="osia-mcp-disconnect", daemon=True).start()

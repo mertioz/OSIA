@@ -80,6 +80,11 @@ from osia.tools import verify_tools
 # a {"type": "new_chat"} reset to every connected device. The endpoint is
 # localhost-only on the server side.
 _SERVER_NEW_CHAT_URL = "http://127.0.0.1:8765/internal/new_chat"
+# Desktop→server MCP state mirror (Phase 1, direction A). The desktop pings this
+# after a local MCP connect/disconnect so the mobile server reconciles its OWN
+# manager and repaints every phone. Same loopback host as new_chat; carries only
+# {id, action} (no secret); localhost-only on the server side.
+_SERVER_MCP_SYNC_URL = "http://127.0.0.1:8765/internal/mcp_sync"
 
 
 def _notify_mobile_new_chat() -> None:
@@ -94,6 +99,28 @@ def _notify_mobile_new_chat() -> None:
         urllib.request.urlopen(req, timeout=1.5).close()
     except Exception as e:
         print(f"[WOR-10] mobile new_chat notify skipped: {e}")
+
+
+def _notify_mobile_mcp_sync(server_id: str, action: str) -> None:
+    """Best-effort desktop→server MCP state mirror (Phase 1, direction A).
+
+    After the DESKTOP manager connects/disconnects an MCP connector, tell the
+    mobile WS server so it reconciles its OWN manager (headless, fresh-token
+    gated — never a browser) and broadcasts the resulting status to every
+    connected phone. Carries only ``{id, action}`` — no secret. Silent no-op when
+    the server isn't running. Called from the GUI's MCP background threads (never
+    the Qt main thread), so the 1.5s timeout never blocks the UI."""
+    import json
+    import urllib.request
+    try:
+        payload = json.dumps({"id": server_id, "action": action}).encode("utf-8")
+        req = urllib.request.Request(
+            _SERVER_MCP_SYNC_URL, data=payload, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=1.5).close()
+    except Exception as e:
+        print(f"[MCP sync] mobile mcp_sync notify skipped: {e}")
 
 
 def _ensure_mobile_server_windows() -> None:

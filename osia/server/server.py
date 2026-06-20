@@ -877,6 +877,75 @@ async def internal_new_chat(request: Request):
     return {"ok": True, "clients": len(_WS_CLIENTS)}
 
 
+@app.post("/internal/mcp_sync")
+async def internal_mcp_sync(request: Request):
+    """Localhost-only desktop→server MCP state mirror — Phase 1, direction A.
+
+    When the user connects/disconnects an MCP connector in the DESKTOP GUI
+    (osia/gui/main_popup.py), the desktop POSTs ``{id, action}`` here so THIS
+    server reconciles its OWN MCPManager to the shared ``mcp_servers[].enabled``
+    intent and repaints every connected phone. The frame carries NO secret (only
+    an id + action); not part of the public mobile WS protocol; never exposed
+    beyond localhost (same loopback host guard as ``/internal/new_chat``).
+
+    ``connect``  → ``reconnect_enabled_connectors(allow_oauth=True, only_id=id)``:
+        the EXACT headless connect path the boot sweep / mcp_connect handler use,
+        scoped to one id. OAuth is gated by ``_oauth_token_fresh`` — a stale
+        token is SKIPPED, never a browser (and the server-process webbrowser
+        guard below makes a pop structurally impossible regardless). The desktop
+        only sends ``connect`` AFTER its own ``connect()`` returned CONNECTED, so
+        the SDK has already persisted a FRESH OAuth token to disk by then.
+    ``disconnect`` → ``get_manager().disconnect(id)`` (idempotent no-op if the
+        server never had it connected).
+
+    ``connect()``/``disconnect()`` BLOCK, so the work runs on a short-lived
+    daemon thread (never the event loop); the resolved status is broadcast to
+    every client via the existing ``_broadcast_mcp_status``. Best-effort."""
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    raw_id = body.get("id")
+    server_id = raw_id.strip() if isinstance(raw_id, str) else ""
+    raw_action = body.get("action")
+    action = raw_action.strip().lower() if isinstance(raw_action, str) else ""
+    if not server_id or action not in ("connect", "disconnect"):
+        return {"ok": False, "error": "bad request"}
+
+    loop = asyncio.get_running_loop()
+
+    def _worker(sid=server_id, act=action, loop=loop):
+        try:
+            if act == "connect":
+                from osia.mcp_client.reconnect import reconnect_enabled_connectors
+                # only_id scopes the EXISTING headless sweep to this one id; all
+                # gates (enabled / _connectable / _oauth_token_fresh) still apply.
+                reconnect_enabled_connectors(allow_oauth=True, only_id=sid)
+            else:
+                from osia.mcp_client import get_manager
+                get_manager().disconnect(sid)
+        except Exception as e:
+            print(f"[OSIA Server] mcp_sync worker {sid!r} ({act}): {e}")
+        # Broadcast the RESOLVED status (connected/disconnected/failed) to every
+        # connected phone — the existing mobile repaint path, unchanged.
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _broadcast_mcp_status(_mcp_status_frame(sid)), loop
+            )
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=_worker, name="osia-mcp-sync", daemon=True
+    ).start()
+    return {"ok": True}
+
+
 # NOTE (WOR-47): the startup ``_warm_models`` handler that eagerly pre-loaded
 # faster-whisper was REMOVED deliberately — do NOT reintroduce it. Importing
 # ``osia.voice.stt`` on the event-loop thread at cold boot pulled in
@@ -1072,6 +1141,31 @@ async def _reconnect_mcp_connectors_on_startup() -> None:
     threading.Thread(
         target=_worker, name="osia-mcp-reconnect", daemon=True
     ).start()
+
+
+@app.on_event("startup")
+async def _disable_browser_on_server() -> None:
+    """SECURITY (Phase 1 §5): the headless mobile server must NEVER open a web
+    browser. Real browser automation drives CDP / Firefox-BiDi directly
+    (osia/tools/browser.py) and never calls ``webbrowser.open``, so neutralising
+    it here is safe and is pure defence-in-depth: it guarantees that even the MCP
+    SDK's one residual browser-pop case (a server-revoked-but-future-dated OAuth
+    token surviving ``_oauth_token_fresh``) can never pop a login window on a
+    machine with nobody there. The /internal/mcp_sync connect path is already
+    fresh-token gated; this turns "extremely unlikely" into "structurally
+    impossible".
+
+    Server-process ONLY: this runs when uvicorn starts the app, NOT on import, so
+    the desktop GUI process (which legitimately opens the OAuth browser on the
+    PC) is untouched."""
+    try:
+        import webbrowser
+        webbrowser.open = lambda *a, **k: False
+        webbrowser.open_new = lambda *a, **k: False
+        webbrowser.open_new_tab = lambda *a, **k: False
+        print("[OSIA Server] webbrowser.open disabled (headless browser-pop guard).")
+    except Exception as e:
+        print(f"[OSIA Server] webbrowser guard not applied: {e}")
 
 
 @app.get("/")

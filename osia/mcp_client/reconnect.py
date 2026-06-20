@@ -142,6 +142,7 @@ def reconnect_enabled_connectors(
     allow_oauth: bool = True,
     on_connected: Optional[Callable[[str, str], None]] = None,
     oauth_margin_s: float = OAUTH_FRESH_MARGIN_S,
+    only_id: Optional[str] = None,
 ) -> list:
     """Reconnect every ``enabled`` MCP connector via ``MCPManager.connect()``.
 
@@ -159,6 +160,14 @@ def reconnect_enabled_connectors(
         callback is swallowed.
     oauth_margin_s:
         Freshness margin passed to the OAuth token check.
+    only_id:
+        When set, process ONLY the saved connector whose id matches — used by the
+        desktop→server MCP state mirror (Phase 1, direction A) to reconcile a
+        SINGLE connector the PC just connected. Every existing gate still applies
+        (``enabled is True``, ``_connectable``, and ``_oauth_token_fresh`` for
+        OAuth — so a stale token is SKIPPED, never a browser). ``None`` (default)
+        preserves the boot-sweep behaviour byte-for-byte: every enabled connector
+        is considered.
 
     Returns a list of per-connector result dicts
     ``{"id", "status", "reason"}`` (status is the ``connect()`` result, or
@@ -173,11 +182,14 @@ def reconnect_enabled_connectors(
     if not isinstance(servers, list):
         return results
 
+    want_id = str(only_id).strip() if only_id is not None else None
     for saved in servers:
         if not isinstance(saved, dict) or saved.get("enabled") is not True:
             continue
         sid = str(saved.get("id") or "").strip()
         if not sid:
+            continue
+        if want_id is not None and sid != want_id:
             continue
         auth_type = str(saved.get("auth_type") or "").strip().lower()
 

@@ -420,8 +420,24 @@ def load_settings() -> dict:
 def save_settings(settings: dict) -> None:
     global _settings_cache_signature, _settings_cache_data
     _ensure_config_dir()
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+    # Atomic write (temp + fsync + os.replace), mirroring _save_oauth_store: a
+    # crash mid-write can never corrupt settings.json, and a concurrent reader in
+    # the OTHER process never observes a half-written/torn file — the desktop and
+    # the mobile server share this file (e.g. the MCP ``mcp_servers[].enabled``
+    # mirror, Phase 1). os.replace is atomic on POSIX and Windows; the temp lives
+    # in the same CONFIG_DIR as the target so the replace stays a same-filesystem
+    # rename. (Cross-process read-modify-write *lost updates* are a separate
+    # concern, out of scope here — writes are human-paced and the Phase-2
+    # reconcile self-heals any transient divergence.)
+    tmp = SETTINGS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    os.replace(tmp, SETTINGS_FILE)
     # Invalidate the read cache so the very next load_settings() re-reads what
     # we just wrote. Hard invalidation (not in-place update) keeps the cache
     # byte-for-byte identical to disk — a populate-from-memory shortcut could
