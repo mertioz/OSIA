@@ -1251,6 +1251,36 @@ async def oauth_callback(request: Request):
     return HTMLResponse(_CLOSE_TAB_HTML, status_code=200)
 
 
+# WOR-97: safety bound on an interactive OAuth login. If the user abandons the
+# flow (goes to create an account, cancels, closes the browser, tunnel Error
+# 1033, …) the SDK's callback wait (osia.mcp_client.oauth.OAUTH_CALLBACK_TIMEOUT
+# = 300s) is the ONLY thing that eventually resets the connector — a 5-minute
+# "connecting…". This shorter bound resets it to DISCONNECTED far sooner. Kept
+# strictly BELOW OAUTH_CALLBACK_TIMEOUT and high enough not to cut off a slow but
+# legitimate account creation; the 300s SDK wait remains the hard backstop. NOT a
+# change to OAUTH_CALLBACK_TIMEOUT (which is shared with the loopback PC flow).
+OAUTH_SAFETY_TIMEOUT = 165.0
+
+# WOR-97: strong refs to in-flight per-flow safety-watchdog tasks, keyed by the
+# OSIA-generated flow_id (asyncio holds only a WEAK ref to a bare ensure_future
+# result, so a fire-and-forget watchdog could be GC'd mid-sleep). The worker
+# cancels its flow's watchdog on resolve via _cancel_oauth_watchdog; the task's
+# own done-callback prunes the entry as a backstop.
+_OAUTH_WATCHDOG_TASKS: dict = {}
+
+
+def _cancel_oauth_watchdog(flow_id: str) -> None:
+    """Cancel + drop the safety watchdog for ``flow_id``. MUST run on the FastAPI
+    loop (the worker thread hops here via ``call_soon_threadsafe``). Best-effort;
+    a no-op for an unknown/already-finished flow."""
+    task = _OAUTH_WATCHDOG_TASKS.pop(flow_id, None)
+    if task is not None and not task.done():
+        try:
+            task.cancel()
+        except Exception:
+            pass
+
+
 async def _begin_oauth_tunnel_connect(server_id: str, saved: dict) -> dict:
     """WOR-96 PART 2a — start an OAuth connect that completes via the HTTPS tunnel
     callback (server process) and return the authorize URL the provider surfaces.
@@ -1278,16 +1308,22 @@ async def _begin_oauth_tunnel_connect(server_id: str, saved: dict) -> dict:
     if not str(saved.get("url") or "").strip():
         return {"ok": False, "error": "missing url"}
 
-    # Already up / in-flight → don't start a redundant flow (connect() would be an
+    # Already CONNECTED → don't start a redundant flow (connect() would be an
     # idempotent no-op that never surfaces a new URL, so the wait would just time
     # out). Report the current state instead.
+    #
+    # WOR-97: a CONNECTING connector here is an OAuth flow whose interactive login
+    # is still pending — or was ABANDONED and is parked in callback_handler. Do
+    # NOT refuse: a re-tap must recover a stuck "connecting…" instead of being
+    # locked out for the full callback timeout. The worker below cancels the
+    # in-flight flow (cancel_pending) BEFORE starting a fresh connect, so the new
+    # flow surfaces a new authorize URL. (Reached only for OAuth — validated
+    # above; the cancel path is exercised solely by OAuth connectors.)
     try:
-        from osia.mcp_client import (
-            get_manager, STATUS_CONNECTED, STATUS_CONNECTING,
-        )
+        from osia.mcp_client import get_manager, STATUS_CONNECTED
         cur = get_manager().status(server_id)
-        if cur in (STATUS_CONNECTED, STATUS_CONNECTING):
-            return {"ok": False, "error": f"already {cur}"}
+        if cur == STATUS_CONNECTED:
+            return {"ok": False, "error": "already connected"}
     except Exception:
         pass
 
@@ -1309,8 +1345,18 @@ async def _begin_oauth_tunnel_connect(server_id: str, saved: dict) -> dict:
             cfg = build_headless_connect_cfg(saved)
             cfg["oauth_callback_mode"] = "tunnel"
             cfg["oauth_flow_id"] = fid
-            from osia.mcp_client import get_manager
-            status = get_manager().connect(cfg)
+            from osia.mcp_client import get_manager, STATUS_CONNECTING
+            mgr = get_manager()
+            # WOR-97: if a PRIOR OAuth flow for this id is still parked CONNECTING
+            # (abandoned login), cancel it first so this connect starts fresh and
+            # surfaces a NEW authorize URL — instead of connect() hitting the
+            # same-connector guard. Bounded (≤10s), off the event loop (we're on a
+            # daemon thread); a no-op unless CONNECTING. connect()'s own guard
+            # would also cancel it, but doing it here keeps the restart explicit
+            # and fully unwound before the fresh connect re-registers the conn.
+            if mgr.status(sid) == STATUS_CONNECTING:
+                mgr.cancel_pending(sid)
+            status = mgr.connect(cfg)
         except Exception as e:
             print(f"[OSIA Server] mcp_oauth_tunnel_connect worker {sid!r}: {e}")
             try:
@@ -1337,6 +1383,13 @@ async def _begin_oauth_tunnel_connect(server_id: str, saved: dict) -> dict:
             )
         except Exception:
             pass
+        # WOR-97: the flow resolved (connected or failed) — cancel ITS safety
+        # watchdog so it can never reset a connector that completed, nor a LATER
+        # flow for the same id. Thread→loop hop; best-effort.
+        try:
+            loop.call_soon_threadsafe(_cancel_oauth_watchdog, fid)
+        except Exception:
+            pass
         # Drop the trigger entry (the state→future entry is freed by the
         # callback_handler). Best-effort.
         try:
@@ -1347,6 +1400,36 @@ async def _begin_oauth_tunnel_connect(server_id: str, saved: dict) -> dict:
     threading.Thread(
         target=_worker, name="osia-mcp-oauth-tunnel", daemon=True
     ).start()
+
+    # WOR-97: arm the safety watchdog for THIS flow. If the login is abandoned,
+    # it resets the connector to DISCONNECTED at OAUTH_SAFETY_TIMEOUT (well before
+    # the SDK's 300s callback backstop) and repaints every pill. Scoped to this
+    # flow_id and cancelled by _worker on resolve, so it can only ever cancel the
+    # flow it was armed for. Runs on THIS (FastAPI) loop.
+    async def _safety_watchdog(sid=server_id, loop=loop):
+        try:
+            await asyncio.sleep(OAUTH_SAFETY_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+        try:
+            from osia.mcp_client import get_manager, STATUS_CONNECTING
+            mgr = get_manager()
+            # Only act on a STILL-CONNECTING connector — a resolved flow (the
+            # watchdog wasn't cancelled in time) is left untouched. cancel_pending
+            # blocks (≤10s), so keep it OFF the event loop; it is itself a no-op
+            # unless CONNECTING and defers to a real CONNECTED (TOCTOU-safe).
+            if mgr.status(sid) != STATUS_CONNECTING:
+                return
+            await loop.run_in_executor(None, mgr.cancel_pending, sid)
+            await _broadcast_mcp_status(_mcp_status_frame(sid))
+        except Exception:
+            pass
+
+    _wd_task = asyncio.ensure_future(_safety_watchdog())
+    _OAUTH_WATCHDOG_TASKS[flow_id] = _wd_task
+    _wd_task.add_done_callback(
+        lambda _t, fid=flow_id: _OAUTH_WATCHDOG_TASKS.pop(fid, None)
+    )
 
     # Wait (bounded) OFF the event loop for the provider to surface the authorize
     # URL (discovery + DCR run first; usually a few seconds). The connect keeps
@@ -3565,6 +3648,47 @@ async def websocket_endpoint(ws: WebSocket):
                 except Exception as e:
                     print(f"[OSIA Server] get_api_keys failed: {e}")
                     await out.send_json({"type": "status", "status": "error"})
+                continue
+
+            # --- MCP / Connectors: cancel an in-flight OAuth login (WOR-97) ---
+            # Additive frame: abort an OAuth connector stuck "connecting…" (the
+            # user went to create an account / cancelled / closed the browser).
+            # Routes to MCPManager.cancel_pending — a no-op unless the connector
+            # is CONNECTING, so an accidental cancel on a CONNECTED connector does
+            # nothing, and it never touches ``enabled`` (a cancelled flow never
+            # connected). Distinct from mcp_disconnect on purpose: that carries
+            # revoke/forget_client semantics + the 10s graceful teardown — wrong
+            # shape for aborting an in-flight login. cancel_pending BLOCKS (≤10s),
+            # so offload to a daemon thread and broadcast the reset to every
+            # client (PC + mobile pills) from that thread.
+            if msg_type == "mcp_oauth_cancel":
+                raw_id = msg.get("id")
+                server_id = raw_id.strip() if isinstance(raw_id, str) else ""
+                if not server_id:
+                    await out.send_json(
+                        {"type": "status", "status": "error", "error": "missing id"}
+                    )
+                    continue
+                loop = asyncio.get_running_loop()
+
+                def _cancel_worker(sid=server_id, loop=loop):
+                    try:
+                        from osia.mcp_client import get_manager
+                        get_manager().cancel_pending(sid)
+                    except Exception as e:
+                        print(f"[OSIA Server] mcp_oauth_cancel worker {sid!r}: {e}")
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            _broadcast_mcp_status(_mcp_status_frame(sid)), loop
+                        )
+                    except Exception:
+                        pass
+
+                threading.Thread(
+                    target=_cancel_worker,
+                    name="osia-mcp-oauth-cancel", daemon=True,
+                ).start()
+                await out.send_json({"type": "status", "status": "done"})
                 continue
 
             # --- MCP / Connectors: connect / disconnect / status (WOR-44 P4) ---

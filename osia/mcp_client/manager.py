@@ -236,6 +236,31 @@ def _leaf_exception(exc: BaseException) -> "tuple[BaseException, int]":
     return leaves[0], len(leaves)
 
 
+def _all_leaves_cancelled(exc: BaseException) -> bool:
+    """True iff ``exc`` is a ``CancelledError``, or a PEP-654 ExceptionGroup whose
+    EVERY leaf is a ``CancelledError``.
+
+    WOR-97: when ``cancel_pending`` / ``disconnect`` / ``shutdown`` cancel a
+    ``_serve`` task that is parked DEEP inside the SDK's anyio TaskGroup (e.g. the
+    OAuth ``callback_handler`` wait), the injected ``CancelledError`` propagates
+    OUT wrapped in a ``BaseExceptionGroup`` ("unhandled errors in a TaskGroup").
+    A bare ``isinstance(e, CancelledError)`` check would then misread a PURE
+    cancel as a connect FAILURE and record STATUS_FAILED. Classifying an
+    all-cancelled group as a cancel keeps a cancelled connector at DISCONNECTED
+    regardless of how anyio wrapped it. A group that ALSO carries a real error
+    (httpx ``ConnectError``, TLS, a ``TimeoutError`` from the 300s callback
+    backstop, …) is NOT a pure cancel — it has a non-cancel leaf — so it still
+    classifies as a failure (FAILED), exactly as before."""
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    if _EXC_GROUP is None or not isinstance(exc, _EXC_GROUP):
+        return False
+    subs = getattr(exc, "exceptions", None)
+    if not subs:
+        return False
+    return all(_all_leaves_cancelled(s) for s in subs)
+
+
 def _print_connect_failure(
     server_id: str, leaf: BaseException, count: int, cfg: Optional[dict]
 ) -> None:
@@ -943,10 +968,18 @@ class MCPManager:
                         # on THIS task — required for anyio cancel-scope safety.
                         await stop_event.wait()
         except BaseException as e:  # noqa: BLE001 - isolate every failure
-            # Includes CancelledError (disconnect/shutdown teardown): record a
-            # status, resolve `ready`, then re-raise CancelledError so the task
-            # ends cancelled; swallow ordinary exceptions as a `failed` status.
-            is_cancel = isinstance(e, asyncio.CancelledError)
+            # Includes CancelledError (disconnect/shutdown/cancel_pending
+            # teardown): record a status, resolve `ready`, then re-raise a bare
+            # CancelledError so the task ends cancelled; swallow ordinary
+            # exceptions as a `failed` status.
+            # WOR-97: classify a cancel even when anyio has WRAPPED the injected
+            # CancelledError in a BaseExceptionGroup — a _serve task cancelled
+            # while parked deep in the SDK's TaskGroup (e.g. cancel_pending
+            # aborting a stuck OAuth login) surfaces an all-cancelled group, and a
+            # pure cancel must record DISCONNECTED, never the FAILED a bare
+            # isinstance check would have produced. A group carrying a real error
+            # leaf is still a failure (see _all_leaves_cancelled).
+            is_cancel = _all_leaves_cancelled(e)
             # Unwrap anyio's ExceptionGroup to the real leaf cause so both the
             # stored status AND the console show what actually failed (httpx
             # ConnectError, TLS, etc.) instead of the useless "unhandled errors
@@ -967,7 +1000,13 @@ class MCPManager:
             if not is_cancel:
                 _print_connect_failure(server_id, leaf, leaf_count, conn.cfg)
             self._safe_set_future(ready, conn.status)
-            if is_cancel:
+            # Re-raise ONLY a BARE CancelledError so the task ends cancelled (anyio
+            # cancel-scope safety). A wrapped all-cancelled ExceptionGroup has
+            # already unwound its scopes by the time it reaches this top-level
+            # except, so it is swallowed (its status was classified as a cancel
+            # above) — byte-identical to the prior behaviour for the wrapped case,
+            # which the old `isinstance` check also left unre-raised.
+            if isinstance(e, asyncio.CancelledError):
                 raise
         finally:
             with self._lock:
@@ -1018,10 +1057,34 @@ class MCPManager:
                 STATUS_CONNECTING,
                 STATUS_CONNECTED,
             ):
-                return existing.status
-            conn = _ServerConn(server_id=server_id, cfg=dict(server_cfg))
-            conn.status = STATUS_CONNECTING
-            self._servers[server_id] = conn
+                # WOR-97: a re-tap on an OAuth connector stuck CONNECTING (an
+                # abandoned interactive login parks ``_serve`` in the provider's
+                # ``callback_handler``) must CANCEL the zombie flow and restart —
+                # not refuse for the full callback timeout. Gated to OAuth +
+                # CONNECTING: a CONNECTED connector, and EVERY non-OAuth
+                # (token/stdio) CONNECTING, still return the current status, so
+                # the fast connect path and the happy path stay byte-identical.
+                if not (auth_type == "oauth"
+                        and existing.status == STATUS_CONNECTING):
+                    return existing.status
+                cancel_first = True
+            else:
+                cancel_first = False
+                conn = _ServerConn(server_id=server_id, cfg=dict(server_cfg))
+                conn.status = STATUS_CONNECTING
+                self._servers[server_id] = conn
+
+        if cancel_first:
+            # Unwind the parked flow OUTSIDE the lock (``cancel_pending`` waits on
+            # ``done_event`` up to ~10s — it must never block the lock). If the
+            # login actually completed in the gap it returns CONNECTED; honour
+            # that and do not start a redundant second flow.
+            if self.cancel_pending(server_id) == STATUS_CONNECTED:
+                return STATUS_CONNECTED
+            with self._lock:
+                conn = _ServerConn(server_id=server_id, cfg=dict(server_cfg))
+                conn.status = STATUS_CONNECTING
+                self._servers[server_id] = conn
 
         # Validate transport / required fields BEFORE scheduling the coroutine.
         # These branches never schedule _serve, so they mark the server FAILED
@@ -1144,6 +1207,83 @@ class MCPManager:
             if conn.status not in (STATUS_FAILED,):
                 conn.status = STATUS_DISCONNECTED
         return conn.status
+
+    def cancel_pending(self, server_id: str) -> str:
+        """WOR-97: cancel an in-flight (CONNECTING) connect and reset the
+        connector to DISCONNECTED. Returns the resulting status.
+
+        An abandoned interactive OAuth login parks ``_serve`` in the provider's
+        ``callback_handler`` (awaiting the browser redirect) for up to
+        ``OAUTH_CALLBACK_TIMEOUT`` — during which ``conn.status`` stays CONNECTING
+        and the same-connector guard refuses any retry. This unwinds that parked
+        flow AT ONCE by cancelling its serve task (no graceful ``stop_event``
+        wait: the coroutine is not at ``await stop_event.wait()`` yet, so signalling
+        the event would do nothing), then forces the status to DISCONNECTED. The
+        cancel lands DISCONNECTED (never FAILED) whether anyio surfaces it as a
+        bare ``CancelledError`` or a wrapped all-cancelled ``ExceptionGroup`` —
+        ``_serve``'s except classifies the latter as a cancel too (see
+        ``_all_leaves_cancelled``), so the forced write here is belt-and-braces,
+        not the sole guarantee.
+
+        Real-login-wins (the achievable guarantee): a login that has ALREADY
+        reached CONNECTED when this is called is left untouched — the CONNECTING
+        guard below returns its status early and the live session survives. A
+        login that completes DURING the cancel's async teardown CANNOT be
+        preserved: cancelling the serve task unwinds ``_serve``'s ``async with``
+        session/transport blocks, so the session is torn down and the connector
+        lands DISCONNECTED — but the SDK already persisted the freshly-minted
+        token, so the next connect reconnects headlessly (no browser). That
+        outcome is correct for all three callers (re-tap wants a fresh flow;
+        watchdog / explicit-cancel asked for the abort).
+
+        Idempotent and a no-op unless the connector is CONNECTING; safe to call
+        from any worker thread; never raises; NEVER sets ``enabled`` (a cancelled
+        flow never connected)."""
+        # Snapshot + idempotent guard: only a genuinely in-flight (CONNECTING)
+        # connect is cancellable. A connector that already reached CONNECTED (the
+        # real login won before we were called) — or any terminal state — is left
+        # untouched: its status is returned and the live session survives.
+        with self._lock:
+            conn = self._servers.get(server_id)
+            if conn is None:
+                return STATUS_DISCONNECTED
+            if conn.status != STATUS_CONNECTING:
+                return conn.status
+            sf = conn.serve_future
+
+        # Cancel OUTSIDE the lock (matches ``disconnect``): cancelling the serve
+        # future propagates a CancelledError into the parked ``callback_handler``
+        # await and unwinds ``_serve``'s async-with blocks on the loop thread
+        # (closing the loopback listener / freeing the cross-loop registry entry
+        # via its own ``finally``). A no-op (returns False) only if the flow
+        # already finished.
+        if sf is not None:
+            try:
+                sf.cancel()
+            except Exception:
+                pass
+        # Bounded wait for the unwind so we don't leave a transport tearing down
+        # behind us (``done_event`` is a threading.Event — safe off the lock).
+        conn.done_event.wait(timeout=DEFAULT_DISCONNECT_TIMEOUT)
+
+        with self._lock:
+            conn = self._servers.get(server_id)
+            if conn is None:
+                return STATUS_DISCONNECTED
+            if conn.status == STATUS_CONNECTED:
+                # Defensive backstop: if a CONNECTED status somehow survived the
+                # cancel (it normally cannot — sf.cancel() tears the session down),
+                # never clobber a live session. The early CONNECTING guard above is
+                # the real real-login-wins path.
+                return STATUS_CONNECTED
+            conn.session = None
+            conn.status = STATUS_DISCONNECTED
+
+        # Outside the lock (avoid re-entrancy through the listener): push the
+        # corrected status to the registered status listener so the server's
+        # mirror repaints the PC + mobile pills. Best-effort (already wrapped).
+        _emit_status_change(server_id, STATUS_DISCONNECTED)
+        return STATUS_DISCONNECTED
 
     def call_tool(
         self,
