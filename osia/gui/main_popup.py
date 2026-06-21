@@ -3223,7 +3223,11 @@ class _SettingsPanel(QWidget):
          "transport": "streamable_http", "command": None, "args": [],
          "url": "https://gmailmcp.googleapis.com/mcp/v1", "auth_type": "oauth",
          "token_env": None, "needs_dir": False, "oauth_no_dcr": True,
-         "oauth_scopes": "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.compose",
+         # TEMP WOR-100 tiebreaker: full-mailbox scope to test if the gateway
+         # demands it; revert to gmail.modify if the gateway bug is confirmed
+         # server-side. (https://mail.google.com/ is the broadest scope and the
+         # first entry in the Gmail MCP's advertised scopes_supported.)
+         "oauth_scopes": "https://mail.google.com/",
          "oauth_token_endpoint_auth_method": "client_secret_post",
          "oauth_issuer": "https://accounts.google.com",
          "oauth_authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
