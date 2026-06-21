@@ -3180,43 +3180,50 @@ class _SettingsPanel(QWidget):
          "token_env": None, "needs_dir": False},
         # WOR-100: Google Gmail/Drive use a PRE-REGISTERED OAuth client (model B,
         # per-user) — their MCP servers do NOT support DCR (no registration_endpoint;
-        # POST /register → 400). The non-DCR backend is wired (the user would paste a
-        # Google "Desktop app" client_id, stored in the gitignored oauth_tokens.json,
-        # NEVER mcp_servers; the SDK then skips DCR — see
-        # osia.mcp_client.oauth.build_oauth_provider / _seed_static_client_info), and
-        # discovery (RFC 9728 PRM → accounts.google.com OIDC) is verified working.
+        # POST /register → 400). The user pastes a Google "Desktop app" client_id,
+        # stored in the gitignored oauth_tokens.json, NEVER mcp_servers; the SDK then
+        # skips DCR (see osia.mcp_client.oauth.build_oauth_provider /
+        # _seed_static_client_info).
         #
-        # SHIPPED DISABLED (url="") pending WOR-100 Phase 2 — two end-to-end blockers
-        # the verify-first probe + review surfaced:
+        # ENABLED in WOR-100 Phase 2 (BETA, PC-only loopback; mobile/tunnel later).
+        # Phase 2 solved the two end-to-end blockers the Phase-1 probe surfaced by
+        # FORCING the OAuth flow at connect (osia.mcp_client.oauth.force_oauth_login,
+        # called from manager._serve gated on static_client):
         #   1) Google's servers return HTTP 200 (unauthenticated) on initialize AND
-        #      tools/list — they only 401 on a real tool CALL. The MCP SDK's
-        #      OAuthClientProvider is 401-driven, so NO OAuth (and no browser login)
-        #      fires at connect; the login would only trigger on the first tool call,
-        #      which is bounded by registry.WRAPPER_CALL_TIMEOUT (25 s) and cancelled
-        #      by manager.call_tool's fut.cancel() on timeout — aborting the login.
-        #      Phase 2 must FORCE the OAuth flow at connect (within
-        #      OAUTH_CONNECT_TIMEOUT=420 s) for oauth_no_dcr connectors.
-        #   2) Scope: the SDK overwrites client_metadata.scope at its Step 3 with ALL
-        #      of the PRM's scopes_supported (mcp 1.28 utils.get_client_metadata_scopes
-        #      → " ".join(...)), i.e. FULL mailbox / FULL drive — so the least-privilege
-        #      ``oauth_scopes`` below is not honoured on the 401 path. Phase 2 must
-        #      drive scope via the connect-time flow.
-        # The ``oauth_no_dcr``/``oauth_scopes``/``oauth_token_endpoint_auth_method``
-        # fields are kept in place (inert while url="") so Phase 2 enables each with a
-        # one-line url flip. ``oauth_token_endpoint_auth_method:"none"`` = PKCE public
-        # Desktop client. Developer Preview → BETA; PC-only loopback (mobile = Phase 2).
+        #      tools/list — they only 401 on a real tool CALL — so the SDK's
+        #      401-driven OAuthClientProvider never fired at connect (false CONNECTED,
+        #      no token). force_oauth_login drives the authorization-code grant
+        #      DIRECTLY on the connect path (OAUTH_CONNECT_TIMEOUT=420 s), so login
+        #      completes BEFORE status goes CONNECTED — never via the 25 s tool-call
+        #      wrapper that would cancel it.
+        #   2) Scope: the SDK overwrites client_metadata.scope with ALL PRM scopes at
+        #      its Step 3 — but only INSIDE the 401 branch. Driving the flow directly
+        #      bypasses that, so the least-privilege ``oauth_scopes`` below is what
+        #      lands in the authorize URL.
+        # The well-known Google endpoints are seeded into oauth_metadata at connect
+        # (the server 200s, so the SDK never discovers them); they ride the headless
+        # reconnect path via mcp_servers (see _mcp_upsert_server / _mcp_build_connect_cfg).
+        # ``oauth_token_endpoint_auth_method:"none"`` = PKCE public Desktop client (if
+        # Google's token endpoint requires the secret, switch to "client_secret_post"
+        # + a stored client_secret — both already supported).
         {"id": "google-drive", "name": "Google Drive", "desc_key": "mcp.desc.gdrive",
          "transport": "streamable_http", "command": None, "args": [],
-         "url": "", "auth_type": "oauth",
+         "url": "https://drivemcp.googleapis.com/mcp/v1", "auth_type": "oauth",
          "token_env": None, "needs_dir": False, "oauth_no_dcr": True,
          "oauth_scopes": "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file",
-         "oauth_token_endpoint_auth_method": "none"},
+         "oauth_token_endpoint_auth_method": "none",
+         "oauth_issuer": "https://accounts.google.com",
+         "oauth_authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+         "oauth_token_endpoint": "https://oauth2.googleapis.com/token"},
         {"id": "gmail", "name": "Gmail", "desc_key": "mcp.desc.gmail",
          "transport": "streamable_http", "command": None, "args": [],
-         "url": "", "auth_type": "oauth",
+         "url": "https://gmailmcp.googleapis.com/mcp/v1", "auth_type": "oauth",
          "token_env": None, "needs_dir": False, "oauth_no_dcr": True,
          "oauth_scopes": "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose",
-         "oauth_token_endpoint_auth_method": "none"},
+         "oauth_token_endpoint_auth_method": "none",
+         "oauth_issuer": "https://accounts.google.com",
+         "oauth_authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+         "oauth_token_endpoint": "https://oauth2.googleapis.com/token"},
         # ── WOR-94: vendor-maintained remote MCP connectors ──────────────────
         # Same OAuth-DCR shape as Notion/Linear above; they inherit the working
         # Dynamic-Client-Registration + mobile-OAuth path with NO new machinery.
@@ -3445,9 +3452,10 @@ class _SettingsPanel(QWidget):
         AND, for OAuth servers (WOR-44 Phase 5, 5-oauth-a), it has a non-empty
         URL (the OAuth flow needs an endpoint). Kept in lockstep with the
         server's _mcp_connectable (osia/server/server.py) so PC and mobile agree
-        on what the manager can connect. (URL-less OAuth catalog entries —
-        Gmail/Google Drive — therefore stay non-connectable, showing the
-        disabled OAuth label, until their URL is wired in a later sub-step.)"""
+        on what the manager can connect. (Any URL-less OAuth catalog entry —
+        e.g. the WOR-94 vendors shipped DISABLED with url="" — therefore stays
+        non-connectable, showing the disabled OAuth label, until its URL is
+        wired. Gmail/Google Drive were enabled in WOR-100 Phase 2.)"""
         try:
             from osia.mcp_client import SUPPORTED_TRANSPORTS
         except Exception:
@@ -3494,6 +3502,14 @@ class _SettingsPanel(QWidget):
             clean["oauth_token_endpoint_auth_method"] = (
                 cfg.get("oauth_token_endpoint_auth_method") or None
             )
+            # WOR-100 Phase 2: the well-known AS endpoints (non-secret) so the
+            # headless reconnect path (build_headless_connect_cfg = dict(saved))
+            # can seed oauth_metadata and force the flow after a restart.
+            clean["oauth_issuer"] = cfg.get("oauth_issuer") or None
+            clean["oauth_authorization_endpoint"] = (
+                cfg.get("oauth_authorization_endpoint") or None
+            )
+            clean["oauth_token_endpoint"] = cfg.get("oauth_token_endpoint") or None
         servers = [s for s in self._mcp_saved_servers() if s.get("id") != cfg["id"]]
         servers.append(clean)
         set_setting("mcp_servers", servers)
@@ -3854,6 +3870,14 @@ class _SettingsPanel(QWidget):
             persist["oauth_token_endpoint_auth_method"] = (
                 entry.get("oauth_token_endpoint_auth_method") or None
             )
+            # WOR-100 Phase 2: the well-known AS endpoints (non-secret) used by
+            # force_oauth_login to seed oauth_metadata at connect. In persist so
+            # both connect_cfg (= dict(persist)) and the saved settings carry them.
+            persist["oauth_issuer"] = entry.get("oauth_issuer") or None
+            persist["oauth_authorization_endpoint"] = (
+                entry.get("oauth_authorization_endpoint") or None
+            )
+            persist["oauth_token_endpoint"] = entry.get("oauth_token_endpoint") or None
 
         # WOR-100: a non-DCR OAuth connector requires the user's client_id. It is
         # AUTHORITATIVE from the field (empty → flag red + abort, like the dir /

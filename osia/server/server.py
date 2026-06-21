@@ -1307,6 +1307,19 @@ async def _begin_oauth_tunnel_connect(server_id: str, saved: dict) -> dict:
         return {"ok": False, "error": "unsupported transport"}
     if not str(saved.get("url") or "").strip():
         return {"ok": False, "error": "missing url"}
+    # WOR-100 Phase 2: a non-DCR (pre-registered-client) connector — Gmail/Drive —
+    # is wired for forced OAuth ONLY on the PC loopback branch (manager._serve
+    # gated on static_client). The tunnel branch does NOT force the flow nor seed
+    # the static client, so a mobile/tunnel attempt would 200-handshake into a
+    # FALSE CONNECTED with no token (Google 200s unauthenticated). Refuse it here
+    # with a clear message until a later phase wires forced auth onto the tunnel;
+    # the user authorizes these on the PC (loopback) for now. DCR connectors are
+    # unaffected (oauth_no_dcr falsy).
+    if saved.get("oauth_no_dcr"):
+        return {
+            "ok": False,
+            "error": "authorize this connector on the PC (loopback) for now",
+        }
 
     # Already CONNECTED → don't start a redundant flow (connect() would be an
     # idempotent no-op that never surfaces a new URL, so the wait would just time

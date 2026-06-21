@@ -846,6 +846,7 @@ class MCPManager:
                     from osia.mcp_client.oauth import (
                         OAuthCallbackServer,
                         build_oauth_provider,
+                        force_oauth_login,
                     )
 
                     # WOR-100: a PRE-REGISTERED (non-DCR) connector (e.g. Google)
@@ -877,6 +878,32 @@ class MCPManager:
                             server_id, url, _cb,
                             static_client=static_client, scope=oauth_scope,
                         )
+                        # WOR-100 Phase 2: a non-DCR connector's server 200s on
+                        # initialize/list_tools (no 401), so the SDK's 401-driven
+                        # auth never fires — FORCE the authorization-code flow here,
+                        # on the connect path (OAUTH_CONNECT_TIMEOUT=420 s), BEFORE
+                        # opening the session. Gated on ``static_client is not None``
+                        # (i.e. oauth_no_dcr + a stored client_id) so DCR connectors
+                        # (Notion/Linear/…) skip it entirely and keep their native
+                        # 401 flow byte-for-byte. Runs INSIDE the OAuthCallbackServer
+                        # context and BEFORE ``stop_event.wait()`` so WOR-97
+                        # cancel_pending unwinds a parked login → DISCONNECTED. A
+                        # stored token → headless (no browser). Failure raises →
+                        # _serve records FAILED (no false CONNECTED). Least-privilege
+                        # ``oauth_scope`` survives (the direct flow bypasses the SDK's
+                        # 401-only scope override).
+                        if static_client is not None:
+                            await force_oauth_login(
+                                provider,
+                                server_id,
+                                issuer=str(cfg.get("oauth_issuer") or ""),
+                                authorization_endpoint=str(
+                                    cfg.get("oauth_authorization_endpoint") or ""
+                                ),
+                                token_endpoint=str(
+                                    cfg.get("oauth_token_endpoint") or ""
+                                ),
+                            )
                         async with streamablehttp_client(url, auth=provider) as (read, write, _sid):
                             async with ClientSession(read, write) as session:
                                 await session.initialize()

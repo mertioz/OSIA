@@ -814,3 +814,201 @@ def build_oauth_provider(
         callback_handler=callback.callback_handler,
         timeout=OAUTH_FLOW_TIMEOUT,
     )
+
+
+# How long to wait for the (post-redirect) token-exchange HTTP leg. The browser
+# login itself is bounded separately by OAUTH_CALLBACK_TIMEOUT (the callback
+# wait); this only guards the short authorization_code → token POST so a hung
+# token endpoint can never park the connect indefinitely (the outer
+# OAUTH_CONNECT_TIMEOUT still sits above both).
+OAUTH_TOKEN_EXCHANGE_TIMEOUT = 30.0
+
+
+def _stored_token_usable(server_id: str) -> bool:
+    """True iff the stored OAuth token for ``server_id`` is present and NOT past
+    its recorded absolute expiry — i.e. safe to reuse headlessly.
+
+    The SDK's ``_initialize`` restores ``current_tokens`` but does NOT reconstruct
+    ``token_expiry_time`` (and the token's own ``expires_in`` is relative to its
+    long-gone issuance), so ``is_token_valid()`` would wrongly report a stale
+    token as valid. We therefore consult OSIA's own absolute ``expires_at``
+    bookkeeping (the same signal the reconnect sweeps use). This matters because a
+    non-DCR server like Google 200s UNAUTHENTICATED on initialize/list_tools, so
+    reusing a DEAD token would yield a false CONNECTED (the Phase-1 blocker) — it
+    must instead trigger a fresh login.
+
+    Trust-present semantics (matches reconnect._oauth_token_fresh, margin 0):
+    present + future expiry → usable; present + NO numeric expiry recorded (some
+    providers issue no ``expires_in``) → usable; present + PAST expiry → NOT
+    usable. A read error → treat as usable (never gratuitously force a browser)."""
+    try:
+        blob = get_mcp_oauth(server_id)
+    except Exception:
+        return True
+    if not isinstance(blob, dict) or not blob.get("token"):
+        return False
+    exp = blob.get("expires_at")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool):
+        return True
+    return float(exp) > time.time()
+
+
+async def force_oauth_login(
+    provider: Any,
+    server_id: str,
+    *,
+    issuer: str,
+    authorization_endpoint: str,
+    token_endpoint: str,
+) -> None:
+    """WOR-100 Phase 2: FORCE the OAuth 2.1 authorization-code flow at CONNECT,
+    WITHOUT relying on a server 401 — for a PRE-REGISTERED (non-DCR) connector
+    such as Google Gmail / Drive.
+
+    WHY this exists. The MCP SDK's ``OAuthClientProvider`` is an ``httpx.Auth``
+    whose full flow fires ONLY on a 401 (mcp 1.28 ``client/auth/oauth2.py``
+    ``async_auth_flow`` → ``if response.status_code == 401``). Google's MCP
+    servers return 200 (unauthenticated) on ``initialize`` AND ``tools/list`` —
+    they only 401 on a real tool CALL — so the SDK's auth never fires at connect:
+    the handshake "succeeds" with NO token (a false CONNECTED), and a login would
+    only trigger on the first tool call, bounded by the 25 s call wrapper and
+    cancelled by ``manager.call_tool``'s timeout. This drives the SDK's OWN
+    authorization-code grant DIRECTLY so the interactive login completes inside
+    the connect window (manager's OAUTH_CONNECT_TIMEOUT=420 s) BEFORE status goes
+    CONNECTED.
+
+    Driving ``_perform_authorization`` directly (instead of through the 401 path)
+    ALSO preserves least-privilege scope: the SDK overwrites
+    ``client_metadata.scope`` with the full PRM/OASM scope set at its Step 3
+    (``oauth2.py`` ``get_client_metadata_scopes``), but that line lives INSIDE the
+    401 branch — never reached here — so the ``scope=`` supplied to
+    :func:`build_oauth_provider` (the catalog's ``oauth_scopes``) is what lands in
+    the authorize URL.
+
+    ⚠️ SDK-INTERNAL. This calls "private" ``OAuthClientProvider`` methods
+    (``_initialize`` / ``_perform_authorization`` / ``_handle_token_response``)
+    and writes ``context.oauth_metadata`` — there is NO public on-demand-auth API
+    in mcp 1.28. It is therefore PINNED to ``mcp==1.28.0`` and every internal
+    access is guarded (``getattr`` + ``try/except``) so a future SDK rename
+    degrades to a clear ``OAuthFlowError`` → connect FAILED, never a crash. Do NOT
+    "refactor" this onto a public method without re-checking the SDK surface.
+
+    Behaviour:
+    * Loads the seeded ``client_info`` (so the SDK skips DCR) + any stored token
+      via ``_initialize``.
+    * HEADLESS RECONNECT: if a STILL-USABLE token is stored (present and not past
+      its recorded expiry — see :func:`_stored_token_usable`), returns immediately
+      — NO browser. The SDK then injects the Bearer for the live session.
+    * STALE / FIRST CONNECT (no token, or a present-but-EXPIRED one — which would
+      false-CONNECT against a server that 200s unauthenticated): seeds the AS
+      metadata (Google's well-known endpoints — ``OAuthMetadata`` needs only
+      issuer / authorization / token endpoints), runs the authorization-code grant
+      (loopback + browser via the callback's
+      ``redirect_handler``/``callback_handler``), sends the token-exchange POST
+      itself (the 401 flow would ``yield`` it), then persists the token via
+      ``OsiaTokenStorage``. (The automated reconnect sweeps already SKIP stale
+      tokens, so the only path that reaches here with an expired token is an
+      explicit manual re-tap, where a fresh login is the right response.)
+
+    NO RFC 8707 resource param: ``protected_resource_metadata`` is left None and
+    ``protocol_version`` stays None, so the SDK's ``should_include_resource_param``
+    stays False — matching the verified manual Google flow.
+
+    Raises (→ caller's ``_serve`` records STATUS_FAILED, never a false CONNECTED):
+    ``OAuthFlowError`` — incompatible SDK, bad metadata, state mismatch, a non-200
+    token exchange (message carries the HTTP status + error body, e.g. a 400
+    ``invalid_client`` telling you the Desktop client needs its secret at the token
+    endpoint), or a malformed 200 token response (re-raised token-free) — plus
+    ``httpx`` errors or ``asyncio.TimeoutError`` (login never completed). A teardown
+    ``asyncio.CancelledError`` (WOR-97 ``cancel_pending`` during a parked login)
+    propagates cleanly so the connect lands DISCONNECTED.
+    """
+    # Lazy imports keep this module import-safe without the mcp SDK / httpx
+    # (mirrors build_oauth_provider / revoke_oauth_token).
+    import httpx
+    from mcp.client.auth.exceptions import OAuthFlowError
+    from mcp.shared.auth import OAuthMetadata
+
+    ctx = getattr(provider, "context", None)
+    _initialize = getattr(provider, "_initialize", None)
+    _perform_authorization = getattr(provider, "_perform_authorization", None)
+    _handle_token_response = getattr(provider, "_handle_token_response", None)
+    if (
+        ctx is None
+        or not callable(_initialize)
+        or not callable(_perform_authorization)
+        or not callable(_handle_token_response)
+    ):
+        raise OAuthFlowError(
+            "forced OAuth unavailable: incompatible mcp SDK "
+            "(expected the 1.28 OAuthClientProvider internal API)"
+        )
+
+    # Load the seeded client_info (→ SDK skips DCR) + any stored token.
+    await _initialize()
+
+    # Headless reconnect: reuse a stored token WITHOUT a browser ONLY if it is
+    # still usable. A present-but-EXPIRED token must NOT short-circuit — the
+    # server 200s unauthenticated, so reusing a dead token would false-CONNECT
+    # (the Phase-1 blocker). In that case drop it and fall through to a fresh
+    # interactive login. (is_token_valid() can't be trusted post-load; see
+    # _stored_token_usable.)
+    if getattr(ctx, "current_tokens", None) is not None:
+        if _stored_token_usable(server_id):
+            return
+        try:
+            ctx.clear_tokens()
+        except Exception:
+            pass
+
+    # First connect: seed the AS metadata so _perform_authorization targets the
+    # right endpoints (the server 200s, so the SDK never discovers them).
+    # Deliberately set ONLY oauth_metadata — NOT protected_resource_metadata — so
+    # no RFC 8707 resource param is added.
+    try:
+        ctx.oauth_metadata = OAuthMetadata(
+            issuer=issuer,
+            authorization_endpoint=authorization_endpoint,
+            token_endpoint=token_endpoint,
+        )
+    except Exception as e:  # noqa: BLE001 - bad/missing endpoints → clean FAILED
+        raise OAuthFlowError(f"forced OAuth: invalid authorization-server metadata: {e}")
+
+    # Drive the authorization-code grant. _perform_authorization opens the
+    # loopback listener + browser (redirect_handler), awaits (code, state)
+    # (callback_handler, bounded by OAUTH_CALLBACK_TIMEOUT), verifies state, and
+    # BUILDS the token-exchange request — it does NOT send it (the 401 flow
+    # normally ``yield``s it), so we send it ourselves.
+    token_request = await _perform_authorization()
+
+    async with httpx.AsyncClient(timeout=OAUTH_TOKEN_EXCHANGE_TIMEOUT) as client:
+        token_response = await client.send(token_request)
+
+    # Token-exchange result handling, kept token-SAFE for conn.error / stderr
+    # (_sanitize_error is not OAuth-token-aware):
+    #  * non-200 → the body is an OAuth ERROR (not a token), safe AND useful to
+    #    surface verbatim — e.g. "invalid_client" means a Desktop client whose
+    #    token endpoint needs its secret (switch oauth_token_endpoint_auth_method
+    #    to "client_secret_post" + store the secret). Raise with a short excerpt.
+    #  * 200-but-malformed → the SDK's pydantic parse error can embed the offending
+    #    field's value, i.e. the access_token itself. Re-raise WITHOUT the original
+    #    message so no secret leaks into the stored error / logs.
+    status = getattr(token_response, "status_code", 0)
+    if status != 200:
+        try:
+            body = (await token_response.aread()).decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        raise OAuthFlowError(
+            f"forced OAuth: token exchange failed (HTTP {status}): {body}"
+        )
+    try:
+        # Validates + persists via OsiaTokenStorage; sets context.current_tokens so
+        # the live streamablehttp_client session sends a real Bearer.
+        await _handle_token_response(token_response)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 - token-safe: never echo the parse value
+        raise OAuthFlowError(
+            f"forced OAuth: invalid token response ({type(e).__name__})"
+        )

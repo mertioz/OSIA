@@ -13,6 +13,7 @@
 - The WebSocket message protocol in `osia/server/server.py`
 - `MAX_RESPONSE_TOKENS` was intentionally **removed** (WOR-28) — do NOT reintroduce it (providers apply their native limits). See "VALEURS CRITIQUES ET DÉCISIONS ARCHITECTURALES" below.
 - Provider config in `osia/models.py` (base URLs, model IDs)
+- `osia/mcp_client/oauth.py` `force_oauth_login` (WOR-100 Phase 2) — depends on **SDK-internal** `OAuthClientProvider` methods (`_initialize` / `_perform_authorization` / `_handle_token_response`) and writes `context.oauth_metadata`. There is **no public on-demand-auth API** in `mcp==1.28.0` (PINNED). Do NOT "refactor" it onto a public method without re-checking the SDK surface; the internal calls are `getattr`/`try`-guarded so a future SDK rename degrades to `OAuthFlowError` → connect FAILED.
 
 ## PROTOCOLE QUALITÉ — NE PAS CASSER L'EXISTANT EN CORRIGEANT
 
