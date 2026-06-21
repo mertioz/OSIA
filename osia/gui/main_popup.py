@@ -3753,6 +3753,27 @@ class _SettingsPanel(QWidget):
             csecin.setPlaceholderText(i18n.t("mcp.ph_client_secret"))
             self._mcp_client_secret_inputs[sid] = csecin
             v.addWidget(csecin)
+            # WOR-100 Phase 2: a "Setup guide" link opens a step-by-step wizard
+            # that walks the user through creating their own Google "Desktop app"
+            # OAuth client (the source of the client_id/secret above). Gated by the
+            # SAME oauth_no_dcr condition, so it appears ONLY on Gmail/Drive — every
+            # other card is byte-for-byte unchanged. The wizard is a SEPARATE
+            # top-level QDialog (lazily imported, instructional only — it never
+            # writes these fields or the connect/persist path), so it cannot touch
+            # the popup's protected sizing (POPUP_W / sizeHint / _animate_width).
+            guide_btn = QPushButton(i18n.t("mcp.setup_guide"))
+            guide_btn.setObjectName("ghostBtn")
+            guide_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+            def _open_oauth_wizard(_=False, e=entry):
+                try:
+                    from osia.gui.mcp_oauth_wizard import _MCPOAuthWizardDialog
+                    _MCPOAuthWizardDialog(self, e).exec()
+                except Exception:
+                    pass
+
+            guide_btn.clicked.connect(_open_oauth_wizard)
+            v.addWidget(guide_btn)
 
         if connectable:
             saved_extra = (saved or {}).get("extra_env") or {}
