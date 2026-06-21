@@ -38,7 +38,7 @@ import threading
 import time
 import webbrowser
 from typing import Any, Optional
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from osia.config import get_mcp_oauth, set_mcp_oauth
 
@@ -523,13 +523,26 @@ async def _discover_revocation_endpoint(server_url: str) -> Optional[str]:
             # that first, then fall back to the resource origin acting as its own
             # AS (common for MCP servers).
             as_issuers: list = []
-            prm = await _get_json(
-                client, f"{origin}/.well-known/oauth-protected-resource"
-            )
-            if isinstance(prm, dict):
-                servers = prm.get("authorization_servers")
-                if isinstance(servers, list):
-                    as_issuers.extend(s for s in servers if isinstance(s, str) and s)
+            # RFC 9728 §3.1: the PRM well-known may carry the resource's path
+            # AFTER the well-known segment. Google's MCP servers serve PRM ONLY at
+            # the path-suffixed URL (e.g. /.well-known/oauth-protected-resource/mcp/v1
+            # → authorization_servers:[accounts.google.com]) and 404 at the bare
+            # path — so probe BOTH, else a path-based resource's AS (and thus its
+            # revocation_endpoint) is undiscoverable and revoke silently no-ops.
+            prm_urls = [f"{origin}/.well-known/oauth-protected-resource"]
+            res_path = parts.path.rstrip("/")
+            if res_path:
+                prm_urls.append(
+                    f"{origin}/.well-known/oauth-protected-resource{res_path}"
+                )
+            for prm_url in prm_urls:
+                prm = await _get_json(client, prm_url)
+                if isinstance(prm, dict):
+                    servers = prm.get("authorization_servers")
+                    if isinstance(servers, list):
+                        as_issuers.extend(
+                            s for s in servers if isinstance(s, str) and s
+                        )
             as_issuers.append(origin)
 
             seen: set = set()
@@ -738,6 +751,44 @@ def _seed_static_client_info(
     set_mcp_oauth(server_id, blob)
 
 
+# WOR-100: Google reuses a prior consent grant ("OSIA already has access") and
+# re-issues a token with the OLD scopes when the authorize request omits
+# ``prompt=consent`` — so broadening ``oauth_scopes`` alone does NOT take effect
+# until a genuine re-consent. We therefore force ``prompt=consent`` (Google
+# re-displays the consent screen and mints a token carrying the CURRENT scopes)
+# and ``access_type=offline`` (ensures a refresh_token). Applied ONLY to non-DCR
+# (``static_client``) connectors — i.e. Google Gmail / Drive — so DCR connectors
+# (Notion / Linear / …) are untouched and their users are never re-prompted.
+_FORCED_CONSENT_AUTH_PARAMS = (("prompt", "consent"), ("access_type", "offline"))
+
+
+def _with_forced_consent(redirect_handler: Any) -> Any:
+    """Wrap an SDK ``redirect_handler`` so the authorize URL it receives gains
+    ``prompt=consent`` + ``access_type=offline`` before the browser opens / the
+    URL is published.
+
+    The MCP SDK (mcp 1.28 ``client/auth/oauth2.py`` ``_perform_authorization_code_grant``)
+    builds the authorize URL from a FIXED ``auth_params`` dict and hands it to
+    ``redirect_handler`` with NO extra-auth-param hook — so mutating the URL in
+    the handler is the cleanest injection point AND stays off the SDK-internal
+    surface (the handler is a public callback OSIA already supplies). Idempotent
+    (overwrites only those two keys); preserves every existing query param —
+    notably ``state``, which the tunnel handler parses back out of the URL. A
+    URL-rewrite error never breaks the login (falls back to the unmodified URL)."""
+    async def _wrapped(url: str) -> None:
+        try:
+            parts = urlsplit(url)
+            q = dict(parse_qsl(parts.query, keep_blank_values=True))
+            for _k, _v in _FORCED_CONSENT_AUTH_PARAMS:
+                q[_k] = _v
+            url = urlunsplit(parts._replace(query=urlencode(q)))
+        except Exception:
+            pass  # never let URL rewriting break the login
+        await redirect_handler(url)
+
+    return _wrapped
+
+
 def build_oauth_provider(
     server_id: str,
     server_url: str,
@@ -806,11 +857,19 @@ def build_oauth_provider(
     if static_client is not None:
         _seed_static_client_info(server_id, static_client, redirect_uris, scope)
 
+    # WOR-100: a non-DCR (Google) connector forces a real re-consent so a
+    # broadened ``oauth_scopes`` actually takes effect on the next login (see
+    # _with_forced_consent). DCR connectors (static_client is None) keep the raw
+    # handler — byte-for-byte unchanged, no prompt=consent forced on them.
+    redirect_handler = callback.redirect_handler
+    if static_client is not None:
+        redirect_handler = _with_forced_consent(redirect_handler)
+
     return OAuthClientProvider(
         server_url=server_url,
         client_metadata=metadata,
         storage=OsiaTokenStorage(server_id),
-        redirect_handler=callback.redirect_handler,
+        redirect_handler=redirect_handler,
         callback_handler=callback.callback_handler,
         timeout=OAUTH_FLOW_TIMEOUT,
     )
