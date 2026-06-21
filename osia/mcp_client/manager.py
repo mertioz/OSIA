@@ -848,8 +848,35 @@ class MCPManager:
                         build_oauth_provider,
                     )
 
+                    # WOR-100: a PRE-REGISTERED (non-DCR) connector (e.g. Google)
+                    # pre-seeds a fixed client_id so the SDK skips DCR. Assemble it
+                    # from the per-user stored credential (gitignored
+                    # oauth_tokens.json) + the catalog's scope/auth-method hints,
+                    # and pin the redirect to the single registered loopback URI.
+                    # ``static_client``/``scope`` stay None for ordinary DCR
+                    # connectors → build_oauth_provider is called EXACTLY as before
+                    # (loopback+tunnel redirect, DCR, no seeding).
+                    static_client = None
+                    oauth_scope = None
+                    if cfg.get("oauth_no_dcr"):
+                        from osia.config import get_mcp_oauth
+                        _sc = (get_mcp_oauth(server_id) or {}).get("static_client") or {}
+                        _cid = str(_sc.get("client_id") or "").strip()
+                        if _cid:
+                            static_client = {
+                                "client_id": _cid,
+                                "client_secret": _sc.get("client_secret") or None,
+                                "token_endpoint_auth_method": str(
+                                    cfg.get("oauth_token_endpoint_auth_method") or "none"
+                                ),
+                            }
+                            oauth_scope = str(cfg.get("oauth_scopes") or "").strip() or None
+
                     async with OAuthCallbackServer() as _cb:
-                        provider = build_oauth_provider(server_id, url, _cb)
+                        provider = build_oauth_provider(
+                            server_id, url, _cb,
+                            static_client=static_client, scope=oauth_scope,
+                        )
                         async with streamablehttp_client(url, auth=provider) as (read, write, _sid):
                             async with ClientSession(read, write) as session:
                                 await session.initialize()
@@ -1139,6 +1166,25 @@ class MCPManager:
                 has_token = bool(auth_h) and auth_h.lower() != "bearer"
             if not has_token:
                 self._fail_unserved(server_id, "token required")
+                return STATUS_FAILED
+
+        # WOR-100: a non-DCR OAuth connector (e.g. Google Gmail/Drive) needs a
+        # PRE-REGISTERED client_id — there is no DCR to obtain one. Without a
+        # stored client_id the SDK would fall back to DCR and the provider would
+        # 400, OR (for servers that 200 unauthenticated, like Google) the connect
+        # would show a misleading CONNECTED with no usable auth. Fail fast with a
+        # clear message instead. Gated on the ``oauth_no_dcr`` flag → ordinary DCR
+        # OAuth connectors (Notion/Linear/Sentry/...) are NOT affected.
+        if auth_type == "oauth" and server_cfg.get("oauth_no_dcr"):
+            cid = ""
+            try:
+                from osia.config import get_mcp_oauth
+                sc = (get_mcp_oauth(server_id) or {}).get("static_client") or {}
+                cid = str(sc.get("client_id") or "").strip()
+            except Exception:
+                cid = ""
+            if not cid:
+                self._fail_unserved(server_id, "OAuth client ID required")
                 return STATUS_FAILED
 
         ready: concurrent.futures.Future = concurrent.futures.Future()

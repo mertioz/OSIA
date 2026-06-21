@@ -696,12 +696,56 @@ class TunnelOAuthCallback:
 # Provider factory
 # ---------------------------------------------------------------------------
 
+def _seed_static_client_info(
+    server_id: str, static_client: dict, redirect_uris: list, scope: Optional[str]
+) -> None:
+    """WOR-100: persist a PRE-REGISTERED (non-DCR) OAuth client into
+    ``oauth_tokens.json`` so :meth:`OsiaTokenStorage.get_client_info` returns it
+    and the SDK SKIPS Dynamic Client Registration.
+
+    The MCP SDK only registers a client when ``self.context.client_info`` is
+    falsy (mcp 1.28 ``client/auth/oauth2.py``: Step 4 is guarded by
+    ``if not self.context.client_info``). ``_initialize`` populates that field
+    from ``storage.get_client_info()``, so pre-seeding the stored ``client`` blob
+    makes the SDK reuse OUR ``client_id`` (and optional secret) instead of
+    attempting DCR — which providers like Google reject with a 400.
+
+    Touches ONLY the per-server ``client`` sub-blob; the SDK ``token`` and the
+    user-entered ``static_client`` credential record (under ``static_client``)
+    are preserved. Idempotent and AUTHORITATIVE: a changed ``client_id`` replaces
+    the prior one. No-op without a non-empty ``client_id``."""
+    cid = str(static_client.get("client_id") or "").strip()
+    if not cid:
+        return
+    blob = get_mcp_oauth(server_id)
+    if not isinstance(blob, dict):
+        blob = {}
+    ci = {
+        "client_id": cid,
+        "redirect_uris": [str(u) for u in redirect_uris],
+        "token_endpoint_auth_method": str(
+            static_client.get("token_endpoint_auth_method") or "none"
+        ),
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    }
+    sec = static_client.get("client_secret")
+    if isinstance(sec, str) and sec:
+        ci["client_secret"] = sec
+    if scope:
+        ci["scope"] = scope
+    blob["client"] = ci
+    set_mcp_oauth(server_id, blob)
+
+
 def build_oauth_provider(
     server_id: str,
     server_url: str,
     callback: Any,
     *,
     redirect_uris: Optional[list] = None,
+    static_client: Optional[dict] = None,
+    scope: Optional[str] = None,
 ) -> Any:
     """Return a configured ``OAuthClientProvider`` for ``server_url``.
 
@@ -718,22 +762,50 @@ def build_oauth_provider(
     now ALSO registers the tunnel URI, so a freshly-connected connector is
     tunnel-ready with no re-registration. The tunnel flow passes
     ``[OAUTH_TUNNEL_REDIRECT_URI, OAUTH_REDIRECT_URI]`` so the tunnel URI is index
-    0 (used) while the loopback URI stays registered. Scope is left unset (the SDK
-    negotiates it from protected-resource metadata / ``WWW-Authenticate``); the
-    token-endpoint auth method is left to DCR.
+    0 (used) while the loopback URI stays registered.
+
+    WOR-100 — ``static_client`` / ``scope`` (both default ``None`` → the DCR
+    path above is byte-for-byte unchanged): a PRE-REGISTERED (non-DCR) connector
+    such as Google Gmail/Drive supplies ``static_client``
+    (``{client_id, client_secret?, token_endpoint_auth_method}``). The factory
+    then (a) defaults ``redirect_uris`` to ``[OAUTH_REDIRECT_URI]`` ONLY — a
+    pre-registered client must use exactly the ONE redirect URI registered with
+    the provider (Google requires exact match and has no DCR to register extras),
+    and (b) seeds the SDK client so DCR is skipped (see
+    :func:`_seed_static_client_info`).
+
+    ``scope`` sets ``OAuthClientMetadata.scope`` as a best-effort/forward-looking
+    hint. NOTE (mcp 1.28): on the SDK's 401-driven flow this is OVERWRITTEN at its
+    Step 3 — ``async_auth_flow`` sets ``client_metadata.scope`` from
+    ``get_client_metadata_scopes(WWW-Authenticate, PRM, OASM)`` BEFORE building the
+    authorize URL — so the value actually sent is discovery-derived, not this one.
+    Honouring an explicit least-privilege scope therefore requires driving the
+    flow WITHOUT relying on the server 401 (a WOR-100 Phase 2 concern). DCR
+    connectors leave it ``None`` (unchanged behaviour).
     """
     from mcp.client.auth import OAuthClientProvider
     from mcp.shared.auth import OAuthClientMetadata
 
     if redirect_uris is None:
-        redirect_uris = [OAUTH_REDIRECT_URI, OAUTH_TUNNEL_REDIRECT_URI]
+        # A pre-registered (non-DCR) client uses the single registered loopback
+        # URI; a DCR client keeps the original loopback+tunnel pair.
+        redirect_uris = (
+            [OAUTH_REDIRECT_URI]
+            if static_client is not None
+            else [OAUTH_REDIRECT_URI, OAUTH_TUNNEL_REDIRECT_URI]
+        )
 
     metadata = OAuthClientMetadata(
         redirect_uris=list(redirect_uris),
         client_name=OAUTH_CLIENT_NAME,
         grant_types=["authorization_code", "refresh_token"],
         response_types=["code"],
+        scope=scope or None,
     )
+
+    if static_client is not None:
+        _seed_static_client_info(server_id, static_client, redirect_uris, scope)
+
     return OAuthClientProvider(
         server_url=server_url,
         client_metadata=metadata,

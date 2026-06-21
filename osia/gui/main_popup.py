@@ -51,7 +51,7 @@ from osia.config import (
     load_api_keys, save_api_keys, load_settings, set_setting, set_api_key,
     get_api_key, load_mobile_token, regenerate_mobile_token,
     get_setting, get_mcp_token, set_mcp_token, delete_mcp_token,
-    delete_mcp_oauth,
+    delete_mcp_oauth, get_mcp_oauth, set_mcp_oauth,
 )
 from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
@@ -3178,12 +3178,45 @@ class _SettingsPanel(QWidget):
          "transport": "streamable_http", "command": None, "args": [],
          "url": "https://mcp.linear.app/mcp", "auth_type": "oauth",
          "token_env": None, "needs_dir": False},
+        # WOR-100: Google Gmail/Drive use a PRE-REGISTERED OAuth client (model B,
+        # per-user) — their MCP servers do NOT support DCR (no registration_endpoint;
+        # POST /register → 400). The non-DCR backend is wired (the user would paste a
+        # Google "Desktop app" client_id, stored in the gitignored oauth_tokens.json,
+        # NEVER mcp_servers; the SDK then skips DCR — see
+        # osia.mcp_client.oauth.build_oauth_provider / _seed_static_client_info), and
+        # discovery (RFC 9728 PRM → accounts.google.com OIDC) is verified working.
+        #
+        # SHIPPED DISABLED (url="") pending WOR-100 Phase 2 — two end-to-end blockers
+        # the verify-first probe + review surfaced:
+        #   1) Google's servers return HTTP 200 (unauthenticated) on initialize AND
+        #      tools/list — they only 401 on a real tool CALL. The MCP SDK's
+        #      OAuthClientProvider is 401-driven, so NO OAuth (and no browser login)
+        #      fires at connect; the login would only trigger on the first tool call,
+        #      which is bounded by registry.WRAPPER_CALL_TIMEOUT (25 s) and cancelled
+        #      by manager.call_tool's fut.cancel() on timeout — aborting the login.
+        #      Phase 2 must FORCE the OAuth flow at connect (within
+        #      OAUTH_CONNECT_TIMEOUT=420 s) for oauth_no_dcr connectors.
+        #   2) Scope: the SDK overwrites client_metadata.scope at its Step 3 with ALL
+        #      of the PRM's scopes_supported (mcp 1.28 utils.get_client_metadata_scopes
+        #      → " ".join(...)), i.e. FULL mailbox / FULL drive — so the least-privilege
+        #      ``oauth_scopes`` below is not honoured on the 401 path. Phase 2 must
+        #      drive scope via the connect-time flow.
+        # The ``oauth_no_dcr``/``oauth_scopes``/``oauth_token_endpoint_auth_method``
+        # fields are kept in place (inert while url="") so Phase 2 enables each with a
+        # one-line url flip. ``oauth_token_endpoint_auth_method:"none"`` = PKCE public
+        # Desktop client. Developer Preview → BETA; PC-only loopback (mobile = Phase 2).
         {"id": "google-drive", "name": "Google Drive", "desc_key": "mcp.desc.gdrive",
-         "transport": "streamable_http", "command": None, "args": [], "url": "",
-         "auth_type": "oauth", "token_env": None, "needs_dir": False},
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False, "oauth_no_dcr": True,
+         "oauth_scopes": "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file",
+         "oauth_token_endpoint_auth_method": "none"},
         {"id": "gmail", "name": "Gmail", "desc_key": "mcp.desc.gmail",
-         "transport": "streamable_http", "command": None, "args": [], "url": "",
-         "auth_type": "oauth", "token_env": None, "needs_dir": False},
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False, "oauth_no_dcr": True,
+         "oauth_scopes": "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose",
+         "oauth_token_endpoint_auth_method": "none"},
         # ── WOR-94: vendor-maintained remote MCP connectors ──────────────────
         # Same OAuth-DCR shape as Notion/Linear above; they inherit the working
         # Dynamic-Client-Registration + mobile-OAuth path with NO new machinery.
@@ -3373,6 +3406,7 @@ class _SettingsPanel(QWidget):
         self._mcp_pills: dict = {}
         self._mcp_buttons: dict = {}
         self._mcp_token_inputs: dict = {}
+        self._mcp_client_id_inputs: dict = {}   # WOR-100: non-DCR OAuth client_id
         self._mcp_dir_inputs: dict = {}
         self._mcp_extra_inputs: dict = {}   # {id: {env_var: QLineEdit}}
         # Optimistic transient state per id: {id: (visual_state, resolve_set, ticks)}
@@ -3449,6 +3483,17 @@ class _SettingsPanel(QWidget):
             "extra_env": dict(cfg.get("extra_env") or {}),
             "custom": bool(cfg.get("custom", False)),
         }
+        # WOR-100: carry the NON-secret non-DCR markers so the headless reconnect
+        # path (reconcile/boot → build_headless_connect_cfg → dict(saved)) takes the
+        # pre-registered-client path after a restart. Added ONLY for non-DCR
+        # connectors, so ordinary DCR entries keep their exact persisted shape. The
+        # client_id/secret are NOT here — they live in the gitignored oauth_tokens.json.
+        if cfg.get("oauth_no_dcr"):
+            clean["oauth_no_dcr"] = True
+            clean["oauth_scopes"] = cfg.get("oauth_scopes") or None
+            clean["oauth_token_endpoint_auth_method"] = (
+                cfg.get("oauth_token_endpoint_auth_method") or None
+            )
         servers = [s for s in self._mcp_saved_servers() if s.get("id") != cfg["id"]]
         servers.append(clean)
         set_setting("mcp_servers", servers)
@@ -3529,6 +3574,7 @@ class _SettingsPanel(QWidget):
         self._mcp_cancel_buttons = {}   # WOR-97: OAuth "Cancel" btns (per id)
         self._mcp_switch_buttons = {}   # WOR-98: OAuth "Switch account" btns (per id)
         self._mcp_token_inputs = {}
+        self._mcp_client_id_inputs = {}   # WOR-100: non-DCR OAuth client_id field
         self._mcp_dir_inputs = {}
         self._mcp_extra_inputs = {}
         entry = self._mcp_entries.get(sid)
@@ -3617,6 +3663,29 @@ class _SettingsPanel(QWidget):
             tin.setPlaceholderText(i18n.t("mcp.ph_token"))
             self._mcp_token_inputs[sid] = tin
             v.addWidget(tin)
+
+        # WOR-100: a PRE-REGISTERED (non-DCR) OAuth connector (Google Gmail/Drive)
+        # needs the user's OWN Google "Desktop app" client_id. Rendered like the
+        # token field, but the value is stored in the gitignored oauth_tokens.json
+        # (under the per-server ``static_client`` blob) — NEVER in mcp_servers. Only
+        # for connectable oauth_no_dcr cards (a field on a disabled card would be
+        # misleading and never saved).
+        if connectable and entry.get("auth_type") == "oauth" and entry.get("oauth_no_dcr"):
+            cidlab = QLabel(i18n.t("mcp.lbl_client_id"))
+            cidlab.setObjectName("providerSub")
+            cidlab.setWordWrap(True)
+            v.addWidget(cidlab)
+            try:
+                cur_cid = str(
+                    ((get_mcp_oauth(sid) or {}).get("static_client") or {}).get("client_id") or ""
+                )
+            except Exception:
+                cur_cid = ""
+            cidin = QLineEdit(cur_cid)
+            cidin.setObjectName("keyInput")
+            cidin.setPlaceholderText(i18n.t("mcp.ph_client_id"))
+            self._mcp_client_id_inputs[sid] = cidin
+            v.addWidget(cidin)
 
         if connectable:
             saved_extra = (saved or {}).get("extra_env") or {}
@@ -3730,11 +3799,14 @@ class _SettingsPanel(QWidget):
             widget.setStyleSheet("QLineEdit{border:1px solid #e0a3a3;}")
 
     def _mcp_build_connect_cfg(self, entry: dict):
-        """Return ``(connect_cfg, persist_cfg, token)``. ``connect_cfg`` carries
-        the token + any extra env in ``env`` (in-memory only, passed to the
+        """Return ``(connect_cfg, persist_cfg, token, client_id)``. ``connect_cfg``
+        carries the token + any extra env in ``env`` (in-memory only, passed to the
         manager); ``persist_cfg`` never carries secrets (``env`` is always {} —
-        non-secret extra-env values round-trip under ``extra_env``). Returns
-        ``(None, None, "")`` on a validation failure (an empty required field is
+        non-secret extra-env values round-trip under ``extra_env``). ``client_id``
+        (WOR-100) is the user's pre-registered OAuth client_id for a non-DCR
+        connector (Google) — stored by the caller in the gitignored oauth_tokens.json,
+        NEVER in persist_cfg/mcp_servers; "" for every other connector. Returns
+        ``(None, None, "", "")`` on a validation failure (an empty required field is
         flagged red)."""
         sid = entry["id"]
         args = list(entry.get("args") or [])
@@ -3745,7 +3817,7 @@ class _SettingsPanel(QWidget):
                 # Never silently fall back to the whole home dir — require a
                 # deliberate choice.
                 self._mcp_flag_required(din)
-                return None, None, ""
+                return None, None, "", ""
             args = args + [d]
 
         # Extra (non-secret) env fields, e.g. Slack's SLACK_TEAM_ID.
@@ -3756,7 +3828,7 @@ class _SettingsPanel(QWidget):
             val = ein.text().strip() if ein else ""
             if not val and spec.get("required"):
                 self._mcp_flag_required(ein)
-                return None, None, ""
+                return None, None, "", ""
             if val:
                 extra_env[var] = val
 
@@ -3770,6 +3842,30 @@ class _SettingsPanel(QWidget):
             "extra_env": extra_env,
             "custom": bool(entry.get("custom", False)),
         }
+
+        # WOR-100: carry the NON-secret non-DCR markers into persist_cfg so the
+        # headless reconnect path (reconcile/boot, which reads mcp_servers via
+        # build_headless_connect_cfg → dict(saved)) also takes the pre-registered
+        # client path after a restart. These are non-secret (a bool, public scope
+        # strings, an auth-method literal); the client_id/secret NEVER go here.
+        if entry.get("oauth_no_dcr"):
+            persist["oauth_no_dcr"] = True
+            persist["oauth_scopes"] = entry.get("oauth_scopes") or None
+            persist["oauth_token_endpoint_auth_method"] = (
+                entry.get("oauth_token_endpoint_auth_method") or None
+            )
+
+        # WOR-100: a non-DCR OAuth connector requires the user's client_id. It is
+        # AUTHORITATIVE from the field (empty → flag red + abort, like the dir /
+        # extra-env required gates); the caller stores it in the gitignored
+        # oauth_tokens.json, never in persist_cfg.
+        client_id = ""
+        if entry.get("oauth_no_dcr"):
+            cidin = self._mcp_client_id_inputs.get(sid)
+            client_id = cidin.text().strip() if cidin else ""
+            if not client_id:
+                self._mcp_flag_required(cidin)
+                return None, None, "", ""
 
         # Build the in-memory connect env: the token (authoritative from the
         # field — empty means none) plus any extra-env values.
@@ -3793,7 +3889,7 @@ class _SettingsPanel(QWidget):
             connect["env"] = env
         if headers:
             connect["headers"] = headers
-        return connect, persist, token
+        return connect, persist, token, client_id
 
     def _on_mcp_toggle(self, entry: dict) -> None:
         sid = entry["id"]
@@ -3808,7 +3904,7 @@ class _SettingsPanel(QWidget):
             self._on_mcp_connect(entry)
 
     def _on_mcp_connect(self, entry: dict) -> None:
-        connect_cfg, persist_cfg, token = self._mcp_build_connect_cfg(entry)
+        connect_cfg, persist_cfg, token, client_id = self._mcp_build_connect_cfg(entry)
         if connect_cfg is None:
             return
         sid = entry["id"]
@@ -3819,6 +3915,21 @@ class _SettingsPanel(QWidget):
         # (which is where the field is rendered).
         if entry.get("auth_type") == "token" and sid in self._mcp_token_inputs:
             set_mcp_token(sid, token)
+        # WOR-100: persist the user's non-DCR OAuth client_id into the gitignored
+        # oauth_tokens.json (under the per-server ``static_client`` blob) — NEVER
+        # mcp_servers. Authoritative from the field (re-entering changes it). The
+        # connect gate (manager.connect) reads it, and build_oauth_provider re-seeds
+        # the SDK ``client`` blob from it so DCR is skipped. Only touches
+        # ``static_client``; the SDK ``token``/``client`` sub-blobs are preserved.
+        if entry.get("oauth_no_dcr") and sid in self._mcp_client_id_inputs:
+            blob = get_mcp_oauth(sid)
+            if not isinstance(blob, dict):
+                blob = {}
+            sc = blob.get("static_client")
+            sc = dict(sc) if isinstance(sc, dict) else {}
+            sc["client_id"] = client_id
+            blob["static_client"] = sc
+            set_mcp_oauth(sid, blob)
         # Optimistic, immediate feedback; the timer settles it on the real status
         # (~60 ticks ≈ 72s cap, comfortably past the manager's ~45s connect
         # timeout, after which status resolves to connected/failed).
