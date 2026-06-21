@@ -310,6 +310,20 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
     # its stub — see osia.mcp.registry). Soft + lazy (mirrors the
     # personality/skills block above): any failure (mcp package absent, no
     # servers connected) yields no block and never breaks prompt construction.
+    # WOR-92 — connector-LEVEL awareness (which MCP connectors are ACTIVE, and
+    # which catalog connectors OSIA could offer to connect). Built server-side in
+    # the shared get_system_prompt so BOTH the desktop in-process Agent and the
+    # mobile server path get it. Placed BEFORE the detailed ## Connected MCP tools
+    # listing below so the model reads "you have Linear" before the tool dump.
+    # Soft + lazy (same discipline as the blocks above): any failure yields no
+    # block and never breaks prompt construction.
+    try:
+        from osia.mcp_client.registry import mcp_connectors_prompt_block
+        connectors_block = mcp_connectors_prompt_block(lang)
+        if connectors_block:
+            body = body + "\n\n" + connectors_block
+    except Exception:
+        pass
     try:
         from osia.mcp_client.registry import mcp_tool_prompt_block
         mcp_block = mcp_tool_prompt_block(lang)

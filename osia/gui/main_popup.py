@@ -3311,6 +3311,45 @@ class _SettingsPanel(QWidget):
          "token_env": None, "needs_dir": False},
     ]
 
+    # WOR-92: connector IDENTITY (id/name/desc_key) has ONE source of truth in
+    # the Qt-free osia.mcp_client.catalog — the module the agent's connector-
+    # awareness prompt reads SERVER-SIDE, so PC and mobile agree. _MCP_CATALOG
+    # above mirrors those values and adds the GUI-only transport/url/auth/oauth_*
+    # connection fields. Assert at import that the two cannot DRIFT: a mismatch
+    # fails fast in development (the GUI won't start) so it can never ship.
+    # Import-guarded so a missing module degrades gracefully; a real drift raises
+    # loudly. Plain loops (NOT comprehensions) on purpose — a class-body
+    # comprehension cannot see class-body locals (Python class-scope rule).
+    try:
+        from osia.mcp_client.catalog import catalog_by_id as _wor92_by_id
+        _wor92_meta = _wor92_by_id()
+        _wor92_gui_ids = set()
+        _wor92_drift = []
+        for _wor92_e in _MCP_CATALOG:
+            _wor92_gui_ids.add(_wor92_e["id"])
+            _wor92_m = _wor92_meta.get(_wor92_e["id"])
+            if (_wor92_m is None
+                    or _wor92_m.get("name") != _wor92_e["name"]
+                    or _wor92_m.get("desc_key") != _wor92_e["desc_key"]):
+                _wor92_drift.append(_wor92_e["id"])
+        _wor92_missing = []
+        for _wor92_mid in _wor92_meta:
+            if _wor92_mid not in _wor92_gui_ids:
+                _wor92_missing.append(_wor92_mid)
+        if _wor92_drift or _wor92_missing:
+            raise RuntimeError(
+                "WOR-92: _MCP_CATALOG drifted from osia.mcp_client.catalog "
+                f"(identity mismatch={_wor92_drift}, missing_in_gui="
+                f"{_wor92_missing}); keep id/name/desc_key in sync — catalog.py "
+                "is the single source."
+            )
+        # Success path: drop the scratch names so they aren't left as class
+        # attributes (a drift instead propagates the RuntimeError, by design).
+        del (_wor92_by_id, _wor92_meta, _wor92_gui_ids, _wor92_drift,
+             _wor92_e, _wor92_m, _wor92_missing, _wor92_mid)
+    except ImportError:
+        pass
+
     # (background, foreground) per status — inline-styled so no global QSS edit.
     _MCP_PILL_COLORS = {
         "connected":    ("#6fcf97", "#10241a"),
