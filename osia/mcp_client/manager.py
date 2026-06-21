@@ -794,9 +794,20 @@ class MCPManager:
                     )
 
                     _cb = TunnelOAuthCallback(str(cfg.get("oauth_flow_id") or ""))
+                    # WOR-98: when the trigger supplied a rendezvous-Worker redirect
+                    # URI (any-user quick-tunnel flow), use it at index 0 — the SDK
+                    # uses redirect_uris[0] for BOTH authorize and token exchange —
+                    # while loopback + osia.space stay in the registered set (DCR
+                    # registers all three). When absent (no mobile token), fall back
+                    # to today's [osia.space, loopback], byte-for-byte unchanged.
+                    worker_uri = str(cfg.get("oauth_redirect_uri") or "").strip()
+                    ruris = (
+                        [worker_uri, OAUTH_REDIRECT_URI, OAUTH_TUNNEL_REDIRECT_URI]
+                        if worker_uri
+                        else [OAUTH_TUNNEL_REDIRECT_URI, OAUTH_REDIRECT_URI]
+                    )
                     provider = build_oauth_provider(
-                        server_id, url, _cb,
-                        redirect_uris=[OAUTH_TUNNEL_REDIRECT_URI, OAUTH_REDIRECT_URI],
+                        server_id, url, _cb, redirect_uris=ruris,
                     )
                     async with streamablehttp_client(url, auth=provider) as (read, write, _sid):
                         async with ClientSession(read, write) as session:

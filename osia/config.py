@@ -427,8 +427,10 @@ def save_settings(settings: dict) -> None:
     # mirror, Phase 1). os.replace is atomic on POSIX and Windows; the temp lives
     # in the same CONFIG_DIR as the target so the replace stays a same-filesystem
     # rename. (Cross-process read-modify-write *lost updates* are a separate
-    # concern, out of scope here — writes are human-paced and the Phase-2
-    # reconcile self-heals any transient divergence.)
+    # concern, out of scope here — writes are human-paced. The Phase-2 reconcile
+    # self-heals a lost ENABLE (it keeps converging toward mcp_servers[].enabled);
+    # a lost DISABLE would be re-connected by the reconcile until the user re-acts
+    # — rare and recoverable, not fully self-healing.)
     tmp = SETTINGS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
@@ -483,6 +485,22 @@ def rendezvous_proof(token: str) -> str:
     import hmac
     import hashlib
     return hmac.new(token.encode("utf-8"), b"osia-rdv-v1", hashlib.sha256).hexdigest()
+
+
+def rendezvous_key(token: str) -> str:
+    """SHA-256 of the rendezvous ``proof`` HEX STRING -> 64-hex (WOR-98).
+
+    The lookup key the rendezvous Worker stores under (``sha256Hex(proof)`` in the
+    public ``mertioz/osia-worker``), derived here on the PC so the SERVER process
+    can build a STABLE per-user OAuth redirect_uri
+    (``<worker>/oauth/cb/<rendezvous_key>``) that the Worker forwards to this PC's
+    current quick-tunnel ``/oauth/callback``. PC, phone, and Worker MUST agree
+    byte-for-byte: the digest is over the UTF-8 bytes of the 64-char hex
+    :func:`rendezvous_proof` STRING — NOT ``bytes.fromhex(proof)``. See WOR-98 and
+    :mod:`osia.rendezvous`.
+    """
+    import hashlib
+    return hashlib.sha256(rendezvous_proof(token).encode("utf-8")).hexdigest()
 
 
 def regenerate_mobile_token() -> str:

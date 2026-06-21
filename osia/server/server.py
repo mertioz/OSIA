@@ -1345,6 +1345,24 @@ async def _begin_oauth_tunnel_connect(server_id: str, saved: dict) -> dict:
             cfg = build_headless_connect_cfg(saved)
             cfg["oauth_callback_mode"] = "tunnel"
             cfg["oauth_flow_id"] = fid
+            # WOR-98: use the rendezvous Worker as the OAuth redirect target so the
+            # mobile/tunnel flow works for ANY user via their quick tunnel — not
+            # only the owner's named osia.space tunnel. The redirect_uri becomes the
+            # STABLE per-user ``<worker>/oauth/cb/<rendezvous_key>``; the Worker
+            # forwards the callback to THIS PC's current trycloudflare
+            # ``/oauth/callback`` (host-agnostic, unchanged). Gated on a mobile
+            # token existing: with no token, leave cfg untouched so _serve falls
+            # back to today's [osia.space, loopback] behavior (no regression).
+            try:
+                from osia.config import load_mobile_token, rendezvous_key
+                from osia.rendezvous import WORKER_URL
+                _tok = load_mobile_token()
+                if _tok:
+                    cfg["oauth_redirect_uri"] = (
+                        WORKER_URL.rstrip("/") + "/oauth/cb/" + rendezvous_key(_tok)
+                    )
+            except Exception:
+                pass
             from osia.mcp_client import get_manager, STATUS_CONNECTING
             mgr = get_manager()
             # WOR-97: if a PRIOR OAuth flow for this id is still parked CONNECTING
