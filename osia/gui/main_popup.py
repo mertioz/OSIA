@@ -3214,6 +3214,8 @@ class _SettingsPanel(QWidget):
          "transport": "streamable_http", "command": None, "args": [],
          "url": "https://drivemcp.googleapis.com/mcp/v1", "auth_type": "oauth",
          "token_env": None, "needs_dir": False, "oauth_no_dcr": True,
+         # WOR-100: same Google MCP gateway bug (#229) — connectable but badged.
+         "temporarily_unavailable": True,
          "oauth_scopes": "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file",
          "oauth_token_endpoint_auth_method": "client_secret_post",
          "oauth_issuer": "https://accounts.google.com",
@@ -3223,6 +3225,11 @@ class _SettingsPanel(QWidget):
          "transport": "streamable_http", "command": None, "args": [],
          "url": "https://gmailmcp.googleapis.com/mcp/v1", "auth_type": "oauth",
          "token_env": None, "needs_dir": False, "oauth_no_dcr": True,
+         # WOR-100: stays CONNECTABLE with full scope, but the Google Gmail-MCP
+         # gateway drops the scope server-side (#229) → render an "unavailable"
+         # badge + tooltip (see _build_mcp_card). Remove this flag once Google
+         # fixes the gateway; the backend is otherwise fully wired.
+         "temporarily_unavailable": True,
          # TEMP WOR-100 tiebreaker: full-mailbox scope to test if the gateway
          # demands it; revert to gmail.modify if the gateway bug is confirmed
          # server-side. (https://mail.google.com/ is the broadest scope and the
@@ -3633,6 +3640,18 @@ class _SettingsPanel(QWidget):
         name = QLabel(entry.get("name", sid))
         name.setObjectName("providerName")
         head.addWidget(name)
+        # WOR-100: a connector flagged ``temporarily_unavailable`` (Gmail/Drive —
+        # the Google MCP gateway has a server-side scope bug, #229) shows a subtle
+        # badge + a hover tooltip making clear it's Google's issue, not OSIA's.
+        # Added INLINE in the existing header (before the stretch) — no new row,
+        # so card layout/sizing is unchanged; gated, so other connectors are
+        # byte-for-byte identical.
+        if entry.get("temporarily_unavailable"):
+            badge = QLabel(i18n.t("mcp.badge_unavailable"))
+            badge.setObjectName("providerSub")
+            badge.setStyleSheet("color: #c79030; font-size: 11px;")
+            badge.setToolTip(i18n.t("mcp.tooltip_google_bug"))
+            head.addWidget(badge)
         head.addStretch(1)
         pill = QLabel("")
         pill.setObjectName("mcpPill")

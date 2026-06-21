@@ -1558,6 +1558,25 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Switch account", "fr": "Changer de compte", "zh": "切换账户",
         "ja": "アカウントを切り替え", "de": "Konto wechseln", "es": "Cambiar de cuenta",
     },
+    # WOR-100: Gmail/Drive stay connectable but the Google MCP gateway has a
+    # server-side scope bug (#229) — a subtle badge + a tooltip that makes clear
+    # it's Google's issue, not OSIA's.
+    "mcp.badge_unavailable": {
+        "en": "⚠ temporarily unavailable",
+        "fr": "⚠ temporairement indisponible",
+        "zh": "⚠ 暂时不可用",
+        "ja": "⚠ 一時的に利用不可",
+        "de": "⚠ vorübergehend nicht verfügbar",
+        "es": "⚠ no disponible temporalmente",
+    },
+    "mcp.tooltip_google_bug": {
+        "en": "Temporarily unavailable due to a bug on Google's side (the Gmail/Drive MCP server is in preview), not an OSIA problem. The connection will work as soon as Google fixes its service.",
+        "fr": "Indisponible temporairement à cause d'un bug côté Google (serveur MCP Gmail/Drive en preview), pas un problème d'OSIA. La connexion fonctionnera dès que Google corrige son service.",
+        "zh": "由于 Google 端的故障（Gmail/Drive 的 MCP 服务器处于预览阶段）暂时不可用，这不是 OSIA 的问题。一旦 Google 修复其服务，连接即可正常使用。",
+        "ja": "Google 側の不具合（Gmail/Drive の MCP サーバーはプレビュー版）により一時的に利用できません。OSIA の問題ではありません。Google がサービスを修正すればすぐに接続できるようになります。",
+        "de": "Vorübergehend nicht verfügbar wegen eines Fehlers auf Google-Seite (der Gmail/Drive-MCP-Server befindet sich in der Vorschau), kein OSIA-Problem. Die Verbindung funktioniert, sobald Google seinen Dienst behebt.",
+        "es": "No disponible temporalmente debido a un error del lado de Google (el servidor MCP de Gmail/Drive está en versión preliminar), no es un problema de OSIA. La conexión funcionará en cuanto Google corrija su servicio.",
+    },
     "mcp.status_disconnected": {
         "en": "Disconnected", "fr": "Déconnecté", "zh": "未连接",
         "ja": "未接続", "de": "Getrennt", "es": "Desconectado",
