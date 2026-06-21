@@ -3203,15 +3203,19 @@ class _SettingsPanel(QWidget):
         # The well-known Google endpoints are seeded into oauth_metadata at connect
         # (the server 200s, so the SDK never discovers them); they ride the headless
         # reconnect path via mcp_servers (see _mcp_upsert_server / _mcp_build_connect_cfg).
-        # ``oauth_token_endpoint_auth_method:"none"`` = PKCE public Desktop client (if
-        # Google's token endpoint requires the secret, switch to "client_secret_post"
-        # + a stored client_secret — both already supported).
+        # ``oauth_token_endpoint_auth_method:"client_secret_post"`` (WOR-100 Phase 2):
+        # the real Google login confirmed the "Desktop app" client REQUIRES its
+        # client_secret at the token endpoint — a public-PKCE ("none") exchange 400s
+        # "client_secret is missing". The user pastes BOTH the client_id AND the
+        # client_secret (both stored in the gitignored oauth_tokens.json, NEVER in
+        # mcp_servers); the secret rides the token POST via the SDK's
+        # prepare_token_auth (client_secret in the request body for client_secret_post).
         {"id": "google-drive", "name": "Google Drive", "desc_key": "mcp.desc.gdrive",
          "transport": "streamable_http", "command": None, "args": [],
          "url": "https://drivemcp.googleapis.com/mcp/v1", "auth_type": "oauth",
          "token_env": None, "needs_dir": False, "oauth_no_dcr": True,
          "oauth_scopes": "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file",
-         "oauth_token_endpoint_auth_method": "none",
+         "oauth_token_endpoint_auth_method": "client_secret_post",
          "oauth_issuer": "https://accounts.google.com",
          "oauth_authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
          "oauth_token_endpoint": "https://oauth2.googleapis.com/token"},
@@ -3220,7 +3224,7 @@ class _SettingsPanel(QWidget):
          "url": "https://gmailmcp.googleapis.com/mcp/v1", "auth_type": "oauth",
          "token_env": None, "needs_dir": False, "oauth_no_dcr": True,
          "oauth_scopes": "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose",
-         "oauth_token_endpoint_auth_method": "none",
+         "oauth_token_endpoint_auth_method": "client_secret_post",
          "oauth_issuer": "https://accounts.google.com",
          "oauth_authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
          "oauth_token_endpoint": "https://oauth2.googleapis.com/token"},
@@ -3414,6 +3418,7 @@ class _SettingsPanel(QWidget):
         self._mcp_buttons: dict = {}
         self._mcp_token_inputs: dict = {}
         self._mcp_client_id_inputs: dict = {}   # WOR-100: non-DCR OAuth client_id
+        self._mcp_client_secret_inputs: dict = {}   # WOR-100 Ph2: non-DCR client_secret
         self._mcp_dir_inputs: dict = {}
         self._mcp_extra_inputs: dict = {}   # {id: {env_var: QLineEdit}}
         # Optimistic transient state per id: {id: (visual_state, resolve_set, ticks)}
@@ -3591,6 +3596,7 @@ class _SettingsPanel(QWidget):
         self._mcp_switch_buttons = {}   # WOR-98: OAuth "Switch account" btns (per id)
         self._mcp_token_inputs = {}
         self._mcp_client_id_inputs = {}   # WOR-100: non-DCR OAuth client_id field
+        self._mcp_client_secret_inputs = {}   # WOR-100 Ph2: non-DCR client_secret field
         self._mcp_dir_inputs = {}
         self._mcp_extra_inputs = {}
         entry = self._mcp_entries.get(sid)
@@ -3702,6 +3708,28 @@ class _SettingsPanel(QWidget):
             cidin.setPlaceholderText(i18n.t("mcp.ph_client_id"))
             self._mcp_client_id_inputs[sid] = cidin
             v.addWidget(cidin)
+            # WOR-100 Phase 2: Google's "Desktop app" client REQUIRES its
+            # client_secret at the token endpoint (oauth_token_endpoint_auth_method=
+            # client_secret_post), so a MASKED secret field sits next to the
+            # client_id. Like the client_id, the value lives in the gitignored
+            # oauth_tokens.json (the per-server ``static_client`` blob) — NEVER in
+            # mcp_servers. Gated identically to the client_id field above.
+            cseclab = QLabel(i18n.t("mcp.lbl_client_secret"))
+            cseclab.setObjectName("providerSub")
+            cseclab.setWordWrap(True)
+            v.addWidget(cseclab)
+            try:
+                cur_csec = str(
+                    ((get_mcp_oauth(sid) or {}).get("static_client") or {}).get("client_secret") or ""
+                )
+            except Exception:
+                cur_csec = ""
+            csecin = QLineEdit(cur_csec)
+            csecin.setObjectName("keyInput")
+            csecin.setEchoMode(QLineEdit.EchoMode.Password)
+            csecin.setPlaceholderText(i18n.t("mcp.ph_client_secret"))
+            self._mcp_client_secret_inputs[sid] = csecin
+            v.addWidget(csecin)
 
         if connectable:
             saved_extra = (saved or {}).get("extra_env") or {}
@@ -3815,15 +3843,16 @@ class _SettingsPanel(QWidget):
             widget.setStyleSheet("QLineEdit{border:1px solid #e0a3a3;}")
 
     def _mcp_build_connect_cfg(self, entry: dict):
-        """Return ``(connect_cfg, persist_cfg, token, client_id)``. ``connect_cfg``
-        carries the token + any extra env in ``env`` (in-memory only, passed to the
-        manager); ``persist_cfg`` never carries secrets (``env`` is always {} —
-        non-secret extra-env values round-trip under ``extra_env``). ``client_id``
-        (WOR-100) is the user's pre-registered OAuth client_id for a non-DCR
-        connector (Google) — stored by the caller in the gitignored oauth_tokens.json,
-        NEVER in persist_cfg/mcp_servers; "" for every other connector. Returns
-        ``(None, None, "", "")`` on a validation failure (an empty required field is
-        flagged red)."""
+        """Return ``(connect_cfg, persist_cfg, token, client_id, client_secret)``.
+        ``connect_cfg`` carries the token + any extra env in ``env`` (in-memory only,
+        passed to the manager); ``persist_cfg`` never carries secrets (``env`` is
+        always {} — non-secret extra-env values round-trip under ``extra_env``).
+        ``client_id`` / ``client_secret`` (WOR-100) are the user's pre-registered
+        OAuth credentials for a non-DCR connector (Google) — stored by the caller in
+        the gitignored oauth_tokens.json, NEVER in persist_cfg/mcp_servers; "" for
+        every other connector (and ``client_secret`` stays "" for a public-PKCE
+        ``none`` client). Returns ``(None, None, "", "", "")`` on a validation
+        failure (an empty required field is flagged red)."""
         sid = entry["id"]
         args = list(entry.get("args") or [])
         if entry.get("needs_dir"):
@@ -3833,7 +3862,7 @@ class _SettingsPanel(QWidget):
                 # Never silently fall back to the whole home dir — require a
                 # deliberate choice.
                 self._mcp_flag_required(din)
-                return None, None, "", ""
+                return None, None, "", "", ""
             args = args + [d]
 
         # Extra (non-secret) env fields, e.g. Slack's SLACK_TEAM_ID.
@@ -3844,7 +3873,7 @@ class _SettingsPanel(QWidget):
             val = ein.text().strip() if ein else ""
             if not val and spec.get("required"):
                 self._mcp_flag_required(ein)
-                return None, None, "", ""
+                return None, None, "", "", ""
             if val:
                 extra_env[var] = val
 
@@ -3882,14 +3911,29 @@ class _SettingsPanel(QWidget):
         # WOR-100: a non-DCR OAuth connector requires the user's client_id. It is
         # AUTHORITATIVE from the field (empty → flag red + abort, like the dir /
         # extra-env required gates); the caller stores it in the gitignored
-        # oauth_tokens.json, never in persist_cfg.
+        # oauth_tokens.json, never in persist_cfg. WOR-100 Phase 2: a
+        # ``client_secret_post`` connector (Google "Desktop app") ALSO needs its
+        # client_secret at the token endpoint, so it is gated the SAME way (empty →
+        # flag red + abort); a public-PKCE ``none`` client leaves it blank. The
+        # secret comes from the masked field and is stored by the caller in the SAME
+        # gitignored oauth_tokens.json — never in persist_cfg.
         client_id = ""
+        client_secret = ""
         if entry.get("oauth_no_dcr"):
             cidin = self._mcp_client_id_inputs.get(sid)
             client_id = cidin.text().strip() if cidin else ""
             if not client_id:
                 self._mcp_flag_required(cidin)
-                return None, None, "", ""
+                return None, None, "", "", ""
+            csecin = self._mcp_client_secret_inputs.get(sid)
+            client_secret = csecin.text().strip() if csecin else ""
+            if (
+                str(entry.get("oauth_token_endpoint_auth_method") or "none")
+                in ("client_secret_post", "client_secret_basic")
+                and not client_secret
+            ):
+                self._mcp_flag_required(csecin)
+                return None, None, "", "", ""
 
         # Build the in-memory connect env: the token (authoritative from the
         # field — empty means none) plus any extra-env values.
@@ -3913,7 +3957,7 @@ class _SettingsPanel(QWidget):
             connect["env"] = env
         if headers:
             connect["headers"] = headers
-        return connect, persist, token, client_id
+        return connect, persist, token, client_id, client_secret
 
     def _on_mcp_toggle(self, entry: dict) -> None:
         sid = entry["id"]
@@ -3928,7 +3972,7 @@ class _SettingsPanel(QWidget):
             self._on_mcp_connect(entry)
 
     def _on_mcp_connect(self, entry: dict) -> None:
-        connect_cfg, persist_cfg, token, client_id = self._mcp_build_connect_cfg(entry)
+        connect_cfg, persist_cfg, token, client_id, client_secret = self._mcp_build_connect_cfg(entry)
         if connect_cfg is None:
             return
         sid = entry["id"]
@@ -3952,6 +3996,14 @@ class _SettingsPanel(QWidget):
             sc = blob.get("static_client")
             sc = dict(sc) if isinstance(sc, dict) else {}
             sc["client_id"] = client_id
+            # WOR-100 Phase 2: the client_secret rides the SAME gitignored
+            # static_client blob (never mcp_servers). AUTHORITATIVE from the masked
+            # field — a non-empty value is stored; blanking it CLEARS the stored
+            # secret (a public-PKCE ``none`` client keeps none).
+            if client_secret:
+                sc["client_secret"] = client_secret
+            else:
+                sc.pop("client_secret", None)
             blob["static_client"] = sc
             set_mcp_oauth(sid, blob)
         # Optimistic, immediate feedback; the timer settles it on the real status

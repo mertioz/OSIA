@@ -1699,6 +1699,19 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Google-„Desktop-App“-Client-ID einfügen (lokal gespeichert)…",
         "es": "Pega el ID de cliente de la \"app de escritorio\" de Google (local)…",
     },
+    "mcp.lbl_client_secret": {
+        "en": "Google OAuth client secret", "fr": "Secret client OAuth Google",
+        "zh": "Google OAuth 客户端密钥", "ja": "Google OAuth クライアント シークレット",
+        "de": "Google-OAuth-Client-Secret", "es": "Secreto de cliente OAuth de Google",
+    },
+    "mcp.ph_client_secret": {
+        "en": "Paste your Google \"Desktop app\" client secret (stored locally)…",
+        "fr": "Collez le secret client Google « application de bureau » (stocké en local)…",
+        "zh": "粘贴你的 Google“桌面应用”客户端密钥（本地存储）…",
+        "ja": "Google「デスクトップ アプリ」クライアント シークレットを貼り付け（ローカル保存）…",
+        "de": "Google-„Desktop-App“-Client-Secret einfügen (lokal gespeichert)…",
+        "es": "Pega el secreto de cliente de la \"app de escritorio\" de Google (local)…",
+    },
     "mcp.lbl_dir": {
         "en": "Allowed directory", "fr": "Dossier autorisé",
         "zh": "允许的目录", "ja": "許可するディレクトリ",

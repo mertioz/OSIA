@@ -872,6 +872,27 @@ class MCPManager:
                                 ),
                             }
                             oauth_scope = str(cfg.get("oauth_scopes") or "").strip() or None
+                            # WOR-100 Phase 2: a Desktop OAuth client whose token
+                            # endpoint requires the secret (Google:
+                            # token_endpoint_auth_method=client_secret_post) MUST have
+                            # a stored client_secret — else the token exchange 400s
+                            # ("client_secret is missing"). FAIL FAST here, before the
+                            # browser login, with a clear message instead of after a
+                            # full interactive flow. (auth_method "none" = public PKCE
+                            # client → no secret needed.) Only the method NAME is in
+                            # the message — never the secret value — so the sanitized
+                            # conn.error stays leak-free.
+                            if (
+                                static_client["token_endpoint_auth_method"]
+                                in ("client_secret_post", "client_secret_basic")
+                                and not static_client["client_secret"]
+                            ):
+                                raise RuntimeError(
+                                    "client secret required: this connector's token "
+                                    "endpoint uses "
+                                    f"{static_client['token_endpoint_auth_method']} "
+                                    "but no client secret is stored"
+                                )
 
                     async with OAuthCallbackServer() as _cb:
                         provider = build_oauth_provider(
