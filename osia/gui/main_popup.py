@@ -3184,6 +3184,76 @@ class _SettingsPanel(QWidget):
         {"id": "gmail", "name": "Gmail", "desc_key": "mcp.desc.gmail",
          "transport": "streamable_http", "command": None, "args": [], "url": "",
          "auth_type": "oauth", "token_env": None, "needs_dir": False},
+        # ── WOR-94: vendor-maintained remote MCP connectors ──────────────────
+        # Same OAuth-DCR shape as Notion/Linear above; they inherit the working
+        # Dynamic-Client-Registration + mobile-OAuth path with NO new machinery.
+        # Transport is streamable_http for all (the manager does not support
+        # ``sse`` — see SUPPORTED_TRANSPORTS in osia.mcp_client.manager). URLs
+        # verified against official vendor docs + live OAuth metadata (RFC 7591
+        # DCR confirmed) as of 2026-06; an entry is connectable iff its ``url``
+        # is non-empty (see _mcp_connectable).
+        {"id": "sentry", "name": "Sentry", "desc_key": "mcp.desc.sentry",
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "https://mcp.sentry.dev/mcp", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False},
+        {"id": "stripe", "name": "Stripe", "desc_key": "mcp.desc.stripe",
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "https://mcp.stripe.com", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False},
+        {"id": "vercel", "name": "Vercel", "desc_key": "mcp.desc.vercel",
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "https://mcp.vercel.com", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False},
+        {"id": "supabase", "name": "Supabase", "desc_key": "mcp.desc.supabase",
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "https://mcp.supabase.com/mcp", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False},
+        {"id": "neon", "name": "Neon", "desc_key": "mcp.desc.neon",
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "https://mcp.neon.tech/mcp", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False},
+        {"id": "atlassian", "name": "Atlassian", "desc_key": "mcp.desc.atlassian",
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "https://mcp.atlassian.com/v1/mcp", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False},
+        {"id": "canva", "name": "Canva", "desc_key": "mcp.desc.canva",
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "https://mcp.canva.com/mcp", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False},
+        {"id": "paypal", "name": "PayPal", "desc_key": "mcp.desc.paypal",
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "https://mcp.paypal.com/mcp", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False},
+        # ── WOR-94: present but DISABLED (``url`` left empty → _mcp_connectable
+        # returns False, exactly like Gmail/Google Drive above). Each HAS a
+        # verified official remote MCP endpoint, but it does NOT support open
+        # RFC 7591 Dynamic Client Registration, which OSIA's OAuth substrate
+        # REQUIRES (the SDK auto-registers — there is no pre-registered
+        # client_id path; see osia.mcp_client.oauth). Fill ``url`` to enable
+        # once the connector offers zero-config DCR.
+        # TODO(WOR-94): Asana V2 streamable_http endpoint is
+        #   https://mcp.asana.com/v2/mcp, but "Dynamic client registration is not
+        #   supported with Asana's V2 MCP Server" (clients must pre-register a
+        #   client_id). The old /sse beta endpoint was shut down 2026-05-11.
+        {"id": "asana", "name": "Asana", "desc_key": "mcp.desc.asana",
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False},
+        # TODO(WOR-94): HubSpot endpoint is https://mcp.hubspot.com (bare host,
+        #   streamable_http) but exposes NO registration_endpoint — the user must
+        #   manually create an "MCP Auth App" for a client_id/secret (no DCR).
+        {"id": "hubspot", "name": "HubSpot", "desc_key": "mcp.desc.hubspot",
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False},
+        # TODO(WOR-94): Figma endpoint is https://mcp.figma.com/mcp (beta,
+        #   streamable_http) but its DCR registration endpoint returns 403 for
+        #   non-allowlisted clients (the mcp:connect scope is gated to Figma's
+        #   pre-approved MCP catalog). Enable once OSIA is allowlisted by Figma.
+        {"id": "figma", "name": "Figma", "desc_key": "mcp.desc.figma",
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False},
     ]
 
     # (background, foreground) per status — inline-styled so no global QSS edit.
