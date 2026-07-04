@@ -1627,6 +1627,11 @@ class _SettingsPanel(QWidget):
             "connected": False,
             "error": "",
             "emailAddress": None,
+            "capabilities": {
+                "readOnly": False,
+                "compose": False,
+                "composeUpgradeRequired": False,
+            },
         }
         self._gmail_rest_probe_busy = False
         self._gmail_rest_last_probe = datetime.min
@@ -3504,6 +3509,9 @@ class _SettingsPanel(QWidget):
         self._mcp_dir_inputs: dict = {}
         self._mcp_extra_inputs: dict = {}   # {id: {env_var: QLineEdit}}
         self._gmail_rest_account_labels: dict = {}
+        self._gmail_rest_capability_badges: dict = {}
+        self._gmail_rest_capability_labels: dict = {}
+        self._gmail_rest_upgrade_buttons: dict = {}
         # Optimistic transient state per id: {id: (visual_state, resolve_set, ticks)}
         self._mcp_pending: dict = {}
         # Catalog + custom entries by id (rebuilt by _render_mcp) and the
@@ -3743,6 +3751,9 @@ class _SettingsPanel(QWidget):
         self._mcp_dir_inputs = {}
         self._mcp_extra_inputs = {}
         self._gmail_rest_account_labels = {}
+        self._gmail_rest_capability_badges = {}
+        self._gmail_rest_capability_labels = {}
+        self._gmail_rest_upgrade_buttons = {}
         entry = self._mcp_entries.get(sid)
         if entry is None:
             return
@@ -3789,6 +3800,7 @@ class _SettingsPanel(QWidget):
             badge = QLabel(i18n.t("mcp.badge_readonly"))
             badge.setObjectName("providerSub")
             badge.setStyleSheet("font-size: 11px;")
+            self._gmail_rest_capability_badges[sid] = badge
             head.addWidget(badge)
         head.addStretch(1)
         pill = QLabel("")
@@ -3817,6 +3829,13 @@ class _SettingsPanel(QWidget):
             self._gmail_rest_account_labels[sid] = account
             v.addWidget(account)
             self._update_gmail_rest_account_label()
+
+            capability = QLabel("")
+            capability.setObjectName("providerSub")
+            capability.setWordWrap(True)
+            self._gmail_rest_capability_labels[sid] = capability
+            v.addWidget(capability)
+            self._update_gmail_rest_capability_label()
 
             if not self._gmail_rest_client().get("client_id"):
                 cidlab = QLabel(i18n.t("mcp.lbl_client_id"))
@@ -3958,6 +3977,13 @@ class _SettingsPanel(QWidget):
         actions.addStretch(1)
         if connectable:
             if self._is_gmail_rest_entry(entry):
+                upgrade_btn = QPushButton(i18n.t("mcp.gmail_upgrade"))
+                upgrade_btn.setObjectName("ghostBtn")
+                upgrade_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                upgrade_btn.clicked.connect(self._on_gmail_rest_upgrade_compose)
+                upgrade_btn.setVisible(False)
+                self._gmail_rest_upgrade_buttons[sid] = upgrade_btn
+                actions.addWidget(upgrade_btn)
                 btn = QPushButton(i18n.t("mcp.gmail_connect"))
                 btn.setObjectName("primaryBtn")
                 btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -4248,6 +4274,8 @@ class _SettingsPanel(QWidget):
             error = str(status.get("error") or "").strip()
             btn.setToolTip(error if state == "failed" else "")
         self._update_gmail_rest_account_label()
+        self._update_gmail_rest_capability_label()
+        self._update_gmail_rest_upgrade_button()
 
     def _update_gmail_rest_account_label(self) -> None:
         label = self._gmail_rest_account_labels.get("gmail")
@@ -4266,6 +4294,53 @@ class _SettingsPanel(QWidget):
         else:
             label.setText(i18n.t("mcp.gmail_hint"))
 
+    def _update_gmail_rest_capability_label(self) -> None:
+        label = self._gmail_rest_capability_labels.get("gmail")
+        if label is None:
+            return
+        status = self._gmail_rest_status if isinstance(
+            self._gmail_rest_status, dict
+        ) else {}
+        state = str(status.get("status") or "disconnected")
+        capabilities = status.get("capabilities")
+        capabilities = capabilities if isinstance(capabilities, dict) else {}
+        compose_enabled = bool(
+            capabilities.get("compose") or status.get("composeEnabled")
+        )
+        if state == "connected" and compose_enabled:
+            label.setText(i18n.t("mcp.gmail_cap_compose"))
+        elif state == "connected":
+            label.setText(i18n.t("mcp.gmail_cap_readonly"))
+        else:
+            label.setText(i18n.t("mcp.gmail_cap_disconnected"))
+
+        badge = self._gmail_rest_capability_badges.get("gmail")
+        if badge is not None:
+            badge.setText(
+                i18n.t("mcp.badge_compose")
+                if state == "connected" and compose_enabled
+                else i18n.t("mcp.badge_readonly")
+            )
+
+    def _update_gmail_rest_upgrade_button(self) -> None:
+        btn = self._gmail_rest_upgrade_buttons.get("gmail")
+        if btn is None:
+            return
+        status = self._gmail_rest_status if isinstance(
+            self._gmail_rest_status, dict
+        ) else {}
+        state = str(status.get("status") or "disconnected")
+        capabilities = status.get("capabilities")
+        capabilities = capabilities if isinstance(capabilities, dict) else {}
+        upgrade_required = bool(
+            capabilities.get("composeUpgradeRequired")
+            or status.get("composeUpgradeRequired")
+        )
+        show = state == "connected" and upgrade_required
+        btn.setVisible(show)
+        btn.setEnabled(show)
+        btn.setToolTip(i18n.t("mcp.gmail_upgrade_hint") if show else "")
+
     def _on_gmail_rest_toggle(self, entry: dict) -> None:
         if not self._is_gmail_rest_entry(entry):
             return
@@ -4276,6 +4351,50 @@ class _SettingsPanel(QWidget):
             self._on_gmail_rest_disconnect()
         else:
             self._on_gmail_rest_connect()
+
+    def _on_gmail_rest_upgrade_compose(self, _checked: bool = False) -> None:
+        try:
+            self._save_gmail_rest_client_from_fields()
+        except ValueError:
+            self._apply_gmail_rest_status({
+                "status": "failed",
+                "connected": False,
+                "emailAddress": None,
+                "error": i18n.t("mcp.gmail_client_required"),
+            })
+            return
+        self._apply_gmail_rest_status({
+            "status": "connecting",
+            "connected": False,
+            "emailAddress": None,
+            "error": "",
+        })
+
+        def _bg():
+            try:
+                from osia.tools.gmail import (
+                    gmail_connection_status,
+                    gmail_upgrade_compose_permissions,
+                )
+                gmail_upgrade_compose_permissions()
+                status = gmail_connection_status(validate=True)
+            except Exception:
+                try:
+                    status = gmail_connection_status(validate=True)
+                except Exception:
+                    status = {}
+                if not isinstance(status, dict) or not status.get("connected"):
+                    status = {
+                        "status": "failed",
+                        "connected": False,
+                        "emailAddress": None,
+                        "error": i18n.t("mcp.gmail_upgrade_failed"),
+                    }
+            self._gmail_rest_status_ready.emit(status)
+
+        threading.Thread(
+            target=_bg, name="osia-gmail-rest-upgrade-compose", daemon=True
+        ).start()
 
     def _on_gmail_rest_connect(self) -> None:
         try:

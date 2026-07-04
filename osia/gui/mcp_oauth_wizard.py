@@ -72,7 +72,11 @@ _WIZARD_APIS = {
 # The scope(s) the user must declare on the consent screen ({scopes}
 # placeholder in the step-3 body). Mirrors the connector/integration scopes.
 _WIZARD_SCOPES = {
-    "gmail-rest": "https://www.googleapis.com/auth/gmail.readonly",
+    "gmail-rest": (
+        "Required: https://www.googleapis.com/auth/gmail.readonly\n"
+        "Optional for confirmed draft creation: "
+        "https://www.googleapis.com/auth/gmail.compose"
+    ),
     "gmail": "https://mail.google.com/",
     "google-drive": "https://www.googleapis.com/auth/drive.readonly + https://www.googleapis.com/auth/drive.file",
 }

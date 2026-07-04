@@ -269,22 +269,24 @@ def get_desktop_path() -> str:
 
 def _gmail_rest_prompt_block(lang: str) -> str:
     if lang == "fr":
-        return """## Gmail natif REST (lecture seule)
-Pour lire ou chercher des emails Gmail, utilise les outils Gmail REST natifs ci-dessous. Le connecteur Google Gmail MCP historique est temporairement indisponible: ne l'utilise pas pour Gmail.
+        return """## Gmail natif REST
+Pour lire ou chercher des emails Gmail, utilise les outils Gmail REST natifs ci-dessous. Pour creer un brouillon Gmail, utilise seulement gmail_create_draft: cela exige une confirmation explicite de l'utilisateur et ne peut pas envoyer d'email. Le connecteur Google Gmail MCP historique est temporairement indisponible: ne l'utilise pas pour Gmail.
 - gmail_list_labels: lister les libelles Gmail. Usage : {"tool": "gmail_list_labels"}
 - gmail_list_latest: lister les derniers messages. Usage : {"tool": "gmail_list_latest", "max_results": 3}
 - gmail_search: chercher des messages avec une requete Gmail. Usage : {"tool": "gmail_search", "query": "France Travail", "max_results": 10}
 - gmail_read_message: lire un message avec son message_id. Usage : {"tool": "gmail_read_message", "message_id": "<id>"}
 - gmail_read_thread: lire un thread avec son thread_id. Usage : {"tool": "gmail_read_thread", "thread_id": "<id>"}
-Si Gmail REST n'est pas connecte, dis a l'utilisateur de connecter l'integration Gmail native. Ne suggere pas de reconnecter le Gmail MCP historique."""
-    return """## Native Gmail REST (read-only)
-For Gmail email reading or search, use the native Gmail REST tools below. The legacy Google Gmail MCP connector is temporarily unavailable; do not use it for Gmail.
+- gmail_create_draft: creer un brouillon Gmail en texte brut uniquement apres confirmation. Usage : {"tool": "gmail_create_draft", "to": "user@example.com", "subject": "Sujet", "body": "Message", "cc": "", "bcc": ""}
+Si Gmail REST n'est pas connecte, dis a l'utilisateur de connecter l'integration Gmail native. Si la permission compose manque, demande-lui d'utiliser "Upgrade Gmail permissions" sur la carte Gmail. L'envoi Gmail n'est pas disponible pour le moment. Ne suggere pas de reconnecter le Gmail MCP historique."""
+    return """## Native Gmail REST
+For Gmail email reading or search, use the native Gmail REST tools below. To create a Gmail draft, use only gmail_create_draft: it requires explicit user confirmation and cannot send email. The legacy Google Gmail MCP connector is temporarily unavailable; do not use it for Gmail.
 - gmail_list_labels: list Gmail labels. Usage: {"tool": "gmail_list_labels"}
 - gmail_list_latest: list the latest messages. Usage: {"tool": "gmail_list_latest", "max_results": 3}
 - gmail_search: search messages with a Gmail query. Usage: {"tool": "gmail_search", "query": "France Travail", "max_results": 10}
 - gmail_read_message: read a message by message_id. Usage: {"tool": "gmail_read_message", "message_id": "<id>"}
 - gmail_read_thread: read a thread by thread_id. Usage: {"tool": "gmail_read_thread", "thread_id": "<id>"}
-If Gmail REST is not connected, ask the user to connect the native Gmail integration. Do not suggest reconnecting the legacy Gmail MCP connector."""
+- gmail_create_draft: create a plain-text Gmail draft only after confirmation. Usage: {"tool": "gmail_create_draft", "to": "user@example.com", "subject": "Subject", "body": "Message", "cc": "", "bcc": ""}
+If Gmail REST is not connected, ask the user to connect the native Gmail integration. If compose permission is missing, ask the user to use "Upgrade Gmail permissions" on the Gmail connector card. Gmail sending is not available yet. Do not suggest reconnecting the legacy Gmail MCP connector."""
 
 
 def get_system_prompt(lang: str = None, model: str = None, provider: str = None) -> str:
@@ -2707,6 +2709,24 @@ def tool_gmail_read_thread(thread_id: str) -> str:
     return _call_gmail_tool("gmail_read_thread", thread_id=thread_id)
 
 
+def tool_gmail_create_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = None,
+    bcc: str = None,
+) -> str:
+    """Create one confirmed plain-text Gmail draft via native Gmail REST."""
+    return _call_gmail_tool(
+        "gmail_create_draft",
+        to=to,
+        subject=subject,
+        body=body,
+        cc=cc,
+        bcc=bcc,
+    )
+
+
 TOOL_MAP = {
     # Shell & launchers
     "bash": tool_bash,
@@ -2769,6 +2789,7 @@ TOOL_MAP = {
     "gmail_search": tool_gmail_search,
     "gmail_read_message": tool_gmail_read_message,
     "gmail_read_thread": tool_gmail_read_thread,
+    "gmail_create_draft": tool_gmail_create_draft,
 }
 
 # Known tool names — bare-JSON candidates (priority 3 of the universal
@@ -2789,6 +2810,7 @@ TOOL_TIMEOUT_SECONDS = 30
 # wrapper (registry.WRAPPER_CALL_TIMEOUT, 25 s) still bounds the actual request,
 # so a hung read tool is NOT held for this whole budget. Native tools unaffected.
 _MCP_CONFIRM_TOOL_TIMEOUT = 150
+_GMAIL_CONFIRM_TOOL_TIMEOUT = 150
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="osia-tool")
 
 _ERROR_PREFIXES = ("ERROR", "ERREUR", "[ERROR]", "[ERREUR]")
@@ -2832,6 +2854,8 @@ def _tool_timeout_seconds(tool_name: str, kwargs: dict) -> float:
     # WOR-44 Phase 5 (5-conf-a): MCP tools may block on a confirmation prompt.
     if tool_name.startswith("mcp__"):
         return _MCP_CONFIRM_TOOL_TIMEOUT
+    if tool_name == "gmail_create_draft":
+        return _GMAIL_CONFIRM_TOOL_TIMEOUT
     if tool_name in ("bash", "run_command"):
         if _is_long_running_command(kwargs.get("command", "") or ""):
             return LONG_RUNNING_TIMEOUT_SECONDS + 30
@@ -2904,6 +2928,7 @@ def _execute_tool_with_retry(tool_name: str, kwargs: dict):
         long_running
         or tool_name == "desktop_click"
         or tool_name.startswith("mcp__")
+        or tool_name == "gmail_create_draft"
     )
     if _is_tool_error(result) and not no_retry:
         preview = _result_text(result).replace("\n", " ")[:120]

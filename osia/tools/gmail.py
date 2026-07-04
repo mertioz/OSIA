@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+from email.message import EmailMessage
+from email.utils import getaddresses
 import html
 import json
 import re
@@ -26,6 +28,8 @@ from osia.config import delete_oauth_token, get_oauth_token
 
 GMAIL_REST_KEY = "gmail-rest"
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
+GMAIL_COMPOSE_SCOPES = (GMAIL_READONLY_SCOPE, GMAIL_COMPOSE_SCOPE)
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 
 BODY_CHAR_LIMIT = 4000
@@ -34,6 +38,12 @@ SNIPPET_CHAR_LIMIT = 1000
 MAX_LATEST_RESULTS = 25
 MAX_ATTACHMENTS = 50
 MAX_THREAD_MESSAGES = 10
+DRAFT_SUBJECT_CHAR_LIMIT = 300
+DRAFT_BODY_CHAR_LIMIT = 20000
+DRAFT_RECIPIENT_LIMIT = 50
+DRAFT_PREVIEW_CHAR_LIMIT = 240
+
+_EMAIL_RE = re.compile(r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
 
 NOT_CONNECTED_ERROR = (
     "ERROR: Gmail is not connected. Open Settings > Gmail and connect the "
@@ -54,6 +64,15 @@ NETWORK_ERROR = (
     "ERROR: Gmail API request failed because the network or Google API was "
     "unavailable. Try again in a moment."
 )
+COMPOSE_UPGRADE_ERROR = (
+    "ERROR: Gmail compose permission required. Open Settings > Gmail and use "
+    "Upgrade Gmail permissions from the Gmail connector card. No Gmail data "
+    "was changed."
+)
+CONFIRMATION_REQUIRED_ERROR = (
+    "ERROR: Gmail draft creation requires explicit user confirmation, but no "
+    "confirmation UI is available. No Gmail data was changed."
+)
 
 
 class GmailRestError(RuntimeError):
@@ -70,6 +89,21 @@ def gmail_connect() -> dict:
         "connected": True,
         "scope": scope or GMAIL_READONLY_SCOPE,
         "expires_at": blob.get("expires_at") if isinstance(blob, dict) else None,
+        **_gmail_capability_payload(token, connected=True),
+    }
+
+
+def gmail_upgrade_compose_permissions() -> dict:
+    """Run explicit re-consent for Gmail read-only + compose scopes."""
+    blob = authorize(GMAIL_REST_KEY, GMAIL_COMPOSE_SCOPES, force_consent=True)
+    token = blob.get("token") if isinstance(blob, dict) else {}
+    token = token if isinstance(token, dict) else {}
+    return {
+        "integration": GMAIL_REST_KEY,
+        "connected": True,
+        "scope": token.get("scope") or " ".join(GMAIL_COMPOSE_SCOPES),
+        "expires_at": blob.get("expires_at") if isinstance(blob, dict) else None,
+        **_gmail_capability_payload(token, connected=True),
     }
 
 
@@ -94,6 +128,7 @@ def gmail_connection_status(*, validate: bool = True) -> dict:
         "emailAddress": None,
         "scope": GMAIL_READONLY_SCOPE,
         "error": "",
+        **_gmail_capability_payload({}, connected=False),
     }
     try:
         blob = get_oauth_token(GMAIL_REST_KEY)
@@ -104,14 +139,23 @@ def gmail_connection_status(*, validate: bool = True) -> dict:
     token = token if isinstance(token, dict) else {}
     if not token.get("access_token") and not token.get("refresh_token"):
         return base
+    capability = _gmail_capability_payload(token, connected=True)
     if not _token_has_readonly_scope(token):
         return dict(
             base,
             status="failed",
             error=PERMISSION_ERROR.removeprefix("ERROR: ").strip(),
+            scope=token.get("scope") or "",
+            **capability,
         )
     if not validate:
-        return dict(base, connected=True, status="connected")
+        return dict(
+            base,
+            connected=True,
+            status="connected",
+            scope=token.get("scope") or GMAIL_READONLY_SCOPE,
+            **capability,
+        )
 
     profile = gmail_profile(interactive=False)
     if isinstance(profile, dict):
@@ -124,14 +168,25 @@ def gmail_connection_status(*, validate: bool = True) -> dict:
             "threadsTotal": profile.get("threadsTotal"),
             "scope": token.get("scope") or GMAIL_READONLY_SCOPE,
             "error": "",
+            **capability,
         }
     error = str(profile or "").strip()
     if error == NOT_CONNECTED_ERROR:
         status = "disconnected"
     else:
         status = "failed"
-    return dict(base, status=status,
-                error=error.removeprefix("ERROR: ").strip())
+    return dict(
+        base,
+        status=status,
+        error=error.removeprefix("ERROR: ").strip(),
+        scope=token.get("scope") or GMAIL_READONLY_SCOPE,
+        **capability,
+    )
+
+
+def gmail_compose_capability_status(*, validate: bool = False) -> dict:
+    """Return safe Gmail capability status for read-only/compose UI checks."""
+    return gmail_connection_status(validate=validate)
 
 
 def gmail_profile(*, interactive: bool = False) -> dict | str:
@@ -319,6 +374,56 @@ def gmail_get_message_metadata(
     return _safe_gmail_result(run)
 
 
+def gmail_create_draft(
+    to: str | list[str],
+    subject: str,
+    body: str,
+    cc: str | list[str] | None = None,
+    bcc: str | list[str] | None = None,
+    *,
+    interactive: bool = False,
+) -> dict | str:
+    """Create a plain-text Gmail draft after explicit user confirmation."""
+    def run() -> dict:
+        draft = _prepare_plain_text_draft(to, subject, body, cc=cc, bcc=bcc)
+        _require_compose_permission()
+        confirmed = _confirm_gmail_draft_creation(draft)
+        if not confirmed:
+            return {
+                "status": "cancelled",
+                "changed": False,
+                "reason": "user_declined_confirmation",
+                "to": draft["to"],
+                "cc": draft["cc"],
+                "bccCount": len(draft["bcc"]),
+                "subject": draft["subject"],
+                "bodyChars": len(draft["body"]),
+            }
+        data = _gmail_post(
+            "/drafts",
+            json_body={"message": {"raw": draft["raw"]}},
+            scopes=GMAIL_COMPOSE_SCOPES,
+            interactive=interactive,
+        )
+        message = data.get("message") if isinstance(data, dict) else {}
+        message = message if isinstance(message, dict) else {}
+        return {
+            "status": "draft_created",
+            "changed": True,
+            "draftId": data.get("id"),
+            "messageId": message.get("id"),
+            "threadId": message.get("threadId"),
+            "to": draft["to"],
+            "cc": draft["cc"],
+            "bccCount": len(draft["bcc"]),
+            "recipientCount": draft["recipientCount"],
+            "subject": draft["subject"],
+            "bodyChars": len(draft["body"]),
+        }
+
+    return _safe_gmail_result(run)
+
+
 def _safe_gmail_result(func):
     try:
         return func()
@@ -400,6 +505,182 @@ def _gmail_get(
     if not isinstance(data, dict):
         raise GmailRestError("Gmail REST response had an invalid shape.")
     return data
+
+
+def _gmail_post(
+    path: str,
+    *,
+    json_body: dict,
+    scopes: tuple[str, ...],
+    interactive: bool = True,
+) -> dict:
+    url = GMAIL_API_BASE + path
+    response = authorized_request(
+        GMAIL_REST_KEY,
+        "POST",
+        url,
+        scopes,
+        interactive=interactive,
+        json=json_body,
+    )
+    if response.status_code >= 400:
+        raise GmailRestError("Gmail REST error: " + _gmail_error_summary(response))
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise GmailRestError("Gmail REST response was not JSON.") from exc
+    if not isinstance(data, dict):
+        raise GmailRestError("Gmail REST response had an invalid shape.")
+    return data
+
+
+def _prepare_plain_text_draft(
+    to: str | list[str],
+    subject: str,
+    body: str,
+    *,
+    cc: str | list[str] | None,
+    bcc: str | list[str] | None,
+) -> dict:
+    to_list = _parse_recipients(to, "to", required=True)
+    cc_list = _parse_recipients(cc, "cc", required=False)
+    bcc_list = _parse_recipients(bcc, "bcc", required=False)
+    total = len(to_list) + len(cc_list) + len(bcc_list)
+    if total > DRAFT_RECIPIENT_LIMIT:
+        raise GmailRestError(
+            f"recipient count exceeds {DRAFT_RECIPIENT_LIMIT}."
+        )
+    clean_subject = _clean_subject(subject)
+    clean_body = _clean_draft_body(body)
+    message = EmailMessage()
+    message["To"] = ", ".join(to_list)
+    if cc_list:
+        message["Cc"] = ", ".join(cc_list)
+    if bcc_list:
+        message["Bcc"] = ", ".join(bcc_list)
+    message["Subject"] = clean_subject
+    message.set_content(clean_body, subtype="plain", charset="utf-8")
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
+    return {
+        "raw": raw,
+        "to": to_list,
+        "cc": cc_list,
+        "bcc": bcc_list,
+        "recipientCount": total,
+        "subject": clean_subject,
+        "body": clean_body,
+    }
+
+
+def _parse_recipients(
+    value: str | list[str] | None, field: str, *, required: bool
+) -> list[str]:
+    if value is None:
+        raw_items: list[str] = []
+    elif isinstance(value, (list, tuple)):
+        raw_items = [str(item or "") for item in value]
+    else:
+        raw_items = [str(value or "")]
+    raw_text = ", ".join(item.strip() for item in raw_items if item.strip())
+    if not raw_text:
+        if required:
+            raise GmailRestError(f"{field} is required.")
+        return []
+    parsed = getaddresses([raw_text])
+    addresses: list[str] = []
+    for _name, address in parsed:
+        clean = str(address or "").strip()
+        if not clean or not _EMAIL_RE.match(clean):
+            raise GmailRestError(f"{field} contains an invalid email address.")
+        addresses.append(clean)
+    if required and not addresses:
+        raise GmailRestError(f"{field} is required.")
+    return addresses
+
+
+def _clean_subject(value: str) -> str:
+    subject = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not subject:
+        raise GmailRestError("subject is required.")
+    if len(subject) > DRAFT_SUBJECT_CHAR_LIMIT:
+        raise GmailRestError(
+            f"subject exceeds {DRAFT_SUBJECT_CHAR_LIMIT} characters."
+        )
+    return subject
+
+
+def _clean_draft_body(value: str) -> str:
+    body = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not body.strip():
+        raise GmailRestError("body is required.")
+    if len(body) > DRAFT_BODY_CHAR_LIMIT:
+        raise GmailRestError(
+            f"body exceeds {DRAFT_BODY_CHAR_LIMIT} characters."
+        )
+    return body
+
+
+def _require_compose_permission() -> None:
+    try:
+        blob = get_oauth_token(GMAIL_REST_KEY)
+    except Exception as exc:
+        raise GmailRestError(NOT_CONNECTED_ERROR) from exc
+    token = blob.get("token") if isinstance(blob, dict) else None
+    token = token if isinstance(token, dict) else {}
+    if not token.get("access_token") and not token.get("refresh_token"):
+        raise GmailRestError(NOT_CONNECTED_ERROR)
+    if not _token_has_readonly_scope(token):
+        raise GmailRestError(PERMISSION_ERROR)
+    if not _token_has_compose_scope(token):
+        raise GmailRestError(COMPOSE_UPGRADE_ERROR)
+
+
+def _confirm_gmail_draft_creation(draft: dict) -> bool:
+    """Ask the registered OSIA confirmation provider; no provider means deny.
+
+    Phase 3A intentionally reuses the existing MCP confirmation bridge so desktop
+    and mobile approvals share one safe path without introducing a new WS frame.
+    Naming is legacy debt only: this gate does not read MCP write settings and
+    cannot be bypassed by unattended-write configuration.
+    """
+    try:
+        from osia.mcp_client.registry import get_confirmation_provider
+        provider = get_confirmation_provider()
+    except Exception:
+        provider = None
+    if provider is None:
+        raise GmailRestError(CONFIRMATION_REQUIRED_ERROR)
+    try:
+        return bool(provider(
+            "gmail",
+            "gmail_create_draft",
+            _draft_confirmation_summary(draft),
+        ))
+    except Exception:
+        return False
+
+
+def _draft_confirmation_summary(draft: dict) -> str:
+    body = str(draft.get("body") or "")
+    preview = re.sub(r"\s+", " ", body).strip()
+    if len(preview) > DRAFT_PREVIEW_CHAR_LIMIT:
+        preview = preview[: DRAFT_PREVIEW_CHAR_LIMIT - 3].rstrip() + "..."
+    parts = [
+        "Create Gmail draft",
+        f"To: {', '.join(draft.get('to') or [])}",
+    ]
+    cc = draft.get("cc") or []
+    bcc = draft.get("bcc") or []
+    if cc:
+        parts.append(f"Cc: {', '.join(cc)}")
+    if bcc:
+        parts.append(f"Bcc: {', '.join(bcc)}")
+    parts.extend([
+        f"Subject: {draft.get('subject') or ''}",
+        f"Body length: {len(body)} characters",
+        f"Preview: {preview}" if preview else "Preview: (empty)",
+    ])
+    return "\n".join(parts)
 
 
 def _extract_message(data: dict, *, include_body: bool) -> dict:
@@ -551,6 +832,37 @@ def _token_has_readonly_scope(token: dict) -> bool:
     return GMAIL_READONLY_SCOPE in scope.split()
 
 
+def _token_has_compose_scope(token: dict) -> bool:
+    scope = token.get("scope") if isinstance(token, dict) else ""
+    if not isinstance(scope, str):
+        return False
+    return GMAIL_COMPOSE_SCOPE in scope.split()
+
+
+def _token_scope_list(token: dict) -> list[str]:
+    scope = token.get("scope") if isinstance(token, dict) else ""
+    if not isinstance(scope, str):
+        return []
+    return sorted({part for part in scope.split() if part})
+
+
+def _gmail_capability_payload(token: dict, *, connected: bool) -> dict:
+    scopes = _token_scope_list(token)
+    read_only = GMAIL_READONLY_SCOPE in scopes
+    compose = GMAIL_COMPOSE_SCOPE in scopes
+    return {
+        "scopes": scopes,
+        "capabilities": {
+            "readOnly": bool(connected and read_only),
+            "compose": bool(connected and compose),
+            "composeUpgradeRequired": bool(connected and read_only and not compose),
+        },
+        "readOnlyConnected": bool(connected and read_only),
+        "composeEnabled": bool(connected and compose),
+        "composeUpgradeRequired": bool(connected and read_only and not compose),
+    }
+
+
 def _gmail_error_summary(response: Any) -> str:
     try:
         data = response.json()
@@ -577,6 +889,10 @@ def main(argv: list[str] | None = None) -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--connect", action="store_true",
                        help="run the Desktop OAuth loopback flow")
+    group.add_argument("--upgrade-compose", action="store_true",
+                       help="run OAuth re-consent for Gmail draft creation")
+    group.add_argument("--status", action="store_true",
+                       help="show safe Gmail connection and capability status")
     group.add_argument("--profile", action="store_true",
                        help="fetch the Gmail profile")
     group.add_argument("--labels", action="store_true",
@@ -601,6 +917,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.no_browser:
                 raise GmailRestError("--connect requires browser OAuth.")
             result = gmail_connect()
+        elif args.upgrade_compose:
+            if args.no_browser:
+                raise GmailRestError("--upgrade-compose requires browser OAuth.")
+            result = gmail_upgrade_compose_permissions()
+        elif args.status:
+            result = gmail_connection_status(validate=False)
         elif args.profile:
             result = gmail_profile(interactive=interactive)
         elif args.labels:
