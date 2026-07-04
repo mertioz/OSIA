@@ -335,6 +335,60 @@ def delete_mcp_oauth(server_id: str) -> None:
     set_mcp_oauth(server_id, {})
 
 
+def get_oauth_token(key: str) -> dict:
+    """Return a generic OAuth blob by key, or {} if unset.
+
+    This is the same local, gitignored, atomically-written store used by MCP
+    OAuth, exposed under a neutral name for native integrations such as Gmail
+    REST. Values are secrets; callers must never log them or route them through
+    settings.json / WebSocket frames.
+    """
+    return get_mcp_oauth(key)
+
+
+def set_oauth_token(key: str, blob: dict) -> None:
+    """Set or clear a generic OAuth blob by key."""
+    set_mcp_oauth(key, blob)
+
+
+def delete_oauth_token(key: str) -> None:
+    """Remove a generic OAuth blob by key, if any."""
+    delete_mcp_oauth(key)
+
+
+def get_oauth_client(key: str) -> dict:
+    """Return stored OAuth client fields for ``key``, or {} if unset.
+
+    Native REST integrations store their static Desktop OAuth client under the
+    ``client`` sub-blob. Existing Google MCP cards store the same user-pasted
+    client fields under ``static_client``; accepting both lets Phase 0 reuse the
+    local setup without treating the legacy MCP token as a REST token.
+    """
+    blob = get_oauth_token(key)
+    if not isinstance(blob, dict):
+        return {}
+    for field in ("static_client", "client"):
+        client = blob.get(field)
+        if isinstance(client, dict) and client.get("client_id"):
+            return dict(client)
+    return {}
+
+
+def set_oauth_client(key: str, client: dict) -> None:
+    """Persist generic OAuth client fields for ``key`` without touching tokens."""
+    if not key:
+        return
+    blob = get_oauth_token(key)
+    if not isinstance(blob, dict):
+        blob = {}
+    clean = dict(client) if isinstance(client, dict) else {}
+    if clean:
+        blob["client"] = clean
+    else:
+        blob.pop("client", None)
+    set_oauth_token(key, blob)
+
+
 # ── settings.json read cache (mtime+size based) ────────────────────────────
 # load_settings() is on the hot per-message server path and was opening
 # settings.json on EVERY call (config.py callers: get_setting, iter_keys, the
