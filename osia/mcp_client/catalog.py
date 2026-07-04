@@ -39,8 +39,9 @@ from __future__ import annotations
 #   suggestable=False -> present in the GUI catalog but NOT offered, because:
 #     * slack: WOR-99 — official remote endpoint exists, but Slack has no DCR and
 #       requires a user-provided Slack app client_id/secret.
-#     * google-drive / gmail: WOR-100 — connect, but Google's MCP gateway is
-#       degraded (#229) -> flagged temporarily_unavailable in the GUI.
+#     * google-drive / gmail-mcp-legacy: WOR-100/WOR-101 — connect, but Google's
+#       MCP gateway is degraded (#229) -> flagged temporarily_unavailable in the
+#       GUI. Visible Gmail uses native REST instead.
 #     * asana / hubspot / figma: WOR-94 — no open RFC 7591 DCR / url left empty
 #       -> not connectable in OSIA's OAuth substrate.
 MCP_CATALOG_META = [
@@ -50,6 +51,7 @@ MCP_CATALOG_META = [
     {"id": "linear",       "name": "Linear",       "desc_key": "mcp.desc.linear",    "suggestable": True},
     {"id": "google-drive", "name": "Google Drive", "desc_key": "mcp.desc.gdrive",    "suggestable": False},
     {"id": "gmail",        "name": "Gmail",        "desc_key": "mcp.desc.gmail",     "suggestable": False},
+    {"id": "gmail-mcp-legacy", "name": "Gmail (legacy MCP)", "desc_key": "mcp.desc.gmail_legacy", "suggestable": False},
     {"id": "sentry",       "name": "Sentry",       "desc_key": "mcp.desc.sentry",    "suggestable": True},
     {"id": "stripe",       "name": "Stripe",       "desc_key": "mcp.desc.stripe",    "suggestable": True},
     {"id": "vercel",       "name": "Vercel",       "desc_key": "mcp.desc.vercel",    "suggestable": True},

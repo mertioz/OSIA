@@ -19,7 +19,9 @@ from osia.integrations.google_oauth import (
     GoogleOAuthError,
     authorize,
     authorized_request,
+    revoke_token,
 )
+from osia.config import delete_oauth_token, get_oauth_token
 
 
 GMAIL_REST_KEY = "gmail-rest"
@@ -69,6 +71,67 @@ def gmail_connect() -> dict:
         "scope": scope or GMAIL_READONLY_SCOPE,
         "expires_at": blob.get("expires_at") if isinstance(blob, dict) else None,
     }
+
+
+def gmail_disconnect() -> dict:
+    """Revoke and delete only the native Gmail REST OAuth blob."""
+    revoked = revoke_token(GMAIL_REST_KEY)
+    delete_oauth_token(GMAIL_REST_KEY)
+    return {
+        "integration": GMAIL_REST_KEY,
+        "connected": False,
+        "status": "disconnected",
+        "revoked": bool(revoked),
+    }
+
+
+def gmail_connection_status(*, validate: bool = True) -> dict:
+    """Return token-safe native Gmail REST connection status for UI surfaces."""
+    base = {
+        "integration": GMAIL_REST_KEY,
+        "connected": False,
+        "status": "disconnected",
+        "emailAddress": None,
+        "scope": GMAIL_READONLY_SCOPE,
+        "error": "",
+    }
+    try:
+        blob = get_oauth_token(GMAIL_REST_KEY)
+    except Exception:
+        return dict(base, status="failed",
+                    error="Unable to read the local Gmail token store.")
+    token = blob.get("token") if isinstance(blob, dict) else None
+    token = token if isinstance(token, dict) else {}
+    if not token.get("access_token") and not token.get("refresh_token"):
+        return base
+    if not _token_has_readonly_scope(token):
+        return dict(
+            base,
+            status="failed",
+            error=PERMISSION_ERROR.removeprefix("ERROR: ").strip(),
+        )
+    if not validate:
+        return dict(base, connected=True, status="connected")
+
+    profile = gmail_profile(interactive=False)
+    if isinstance(profile, dict):
+        return {
+            "integration": GMAIL_REST_KEY,
+            "connected": True,
+            "status": "connected",
+            "emailAddress": profile.get("emailAddress"),
+            "messagesTotal": profile.get("messagesTotal"),
+            "threadsTotal": profile.get("threadsTotal"),
+            "scope": token.get("scope") or GMAIL_READONLY_SCOPE,
+            "error": "",
+        }
+    error = str(profile or "").strip()
+    if error == NOT_CONNECTED_ERROR:
+        status = "disconnected"
+    else:
+        status = "failed"
+    return dict(base, status=status,
+                error=error.removeprefix("ERROR: ").strip())
 
 
 def gmail_profile(*, interactive: bool = False) -> dict | str:
@@ -481,6 +544,13 @@ def _coerce_limit(max_results: int) -> int:
     return max(1, min(value, MAX_LATEST_RESULTS))
 
 
+def _token_has_readonly_scope(token: dict) -> bool:
+    scope = token.get("scope") if isinstance(token, dict) else ""
+    if not isinstance(scope, str):
+        return False
+    return GMAIL_READONLY_SCOPE in scope.split()
+
+
 def _gmail_error_summary(response: Any) -> str:
     try:
         data = response.json()
@@ -552,7 +622,10 @@ def main(argv: list[str] | None = None) -> int:
         print(result)
         return 1
 
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    try:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    except UnicodeEncodeError:
+        print(json.dumps(result, indent=2, ensure_ascii=True))
     return 0
 
 

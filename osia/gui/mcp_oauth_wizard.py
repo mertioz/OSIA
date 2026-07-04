@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""WOR-100 Phase 2 — guided OAuth setup wizard for the non-DCR Google connectors.
+"""Guided Google OAuth setup wizard for BYO Google clients.
 
-Gmail and Google Drive use a PRE-REGISTERED OAuth client (model B, per user): the
-user must create their own Google "Desktop app" OAuth client and paste its
-``client_id`` + ``client_secret`` into the connector card (see
-``main_popup._build_mcp_card``). That Google Cloud setup is ~15-30 min and has two
-real gotchas — the MCP-specific API (``gmailmcp``/``drivemcp``) is NOT the classic
-Gmail/Drive API, and the client must be a "Desktop app" (loopback redirect), not a
-"Web" client. This dialog walks the user through it in 5 numbered steps with a
-direct "Open this page" link per step.
+Google Drive MCP and native Gmail REST both use a PRE-REGISTERED OAuth client
+(model B, per user): the user must create their own Google "Desktop app" OAuth
+client and paste its ``client_id`` + ``client_secret`` into the connector card
+(see ``main_popup._build_mcp_card``). That Google Cloud setup is ~15-30 min and
+has two mode-specific gotchas: Drive MCP still needs Google's MCP-specific
+``drivemcp`` API, while native Gmail REST needs the classic Gmail API
+(``gmail.googleapis.com``). Both modes need a "Desktop app" client (loopback
+redirect), not a "Web" client. This dialog walks the user through it in 5
+numbered steps with a direct "Open this page" link per step.
 
 Design (audited)
 ----------------
@@ -27,10 +28,10 @@ Design (audited)
   (``i18n`` pulls in no GUI module), same as ``mcp_confirm``.
 
 URLs live HERE (code), never in i18n — links are not translated and must not be
-mistranslated. Only the step-2 enable link, the step-2 API name and the step-3
-scope string differ per connector; everything else is generic Google Cloud Console
-pages (a project id does not exist until step 1, so nothing user-specific can be
-deep-linked).
+mistranslated. Only the step-2 enable link, the step-2 API name, the step-3
+scope string and Gmail REST copy differ per mode; everything else is generic
+Google Cloud Console pages (a project id does not exist until step 1, so nothing
+user-specific can be deep-linked).
 """
 
 from __future__ import annotations
@@ -53,25 +54,30 @@ from osia import i18n
 
 
 # ── Per-connector data (code, not i18n) ──────────────────────────────────────
-# Keyed by the catalog connector id (osia.gui.main_popup MCP catalog):
-#   Gmail        id == "gmail"        url https://gmailmcp.googleapis.com/mcp/v1
-#   Google Drive id == "google-drive" url https://drivemcp.googleapis.com/mcp/v1
-# The step-2 "enable the MCP API" link is the Google Cloud Console API overview for
-# the MCP-specific service (NOT the classic gmail/drive API — the documented gotcha).
+# Keyed by the catalog connector id or explicit wizard mode:
+#   gmail-rest   native Gmail REST (Gmail API)
+#   gmail        legacy Gmail MCP  url https://gmailmcp.googleapis.com/mcp/v1
+#   google-drive Google Drive MCP   url https://drivemcp.googleapis.com/mcp/v1
 _WIZARD_LINKS = {
+    "gmail-rest": "https://console.developers.google.com/apis/api/gmail.googleapis.com/overview",
     "gmail": "https://console.developers.google.com/apis/api/gmailmcp.googleapis.com/overview",
     "google-drive": "https://console.developers.google.com/apis/api/drivemcp.googleapis.com/overview",
 }
-# Human-readable MCP API hostname shown in the step-2 body ({api} placeholder).
+# Human-readable API hostname shown in the step-2 body ({api} placeholder).
 _WIZARD_APIS = {
+    "gmail-rest": "gmail.googleapis.com",
     "gmail": "gmailmcp.googleapis.com",
     "google-drive": "drivemcp.googleapis.com",
 }
-# The Gmail/Drive scope(s) the user must declare on the consent screen ({scopes}
-# placeholder in the step-3 body). Mirrors the connector's ``oauth_scopes``.
+# The scope(s) the user must declare on the consent screen ({scopes}
+# placeholder in the step-3 body). Mirrors the connector/integration scopes.
 _WIZARD_SCOPES = {
+    "gmail-rest": "https://www.googleapis.com/auth/gmail.readonly",
     "gmail": "https://mail.google.com/",
     "google-drive": "https://www.googleapis.com/auth/drive.readonly + https://www.googleapis.com/auth/drive.file",
+}
+_WIZARD_ALIASES = {
+    "gmail-mcp-legacy": "gmail",
 }
 
 # Generic console pages (same for every connector — see module docstring).
@@ -83,15 +89,23 @@ _LINK_CLIENTS = "https://console.cloud.google.com/auth/clients"
 class _MCPOAuthWizardDialog(QDialog):
     """5-step guide for creating a Google "Desktop app" OAuth client.
 
-    Constructed with ``(parent, entry)`` where ``entry`` is the connector catalog
-    dict (its ``id`` selects the per-connector step-2 link / API name / scopes).
-    Instructional only; closing it has no side effects.
+    Constructed with ``(parent, entry, mode=None)`` where ``entry`` is the
+    connector catalog dict and ``mode`` can force a specific guide such as
+    ``gmail-rest``. Instructional only; closing it has no side effects.
     """
 
-    def __init__(self, parent, entry):
+    def __init__(self, parent, entry, mode: str | None = None):
         super().__init__(parent)
         self.setObjectName("mcpOAuthWizard")
         sid = (entry or {}).get("id", "") or "gmail"
+        wizard_mode = str(
+            mode
+            or (entry or {}).get("oauth_wizard_mode")
+            or (entry or {}).get("native_integration")
+            or sid
+            or "gmail"
+        )
+        wizard_mode = _WIZARD_ALIASES.get(wizard_mode, wizard_mode)
         # Mirror the existing dialogs' flags so the modal always surfaces above the
         # FramelessWindowHint|Tool|WindowStaysOnTopHint parent popup.
         self.setWindowFlags(
@@ -102,10 +116,39 @@ class _MCPOAuthWizardDialog(QDialog):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setModal(True)
 
-        # Per-connector substitutions (fall back to Gmail for an unknown id).
-        enable_url = _WIZARD_LINKS.get(sid, _WIZARD_LINKS["gmail"])
-        api_name = _WIZARD_APIS.get(sid, _WIZARD_APIS["gmail"])
-        scopes = _WIZARD_SCOPES.get(sid, _WIZARD_SCOPES["gmail"])
+        # Per-mode substitutions (fall back to legacy Gmail MCP for an unknown id).
+        enable_url = _WIZARD_LINKS.get(wizard_mode, _WIZARD_LINKS["gmail"])
+        api_name = _WIZARD_APIS.get(wizard_mode, _WIZARD_APIS["gmail"])
+        scopes = _WIZARD_SCOPES.get(wizard_mode, _WIZARD_SCOPES["gmail"])
+        gmail_rest = wizard_mode == "gmail-rest"
+        step2_title_key = (
+            "mcp.wizard.gmail_rest.step2_title"
+            if gmail_rest else "mcp.wizard.step2_title"
+        )
+        step2_body_key = (
+            "mcp.wizard.gmail_rest.step2_body"
+            if gmail_rest else "mcp.wizard.step2_body"
+        )
+        step3_title_key = (
+            "mcp.wizard.gmail_rest.step3_title"
+            if gmail_rest else "mcp.wizard.step3_title"
+        )
+        step3_body_key = (
+            "mcp.wizard.gmail_rest.step3_body"
+            if gmail_rest else "mcp.wizard.step3_body"
+        )
+        step4_body_key = (
+            "mcp.wizard.gmail_rest.step4_body"
+            if gmail_rest else "mcp.wizard.step4_body"
+        )
+        step5_title_key = (
+            "mcp.wizard.gmail_rest.step5_title"
+            if gmail_rest else "mcp.wizard.step5_title"
+        )
+        step5_body_key = (
+            "mcp.wizard.gmail_rest.step5_body"
+            if gmail_rest else "mcp.wizard.step5_body"
+        )
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -136,23 +179,23 @@ class _MCPOAuthWizardDialog(QDialog):
                 _LINK_PROJECT,
             ),
             (
-                "mcp.wizard.step2_title",
-                i18n.t("mcp.wizard.step2_body", api=api_name),
+                step2_title_key,
+                i18n.t(step2_body_key, api=api_name),
                 enable_url,
             ),
             (
-                "mcp.wizard.step3_title",
-                i18n.t("mcp.wizard.step3_body", scopes=scopes),
+                step3_title_key,
+                i18n.t(step3_body_key, scopes=scopes),
                 _LINK_CONSENT,
             ),
             (
                 "mcp.wizard.step4_title",
-                i18n.t("mcp.wizard.step4_body"),
+                i18n.t(step4_body_key),
                 _LINK_CLIENTS,
             ),
             (
-                "mcp.wizard.step5_title",
-                i18n.t("mcp.wizard.step5_body"),
+                step5_title_key,
+                i18n.t(step5_body_key),
                 None,
             ),
         ]

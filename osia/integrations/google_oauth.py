@@ -39,6 +39,7 @@ OAUTH_REDIRECT_URI = (
 
 GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_REVOCATION_ENDPOINT = "https://oauth2.googleapis.com/revoke"
 
 DEFAULT_TIMEOUT_S = 30.0
 CALLBACK_TIMEOUT_S = 300.0
@@ -316,6 +317,38 @@ def refresh_access_token(
     if not isinstance(access_token, str) or not access_token:
         raise GoogleOAuthError("OAuth refresh response did not include an access token.")
     return access_token
+
+
+def revoke_token(integration_key: str) -> bool:
+    """Best-effort Google OAuth token revocation for a native REST integration.
+
+    Reads the stored refresh token first, falling back to the access token. Never
+    raises and never logs token values; callers should still delete the local
+    OAuth blob even when Google revocation is unavailable.
+    """
+    key = str(integration_key or "").strip()
+    if not key:
+        return False
+    try:
+        blob = get_oauth_token(key)
+    except Exception:
+        return False
+    token_blob = blob.get("token") if isinstance(blob, dict) else None
+    token_blob = token_blob if isinstance(token_blob, dict) else {}
+    token = token_blob.get("refresh_token") or token_blob.get("access_token")
+    if not isinstance(token, str) or not token:
+        return False
+    try:
+        requests = _requests()
+        response = requests.post(
+            GOOGLE_REVOCATION_ENDPOINT,
+            data={"token": token},
+            headers={"Accept": "application/json"},
+            timeout=DEFAULT_TIMEOUT_S,
+        )
+        return 200 <= response.status_code < 300
+    except Exception:
+        return False
 
 
 def authorized_request(

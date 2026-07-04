@@ -52,6 +52,7 @@ from osia.config import (
     get_api_key, load_mobile_token, regenerate_mobile_token,
     get_setting, get_mcp_token, set_mcp_token, delete_mcp_token,
     delete_mcp_oauth, get_mcp_oauth, set_mcp_oauth,
+    get_oauth_client, set_oauth_client,
 )
 from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
@@ -1547,6 +1548,8 @@ class _SettingsPanel(QWidget):
     # the background probe thread back onto the GUI thread (WOR perf fix — the
     # probe does slow tasklist/socket calls that must not block the UI).
     _startup_status_ready = pyqtSignal(list)
+    # Carries token-safe native Gmail REST status from a background probe.
+    _gmail_rest_status_ready = pyqtSignal(dict)
 
     # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
     # last as an info-only row).
@@ -1619,6 +1622,15 @@ class _SettingsPanel(QWidget):
         # timer / repeated shows never pile up overlapping probe threads.
         self._startup_probe_busy = False
         self._startup_status_ready.connect(self._apply_startup_status)
+        self._gmail_rest_status = {
+            "status": "disconnected",
+            "connected": False,
+            "error": "",
+            "emailAddress": None,
+        }
+        self._gmail_rest_probe_busy = False
+        self._gmail_rest_last_probe = datetime.min
+        self._gmail_rest_status_ready.connect(self._apply_gmail_rest_status)
         self._startup_rows: list[tuple[str, QLabel, QCheckBox]] = []
         # Guards the autostart toggle against re-entrant stateChanged while it is
         # being reverted (e.g. on an unsupported platform). See WOR-22.
@@ -3196,8 +3208,9 @@ class _SettingsPanel(QWidget):
          "transport": "streamable_http", "command": None, "args": [],
          "url": "https://mcp.linear.app/mcp", "auth_type": "oauth",
          "token_env": None, "needs_dir": False},
-        # WOR-100: Google Gmail/Drive use a PRE-REGISTERED OAuth client (model B,
-        # per-user) — their MCP servers do NOT support DCR (no registration_endpoint;
+        # WOR-100: Google Drive, plus the hidden legacy Gmail MCP fallback, use a
+        # PRE-REGISTERED OAuth client (model B, per-user) — their MCP servers do
+        # NOT support DCR (no registration_endpoint;
         # POST /register → 400). The user pastes a Google "Desktop app" client_id,
         # stored in the gitignored oauth_tokens.json, NEVER mcp_servers; the SDK then
         # skips DCR (see osia.mcp_client.oauth.build_oauth_provider /
@@ -3239,19 +3252,20 @@ class _SettingsPanel(QWidget):
          "oauth_issuer": "https://accounts.google.com",
          "oauth_authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
          "oauth_token_endpoint": "https://oauth2.googleapis.com/token"},
+        # WOR-101 Phase 2: the normal visible Gmail option is native OSIA Gmail
+        # REST, not the broken Google Gmail MCP gateway. The legacy MCP code can
+        # stay as a future fallback, but this card no longer points users at the
+        # legacy Google Gmail MCP endpoint.
         {"id": "gmail", "name": "Gmail", "desc_key": "mcp.desc.gmail",
+         "transport": "native", "command": None, "args": [], "url": "",
+         "auth_type": "native_oauth", "token_env": None, "needs_dir": False,
+         "native_integration": "gmail-rest"},
+        {"id": "gmail-mcp-legacy", "name": "Gmail (legacy MCP)",
+         "desc_key": "mcp.desc.gmail_legacy",
          "transport": "streamable_http", "command": None, "args": [],
          "url": "https://gmailmcp.googleapis.com/mcp/v1", "auth_type": "oauth",
          "token_env": None, "needs_dir": False, "oauth_no_dcr": True,
-         # WOR-100: stays CONNECTABLE with full scope, but the Google Gmail-MCP
-         # gateway drops the scope server-side (#229) → render an "unavailable"
-         # badge + tooltip (see _build_mcp_card). Remove this flag once Google
-         # fixes the gateway; the backend is otherwise fully wired.
-         "temporarily_unavailable": True,
-         # TEMP WOR-100 tiebreaker: full-mailbox scope to test if the gateway
-         # demands it; revert to gmail.modify if the gateway bug is confirmed
-         # server-side. (https://mail.google.com/ is the broadest scope and the
-         # first entry in the Gmail MCP's advertised scopes_supported.)
+         "temporarily_unavailable": True, "hidden": True,
          "oauth_scopes": "https://mail.google.com/",
          "oauth_token_endpoint_auth_method": "client_secret_post",
          "oauth_issuer": "https://accounts.google.com",
@@ -3298,7 +3312,7 @@ class _SettingsPanel(QWidget):
          "url": "https://mcp.paypal.com/mcp", "auth_type": "oauth",
          "token_env": None, "needs_dir": False},
         # ── WOR-94: present but DISABLED (``url`` left empty → _mcp_connectable
-        # returns False, exactly like Gmail/Google Drive above). Each HAS a
+        # returns False, exactly like legacy Google Drive above). Each HAS a
         # verified official remote MCP endpoint, but it does NOT support open
         # RFC 7591 Dynamic Client Registration, which OSIA's OAuth substrate
         # REQUIRES (the SDK auto-registers — there is no pre-registered
@@ -3489,6 +3503,7 @@ class _SettingsPanel(QWidget):
         self._mcp_client_secret_inputs: dict = {}   # WOR-100 Ph2: non-DCR client_secret
         self._mcp_dir_inputs: dict = {}
         self._mcp_extra_inputs: dict = {}   # {id: {env_var: QLineEdit}}
+        self._gmail_rest_account_labels: dict = {}
         # Optimistic transient state per id: {id: (visual_state, resolve_set, ticks)}
         self._mcp_pending: dict = {}
         # Catalog + custom entries by id (rebuilt by _render_mcp) and the
@@ -3528,11 +3543,14 @@ class _SettingsPanel(QWidget):
         on what the manager can connect. (Any URL-less OAuth catalog entry —
         e.g. the WOR-94 vendors shipped DISABLED with url="" — therefore stays
         non-connectable, showing the disabled OAuth label, until its URL is
-        wired. Gmail/Google Drive were enabled in WOR-100 Phase 2.)"""
+        wired. Google Drive was enabled in WOR-100 Phase 2; visible Gmail is now
+        native REST and handled by its own branch.)"""
         try:
             from osia.mcp_client import SUPPORTED_TRANSPORTS
         except Exception:
             SUPPORTED_TRANSPORTS = ("stdio",)
+        if self._is_gmail_rest_entry(entry):
+            return True
         return (
             entry.get("transport") in SUPPORTED_TRANSPORTS
             and (
@@ -3540,6 +3558,63 @@ class _SettingsPanel(QWidget):
                 or bool(str(entry.get("url") or "").strip())
             )
         )
+
+    @staticmethod
+    def _is_gmail_rest_entry(entry: dict | None) -> bool:
+        return bool(
+            isinstance(entry, dict)
+            and entry.get("id") == "gmail"
+            and entry.get("native_integration") == "gmail-rest"
+        )
+
+    def _make_google_oauth_guide_button(
+        self, entry: dict, *, mode: str | None = None
+    ) -> QPushButton:
+        guide_btn = QPushButton(i18n.t("mcp.setup_guide"))
+        guide_btn.setObjectName("ghostBtn")
+        guide_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        def _open_oauth_wizard(_=False, e=entry, wizard_mode=mode):
+            try:
+                from osia.gui.mcp_oauth_wizard import _MCPOAuthWizardDialog
+                _MCPOAuthWizardDialog(self, e, mode=wizard_mode).exec()
+            except Exception:
+                pass
+
+        guide_btn.clicked.connect(_open_oauth_wizard)
+        return guide_btn
+
+    def _gmail_rest_client(self) -> dict:
+        """Return stored native Gmail client fields, falling back to legacy setup."""
+        for key in ("gmail-rest", "gmail"):
+            try:
+                client = get_oauth_client(key)
+            except Exception:
+                client = {}
+            if isinstance(client, dict) and client.get("client_id"):
+                return dict(client)
+        return {}
+
+    def _save_gmail_rest_client_from_fields(self) -> None:
+        cidin = self._mcp_client_id_inputs.get("gmail")
+        csecin = self._mcp_client_secret_inputs.get("gmail")
+        client_id = cidin.text().strip() if cidin else ""
+        client_secret = csecin.text().strip() if csecin else ""
+        if not client_id and not client_secret:
+            return
+        if not client_id:
+            self._mcp_flag_required(cidin)
+            raise ValueError("missing Gmail OAuth client id")
+        client = {
+            "client_id": client_id,
+            "redirect_uris": ["http://127.0.0.1:8975/callback"],
+            "token_endpoint_auth_method": (
+                "client_secret_post" if client_secret else "none"
+            ),
+        }
+        if client_secret:
+            client["client_secret"] = client_secret
+        set_oauth_client("gmail-rest", client)
 
     def _mcp_saved_servers(self) -> list:
         out = []
@@ -3607,7 +3682,7 @@ class _SettingsPanel(QWidget):
         Brave Search are intentionally absent from the catalog — each duplicates
         a native OSIA capability; see _MCP_CATALOG.)"""
         catalog_ids = {e["id"] for e in self._MCP_CATALOG}
-        out = list(self._MCP_CATALOG)
+        out = [e for e in self._MCP_CATALOG if not e.get("hidden")]
         for s in self._mcp_saved_servers():
             sid = s["id"]
             if sid in catalog_ids:
@@ -3667,6 +3742,7 @@ class _SettingsPanel(QWidget):
         self._mcp_client_secret_inputs = {}   # WOR-100 Ph2: non-DCR client_secret field
         self._mcp_dir_inputs = {}
         self._mcp_extra_inputs = {}
+        self._gmail_rest_account_labels = {}
         entry = self._mcp_entries.get(sid)
         if entry is None:
             return
@@ -3709,6 +3785,11 @@ class _SettingsPanel(QWidget):
             badge.setStyleSheet("color: #c79030; font-size: 11px;")
             badge.setToolTip(i18n.t("mcp.tooltip_google_bug"))
             head.addWidget(badge)
+        if self._is_gmail_rest_entry(entry):
+            badge = QLabel(i18n.t("mcp.badge_readonly"))
+            badge.setObjectName("providerSub")
+            badge.setStyleSheet("font-size: 11px;")
+            head.addWidget(badge)
         head.addStretch(1)
         pill = QLabel("")
         pill.setObjectName("mcpPill")
@@ -3728,6 +3809,38 @@ class _SettingsPanel(QWidget):
             desc.setObjectName("providerSub")
             desc.setWordWrap(True)
             v.addWidget(desc)
+
+        if self._is_gmail_rest_entry(entry):
+            account = QLabel("")
+            account.setObjectName("providerSub")
+            account.setWordWrap(True)
+            self._gmail_rest_account_labels[sid] = account
+            v.addWidget(account)
+            self._update_gmail_rest_account_label()
+
+            if not self._gmail_rest_client().get("client_id"):
+                cidlab = QLabel(i18n.t("mcp.lbl_client_id"))
+                cidlab.setObjectName("providerSub")
+                cidlab.setWordWrap(True)
+                v.addWidget(cidlab)
+                cidin = QLineEdit("")
+                cidin.setObjectName("keyInput")
+                cidin.setPlaceholderText(i18n.t("mcp.ph_client_id"))
+                self._mcp_client_id_inputs[sid] = cidin
+                v.addWidget(cidin)
+
+                cseclab = QLabel(i18n.t("mcp.lbl_client_secret"))
+                cseclab.setObjectName("providerSub")
+                cseclab.setWordWrap(True)
+                v.addWidget(cseclab)
+                csecin = QLineEdit("")
+                csecin.setObjectName("keyInput")
+                csecin.setEchoMode(QLineEdit.EchoMode.Password)
+                csecin.setPlaceholderText(i18n.t("mcp.ph_client_secret"))
+                self._mcp_client_secret_inputs[sid] = csecin
+                v.addWidget(csecin)
+
+            v.addWidget(self._make_google_oauth_guide_button(entry, mode="gmail-rest"))
 
         connectable = self._mcp_connectable(entry)
 
@@ -3821,19 +3934,7 @@ class _SettingsPanel(QWidget):
             # WOR-100 Phase 2: the Google setup guide is provider-specific, so it
             # stays only on Gmail/Drive. Slack has its own app setup flow.
             if sid in ("google-drive", "gmail"):
-                guide_btn = QPushButton(i18n.t("mcp.setup_guide"))
-                guide_btn.setObjectName("ghostBtn")
-                guide_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-
-                def _open_oauth_wizard(_=False, e=entry):
-                    try:
-                        from osia.gui.mcp_oauth_wizard import _MCPOAuthWizardDialog
-                        _MCPOAuthWizardDialog(self, e).exec()
-                    except Exception:
-                        pass
-
-                guide_btn.clicked.connect(_open_oauth_wizard)
-                v.addWidget(guide_btn)
+                v.addWidget(self._make_google_oauth_guide_button(entry))
 
         if connectable:
             saved_extra = (saved or {}).get("extra_env") or {}
@@ -3856,6 +3957,18 @@ class _SettingsPanel(QWidget):
         actions.setSpacing(6)
         actions.addStretch(1)
         if connectable:
+            if self._is_gmail_rest_entry(entry):
+                btn = QPushButton(i18n.t("mcp.gmail_connect"))
+                btn.setObjectName("primaryBtn")
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.clicked.connect(
+                    lambda _=False, e=entry: self._on_gmail_rest_toggle(e)
+                )
+                self._mcp_buttons[sid] = btn
+                actions.addWidget(btn)
+                v.addLayout(actions)
+                self._refresh_gmail_rest_status()
+                return row
             # WOR-44 Phase 5 (5-oauth-a): OAuth connectors get a distinct
             # "Connect with OAuth" label (the click still routes through the
             # same _on_mcp_toggle → _on_mcp_connect path; the manager opens the
@@ -4062,6 +4175,177 @@ class _SettingsPanel(QWidget):
         if headers:
             connect["headers"] = headers
         return connect, persist, token, client_id, client_secret
+
+    def _refresh_gmail_rest_status(self, *, force: bool = False) -> None:
+        if self._gmail_rest_probe_busy:
+            return
+        if (
+            not force
+            and isinstance(self._gmail_rest_status, dict)
+            and self._gmail_rest_status.get("status") == "connecting"
+        ):
+            return
+        now = datetime.now()
+        if (
+            not force
+            and now - self._gmail_rest_last_probe < timedelta(seconds=45)
+        ):
+            return
+        self._gmail_rest_probe_busy = True
+        self._gmail_rest_last_probe = now
+
+        def _bg():
+            try:
+                from osia.tools.gmail import gmail_connection_status
+                status = gmail_connection_status(validate=True)
+            except Exception as exc:
+                status = {
+                    "status": "failed",
+                    "connected": False,
+                    "emailAddress": None,
+                    "error": f"Gmail status check failed: {type(exc).__name__}",
+                }
+            self._gmail_rest_status_ready.emit(status)
+
+        threading.Thread(
+            target=_bg, name="osia-gmail-rest-status", daemon=True
+        ).start()
+
+    def _apply_gmail_rest_status(self, status: dict) -> None:
+        self._gmail_rest_probe_busy = False
+        if not isinstance(status, dict):
+            status = {
+                "status": "failed",
+                "connected": False,
+                "emailAddress": None,
+                "error": "Gmail status check failed.",
+            }
+        self._gmail_rest_status = dict(status)
+        self._update_gmail_rest_widgets()
+
+    def _update_gmail_rest_widgets(self) -> None:
+        status = self._gmail_rest_status if isinstance(
+            self._gmail_rest_status, dict
+        ) else {}
+        state = str(status.get("status") or "disconnected")
+        if state not in self._MCP_PILL_COLORS:
+            state = "disconnected"
+        pill = self._mcp_pills.get("gmail")
+        if pill is not None:
+            self._set_mcp_pill(pill, state)
+        btn = self._mcp_buttons.get("gmail")
+        if btn is not None:
+            btn.setText(
+                i18n.t("mcp.disconnect")
+                if state == "connected"
+                else (
+                    i18n.t("mcp.status_connecting")
+                    if state == "connecting"
+                    else i18n.t("mcp.gmail_connect")
+                )
+            )
+            btn.setEnabled(state != "connecting")
+            error = str(status.get("error") or "").strip()
+            btn.setToolTip(error if state == "failed" else "")
+        self._update_gmail_rest_account_label()
+
+    def _update_gmail_rest_account_label(self) -> None:
+        label = self._gmail_rest_account_labels.get("gmail")
+        if label is None:
+            return
+        status = self._gmail_rest_status if isinstance(
+            self._gmail_rest_status, dict
+        ) else {}
+        state = str(status.get("status") or "disconnected")
+        email = str(status.get("emailAddress") or "").strip()
+        error = str(status.get("error") or "").strip()
+        if state == "connected" and email:
+            label.setText(i18n.t("mcp.gmail_account", email=email))
+        elif state == "failed" and error:
+            label.setText(i18n.t("mcp.gmail_failed", error=error))
+        else:
+            label.setText(i18n.t("mcp.gmail_hint"))
+
+    def _on_gmail_rest_toggle(self, entry: dict) -> None:
+        if not self._is_gmail_rest_entry(entry):
+            return
+        status = self._gmail_rest_status if isinstance(
+            self._gmail_rest_status, dict
+        ) else {}
+        if status.get("status") == "connected":
+            self._on_gmail_rest_disconnect()
+        else:
+            self._on_gmail_rest_connect()
+
+    def _on_gmail_rest_connect(self) -> None:
+        try:
+            self._save_gmail_rest_client_from_fields()
+        except ValueError:
+            self._apply_gmail_rest_status({
+                "status": "failed",
+                "connected": False,
+                "emailAddress": None,
+                "error": i18n.t("mcp.gmail_client_required"),
+            })
+            return
+        self._apply_gmail_rest_status({
+            "status": "connecting",
+            "connected": False,
+            "emailAddress": None,
+            "error": "",
+        })
+
+        def _bg():
+            try:
+                from osia.tools.gmail import (
+                    gmail_connect,
+                    gmail_connection_status,
+                )
+                gmail_connect()
+                status = gmail_connection_status(validate=True)
+            except Exception:
+                status = {
+                    "status": "failed",
+                    "connected": False,
+                    "emailAddress": None,
+                    "error": i18n.t("mcp.gmail_oauth_failed"),
+                }
+            self._gmail_rest_status_ready.emit(status)
+
+        threading.Thread(
+            target=_bg, name="osia-gmail-rest-connect", daemon=True
+        ).start()
+
+    def _on_gmail_rest_disconnect(self) -> None:
+        self._apply_gmail_rest_status({
+            "status": "connecting",
+            "connected": False,
+            "emailAddress": None,
+            "error": "",
+        })
+
+        def _bg():
+            try:
+                from osia.tools.gmail import gmail_disconnect
+                gmail_disconnect()
+                status = {
+                    "status": "disconnected",
+                    "connected": False,
+                    "emailAddress": None,
+                    "error": "",
+                }
+            except Exception:
+                status = {
+                    "status": "failed",
+                    "connected": False,
+                    "emailAddress": None,
+                    "error": i18n.t("mcp.gmail_disconnect_failed"),
+                }
+            self._gmail_rest_status_ready.emit(status)
+
+        threading.Thread(
+            target=_bg, name="osia-gmail-rest-disconnect", daemon=True
+        ).start()
 
     def _on_mcp_toggle(self, entry: dict) -> None:
         sid = entry["id"]
@@ -4326,6 +4610,11 @@ class _SettingsPanel(QWidget):
         except Exception:
             snap = {}
         for sid, pill in self._mcp_pills.items():
+            entry = self._mcp_entries.get(sid) or {}
+            if self._is_gmail_rest_entry(entry):
+                self._refresh_gmail_rest_status()
+                self._update_gmail_rest_widgets()
+                continue
             info = snap.get(sid, {}) if isinstance(snap, dict) else {}
             ms = info.get("status", "disconnected")
             err = info.get("error", "")
@@ -4347,7 +4636,6 @@ class _SettingsPanel(QWidget):
                 # Keep the OAuth-specific connect label when disconnected (the
                 # card built it as "Connect with OAuth"); the poll would
                 # otherwise revert it to the generic "Connect".
-                entry = self._mcp_entries.get(sid) or {}
                 connect_label = (
                     i18n.t("mcp.connect_oauth")
                     if entry.get("auth_type") == "oauth"
