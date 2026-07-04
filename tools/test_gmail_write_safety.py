@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 import json
 from pathlib import Path
@@ -329,10 +330,24 @@ class MobileGmailSnapshotTests(unittest.TestCase):
                     "modify": False,
                 },
                 "reason": "",
+                "canDisconnect": True,
+                "configureOnPc": True,
+                "elevateOnPc": True,
+                "guideAvailable": True,
             },
         )
         self.assertNotIn("scope", cfg["gmail_rest"])
         self.assertNotIn("access_token", cfg["gmail_rest"])
+        for secret_key in (
+            "access_token",
+            "refresh_token",
+            "client_secret",
+            "clientSecret",
+            "oauth_token",
+            "token",
+            "scope",
+        ):
+            self.assertNotIn(secret_key, cfg["gmail_rest"])
 
         by_id = {s["id"]: s for s in cfg["mcp_servers"]}
         self.assertIn("linear", by_id)
@@ -360,6 +375,70 @@ class MobileGmailSnapshotTests(unittest.TestCase):
             "should-not-leak",
         ):
             self.assertNotIn(needle, safe_payload)
+
+    def test_native_gmail_disconnect_action_broadcasts_safe_config(self):
+        from osia.server import server as server_mod
+
+        disconnect_calls: list[bool] = []
+        broadcasts: list[dict] = []
+
+        def fake_disconnect():
+            disconnect_calls.append(True)
+            return {"status": "disconnected"}
+
+        async def fake_broadcast_config(frame, exclude=None):
+            broadcasts.append(frame)
+
+        def fake_run_coroutine_threadsafe(coro, loop):
+            asyncio.run(coro)
+            return object()
+
+        self.assertTrue(
+            server_mod._is_native_gmail_rest_mobile_action(
+                "mcp_disconnect", "gmail-rest"
+            )
+        )
+        self.assertFalse(
+            server_mod._is_native_gmail_rest_mobile_action(
+                "mcp_disconnect", "gmail"
+            )
+        )
+        self.assertFalse(
+            server_mod._is_native_gmail_rest_mobile_action(
+                "mcp_connect", "gmail-rest"
+            )
+        )
+
+        safe_cfg = {
+            "gmail_rest": {
+                "connected": False,
+                "status": "disconnected",
+                "canDisconnect": False,
+                "configureOnPc": True,
+                "elevateOnPc": False,
+                "guideAvailable": True,
+            },
+            "mcp_servers": [
+                {"id": "linear", "enabled": True},
+                {"id": "github", "enabled": True},
+            ],
+        }
+        with patched(gmail, "gmail_disconnect", fake_disconnect), patched(
+            server_mod, "_build_config_snapshot", lambda: safe_cfg
+        ), patched(
+            server_mod, "_broadcast_config", fake_broadcast_config
+        ), patched(
+            server_mod.asyncio,
+            "run_coroutine_threadsafe",
+            fake_run_coroutine_threadsafe,
+        ):
+            server_mod._disconnect_native_gmail_rest_and_broadcast(object())
+
+        self.assertEqual(disconnect_calls, [True])
+        self.assertEqual(
+            broadcasts,
+            [{"type": "config", "config": safe_cfg}],
+        )
 
 
 class GoogleOAuthFlowTests(unittest.TestCase):

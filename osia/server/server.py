@@ -915,6 +915,7 @@ def _mcp_status_frame(server_id=None) -> dict:
 
 
 _LEGACY_GMAIL_MCP_HOST = "gmailmcp.googleapis.com"
+_NATIVE_GMAIL_REST_ID = "gmail-rest"
 _MOBILE_MCP_SERVER_SECRET_KEYS = {
     "access_token",
     "clientSecret",
@@ -954,21 +955,50 @@ def _gmail_rest_config_snapshot() -> dict:
     if not connected:
         error = status.get("error") or status.get("reason") or ""
         reason = str(error).strip()[:500] if error else ""
+    capabilities = {
+        "readonly": bool(
+            caps.get("readOnly")
+            or caps.get("readonly")
+            or status.get("readOnlyConnected")
+        ),
+        "compose": bool(caps.get("compose") or status.get("composeEnabled")),
+        "modify": bool(caps.get("modify") or status.get("modifyEnabled")),
+    }
     return {
         "connected": connected,
         "status": state,
         "emailAddress": email,
-        "capabilities": {
-            "readonly": bool(
-                caps.get("readOnly")
-                or caps.get("readonly")
-                or status.get("readOnlyConnected")
-            ),
-            "compose": bool(caps.get("compose") or status.get("composeEnabled")),
-            "modify": bool(caps.get("modify") or status.get("modifyEnabled")),
-        },
+        "capabilities": capabilities,
         "reason": reason,
+        "canDisconnect": connected,
+        "configureOnPc": True,
+        "elevateOnPc": bool(
+            connected and (not capabilities["compose"] or not capabilities["modify"])
+        ),
+        "guideAvailable": True,
     }
+
+
+def _is_native_gmail_rest_mobile_action(msg_type: str, server_id: str) -> bool:
+    return msg_type == "mcp_disconnect" and server_id == _NATIVE_GMAIL_REST_ID
+
+
+def _disconnect_native_gmail_rest_and_broadcast(loop) -> None:
+    """Disconnect native Gmail REST, then push the existing safe config frame."""
+    try:
+        from osia.tools.gmail import gmail_disconnect
+
+        gmail_disconnect()
+    except Exception as e:
+        print(f"[OSIA Server] gmail-rest disconnect worker failed: {e}")
+        return
+    try:
+        cfg = _build_config_snapshot()
+        asyncio.run_coroutine_threadsafe(
+            _broadcast_config({"type": "config", "config": cfg}), loop
+        )
+    except Exception as e:
+        print(f"[OSIA Server] gmail-rest config broadcast failed: {e}")
 
 
 def _is_legacy_gmail_mcp_server(entry: dict) -> bool:
@@ -3979,11 +4009,22 @@ async def websocket_endpoint(ws: WebSocket):
                         await out.send_json({"type": "status", "status": "error"})
                     continue
 
-                # connect / disconnect require a known, saved server id.
+                # connect / disconnect require a known, saved server id, except
+                # the native Gmail REST integration which reuses this action
+                # channel but is intentionally not an MCP server.
                 if not server_id:
                     await out.send_json(
                         {"type": "status", "status": "error", "error": "missing id"}
                     )
+                    continue
+                if _is_native_gmail_rest_mobile_action(msg_type, server_id):
+                    threading.Thread(
+                        target=_disconnect_native_gmail_rest_and_broadcast,
+                        args=(asyncio.get_running_loop(),),
+                        name="osia-gmail-rest-disconnect",
+                        daemon=True,
+                    ).start()
+                    await out.send_json({"type": "status", "status": "done"})
                     continue
                 saved = _mcp_find_saved_server(server_id)
                 if saved is None:
