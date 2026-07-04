@@ -914,6 +914,98 @@ def _mcp_status_frame(server_id=None) -> dict:
     return {"type": "mcp_status", "servers": servers}
 
 
+_LEGACY_GMAIL_MCP_HOST = "gmailmcp.googleapis.com"
+_MOBILE_MCP_SERVER_SECRET_KEYS = {
+    "access_token",
+    "clientSecret",
+    "client_secret",
+    "oauth_client_secret",
+    "oauth_token",
+    "refresh_token",
+    "token",
+}
+
+
+def _gmail_rest_config_snapshot() -> dict:
+    """Token-safe native Gmail REST status for the mobile config snapshot."""
+    try:
+        from osia.tools.gmail import gmail_connection_status
+
+        raw = gmail_connection_status(validate=False)
+        status = raw if isinstance(raw, dict) else {}
+    except Exception:
+        status = {
+            "connected": False,
+            "status": "failed",
+            "error": "Unable to read Gmail REST status.",
+        }
+
+    caps = status.get("capabilities")
+    caps = caps if isinstance(caps, dict) else {}
+    connected = bool(status.get("connected"))
+    state = str(
+        status.get("status") or ("connected" if connected else "disconnected")
+    ).strip() or ("connected" if connected else "disconnected")
+    email = status.get("emailAddress")
+    email = email.strip() if isinstance(email, str) else None
+    if not email:
+        email = None
+    reason = ""
+    if not connected:
+        error = status.get("error") or status.get("reason") or ""
+        reason = str(error).strip()[:500] if error else ""
+    return {
+        "connected": connected,
+        "status": state,
+        "emailAddress": email,
+        "capabilities": {
+            "readonly": bool(
+                caps.get("readOnly")
+                or caps.get("readonly")
+                or status.get("readOnlyConnected")
+            ),
+            "compose": bool(caps.get("compose") or status.get("composeEnabled")),
+            "modify": bool(caps.get("modify") or status.get("modifyEnabled")),
+        },
+        "reason": reason,
+    }
+
+
+def _is_legacy_gmail_mcp_server(entry: dict) -> bool:
+    sid = str(entry.get("id") or "").strip().lower()
+    url = str(entry.get("url") or "").strip().lower()
+    return sid in {"gmail", "gmail-mcp-legacy"} and _LEGACY_GMAIL_MCP_HOST in url
+
+
+def _sanitize_mobile_mcp_servers(servers) -> list:
+    """Return the mobile-facing connector list without legacy Gmail as Gmail."""
+    clean = []
+    legacy_seen = False
+    if not isinstance(servers, list):
+        return clean
+    for server in servers:
+        if not isinstance(server, dict):
+            continue
+        entry = dict(server)
+        entry["env"] = {}
+        entry.pop("headers", None)
+        for key in _MOBILE_MCP_SERVER_SECRET_KEYS:
+            entry.pop(key, None)
+        if _is_legacy_gmail_mcp_server(entry):
+            if legacy_seen:
+                continue
+            entry.update({
+                "id": "gmail-mcp-legacy",
+                "name": "Gmail (legacy MCP)",
+                "hidden": True,
+                "temporarily_unavailable": True,
+                "enabled": False,
+            })
+            legacy_seen = True
+        clean.append(entry)
+    return clean
+
+
 async def _broadcast_mcp_status(
     frame: dict, exclude: "_OutboundChannel | None" = None
 ) -> None:
@@ -952,6 +1044,8 @@ def _build_config_snapshot() -> dict:
     from osia.config import load_settings, load_api_keys, get_setting
     from osia import personality
     cfg = load_settings()
+    cfg["mcp_servers"] = _sanitize_mobile_mcp_servers(cfg.get("mcp_servers"))
+    cfg["gmail_rest"] = _gmail_rest_config_snapshot()
     # api_key_fallbacks holds the raw ordered fallback keys per provider (WOR-29).
     # The mobile fallback-keys editor needs the actual keys, so ship them as-is —
     # the connection is already authenticated + TLS, identical to get_api_keys.
@@ -1723,19 +1817,20 @@ def _deny_confirms_for_channel(channel) -> None:
                     pass
 
 
-def _ws_confirm_provider(server_id: str, tool_name: str, summary: str) -> bool:
+def _ws_confirm_provider(server_id: str, tool_name: str, summary: str) -> bool | None:
     """MCP confirmation provider for the SERVER process. CALLED ON THE AGENT'S
     WORKER THREAD. Sends an ``mcp_confirm_request`` to the turn's originating
     client and blocks until the user answers or the timeout elapses. Returns True
-    ONLY on an explicit approve; denies (False) on timeout / no client / send
-    failure / disconnect / any error. Never raises (the provider contract)."""
+    ONLY on an explicit approve, False on decline / timeout / disconnect, and
+    None when there is no active target to ask. Never raises (the provider
+    contract)."""
     try:
         target = _turn_target.get()
         if not target:
-            return False  # no originating channel (unattended) -> deny
+            return None  # no originating channel; let unattended policy decide
         channel, loop = target
         if channel is None or loop is None or not loop.is_running():
-            return False
+            return None
         request_id = secrets.token_hex(8)
         fut: "concurrent.futures.Future" = concurrent.futures.Future()
         with _pending_confirms_lock:
@@ -1754,7 +1849,7 @@ def _ws_confirm_provider(server_id: str, tool_name: str, summary: str) -> bool:
         except Exception:
             with _pending_confirms_lock:
                 _pending_confirms.pop(request_id, None)
-            return False
+            return None
         try:
             approved = fut.result(timeout=_MCP_CONFIRM_WS_TIMEOUT)
         except Exception:  # TimeoutError or any -> deny

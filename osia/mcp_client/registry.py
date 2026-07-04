@@ -162,8 +162,10 @@ def classify_tool(name: str, annotations: Optional[dict] = None) -> bool:
 # Process-wide confirmation provider. A UI (desktop Qt dialog / mobile WS round-
 # trip — later sub-steps) registers ONE provider; the gate calls it for write
 # tools when confirmation is enabled. Signature:
-# ``provider(server_id, tool_name, summary) -> bool`` (True = approved).
-# ``None`` means no provider is registered (an unattended cron/autonomous run).
+# ``provider(server_id, tool_name, summary) -> bool | None``
+# True = approved, False = declined/denied, None = no approver target available.
+# A missing provider also means no provider is registered (an unattended
+# cron/autonomous run).
 _confirmation_provider = None
 
 
@@ -219,13 +221,16 @@ def confirm_connector_write(
     provider = get_confirmation_provider()
     if provider is not None:
         try:
-            approved = bool(provider(server_id, tool_name, str(summary or "")))
+            decision = provider(server_id, tool_name, str(summary or ""))
         except Exception:
-            approved = False  # a provider failure is treated as a decline (safe)
-        if approved:
-            return None
-        return f"ERROR: {error_namespace}/{server_id}/{tool_name}: user declined"
-    # Unattended: no UI/provider present.
+            decision = False  # a provider failure is treated as a decline (safe)
+        if decision is not None:
+            if bool(decision):
+                return None
+            return (
+                f"ERROR: {error_namespace}/{server_id}/{tool_name}: user declined"
+            )
+    # Unattended: no UI/provider/target present.
     if _setting_bool("mcp_allow_unattended_writes", False):
         return None
     return (
@@ -243,7 +248,7 @@ def _confirm_gate(server_id: str, tool_name: str, kwargs: dict) -> Optional[str]
       * mcp_confirm_writes False                -> allow.
       * confirm True + provider registered      -> ask; approved -> allow,
         declined/raised -> block ("user declined").
-      * confirm True + NO provider (unattended) -> mcp_allow_unattended_writes
+      * confirm True + NO provider/target       -> mcp_allow_unattended_writes
         True -> allow, else block ("no approver available").
     """
     return confirm_connector_write(
