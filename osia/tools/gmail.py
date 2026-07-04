@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Minimal native Gmail REST proof-of-life tools.
+"""Minimal native Gmail REST tools.
 
-Phase 0 only: command-line, read-only Gmail REST calls using OSIA's local
-``gmail-rest`` OAuth blob. This module is intentionally not registered in
-``osia.agent`` yet.
+Read-only Gmail REST calls using OSIA's local ``gmail-rest`` OAuth blob.
+Phase 1 registers the safe read-only subset in ``osia.agent``.
 """
 
 from __future__ import annotations
@@ -32,6 +31,27 @@ HEADER_CHAR_LIMIT = 1000
 SNIPPET_CHAR_LIMIT = 1000
 MAX_LATEST_RESULTS = 25
 MAX_ATTACHMENTS = 50
+MAX_THREAD_MESSAGES = 10
+
+NOT_CONNECTED_ERROR = (
+    "ERROR: Gmail is not connected. Open Settings > Gmail and connect the "
+    "native Gmail integration. The legacy Google MCP Gmail connector is "
+    "temporarily unavailable."
+)
+RECONNECT_ERROR = (
+    "ERROR: Gmail connection needs to be refreshed. Open Settings > Gmail and "
+    "reconnect the native Gmail integration. The legacy Google MCP Gmail "
+    "connector is temporarily unavailable."
+)
+PERMISSION_ERROR = (
+    "ERROR: Gmail API permission error. Reconnect native Gmail with the Gmail "
+    "read-only scope. The legacy Google MCP Gmail connector is temporarily "
+    "unavailable."
+)
+NETWORK_ERROR = (
+    "ERROR: Gmail API request failed because the network or Google API was "
+    "unavailable. Try again in a moment."
+)
 
 
 class GmailRestError(RuntimeError):
@@ -51,92 +71,246 @@ def gmail_connect() -> dict:
     }
 
 
-def gmail_profile(*, interactive: bool = True) -> dict:
+def gmail_profile(*, interactive: bool = False) -> dict | str:
     """Return the Gmail profile for the connected account."""
-    data = _gmail_get("/profile", interactive=interactive)
-    return {
-        "emailAddress": data.get("emailAddress"),
-        "messagesTotal": data.get("messagesTotal"),
-        "threadsTotal": data.get("threadsTotal"),
-        "historyId": data.get("historyId"),
-    }
+    def run() -> dict:
+        data = _gmail_get("/profile", interactive=interactive)
+        return {
+            "emailAddress": data.get("emailAddress"),
+            "messagesTotal": data.get("messagesTotal"),
+            "threadsTotal": data.get("threadsTotal"),
+            "historyId": data.get("historyId"),
+        }
+
+    return _safe_gmail_result(run)
 
 
-def gmail_list_labels(*, interactive: bool = True) -> dict:
+def gmail_list_labels(*, interactive: bool = False) -> dict | str:
     """Return Gmail labels with basic count metadata."""
-    data = _gmail_get("/labels", interactive=interactive)
-    labels = data.get("labels") if isinstance(data, dict) else []
-    clean = []
-    for label in labels if isinstance(labels, list) else []:
-        if not isinstance(label, dict):
-            continue
-        clean.append({
-            "id": label.get("id"),
-            "name": label.get("name"),
-            "type": label.get("type"),
-            "messageListVisibility": label.get("messageListVisibility"),
-            "labelListVisibility": label.get("labelListVisibility"),
-            "messagesTotal": label.get("messagesTotal"),
-            "messagesUnread": label.get("messagesUnread"),
-            "threadsTotal": label.get("threadsTotal"),
-            "threadsUnread": label.get("threadsUnread"),
-        })
-    return {"labels": clean}
+    def run() -> dict:
+        data = _gmail_get("/labels", interactive=interactive)
+        labels = data.get("labels") if isinstance(data, dict) else []
+        clean = []
+        for label in labels if isinstance(labels, list) else []:
+            if not isinstance(label, dict):
+                continue
+            clean.append({
+                "id": label.get("id"),
+                "name": label.get("name"),
+                "type": label.get("type"),
+                "messageListVisibility": label.get("messageListVisibility"),
+                "labelListVisibility": label.get("labelListVisibility"),
+                "messagesTotal": label.get("messagesTotal"),
+                "messagesUnread": label.get("messagesUnread"),
+                "threadsTotal": label.get("threadsTotal"),
+                "threadsUnread": label.get("threadsUnread"),
+            })
+        return {"labels": clean}
+
+    return _safe_gmail_result(run)
 
 
-def gmail_list_latest(max_results: int = 5, *, interactive: bool = True) -> dict:
+def gmail_list_latest(
+    max_results: int = 5, *, interactive: bool = False
+) -> dict | str:
     """List recent message summaries and fetch each message's metadata."""
-    limit = _coerce_limit(max_results)
-    data = _gmail_get(
-        "/messages",
-        params={"maxResults": limit},
-        interactive=interactive,
-    )
-    raw_messages = data.get("messages") if isinstance(data, dict) else []
-    summaries = []
-    for item in raw_messages if isinstance(raw_messages, list) else []:
-        if not isinstance(item, dict) or not item.get("id"):
-            continue
-        summaries.append(gmail_get_message_metadata(str(item["id"]),
-                                                    interactive=interactive))
-    return {
-        "messages": summaries,
-        "nextPageToken": data.get("nextPageToken"),
-        "resultSizeEstimate": data.get("resultSizeEstimate"),
-    }
+    def run() -> dict | str:
+        limit = _coerce_limit(max_results)
+        data = _gmail_get(
+            "/messages",
+            params={"maxResults": limit},
+            interactive=interactive,
+        )
+        raw_messages = data.get("messages") if isinstance(data, dict) else []
+        summaries = []
+        for item in raw_messages if isinstance(raw_messages, list) else []:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            summary = gmail_get_message_metadata(str(item["id"]),
+                                                 interactive=interactive)
+            if isinstance(summary, str) and summary.startswith("ERROR:"):
+                return summary
+            summaries.append(summary)
+        return {
+            "messages": summaries,
+            "nextPageToken": data.get("nextPageToken"),
+            "resultSizeEstimate": data.get("resultSizeEstimate"),
+        }
+
+    return _safe_gmail_result(run)
 
 
-def gmail_get_message(message_id: str, *, interactive: bool = True) -> dict:
+def gmail_search(
+    query: str, max_results: int = 10, *, interactive: bool = False
+) -> dict | str:
+    """Search Gmail with a Gmail query string and return message summaries."""
+    def run() -> dict | str:
+        clean_query = str(query or "").strip()
+        if not clean_query:
+            raise GmailRestError("query is required.")
+        limit = _coerce_limit(max_results)
+        data = _gmail_get(
+            "/messages",
+            params={"q": clean_query, "maxResults": limit},
+            interactive=interactive,
+        )
+        raw_messages = data.get("messages") if isinstance(data, dict) else []
+        summaries = []
+        for item in raw_messages if isinstance(raw_messages, list) else []:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            summary = gmail_get_message_metadata(str(item["id"]),
+                                                 interactive=interactive)
+            if isinstance(summary, str) and summary.startswith("ERROR:"):
+                return summary
+            summaries.append(summary)
+        return {
+            "query": clean_query,
+            "messages": summaries,
+            "nextPageToken": data.get("nextPageToken"),
+            "resultSizeEstimate": data.get("resultSizeEstimate"),
+        }
+
+    return _safe_gmail_result(run)
+
+
+def gmail_get_message(
+    message_id: str, *, interactive: bool = False
+) -> dict | str:
     """Return a bounded, read-only full Gmail message representation."""
-    message_id = str(message_id or "").strip()
-    if not message_id:
-        raise GmailRestError("message_id is required.")
-    data = _gmail_get(
-        f"/messages/{quote(message_id, safe='')}",
-        params={"format": "full"},
-        interactive=interactive,
-    )
-    return _extract_message(data, include_body=True)
+    def run() -> dict:
+        clean_id = str(message_id or "").strip()
+        if not clean_id:
+            raise GmailRestError("message_id is required.")
+        data = _gmail_get(
+            f"/messages/{quote(clean_id, safe='')}",
+            params={"format": "full"},
+            interactive=interactive,
+        )
+        return _extract_message(data, include_body=True)
+
+    return _safe_gmail_result(run)
 
 
-def gmail_get_message_metadata(message_id: str, *, interactive: bool = True) -> dict:
+def gmail_read_message(
+    message_id: str, *, interactive: bool = False
+) -> dict | str:
+    """Agent-facing alias for reading one bounded Gmail message."""
+    return gmail_get_message(message_id, interactive=interactive)
+
+
+def gmail_read_thread(
+    thread_id: str, *, interactive: bool = False
+) -> dict | str:
+    """Return a bounded, read-only Gmail thread representation."""
+    def run() -> dict:
+        clean_id = str(thread_id or "").strip()
+        if not clean_id:
+            raise GmailRestError("thread_id is required.")
+        data = _gmail_get(
+            f"/threads/{quote(clean_id, safe='')}",
+            params={"format": "full"},
+            interactive=interactive,
+        )
+        raw_messages = data.get("messages") if isinstance(data, dict) else []
+        raw_messages = raw_messages if isinstance(raw_messages, list) else []
+        messages = [
+            _extract_message(message, include_body=True)
+            for message in raw_messages[:MAX_THREAD_MESSAGES]
+            if isinstance(message, dict)
+        ]
+        return {
+            "id": data.get("id") or clean_id,
+            "threadId": data.get("id") or clean_id,
+            "historyId": data.get("historyId"),
+            "messageCount": len(raw_messages),
+            "messagesTruncated": len(raw_messages) > len(messages),
+            "messages": messages,
+        }
+
+    return _safe_gmail_result(run)
+
+
+def gmail_get_message_metadata(
+    message_id: str, *, interactive: bool = False
+) -> dict | str:
     """Return a bounded metadata summary for one Gmail message."""
-    message_id = str(message_id or "").strip()
-    if not message_id:
-        raise GmailRestError("message_id is required.")
-    params = [
-        ("format", "metadata"),
-        ("metadataHeaders", "Subject"),
-        ("metadataHeaders", "From"),
-        ("metadataHeaders", "To"),
-        ("metadataHeaders", "Date"),
-    ]
-    data = _gmail_get(
-        f"/messages/{quote(message_id, safe='')}",
-        params=params,
-        interactive=interactive,
+    def run() -> dict:
+        clean_id = str(message_id or "").strip()
+        if not clean_id:
+            raise GmailRestError("message_id is required.")
+        params = [
+            ("format", "metadata"),
+            ("metadataHeaders", "Subject"),
+            ("metadataHeaders", "From"),
+            ("metadataHeaders", "To"),
+            ("metadataHeaders", "Date"),
+        ]
+        data = _gmail_get(
+            f"/messages/{quote(clean_id, safe='')}",
+            params=params,
+            interactive=interactive,
+        )
+        return _extract_message(data, include_body=False)
+
+    return _safe_gmail_result(run)
+
+
+def _safe_gmail_result(func):
+    try:
+        return func()
+    except (GoogleOAuthError, GmailRestError) as exc:
+        return _safe_gmail_error(exc)
+
+
+def _safe_gmail_error(exc: Exception) -> str:
+    text = str(exc or "").strip()
+    if text.startswith("ERROR:"):
+        return text
+    lower = text.lower()
+    if (
+        "oauth token missing" in lower
+        or "no refresh token stored" in lower
+        or "missing required scopes" in lower
+    ):
+        return NOT_CONNECTED_ERROR
+    if (
+        "401" in lower
+        or "invalid_grant" in lower
+        or "refresh failed" in lower
+        or "expired" in lower
+    ):
+        return RECONNECT_ERROR
+    if (
+        "403" in lower
+        or "permission" in lower
+        or "insufficient" in lower
+        or "forbidden" in lower
+    ):
+        return PERMISSION_ERROR
+    if (
+        "request failed" in lower
+        or "timeout" in lower
+        or "connection" in lower
+        or "network" in lower
+    ):
+        return NETWORK_ERROR
+    prefix = "Gmail request failed"
+    if isinstance(exc, GoogleOAuthError):
+        prefix = "Gmail OAuth failed"
+    detail = _sanitize_error_detail(text)
+    return f"ERROR: {prefix}: {detail}" if detail else f"ERROR: {prefix}."
+
+
+def _sanitize_error_detail(text: str) -> str:
+    detail = str(text or "")
+    detail = re.sub(
+        r"(?i)(access_token|refresh_token|client_secret)\s*[:=]\s*[^,\s}]+",
+        r"\1=<redacted>",
+        detail,
     )
-    return _extract_message(data, include_body=False)
+    detail = re.sub(r"\s+", " ", detail).strip()
+    return detail[:300]
 
 
 def _gmail_get(
@@ -339,8 +513,14 @@ def main(argv: list[str] | None = None) -> int:
                        help="list Gmail labels")
     group.add_argument("--latest", type=int, metavar="N",
                        help="list the latest N message summaries")
+    group.add_argument("--search", metavar="QUERY",
+                       help="search Gmail with a Gmail query")
     group.add_argument("--message", metavar="ID",
                        help="fetch one full message by id")
+    group.add_argument("--thread", metavar="ID",
+                       help="fetch one full thread by id")
+    parser.add_argument("--max-results", type=int, default=10,
+                        help="maximum search results for --search")
     parser.add_argument("--no-browser", action="store_true",
                         help="fail instead of starting OAuth when no token works")
     args = parser.parse_args(argv)
@@ -357,10 +537,19 @@ def main(argv: list[str] | None = None) -> int:
             result = gmail_list_labels(interactive=interactive)
         elif args.latest is not None:
             result = gmail_list_latest(args.latest, interactive=interactive)
-        else:
+        elif args.search is not None:
+            result = gmail_search(args.search, args.max_results,
+                                  interactive=interactive)
+        elif args.message is not None:
             result = gmail_get_message(args.message, interactive=interactive)
+        else:
+            result = gmail_read_thread(args.thread, interactive=interactive)
     except (GoogleOAuthError, GmailRestError) as exc:
         print(f"ERROR: {exc}")
+        return 1
+
+    if isinstance(result, str) and result.startswith("ERROR:"):
+        print(result)
         return 1
 
     print(json.dumps(result, indent=2, ensure_ascii=False))

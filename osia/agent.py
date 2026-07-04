@@ -267,6 +267,26 @@ def get_desktop_path() -> str:
     return home
 
 
+def _gmail_rest_prompt_block(lang: str) -> str:
+    if lang == "fr":
+        return """## Gmail natif REST (lecture seule)
+Pour lire ou chercher des emails Gmail, utilise les outils Gmail REST natifs ci-dessous. Le connecteur Google Gmail MCP historique est temporairement indisponible: ne l'utilise pas pour Gmail.
+- gmail_list_labels: lister les libelles Gmail. Usage : {"tool": "gmail_list_labels"}
+- gmail_list_latest: lister les derniers messages. Usage : {"tool": "gmail_list_latest", "max_results": 3}
+- gmail_search: chercher des messages avec une requete Gmail. Usage : {"tool": "gmail_search", "query": "France Travail", "max_results": 10}
+- gmail_read_message: lire un message avec son message_id. Usage : {"tool": "gmail_read_message", "message_id": "<id>"}
+- gmail_read_thread: lire un thread avec son thread_id. Usage : {"tool": "gmail_read_thread", "thread_id": "<id>"}
+Si Gmail REST n'est pas connecte, dis a l'utilisateur de connecter l'integration Gmail native. Ne suggere pas de reconnecter le Gmail MCP historique."""
+    return """## Native Gmail REST (read-only)
+For Gmail email reading or search, use the native Gmail REST tools below. The legacy Google Gmail MCP connector is temporarily unavailable; do not use it for Gmail.
+- gmail_list_labels: list Gmail labels. Usage: {"tool": "gmail_list_labels"}
+- gmail_list_latest: list the latest messages. Usage: {"tool": "gmail_list_latest", "max_results": 3}
+- gmail_search: search messages with a Gmail query. Usage: {"tool": "gmail_search", "query": "France Travail", "max_results": 10}
+- gmail_read_message: read a message by message_id. Usage: {"tool": "gmail_read_message", "message_id": "<id>"}
+- gmail_read_thread: read a thread by thread_id. Usage: {"tool": "gmail_read_thread", "thread_id": "<id>"}
+If Gmail REST is not connected, ask the user to connect the native Gmail integration. Do not suggest reconnecting the legacy Gmail MCP connector."""
+
+
 def get_system_prompt(lang: str = None, model: str = None, provider: str = None) -> str:
     """Return the system prompt for the given language, with the active
     model and provider injected at the start so the agent knows what it's
@@ -299,6 +319,7 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
             body = body + "\n\n" + skills
     except Exception:
         pass
+    body = body + "\n\n" + _gmail_rest_prompt_block(lang)
     # WOR-44 Phase 2 — list the tools exposed by connected MCP servers so the
     # model can see and call them like native tools. Built FRESH on every
     # get_system_prompt() call. On the SERVER path run(history=...) rebuilds the
@@ -2642,6 +2663,50 @@ def tool_web_state(expect_url: str = None, expect_text: str = None,
     return "web_state: " + " | ".join(parts)
 
 
+def _gmail_tool_result(result) -> str:
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _call_gmail_tool(name: str, *args, **kwargs) -> str:
+    try:
+        from osia.tools import gmail as gmail_tools
+        func = getattr(gmail_tools, name)
+        result = func(*args, interactive=False, **kwargs)
+        return _gmail_tool_result(result)
+    except Exception as exc:
+        return (
+            "ERROR: Gmail native REST tool failed: "
+            f"{type(exc).__name__}. No Gmail data was changed."
+        )
+
+
+def tool_gmail_list_labels() -> str:
+    """List Gmail labels via native Gmail REST (read-only)."""
+    return _call_gmail_tool("gmail_list_labels")
+
+
+def tool_gmail_list_latest(max_results: int = 5) -> str:
+    """List latest Gmail message summaries via native Gmail REST."""
+    return _call_gmail_tool("gmail_list_latest", max_results=max_results)
+
+
+def tool_gmail_search(query: str, max_results: int = 10) -> str:
+    """Search Gmail message summaries via native Gmail REST."""
+    return _call_gmail_tool("gmail_search", query=query, max_results=max_results)
+
+
+def tool_gmail_read_message(message_id: str) -> str:
+    """Read one bounded Gmail message via native Gmail REST."""
+    return _call_gmail_tool("gmail_read_message", message_id=message_id)
+
+
+def tool_gmail_read_thread(thread_id: str) -> str:
+    """Read one bounded Gmail thread via native Gmail REST."""
+    return _call_gmail_tool("gmail_read_thread", thread_id=thread_id)
+
+
 TOOL_MAP = {
     # Shell & launchers
     "bash": tool_bash,
@@ -2698,6 +2763,12 @@ TOOL_MAP = {
     "has_window": tool_has_window,
     "steam_game_state": tool_steam_game_state,
     "web_state": tool_web_state,
+    # Gmail REST (native read-only, WOR-101)
+    "gmail_list_labels": tool_gmail_list_labels,
+    "gmail_list_latest": tool_gmail_list_latest,
+    "gmail_search": tool_gmail_search,
+    "gmail_read_message": tool_gmail_read_message,
+    "gmail_read_thread": tool_gmail_read_thread,
 }
 
 # Known tool names — bare-JSON candidates (priority 3 of the universal
