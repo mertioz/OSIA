@@ -3145,7 +3145,8 @@ class _SettingsPanel(QWidget):
 
     # Catalog entry: id (mcp__<id>__ namespace — no "__"), display name, short
     # descriptor key, transport, command/args (stdio) or url (http), auth_type,
-    # token_env (env var the token is injected into for stdio token servers),
+    # token_env (env var the token is injected into for stdio token servers;
+    # remote token servers leave it None and use an in-memory Bearer header),
     # needs_dir (a stdio server needing an allowed-directory arg — the mechanism
     # is retained for custom servers though no catalog entry uses it: Filesystem
     # was removed because it duplicates OSIA's native file_read/bash tools).
@@ -3157,19 +3158,36 @@ class _SettingsPanel(QWidget):
     # (a user can still add either as a custom stdio server via "+ Add custom").
     _MCP_CATALOG = [
         {"id": "github", "name": "GitHub", "desc_key": "mcp.desc.github",
-         "transport": "stdio", "command": "npx",
-         "args": ["-y", "@modelcontextprotocol/server-github"], "url": None,
-         "auth_type": "token", "token_env": "GITHUB_PERSONAL_ACCESS_TOKEN",
+         # WOR-99: remote GitHub MCP endpoint documented in Linear WOR-99; PAT
+         # rides the existing api_keys.json mcp:github -> Bearer header path.
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "https://api.githubcopilot.com/mcp/",
+         "auth_type": "token", "token_env": None,
          "needs_dir": False},
         {"id": "slack", "name": "Slack", "desc_key": "mcp.desc.slack",
-         "transport": "stdio", "command": "npx",
-         "args": ["-y", "@modelcontextprotocol/server-slack"], "url": None,
-         "auth_type": "token", "token_env": "SLACK_BOT_TOKEN", "needs_dir": False,
-         # Slack's stdio server needs a SECOND (non-secret) env var beside the
-         # bot token — generic extra_env fields render as plain inputs and are
-         # injected into the connect env alongside the token (WOR-44 review).
-         "extra_env": [{"var": "SLACK_TEAM_ID", "label_key": "mcp.field_slack_team",
-                        "ph_key": "mcp.field_slack_team_ph", "required": True}]},
+         # WOR-99: official Slack remote MCP endpoint. Slack does not support
+         # DCR, so users provide their own Slack app OAuth client id/secret; both
+         # are stored in gitignored oauth_tokens.json, never settings.json.
+         "transport": "streamable_http", "command": None, "args": [],
+         "url": "https://mcp.slack.com/mcp", "auth_type": "oauth",
+         "token_env": None, "needs_dir": False, "oauth_no_dcr": True,
+         "oauth_scopes": (
+             "search:read.public search:read.private search:read.mpim "
+             "search:read.im search:read.files search:read.users chat:write "
+             "channels:history groups:history mpim:history im:history "
+             "canvases:read canvases:write users:read users:read.email "
+             "reactions:write reactions:read emoji:read files:read "
+             "channels:write groups:write im:write mpim:write channels:read "
+             "groups:read mpim:read"
+         ),
+         "oauth_token_endpoint_auth_method": "client_secret_post",
+         "oauth_issuer": "https://slack.com",
+         "oauth_authorization_endpoint": "https://slack.com/oauth/v2_user/authorize",
+         "oauth_token_endpoint": "https://slack.com/api/oauth.v2.user.access",
+         "oauth_client_id_label_key": "mcp.lbl_client_id_slack",
+         "oauth_client_id_ph_key": "mcp.ph_client_id_slack",
+         "oauth_client_secret_label_key": "mcp.lbl_client_secret_slack",
+         "oauth_client_secret_ph_key": "mcp.ph_client_secret_slack"},
         {"id": "notion", "name": "Notion", "desc_key": "mcp.desc.notion",
          "transport": "streamable_http", "command": None, "args": [],
          "url": "https://mcp.notion.com/mcp", "auth_type": "oauth",
@@ -3541,7 +3559,7 @@ class _SettingsPanel(QWidget):
             "auth_type": cfg.get("auth_type", "none"),
             "enabled": bool(cfg.get("enabled", False)),
             "token_env": cfg.get("token_env"),
-            # Non-secret extra env values (e.g. SLACK_TEAM_ID) round-trip here so
+            # Non-secret extra env values for custom stdio servers round-trip here so
             # the field re-prefills on reopen; tokens NEVER live here.
             "extra_env": dict(cfg.get("extra_env") or {}),
             "custom": bool(cfg.get("custom", False)),
@@ -3748,14 +3766,15 @@ class _SettingsPanel(QWidget):
             self._mcp_token_inputs[sid] = tin
             v.addWidget(tin)
 
-        # WOR-100: a PRE-REGISTERED (non-DCR) OAuth connector (Google Gmail/Drive)
-        # needs the user's OWN Google "Desktop app" client_id. Rendered like the
-        # token field, but the value is stored in the gitignored oauth_tokens.json
-        # (under the per-server ``static_client`` blob) — NEVER in mcp_servers. Only
-        # for connectable oauth_no_dcr cards (a field on a disabled card would be
-        # misleading and never saved).
+        # A PRE-REGISTERED (non-DCR) OAuth connector needs the user's own OAuth
+        # client_id. Rendered like the token field, but the value is stored in the
+        # gitignored oauth_tokens.json (under the per-server ``static_client``
+        # blob) — NEVER in mcp_servers. Only for connectable oauth_no_dcr cards
+        # (a field on a disabled card would be misleading and never saved).
         if connectable and entry.get("auth_type") == "oauth" and entry.get("oauth_no_dcr"):
-            cidlab = QLabel(i18n.t("mcp.lbl_client_id"))
+            cidlab = QLabel(i18n.t(
+                entry.get("oauth_client_id_label_key") or "mcp.lbl_client_id"
+            ))
             cidlab.setObjectName("providerSub")
             cidlab.setWordWrap(True)
             v.addWidget(cidlab)
@@ -3767,16 +3786,20 @@ class _SettingsPanel(QWidget):
                 cur_cid = ""
             cidin = QLineEdit(cur_cid)
             cidin.setObjectName("keyInput")
-            cidin.setPlaceholderText(i18n.t("mcp.ph_client_id"))
+            cidin.setPlaceholderText(i18n.t(
+                entry.get("oauth_client_id_ph_key") or "mcp.ph_client_id"
+            ))
             self._mcp_client_id_inputs[sid] = cidin
             v.addWidget(cidin)
-            # WOR-100 Phase 2: Google's "Desktop app" client REQUIRES its
-            # client_secret at the token endpoint (oauth_token_endpoint_auth_method=
-            # client_secret_post), so a MASKED secret field sits next to the
-            # client_id. Like the client_id, the value lives in the gitignored
-            # oauth_tokens.json (the per-server ``static_client`` blob) — NEVER in
-            # mcp_servers. Gated identically to the client_id field above.
-            cseclab = QLabel(i18n.t("mcp.lbl_client_secret"))
+            # Some pre-registered clients require a client_secret at the token
+            # endpoint (oauth_token_endpoint_auth_method=client_secret_post), so
+            # a MASKED secret field sits next to the client_id. Like the
+            # client_id, the value lives in the gitignored oauth_tokens.json (the
+            # per-server ``static_client`` blob) — NEVER in mcp_servers.
+            cseclab = QLabel(i18n.t(
+                entry.get("oauth_client_secret_label_key")
+                or "mcp.lbl_client_secret"
+            ))
             cseclab.setObjectName("providerSub")
             cseclab.setWordWrap(True)
             v.addWidget(cseclab)
@@ -3789,30 +3812,28 @@ class _SettingsPanel(QWidget):
             csecin = QLineEdit(cur_csec)
             csecin.setObjectName("keyInput")
             csecin.setEchoMode(QLineEdit.EchoMode.Password)
-            csecin.setPlaceholderText(i18n.t("mcp.ph_client_secret"))
+            csecin.setPlaceholderText(i18n.t(
+                entry.get("oauth_client_secret_ph_key")
+                or "mcp.ph_client_secret"
+            ))
             self._mcp_client_secret_inputs[sid] = csecin
             v.addWidget(csecin)
-            # WOR-100 Phase 2: a "Setup guide" link opens a step-by-step wizard
-            # that walks the user through creating their own Google "Desktop app"
-            # OAuth client (the source of the client_id/secret above). Gated by the
-            # SAME oauth_no_dcr condition, so it appears ONLY on Gmail/Drive — every
-            # other card is byte-for-byte unchanged. The wizard is a SEPARATE
-            # top-level QDialog (lazily imported, instructional only — it never
-            # writes these fields or the connect/persist path), so it cannot touch
-            # the popup's protected sizing (POPUP_W / sizeHint / _animate_width).
-            guide_btn = QPushButton(i18n.t("mcp.setup_guide"))
-            guide_btn.setObjectName("ghostBtn")
-            guide_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            # WOR-100 Phase 2: the Google setup guide is provider-specific, so it
+            # stays only on Gmail/Drive. Slack has its own app setup flow.
+            if sid in ("google-drive", "gmail"):
+                guide_btn = QPushButton(i18n.t("mcp.setup_guide"))
+                guide_btn.setObjectName("ghostBtn")
+                guide_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
-            def _open_oauth_wizard(_=False, e=entry):
-                try:
-                    from osia.gui.mcp_oauth_wizard import _MCPOAuthWizardDialog
-                    _MCPOAuthWizardDialog(self, e).exec()
-                except Exception:
-                    pass
+                def _open_oauth_wizard(_=False, e=entry):
+                    try:
+                        from osia.gui.mcp_oauth_wizard import _MCPOAuthWizardDialog
+                        _MCPOAuthWizardDialog(self, e).exec()
+                    except Exception:
+                        pass
 
-            guide_btn.clicked.connect(_open_oauth_wizard)
-            v.addWidget(guide_btn)
+                guide_btn.clicked.connect(_open_oauth_wizard)
+                v.addWidget(guide_btn)
 
         if connectable:
             saved_extra = (saved or {}).get("extra_env") or {}
@@ -3948,7 +3969,7 @@ class _SettingsPanel(QWidget):
                 return None, None, "", "", ""
             args = args + [d]
 
-        # Extra (non-secret) env fields, e.g. Slack's SLACK_TEAM_ID.
+        # Extra (non-secret) env fields for custom stdio servers.
         extra_env: dict = {}
         for spec in entry.get("extra_env") or []:
             var = spec.get("var")

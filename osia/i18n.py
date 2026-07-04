@@ -1731,6 +1731,32 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Google-„Desktop-App“-Client-Secret einfügen (lokal gespeichert)…",
         "es": "Pega el secreto de cliente de la \"app de escritorio\" de Google (local)…",
     },
+    "mcp.lbl_client_id_slack": {
+        "en": "Slack OAuth client ID", "fr": "ID client OAuth Slack",
+        "zh": "Slack OAuth 客户端 ID", "ja": "Slack OAuth クライアント ID",
+        "de": "Slack-OAuth-Client-ID", "es": "ID de cliente OAuth de Slack",
+    },
+    "mcp.ph_client_id_slack": {
+        "en": "Paste your Slack app client ID (stored locally)…",
+        "fr": "Collez l'ID client de votre app Slack (stocké en local)…",
+        "zh": "粘贴你的 Slack 应用客户端 ID（本地存储）…",
+        "ja": "Slack アプリのクライアント ID を貼り付け（ローカル保存）…",
+        "de": "Client-ID Ihrer Slack-App einfügen (lokal gespeichert)…",
+        "es": "Pega el ID de cliente de tu app de Slack (local)…",
+    },
+    "mcp.lbl_client_secret_slack": {
+        "en": "Slack OAuth client secret", "fr": "Secret client OAuth Slack",
+        "zh": "Slack OAuth 客户端密钥", "ja": "Slack OAuth クライアント シークレット",
+        "de": "Slack-OAuth-Client-Secret", "es": "Secreto de cliente OAuth de Slack",
+    },
+    "mcp.ph_client_secret_slack": {
+        "en": "Paste your Slack app client secret (stored locally)…",
+        "fr": "Collez le secret client de votre app Slack (stocké en local)…",
+        "zh": "粘贴你的 Slack 应用客户端密钥（本地存储）…",
+        "ja": "Slack アプリのクライアント シークレットを貼り付け（ローカル保存）…",
+        "de": "Client-Secret Ihrer Slack-App einfügen (lokal gespeichert)…",
+        "es": "Pega el secreto de cliente de tu app de Slack (local)…",
+    },
     # ── WOR-100 Phase 2: guided OAuth setup wizard (Gmail/Drive, model B) ──────
     # The card button + the 5-step _MCPOAuthWizardDialog (osia.gui.mcp_oauth_wizard).
     # URLs live in the wizard module (code), NEVER here — links are not translated.
@@ -1980,12 +2006,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "es": "Repos, incidencias y pull requests en GitHub.",
     },
     "mcp.desc.slack": {
-        "en": "Read & post messages in your Slack workspace.",
-        "fr": "Lire et publier des messages dans votre espace Slack.",
-        "zh": "在你的 Slack 工作区读取与发布消息。",
-        "ja": "Slack ワークスペースでメッセージを読み書きします。",
-        "de": "Nachrichten in Ihrem Slack-Workspace lesen und posten.",
-        "es": "Leer y publicar mensajes en tu espacio de Slack.",
+        "en": "Read & post via Slack remote MCP. Requires a Slack OAuth app.",
+        "fr": "Lire et publier via le MCP distant Slack. Nécessite une app OAuth Slack.",
+        "zh": "通过 Slack 远程 MCP 读取和发布消息。需要 Slack OAuth 应用。",
+        "ja": "Slack のリモート MCP でメッセージを読み書きします。Slack OAuth アプリが必要です。",
+        "de": "Über Slacks Remote-MCP lesen und posten. Erfordert eine Slack-OAuth-App.",
+        "es": "Lee y publica con el MCP remoto de Slack. Requiere una app OAuth de Slack.",
     },
     "mcp.desc.notion": {
         "en": "Pages & databases in your Notion workspace.",

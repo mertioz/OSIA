@@ -37,13 +37,15 @@ from __future__ import annotations
 #   suggestable=True  -> connectable now (open DCR / token / pre-seeded client),
 #                        healthy -> OSIA may proactively offer it.
 #   suggestable=False -> present in the GUI catalog but NOT offered, because:
+#     * slack: WOR-99 — official remote endpoint exists, but Slack has no DCR and
+#       requires a user-provided Slack app client_id/secret.
 #     * google-drive / gmail: WOR-100 — connect, but Google's MCP gateway is
 #       degraded (#229) -> flagged temporarily_unavailable in the GUI.
 #     * asana / hubspot / figma: WOR-94 — no open RFC 7591 DCR / url left empty
 #       -> not connectable in OSIA's OAuth substrate.
 MCP_CATALOG_META = [
     {"id": "github",       "name": "GitHub",       "desc_key": "mcp.desc.github",    "suggestable": True},
-    {"id": "slack",        "name": "Slack",        "desc_key": "mcp.desc.slack",     "suggestable": True},
+    {"id": "slack",        "name": "Slack",        "desc_key": "mcp.desc.slack",     "suggestable": False},
     {"id": "notion",       "name": "Notion",       "desc_key": "mcp.desc.notion",    "suggestable": True},
     {"id": "linear",       "name": "Linear",       "desc_key": "mcp.desc.linear",    "suggestable": True},
     {"id": "google-drive", "name": "Google Drive", "desc_key": "mcp.desc.gdrive",    "suggestable": False},

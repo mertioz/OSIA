@@ -53,6 +53,7 @@ import asyncio
 import concurrent.futures
 import json
 import re
+import shutil
 import sys
 import threading
 import traceback
@@ -199,6 +200,43 @@ def _sanitize_error(text: str, cfg: Optional[dict]) -> str:
     except Exception:
         pass
     return text
+
+
+_NODE_STDIO_COMMANDS = {
+    "node", "node.exe", "node.cmd",
+    "npx", "npx.exe", "npx.cmd", "npx.ps1",
+}
+
+
+def _stdio_command_name(command: str) -> str:
+    """Return the executable leaf without args, preserving paths in messages."""
+    cmd = str(command or "").strip()
+    if not cmd:
+        return ""
+    return cmd.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _stdio_command_not_found_error(command: str) -> str:
+    cmd = str(command or "").strip() or "<empty>"
+    msg = f"Command not found: {cmd}"
+    if _stdio_command_name(cmd) in _NODE_STDIO_COMMANDS:
+        msg += (
+            ". Node.js/npx is required for this stdio MCP connector. "
+            "Install Node.js or use a remote MCP connector."
+        )
+    return msg
+
+
+def _is_stdio_command_not_found(exc: BaseException) -> bool:
+    if isinstance(exc, FileNotFoundError):
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        "the system cannot find the file specified" in text
+        or "no such file or directory" in text
+        or "file not found" in text
+        or "command not found" in text
+    )
 
 
 # ``BaseExceptionGroup`` is a builtin on Python 3.11+ (PEP 654). Resolve it once
@@ -1071,6 +1109,21 @@ class MCPManager:
             # ConnectError, TLS, etc.) instead of the useless "unhandled errors
             # in a TaskGroup" wrapper. Only needed on the failure path.
             leaf, leaf_count = (e, 1) if is_cancel else _leaf_exception(e)
+            error_text = f"{type(leaf).__name__}: {leaf}"
+            try:
+                failed_transport = str(
+                    conn.cfg.get("transport") or "stdio"
+                ).strip().lower()
+                if (
+                    not is_cancel
+                    and failed_transport == "stdio"
+                    and _is_stdio_command_not_found(leaf)
+                ):
+                    error_text = _stdio_command_not_found_error(
+                        str(conn.cfg.get("command") or "")
+                    )
+            except Exception:
+                pass
             with self._lock:
                 conn.session = None
                 if is_cancel:
@@ -1078,9 +1131,7 @@ class MCPManager:
                         conn.status = STATUS_DISCONNECTED
                 else:
                     conn.status = STATUS_FAILED
-                    conn.error = _sanitize_error(
-                        f"{type(leaf).__name__}: {leaf}", conn.cfg
-                    )
+                    conn.error = _sanitize_error(error_text, conn.cfg)
             # Surface the leaf traceback on stderr (redacted) — outside the lock,
             # never for a normal cancel/teardown. Best-effort, never raises.
             if not is_cancel:
@@ -1185,9 +1236,25 @@ class MCPManager:
                 f"transport {transport!r} not supported in Phase 1 (stdio only)",
             )
             return STATUS_FAILED
-        if transport == "stdio" and not str(server_cfg.get("command") or "").strip():
-            self._fail_unserved(server_id, "stdio transport requires a 'command'")
-            return STATUS_FAILED
+        if transport == "stdio":
+            command = str(server_cfg.get("command") or "").strip()
+            if not command:
+                self._fail_unserved(server_id, "stdio transport requires a 'command'")
+                return STATUS_FAILED
+            cfg_env = (
+                server_cfg.get("env")
+                if isinstance(server_cfg.get("env"), dict) else {}
+            )
+            env_path = ""
+            for path_key in ("PATH", "Path", "path"):
+                env_path = str(cfg_env.get(path_key) or "").strip()
+                if env_path:
+                    break
+            if shutil.which(command, path=env_path or None) is None:
+                self._fail_unserved(
+                    server_id, _stdio_command_not_found_error(command)
+                )
+                return STATUS_FAILED
         if transport == "streamable_http" and not str(server_cfg.get("url") or "").strip():
             self._fail_unserved(
                 server_id, "streamable_http transport requires a 'url'"
