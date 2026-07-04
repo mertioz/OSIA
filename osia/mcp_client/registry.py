@@ -201,6 +201,39 @@ def _confirm_summary(server_id: str, tool_name: str, kwargs: dict) -> str:
     return f"{base} (args: {keys})" if keys else base
 
 
+def confirm_connector_write(
+    server_id: str,
+    tool_name: str,
+    summary: str,
+    *,
+    error_namespace: str = "connector",
+) -> Optional[str]:
+    """Shared connector/add-on write safety gate.
+
+    Returns ``None`` to ALLOW the call, or an ``ERROR: ...`` string to BLOCK it.
+    ``mcp_confirm_writes`` is intentionally kept as the stored compatibility key:
+    True means ask/require approval, False means auto-approve connector writes.
+    """
+    if not _setting_bool("mcp_confirm_writes", True):
+        return None
+    provider = get_confirmation_provider()
+    if provider is not None:
+        try:
+            approved = bool(provider(server_id, tool_name, str(summary or "")))
+        except Exception:
+            approved = False  # a provider failure is treated as a decline (safe)
+        if approved:
+            return None
+        return f"ERROR: {error_namespace}/{server_id}/{tool_name}: user declined"
+    # Unattended: no UI/provider present.
+    if _setting_bool("mcp_allow_unattended_writes", False):
+        return None
+    return (
+        f"ERROR: {error_namespace}/{server_id}/{tool_name}: write tool blocked "
+        "(confirmation required, no approver available)"
+    )
+
+
 def _confirm_gate(server_id: str, tool_name: str, kwargs: dict) -> Optional[str]:
     """Decide whether a WRITE tool may run. Returns ``None`` to ALLOW the call,
     or an ``ERROR: ...`` string to BLOCK it (declined / no approver). Reads the
@@ -213,26 +246,11 @@ def _confirm_gate(server_id: str, tool_name: str, kwargs: dict) -> Optional[str]
       * confirm True + NO provider (unattended) -> mcp_allow_unattended_writes
         True -> allow, else block ("no approver available").
     """
-    if not _setting_bool("mcp_confirm_writes", True):
-        return None
-    provider = get_confirmation_provider()
-    if provider is not None:
-        try:
-            approved = bool(provider(
-                server_id, tool_name,
-                _confirm_summary(server_id, tool_name, kwargs),
-            ))
-        except Exception:
-            approved = False  # a provider failure is treated as a decline (safe)
-        if approved:
-            return None
-        return f"ERROR: mcp/{server_id}/{tool_name}: user declined"
-    # Unattended: no UI/provider present.
-    if _setting_bool("mcp_allow_unattended_writes", False):
-        return None
-    return (
-        f"ERROR: mcp/{server_id}/{tool_name}: write tool blocked "
-        "(confirmation required, no approver available)"
+    return confirm_connector_write(
+        server_id,
+        tool_name,
+        _confirm_summary(server_id, tool_name, kwargs),
+        error_namespace="mcp",
     )
 
 

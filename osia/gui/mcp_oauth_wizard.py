@@ -74,8 +74,10 @@ _WIZARD_APIS = {
 _WIZARD_SCOPES = {
     "gmail-rest": (
         "Required: https://www.googleapis.com/auth/gmail.readonly\n"
-        "Optional for confirmed draft creation: "
-        "https://www.googleapis.com/auth/gmail.compose"
+        "Optional for confirmed draft creation and draft sending: "
+        "https://www.googleapis.com/auth/gmail.compose\n"
+        "Optional for confirmed read/unread and label changes: "
+        "https://www.googleapis.com/auth/gmail.modify"
     ),
     "gmail": "https://mail.google.com/",
     "google-drive": "https://www.googleapis.com/auth/drive.readonly + https://www.googleapis.com/auth/drive.file",

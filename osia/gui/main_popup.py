@@ -1630,11 +1630,15 @@ class _SettingsPanel(QWidget):
             "capabilities": {
                 "readOnly": False,
                 "compose": False,
+                "modify": False,
                 "composeUpgradeRequired": False,
+                "modifyUpgradeRequired": False,
             },
         }
         self._gmail_rest_probe_busy = False
         self._gmail_rest_last_probe = datetime.min
+        self._gmail_rest_oauth_busy = False
+        self._gmail_rest_credentials_editing = False
         self._gmail_rest_status_ready.connect(self._apply_gmail_rest_status)
         self._startup_rows: list[tuple[str, QLabel, QCheckBox]] = []
         # Guards the autostart toggle against re-entrant stateChanged while it is
@@ -3429,8 +3433,9 @@ class _SettingsPanel(QWidget):
         ws.setContentsMargins(10, 8, 10, 8)
         ws.setSpacing(8)
 
-        # Confirm write actions — the user-facing "stop asking" switch. ON
-        # (default) prompts before any write; OFF runs writes with no prompt.
+        # Auto-approve connector writes — user-facing switch. OFF (default)
+        # prompts before connector writes; ON persists mcp_confirm_writes=False
+        # so MCP/native connector writes run without a local prompt.
         cw_row = QHBoxLayout()
         cw_row.setSpacing(6)
         self._mcp_confirm_writes_label = QLabel(i18n.t("mcp.confirm_writes"))
@@ -3512,6 +3517,7 @@ class _SettingsPanel(QWidget):
         self._gmail_rest_capability_badges: dict = {}
         self._gmail_rest_capability_labels: dict = {}
         self._gmail_rest_upgrade_buttons: dict = {}
+        self._gmail_rest_upgrade_info_badges: dict = {}
         # Optimistic transient state per id: {id: (visual_state, resolve_set, ticks)}
         self._mcp_pending: dict = {}
         # Catalog + custom entries by id (rebuilt by _render_mcp) and the
@@ -3527,13 +3533,13 @@ class _SettingsPanel(QWidget):
         return wrap
 
     def _on_mcp_confirm_writes_changed(self, _state) -> None:
-        """Persist the write-confirmation gate (WOR-44 Phase 5, 5-conf). ON
-        (default) prompts before any write MCP tool; OFF runs writes with no
-        prompt. The gate reads this LIVE, so it takes effect with no reconnect;
-        the server process picks the new value up via its settings mtime cache,
-        so mobile-initiated writes honour it too. No gate/refresh call needed."""
+        """Persist the connector write auto-approval switch.
+
+        The stored key is kept for compatibility: mcp_confirm_writes=True means
+        ask first. The UI switch is inverted: checked means auto-approve.
+        """
         set_setting(
-            "mcp_confirm_writes", self._mcp_confirm_writes_toggle.isChecked())
+            "mcp_confirm_writes", not self._mcp_confirm_writes_toggle.isChecked())
 
     def _on_mcp_unattended_changed(self, _state) -> None:
         """Persist the unattended-writes allowance (WOR-44 Phase 5, 5-conf).
@@ -3613,6 +3619,14 @@ class _SettingsPanel(QWidget):
         if not client_id:
             self._mcp_flag_required(cidin)
             raise ValueError("missing Gmail OAuth client id")
+        existing = self._gmail_rest_client()
+        if (
+            not client_secret
+            and isinstance(existing, dict)
+            and str(existing.get("client_id") or "").strip() == client_id
+            and str(existing.get("client_secret") or "").strip()
+        ):
+            client_secret = str(existing.get("client_secret") or "").strip()
         client = {
             "client_id": client_id,
             "redirect_uris": ["http://127.0.0.1:8975/callback"],
@@ -3754,6 +3768,7 @@ class _SettingsPanel(QWidget):
         self._gmail_rest_capability_badges = {}
         self._gmail_rest_capability_labels = {}
         self._gmail_rest_upgrade_buttons = {}
+        self._gmail_rest_upgrade_info_badges = {}
         entry = self._mcp_entries.get(sid)
         if entry is None:
             return
@@ -3837,12 +3852,17 @@ class _SettingsPanel(QWidget):
             v.addWidget(capability)
             self._update_gmail_rest_capability_label()
 
-            if not self._gmail_rest_client().get("client_id"):
+            client = self._gmail_rest_client()
+            client_configured = bool(client.get("client_id"))
+            show_credential_fields = (
+                not client_configured or self._gmail_rest_credentials_editing
+            )
+            if show_credential_fields:
                 cidlab = QLabel(i18n.t("mcp.lbl_client_id"))
                 cidlab.setObjectName("providerSub")
                 cidlab.setWordWrap(True)
                 v.addWidget(cidlab)
-                cidin = QLineEdit("")
+                cidin = QLineEdit(str(client.get("client_id") or ""))
                 cidin.setObjectName("keyInput")
                 cidin.setPlaceholderText(i18n.t("mcp.ph_client_id"))
                 self._mcp_client_id_inputs[sid] = cidin
@@ -3855,9 +3875,33 @@ class _SettingsPanel(QWidget):
                 csecin = QLineEdit("")
                 csecin.setObjectName("keyInput")
                 csecin.setEchoMode(QLineEdit.EchoMode.Password)
-                csecin.setPlaceholderText(i18n.t("mcp.ph_client_secret"))
+                csecin.setPlaceholderText(
+                    i18n.t("mcp.ph_client_secret_replace")
+                    if client_configured
+                    else i18n.t("mcp.ph_client_secret")
+                )
                 self._mcp_client_secret_inputs[sid] = csecin
                 v.addWidget(csecin)
+            else:
+                configured = QLabel(i18n.t("mcp.gmail_credentials_configured"))
+                configured.setObjectName("providerSub")
+                configured.setWordWrap(True)
+                v.addWidget(configured)
+
+                cred_actions = QHBoxLayout()
+                cred_actions.setSpacing(6)
+                edit_btn = QPushButton(i18n.t("mcp.gmail_edit_credentials"))
+                edit_btn.setObjectName("ghostBtn")
+                edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+                def _edit_gmail_credentials(_=False):
+                    self._gmail_rest_credentials_editing = True
+                    self._render_mcp_panel("gmail")
+
+                edit_btn.clicked.connect(_edit_gmail_credentials)
+                cred_actions.addWidget(edit_btn)
+                cred_actions.addStretch(1)
+                v.addLayout(cred_actions)
 
             v.addWidget(self._make_google_oauth_guide_button(entry, mode="gmail-rest"))
 
@@ -3980,10 +4024,14 @@ class _SettingsPanel(QWidget):
                 upgrade_btn = QPushButton(i18n.t("mcp.gmail_upgrade"))
                 upgrade_btn.setObjectName("ghostBtn")
                 upgrade_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                upgrade_btn.clicked.connect(self._on_gmail_rest_upgrade_compose)
+                upgrade_btn.clicked.connect(self._on_gmail_rest_upgrade_permissions)
                 upgrade_btn.setVisible(False)
                 self._gmail_rest_upgrade_buttons[sid] = upgrade_btn
                 actions.addWidget(upgrade_btn)
+                upgrade_info = _InfoBadge("mcp.gmail_upgrade_hint")
+                upgrade_info.setVisible(False)
+                self._gmail_rest_upgrade_info_badges[sid] = upgrade_info
+                actions.addWidget(upgrade_info)
                 btn = QPushButton(i18n.t("mcp.gmail_connect"))
                 btn.setObjectName("primaryBtn")
                 btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -4246,8 +4294,29 @@ class _SettingsPanel(QWidget):
                 "emailAddress": None,
                 "error": "Gmail status check failed.",
             }
-        self._gmail_rest_status = dict(status)
+        clean_status = dict(status)
+        oauth_done = bool(clean_status.pop("_oauthFlowDone", False))
+        if oauth_done:
+            self._gmail_rest_oauth_busy = False
+        self._gmail_rest_status = clean_status
         self._update_gmail_rest_widgets()
+
+    @staticmethod
+    def _gmail_rest_status_after_oauth() -> dict:
+        """Validate Gmail status after OAuth, with short propagation retries."""
+        import time
+        from osia.tools.gmail import gmail_connection_status
+
+        last_status: dict = {}
+        for delay_s in (0.0, 1.0, 2.0):
+            if delay_s:
+                time.sleep(delay_s)
+            status = gmail_connection_status(validate=True)
+            if isinstance(status, dict):
+                last_status = status
+                if status.get("connected"):
+                    return status
+        return last_status
 
     def _update_gmail_rest_widgets(self) -> None:
         status = self._gmail_rest_status if isinstance(
@@ -4270,7 +4339,7 @@ class _SettingsPanel(QWidget):
                     else i18n.t("mcp.gmail_connect")
                 )
             )
-            btn.setEnabled(state != "connecting")
+            btn.setEnabled(state != "connecting" and not self._gmail_rest_oauth_busy)
             error = str(status.get("error") or "").strip()
             btn.setToolTip(error if state == "failed" else "")
         self._update_gmail_rest_account_label()
@@ -4307,7 +4376,12 @@ class _SettingsPanel(QWidget):
         compose_enabled = bool(
             capabilities.get("compose") or status.get("composeEnabled")
         )
-        if state == "connected" and compose_enabled:
+        modify_enabled = bool(
+            capabilities.get("modify") or status.get("modifyEnabled")
+        )
+        if state == "connected" and modify_enabled:
+            label.setText(i18n.t("mcp.gmail_cap_modify"))
+        elif state == "connected" and compose_enabled:
             label.setText(i18n.t("mcp.gmail_cap_compose"))
         elif state == "connected":
             label.setText(i18n.t("mcp.gmail_cap_readonly"))
@@ -4316,30 +4390,41 @@ class _SettingsPanel(QWidget):
 
         badge = self._gmail_rest_capability_badges.get("gmail")
         if badge is not None:
-            badge.setText(
-                i18n.t("mcp.badge_compose")
-                if state == "connected" and compose_enabled
-                else i18n.t("mcp.badge_readonly")
-            )
+            if state == "connected" and modify_enabled:
+                badge.setText(i18n.t("mcp.badge_modify"))
+            elif state == "connected" and compose_enabled:
+                badge.setText(i18n.t("mcp.badge_compose"))
+            else:
+                badge.setText(i18n.t("mcp.badge_readonly"))
 
     def _update_gmail_rest_upgrade_button(self) -> None:
         btn = self._gmail_rest_upgrade_buttons.get("gmail")
         if btn is None:
             return
+        info_badge = self._gmail_rest_upgrade_info_badges.get("gmail")
         status = self._gmail_rest_status if isinstance(
             self._gmail_rest_status, dict
         ) else {}
         state = str(status.get("status") or "disconnected")
         capabilities = status.get("capabilities")
         capabilities = capabilities if isinstance(capabilities, dict) else {}
-        upgrade_required = bool(
+        compose_required = bool(
             capabilities.get("composeUpgradeRequired")
             or status.get("composeUpgradeRequired")
         )
-        show = state == "connected" and upgrade_required
-        btn.setVisible(show)
-        btn.setEnabled(show)
+        modify_required = bool(
+            capabilities.get("modifyUpgradeRequired")
+            or status.get("modifyUpgradeRequired")
+        )
+        show_compose = state == "connected" and compose_required
+        show_modify = state == "connected" and modify_required
+        show = show_compose or show_modify
+        btn.setText(i18n.t("mcp.gmail_upgrade"))
         btn.setToolTip(i18n.t("mcp.gmail_upgrade_hint") if show else "")
+        btn.setVisible(show)
+        btn.setEnabled(show and not self._gmail_rest_oauth_busy)
+        if info_badge is not None:
+            info_badge.setVisible(show)
 
     def _on_gmail_rest_toggle(self, entry: dict) -> None:
         if not self._is_gmail_rest_entry(entry):
@@ -4347,12 +4432,16 @@ class _SettingsPanel(QWidget):
         status = self._gmail_rest_status if isinstance(
             self._gmail_rest_status, dict
         ) else {}
+        if self._gmail_rest_oauth_busy or status.get("status") == "connecting":
+            return
         if status.get("status") == "connected":
             self._on_gmail_rest_disconnect()
         else:
             self._on_gmail_rest_connect()
 
-    def _on_gmail_rest_upgrade_compose(self, _checked: bool = False) -> None:
+    def _on_gmail_rest_upgrade_permissions(self, _checked: bool = False) -> None:
+        if self._gmail_rest_oauth_busy:
+            return
         try:
             self._save_gmail_rest_client_from_fields()
         except ValueError:
@@ -4363,6 +4452,7 @@ class _SettingsPanel(QWidget):
                 "error": i18n.t("mcp.gmail_client_required"),
             })
             return
+        self._gmail_rest_oauth_busy = True
         self._apply_gmail_rest_status({
             "status": "connecting",
             "connected": False,
@@ -4373,30 +4463,53 @@ class _SettingsPanel(QWidget):
         def _bg():
             try:
                 from osia.tools.gmail import (
-                    gmail_connection_status,
-                    gmail_upgrade_compose_permissions,
+                    gmail_upgrade_modify_permissions,
                 )
-                gmail_upgrade_compose_permissions()
-                status = gmail_connection_status(validate=True)
-            except Exception:
-                try:
-                    status = gmail_connection_status(validate=True)
-                except Exception:
-                    status = {}
-                if not isinstance(status, dict) or not status.get("connected"):
+                gmail_upgrade_modify_permissions()
+                status = self._gmail_rest_status_after_oauth()
+                caps = status.get("capabilities")
+                caps = caps if isinstance(caps, dict) else {}
+                has_modify = bool(caps.get("modify") or status.get("modifyEnabled"))
+                if not status.get("connected") or not has_modify:
                     status = {
                         "status": "failed",
                         "connected": False,
                         "emailAddress": None,
                         "error": i18n.t("mcp.gmail_upgrade_failed"),
                     }
+            except Exception:
+                try:
+                    status = self._gmail_rest_status_after_oauth()
+                except Exception:
+                    status = {}
+                caps = status.get("capabilities") if isinstance(status, dict) else {}
+                caps = caps if isinstance(caps, dict) else {}
+                has_modify = bool(caps.get("modify") or status.get("modifyEnabled"))
+                if (
+                    not isinstance(status, dict)
+                    or not status.get("connected")
+                    or not has_modify
+                ):
+                    status = {
+                        "status": "failed",
+                        "connected": False,
+                        "emailAddress": None,
+                        "error": i18n.t("mcp.gmail_upgrade_failed"),
+                    }
+            if not isinstance(status, dict):
+                status = {}
+            status["_oauthFlowDone"] = True
             self._gmail_rest_status_ready.emit(status)
 
         threading.Thread(
-            target=_bg, name="osia-gmail-rest-upgrade-compose", daemon=True
+            target=_bg,
+            name="osia-gmail-rest-elevate",
+            daemon=True,
         ).start()
 
     def _on_gmail_rest_connect(self) -> None:
+        if self._gmail_rest_oauth_busy:
+            return
         try:
             self._save_gmail_rest_client_from_fields()
         except ValueError:
@@ -4407,6 +4520,7 @@ class _SettingsPanel(QWidget):
                 "error": i18n.t("mcp.gmail_client_required"),
             })
             return
+        self._gmail_rest_oauth_busy = True
         self._apply_gmail_rest_status({
             "status": "connecting",
             "connected": False,
@@ -4418,10 +4532,16 @@ class _SettingsPanel(QWidget):
             try:
                 from osia.tools.gmail import (
                     gmail_connect,
-                    gmail_connection_status,
                 )
                 gmail_connect()
-                status = gmail_connection_status(validate=True)
+                status = self._gmail_rest_status_after_oauth()
+                if not status.get("connected") and not status.get("error"):
+                    status = {
+                        "status": "failed",
+                        "connected": False,
+                        "emailAddress": None,
+                        "error": i18n.t("mcp.gmail_oauth_failed"),
+                    }
             except Exception:
                 status = {
                     "status": "failed",
@@ -4429,6 +4549,9 @@ class _SettingsPanel(QWidget):
                     "emailAddress": None,
                     "error": i18n.t("mcp.gmail_oauth_failed"),
                 }
+            if not isinstance(status, dict):
+                status = {}
+            status["_oauthFlowDone"] = True
             self._gmail_rest_status_ready.emit(status)
 
         threading.Thread(
@@ -5352,12 +5475,14 @@ class _SettingsPanel(QWidget):
         self._render_mcp()
 
         # MCP write-safety toggles (WOR-44 Phase 5, 5-conf) — seed both from
-        # settings (confirm-writes default ON, allow-unattended default OFF).
+        # settings. The auto-approve UI is inverted from the compatibility key:
+        # mcp_confirm_writes=True means prompts are required, so the switch is
+        # unchecked by default. allow-unattended remains default OFF.
         # blockSignals so seeding never re-persists via the stateChanged
         # handlers.
         self._mcp_confirm_writes_toggle.blockSignals(True)
         self._mcp_confirm_writes_toggle.setChecked(
-            bool(settings.get("mcp_confirm_writes", True)))
+            not bool(settings.get("mcp_confirm_writes", True)))
         self._mcp_confirm_writes_toggle.blockSignals(False)
         self._mcp_unattended_toggle.blockSignals(True)
         self._mcp_unattended_toggle.setChecked(

@@ -44,6 +44,7 @@ GOOGLE_REVOCATION_ENDPOINT = "https://oauth2.googleapis.com/revoke"
 DEFAULT_TIMEOUT_S = 30.0
 CALLBACK_TIMEOUT_S = 300.0
 TOKEN_EXPIRY_MARGIN_S = 60.0
+_AUTH_FLOW_LOCK = threading.Lock()
 
 _CLIENT_FALLBACK_KEYS = {
     "gmail-rest": ("gmail",),
@@ -189,6 +190,27 @@ def authorize(
     force_consent: bool = True,
 ) -> dict:
     """Run an interactive Google OAuth flow and persist the resulting token."""
+    if not _AUTH_FLOW_LOCK.acquire(blocking=False):
+        raise GoogleOAuthError(
+            "Another Google OAuth flow is already in progress. Finish it in "
+            "the browser, then try again."
+        )
+    try:
+        return _authorize_locked(
+            integration_key,
+            scopes,
+            force_consent=force_consent,
+        )
+    finally:
+        _AUTH_FLOW_LOCK.release()
+
+
+def _authorize_locked(
+    integration_key: str,
+    scopes: Iterable[str] | str,
+    *,
+    force_consent: bool,
+) -> dict:
     key = str(integration_key or "").strip()
     client = load_client_config(key)
     scope_text = _scope_string(scopes)

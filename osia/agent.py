@@ -270,23 +270,33 @@ def get_desktop_path() -> str:
 def _gmail_rest_prompt_block(lang: str) -> str:
     if lang == "fr":
         return """## Gmail natif REST
-Pour lire ou chercher des emails Gmail, utilise les outils Gmail REST natifs ci-dessous. Pour creer un brouillon Gmail, utilise seulement gmail_create_draft: cela exige une confirmation explicite de l'utilisateur et ne peut pas envoyer d'email. Le connecteur Google Gmail MCP historique est temporairement indisponible: ne l'utilise pas pour Gmail.
+Pour lire, chercher ou agir sur Gmail, utilise les outils Gmail REST natifs ci-dessous. Les actions qui changent Gmail suivent les reglages de securite des ecritures de connecteurs.
 - gmail_list_labels: lister les libelles Gmail. Usage : {"tool": "gmail_list_labels"}
 - gmail_list_latest: lister les derniers messages. Usage : {"tool": "gmail_list_latest", "max_results": 3}
 - gmail_search: chercher des messages avec une requete Gmail. Usage : {"tool": "gmail_search", "query": "France Travail", "max_results": 10}
 - gmail_read_message: lire un message avec son message_id. Usage : {"tool": "gmail_read_message", "message_id": "<id>"}
 - gmail_read_thread: lire un thread avec son thread_id. Usage : {"tool": "gmail_read_thread", "thread_id": "<id>"}
-- gmail_create_draft: creer un brouillon Gmail en texte brut uniquement apres confirmation. Usage : {"tool": "gmail_create_draft", "to": "user@example.com", "subject": "Sujet", "body": "Message", "cc": "", "bcc": ""}
-Si Gmail REST n'est pas connecte, dis a l'utilisateur de connecter l'integration Gmail native. Si la permission compose manque, demande-lui d'utiliser "Upgrade Gmail permissions" sur la carte Gmail. L'envoi Gmail n'est pas disponible pour le moment. Ne suggere pas de reconnecter le Gmail MCP historique."""
+- gmail_create_draft: creer un brouillon Gmail en texte brut via les reglages d'ecriture connecteur. Usage : {"tool": "gmail_create_draft", "to": "user@example.com", "subject": "Sujet", "body": "Message", "cc": "", "bcc": ""}
+- gmail_send_draft: envoyer un brouillon Gmail existant via les reglages d'ecriture connecteur. Usage : {"tool": "gmail_send_draft", "draft_id": "<draft_id>"}
+- gmail_mark_read: marquer un message comme lu via les reglages d'ecriture connecteur. Usage : {"tool": "gmail_mark_read", "message_id": "<id>"}
+- gmail_mark_unread: marquer un message comme non lu via les reglages d'ecriture connecteur. Usage : {"tool": "gmail_mark_unread", "message_id": "<id>"}
+- gmail_apply_label: appliquer un libelle utilisateur existant avec correspondance exacte via les reglages d'ecriture connecteur. Usage : {"tool": "gmail_apply_label", "message_id": "<id>", "label": "Nom exact"}
+- gmail_remove_label: retirer un libelle utilisateur existant avec correspondance exacte via les reglages d'ecriture connecteur. Usage : {"tool": "gmail_remove_label", "message_id": "<id>", "label": "Nom exact"}
+Si Gmail REST n'est pas connecte, dis a l'utilisateur de connecter l'integration Gmail native. Si les permissions compose ou modify manquent, demande-lui d'utiliser "Elevate OSIA permissions" sur la carte Gmail. Ne cree pas de piece jointe, HTML, reponse/thread, suppression, spam ou archivage; ces actions ne sont pas disponibles."""
     return """## Native Gmail REST
-For Gmail email reading or search, use the native Gmail REST tools below. To create a Gmail draft, use only gmail_create_draft: it requires explicit user confirmation and cannot send email. The legacy Google Gmail MCP connector is temporarily unavailable; do not use it for Gmail.
+For Gmail email reading, search, and mailbox actions, use the native Gmail REST tools below. Actions that change Gmail follow the connector write safety settings.
 - gmail_list_labels: list Gmail labels. Usage: {"tool": "gmail_list_labels"}
 - gmail_list_latest: list the latest messages. Usage: {"tool": "gmail_list_latest", "max_results": 3}
 - gmail_search: search messages with a Gmail query. Usage: {"tool": "gmail_search", "query": "France Travail", "max_results": 10}
 - gmail_read_message: read a message by message_id. Usage: {"tool": "gmail_read_message", "message_id": "<id>"}
 - gmail_read_thread: read a thread by thread_id. Usage: {"tool": "gmail_read_thread", "thread_id": "<id>"}
-- gmail_create_draft: create a plain-text Gmail draft only after confirmation. Usage: {"tool": "gmail_create_draft", "to": "user@example.com", "subject": "Subject", "body": "Message", "cc": "", "bcc": ""}
-If Gmail REST is not connected, ask the user to connect the native Gmail integration. If compose permission is missing, ask the user to use "Upgrade Gmail permissions" on the Gmail connector card. Gmail sending is not available yet. Do not suggest reconnecting the legacy Gmail MCP connector."""
+- gmail_create_draft: create a plain-text Gmail draft through connector write settings. Usage: {"tool": "gmail_create_draft", "to": "user@example.com", "subject": "Subject", "body": "Message", "cc": "", "bcc": ""}
+- gmail_send_draft: send an existing Gmail draft through connector write settings. Usage: {"tool": "gmail_send_draft", "draft_id": "<draft_id>"}
+- gmail_mark_read: mark one message read through connector write settings. Usage: {"tool": "gmail_mark_read", "message_id": "<id>"}
+- gmail_mark_unread: mark one message unread through connector write settings. Usage: {"tool": "gmail_mark_unread", "message_id": "<id>"}
+- gmail_apply_label: apply one exact existing user label through connector write settings. Usage: {"tool": "gmail_apply_label", "message_id": "<id>", "label": "Exact label"}
+- gmail_remove_label: remove one exact existing user label through connector write settings. Usage: {"tool": "gmail_remove_label", "message_id": "<id>", "label": "Exact label"}
+If Gmail REST is not connected, ask the user to connect the native Gmail integration. If compose or modify permission is missing, ask the user to use "Elevate OSIA permissions" on the Gmail connector card. Do not create attachments, HTML mail, replies/threads, deletes, spam changes, or archive actions; those are not available."""
 
 
 def get_system_prompt(lang: str = None, model: str = None, provider: str = None) -> str:
@@ -2716,7 +2726,7 @@ def tool_gmail_create_draft(
     cc: str = None,
     bcc: str = None,
 ) -> str:
-    """Create one confirmed plain-text Gmail draft via native Gmail REST."""
+    """Create one plain-text Gmail draft via native Gmail REST."""
     return _call_gmail_tool(
         "gmail_create_draft",
         to=to,
@@ -2724,6 +2734,35 @@ def tool_gmail_create_draft(
         body=body,
         cc=cc,
         bcc=bcc,
+    )
+
+
+def tool_gmail_send_draft(draft_id: str) -> str:
+    """Send one Gmail draft via native Gmail REST."""
+    return _call_gmail_tool("gmail_send_draft", draft_id=draft_id)
+
+
+def tool_gmail_mark_read(message_id: str) -> str:
+    """Mark one Gmail message read via native Gmail REST."""
+    return _call_gmail_tool("gmail_mark_read", message_id=message_id)
+
+
+def tool_gmail_mark_unread(message_id: str) -> str:
+    """Mark one Gmail message unread via native Gmail REST."""
+    return _call_gmail_tool("gmail_mark_unread", message_id=message_id)
+
+
+def tool_gmail_apply_label(message_id: str, label: str) -> str:
+    """Apply one exact existing Gmail user label via native Gmail REST."""
+    return _call_gmail_tool(
+        "gmail_apply_label", message_id=message_id, label=label
+    )
+
+
+def tool_gmail_remove_label(message_id: str, label: str) -> str:
+    """Remove one exact existing Gmail user label via native Gmail REST."""
+    return _call_gmail_tool(
+        "gmail_remove_label", message_id=message_id, label=label
     )
 
 
@@ -2790,6 +2829,11 @@ TOOL_MAP = {
     "gmail_read_message": tool_gmail_read_message,
     "gmail_read_thread": tool_gmail_read_thread,
     "gmail_create_draft": tool_gmail_create_draft,
+    "gmail_send_draft": tool_gmail_send_draft,
+    "gmail_mark_read": tool_gmail_mark_read,
+    "gmail_mark_unread": tool_gmail_mark_unread,
+    "gmail_apply_label": tool_gmail_apply_label,
+    "gmail_remove_label": tool_gmail_remove_label,
 }
 
 # Known tool names — bare-JSON candidates (priority 3 of the universal
@@ -2811,6 +2855,14 @@ TOOL_TIMEOUT_SECONDS = 30
 # so a hung read tool is NOT held for this whole budget. Native tools unaffected.
 _MCP_CONFIRM_TOOL_TIMEOUT = 150
 _GMAIL_CONFIRM_TOOL_TIMEOUT = 150
+_GMAIL_WRITE_TOOL_NAMES = frozenset({
+    "gmail_create_draft",
+    "gmail_send_draft",
+    "gmail_mark_read",
+    "gmail_mark_unread",
+    "gmail_apply_label",
+    "gmail_remove_label",
+})
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="osia-tool")
 
 _ERROR_PREFIXES = ("ERROR", "ERREUR", "[ERROR]", "[ERREUR]")
@@ -2854,7 +2906,7 @@ def _tool_timeout_seconds(tool_name: str, kwargs: dict) -> float:
     # WOR-44 Phase 5 (5-conf-a): MCP tools may block on a confirmation prompt.
     if tool_name.startswith("mcp__"):
         return _MCP_CONFIRM_TOOL_TIMEOUT
-    if tool_name == "gmail_create_draft":
+    if tool_name in _GMAIL_WRITE_TOOL_NAMES:
         return _GMAIL_CONFIRM_TOOL_TIMEOUT
     if tool_name in ("bash", "run_command"):
         if _is_long_running_command(kwargs.get("command", "") or ""):
@@ -2928,7 +2980,7 @@ def _execute_tool_with_retry(tool_name: str, kwargs: dict):
         long_running
         or tool_name == "desktop_click"
         or tool_name.startswith("mcp__")
-        or tool_name == "gmail_create_draft"
+        or tool_name in _GMAIL_WRITE_TOOL_NAMES
     )
     if _is_tool_error(result) and not no_retry:
         preview = _result_text(result).replace("\n", " ")[:120]
