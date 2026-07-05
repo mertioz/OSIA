@@ -688,8 +688,12 @@ class _ModelRow(QFrame):
         super().__init__()
         self.setObjectName("modelRow")
         self.setProperty("active", is_active)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._mid = model["id"]
         self._provider = model.get("provider", "")
+        self._name_text = str(model.get("label") or model["id"])
+        self._sub_text = str(model.get("id", ""))
+        self._reasoning_chip_text = ""
         try:
             self._reasoning_options = get_reasoning_options(self._provider, self._mid)
         except Exception:
@@ -706,13 +710,23 @@ class _ModelRow(QFrame):
         col = QVBoxLayout()
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(0)
-        name = QLabel(model.get("label") or model["id"])
+        name = QLabel(self._name_text)
         name.setObjectName("modelName")
-        sub = QLabel(model.get("id", ""))
+        name.setWordWrap(False)
+        name.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        sub = QLabel(self._sub_text)
         sub.setObjectName("modelSub")
+        sub.setWordWrap(False)
+        sub.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self._reasoning_chip = QLabel()
         self._reasoning_chip.setObjectName("modelReasoningChip")
+        self._reasoning_chip.setWordWrap(False)
+        self._reasoning_chip.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         self._reasoning_chip.setVisible(False)
+        self._name_label = name
+        self._sub_label = sub
         col.addWidget(name)
         col.addWidget(sub)
         col.addWidget(self._reasoning_chip)
@@ -724,10 +738,17 @@ class _ModelRow(QFrame):
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setEnabled(not is_active)
         btn.clicked.connect(lambda: self.selected.emit(self._mid))
+        btn_width = max(68, btn.fontMetrics().horizontalAdvance(btn.text()) + 34)
+        btn.setFixedWidth(btn_width)
 
         row.addWidget(prov)
         row.addLayout(col, 1)
         self._reasoning_btn = None
+        actions = QWidget()
+        actions_lay = QHBoxLayout(actions)
+        actions_lay.setContentsMargins(0, 0, 0, 0)
+        actions_lay.setSpacing(8)
+        actions_width = btn_width
         if self._reasoning_options:
             self._reasoning_btn = QPushButton("\u2699")
             self._reasoning_btn.setObjectName("modelReasoning")
@@ -735,13 +756,35 @@ class _ModelRow(QFrame):
             self._reasoning_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             self._reasoning_btn.setToolTip(i18n.t("reasoning.tooltip"))
             self._reasoning_btn.clicked.connect(self._show_reasoning_menu)
-            row.addWidget(self._reasoning_btn)
+            actions_lay.addWidget(self._reasoning_btn)
+            actions_width += 38
             i18n.add_listener(self._retranslate_reasoning)
             self.destroyed.connect(
                 lambda: i18n.remove_listener(self._retranslate_reasoning)
             )
-        row.addWidget(btn)
+        actions_lay.addWidget(btn)
+        actions.setFixedWidth(actions_width)
+        actions.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        row.addWidget(actions)
         self._refresh_reasoning_chip()
+
+    def _refresh_elided_text(self) -> None:
+        for label, full_text in (
+            (self._name_label, self._name_text),
+            (self._sub_label, self._sub_text),
+            (self._reasoning_chip, self._reasoning_chip_text),
+        ):
+            label.setText(
+                label.fontMetrics().elidedText(
+                    full_text,
+                    Qt.TextElideMode.ElideRight,
+                    max(0, label.width()),
+                )
+            )
+
+    def resizeEvent(self, event):
+        self._refresh_elided_text()
+        super().resizeEvent(event)
 
     def _option_label(self, option: dict) -> str:
         key = option.get("label_key")
@@ -780,14 +823,15 @@ class _ModelRow(QFrame):
         show = bool(option and not option.get("default"))
         if show:
             label = self._option_label(option)
-            self._reasoning_chip.setText(
-                i18n.t("reasoning.current_level", level=label)
-            )
+            self._reasoning_chip_text = i18n.t("reasoning.current_level", level=label)
+        else:
+            self._reasoning_chip_text = ""
         self._reasoning_chip.setVisible(show)
         if self._reasoning_btn is not None:
             self._reasoning_btn.setProperty("selected", show)
             self._reasoning_btn.style().unpolish(self._reasoning_btn)
             self._reasoning_btn.style().polish(self._reasoning_btn)
+        self._refresh_elided_text()
 
     def _show_reasoning_menu(self) -> None:
         if not self._reasoning_options or self._reasoning_btn is None:
