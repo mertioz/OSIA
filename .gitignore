@@ -17,6 +17,11 @@ config/mobile_token.txt
 config/desktop_calibration.json
 config/greeting_cache.json
 config/greeting_cache.wav
+config/memory.json
+config/memory.json.tmp*
+config/memory.json.bak
+config/memory.corrupt.*.json
+config/memory.sqlite*
 # Windows runtime artifacts (cloudflared.exe and ffmpeg.exe are downloaded by
 # install.bat; tunnel.log is written at runtime by the tunnel service) — never
 # commit these.
