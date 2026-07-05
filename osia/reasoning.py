@@ -39,6 +39,21 @@ _MISTRAL_REASONING_MODELS = frozenset(
     for model_id in _hardcoded_model_ids("mistral")
     if model_id == "mistral-medium-3-5"
 )
+_OPENAI_REASONING_MODELS = frozenset(
+    model_id
+    for model_id in _hardcoded_model_ids("openai")
+    if model_id in {"gpt-5.5", "gpt-5.4", "gpt-5.4-mini"}
+)
+_ANTHROPIC_ADAPTIVE_XHIGH_MODELS = frozenset(
+    model_id
+    for model_id in _hardcoded_model_ids("anthropic")
+    if model_id in {"claude-opus-4-8", "claude-opus-4-7"}
+)
+_ANTHROPIC_ADAPTIVE_REASONING_MODELS = _ANTHROPIC_ADAPTIVE_XHIGH_MODELS | frozenset(
+    model_id
+    for model_id in _hardcoded_model_ids("anthropic")
+    if model_id in {"claude-opus-4-6", "claude-sonnet-4-6"}
+)
 
 
 def _option(
@@ -59,6 +74,15 @@ def _option(
 
 
 _AUTO_OPTION = _option("auto", "Default", default=True, label_key="reasoning.default")
+
+
+def _anthropic_adaptive_kwargs(effort: str) -> dict:
+    return {
+        "extra_body": {
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {"effort": effort},
+        }
+    }
 
 
 def normalize_level(value) -> str:
@@ -130,6 +154,40 @@ def get_reasoning_options(provider, model) -> list[dict]:
     model_id = _model_id(model)
     if not provider_id or not model_id:
         return []
+
+    if provider_id == "openai" and model_id in _OPENAI_REASONING_MODELS:
+        options = [
+            _AUTO_OPTION,
+            _option("off", "Off", {"reasoning_effort": "none"}),
+            _option("minimal", "Minimal", {"reasoning_effort": "minimal"}),
+            _option("low", "Low", {"reasoning_effort": "low"}),
+            _option("medium", "Medium", {"reasoning_effort": "medium"}),
+            _option("high", "High", {"reasoning_effort": "high"}),
+            _option("xhigh", "Extra high", {"reasoning_effort": "xhigh"}),
+        ]
+        return [copy.deepcopy(opt) for opt in options]
+
+    if (
+        provider_id == "anthropic"
+        and model_id in _ANTHROPIC_ADAPTIVE_REASONING_MODELS
+    ):
+        options = [
+            _AUTO_OPTION,
+            _option(
+                "off",
+                "Off",
+                {"extra_body": {"thinking": {"type": "disabled"}}},
+            ),
+            _option("low", "Low", _anthropic_adaptive_kwargs("low")),
+            _option("medium", "Medium", _anthropic_adaptive_kwargs("medium")),
+            _option("high", "High", _anthropic_adaptive_kwargs("high")),
+        ]
+        if model_id in _ANTHROPIC_ADAPTIVE_XHIGH_MODELS:
+            options.append(
+                _option("xhigh", "Extra high", _anthropic_adaptive_kwargs("xhigh"))
+            )
+        options.append(_option("max", "Max", _anthropic_adaptive_kwargs("max")))
+        return [copy.deepcopy(opt) for opt in options]
 
     if provider_id == "google" and model_id in _GOOGLE_REASONING_MODELS:
         options = [_AUTO_OPTION]

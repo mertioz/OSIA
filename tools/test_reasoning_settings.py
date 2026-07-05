@@ -32,6 +32,15 @@ def option_ids(provider: str, model: str) -> list[str]:
     return [opt["id"] for opt in reasoning.get_reasoning_options(provider, model)]
 
 
+def claude_adaptive_kwargs(effort: str) -> dict:
+    return {
+        "extra_body": {
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {"effort": effort},
+        }
+    }
+
+
 class ReasoningSettingsTests(unittest.TestCase):
     def test_default_config_normalizes_to_stable_schema(self):
         self.assertEqual(
@@ -143,8 +152,29 @@ class ReasoningSettingsTests(unittest.TestCase):
             option_ids("mistral", "mistral-medium-3-5"),
             ["auto", "off", "minimal", "low", "medium", "high", "xhigh"],
         )
-        self.assertEqual(option_ids("openai", "gpt-5.5"), [])
-        self.assertEqual(option_ids("anthropic", "claude-sonnet-4-6"), [])
+        openai_reasoning_ids = [
+            "auto",
+            "off",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+        ]
+        self.assertEqual(option_ids("openai", "gpt-5.5"), openai_reasoning_ids)
+        self.assertEqual(option_ids("openai", "gpt-5.4"), openai_reasoning_ids)
+        self.assertEqual(option_ids("openai", "gpt-5.4-mini"), openai_reasoning_ids)
+        self.assertEqual(option_ids("openai", "gpt-4.1"), [])
+        self.assertEqual(
+            option_ids("anthropic", "claude-opus-4-8"),
+            ["auto", "off", "low", "medium", "high", "xhigh", "max"],
+        )
+        self.assertEqual(
+            option_ids("anthropic", "claude-sonnet-4-6"),
+            ["auto", "off", "low", "medium", "high", "max"],
+        )
+        self.assertNotIn("xhigh", option_ids("anthropic", "claude-sonnet-4-6"))
+        self.assertEqual(option_ids("anthropic", "claude-haiku-4-5-20251001"), [])
         self.assertEqual(option_ids("xai", "grok-3"), [])
 
     def test_auto_invalid_and_unsupported_models_return_no_kwargs(self):
@@ -161,12 +191,24 @@ class ReasoningSettingsTests(unittest.TestCase):
             {},
         )
         self.assertEqual(
-            reasoning.build_reasoning_kwargs("openai", "gpt-5.5", {"default": "high"}),
+            reasoning.build_reasoning_kwargs("openai", "gpt-5.5", {"default": "auto"}),
             {},
         )
         self.assertEqual(
             reasoning.build_reasoning_kwargs(
-                "anthropic", "claude-sonnet-4-6", {"default": "high"}
+                "openai", "gpt-4.1", {"default": "high"}
+            ),
+            {},
+        )
+        self.assertEqual(
+            reasoning.build_reasoning_kwargs(
+                "anthropic", "claude-opus-4-8", {"default": "auto"}
+            ),
+            {},
+        )
+        self.assertEqual(
+            reasoning.build_reasoning_kwargs(
+                "anthropic", "claude-haiku-4-5-20251001", {"default": "high"}
             ),
             {},
         )
@@ -274,6 +316,64 @@ class ReasoningSettingsTests(unittest.TestCase):
             ),
             {},
         )
+        self.assertEqual(
+            reasoning.build_reasoning_kwargs(
+                "openai", "gpt-5.5", {"models": {"gpt-5.5": "off"}}
+            ),
+            {"reasoning_effort": "none"},
+        )
+        self.assertEqual(
+            reasoning.build_reasoning_kwargs(
+                "openai", "gpt-5.5", {"models": {"gpt-5.5": "high"}}
+            ),
+            {"reasoning_effort": "high"},
+        )
+        self.assertEqual(
+            reasoning.build_reasoning_kwargs(
+                "openai", "gpt-5.5", {"models": {"gpt-5.5": "xhigh"}}
+            ),
+            {"reasoning_effort": "xhigh"},
+        )
+        self.assertEqual(
+            reasoning.build_reasoning_kwargs(
+                "anthropic",
+                "claude-opus-4-8",
+                {"models": {"claude-opus-4-8": "max"}},
+            ),
+            claude_adaptive_kwargs("max"),
+        )
+        self.assertEqual(
+            reasoning.build_reasoning_kwargs(
+                "anthropic",
+                "claude-opus-4-8",
+                {"models": {"claude-opus-4-8": "off"}},
+            ),
+            {"extra_body": {"thinking": {"type": "disabled"}}},
+        )
+        self.assertEqual(
+            reasoning.build_reasoning_kwargs(
+                "anthropic",
+                "claude-sonnet-4-6",
+                {"models": {"claude-sonnet-4-6": "max"}},
+            ),
+            claude_adaptive_kwargs("max"),
+        )
+        self.assertEqual(
+            reasoning.build_reasoning_kwargs(
+                "anthropic",
+                "claude-sonnet-4-6",
+                {"models": {"claude-sonnet-4-6": "xhigh"}},
+            ),
+            {},
+        )
+        self.assertEqual(
+            reasoning.build_reasoning_kwargs(
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                {"models": {"claude-haiku-4-5-20251001": "max"}},
+            ),
+            {},
+        )
 
     def test_selected_reasoning_label(self):
         self.assertEqual(
@@ -351,40 +451,96 @@ class ReasoningSettingsTests(unittest.TestCase):
     def test_agent_stream_chat_request_merges_reasoning_kwargs(self):
         import osia.agent as agent_mod
 
-        captured: dict = {}
+        def capture_stream_kwargs(provider: str, model: str, settings: dict) -> dict:
+            captured: dict = {}
 
-        class FakeCompletions:
-            def create(self, **kwargs):
-                captured.update(kwargs)
-                return []
+            class FakeCompletions:
+                def create(self, **kwargs):
+                    captured.update(kwargs)
+                    return []
 
-        class FakeChat:
-            completions = FakeCompletions()
+            class FakeChat:
+                completions = FakeCompletions()
 
-        class FakeClient:
-            chat = FakeChat()
+            class FakeClient:
+                chat = FakeChat()
 
-        agent = object.__new__(agent_mod.OSIAAgent)
-        agent.client = FakeClient()
-        agent.model = "gemini-3.5-flash"
-        agent.provider = "google"
-        agent.messages = [{"role": "user", "content": "hello"}]
+            agent = object.__new__(agent_mod.OSIAAgent)
+            agent.client = FakeClient()
+            agent.model = model
+            agent.provider = provider
+            agent.messages = [{"role": "user", "content": "hello"}]
 
-        with patched(
-            reasoning,
-            "get_reasoning_settings",
-            lambda: {
+            with patched(reasoning, "get_reasoning_settings", lambda: settings):
+                self.assertEqual(list(agent._stream_deltas()), [])
+
+            return captured
+
+        captured = capture_stream_kwargs(
+            "google",
+            "gemini-3.5-flash",
+            {
                 "default": "auto",
                 "providers": {},
                 "models": {"gemini-3.5-flash": "high"},
             },
-        ):
-            self.assertEqual(list(agent._stream_deltas()), [])
-
+        )
         self.assertEqual(captured["model"], "gemini-3.5-flash")
         self.assertEqual(captured["messages"], [{"role": "user", "content": "hello"}])
         self.assertTrue(captured["stream"])
         self.assertEqual(captured["reasoning_effort"], "high")
+
+        captured = capture_stream_kwargs(
+            "openai",
+            "gpt-5.5",
+            {"default": "auto", "providers": {}, "models": {"gpt-5.5": "high"}},
+        )
+        self.assertEqual(captured["reasoning_effort"], "high")
+
+        captured = capture_stream_kwargs(
+            "openai",
+            "gpt-5.5",
+            {"default": "auto", "providers": {}, "models": {"gpt-5.5": "auto"}},
+        )
+        self.assertNotIn("reasoning_effort", captured)
+        self.assertNotIn("extra_body", captured)
+
+        captured = capture_stream_kwargs(
+            "anthropic",
+            "claude-opus-4-8",
+            {
+                "default": "auto",
+                "providers": {},
+                "models": {"claude-opus-4-8": "max"},
+            },
+        )
+        self.assertEqual(
+            captured["extra_body"],
+            claude_adaptive_kwargs("max")["extra_body"],
+        )
+
+        captured = capture_stream_kwargs(
+            "anthropic",
+            "claude-opus-4-8",
+            {
+                "default": "auto",
+                "providers": {},
+                "models": {"claude-opus-4-8": "off"},
+            },
+        )
+        self.assertEqual(captured["extra_body"], {"thinking": {"type": "disabled"}})
+
+        captured = capture_stream_kwargs(
+            "anthropic",
+            "claude-haiku-4-5-20251001",
+            {
+                "default": "auto",
+                "providers": {},
+                "models": {"claude-haiku-4-5-20251001": "max"},
+            },
+        )
+        self.assertNotIn("reasoning_effort", captured)
+        self.assertNotIn("extra_body", captured)
 
 
 if __name__ == "__main__":
