@@ -38,6 +38,7 @@ _IS_WINDOWS = sys.platform == "win32"
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _WINDOWS_DIR = _REPO_ROOT / "windows"
 _RUN_SERVICE = _WINDOWS_DIR / "run_service.py"
+_WAKE_RECOVERY = _WINDOWS_DIR / "wake_recovery.py"
 # Same path windows\run_service.py passes to cloudflared (--logfile). It is the
 # OSIA-specific signature used to kill exactly OSIA's quick tunnel (WOR-64).
 _TUNNEL_LOG = _WINDOWS_DIR / "tunnel.log"
@@ -68,6 +69,9 @@ _TASK_DESC = {
     "server": "OSIA Server — Mobile WebSocket Server",
     "tunnel": "OSIA Tunnel — Cloudflare Tunnel",
 }
+
+_WAKE_TASK_NAME = "OSIA Wake Recovery"
+_WAKE_TASK_DESC = "OSIA Wake Recovery - restart server and tunnel after Windows resume"
 
 # Display names used by earlier WOR-47 iterations. Removed on (re)registration so
 # an upgrade never leaves an orphaned AtLogOn task that would double-start the
@@ -115,6 +119,14 @@ def _ps(script: str, env_extra: dict, timeout: float = 30.0) -> subprocess.Compl
     )
 
 
+def _win_norm_cmdline(cmdline: str) -> str:
+    return (cmdline or "").lower().replace("/", "\\")
+
+
+def _win_cmdline_has_path(cmdline: str, path: Path) -> bool:
+    return str(path).lower().replace("/", "\\") in _win_norm_cmdline(cmdline)
+
+
 def _win_proc_running(image: str) -> bool:
     """True if a process with executable name ``image`` is running (tasklist)."""
     try:
@@ -141,6 +153,24 @@ def _win_port_open(port: int) -> bool:
             return True
     except Exception:
         return False
+
+
+def _win_osia_tunnel_running() -> bool:
+    """True if OSIA's own cloudflared quick tunnel is running."""
+    try:
+        import psutil
+    except Exception:
+        return False
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        try:
+            if (proc.info.get("name") or "").lower() != "cloudflared.exe":
+                continue
+            cmdline = " ".join(proc.info.get("cmdline") or [])
+            if _win_cmdline_has_path(cmdline, _TUNNEL_LOG):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _win_pythonw() -> str:
@@ -237,6 +267,61 @@ def _win_register_task(kind: str) -> bool:
     return r.returncode == 0
 
 
+def _win_register_wake_recovery_task() -> bool:
+    """Create/overwrite the Windows resume recovery Scheduled Task.
+
+    This task is intentionally separate from "OSIA Server" and "OSIA Tunnel":
+    those keep their AtLogOn startup behavior, while this event trigger runs a
+    small idempotent recovery script after Windows resumes from low power.
+    """
+    user = _win_current_user()
+    subscription = (
+        "<QueryList>"
+        "<Query Id=\"0\" Path=\"System\">"
+        "<Select Path=\"System\">"
+        "*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] "
+        "and EventID=1]]"
+        "</Select>"
+        "</Query>"
+        "</QueryList>"
+    )
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "$a = New-ScheduledTaskAction -Execute $env:OSIA_PYW"
+        " -Argument $env:OSIA_ARG -WorkingDirectory $env:OSIA_REPO;"
+        "$triggerClass = Get-CimClass -Namespace Root/Microsoft/Windows/TaskScheduler"
+        " -ClassName MSFT_TaskEventTrigger;"
+        "$t = New-CimInstance -CimClass $triggerClass -ClientOnly;"
+        "$t.Enabled = $true;"
+        "$t.Subscription = $env:OSIA_EVENT_SUBSCRIPTION;"
+        "$t.Delay = 'PT30S';"
+        "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries"
+        " -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)"
+        " -MultipleInstances IgnoreNew -StartWhenAvailable"
+        " -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1);"
+        "$p = New-ScheduledTaskPrincipal -UserId $env:OSIA_USER"
+        " -LogonType Interactive -RunLevel Limited;"
+        "Register-ScheduledTask -TaskName $env:OSIA_TASK -Action $a -Trigger $t"
+        " -Settings $s -Principal $p -Description $env:OSIA_DESC -Force | Out-Null"
+    )
+    try:
+        r = _ps(script, {
+            "OSIA_PYW": _win_pythonw(),
+            "OSIA_ARG": f'"{_WAKE_RECOVERY}"',
+            "OSIA_REPO": str(_REPO_ROOT),
+            "OSIA_USER": user,
+            "OSIA_TASK": _WAKE_TASK_NAME,
+            "OSIA_DESC": _WAKE_TASK_DESC,
+            "OSIA_EVENT_SUBSCRIPTION": subscription,
+        })
+    except Exception as e:
+        print(f"[win-service] register {_WAKE_TASK_NAME} failed: {e}")
+        return False
+    if r.returncode != 0:
+        print(f"[win-service] register {_WAKE_TASK_NAME} failed: {(r.stderr or r.stdout).strip()}")
+    return r.returncode == 0
+
+
 def _win_run_task(task: str) -> bool:
     try:
         return _schtasks(["/run", "/TN", task]).returncode == 0
@@ -268,7 +353,7 @@ def _win_service_up(kind: str) -> bool:
     if kind == "server":
         return _win_port_open(_SERVER_PORT)
     if kind == "tunnel":
-        return _win_proc_running("cloudflared.exe")
+        return _win_osia_tunnel_running()
     return False
 
 
@@ -289,7 +374,7 @@ def _win_supervisor_running(kind: str) -> bool:
         except Exception:
             continue
         joined = " ".join(cmdline)
-        if "run_service.py" in joined and kind in cmdline:
+        if _win_cmdline_has_path(joined, _RUN_SERVICE) and kind in cmdline:
             return True
     return False
 
@@ -329,7 +414,7 @@ def _win_stop_server() -> bool:
             cmdline = " ".join(proc.info.get("cmdline") or [])
         except Exception:
             continue
-        if "run_server.py" in cmdline or "osia.server" in cmdline:
+        if _win_cmdline_has_path(cmdline, _REPO_ROOT / "osia" / "server" / "run_server.py"):
             try:
                 proc.terminate()
                 targets.append(proc)
@@ -366,12 +451,11 @@ def _win_kill_tunnel() -> bool:
     except Exception:
         return False
     killed = []
-    sig = str(_TUNNEL_LOG).lower()
     for proc in psutil.process_iter(["name", "cmdline"]):
         try:
             if (proc.info.get("name") or "").lower() != "cloudflared.exe":
                 continue
-            if sig in " ".join(proc.info.get("cmdline") or []).lower():
+            if _win_cmdline_has_path(" ".join(proc.info.get("cmdline") or []), _TUNNEL_LOG):
                 proc.terminate()
                 killed.append(proc)
         except Exception:
@@ -425,10 +509,10 @@ def _win_disable(name: str) -> bool:
 
 def install_windows_services() -> bool:
     """Register (and start) both OSIA background services as per-user Scheduled
-    Tasks so they run independently of the GUI and start at login. Called by
-    ``install.bat``. Windows-only; a harmless no-op (returns True) elsewhere.
+    Tasks, plus the Windows resume recovery task. Called by ``install.bat``.
+    Windows-only; a harmless no-op (returns True) elsewhere.
 
-    Returns True only if both tasks registered successfully.
+    Returns True only if all Windows tasks registered successfully.
     """
     if not _IS_WINDOWS:
         return True
@@ -439,6 +523,8 @@ def install_windows_services() -> bool:
             continue
         if _win_should_start(kind):
             _win_run_task(_TASK_NAME[kind])
+    if not _win_register_wake_recovery_task():
+        ok = False
     return ok
 
 
@@ -484,7 +570,7 @@ def get_service_status(name: str) -> str:
     if _IS_WINDOWS:
         kind = _UNIT_KIND.get(name)
         if kind == "tunnel":
-            return "running" if _win_proc_running("cloudflared.exe") else "stopped"
+            return "running" if _win_osia_tunnel_running() else "stopped"
         if kind == "server":
             return "running" if _win_port_open(_SERVER_PORT) else "stopped"
         return "error"

@@ -56,6 +56,14 @@ _HANG_TIMEOUT = 75.0    # max time a server child may be alive-but-not-listening
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+def _norm_cmdline(cmdline: str) -> str:
+    return (cmdline or "").lower().replace("/", "\\")
+
+
+def _cmdline_has_path(cmdline: str, path: Path) -> bool:
+    return str(path).lower().replace("/", "\\") in _norm_cmdline(cmdline)
+
+
 def _venv_python() -> str:
     """The regular venv ``python.exe`` (launched CREATE_NO_WINDOW → no console).
 
@@ -164,10 +172,10 @@ def _other_owner_running(kind: str, exclude_pid: int) -> bool:
                 # logfile path is the OSIA-specific signature (mirrors
                 # _win_kill_tunnel in osia/utils/systemd_manager.py).
                 if (proc.info.get("name") or "").lower() == "cloudflared.exe" \
-                        and str(_TUNNEL_LOG).lower() in cmdline.lower():
+                        and _cmdline_has_path(cmdline, _TUNNEL_LOG):
                     return True
             else:
-                if "run_server.py" in cmdline:
+                if _cmdline_has_path(cmdline, _RUN_SERVER):
                     return True
         except Exception:
             continue
