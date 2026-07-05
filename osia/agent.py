@@ -4391,6 +4391,14 @@ class OSIAAgent:
             wire.append(m)
         return wire
 
+    def _reasoning_request_kwargs(self) -> dict:
+        """Return provider reasoning kwargs for the current chat attempt."""
+        try:
+            from osia.reasoning import build_reasoning_kwargs
+            return build_reasoning_kwargs(self.provider, self.model)
+        except Exception:
+            return {}
+
     def _stream_deltas(self):
         """Yield text deltas from the OpenAI-compatible chat-completions
         stream, abstracting it so the sentence-splitting loop stays simple.
@@ -4403,6 +4411,7 @@ class OSIAAgent:
             "messages": self._wire_messages(),
             "stream": True,
         }
+        create_kwargs.update(self._reasoning_request_kwargs())
         stream = self.client.chat.completions.create(**create_kwargs)
         for chunk in stream:
             try:
@@ -4613,6 +4622,7 @@ class OSIAAgent:
                     "model": self.model,
                     "messages": self._wire_messages(),
                 }
+                create_kwargs.update(self._reasoning_request_kwargs())
                 response = self.client.chat.completions.create(**create_kwargs)
                 content = response.choices[0].message.content or ""
             # Same final-text pipeline as a normal response: strip reasoning
@@ -4881,6 +4891,7 @@ class OSIAAgent:
                         "model": self.model,
                         "messages": self._wire_messages(),
                     }
+                    create_kwargs.update(self._reasoning_request_kwargs())
                     response = self.client.chat.completions.create(**create_kwargs)
                     # Keep the message object: native providers may return
                     # structured tool calls on it (message.tool_calls).

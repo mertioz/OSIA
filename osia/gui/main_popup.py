@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QStackedWidget, QListWidget, QFrame,
     QSizePolicy, QFileDialog, QCheckBox, QComboBox,
-    QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog, QLayout,
+    QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog, QLayout, QMenu,
 )
 
 from osia import conversations
@@ -53,7 +53,9 @@ from osia.config import (
     get_setting, get_mcp_token, set_mcp_token, delete_mcp_token,
     delete_mcp_oauth, get_mcp_oauth, set_mcp_oauth,
     get_oauth_client, set_oauth_client,
+    get_reasoning_settings, set_reasoning_settings,
 )
+from osia.reasoning import get_reasoning_options
 from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
     restart_service,
@@ -687,6 +689,11 @@ class _ModelRow(QFrame):
         self.setObjectName("modelRow")
         self.setProperty("active", is_active)
         self._mid = model["id"]
+        self._provider = model.get("provider", "")
+        try:
+            self._reasoning_options = get_reasoning_options(self._provider, self._mid)
+        except Exception:
+            self._reasoning_options = []
 
         row = QHBoxLayout(self)
         row.setContentsMargins(12, 8, 10, 8)
@@ -703,8 +710,12 @@ class _ModelRow(QFrame):
         name.setObjectName("modelName")
         sub = QLabel(model.get("id", ""))
         sub.setObjectName("modelSub")
+        self._reasoning_chip = QLabel()
+        self._reasoning_chip.setObjectName("modelReasoningChip")
+        self._reasoning_chip.setVisible(False)
         col.addWidget(name)
         col.addWidget(sub)
+        col.addWidget(self._reasoning_chip)
 
         btn = QPushButton(
             "✓ " + i18n.t("models.active") if is_active else i18n.t("models.use")
@@ -716,7 +727,126 @@ class _ModelRow(QFrame):
 
         row.addWidget(prov)
         row.addLayout(col, 1)
+        self._reasoning_btn = None
+        if self._reasoning_options:
+            self._reasoning_btn = QPushButton("\u2699")
+            self._reasoning_btn.setObjectName("modelReasoning")
+            self._reasoning_btn.setFixedSize(30, 30)
+            self._reasoning_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._reasoning_btn.setToolTip(i18n.t("reasoning.tooltip"))
+            self._reasoning_btn.clicked.connect(self._show_reasoning_menu)
+            row.addWidget(self._reasoning_btn)
+            i18n.add_listener(self._retranslate_reasoning)
+            self.destroyed.connect(
+                lambda: i18n.remove_listener(self._retranslate_reasoning)
+            )
         row.addWidget(btn)
+        self._refresh_reasoning_chip()
+
+    def _option_label(self, option: dict) -> str:
+        key = option.get("label_key")
+        if key:
+            return i18n.t(str(key))
+        return str(option.get("label") or option.get("id") or "")
+
+    def _explicit_reasoning_option_id(self) -> str:
+        option_ids = {
+            str(opt.get("id") or "").strip().lower()
+            for opt in self._reasoning_options
+        }
+        try:
+            cfg = get_reasoning_settings()
+            selected = (
+                (cfg.get("models") or {}).get(self._mid, "auto")
+                if isinstance(cfg, dict) else "auto"
+            )
+        except Exception:
+            selected = "auto"
+        selected = str(selected or "auto").strip().lower()
+        return selected if selected in option_ids else "auto"
+
+    def _refresh_reasoning_chip(self) -> None:
+        if not self._reasoning_options:
+            self._reasoning_chip.setVisible(False)
+            return
+        selected = self._explicit_reasoning_option_id()
+        option = next(
+            (
+                opt for opt in self._reasoning_options
+                if str(opt.get("id") or "").strip().lower() == selected
+            ),
+            None,
+        )
+        show = bool(option and not option.get("default"))
+        if show:
+            label = self._option_label(option)
+            self._reasoning_chip.setText(
+                i18n.t("reasoning.current_level", level=label)
+            )
+        self._reasoning_chip.setVisible(show)
+        if self._reasoning_btn is not None:
+            self._reasoning_btn.setProperty("selected", show)
+            self._reasoning_btn.style().unpolish(self._reasoning_btn)
+            self._reasoning_btn.style().polish(self._reasoning_btn)
+
+    def _show_reasoning_menu(self) -> None:
+        if not self._reasoning_options or self._reasoning_btn is None:
+            return
+        current = self._explicit_reasoning_option_id()
+        menu = QMenu(self)
+        menu.setObjectName("reasoningMenu")
+        menu.setStyleSheet("""
+            QMenu#reasoningMenu {
+                background: #0d0b12;
+                border: 1px solid rgba(196, 181, 245, 0.28);
+                color: #e8e6f0;
+                padding: 6px;
+            }
+            QMenu#reasoningMenu::item {
+                padding: 7px 18px;
+                border-radius: 6px;
+                font-size: 12px;
+            }
+            QMenu#reasoningMenu::item:selected {
+                background: rgba(196, 181, 245, 0.20);
+                color: #ffffff;
+            }
+        """)
+        title = menu.addAction(i18n.t("settings.reasoning"))
+        title.setEnabled(False)
+        menu.addSeparator()
+        for option in self._reasoning_options:
+            option_id = str(option.get("id") or "").strip().lower()
+            label = self._option_label(option)
+            prefix = "\u2713 " if option_id == current else "   "
+            action = menu.addAction(prefix + label)
+            action.triggered.connect(
+                lambda _checked=False, oid=option_id: self._set_reasoning_option(oid)
+            )
+        pos = self._reasoning_btn.mapToGlobal(
+            QPoint(0, self._reasoning_btn.height() + 4)
+        )
+        menu.exec(pos)
+
+    def _set_reasoning_option(self, option_id: str) -> None:
+        option_ids = {
+            str(opt.get("id") or "").strip().lower()
+            for opt in self._reasoning_options
+        }
+        option_id = str(option_id or "auto").strip().lower()
+        if option_id not in option_ids:
+            option_id = "auto"
+        cfg = get_reasoning_settings()
+        models = dict((cfg or {}).get("models") or {})
+        models[self._mid] = option_id
+        cfg["models"] = models
+        set_reasoning_settings(cfg)
+        self._refresh_reasoning_chip()
+
+    def _retranslate_reasoning(self) -> None:
+        if self._reasoning_btn is not None:
+            self._reasoning_btn.setToolTip(i18n.t("reasoning.tooltip"))
+        self._refresh_reasoning_chip()
 
 
 class _InfoBadge(QLabel):
@@ -1719,7 +1849,7 @@ class _SettingsPanel(QWidget):
         # warrants top-level discoverability.
         self._settings_pages = [
             ("settings.cat.general",  [sec_language, sec_capsule]),
-            ("settings.cat.ai",       [sec_ai_prov, sec_hierarchy, sec_apikeys]),
+            ("settings.cat.models",   [sec_ai_prov, sec_hierarchy, sec_apikeys]),
             ("settings.cat.voice",    [sec_voice, sec_stt, sec_liveapi]),
             ("settings.cat.wake",     [sec_wake]),
             ("settings.cat.mcp",      [sec_mcp]),
@@ -5415,6 +5545,7 @@ class _SettingsPanel(QWidget):
             stt_fallback, self._stt_selected_model(settings, stt_fallback)
         )
 
+
         # AI task hierarchy (Bloc 3) — rebuild both fallback-chain editors.
         hierarchy = settings.get("ai_hierarchy", {}) or {}
         self._hier_values = {
@@ -7704,6 +7835,29 @@ class MainPopup(QWidget):
             QLabel#modelSub {
                 font-size: 11px;
                 color: #9d9aad;
+            }
+            QLabel#modelReasoningChip {
+                color: rgba(196, 181, 245, 0.82);
+                font-size: 10px;
+                padding-top: 2px;
+            }
+            QPushButton#modelReasoning {
+                background: rgba(196, 181, 245, 0.06);
+                border: 1px solid rgba(196, 181, 245, 0.16);
+                color: rgba(232, 230, 240, 0.68);
+                border-radius: 10px;
+                font-size: 13px;
+                padding: 0;
+            }
+            QPushButton#modelReasoning:hover {
+                background: rgba(196, 181, 245, 0.14);
+                border: 1px solid rgba(196, 181, 245, 0.34);
+                color: #e8e6f0;
+            }
+            QPushButton#modelReasoning[selected="true"] {
+                background: rgba(196, 181, 245, 0.16);
+                border: 1px solid rgba(196, 181, 245, 0.44);
+                color: #c4b5f5;
             }
             QPushButton#modelUse {
                 background: rgba(196, 181, 245, 0.18);

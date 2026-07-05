@@ -47,6 +47,17 @@ API_KEYS_FILE = os.path.join(CONFIG_DIR, "api_keys.json")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 MOBILE_TOKEN_FILE = os.path.join(CONFIG_DIR, "mobile_token.txt")
 
+REASONING_LEVELS = ("auto", "off", "low", "medium", "high")
+REASONING_OPTION_IDS = (
+    "auto", "off", "minimal", "low", "medium", "high", "xhigh", "normal", "max",
+)
+_DEFAULT_REASONING_SETTINGS = {
+    "default": "auto",
+    "providers": {},
+    "models": {},
+}
+
+
 DEFAULT_SETTINGS = {
     "selected_model": None,
     "tts_provider": "local",   # one of: "local", "openai", "google"
@@ -76,6 +87,10 @@ DEFAULT_SETTINGS = {
     # and always uses the manually selected model (the chains above are kept so
     # they can still be configured). See OSIAAgent.run().
     "ai_hierarchy_enabled": False,
+    # Shared per-provider/per-model reasoning level. "auto" deliberately sends
+    # no provider-specific parameter, so old configs and unsupported models keep
+    # their provider-native behaviour.
+    "reasoning": copy.deepcopy(_DEFAULT_REASONING_SETTINGS),
     # Vision model cooperation (WOR-25): when the selected main model has no
     # vision capability (e.g. DeepSeek text), OSIA pairs it with a vision-capable
     # companion (e.g. Gemini) for image/screenshot tasks. Empty = no companion
@@ -167,6 +182,47 @@ DEFAULT_SETTINGS = {
     "island_x": None,          # last dragged capsule position; None = top-centre
     "island_y": None,
 }
+
+
+def normalize_reasoning_level(value) -> str:
+    """Return a supported reasoning option id, defaulting invalid values to auto."""
+    if isinstance(value, str):
+        level = value.strip().lower()
+        if level == "default":
+            return "auto"
+        if level == "none":
+            return "off"
+        if level in REASONING_OPTION_IDS:
+            return level
+    return "auto"
+
+
+def _normalize_reasoning_map(value, *, lowercase_keys: bool = False) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    out: dict = {}
+    for raw_key, raw_level in value.items():
+        if not isinstance(raw_key, str):
+            continue
+        key = raw_key.strip()
+        if lowercase_keys:
+            key = key.lower()
+        if not key:
+            continue
+        out[key] = normalize_reasoning_level(raw_level)
+    return out
+
+
+def normalize_reasoning_settings(value) -> dict:
+    """Normalize persisted reasoning settings into the stable WOR-77 schema."""
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "default": normalize_reasoning_level(raw.get("default", "auto")),
+        "providers": _normalize_reasoning_map(
+            raw.get("providers"), lowercase_keys=True,
+        ),
+        "models": _normalize_reasoning_map(raw.get("models")),
+    }
 
 
 def _ensure_config_dir():
@@ -468,6 +524,7 @@ def load_settings() -> dict:
     """
     base = dict(DEFAULT_SETTINGS)
     base.update(_read_settings_file())
+    base["reasoning"] = normalize_reasoning_settings(base.get("reasoning"))
     return base
 
 
@@ -509,8 +566,18 @@ def get_setting(key: str, default=None):
 
 def set_setting(key: str, value) -> None:
     settings = load_settings()
+    if key == "reasoning":
+        value = normalize_reasoning_settings(value)
     settings[key] = value
     save_settings(settings)
+
+
+def get_reasoning_settings() -> dict:
+    return normalize_reasoning_settings(load_settings().get("reasoning"))
+
+
+def set_reasoning_settings(value) -> None:
+    set_setting("reasoning", normalize_reasoning_settings(value))
 
 
 # ── Mobile pairing token ───────────────────────────────────────────────────

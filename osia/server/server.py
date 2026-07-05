@@ -1056,6 +1056,11 @@ async def _broadcast_mcp_status(
             _WS_CLIENTS.discard(client)
 
 
+def _normalize_mobile_reasoning_setting(value) -> dict:
+    from osia.config import normalize_reasoning_settings
+    return normalize_reasoning_settings(value)
+
+
 def _build_config_snapshot() -> dict:
     """Build the mobile config snapshot — the ``config`` payload of a
     ``{"type": "config", "config": {...}}`` frame. ONE source of truth shared by
@@ -1074,6 +1079,7 @@ def _build_config_snapshot() -> dict:
     from osia.config import load_settings, load_api_keys, get_setting
     from osia import personality
     cfg = load_settings()
+    cfg["reasoning"] = _normalize_mobile_reasoning_setting(cfg.get("reasoning"))
     cfg["mcp_servers"] = _sanitize_mobile_mcp_servers(cfg.get("mcp_servers"))
     cfg["gmail_rest"] = _gmail_rest_config_snapshot()
     # api_key_fallbacks holds the raw ordered fallback keys per provider (WOR-29).
@@ -3817,6 +3823,8 @@ async def websocket_endpoint(ws: WebSocket):
                     "heartbeat_enabled", "heartbeat_interval_seconds",
                     # Cooperation IA vision provider/model (WOR-25).
                     "vision_provider", "vision_model",
+                    # Shared reasoning/thinking level settings (WOR-77).
+                    "reasoning",
                     # MCP / Connectors server list (WOR-44 Phase 4). The list is
                     # NON-SECRET (env is always {} — see the mcp_servers write
                     # branch below); per-server tokens live only in the
@@ -3838,7 +3846,12 @@ async def websocket_endpoint(ws: WebSocket):
                     await out.send_json({"type": "status", "status": "error"})
                     continue
                 try:
-                    from osia.config import set_setting, get_setting
+                    from osia.config import (
+                        set_setting,
+                        get_setting,
+                        set_reasoning_settings,
+                    )
+                    logged_value = setting_value
                     if setting_key in ("heavy_chain", "medium_chain"):
                         # heavy_chain/medium_chain are the flat names the mobile
                         # app uses for the two ordered fallback chains that live
@@ -3875,6 +3888,11 @@ async def websocket_endpoint(ws: WebSocket):
                                     e.pop("headers", None)
                                     clean.append(e)
                         set_setting("mcp_servers", clean)
+                        logged_value = clean
+                    elif setting_key == "reasoning":
+                        clean_reasoning = _normalize_mobile_reasoning_setting(setting_value)
+                        set_reasoning_settings(clean_reasoning)
+                        logged_value = clean_reasoning
                     else:
                         set_setting(setting_key, setting_value)
                     # WOR-44 Phase 5: for mcp_servers log the SANITIZED `clean`
@@ -3883,7 +3901,6 @@ async def websocket_endpoint(ws: WebSocket):
                     # and the raw value would otherwise leak it to the journal in
                     # plaintext. `clean` is only referenced on the mcp_servers
                     # branch, where it is always bound.
-                    logged_value = clean if setting_key == "mcp_servers" else setting_value
                     print(
                         f"[OSIA Server] set_setting {setting_key!r} -> "
                         f"{logged_value!r}"
