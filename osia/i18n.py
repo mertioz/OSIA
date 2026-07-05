@@ -1673,6 +1673,107 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Erweitert",
         "es": "Avanzado",
     },
+    # ── Local Memory (WOR-89) ───────────────────────────────────────────────
+    "settings.cat.memory": {
+        "en": "Memory",
+        "fr": "Mémoire",
+    },
+    "settings.memory": {
+        "en": "Memory",
+        "fr": "Mémoire",
+    },
+    "settings.memory_sub": {
+        "en": "Local memories",
+        "fr": "Mémoires locales",
+    },
+    "settings.memory_desc": {
+        "en": "Local memories OSIA uses to personalize actions and responses.",
+        "fr": "Souvenirs locaux qu'OSIA utilise pour personnaliser ses actions et ses réponses.",
+    },
+    "settings.memory_refresh": {
+        "en": "Refresh",
+        "fr": "Actualiser",
+    },
+    "settings.memory_edit": {
+        "en": "Edit",
+        "fr": "Modifier",
+    },
+    "settings.memory_delete": {
+        "en": "Delete",
+        "fr": "Supprimer",
+    },
+    "settings.memory_clear_all": {
+        "en": "Clear all",
+        "fr": "Tout effacer",
+    },
+    "settings.memory_empty": {
+        "en": "No memories yet",
+        "fr": "Aucun souvenir pour l'instant",
+    },
+    "settings.memory_saved": {
+        "en": "Memory saved",
+        "fr": "Souvenir enregistré",
+    },
+    "settings.memory_deleted": {
+        "en": "Memory deleted",
+        "fr": "Souvenir supprimé",
+    },
+    "settings.memory_cleared": {
+        "en": "Memory cleared",
+        "fr": "Mémoire effacée",
+    },
+    "settings.memory_save_failed": {
+        "en": "Save failed{error}",
+        "fr": "Échec de l'enregistrement{error}",
+    },
+    "settings.memory_delete_failed": {
+        "en": "Delete failed",
+        "fr": "Échec de la suppression",
+    },
+    "settings.memory_delete_title": {
+        "en": "Delete memory",
+        "fr": "Supprimer le souvenir",
+    },
+    "settings.memory_delete_confirm": {
+        "en": "Delete this memory?",
+        "fr": "Supprimer ce souvenir ?",
+    },
+    "settings.memory_clear_title": {
+        "en": "Clear memory",
+        "fr": "Effacer la mémoire",
+    },
+    "settings.memory_clear_confirm": {
+        "en": "Clear all local OSIA memories? This cannot be undone.",
+        "fr": "Effacer tous les souvenirs locaux d'OSIA ? Cette action est irréversible.",
+    },
+    "settings.memory_edit_title": {
+        "en": "Edit memory",
+        "fr": "Modifier le souvenir",
+    },
+    "settings.memory_field_title": {
+        "en": "Title",
+        "fr": "Titre",
+    },
+    "settings.memory_field_key": {
+        "en": "Key",
+        "fr": "Clé",
+    },
+    "settings.memory_field_type": {
+        "en": "Type",
+        "fr": "Type",
+    },
+    "settings.memory_field_category": {
+        "en": "Category",
+        "fr": "Catégorie",
+    },
+    "settings.memory_field_value_kind": {
+        "en": "Value kind",
+        "fr": "Type de valeur",
+    },
+    "settings.memory_field_value": {
+        "en": "Value",
+        "fr": "Valeur",
+    },
     # ── MCP / Connectors (WOR-44) ───────────────────────────────────────────
     "settings.cat.mcp": {
         "en": "MCP / Connectors",

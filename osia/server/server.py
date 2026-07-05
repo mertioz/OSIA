@@ -95,6 +95,12 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 
 from osia import conversations
 from osia.config import CONFIG_DIR as _CONFIG_DIR, regenerate_mobile_token
+from osia.memory import (
+    MemoryError as OsiaMemoryError,
+    MemorySecretError,
+    MemoryStore,
+    MemoryValidationError,
+)
 
 # Windows consoles default to cp1252, which raises UnicodeEncodeError the moment
 # a log line contains a non-ASCII char (e.g. the "▶" in "[OSIA Agent] ▶ tool:")
@@ -1145,6 +1151,44 @@ async def _broadcast_config(
     state (config is otherwise pull-only via ``get_config``). Reuses the existing
     ``{"type": "config"}`` shape the mobile already repaints from; introduces no
     new message type."""
+    for client in list(_WS_CLIENTS):
+        if client is exclude:
+            continue
+        try:
+            await client.send_json(frame)
+        except Exception:
+            _WS_CLIENTS.discard(client)
+
+
+def _memory_store() -> MemoryStore:
+    return MemoryStore()
+
+
+def _memory_error_code(exc: Exception) -> str:
+    if isinstance(exc, (MemoryValidationError, MemorySecretError)):
+        return "validation_error"
+    if isinstance(exc, (OSError, OsiaMemoryError)):
+        return "storage_error"
+    return "unknown"
+
+
+async def _send_memory_error(
+    channel: "_OutboundChannel",
+    code: str,
+    message: str,
+) -> None:
+    await channel.send_json({
+        "type": "memory_error",
+        "code": code,
+        "message": message,
+    })
+
+
+async def _broadcast_memory_updated(
+    memory: dict,
+    exclude: "_OutboundChannel | None" = None,
+) -> None:
+    frame = {"type": "memory_updated", "memory": memory}
     for client in list(_WS_CLIENTS):
         if client is exclude:
             continue
@@ -3931,6 +3975,103 @@ async def websocket_endpoint(ws: WebSocket):
                     print(f"[OSIA Server] get_config failed: {e}")
                     traceback.print_exc()
                     await out.send_json({"type": "status", "status": "error"})
+                continue
+
+            # --- Memory management (WOR-89, additive WS API) ---
+            if msg_type == "get_memory":
+                try:
+                    store = _memory_store()
+                    memory = store.load()
+                    await out.send_json({"type": "memory", "memory": memory})
+                    print(
+                        f"[OSIA Server] get_memory sent "
+                        f"({len(memory.get('entries', []))} entries)"
+                    )
+                except Exception as e:
+                    print(f"[OSIA Server] get_memory failed: {e}")
+                    traceback.print_exc()
+                    await _send_memory_error(
+                        out,
+                        _memory_error_code(e),
+                        str(e) or type(e).__name__,
+                    )
+                continue
+
+            if msg_type == "upsert_memory":
+                raw_entry = msg.get("entry")
+                if not isinstance(raw_entry, dict):
+                    await _send_memory_error(
+                        out,
+                        "validation_error",
+                        "entry must be an object",
+                    )
+                    continue
+                try:
+                    store = _memory_store()
+                    store.upsert_entry(raw_entry)
+                    memory = store.export_snapshot()
+                    await _broadcast_memory_updated(memory)
+                    print(
+                        f"[OSIA Server] upsert_memory saved "
+                        f"({len(memory.get('entries', []))} entries)"
+                    )
+                except Exception as e:
+                    print(f"[OSIA Server] upsert_memory failed: {e}")
+                    await _send_memory_error(
+                        out,
+                        _memory_error_code(e),
+                        str(e) or type(e).__name__,
+                    )
+                continue
+
+            if msg_type == "delete_memory":
+                raw_id = msg.get("id")
+                entry_id = raw_id.strip() if isinstance(raw_id, str) else ""
+                if not entry_id:
+                    await _send_memory_error(
+                        out,
+                        "validation_error",
+                        "id is required",
+                    )
+                    continue
+                try:
+                    store = _memory_store()
+                    if not store.delete_entry(entry_id):
+                        await _send_memory_error(
+                            out,
+                            "not_found",
+                            f"memory entry {entry_id!r} not found",
+                        )
+                        continue
+                    memory = store.export_snapshot()
+                    await _broadcast_memory_updated(memory)
+                    print(
+                        f"[OSIA Server] delete_memory removed {entry_id!r} "
+                        f"({len(memory.get('entries', []))} entries)"
+                    )
+                except Exception as e:
+                    print(f"[OSIA Server] delete_memory failed: {e}")
+                    await _send_memory_error(
+                        out,
+                        _memory_error_code(e),
+                        str(e) or type(e).__name__,
+                    )
+                continue
+
+            if msg_type == "clear_memory":
+                try:
+                    store = _memory_store()
+                    store.clear()
+                    memory = store.export_snapshot()
+                    await _broadcast_memory_updated(memory)
+                    print("[OSIA Server] clear_memory cleared all entries")
+                except Exception as e:
+                    print(f"[OSIA Server] clear_memory failed: {e}")
+                    await _send_memory_error(
+                        out,
+                        _memory_error_code(e),
+                        str(e) or type(e).__name__,
+                    )
                 continue
 
             # --- API keys (mobile "Configure APIs & Providers" editor) ---

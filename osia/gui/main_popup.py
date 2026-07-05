@@ -18,6 +18,7 @@ signals/slots so the host can wire up the actual behaviour without the
 GUI knowing about threads or persistence.
 """
 
+import json
 import math
 import re
 import shlex
@@ -43,6 +44,7 @@ from PyQt6.QtWidgets import (
 from osia import conversations
 from osia import personality
 from osia.agent import strip_tool_artifacts
+from osia.memory import MemoryStore
 from osia.models import (
     PROVIDERS, get_all_models,
     provider_for_model, model_has_vision, vision_capable_models,
@@ -1411,6 +1413,178 @@ class _PopoverDialog(QDialog):
         self.activateWindow()
 
 
+class _MemoryEditDialog(_PopoverDialog):
+    """Small settings popover for editing one local memory entry."""
+
+    _TYPES = ("route", "preference", "fact", "workflow", "contact", "shortcut")
+    _CATEGORIES = (
+        "app", "site", "deep_link", "folder", "file", "game",
+        "user", "workflow", "contact", "other",
+    )
+    _KINDS = ("path", "url", "uri", "steam_appid", "text", "steps")
+
+    def __init__(self, parent, entry: dict, anchor=None):
+        super().__init__(parent, anchor=anchor)
+        self.setObjectName("memoryEditDialog")
+        try:
+            self._entry = json.loads(json.dumps(entry, ensure_ascii=False))
+        except Exception:
+            self._entry = dict(entry or {})
+        self.saved_entry = None
+
+        lay = self._card_layout
+        title = QLabel(i18n.t("settings.memory_edit_title"))
+        title.setObjectName("dialogTitle")
+        lay.addWidget(title)
+
+        self._type_combo = self._combo(self._TYPES, self._entry.get("type"))
+        self._category_combo = self._combo(
+            self._CATEGORIES, self._entry.get("category")
+        )
+        value = self._entry.get("value") if isinstance(self._entry.get("value"), dict) else {}
+        self._kind_combo = self._combo(self._KINDS, value.get("kind"))
+
+        self._title_input = self._line(
+            "settings.memory_field_title", self._entry.get("title", "")
+        )
+        self._key_input = self._line(
+            "settings.memory_field_key", self._entry.get("key", "")
+        )
+        self._labeled_widget("settings.memory_field_type", self._type_combo)
+        self._labeled_widget("settings.memory_field_category", self._category_combo)
+        self._labeled_widget("settings.memory_field_value_kind", self._kind_combo)
+
+        self._value_edit = QTextEdit()
+        self._value_edit.setObjectName("mdEditor")
+        self._value_edit.setMinimumSize(320, 120)
+        data = value.get("data", "")
+        if isinstance(data, (dict, list)):
+            self._value_edit.setPlainText(
+                json.dumps(data, ensure_ascii=False, indent=2)
+            )
+        else:
+            self._value_edit.setPlainText(str(data or ""))
+        self._labeled_widget("settings.memory_field_value", self._value_edit)
+
+        self._error = QLabel("")
+        self._error.setObjectName("providerSub")
+        self._error.setWordWrap(True)
+        self._error.setStyleSheet("color: #e0a3a3;")
+        lay.addWidget(self._error)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton(i18n.t("settings.close"))
+        cancel.setObjectName("ghostBtn")
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.clicked.connect(self.reject)
+        save = QPushButton(i18n.t("provider.save"))
+        save.setObjectName("primaryBtn")
+        save.setCursor(Qt.CursorShape.PointingHandCursor)
+        save.clicked.connect(self._on_save)
+        row.addWidget(cancel)
+        row.addWidget(save)
+        lay.addLayout(row)
+
+    def _combo(self, values: tuple[str, ...], current) -> QComboBox:
+        combo = QComboBox()
+        combo.setObjectName("voiceCombo")
+        for value in values:
+            combo.addItem(value.replace("_", " "), value)
+        selected = str(current or "").strip().lower()
+        for idx, value in enumerate(values):
+            if value == selected:
+                combo.setCurrentIndex(idx)
+                break
+        return combo
+
+    def _line(self, label_key: str, value) -> QLineEdit:
+        line = QLineEdit(str(value or ""))
+        line.setObjectName("keyInput")
+        line.setMinimumWidth(320)
+        self._labeled_widget(label_key, line)
+        return line
+
+    def _labeled_widget(self, label_key: str, widget: QWidget) -> None:
+        label = QLabel(i18n.t(label_key))
+        label.setObjectName("providerSub")
+        self._card_layout.addWidget(label)
+        self._card_layout.addWidget(widget)
+
+    def _edited_value_data(self):
+        raw = self._value_edit.toPlainText().strip()
+        kind = self._kind_combo.currentData() or "text"
+        if kind == "steps":
+            if raw.startswith("[") or raw.startswith("{"):
+                return json.loads(raw)
+            return [line.strip() for line in raw.splitlines() if line.strip()]
+        return raw
+
+    def _on_save(self) -> None:
+        try:
+            updated = json.loads(json.dumps(self._entry, ensure_ascii=False))
+            updated["type"] = self._type_combo.currentData() or "fact"
+            updated["category"] = self._category_combo.currentData() or "other"
+            updated["key"] = self._key_input.text().strip()
+            updated["title"] = self._title_input.text().strip()
+            updated["value"] = {
+                "kind": self._kind_combo.currentData() or "text",
+                "data": self._edited_value_data(),
+            }
+            saved = MemoryStore().upsert_entry(updated)
+            if not MemoryStore().get_entry(saved["id"]):
+                raise RuntimeError("memory entry was not readable after save")
+            self.saved_entry = saved
+            self.accept()
+        except Exception as exc:
+            self._error.setText(
+                i18n.t("settings.memory_save_failed", error=f": {exc}")
+            )
+
+
+class _MemoryConfirmDialog(_PopoverDialog):
+    """Small confirmation popover for destructive memory actions."""
+
+    def __init__(self, parent, title_key: str, body_key: str, action_key: str, anchor=None):
+        super().__init__(parent, anchor=anchor)
+        title = QLabel(i18n.t(title_key))
+        title.setObjectName("dialogTitle")
+        self._card_layout.addWidget(title)
+
+        body = QLabel(i18n.t(body_key))
+        body.setObjectName("sectionSub")
+        body.setWordWrap(True)
+        body.setMaximumWidth(340)
+        self._card_layout.addWidget(body)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton(i18n.t("settings.close"))
+        cancel.setObjectName("ghostBtn")
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.clicked.connect(self.reject)
+        action = QPushButton(i18n.t(action_key))
+        action.setObjectName("memoryDangerAction")
+        action.setCursor(Qt.CursorShape.PointingHandCursor)
+        action.clicked.connect(self.accept)
+        row.addWidget(cancel)
+        row.addWidget(action)
+        self._card_layout.addLayout(row)
+
+
+class _MemoryClearDialog(_MemoryConfirmDialog):
+    """Confirmation popover for clearing local OSIA memory."""
+
+    def __init__(self, parent, anchor=None):
+        super().__init__(
+            parent,
+            "settings.memory_clear_title",
+            "settings.memory_clear_confirm",
+            "settings.memory_clear_all",
+            anchor=anchor,
+        )
+
+
 class _ApiKeyFallbackDialog(_PopoverDialog):
     """Popover to edit a provider's ordered API-key fallback hierarchy.
 
@@ -1885,9 +2059,10 @@ class _SettingsPanel(QWidget):
         sec_apikeys   = self._build_apikeys_section()       # API Key Fallback
         sec_mobile    = self._build_mobile_section()        # Mobile Connection
         sec_startup   = self._build_startup_section()       # Autostart services
+        sec_memory    = self._build_memory_section()        # Local Memory
         sec_mcp       = self._build_mcp_section()           # MCP / Connectors (WOR-44)
 
-        # (nav i18n key, [sections on that page]) — 7 categories, all 14 frames,
+        # (nav i18n key, [sections on that page]) — 8 categories, all 15 frames,
         # each frame used exactly once. MCP/Connectors gets its OWN category (not
         # folded into Advanced) — it is a central, growing capability that
         # warrants top-level discoverability.
@@ -1896,6 +2071,7 @@ class _SettingsPanel(QWidget):
             ("settings.cat.models",   [sec_ai_prov, sec_hierarchy, sec_apikeys]),
             ("settings.cat.voice",    [sec_voice, sec_stt, sec_liveapi]),
             ("settings.cat.wake",     [sec_wake]),
+            ("settings.cat.memory",   [sec_memory]),
             ("settings.cat.mcp",      [sec_mcp]),
             ("settings.cat.mobile",   [sec_mobile, sec_startup]),
             ("settings.cat.advanced", [sec_cron, sec_heartbeat]),
@@ -1921,7 +2097,7 @@ class _SettingsPanel(QWidget):
 
         # Wire the nav -> stack, default to the first category.
         self._settings_nav.currentRowChanged.connect(
-            self._settings_stack.setCurrentIndex
+            self._on_settings_category_changed
         )
         self._settings_nav.setCurrentRow(0)
 
@@ -1957,6 +2133,17 @@ class _SettingsPanel(QWidget):
         self._mcp_timer.timeout.connect(self._refresh_mcp_status)
 
     # ── Section builders ──────────────────────────────────────────────────
+
+    def _on_settings_category_changed(self, row: int) -> None:
+        if row < 0:
+            return
+        self._settings_stack.setCurrentIndex(row)
+        try:
+            key = self._settings_pages[row][0]
+        except Exception:
+            return
+        if key == "settings.cat.memory":
+            self._refresh_memory_entries()
 
     def _build_language_section(self) -> QFrame:
         wrap = QFrame()
@@ -3323,6 +3510,197 @@ class _SettingsPanel(QWidget):
                     entry["threshold"] = self._HB_DEFAULT_THRESHOLDS.get(name, 0)
             checks[name] = entry
         set_setting("heartbeat_checks", checks)
+
+    # Local Memory (WOR-89)
+
+    def _build_memory_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        l = QVBoxLayout(wrap)
+        l.setContentsMargins(14, 12, 14, 12)
+        l.setSpacing(8)
+
+        self._memory_title = QLabel(i18n.t("settings.memory"))
+        self._memory_title.setObjectName("sectionTitle")
+        self._memory_title.setWordWrap(True)
+        self._memory_sub = QLabel(i18n.t("settings.memory_sub"))
+        self._memory_sub.setObjectName("sectionSub")
+        self._memory_sub.setWordWrap(True)
+        self._memory_desc = QLabel(i18n.t("settings.memory_desc"))
+        self._memory_desc.setObjectName("sectionDesc")
+        self._memory_desc.setWordWrap(True)
+        l.addWidget(self._memory_title)
+        l.addWidget(self._memory_sub)
+        l.addWidget(self._memory_desc)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self._memory_refresh_btn = QPushButton(i18n.t("settings.memory_refresh"))
+        self._memory_refresh_btn.setObjectName("ghostBtn")
+        self._memory_refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._memory_refresh_btn.clicked.connect(self._refresh_memory_entries)
+        self._memory_clear_btn = QPushButton(i18n.t("settings.memory_clear_all"))
+        self._memory_clear_btn.setObjectName("memoryDangerAction")
+        self._memory_clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._memory_clear_btn.clicked.connect(self._on_memory_clear_all)
+        actions.addWidget(self._memory_refresh_btn)
+        actions.addWidget(self._memory_clear_btn)
+        actions.addStretch()
+        l.addLayout(actions)
+
+        self._memory_status = QLabel("")
+        self._memory_status.setObjectName("providerSub")
+        self._memory_status.setWordWrap(True)
+        l.addWidget(self._memory_status)
+
+        host = QWidget()
+        self._memory_entries_host = QVBoxLayout(host)
+        self._memory_entries_host.setContentsMargins(0, 0, 0, 0)
+        self._memory_entries_host.setSpacing(8)
+        l.addWidget(host)
+        self._refresh_memory_entries()
+        return wrap
+
+    def _clear_memory_rows(self) -> None:
+        while self._memory_entries_host.count():
+            item = self._memory_entries_host.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    @staticmethod
+    def _memory_value_preview(entry: dict, limit: int = 160) -> str:
+        value = entry.get("value") if isinstance(entry.get("value"), dict) else {}
+        data = value.get("data", "")
+        if isinstance(data, (dict, list)):
+            text = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        else:
+            text = str(data or "")
+        text = " ".join(text.split())
+        if len(text) > limit:
+            text = text[: limit - 1].rstrip() + "…"
+        return text
+
+    @staticmethod
+    def _memory_sort_key(entry: dict) -> tuple[str, str, str]:
+        return (
+            str(entry.get("last_used_at") or ""),
+            str(entry.get("updated_at") or ""),
+            str(entry.get("created_at") or ""),
+        )
+
+    @classmethod
+    def _memory_entries_for_display(cls, store=None) -> list[dict]:
+        entries = (store or MemoryStore()).list_entries()
+        return sorted(entries, key=cls._memory_sort_key, reverse=True)
+
+    def _refresh_memory_entries(self) -> None:
+        if not hasattr(self, "_memory_entries_host"):
+            return
+        self._clear_memory_rows()
+        try:
+            entries = self._memory_entries_for_display()
+        except Exception as exc:
+            self._memory_status.setText(
+                i18n.t("settings.memory_save_failed", error=f": {exc}")
+            )
+            entries = []
+        self._memory_clear_btn.setEnabled(bool(entries))
+        if not entries:
+            empty = QLabel(i18n.t("settings.memory_empty"))
+            empty.setObjectName("providerSub")
+            empty.setWordWrap(True)
+            self._memory_entries_host.addWidget(empty)
+            return
+        for entry in entries:
+            self._memory_entries_host.addWidget(self._build_memory_row(entry))
+
+    def _build_memory_row(self, entry: dict) -> QFrame:
+        row = QFrame()
+        row.setObjectName("providerCard")
+        outer = QVBoxLayout(row)
+        outer.setContentsMargins(12, 10, 12, 10)
+        outer.setSpacing(6)
+
+        top = QHBoxLayout()
+        title = QLabel(str(entry.get("title") or entry.get("key") or "Memory"))
+        title.setObjectName("providerName")
+        title.setWordWrap(True)
+        top.addWidget(title, 1)
+
+        edit_btn = QPushButton(i18n.t("settings.memory_edit"))
+        edit_btn.setObjectName("ghostBtn")
+        edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        edit_btn.clicked.connect(
+            lambda _=False, e=entry, b=edit_btn: self._on_memory_edit(e, b)
+        )
+        delete_btn = QPushButton(i18n.t("settings.memory_delete"))
+        delete_btn.setObjectName("memoryDangerAction")
+        delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        delete_btn.clicked.connect(
+            lambda _=False, eid=entry.get("id"), b=delete_btn: self._on_memory_delete(eid, b)
+        )
+        top.addWidget(edit_btn)
+        top.addWidget(delete_btn)
+        outer.addLayout(top)
+
+        meta_bits = [
+            f"{entry.get('type', 'fact')}/{entry.get('category', 'other')}",
+            str(entry.get("source") or "unknown"),
+        ]
+        stamp = entry.get("last_used_at") or entry.get("updated_at")
+        if stamp:
+            meta_bits.append(str(stamp))
+        meta = QLabel(" · ".join(meta_bits))
+        meta.setObjectName("providerSub")
+        meta.setWordWrap(True)
+        outer.addWidget(meta)
+
+        preview = QLabel(self._memory_value_preview(entry))
+        preview.setObjectName("sectionSub")
+        preview.setWordWrap(True)
+        outer.addWidget(preview)
+        return row
+
+    def _on_memory_edit(self, entry: dict, anchor=None) -> None:
+        dialog = _MemoryEditDialog(self, entry, anchor=anchor)
+        if dialog.exec():
+            self._memory_status.setText(i18n.t("settings.memory_saved"))
+            self._refresh_memory_entries()
+
+    def _on_memory_delete(self, entry_id, anchor=None) -> None:
+        if not entry_id:
+            self._memory_status.setText(i18n.t("settings.memory_delete_failed"))
+            return
+        dialog = _MemoryConfirmDialog(
+            self,
+            "settings.memory_delete_title",
+            "settings.memory_delete_confirm",
+            "settings.memory_delete",
+            anchor=anchor,
+        )
+        if not dialog.exec():
+            return
+        try:
+            if not MemoryStore().delete_entry(str(entry_id)):
+                raise RuntimeError("memory entry not found")
+            self._memory_status.setText(i18n.t("settings.memory_deleted"))
+            self._refresh_memory_entries()
+        except Exception:
+            self._memory_status.setText(i18n.t("settings.memory_delete_failed"))
+
+    def _on_memory_clear_all(self) -> None:
+        dialog = _MemoryClearDialog(self, anchor=self._memory_clear_btn)
+        if not dialog.exec():
+            return
+        try:
+            MemoryStore().clear()
+            self._memory_status.setText(i18n.t("settings.memory_cleared"))
+            self._refresh_memory_entries()
+        except Exception:
+            self._memory_status.setText(
+                i18n.t("settings.memory_save_failed", error="")
+            )
 
     # ── MCP / Connectors (WOR-44 Phase 3) ───────────────────────────────────
     # A preconfigured catalog of popular MCP servers (one-tap Connect) plus any
@@ -5648,6 +6026,7 @@ class _SettingsPanel(QWidget):
         # from the saved list, then paint each pill with the manager's live
         # status (so a connection persists visually across reopen).
         self._render_mcp()
+        self._refresh_memory_entries()
 
         # MCP write-safety toggles (WOR-44 Phase 5, 5-conf) — seed both from
         # settings. The auto-approve UI is inverted from the compatibility key:
@@ -6022,6 +6401,13 @@ class _SettingsPanel(QWidget):
         self._mobile_show_btn.setText(i18n.t("settings.show"))
         self._mobile_regen_btn.setText(i18n.t("settings.regenerate"))
         self._mobile_warn.setText(i18n.t("settings.mobile_token_warning"))
+
+        self._memory_title.setText(i18n.t("settings.memory"))
+        self._memory_sub.setText(i18n.t("settings.memory_sub"))
+        self._memory_desc.setText(i18n.t("settings.memory_desc"))
+        self._memory_refresh_btn.setText(i18n.t("settings.memory_refresh"))
+        self._memory_clear_btn.setText(i18n.t("settings.memory_clear_all"))
+        self._refresh_memory_entries()
 
         # Startup section (autostart services)
         self._startup_title.setText(i18n.t("settings.startup"))
@@ -8054,6 +8440,25 @@ class MainPopup(QWidget):
                 background: rgba(196, 181, 245, 0.18);
                 border: 1px solid rgba(196, 181, 245, 0.45);
                 color: #e8e6f0;
+            }
+
+            QPushButton#memoryDangerAction {
+                background: transparent;
+                border: none;
+                color: rgba(232, 230, 240, 0.62);
+                border-radius: 0px;
+                padding: 4px 6px;
+                font-size: 11px;
+            }
+            QPushButton#memoryDangerAction:hover {
+                background: transparent;
+                border: none;
+                color: #ff6b6b;
+            }
+            QPushButton#memoryDangerAction:disabled {
+                background: transparent;
+                border: none;
+                color: rgba(232, 230, 240, 0.28);
             }
 
             QPushButton#ghostBtn {

@@ -299,6 +299,26 @@ For Gmail email reading, search, and mailbox actions, use the native Gmail REST 
 If Gmail REST is not connected, ask the user to connect the native Gmail integration. If compose or modify permission is missing, ask the user to use "Elevate OSIA permissions" on the Gmail connector card. Do not create attachments, HTML mail, replies/threads, deletes, spam changes, or archive actions; those are not available."""
 
 
+def _memory_tool_prompt_block(lang: str) -> str:
+    if lang == "fr":
+        return """## Memoire locale OSIA
+OSIA dispose d'une memoire locale persistante, stockee uniquement sur cette machine. Pour ajouter quelque chose a cette memoire, tu DOIS appeler l'outil interne save_memory. Ne dis jamais que tu as retenu, memorise, enregistre ou ajoute une information a la memoire si save_memory n'a pas renvoye {"ok": true}.
+
+- save_memory: persister une information locale utile. Usage : {"tool": "save_memory", "type": "route|preference|fact|workflow|contact|shortcut", "category": "app|site|deep_link|folder|file|game|user|workflow|contact|other", "key": "<cle stable courte>", "title": "<titre lisible>", "value": {"kind": "path|url|uri|steam_appid|text|steps", "data": "<contenu>"}, "confidence": 0.0, "tags": []}
+
+Appelle save_memory quand l'utilisateur demande de retenir/sauver/noter/stocker quelque chose, dans n'importe quelle langue, ou quand il donne une preference, un fait stable, un detail de projet, un chemin, une route, un workflow, un site, une habitude ou un raccourci qui sera probablement utile plus tard. N'appelle pas save_memory pour les secrets, mots de passe, cles API, tokens, faits temporaires, blagues, affirmations incertaines, commandes ponctuelles, ou donnees sensibles sauf si l'utilisateur veut clairement les memoriser et que la validation accepte.
+
+Si save_memory renvoie {"ok": true}, tu peux dire que la memoire a ete enregistree. Si save_memory renvoie {"ok": false}, dis que tu n'as pas pu memoriser l'information. Si tu n'as pas appele save_memory, ne pretends jamais avoir memorise quoi que ce soit. Utilise seulement les blocs "Local OSIA memory" injectes dans ce tour pour repondre aux questions de rappel."""
+    return """## Local OSIA Memory
+OSIA has persistent local memory stored only on this machine. To add anything to memory, you MUST call the internal save_memory tool. Never say you remembered, saved, stored, registered, or added information to memory unless save_memory returned {"ok": true}.
+
+- save_memory: persist a useful local memory. Usage: {"tool": "save_memory", "type": "route|preference|fact|workflow|contact|shortcut", "category": "app|site|deep_link|folder|file|game|user|workflow|contact|other", "key": "<short stable key>", "title": "<human readable title>", "value": {"kind": "path|url|uri|steam_appid|text|steps", "data": "<contents>"}, "confidence": 0.0, "tags": []}
+
+Call save_memory when the user asks you to remember/save/note/store something in any language, or when they provide a stable preference, fact, project detail, path, route, workflow, site, habit, or shortcut likely to be useful later. Do not call save_memory for secrets, passwords, API keys, tokens, temporary facts, jokes, uncertain claims, one-off commands, or sensitive data unless the user clearly wants it remembered and validation accepts it.
+
+If save_memory returns {"ok": true}, you may say the memory was saved. If save_memory returns {"ok": false}, say you could not save it. If you did not call save_memory, never claim you saved or remembered anything. Use only the injected "Local OSIA memory" blocks from this turn to answer recall questions."""
+
+
 def get_system_prompt(lang: str = None, model: str = None, provider: str = None) -> str:
     """Return the system prompt for the given language, with the active
     model and provider injected at the start so the agent knows what it's
@@ -331,6 +351,7 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
             body = body + "\n\n" + skills
     except Exception:
         pass
+    body = body + "\n\n" + _memory_tool_prompt_block(lang)
     body = body + "\n\n" + _gmail_rest_prompt_block(lang)
     # WOR-44 Phase 2 — list the tools exposed by connected MCP servers so the
     # model can see and call them like native tools. Built FRESH on every
@@ -740,6 +761,61 @@ def tool_write_file(path: str, content: str) -> str:
         return f"ERROR: writing file: {e}"
 
 
+def _tool_result_text(result) -> str:
+    if isinstance(result, dict):
+        return str(result.get("text", ""))
+    return str(result or "")
+
+
+def _tool_result_succeeded(result) -> bool:
+    return not _tool_result_text(result).lstrip().startswith("ERROR:")
+
+
+def _lookup_memory_app_route(name: str):
+    try:
+        from osia import memory_runtime as _memory_runtime
+        return _memory_runtime.lookup_verified_app_route(name)
+    except Exception:
+        return None
+
+
+def _remember_verified_app_route(name: str, resolved, memory_entry_id=None) -> None:
+    try:
+        if resolved is None:
+            return
+        path, args = resolved
+        from osia import memory_runtime as _memory_runtime
+        if memory_entry_id:
+            _memory_runtime.mark_memory_route_used(memory_entry_id)
+        if args:
+            return
+        _memory_runtime.remember_verified_route(
+            category="app",
+            label=name,
+            path=str(path),
+        )
+    except Exception:
+        pass
+
+
+def _maybe_remember_verified_site(url: str, result) -> None:
+    if not url or not _tool_result_succeeded(result):
+        return
+    try:
+        from osia import memory_runtime as _memory_runtime
+        _memory_runtime.remember_verified_site(url)
+    except Exception:
+        pass
+
+
+def _remember_verified_steam_app(appid: str, label: str) -> None:
+    try:
+        from osia import memory_runtime as _memory_runtime
+        _memory_runtime.remember_verified_steam_app(appid=appid, label=label)
+    except Exception:
+        pass
+
+
 def tool_open_application(name: str) -> str:
     """Launch an application by name. Detaches so it keeps running.
 
@@ -811,9 +887,15 @@ def tool_open_application(name: str) -> str:
     # launch below stays the existing `cmd /c <name>` behaviour, byte-for-byte. ----
     resolved = None            # (exe_path, [args]) when a concrete target is found
     candidates = set()         # process bases that identify THIS app's window/proc
+    memory_route_id = None     # remembered route used for this launch, if any
     if sys.platform == "win32" and _dc is not None:
+        remembered_route = _lookup_memory_app_route(name)
+        if remembered_route:
+            resolved = (remembered_route["path"], [])
+            memory_route_id = remembered_route.get("id")
         try:
-            resolved = _dc.resolve_windows_app(name)
+            if resolved is None:
+                resolved = _dc.resolve_windows_app(name)
         except Exception:
             resolved = None
         try:
@@ -833,6 +915,7 @@ def tool_open_application(name: str) -> str:
             except Exception:
                 _st, _dt = "unavailable", ""
             if _st == "ready":
+                _remember_verified_app_route(name, resolved, memory_route_id)
                 return (
                     f"'{name}' is already open — brought its window '{_dt}' to the "
                     "foreground and focused it (ready; did not launch a second instance)."
@@ -1003,6 +1086,7 @@ def tool_open_application(name: str) -> str:
         except Exception:
             status, detail = "unavailable", ""
         if status == "ready":
+            _remember_verified_app_route(name, resolved, memory_route_id)
             return f"Launched: {name} — window '{detail}' is ready and focused"
         if status == "timeout":
             # The window never grabbed the foreground in time. On Windows, if the
@@ -1013,6 +1097,7 @@ def tool_open_application(name: str) -> str:
                     and _dc is not None):
                 try:
                     if _dc.is_app_running(candidates):
+                        _remember_verified_app_route(name, resolved, memory_route_id)
                         return (
                             f"Launched: {name} — the app is running (its window did "
                             f"not take the foreground within {_wait_secs}s; take a "
@@ -1089,6 +1174,7 @@ def _verify_open_uri(uri: str):
 
         if action == "install":
             if state and state.get("installed"):
+                _remember_verified_steam_app(appid, state.get("name") or label)
                 return (f"{uri} fired — {label} is ALREADY fully installed; Steam "
                         "will just show its page, no download is needed.")
             return (f"{uri} fired — Steam will prompt to install {label}. The "
@@ -1105,6 +1191,7 @@ def _verify_open_uri(uri: str):
             return (f"{uri} fired, but {label} is NOT fully installed "
                     "(download/update incomplete) — it will not launch yet. Tell "
                     "the user honestly; offer to finish installing it.")
+        _remember_verified_steam_app(appid, state.get("name") or label)
         # Installed. Give the process a brief, BOUNDED moment to appear (a warm
         # Steam launches fast). We never wait out a cold-start (Steam can take
         # ~30s) — past the short budget we report 'starting', honestly.
@@ -1911,7 +1998,9 @@ def _get_browser_tools():
 
 
 def tool_navigate(url: str):
-    return _get_browser_tools()["navigate"](url)
+    result = _get_browser_tools()["navigate"](url)
+    _maybe_remember_verified_site(url, result)
+    return result
 
 def tool_click(selector: str):
     return _get_browser_tools()["click"](selector)
@@ -1935,7 +2024,9 @@ def tool_go_forward():
     return _get_browser_tools()["go_forward"]()
 
 def tool_open_new_tab(url: str) -> str:
-    return _get_browser_tools()["open_new_tab"](url)
+    result = _get_browser_tools()["open_new_tab"](url)
+    _maybe_remember_verified_site(url, result)
+    return result
 
 def tool_find_and_click(text: str):
     return _get_browser_tools()["find_and_click"](text)
@@ -1958,7 +2049,10 @@ def tool_press_key(key: str) -> str:
 def tool_open_browser(name: str, url: str | None = None):
     # Returns a dict (text + screenshot) when Firefox is opened over BiDi,
     # a plain string for regular application launches.
-    return _get_browser_tools()["open_browser"](name, url)
+    result = _get_browser_tools()["open_browser"](name, url)
+    if url:
+        _maybe_remember_verified_site(url, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2766,7 +2860,34 @@ def tool_gmail_remove_label(message_id: str, label: str) -> str:
     )
 
 
+def tool_save_memory(
+    type: str = None,
+    category: str = None,
+    key: str = None,
+    title: str = None,
+    value: dict = None,
+    confidence=1.0,
+    tags=None,
+    **_extra,
+) -> str:
+    """Internal local-memory write tool for the agent."""
+    from osia import memory_runtime
+
+    result = memory_runtime.execute_save_memory_tool({
+        "type": type,
+        "category": category,
+        "key": key,
+        "title": title,
+        "value": value,
+        "confidence": confidence,
+        "tags": tags or [],
+    })
+    return json.dumps(result, ensure_ascii=False, sort_keys=True)
+
+
 TOOL_MAP = {
+    # Local memory
+    "save_memory": tool_save_memory,
     # Shell & launchers
     "bash": tool_bash,
     "run_command": tool_run_command,
@@ -4064,6 +4185,7 @@ class OSIAAgent:
         self._fallback_base_url = None
         self._active_base_url = base_url
         self.messages = [{"role": "system", "content": get_system_prompt(self.lang, self.model, self.provider)}]
+        self._memory_store = None
 
     def reset(self):
         """Clear conversation history except system prompt."""
@@ -4784,11 +4906,33 @@ class OSIAAgent:
                 m for m in history
                 if isinstance(m, dict)
                 and m.get("role") in ("user", "assistant")
+                and not m.get("_internal")
+                and not m.get("_memory_context")
                 and "RÈGLES ABSOLUES" not in str(m.get("content", ""))
                 and "ABSOLUTE RULES" not in str(m.get("content", ""))
                 and not str(m.get("content", "")).lstrip().startswith("##")
             ]
             self.messages = [{"role": "system", "content": get_system_prompt(self.lang, self.model, self.provider)}] + sanitized
+        else:
+            self.messages = [
+                m for m in self.messages
+                if not (isinstance(m, dict) and m.get("_memory_context"))
+            ]
+
+        from osia import memory_runtime as _memory_runtime
+
+        memory_store = getattr(self, "_memory_store", None)
+        memory_context = _memory_runtime.build_memory_context(
+            user_input,
+            store=memory_store,
+        )
+        if memory_context:
+            self.messages.append({
+                "role": "user",
+                "_internal": True,
+                "_memory_context": True,
+                "content": memory_context,
+            })
         self.messages.append({"role": "user", "content": user_input})
 
         # ── Task-hierarchy routing (Bloc 3) ──────────────────────────────
@@ -4853,6 +4997,10 @@ class OSIAAgent:
         # "you never called the tool" retry has been spent.
         any_tool_executed = False
         hallucination_retry_used = False
+        memory_save_tool_seen = False
+        memory_save_tool_succeeded = False
+        memory_request_retry_used = False
+        memory_claim_retry_used = False
         # Empty-response guard: whether the one allowed "your reply was
         # empty after stripping markup" retry has been spent.
         empty_retry_used = False
@@ -5112,24 +5260,41 @@ class OSIAAgent:
 
                     kwargs = {k: v for k, v in tc.items() if k != "tool"}
                     kwargs_preview = {
-                        k: (v[:80] + "…" if isinstance(v, str) and len(v) > 80 else v)
+                        k: (v[:80] + "..." if isinstance(v, str) and len(v) > 80 else v)
                         for k, v in kwargs.items()
                     }
-                    print(f"[OSIA Agent] ▶ tool: {tool_name}({kwargs_preview})")
-                    result, is_error = _execute_tool_with_retry(tool_name, kwargs)
+                    print(f"[OSIA Agent] tool start: {tool_name}({kwargs_preview})")
+                    if tool_name == "save_memory":
+                        token = _memory_runtime.set_save_memory_context(
+                            store=memory_store,
+                            user_text=user_input,
+                        )
+                        try:
+                            result, is_error = _execute_tool_with_retry(tool_name, kwargs)
+                        finally:
+                            _memory_runtime.reset_save_memory_context(token)
+                        memory_save_tool_seen = True
+                        save_result = _memory_runtime.parse_save_memory_tool_result(result)
+                        if save_result is not None:
+                            if save_result.get("ok") is True:
+                                memory_save_tool_succeeded = True
+                            elif save_result.get("ok") is False:
+                                is_error = True
+                    else:
+                        result, is_error = _execute_tool_with_retry(tool_name, kwargs)
                     any_tool_executed = True
                     text_part = _result_text(result)
                     screenshot = (
                         result.get("screenshot")
                         if isinstance(result, dict) else None
                     )
-                    status = "✗ error" if is_error else "✓ ok"
+                    status = "error" if is_error else "ok"
                     extra = (
                         f" +screenshot({len(screenshot)} b64 chars)"
                         if screenshot else ""
                     )
                     print(
-                        f"[OSIA Agent] ◀ tool: {tool_name} → "
+                        f"[OSIA Agent] tool end: {tool_name} -> "
                         f"{len(text_part)} chars [{status}]{extra}"
                     )
                     # Make failures impossible for a fast model to skim past:
@@ -5295,6 +5460,65 @@ class OSIAAgent:
                     "[OSIA Agent] ✗ unbacked tool description repeated after the "
                     "retry — returning the text as-is"
                 )
+
+            if (
+                not memory_save_tool_succeeded
+                and _memory_runtime.claims_memory_saved(content)
+            ):
+                print(
+                    "[WARN] Model claimed memory save without save_memory ok=true."
+                )
+                if not memory_claim_retry_used:
+                    memory_claim_retry_used = True
+                    self.messages.append({
+                        "role": "assistant",
+                        "_internal": True,
+                        "_memory_context": True,
+                        "content": content,
+                    })
+                    self.messages.append({
+                        "role": "user",
+                        "_internal": True,
+                        "_memory_context": True,
+                        "content": (
+                            "No save_memory tool result with ok=true exists for "
+                            "this turn, so no local OSIA memory was saved. Do not "
+                            "claim that anything was remembered, saved, stored, "
+                            "registered, or added to memory. If the current user "
+                            "message should be saved, call save_memory now; if "
+                            "not, answer plainly that it was not saved."
+                        ),
+                    })
+                    continue
+                content = _memory_runtime.memory_not_saved_response(self.lang)
+
+            if (
+                not memory_save_tool_seen
+                and not any_tool_executed
+                and _memory_runtime.looks_like_memory_request(user_input)
+            ):
+                if not memory_request_retry_used:
+                    memory_request_retry_used = True
+                    self.messages.append({
+                        "role": "assistant",
+                        "_internal": True,
+                        "_memory_context": True,
+                        "content": content,
+                    })
+                    self.messages.append({
+                        "role": "user",
+                        "_internal": True,
+                        "_memory_context": True,
+                        "content": (
+                            "The current user message appears to ask OSIA to "
+                            "remember or store information. Local memory is only "
+                            "real if save_memory is called and returns ok=true. "
+                            "If the information should be saved, call save_memory "
+                            "now. If it should not be saved, answer without "
+                            "claiming that it was saved."
+                        ),
+                    })
+                    continue
 
             # STEP 5 — final response. ONLY NOW strip raw tool/function XML
             # tags, Llama special tokens, and residual bare {"tool": ...}
