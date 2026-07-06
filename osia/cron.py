@@ -9,6 +9,7 @@ of ``{"task": <description>, "schedule": <spec>, "enabled": <bool>,
 "conversation_id": <id|null>}`` entries. ``schedule`` is one of:
 
   * ``"every <N> minutes"`` / ``"every <N> hours"`` / ``"every <N> days"``
+  * ``"every <N> days at HH:MM"`` — every N calendar days at a wall-clock time
   * ``"at HH:MM"`` — fires once a day at that local wall-clock time
   * ``"once:YYYY-MM-DDTHH:MM"`` — fires exactly once at that local date+time,
     then the entry is auto-disabled (``enabled: false``) and persisted
@@ -52,6 +53,7 @@ def parse_schedule(spec: str) -> dict | None:
     Returns one of::
 
         {"kind": "interval", "seconds": <int>}     # "every N minutes/hours/days"
+        {"kind": "day_interval_at", "days": <int>, "hour": <int>, "minute": <int>}
         {"kind": "daily", "hour": <int>, "minute": <int>}   # "at HH:MM"
         {"kind": "once", "dt": <datetime>}    # "once:YYYY-MM-DDTHH:MM"
 
@@ -76,6 +78,23 @@ def parse_schedule(spec: str) -> dict | None:
         except ValueError:
             return None  # impossible calendar date (e.g. 31/02)
         return {"kind": "once", "dt": dt}
+
+    # "every <N> days at HH:MM" — calendar-day interval anchored to the
+    # job's created_at / last_run_at metadata, but fired at a wall-clock time.
+    m = re.match(
+        r"^every\s+(\d+)\s*days?\s+at\s+([01]?\d|2[0-3]):([0-5]\d)$",
+        s,
+    )
+    if m:
+        n = int(m.group(1))
+        if n <= 0:
+            return None
+        return {
+            "kind": "day_interval_at",
+            "days": n,
+            "hour": int(m.group(2)),
+            "minute": int(m.group(3)),
+        }
 
     # "every <N> <unit>(s)"  — unit ∈ minute/hour/day (singular or plural).
     m = re.match(r"^every\s+(\d+)\s*(minute|hour|day)s?$", s)
@@ -105,6 +124,28 @@ def parse_schedule(spec: str) -> dict | None:
 def _job_signature(job: dict) -> tuple:
     """Stable identity for a job slot, used to detect in-place edits."""
     return (str(job.get("task", "")), str(job.get("schedule", "")))
+
+
+def _parse_job_datetime(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def _job_anchor_date(job: dict, now: datetime):
+    """Anchor day-interval schedules to last_run_at, then created_at, then now."""
+
+    for key in ("last_run_at", "created_at"):
+        dt = _parse_job_datetime(job.get(key))
+        if dt is not None:
+            return dt.date()
+    return now.date()
 
 
 class CronManager:
@@ -200,7 +241,8 @@ class CronManager:
             if self._is_due(spec, st, now):
                 launched = self._fire(
                     job.get("task", ""), job.get("schedule", ""), st, now,
-                    conversation_id=job.get("conversation_id"))
+                    conversation_id=job.get("conversation_id"),
+                    job_index=idx, signature=sig, task_id=job.get("id"))
                 # A one-shot job runs exactly once: as soon as it actually
                 # launches, flag it in-memory (so it never re-fires this
                 # session even if the persist below fails) and disable it on
@@ -222,13 +264,29 @@ class CronManager:
         past today's scheduled time, so OSIA never "catches up" a missed run on
         startup.
         """
-        st = {"sig": sig, "last_run": now, "last_date": None}
+        st = {
+            "sig": sig,
+            "last_run": now,
+            "last_date": None,
+            "anchor_date": _job_anchor_date(job, now),
+        }
         spec = parse_schedule(job.get("schedule", ""))
         if spec and spec["kind"] == "daily":
             scheduled = now.replace(
                 hour=spec["hour"], minute=spec["minute"], second=0, microsecond=0
             )
             if now >= scheduled:
+                st["last_date"] = now.date()
+        elif spec and spec["kind"] == "day_interval_at":
+            scheduled = now.replace(
+                hour=spec["hour"], minute=spec["minute"], second=0, microsecond=0
+            )
+            days_since_anchor = (now.date() - st["anchor_date"]).days
+            if (
+                days_since_anchor >= 0
+                and days_since_anchor % spec["days"] == 0
+                and now >= scheduled
+            ):
                 st["last_date"] = now.date()
         return st
 
@@ -246,6 +304,23 @@ class CronManager:
                 hour=spec["hour"], minute=spec["minute"], second=0, microsecond=0
             )
             return now >= scheduled
+        if spec["kind"] == "day_interval_at":
+            pending = st.get("pending_due_date")
+            if pending is not None and st.get("last_date") != pending:
+                return True
+            if st.get("last_date") == now.date():
+                return False
+            scheduled = now.replace(
+                hour=spec["hour"], minute=spec["minute"], second=0, microsecond=0
+            )
+            if now < scheduled:
+                return False
+            anchor_date = st.get("anchor_date") or now.date()
+            days_since_anchor = (now.date() - anchor_date).days
+            if days_since_anchor < 0 or days_since_anchor % spec["days"] != 0:
+                return False
+            st["pending_due_date"] = now.date()
+            return True
         if spec["kind"] == "once":
             # Fire once when the target time is reached (or already past, e.g.
             # OSIA started after it), then never again this session.
@@ -255,7 +330,8 @@ class CronManager:
         return False
 
     def _fire(self, task: str, schedule: str, st: dict, now: datetime,
-              conversation_id: str | None = None) -> bool:
+              conversation_id: str | None = None, job_index: int | None = None,
+              signature: tuple | None = None, task_id: str | None = None) -> bool:
         """Launch a job's task on a worker thread.
 
         Returns ``True`` when the task was actually launched (timing state
@@ -279,16 +355,29 @@ class CronManager:
         # tick and cannot double-fire.
         st["last_run"] = now
         st["last_date"] = now.date()
+        st["anchor_date"] = now.date()
+        st.pop("pending_due_date", None)
+        self._update_job_status(
+            job_index, signature, task_id,
+            last_run_at=now.astimezone().isoformat(timespec="seconds"),
+            last_status="running",
+        )
 
         print(f"[CRON] firing scheduled task ({schedule}): {task[:80]}")
 
         def _worker():
             self._busy.set()
+            status = "completed"
             try:
                 self._run_task(task, conversation_id)
             except Exception as e:
+                status = "error"
                 print(f"[CRON] task failed: {e}")
             finally:
+                self._update_job_status(
+                    job_index, signature, task_id,
+                    last_status=status,
+                )
                 self._busy.clear()
 
         threading.Thread(target=_worker, name="osia-cron-task", daemon=True).start()
@@ -311,3 +400,31 @@ class CronManager:
                   f"{str(job.get('task', ''))[:60]}")
         except Exception as e:
             print(f"[CRON] could not disable one-shot job: {e}")
+
+    def _update_job_status(self, idx: int | None, sig: tuple | None,
+                           task_id: str | None, **fields) -> None:
+        """Best-effort metadata update for Settings/Mobile status displays."""
+
+        try:
+            jobs = get_setting("cron_jobs", []) or []
+            if not isinstance(jobs, list):
+                return
+            target = None
+            if task_id:
+                for i, job in enumerate(jobs):
+                    if isinstance(job, dict) and job.get("id") == task_id:
+                        target = i
+                        break
+            if target is None and idx is not None and 0 <= idx < len(jobs):
+                job = jobs[idx]
+                if isinstance(job, dict) and (sig is None or _job_signature(job) == sig):
+                    target = idx
+            if target is None:
+                return
+            jobs[target].update({k: v for k, v in fields.items() if v is not None})
+            jobs[target]["updated_at"] = datetime.now().astimezone().isoformat(
+                timespec="seconds"
+            )
+            set_setting("cron_jobs", jobs)
+        except Exception as e:
+            print(f"[CRON] could not update job status: {e}")

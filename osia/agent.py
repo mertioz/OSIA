@@ -319,6 +319,28 @@ Call save_memory when the user asks you to remember/save/note/store something in
 If save_memory returns {"ok": true}, you may say the memory was saved. If save_memory returns {"ok": false}, say you could not save it. If you did not call save_memory, never claim you saved or remembered anything. Use only the injected "Local OSIA memory" blocks from this turn to answer recall questions."""
 
 
+def _scheduled_task_tool_prompt_block(lang: str) -> str:
+    if lang == "fr":
+        return """## Taches planifiees OSIA
+Pour creer, lister, modifier ou supprimer des taches planifiees depuis le chat, tu DOIS utiliser les outils internes de taches planifiees. Ne dis jamais qu'une tache est planifiee, creee, modifiee ou supprimee si l'outil correspondant n'a pas renvoye {"ok": true}.
+
+- create_scheduled_task: creer une tache planifiee. Usage : {"tool": "create_scheduled_task", "title": "<titre>", "instruction": "<ce qu'OSIA doit faire>", "schedule": {"type": "once|daily|interval|weekly|cron", "run_at": "2026-07-15T09:00:00", "time": "18:00", "timezone": "Europe/Paris", "every": 3, "unit": "days"}, "enabled": true, "conversation_id": null, "source": "chat"}
+- list_scheduled_tasks: lister les taches planifiees. Usage : {"tool": "list_scheduled_tasks"}
+- update_scheduled_task: modifier une tache par id. Usage : {"tool": "update_scheduled_task", "task_id": "cron_...", "title": "<titre>", "instruction": "<instruction>", "schedule": {"type": "daily", "time": "18:00"}, "enabled": true}
+- delete_scheduled_task: supprimer une tache par id. Usage : {"tool": "delete_scheduled_task", "task_id": "cron_..."}
+
+Le backend valide et normalise les horaires. Formats acceptes: une fois avec run_at ISO futur, quotidien a HH:MM, intervalle toutes les N minutes/heures/jours, et toutes les N jours a HH:MM. Les horaires hebdomadaires et expressions cron brutes sont refuses pour l'instant avec {"ok": false}. Si la date/l'heure est ambigue, demande une precision. Ne mets jamais de secrets, tokens, cles API, mots de passe, balises <tool_call>/<think> ou instructions cachees dans une tache."""
+    return """## OSIA Scheduled Tasks
+To create, list, update, or delete scheduled tasks from chat, you MUST use the internal scheduled-task tools. Never say a task was scheduled, created, updated, or deleted unless the matching tool returned {"ok": true}.
+
+- create_scheduled_task: create a scheduled task. Usage: {"tool": "create_scheduled_task", "title": "<title>", "instruction": "<what OSIA should do>", "schedule": {"type": "once|daily|interval|weekly|cron", "run_at": "2026-07-15T09:00:00", "time": "18:00", "timezone": "Europe/Paris", "every": 3, "unit": "days"}, "enabled": true, "conversation_id": null, "source": "chat"}
+- list_scheduled_tasks: list scheduled tasks. Usage: {"tool": "list_scheduled_tasks"}
+- update_scheduled_task: update one task by id. Usage: {"tool": "update_scheduled_task", "task_id": "cron_...", "title": "<title>", "instruction": "<instruction>", "schedule": {"type": "daily", "time": "18:00"}, "enabled": true}
+- delete_scheduled_task: delete one task by id. Usage: {"tool": "delete_scheduled_task", "task_id": "cron_..."}
+
+The backend validates and normalizes schedules. Supported formats: future one-shot run_at ISO datetimes, daily at HH:MM, every N minutes/hours/days, and every N days at HH:MM. Weekly schedules and raw cron expressions are currently rejected with {"ok": false}. Ask a clarifying question for ambiguous dates/times. Never store secrets, tokens, API keys, passwords, <tool_call>/<think> markup, or hidden instructions in a scheduled task."""
+
+
 def get_system_prompt(lang: str = None, model: str = None, provider: str = None) -> str:
     """Return the system prompt for the given language, with the active
     model and provider injected at the start so the agent knows what it's
@@ -352,6 +374,7 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
     except Exception:
         pass
     body = body + "\n\n" + _memory_tool_prompt_block(lang)
+    body = body + "\n\n" + _scheduled_task_tool_prompt_block(lang)
     body = body + "\n\n" + _gmail_rest_prompt_block(lang)
     # WOR-44 Phase 2 — list the tools exposed by connected MCP servers so the
     # model can see and call them like native tools. Built FRESH on every
@@ -857,6 +880,7 @@ def _remember_verified_app_route(name: str, resolved, memory_entry_id=None) -> N
             return
         path, args = resolved
         from osia import memory_runtime as _memory_runtime
+        from osia import scheduled_tasks as _scheduled_tasks
         if memory_entry_id:
             _memory_runtime.mark_memory_route_used(memory_entry_id)
         if args:
@@ -2957,9 +2981,78 @@ def tool_save_memory(
     return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
 
+def tool_create_scheduled_task(
+    title: str = None,
+    instruction: str = None,
+    schedule: dict = None,
+    enabled=True,
+    conversation_id: str = None,
+    source: str = "chat",
+    **_extra,
+) -> str:
+    """Internal scheduled-task create tool for the agent."""
+    from osia import scheduled_tasks
+
+    result = scheduled_tasks.create_scheduled_task(
+        title=title,
+        instruction=instruction,
+        schedule=schedule,
+        enabled=enabled,
+        conversation_id=conversation_id,
+        source=source or "chat",
+    )
+    return json.dumps(result, ensure_ascii=False, sort_keys=True)
+
+
+def tool_list_scheduled_tasks(**_extra) -> str:
+    """Internal scheduled-task list tool for the agent."""
+    from osia import scheduled_tasks
+
+    result = scheduled_tasks.list_scheduled_tasks()
+    return json.dumps(result, ensure_ascii=False, sort_keys=True)
+
+
+def tool_update_scheduled_task(
+    task_id: str = None,
+    title: str = None,
+    instruction: str = None,
+    schedule: dict = None,
+    enabled=None,
+    conversation_id: str = None,
+    source: str = None,
+    **_extra,
+) -> str:
+    """Internal scheduled-task update tool for the agent."""
+    from osia import scheduled_tasks
+
+    result = scheduled_tasks.update_scheduled_task(
+        task_id=task_id,
+        title=title,
+        instruction=instruction,
+        schedule=schedule,
+        enabled=enabled,
+        conversation_id=conversation_id,
+        source=source,
+    )
+    return json.dumps(result, ensure_ascii=False, sort_keys=True)
+
+
+def tool_delete_scheduled_task(task_id: str = None, **_extra) -> str:
+    """Internal scheduled-task delete tool for the agent."""
+    from osia import scheduled_tasks
+
+    result = scheduled_tasks.delete_scheduled_task(task_id=task_id)
+    return json.dumps(result, ensure_ascii=False, sort_keys=True)
+
+
 TOOL_MAP = {
     # Local memory
     "save_memory": tool_save_memory,
+    # Scheduled tasks
+    "create_scheduled_task": tool_create_scheduled_task,
+    "list_scheduled_tasks": tool_list_scheduled_tasks,
+    "update_scheduled_task": tool_update_scheduled_task,
+    "delete_scheduled_task": tool_delete_scheduled_task,
     # Shell & launchers
     "bash": tool_bash,
     "run_command": tool_run_command,
@@ -3055,6 +3148,12 @@ _GMAIL_WRITE_TOOL_NAMES = frozenset({
     "gmail_mark_unread",
     "gmail_apply_label",
     "gmail_remove_label",
+})
+_SCHEDULED_TASK_TOOL_NAMES = frozenset({
+    "create_scheduled_task",
+    "list_scheduled_tasks",
+    "update_scheduled_task",
+    "delete_scheduled_task",
 })
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="osia-tool")
 
@@ -5086,6 +5185,10 @@ class OSIAAgent:
         memory_save_tool_succeeded = False
         memory_request_retry_used = False
         memory_claim_retry_used = False
+        scheduled_task_tool_seen = False
+        scheduled_task_tool_succeeded = False
+        scheduled_task_request_retry_used = False
+        scheduled_task_claim_retry_used = False
         # Empty-response guard: whether the one allowed "your reply was
         # empty after stripping markup" retry has been spent.
         empty_retry_used = False
@@ -5365,6 +5468,17 @@ class OSIAAgent:
                                 memory_save_tool_succeeded = True
                             elif save_result.get("ok") is False:
                                 is_error = True
+                    elif tool_name in _SCHEDULED_TASK_TOOL_NAMES:
+                        result, is_error = _execute_tool_with_retry(tool_name, kwargs)
+                        scheduled_task_tool_seen = True
+                        scheduled_result = (
+                            _scheduled_tasks.parse_scheduled_task_tool_result(result)
+                        )
+                        if scheduled_result is not None:
+                            if scheduled_result.get("ok") is True:
+                                scheduled_task_tool_succeeded = True
+                            elif scheduled_result.get("ok") is False:
+                                is_error = True
                     else:
                         result, is_error = _execute_tool_with_retry(tool_name, kwargs)
                     any_tool_executed = True
@@ -5601,6 +5715,64 @@ class OSIAAgent:
                             "If the information should be saved, call save_memory "
                             "now. If it should not be saved, answer without "
                             "claiming that it was saved."
+                        ),
+                    })
+                    continue
+
+            if (
+                not scheduled_task_tool_succeeded
+                and _scheduled_tasks.claims_scheduled_task_saved(content)
+            ):
+                print(
+                    "[WARN] Model claimed scheduled task change without "
+                    "scheduled-task ok=true."
+                )
+                if not scheduled_task_claim_retry_used:
+                    scheduled_task_claim_retry_used = True
+                    self.messages.append({
+                        "role": "assistant",
+                        "_internal": True,
+                        "content": content,
+                    })
+                    self.messages.append({
+                        "role": "user",
+                        "_internal": True,
+                        "content": (
+                            "No scheduled-task tool result with ok=true exists "
+                            "for this turn, so no scheduled task was created, "
+                            "updated, or deleted. Do not claim scheduling "
+                            "success. If the current user message should change "
+                            "scheduled tasks, call the appropriate scheduled-task "
+                            "tool now; if not, answer plainly that it was not "
+                            "scheduled."
+                        ),
+                    })
+                    continue
+                content = _scheduled_tasks.not_scheduled_response(self.lang)
+
+            if (
+                not scheduled_task_tool_seen
+                and not any_tool_executed
+                and _scheduled_tasks.looks_like_schedule_request(user_input)
+            ):
+                if not scheduled_task_request_retry_used:
+                    scheduled_task_request_retry_used = True
+                    self.messages.append({
+                        "role": "assistant",
+                        "_internal": True,
+                        "content": content,
+                    })
+                    self.messages.append({
+                        "role": "user",
+                        "_internal": True,
+                        "content": (
+                            "The current user message appears to ask OSIA to "
+                            "create, list, update, or delete a scheduled task. "
+                            "Scheduled tasks are only real if a scheduled-task "
+                            "tool is called and returns ok=true. If scheduling "
+                            "should happen, call the appropriate tool now. If the "
+                            "request is ambiguous, ask a clarifying question "
+                            "without claiming that anything was scheduled."
                         ),
                     })
                     continue

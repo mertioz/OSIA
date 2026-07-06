@@ -3057,7 +3057,7 @@ class _SettingsPanel(QWidget):
     # the canonical string parsed by osia.cron ("every N minutes|hours|days" or
     # "at HH:MM").
 
-    _CRON_MODES = ("minutes", "hours", "days", "daily")
+    _CRON_MODES = ("minutes", "hours", "days", "daily", "days_at")
     _CRON_MODE_KEYS = {
         "minutes": "cron.every_minutes",
         "hours": "cron.every_hours",
@@ -3213,7 +3213,12 @@ class _SettingsPanel(QWidget):
             mode_combo = QComboBox()
             mode_combo.setObjectName("voiceCombo")
             for m in self._CRON_MODES:
-                mode_combo.addItem(i18n.t(self._CRON_MODE_KEYS[m]), m)
+                label = (
+                    i18n.t(self._CRON_MODE_KEYS[m])
+                    if m in self._CRON_MODE_KEYS
+                    else f"{i18n.t('cron.every_days')} @"
+                )
+                mode_combo.addItem(label, m)
             for i in range(mode_combo.count()):
                 if mode_combo.itemData(i) == mode:
                     mode_combo.setCurrentIndex(i)
@@ -3222,7 +3227,7 @@ class _SettingsPanel(QWidget):
             value_input.setObjectName("keyInput")
             value_input.setFixedWidth(90)
             value_input.setPlaceholderText(
-                ("2:30 PM" if timefmt.use_12h() else "14:30") if mode == "daily" else "5")
+                self._cron_value_placeholder(mode))
             mode_combo.currentIndexChanged.connect(
                 lambda _i, idx=index, mc=mode_combo, vi=value_input:
                     self._on_cron_schedule_changed(idx, mc, vi)
@@ -3264,6 +3269,11 @@ class _SettingsPanel(QWidget):
             return ("minutes", "")
         if spec["kind"] == "daily":
             return ("daily", timefmt.format_hm(spec["hour"], spec["minute"]))
+        if spec["kind"] == "day_interval_at":
+            return (
+                "days_at",
+                f"{spec['days']} @ {timefmt.format_hm(spec['hour'], spec['minute'])}",
+            )
         secs = spec["seconds"]
         if secs % 86400 == 0:
             return ("days", str(secs // 86400))
@@ -3317,11 +3327,28 @@ class _SettingsPanel(QWidget):
         return f"once:{year:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}"
 
     @staticmethod
-    def _compose_cron_schedule(mode: str, value: str) -> str:
+    def _cron_value_placeholder(mode: str) -> str:
+        if mode == "daily":
+            return "2:30 PM" if timefmt.use_12h() else "14:30"
+        if mode == "days_at":
+            return "3 @ 2:30 PM" if timefmt.use_12h() else "3 @ 20:00"
+        return "5"
+
+    @classmethod
+    def _compose_cron_schedule(cls, mode: str, value: str) -> str:
         """Build the canonical schedule string from the UI ``(mode, value)``."""
         value = (value or "").strip()
         if mode == "daily":
             return f"at {value}"
+        if mode == "days_at":
+            m = re.match(r"^\s*(\d+)\s*(?:@|at|a|Ã )?\s*(.+?)\s*$", value)
+            if not m:
+                return "every days at"
+            hm = cls._parse_time_display(m.group(2))
+            if hm is None:
+                return "every days at"
+            hour, minute = hm
+            return f"every {int(m.group(1))} days at {hour:02d}:{minute:02d}"
         unit = mode if mode in ("minutes", "hours", "days") else "minutes"
         return f"every {value} {unit}"
 
@@ -3334,8 +3361,7 @@ class _SettingsPanel(QWidget):
     def _on_cron_schedule_changed(self, index: int, mode_combo: QComboBox,
                                   value_input: QLineEdit, persist: bool = True) -> None:
         mode = mode_combo.currentData() or "minutes"
-        value_input.setPlaceholderText(
-            ("2:30 PM" if timefmt.use_12h() else "14:30") if mode == "daily" else "5")
+        value_input.setPlaceholderText(self._cron_value_placeholder(mode))
         if 0 <= index < len(self._cron_jobs):
             self._cron_jobs[index]["schedule"] = self._compose_cron_schedule(
                 mode, value_input.text()
@@ -3411,12 +3437,14 @@ class _SettingsPanel(QWidget):
     def _persist_cron(self) -> None:
         clean = []
         for job in self._cron_jobs:
-            clean.append({
+            entry = dict(job)
+            entry.update({
                 "task": (job.get("task") or "").strip(),
                 "schedule": (job.get("schedule") or "").strip(),
                 "enabled": bool(job.get("enabled", False)),
                 "conversation_id": job.get("conversation_id") or None,
             })
+            clean.append(entry)
         set_setting("cron_jobs", clean)
 
     # ── Heartbeat / system monitoring (Bloc 5) ──────────────────────────────
@@ -6074,15 +6102,18 @@ class _SettingsPanel(QWidget):
 
         # Scheduled tasks (Bloc 5) — rebuild the cron job editor.
         cron_jobs = settings.get("cron_jobs", []) or []
-        self._cron_jobs = [
-            {
+        self._cron_jobs = []
+        for j in cron_jobs:
+            if not isinstance(j, dict):
+                continue
+            entry = dict(j)
+            entry.update({
                 "task": str(j.get("task", "")),
                 "schedule": str(j.get("schedule", "")),
                 "enabled": bool(j.get("enabled", False)),
                 "conversation_id": j.get("conversation_id") or None,
-            }
-            for j in cron_jobs if isinstance(j, dict)
-        ]
+            })
+            self._cron_jobs.append(entry)
         self._render_cron()
 
         # MCP / Connectors (WOR-44) — rebuild the catalog + custom server cards

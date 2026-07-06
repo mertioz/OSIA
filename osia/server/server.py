@@ -649,7 +649,11 @@ _DEFERRED_LOADS: set["asyncio.Task"] = set()
 # across connected devices so a same-conversation race is rejected instead of
 # queued, while different conversations can still run concurrently.
 _ACTIVE_TURNS_BY_CONV: dict[str, "asyncio.Future"] = {}
+_ACTIVE_TURN_META_BY_CONV: dict[str, dict] = {}
+_ACTIVE_CONV_BY_REQUEST: dict[str, str] = {}
 _CONVERSATION_BUSY_MESSAGE = "OSIA is still working in this conversation."
+_TURN_ID_PREFIX = "turn-"
+_CLIENT_REQUEST_ID_MAX = 128
 
 
 # Sentinel pushed onto an _OutboundChannel to tell its writer task to stop.
@@ -772,6 +776,10 @@ def _active_conversation_busy_ids() -> list[str]:
     for conv_id, task in list(_ACTIVE_TURNS_BY_CONV.items()):
         if task.done():
             _ACTIVE_TURNS_BY_CONV.pop(conv_id, None)
+            meta = _ACTIVE_TURN_META_BY_CONV.pop(conv_id, None)
+            req_id = str((meta or {}).get("client_request_id") or "")
+            if req_id:
+                _ACTIVE_CONV_BY_REQUEST.pop(req_id, None)
             continue
         busy.append(conv_id)
     return busy
@@ -785,14 +793,129 @@ def _is_conversation_busy(conv_id: str | None) -> bool:
         return False
     if task.done():
         _ACTIVE_TURNS_BY_CONV.pop(conv_id, None)
+        meta = _ACTIVE_TURN_META_BY_CONV.pop(conv_id, None)
+        req_id = str((meta or {}).get("client_request_id") or "")
+        if req_id:
+            _ACTIVE_CONV_BY_REQUEST.pop(req_id, None)
         return False
     return True
 
 
-def _claim_conversation_turn(conv_id: str, task: "asyncio.Future") -> bool:
+def _clean_client_request_id(value) -> str | None:
+    req_id = str(value or "").strip()
+    if not req_id or len(req_id) > _CLIENT_REQUEST_ID_MAX:
+        return None
+    if not all(ch.isalnum() or ch in "_.:-" for ch in req_id):
+        return None
+    return req_id
+
+
+def _new_turn_id() -> str:
+    return _TURN_ID_PREFIX + secrets.token_hex(16)
+
+
+def _new_turn_meta(conv_id: str, client_request_id: str | None) -> dict:
+    return {
+        "conversation_id": conv_id,
+        "client_request_id": client_request_id or "",
+        "turn_id": _new_turn_id(),
+        "persisted": False,
+    }
+
+
+def _turn_fields(turn_meta: dict | None) -> dict:
+    if not isinstance(turn_meta, dict):
+        return {}
+    fields = {}
+    req_id = str(turn_meta.get("client_request_id") or "")
+    turn_id = str(turn_meta.get("turn_id") or "")
+    if req_id:
+        fields["client_request_id"] = req_id
+    if turn_id:
+        fields["turn_id"] = turn_id
+    return fields
+
+
+def _turn_accepted_frame(turn_meta: dict) -> dict:
+    return {
+        "type": "turn_accepted",
+        "client_request_id": str(turn_meta.get("client_request_id") or ""),
+        "turn_id": str(turn_meta.get("turn_id") or ""),
+        "conversation_id": str(turn_meta.get("conversation_id") or ""),
+        "persisted": bool(turn_meta.get("persisted")),
+    }
+
+
+def _turn_status_frame(turn_meta: dict, status: str) -> dict:
+    frame = _turn_accepted_frame(turn_meta)
+    frame["type"] = "turn_status"
+    frame["status"] = status
+    return frame
+
+
+async def _send_existing_turn_status(
+    channel: "_OutboundChannel",
+    conv_id: str,
+    client_request_id: str | None,
+) -> bool:
+    if not client_request_id or not _is_conversation_busy(conv_id):
+        return False
+    meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
+    if not meta or meta.get("client_request_id") != client_request_id:
+        return False
+    await channel.send_json(_turn_accepted_frame(meta))
+    await channel.send_json(_turn_status_frame(meta, "running"))
+    return True
+
+
+async def _send_existing_turn_status_for_request(
+    channel: "_OutboundChannel",
+    client_request_id: str | None,
+) -> bool:
+    if not client_request_id:
+        return False
+    conv_id = _ACTIVE_CONV_BY_REQUEST.get(client_request_id)
+    if not conv_id:
+        return False
+    return await _send_existing_turn_status(channel, conv_id, client_request_id)
+
+
+def _persist_accepted_user_message(
+    conv_id: str | None,
+    content,
+    turn_meta: dict | None,
+) -> bool:
+    if not conv_id or not isinstance(turn_meta, dict):
+        return False
+    try:
+        updated = conversations.add_message(
+            conv_id,
+            "user",
+            content,
+            metadata={
+                "_client_request_id": turn_meta.get("client_request_id") or "",
+                "_turn_id": turn_meta.get("turn_id") or "",
+            },
+        )
+    except Exception as e:
+        print(f"[OSIA Server] failed to persist accepted user turn: {e}")
+        return False
+    return updated is not None
+
+
+def _claim_conversation_turn(
+    conv_id: str,
+    task: "asyncio.Future",
+    turn_meta: dict | None = None,
+) -> bool:
     if _is_conversation_busy(conv_id):
         return False
     _ACTIVE_TURNS_BY_CONV[conv_id] = task
+    if isinstance(turn_meta, dict):
+        _ACTIVE_TURN_META_BY_CONV[conv_id] = turn_meta
+        req_id = str(turn_meta.get("client_request_id") or "")
+        if req_id:
+            _ACTIVE_CONV_BY_REQUEST[req_id] = conv_id
     return True
 
 
@@ -806,6 +929,10 @@ def _clear_conversation_turn(
     if task is not None and current is not task:
         return False
     _ACTIVE_TURNS_BY_CONV.pop(conv_id, None)
+    meta = _ACTIVE_TURN_META_BY_CONV.pop(conv_id, None)
+    req_id = str((meta or {}).get("client_request_id") or "")
+    if req_id:
+        _ACTIVE_CONV_BY_REQUEST.pop(req_id, None)
     return True
 
 
@@ -3004,6 +3131,23 @@ async def websocket_endpoint(ws: WebSocket):
     # worker-thread provider reads the right (channel, loop). Each connection has
     # its own context, so a confirm never reaches the wrong device.
     _turn_target.set((out, asyncio.get_running_loop()))
+    try:
+        from osia import scheduled_tasks as _scheduled_tasks
+
+        loop = asyncio.get_running_loop()
+
+        def _scheduled_tasks_changed() -> None:
+            try:
+                cfg = _build_config_snapshot()
+                asyncio.run_coroutine_threadsafe(
+                    _broadcast_config({"type": "config", "config": cfg}), loop
+                )
+            except Exception as e:
+                print(f"[OSIA Server] scheduled-task config broadcast failed: {e}")
+
+        _scheduled_tasks.set_change_callback(_scheduled_tasks_changed)
+    except Exception as e:
+        print(f"[OSIA Server] scheduled-task broadcast hook unavailable: {e}")
     # Per-session state.
     # ``session_history`` is the OpenAI-format message list (sans system
     # prompt) handed to the agent each turn. ``active_conv_id`` is the
@@ -3174,14 +3318,14 @@ async def websocket_endpoint(ws: WebSocket):
         if result_conv_id is not None and active_conv_id == result_conv_id:
             session_history = new_history
 
-    def _spawn_turn(conv_id, make_coro):
+    def _spawn_turn(conv_id, make_coro, turn_meta: dict | None = None):
         # conv_id is always a real id here (resolved via _ensure_active_conv
         # before spawning), so the task is keyed by it: a follow-up turn on
         # the same conversation is rejected before this function is called, and
         # delete/disconnect can find and cancel it.
         prev = streaming_tasks.get(conv_id)
         task = asyncio.create_task(_run_turn(conv_id, prev, make_coro))
-        if not _claim_conversation_turn(conv_id, task):
+        if not _claim_conversation_turn(conv_id, task, turn_meta):
             task.cancel()
             return False
         streaming_tasks[conv_id] = task
@@ -4033,6 +4177,21 @@ async def websocket_endpoint(ws: WebSocket):
                         clean_reasoning = _normalize_mobile_reasoning_setting(setting_value)
                         set_reasoning_settings(clean_reasoning)
                         logged_value = clean_reasoning
+                    elif setting_key == "cron_jobs":
+                        from osia import scheduled_tasks
+
+                        result = scheduled_tasks.replace_scheduled_tasks_from_settings(
+                            setting_value,
+                            source_default="mobile_settings",
+                        )
+                        if not result.get("ok"):
+                            print(
+                                "[OSIA Server] set_setting cron_jobs rejected: "
+                                f"{result.get('code')}: {result.get('message')}"
+                            )
+                            await out.send_json({"type": "status", "status": "error"})
+                            continue
+                        logged_value = result.get("jobs", [])
                     else:
                         set_setting(setting_key, setting_value)
                     # WOR-44 Phase 5: for mcp_servers log the SANITIZED `clean`
@@ -4726,6 +4885,14 @@ async def websocket_endpoint(ws: WebSocket):
                 user_text = msg.get("content", "").strip()
                 if not user_text:
                     continue
+                client_request_id = _clean_client_request_id(
+                    msg.get("client_request_id"),
+                )
+                if await _send_existing_turn_status_for_request(
+                    out,
+                    client_request_id,
+                ):
+                    continue
                 # Consume pending files synchronously (clears the shared list)
                 # so this turn — and only this turn — carries them. Resolve the
                 # conversation synchronously (creating it on the first message)
@@ -4734,15 +4901,24 @@ async def websocket_endpoint(ws: WebSocket):
                 _conv = await _ensure_active_conv(user_text)
                 if _conv is not None:
                     if _is_conversation_busy(_conv):
+                        if await _send_existing_turn_status(
+                            out,
+                            _conv,
+                            client_request_id,
+                        ):
+                            continue
                         await _send_conversation_busy(out, _conv)
                         continue
                     user_text = _consume_pending_files(user_text, pending_files)
+                    turn_meta = _new_turn_meta(_conv, client_request_id)
                     _spawn_turn(
                         _conv,
-                        lambda snap, _t=user_text, _c=_conv:
+                        lambda snap, _t=user_text, _c=_conv, _m=turn_meta:
                             _run_agent_and_respond(
                                 out, _t, snap, _c,
-                                get_agent=_get_conn_agent),
+                                get_agent=_get_conn_agent,
+                                turn_meta=_m),
+                        turn_meta,
                     )
 
             # --- Audio message ---
@@ -4750,6 +4926,14 @@ async def websocket_endpoint(ws: WebSocket):
                 b64_data = msg.get("data", "")
                 audio_format = msg.get("format", "wav")
                 if not b64_data:
+                    continue
+                client_request_id = _clean_client_request_id(
+                    msg.get("client_request_id"),
+                )
+                if await _send_existing_turn_status_for_request(
+                    out,
+                    client_request_id,
+                ):
                     continue
                 # Snapshot + clear pending files at spawn time so they attach
                 # to THIS turn regardless of uploads that arrive during STT.
@@ -4764,16 +4948,25 @@ async def websocket_endpoint(ws: WebSocket):
                 _conv = await _ensure_active_conv(None)
                 if _conv is not None:
                     if _is_conversation_busy(_conv):
+                        if await _send_existing_turn_status(
+                            out,
+                            _conv,
+                            client_request_id,
+                        ):
+                            continue
                         await _send_conversation_busy(out, _conv)
                         continue
                     _pf = list(pending_files)
                     pending_files.clear()
+                    turn_meta = _new_turn_meta(_conv, client_request_id)
                     _spawn_turn(
                         _conv,
-                        lambda snap, _b=b64_data, _f=audio_format, _c=_conv, _files=_pf:
+                        lambda snap, _b=b64_data, _f=audio_format, _c=_conv, _files=_pf, _m=turn_meta:
                             _handle_audio(out, _b, _f, snap, _c,
                                           pending_files=_files,
-                                          get_agent=_get_conn_agent),
+                                          get_agent=_get_conn_agent,
+                                          turn_meta=_m),
+                        turn_meta,
                     )
 
             else:
@@ -5015,7 +5208,8 @@ def _persist_new_messages(conv_id: str | None, full_history: list,
 async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                                  active_conv_id: str | None,
                                  *, t0: float | None = None,
-                                 get_agent=None) -> tuple[list, str]:
+                                 get_agent=None,
+                                 turn_meta: dict | None = None) -> tuple[list, str]:
     """Run the agent with the given conversation history, persist the
     new turn, stream the spoken response sentence-by-sentence, then send
     the assembled reply + TTS audio.
@@ -5073,12 +5267,22 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         })
 
     prev_len = len(history)
+    accepted_user_persisted = _persist_accepted_user_message(
+        active_conv_id,
+        text,
+        turn_meta,
+    )
+    if isinstance(turn_meta, dict):
+        turn_meta["persisted"] = accepted_user_persisted
+        await ws.send_json(_turn_accepted_frame(turn_meta))
+    turn_fields = _turn_fields(turn_meta)
 
     # Status: thinking (single small send before the agent kicks off —
     # cheap, fire-and-forget effectively, mobile uses it for UI state).
     await ws.send_json({
         "type": "status", "content": "thinking",
         "conversation_id": active_conv_id,
+        **turn_fields,
     })
 
     # ── Streaming plumbing ────────────────────────────────────────────
@@ -5139,6 +5343,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 await ws.send_json({
                     "type": "response_chunk", "content": item,
                     "conversation_id": active_conv_id,
+                    **turn_fields,
                 })
                 sent_chunks.append(item)
                 # Yield to the event loop after every chunk. Enqueuing a frame
@@ -5247,11 +5452,15 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         await ws.send_json({
             "type": "response", "content": f"Erreur: {e}",
             "conversation_id": active_conv_id,
+            **turn_fields,
         })
         await ws.send_json({
             "type": "status", "content": "error",
             "conversation_id": active_conv_id,
+            **turn_fields,
         })
+        if accepted_user_persisted:
+            return history + [{"role": "user", "content": text}], active_conv_id
         return history, active_conv_id
 
     # Wait for every scheduled put to actually land in the queue before
@@ -5305,6 +5514,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     await ws.send_json({
                         "type": "response_chunk", "content": tail,
                         "conversation_id": active_conv_id,
+                        **turn_fields,
                     })
                     sent_chunks.append(tail)
                     _ts(t0, "tail response_chunk flushed",
@@ -5331,7 +5541,15 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
 
     # Persist everything added during this turn (user msg, any
     # assistant/tool rounds, final assistant reply).
-    _persist_new_messages(active_conv_id, new_history, prev_len)
+    persist_from = prev_len
+    if (
+        accepted_user_persisted
+        and len(new_history) > prev_len
+        and isinstance(new_history[prev_len], dict)
+        and new_history[prev_len].get("role") == "user"
+    ):
+        persist_from = prev_len + 1
+    _persist_new_messages(active_conv_id, new_history, persist_from)
     print(
         f"[OSIA Server] ◀ post-persist history check: "
         f"len(session_history)={len(new_history)} after _persist_new_messages()"
@@ -5377,6 +5595,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 await ws.send_json({
                     "type": "response_chunk", "content": response_text,
                     "conversation_id": active_conv_id,
+                    **turn_fields,
                 })
                 sent_chunks.append(response_text)
             except Exception as e:
@@ -5388,7 +5607,25 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     await ws.send_json({
         "type": "response", "content": response_text,
         "conversation_id": active_conv_id,
+        **turn_fields,
     })
+
+    # The text turn is complete once the canonical response is queued. Release
+    # the same-conversation gate before post-turn media work, so mobile can send
+    # the next turn without waiting for TTS synthesis.
+    await ws.send_json({
+        "type": "status", "content": "done",
+        "conversation_id": active_conv_id,
+        **turn_fields,
+    })
+    current_task = asyncio.current_task()
+    if (
+        active_conv_id
+        and current_task is not None
+        and _clear_conversation_turn(active_conv_id, current_task)
+    ):
+        await _broadcast_conversation_busy_changed(active_conv_id, False)
+    _ts(t0, "turn final frame sent")
 
     # Synthesize TTS off-thread so the event loop keeps serving.
     try:
@@ -5420,13 +5657,6 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         print(f"[OSIA Server] TTS synthesis failed: {e}")
         traceback.print_exc()
 
-    # Brief settle so any chunks still in flight on the WebSocket land
-    # before the client sees `done` and tears down the streaming UI.
-    await asyncio.sleep(0.2)
-    await ws.send_json({
-        "type": "status", "content": "done",
-        "conversation_id": active_conv_id,
-    })
     _ts(t0, "request complete")
     return new_history, active_conv_id
 
@@ -5435,7 +5665,8 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
                         history: list,
                         active_conv_id: str | None,
                         *, pending_files: list[str] | None = None,
-                        get_agent=None) -> tuple[list, str | None]:
+                        get_agent=None,
+                        turn_meta: dict | None = None) -> tuple[list, str | None]:
     """Process an audio command: transcribe, then run the agent on the
     transcript using the SAME path as text commands (so tools execute
     identically and the transcript ends up in the same conversation).
@@ -5457,11 +5688,13 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
 
     t0 = time.perf_counter()
     _ts(t0, "audio received", f"({len(b64_data)} b64 chars, format={audio_format})")
+    turn_fields = _turn_fields(turn_meta)
 
     # Status: thinking
     await ws.send_json({
         "type": "status", "content": "thinking",
         "conversation_id": active_conv_id,
+        **turn_fields,
     })
 
     try:
@@ -5471,10 +5704,12 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
             await ws.send_json({
                 "type": "transcript", "content": "",
                 "conversation_id": active_conv_id,
+                **turn_fields,
             })
             await ws.send_json({
                 "type": "status", "content": "done",
                 "conversation_id": active_conv_id,
+                **turn_fields,
             })
             _ts(t0, "silent audio — short-circuit done")
             return history, active_conv_id
@@ -5492,10 +5727,12 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
             await ws.send_json({
                 "type": "transcript", "content": "",
                 "conversation_id": active_conv_id,
+                **turn_fields,
             })
             await ws.send_json({
                 "type": "status", "content": "done",
                 "conversation_id": active_conv_id,
+                **turn_fields,
             })
             return history, active_conv_id
 
@@ -5508,6 +5745,7 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
             ws.send_json({
                 "type": "transcript", "content": transcript,
                 "conversation_id": active_conv_id,
+                **turn_fields,
             })
         )
 
@@ -5519,6 +5757,7 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
             return await _run_agent_and_respond(
                 ws, agent_input, history, active_conv_id, t0=t0,
                 get_agent=get_agent,
+                turn_meta=turn_meta,
             )
         finally:
             # Make sure the transcript frame finished going out before
@@ -5534,6 +5773,7 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
         await ws.send_json({
             "type": "status", "content": "error",
             "conversation_id": active_conv_id,
+            **turn_fields,
         })
         return history, active_conv_id
 
