@@ -29,7 +29,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import (
     Qt, QEvent, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
-    QRect, QRectF, QPointF,
+    QRect, QRectF, QPointF, QSize,
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap,
@@ -1176,6 +1176,26 @@ class _ModelPanel(QWidget):
 
 # ── Settings panel ──────────────────────────────────────────────────────────
 
+class _SettingsDetailStack(QStackedWidget):
+    """Stack used inside the Settings detail scroll area.
+
+    A regular QStackedWidget reports a size hint/minimum from the largest page,
+    including hidden pages. In a scroll area's resizable widget this can make one
+    wide/tall Settings category force every other category to an oversized child
+    geometry; with scrollbars hidden, the viewport clips the content. The detail
+    pane only needs the current page's hint, while its minimum must stay soft so
+    the scroll area can fit the page to the existing popup width.
+    """
+
+    def sizeHint(self) -> QSize:  # noqa: N802 (Qt method name)
+        current = self.currentWidget()
+        if current is not None:
+            return current.sizeHint()
+        return super().sizeHint()
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 (Qt method name)
+        return QSize(0, 0)
+
 class _ProviderCard(QFrame):
     """One AI provider as a compact configuration card.
 
@@ -2079,7 +2099,7 @@ class _SettingsPanel(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
 
-        self._settings_stack = QStackedWidget()
+        self._settings_stack = _SettingsDetailStack()
         self._settings_stack.setObjectName("settingsStack")
 
         # Build every section ONCE, in the original column order, so any
