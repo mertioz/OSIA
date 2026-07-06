@@ -130,6 +130,16 @@ if __name__ == "__main__":
         print(f"[CONFIG] ensure_config_files skipped: {e}")
     _boot_mark("after ensure_config_files")
 
+    # Public relay connector (WOR-104): additive outbound bridge. It retries in
+    # the background and never owns port 8765, so quick-tunnel/rendezvous and
+    # wake-recovery behavior remain unchanged when the relay is offline.
+    try:
+        from osia.relay_connector import start_background_connector
+        start_background_connector()
+        _boot_mark("relay connector start requested")
+    except Exception as e:
+        print(f"[OSIA Relay] connector start skipped: {e}")
+
     # Port guard (WOR-47): if 8765 is already held — e.g. the supervisor
     # relaunched us while a detached restart_server replacement still owns the
     # port, or an external owner is serving — uvicorn would die on bind and the
