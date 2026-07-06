@@ -87,7 +87,7 @@ LIVEAPI_AVAILABLE = False
 # {id, action} (no secret); localhost-only on the server side.
 _SERVER_MCP_SYNC_URL = "http://127.0.0.1:8765/internal/mcp_sync"
 # WOR-96 PART 1 — desktop entry point for an OAuth connect that completes via the
-# HTTPS tunnel callback (osia.space → the SERVER process). The desktop kicks the
+# HTTPS tunnel callback (app.osia.space → the SERVER process). The desktop kicks the
 # server (which runs the OAuth provider so the tunnel redirect lands in the same
 # process as the PKCE state) and opens the returned authorize URL in the PC
 # browser. Separate from the existing loopback Connect button, which is unchanged.
@@ -141,7 +141,7 @@ def _notify_mobile_mcp_sync(server_id: str, action: str) -> None:
 
 def request_oauth_tunnel_connect(server_id: str) -> bool:
     """WOR-96 PART 1 — start an OAuth connect that completes via the HTTPS tunnel
-    callback (osia.space → the SERVER process), and open the authorize URL in the
+    callback (app.osia.space → the SERVER process), and open the authorize URL in the
     PC browser.
 
     POSTs ``{id}`` to the loopback trigger ``/internal/mcp_oauth_tunnel_connect``.

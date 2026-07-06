@@ -133,9 +133,10 @@ def _child_command(kind: str):
     # invocation to windows\start_tunnel.bat). The public trycloudflare.com URL
     # it prints to _TUNNEL_LOG is what osia.rendezvous publishes (WOR-64).
     #
-    # WOR-67: ``--config NUL`` forces cloudflared to SKIP ~/.cloudflared/config.yml.
-    # That file's ingress only routes hostname: osia.space and 404s everything
-    # else, so without this the quick-tunnel URL returned 404 on every path. NUL
+    # WOR-67/WOR-16: ``--config NUL`` forces cloudflared to SKIP any
+    # user-local ~/.cloudflared/config.yml. OSIA's Windows mobile path is this
+    # quick tunnel + rendezvous publisher; if cloudflared accidentally reads a
+    # fixed-host ingress config, the trycloudflare URL can 404 on every path. NUL
     # is the Windows null device (the Linux wrapper must use ``/dev/null`` here,
     # NOT NUL). Origin is 127.0.0.1 (not localhost) to force IPv4 — the server
     # binds 0.0.0.0:8765 which is IPv4-only, so a localhost→::1 resolution would

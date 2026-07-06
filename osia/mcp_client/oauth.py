@@ -53,17 +53,21 @@ OAUTH_CALLBACK_PORT = 8975
 OAUTH_REDIRECT_PATH = "/callback"
 OAUTH_REDIRECT_URI = f"http://{OAUTH_CALLBACK_HOST}:{OAUTH_CALLBACK_PORT}{OAUTH_REDIRECT_PATH}"
 
-# WOR-96 PART 1: the PUBLIC HTTPS callback, reached through the Cloudflare named
-# tunnel (osia.space → the SERVER process on :8765, which serves GET
-# /oauth/callback). Used IN ADDITION to the loopback URI above so a PC-initiated
-# (later, PART 2: phone-initiated) OAuth flow can complete via the tunnel. The
-# flow that USES this redirect MUST run in the server process — that is where the
-# redirect lands AND where the SDK's in-memory PKCE verifier/state live (the SDK
-# never persists them), so the same process/instance that started the flow must
-# perform the token exchange. See the ``oauth_callback_mode == "tunnel"`` branch
+# WOR-96 PART 1: the PUBLIC HTTPS callback for the fixed app-domain fallback
+# (app.osia.space -> the SERVER process on :8765, which serves GET
+# /oauth/callback). Mobile normally uses the rendezvous Worker redirect so it can
+# follow the current quick tunnel; this URI stays registered for non-rendezvous
+# tunnel flows. The flow that USES this redirect MUST run in the server process:
+# that is where the redirect lands AND where the SDK's in-memory PKCE verifier
+# and state live (the SDK never persists them), so the same process/instance
+# that started the flow must perform the token exchange. See the
+# ``oauth_callback_mode == "tunnel"`` branch
 # in ``osia.mcp_client.manager._serve`` and the server's ``/oauth/callback`` route
 # + cross-loop registry below.
-OAUTH_TUNNEL_REDIRECT_URI = "https://osia.space/oauth/callback"
+OAUTH_TUNNEL_REDIRECT_URI = "https://app.osia.space/oauth/callback"
+# Transitional overlap: keep the former root-domain callback registered while
+# DNS and existing clients migrate. Do not use this as the primary redirect.
+OAUTH_LEGACY_TUNNEL_REDIRECT_URI = "https://osia.space/oauth/callback"
 
 OAUTH_CLIENT_NAME = "OSIA"
 
@@ -806,14 +810,14 @@ def build_oauth_provider(
     expose the same interface, so this factory is transport-agnostic.
 
     ``redirect_uris`` selects the registered/used redirect URIs. Default
-    (``None``) → ``[OAUTH_REDIRECT_URI, OAUTH_TUNNEL_REDIRECT_URI]``: the loopback
-    URI stays index 0, and the SDK uses ``redirect_uris[0]`` for BOTH the
-    authorize request and the token exchange (mcp 1.28 ``oauth2.py``), so the
-    existing PC loopback flow is byte-for-byte unchanged — while DCR (RFC 7591)
-    now ALSO registers the tunnel URI, so a freshly-connected connector is
-    tunnel-ready with no re-registration. The tunnel flow passes
-    ``[OAUTH_TUNNEL_REDIRECT_URI, OAUTH_REDIRECT_URI]`` so the tunnel URI is index
-    0 (used) while the loopback URI stays registered.
+    (``None``) →
+    ``[OAUTH_REDIRECT_URI, OAUTH_TUNNEL_REDIRECT_URI, OAUTH_LEGACY_TUNNEL_REDIRECT_URI]``:
+    the loopback URI stays index 0, and the SDK uses ``redirect_uris[0]`` for
+    BOTH the authorize request and the token exchange (mcp 1.28 ``oauth2.py``),
+    so the existing PC loopback flow is byte-for-byte unchanged — while DCR
+    (RFC 7591) now ALSO registers the app tunnel URI plus the legacy root URI
+    for the migration overlap. The tunnel flow passes the app tunnel URI at
+    index 0 (used) while loopback and legacy root stay registered.
 
     WOR-100 — ``static_client`` / ``scope`` (both default ``None`` → the DCR
     path above is byte-for-byte unchanged): a PRE-REGISTERED (non-DCR) connector
@@ -843,7 +847,11 @@ def build_oauth_provider(
         redirect_uris = (
             [OAUTH_REDIRECT_URI]
             if static_client is not None
-            else [OAUTH_REDIRECT_URI, OAUTH_TUNNEL_REDIRECT_URI]
+            else [
+                OAUTH_REDIRECT_URI,
+                OAUTH_TUNNEL_REDIRECT_URI,
+                OAUTH_LEGACY_TUNNEL_REDIRECT_URI,
+            ]
         )
 
     metadata = OAuthClientMetadata(

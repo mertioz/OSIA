@@ -7,9 +7,11 @@ REM Exposes the local OSIA mobile server (http://127.0.0.1:8765) via a
 REM Cloudflare quick tunnel. The public https://*.trycloudflare.com URL is
 REM written to windows\tunnel.log.
 REM
-REM WOR-67: --config NUL makes cloudflared skip ~/.cloudflared/config.yml (whose
-REM ingress only routes osia.space and 404s everything else); 127.0.0.1 forces
-REM IPv4 to match the server's 0.0.0.0:8765 (IPv4-only) bind.
+REM WOR-67/WOR-16: --config NUL makes cloudflared skip any user-local
+REM ~/.cloudflared/config.yml. OSIA's Windows mobile path is this quick tunnel
+REM plus rendezvous; if a fixed-host ingress config is read accidentally, the
+REM trycloudflare URL can 404. 127.0.0.1 forces IPv4 to match the server's
+REM 0.0.0.0:8765 (IPv4-only) bind.
 REM ===========================================================================
 setlocal
 set "SCRIPT_DIR=%~dp0"

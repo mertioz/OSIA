@@ -1391,9 +1391,10 @@ async def internal_mcp_sync(request: Request):
 
 
 # ── WOR-96 PART 1: OAuth-via-HTTPS-tunnel callback (public) + PC trigger ──────
-# An OAuth MCP connect can complete via https://osia.space/oauth/callback (routed
-# by the Cloudflare named tunnel to THIS server on :8765) IN ADDITION to the PC
-# loopback (127.0.0.1:8975). The flow runs ENTIRELY in this server process: the
+# An OAuth MCP connect can complete via the fixed fallback/callback endpoint
+# https://app.osia.space/oauth/callback IN ADDITION to the PC loopback
+# (127.0.0.1:8975). Mobile normally uses the rendezvous Worker redirect to reach
+# the current quick tunnel. The flow runs ENTIRELY in this server process: the
 # tunnel redirect lands here AND the SDK's in-memory PKCE verifier/state live here
 # (the SDK never persists them), so the same process/instance that started the
 # flow performs the token exchange. The cross-loop state registry + transport live
@@ -1457,12 +1458,13 @@ def _oauth_cb_rate_ok(ip: str) -> bool:
 async def oauth_callback(request: Request):
     """PUBLIC OAuth 2.1 redirect endpoint — WOR-96 PART 1.
 
-    Reached through the Cloudflare named tunnel (osia.space → this server). An
-    OAuth provider redirects the user's browser here with ``?code=&state=`` after
-    an interactive login that an MCP connect flow started IN THIS PROCESS (the
-    tunnel branch of ``MCPManager._serve``). We match ``state`` to the in-flight
-    flow and hand ``(code, state)`` to the waiting provider's ``callback_handler``
-    — across the FastAPI ↔ MCP-manager event loops via a
+    Reached either through the rendezvous Worker forwarding to the current quick
+    tunnel, or through the fixed app-domain fallback endpoint. An OAuth provider
+    redirects the user's browser here with ``?code=&state=`` after an interactive
+    login that an MCP connect flow started IN THIS PROCESS (the tunnel branch of
+    ``MCPManager._serve``). We match ``state`` to the in-flight flow and hand
+    ``(code, state)`` to the waiting provider's ``callback_handler`` — across the
+    FastAPI ↔ MCP-manager event loops via a
     ``concurrent.futures.Future`` — then show a neutral close-tab page.
 
     This is the ONLY route intentionally exposed to the public internet (so it has
@@ -1612,12 +1614,13 @@ async def _begin_oauth_tunnel_connect(server_id: str, saved: dict) -> dict:
             cfg["oauth_flow_id"] = fid
             # WOR-98: use the rendezvous Worker as the OAuth redirect target so the
             # mobile/tunnel flow works for ANY user via their quick tunnel — not
-            # only the owner's named osia.space tunnel. The redirect_uri becomes the
+            # only via a fixed app.osia.space endpoint. The redirect_uri becomes the
             # STABLE per-user ``<worker>/oauth/cb/<rendezvous_key>``; the Worker
             # forwards the callback to THIS PC's current trycloudflare
             # ``/oauth/callback`` (host-agnostic, unchanged). Gated on a mobile
             # token existing: with no token, leave cfg untouched so _serve falls
-            # back to today's [osia.space, loopback] behavior (no regression).
+            # back to the fixed app.osia.space endpoint (legacy root still
+            # registered for the migration overlap).
             try:
                 from osia.config import load_mobile_token, rendezvous_key
                 from osia.rendezvous import WORKER_URL
