@@ -1957,6 +1957,7 @@ class _SettingsPanel(QWidget):
 
     # ── Live API (Bloc 4) ──────────────────────────────────────────────────
     # Order Live API providers appear in the selector.
+    _LIVEAPI_AVAILABLE = False
     _LIVEAPI_PROVIDER_ORDER = ("google", "openai", "claude")
     # Live API provider value -> verbatim display name (proper nouns, untranslated).
     _LIVEAPI_PROVIDER_NAMES = {
@@ -2683,12 +2684,18 @@ class _SettingsPanel(QWidget):
         self._liveapi_enabled_label = QLabel(i18n.t("liveapi.enabled"))
         self._liveapi_enabled_label.setObjectName("providerName")
         self._liveapi_enabled_label.setWordWrap(True)
+        self._liveapi_soon = QLabel(i18n.t("liveapi.coming_soon"))
+        self._liveapi_soon.setObjectName("comingSoonPill")
+        self._liveapi_soon.setWordWrap(True)
         self._liveapi_enabled_toggle = QCheckBox()
         self._liveapi_enabled_toggle.setObjectName("smartToggle")
+        self._liveapi_enabled_toggle.setEnabled(self._LIVEAPI_AVAILABLE)
         self._liveapi_enabled_toggle.stateChanged.connect(
             self._on_liveapi_enabled_changed
         )
         enable_row.addWidget(self._liveapi_enabled_label)
+        enable_row.addSpacing(8)
+        enable_row.addWidget(self._liveapi_soon)
         enable_row.addStretch()
         enable_row.addWidget(self._liveapi_enabled_toggle)
         l.addLayout(enable_row)
@@ -2707,6 +2714,7 @@ class _SettingsPanel(QWidget):
         self._liveapi_prov_label.setWordWrap(True)
         self._liveapi_provider_combo = QComboBox()
         self._liveapi_provider_combo.setObjectName("voiceCombo")
+        self._liveapi_provider_combo.setEnabled(self._LIVEAPI_AVAILABLE)
         for key in self._LIVEAPI_PROVIDER_ORDER:
             self._liveapi_provider_combo.addItem(
                 self._LIVEAPI_PROVIDER_NAMES[key], key
@@ -2726,6 +2734,7 @@ class _SettingsPanel(QWidget):
         self._liveapi_model_label.setWordWrap(True)
         self._liveapi_model_combo = QComboBox()
         self._liveapi_model_combo.setObjectName("voiceCombo")
+        self._liveapi_model_combo.setEnabled(self._LIVEAPI_AVAILABLE)
         self._liveapi_model_combo.currentIndexChanged.connect(
             self._on_liveapi_model_changed
         )
@@ -2739,6 +2748,7 @@ class _SettingsPanel(QWidget):
         self._liveapi_docs_btn = QPushButton(i18n.t("provider.browse"))
         self._liveapi_docs_btn.setObjectName("ghostBtn")
         self._liveapi_docs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._liveapi_docs_btn.setEnabled(self._LIVEAPI_AVAILABLE)
         self._liveapi_docs_btn.clicked.connect(self._on_liveapi_docs)
         docs_row.addWidget(self._liveapi_docs_btn)
         body.addLayout(docs_row)
@@ -2747,6 +2757,7 @@ class _SettingsPanel(QWidget):
         # (no duplicate storage). Only the active provider's card is shown.
         for key in self._LIVEAPI_PROVIDER_ORDER:
             card = _ProviderCard(self._LIVEAPI_KEY_PROVIDER[key])
+            card.setEnabled(self._LIVEAPI_AVAILABLE)
             card.saved.connect(self._on_provider_saved)
             body.addWidget(card)
             self._liveapi_cards[key] = card
@@ -2757,6 +2768,10 @@ class _SettingsPanel(QWidget):
         self._liveapi_notice.setWordWrap(True)
         body.addWidget(self._liveapi_notice)
 
+        self._liveapi_body.setEnabled(self._LIVEAPI_AVAILABLE)
+        self._liveapi_sub.setEnabled(self._LIVEAPI_AVAILABLE)
+        self._liveapi_desc.setEnabled(self._LIVEAPI_AVAILABLE)
+        self._liveapi_enabled_label.setEnabled(self._LIVEAPI_AVAILABLE)
         l.addWidget(self._liveapi_body)
         return wrap
 
@@ -2781,9 +2796,17 @@ class _SettingsPanel(QWidget):
             card.setVisible(live_provider == provider)
 
     def _apply_liveapi_visibility(self) -> None:
-        self._liveapi_body.setVisible(self._liveapi_enabled_toggle.isChecked())
+        self._liveapi_body.setVisible(
+            self._LIVEAPI_AVAILABLE and self._liveapi_enabled_toggle.isChecked()
+        )
 
     def _on_liveapi_enabled_changed(self, _state) -> None:
+        if not self._LIVEAPI_AVAILABLE:
+            self._liveapi_enabled_toggle.blockSignals(True)
+            self._liveapi_enabled_toggle.setChecked(False)
+            self._liveapi_enabled_toggle.blockSignals(False)
+            self._apply_liveapi_visibility()
+            return
         set_setting("liveapi_enabled", self._liveapi_enabled_toggle.isChecked())
         self._apply_liveapi_visibility()
 
@@ -6038,8 +6061,11 @@ class _SettingsPanel(QWidget):
         )
         self._liveapi_enabled_toggle.blockSignals(True)
         self._liveapi_enabled_toggle.setChecked(
-            bool(settings.get("liveapi_enabled", False)))
+            self._LIVEAPI_AVAILABLE
+            and bool(settings.get("liveapi_enabled", False))
+        )
         self._liveapi_enabled_toggle.blockSignals(False)
+        self._liveapi_enabled_toggle.setEnabled(self._LIVEAPI_AVAILABLE)
         self._apply_liveapi_visibility()
 
         # Vision companion (WOR-25) — show + prefill only when the selected
@@ -6386,6 +6412,7 @@ class _SettingsPanel(QWidget):
         self._liveapi_sub.setText(i18n.t("settings.liveapi_sub"))
         self._liveapi_desc.setText(i18n.t("settings.liveapi_desc"))
         self._liveapi_enabled_label.setText(i18n.t("liveapi.enabled"))
+        self._liveapi_soon.setText(i18n.t("liveapi.coming_soon"))
         self._liveapi_prov_label.setText(i18n.t("settings.active_provider"))
         self._liveapi_model_label.setText(i18n.t("settings.model"))
         self._liveapi_docs_btn.setText(i18n.t("provider.browse"))
@@ -8477,6 +8504,14 @@ class MainPopup(QWidget):
                 color: #c4b5f5;
                 font-size: 11px;
             }
+            QLabel#comingSoonPill {
+                background: rgba(232, 230, 240, 0.06);
+                border: 1px solid rgba(232, 230, 240, 0.14);
+                border-radius: 9px;
+                padding: 3px 8px;
+                color: rgba(232, 230, 240, 0.58);
+                font-size: 10px;
+            }
             QFrame#dialogCard {
                 background: #0f0d16;
                 border: 1px solid rgba(196, 181, 245, 0.30);
@@ -8653,6 +8688,10 @@ class MainPopup(QWidget):
             QCheckBox#smartToggle::indicator:checked {
                 background: rgba(196, 181, 245, 0.85);
                 border: 1px solid rgba(196, 181, 245, 1.0);
+            }
+            QCheckBox#smartToggle::indicator:disabled {
+                background: rgba(232, 230, 240, 0.07);
+                border: 1px solid rgba(232, 230, 240, 0.12);
             }
 
             /* WOR-48: scrollbars are fully hidden everywhere (the per-area

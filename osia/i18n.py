@@ -602,6 +602,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Live-API ist ein Echtzeit-Sprache-zu-Sprache-Modus, in dem das Modell direkt zuhört und spricht und separate Transkription und Synthese überspringt. Das wirkt natürlicher, verbraucht aber mehr API-Kontingent, und Ihre STT- und TTS-Einstellungen werden währenddessen umgangen.",
         "es": "Live API es un modo de voz a voz en tiempo real en el que el modelo escucha y habla directamente, omitiendo la transcripción y la síntesis por separado. Resulta más natural pero consume más cuota de API, y tus ajustes de STT y TTS se omiten mientras está activo.",
     },
+    "liveapi.coming_soon": {
+        "en": "Coming soon",
+        "fr": "Bientôt disponible",
+        "zh": "Coming soon",
+        "ja": "Coming soon",
+        "de": "Coming soon",
+        "es": "Coming soon",
+    },
     "liveapi.enabled": {
         "en": "Enable Live API voice-to-voice",
         "fr": "Activer la Live API voix-à-voix",

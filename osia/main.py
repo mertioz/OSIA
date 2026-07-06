@@ -80,6 +80,7 @@ from osia.tools import verify_tools
 # a {"type": "new_chat"} reset to every connected device. The endpoint is
 # localhost-only on the server side.
 _SERVER_NEW_CHAT_URL = "http://127.0.0.1:8765/internal/new_chat"
+LIVEAPI_AVAILABLE = False
 # Desktop→server MCP state mirror (Phase 1, direction A). The desktop pings this
 # after a local MCP connect/disconnect so the mobile server reconciles its OWN
 # manager and repaints every phone. Same loopback host as new_chat; carries only
@@ -826,7 +827,13 @@ def wake_mode():
         # back natively. The real WebSocket streaming is a separate task —
         # _connect_live_api() is currently a stub (see osia.voice.live_api).
         live_settings = load_settings()
-        if live_settings.get("liveapi_enabled"):
+        if live_settings.get("liveapi_enabled") and not LIVEAPI_AVAILABLE:
+            print(
+                "[LIVE API] configured but not yet available; "
+                "using local STT/TTS instead.",
+                flush=True,
+            )
+        if live_settings.get("liveapi_enabled") and LIVEAPI_AVAILABLE:
             provider = live_settings.get("liveapi_provider", "google") or "google"
             model = live_settings.get("liveapi_model")
             print(

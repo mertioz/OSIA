@@ -78,13 +78,14 @@ VERIFIER_THRESHOLD = 0.92  # Score above which we consider "osia" detected
 COOLDOWN_SECONDS = 1.5    # Minimum time between detections
 PATIENCE_FRAMES = 8       # Number of consecutive positive frames required
 # Voice-activity energy gate (RMS over the verifier's ~1.28s context window).
-# The universal verifier (WOR-37) scores a silent/ambient room as high as ~0.91
-# — above VERIFIER_THRESHOLD — so without this gate a quiet room fires the wake
-# on its own (e.g. greeting + listening at startup, with no one speaking). A
-# high score may only count toward a detection when real speech is present in
-# the window. 300 sits well under the quietest real "osia" sample (peak-frame
-# RMS ~640) and comfortably above a typical quiet-room noise floor.
-ENERGY_GATE_RMS = 300
+# The universal verifier (WOR-37) has scored silent/ambient rooms around 0.91,
+# close to VERIFIER_THRESHOLD, so high scores only count when real speech is
+# present in the window. 450 remains far below the local synthetic wake-word
+# samples while rejecting more quiet-room and fan/keyboard noise than the
+# original gate.
+ENERGY_GATE_RMS = 450
+DIAGNOSTIC_LOG_INTERVAL_SECONDS = 5.0
+DIAGNOSTIC_SCORE_MARGIN = 0.03
 
 # === Lazy-loaded globals ===
 _verifier_model = None
@@ -194,6 +195,13 @@ class WakeWordDetector:
         self._thread = None
         self._last_detection = 0.0
         self._positive_streak = 0
+        self._last_diag_log = 0.0
+
+    def _log_diagnostic(self, now: float, message: str) -> None:
+        if now - self._last_diag_log < DIAGNOSTIC_LOG_INTERVAL_SECONDS:
+            return
+        self._last_diag_log = now
+        print(message, flush=True)
 
     def _listen_loop(self):
         """Main loop: stream audio, extract features, run verifier."""
@@ -295,13 +303,36 @@ class WakeWordDetector:
                     # speech is present somewhere in the window. A quiet room
                     # (verifier ~0.88 on silence) can never build a streak, so
                     # startup stays silent/passive until "osia" is actually said.
-                    speech_present = bool(energy_window) and max(energy_window) >= ENERGY_GATE_RMS
+                    max_rms = max(energy_window) if energy_window else 0.0
+                    speech_present = max_rms >= ENERGY_GATE_RMS
 
-                    if score >= VERIFIER_THRESHOLD and speech_present:
+                    if score >= VERIFIER_THRESHOLD:
+                        if not speech_present:
+                            self._positive_streak = 0
+                            self._log_diagnostic(
+                                now,
+                                "[wake] rejected high verifier score: "
+                                f"score={score:.3f} threshold={VERIFIER_THRESHOLD:.2f} "
+                                f"max_rms={max_rms:.0f} gate={ENERGY_GATE_RMS} "
+                                "reason=energy",
+                            )
+                            continue
                         self._positive_streak += 1
+                        self._log_diagnostic(
+                            now,
+                            "[wake] verifier candidate: "
+                            f"score={score:.3f} threshold={VERIFIER_THRESHOLD:.2f} "
+                            f"streak={self._positive_streak}/{PATIENCE_FRAMES} "
+                            f"max_rms={max_rms:.0f} gate={ENERGY_GATE_RMS}",
+                        )
                         if self._positive_streak >= PATIENCE_FRAMES:
                             if now - self._last_detection > COOLDOWN_SECONDS:
                                 print(f"✅ Wake word detected! score={score:.3f}")
+                                print(
+                                    "[wake] accepted verifier score: "
+                                    f"threshold={VERIFIER_THRESHOLD:.2f} "
+                                    f"max_rms={max_rms:.0f} gate={ENERGY_GATE_RMS}"
+                                )
                                 self._last_detection = now
                                 self._positive_streak = 0
                                 if self.callback:
@@ -309,6 +340,16 @@ class WakeWordDetector:
                             else:
                                 self._positive_streak = 0
                     else:
+                        near_threshold = (
+                            score >= VERIFIER_THRESHOLD - DIAGNOSTIC_SCORE_MARGIN
+                        )
+                        if speech_present and near_threshold:
+                            self._log_diagnostic(
+                                now,
+                                "[wake] rejected near verifier threshold: "
+                                f"score={score:.3f} threshold={VERIFIER_THRESHOLD:.2f} "
+                                f"max_rms={max_rms:.0f} gate={ENERGY_GATE_RMS}",
+                            )
                         self._positive_streak = max(0, self._positive_streak - 1)
 
                 except Exception as e:
