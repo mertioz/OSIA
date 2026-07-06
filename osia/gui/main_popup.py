@@ -307,9 +307,11 @@ class _ChatPage(QWidget):
 
     send_text = pyqtSignal(str)
     pick_file = pyqtSignal(str)
+    _BUSY_TEXT = "OSIA is still working in this conversation."
 
     def __init__(self):
         super().__init__()
+        self._busy = False
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -345,8 +347,18 @@ class _ChatPage(QWidget):
         # Input row
         input_wrap = QFrame()
         input_wrap.setObjectName("inputWrap")
-        row = QHBoxLayout(input_wrap)
-        row.setContentsMargins(10, 8, 10, 10)
+        input_layout = QVBoxLayout(input_wrap)
+        input_layout.setContentsMargins(10, 8, 10, 10)
+        input_layout.setSpacing(4)
+
+        self._notice = QLabel("")
+        self._notice.setObjectName("chatNotice")
+        self._notice.setWordWrap(True)
+        self._notice.hide()
+        input_layout.addWidget(self._notice)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
 
         self._file_btn = QPushButton("+")
@@ -371,6 +383,7 @@ class _ChatPage(QWidget):
         row.addWidget(self._file_btn)
         row.addWidget(self._input, 1)
         row.addWidget(self._send_btn)
+        input_layout.addLayout(row)
         outer.addWidget(input_wrap)
 
         # Re-translate the input chrome + empty-state label on language change.
@@ -379,7 +392,9 @@ class _ChatPage(QWidget):
 
     def _retranslate(self) -> None:
         self._file_btn.setToolTip(i18n.t("chat.attach_file"))
-        self._input.setPlaceholderText(i18n.t("chat.input_placeholder"))
+        self._input.setPlaceholderText(
+            self._BUSY_TEXT if self._busy else i18n.t("chat.input_placeholder")
+        )
         self._send_btn.setToolTip(i18n.t("chat.send"))
         if not _is_deleted(self._empty):
             self._empty.setText(i18n.t("chat.empty"))
@@ -446,6 +461,25 @@ class _ChatPage(QWidget):
 
     # ── Internals ─────────────────────────────────────────────────────────
 
+    def set_busy(self, busy: bool) -> None:
+        self._busy = bool(busy)
+        self._input.setEnabled(not self._busy)
+        self._send_btn.setEnabled(not self._busy)
+        self._send_btn.setCursor(
+            Qt.CursorShape.ArrowCursor
+            if self._busy else Qt.CursorShape.PointingHandCursor
+        )
+        self._input.setPlaceholderText(
+            self._BUSY_TEXT if self._busy else i18n.t("chat.input_placeholder")
+        )
+        self._send_btn.style().unpolish(self._send_btn)
+        self._send_btn.style().polish(self._send_btn)
+
+    def show_notice(self, text: str) -> None:
+        self._notice.setText(text)
+        self._notice.show()
+        QTimer.singleShot(2600, self._notice.hide)
+
     @staticmethod
     def _build_empty_label() -> QLabel:
         label = QLabel(i18n.t("chat.empty"))
@@ -483,6 +517,9 @@ class _ChatPage(QWidget):
         bar.setValue(bar.maximum())
 
     def _on_send(self) -> None:
+        if self._busy:
+            self.show_notice(self._BUSY_TEXT)
+            return
         text = self._input.text().strip()
         if not text:
             return
@@ -7649,6 +7686,8 @@ class MainPopup(QWidget):
         self._stack.addWidget(self._osia)
         self._stack.addWidget(self._autonomous)
         outer.addWidget(self._stack, 1)
+        self._active_conversation_id: str | None = None
+        self._busy_conversation_ids: set[str] = set()
 
         # Bottom nav
         nav = QHBoxLayout()
@@ -7804,6 +7843,7 @@ class MainPopup(QWidget):
         self._stack.setCurrentIndex(self.PAGE_CHAT)
         for b in self._nav_buttons.values():
             b.setChecked(False)
+        self._apply_current_busy()
         # Leaving settings via any "back to chat" path shrinks back to COMPACT.
         self._animate_width(POPUP_W)
 
@@ -7824,7 +7864,21 @@ class MainPopup(QWidget):
         self._chat.append_message(role, text)
 
     def refresh_conversations(self, active_id: str | None) -> None:
+        self._active_conversation_id = active_id
         self._convs.set_active(active_id)
+        self._apply_current_busy()
+
+    def set_conversation_busy(self, conv_id: str, busy: bool) -> None:
+        if not conv_id:
+            return
+        if busy:
+            self._busy_conversation_ids.add(conv_id)
+        else:
+            self._busy_conversation_ids.discard(conv_id)
+        self._apply_current_busy()
+
+    def show_conversation_busy_notice(self) -> None:
+        self._chat.show_notice(_ChatPage._BUSY_TEXT)
 
     def set_current_model(self, model_id: str | None) -> None:
         self._models.set_current(model_id)
@@ -7861,6 +7915,12 @@ class MainPopup(QWidget):
             tip_key = getattr(btn, "_tip_key", None)
             if tip_key:
                 btn.setToolTip(i18n.t(tip_key))
+
+    def _apply_current_busy(self) -> None:
+        active_id = self._active_conversation_id
+        self._chat.set_busy(
+            bool(active_id and active_id in self._busy_conversation_ids)
+        )
 
     def _on_nav_clicked(self, page_idx: int) -> None:
         with perf_timer(f"nav -> page {page_idx}"):
@@ -8144,6 +8204,19 @@ class MainPopup(QWidget):
             }
 
             /* Bottom nav (icons are painted by _NavButton) ───────────── */
+            QPushButton#sendBtn:disabled {
+                background: rgba(196, 181, 245, 0.18);
+                color: rgba(232, 230, 240, 0.35);
+            }
+            QLineEdit#chatInput:disabled {
+                color: rgba(232, 230, 240, 0.46);
+            }
+            QLabel#chatNotice {
+                color: rgba(232, 230, 240, 0.72);
+                font-size: 11px;
+                padding: 0 2px 2px 2px;
+            }
+
             QPushButton#navBtn {
                 background: transparent;
                 border: none;

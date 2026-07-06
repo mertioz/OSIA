@@ -644,6 +644,13 @@ _LOAD_CONV_AWAIT_TIMEOUT = 30.0
 # bounded — same pattern as ``_DETACHED_TURNS`` / ``_detached_done``.
 _DEFERRED_LOADS: set["asyncio.Task"] = set()
 
+# WOR-103: process-wide in-flight chat turns, keyed by conversation id.
+# ``streaming_tasks`` below is per WebSocket connection; this map is shared
+# across connected devices so a same-conversation race is rejected instead of
+# queued, while different conversations can still run concurrently.
+_ACTIVE_TURNS_BY_CONV: dict[str, "asyncio.Future"] = {}
+_CONVERSATION_BUSY_MESSAGE = "OSIA is still working in this conversation."
+
 
 # Sentinel pushed onto an _OutboundChannel to tell its writer task to stop.
 _WRITER_STOP = object()
@@ -744,6 +751,77 @@ async def _broadcast_conversations(exclude: "_OutboundChannel | None" = None) ->
 
 
 # ── MCP / Connectors server-side plumbing (WOR-44 Phase 4) ──────────────────
+def _conversation_busy_frame(conv_id: str) -> dict:
+    return {
+        "type": "conversation_busy",
+        "conversation_id": conv_id,
+        "message": _CONVERSATION_BUSY_MESSAGE,
+    }
+
+
+def _conversation_busy_changed_frame(conv_id: str, busy: bool) -> dict:
+    return {
+        "type": "conversation_busy_changed",
+        "conversation_id": conv_id,
+        "busy": bool(busy),
+    }
+
+
+def _active_conversation_busy_ids() -> list[str]:
+    busy: list[str] = []
+    for conv_id, task in list(_ACTIVE_TURNS_BY_CONV.items()):
+        if task.done():
+            _ACTIVE_TURNS_BY_CONV.pop(conv_id, None)
+            continue
+        busy.append(conv_id)
+    return busy
+
+
+def _is_conversation_busy(conv_id: str | None) -> bool:
+    if not conv_id:
+        return False
+    task = _ACTIVE_TURNS_BY_CONV.get(conv_id)
+    if task is None:
+        return False
+    if task.done():
+        _ACTIVE_TURNS_BY_CONV.pop(conv_id, None)
+        return False
+    return True
+
+
+def _claim_conversation_turn(conv_id: str, task: "asyncio.Future") -> bool:
+    if _is_conversation_busy(conv_id):
+        return False
+    _ACTIVE_TURNS_BY_CONV[conv_id] = task
+    return True
+
+
+def _clear_conversation_turn(
+    conv_id: str,
+    task: "asyncio.Future | None" = None,
+) -> bool:
+    current = _ACTIVE_TURNS_BY_CONV.get(conv_id)
+    if current is None:
+        return False
+    if task is not None and current is not task:
+        return False
+    _ACTIVE_TURNS_BY_CONV.pop(conv_id, None)
+    return True
+
+
+async def _send_conversation_busy(channel: "_OutboundChannel", conv_id: str) -> None:
+    await channel.send_json(_conversation_busy_frame(conv_id))
+
+
+async def _broadcast_conversation_busy_changed(conv_id: str, busy: bool) -> None:
+    frame = _conversation_busy_changed_frame(conv_id, busy)
+    for client in list(_WS_CLIENTS):
+        try:
+            await client.send_json(frame)
+        except Exception:
+            _WS_CLIENTS.discard(client)
+
+
 # Mobile mirrors the desktop GUI's connector controls through the WS handlers
 # (mcp_connect / mcp_disconnect / mcp_status, below). The server owns its OWN
 # process-wide MCPManager singleton (osia.mcp.get_manager) — distinct from the
@@ -3096,17 +3174,26 @@ async def websocket_endpoint(ws: WebSocket):
     def _spawn_turn(conv_id, make_coro):
         # conv_id is always a real id here (resolved via _ensure_active_conv
         # before spawning), so the task is keyed by it: a follow-up turn on
-        # the same conversation chains after this one, and delete/disconnect
-        # can find and cancel it.
+        # the same conversation is rejected before this function is called, and
+        # delete/disconnect can find and cancel it.
         prev = streaming_tasks.get(conv_id)
         task = asyncio.create_task(_run_turn(conv_id, prev, make_coro))
+        if not _claim_conversation_turn(conv_id, task):
+            task.cancel()
+            return False
         streaming_tasks[conv_id] = task
+        asyncio.create_task(_broadcast_conversation_busy_changed(conv_id, True))
 
         def _clear(t):
             if streaming_tasks.get(conv_id) is t:
                 streaming_tasks.pop(conv_id, None)
+            if _clear_conversation_turn(conv_id, t):
+                asyncio.create_task(
+                    _broadcast_conversation_busy_changed(conv_id, False)
+                )
 
         task.add_done_callback(_clear)
+        return True
 
     async def _deferred_load_history(conv_id, inflight):
         """Finish a ``load_conversation`` that hit a LIVE DETACHED turn — OFF the
@@ -3246,6 +3333,10 @@ async def websocket_endpoint(ws: WebSocket):
                         f"[WS] auth OK, sending: conversations "
                         f"({len(items)} items)"
                     )
+                    for _busy_id in _active_conversation_busy_ids():
+                        await ws.send_json(
+                            _conversation_busy_changed_frame(_busy_id, True)
+                        )
                     print("[OSIA Server] Mobile client authenticated.")
                     # Start the live system-metrics push for this client. The
                     # loop self-gates on heartbeat_enabled; guard against a
@@ -3456,6 +3547,8 @@ async def websocket_endpoint(ws: WebSocket):
                 # Cancel an in-flight stream for this conversation (if any) so
                 # it stops persisting to a file we're about to remove.
                 doomed = streaming_tasks.pop(conv_id, None)
+                if doomed is None:
+                    doomed = _ACTIVE_TURNS_BY_CONV.get(conv_id)
                 if doomed is not None:
                     doomed.cancel()
                 # Drop this conversation's reused agent (perf fix #3) so the
@@ -4548,6 +4641,9 @@ async def websocket_endpoint(ws: WebSocket):
 
             # --- File upload ---
             if msg_type == "file":
+                if _is_conversation_busy(active_conv_id):
+                    await _send_conversation_busy(out, active_conv_id)
+                    continue
                 filename = (msg.get("filename") or "upload.bin").strip()
                 b64_data = msg.get("data", "")
                 if not b64_data:
@@ -4602,6 +4698,9 @@ async def websocket_endpoint(ws: WebSocket):
                         # id (no synthetic placeholder, no duplicate-conv race).
                         _conv = await _ensure_active_conv(vision_content)
                         if _conv is not None:
+                            if _is_conversation_busy(_conv):
+                                await _send_conversation_busy(out, _conv)
+                                continue
                             _spawn_turn(
                                 _conv,
                                 lambda snap, _vc=vision_content, _c=_conv:
@@ -4629,9 +4728,12 @@ async def websocket_endpoint(ws: WebSocket):
                 # conversation synchronously (creating it on the first message)
                 # so the turn is keyed by a real id, then run the agent in its
                 # own task so the receive loop stays free.
-                user_text = _consume_pending_files(user_text, pending_files)
                 _conv = await _ensure_active_conv(user_text)
                 if _conv is not None:
+                    if _is_conversation_busy(_conv):
+                        await _send_conversation_busy(out, _conv)
+                        continue
+                    user_text = _consume_pending_files(user_text, pending_files)
                     _spawn_turn(
                         _conv,
                         lambda snap, _t=user_text, _c=_conv:
@@ -4648,8 +4750,6 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 # Snapshot + clear pending files at spawn time so they attach
                 # to THIS turn regardless of uploads that arrive during STT.
-                _pf = list(pending_files)
-                pending_files.clear()
                 # Resolve the conversation synchronously (default title; the
                 # transcript upgrades it on first persist) so concurrent first
                 # messages serialise into ONE conversation.
@@ -4660,6 +4760,11 @@ async def websocket_endpoint(ws: WebSocket):
                 # is harmless and reused by the next real message.
                 _conv = await _ensure_active_conv(None)
                 if _conv is not None:
+                    if _is_conversation_busy(_conv):
+                        await _send_conversation_busy(out, _conv)
+                        continue
+                    _pf = list(pending_files)
+                    pending_files.clear()
                     _spawn_turn(
                         _conv,
                         lambda snap, _b=b64_data, _f=audio_format, _c=_conv, _files=_pf:

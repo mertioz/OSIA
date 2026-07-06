@@ -531,8 +531,12 @@ def wake_mode():
         remote_models_signal = pyqtSignal(list)
         # Update the chat with a (role, text) pair from a worker thread.
         chat_message = pyqtSignal(str, str)
+        # Update the chat only if the popup is still viewing this conversation.
+        chat_message_for_conversation = pyqtSignal(str, str, str)
         # Drive the island's visual state from a worker thread.
         island_state = pyqtSignal(str)
+        # Per-conversation desktop busy state for the popup input controls.
+        conversation_busy_changed = pyqtSignal(str, bool)
         # Refresh the conversations panel (new active id) from a worker thread.
         conversations_changed = pyqtSignal(str)
         # Reset chat (agent + GUI) from a worker thread — "nouveau chat" voice
@@ -692,30 +696,74 @@ def wake_mode():
         print("⚠️  No wake model found. Using Ctrl+Space to trigger OSIA.")
         stop_hotkey = _start_ctrl_space_listener(on_wake)
 
-    # Serialises voice + text handling so two requests don't run in parallel.
+    # Serialises voice/cron/audio side effects. Typed chat turns are gated per
+    # conversation below so different conversations can run independently.
     handler_lock = threading.Lock()
+    busy_conversations: set[str] = set()
+    busy_lock = threading.Lock()
+
+    def _desktop_busy_message() -> str:
+        return "OSIA is still working in this conversation."
+
+    def _is_conversation_busy(conv_id: str | None) -> bool:
+        if not conv_id:
+            return False
+        with busy_lock:
+            return conv_id in busy_conversations
+
+    def _set_conversation_busy(conv_id: str | None, busy: bool) -> None:
+        if not conv_id:
+            return
+        with busy_lock:
+            if busy:
+                busy_conversations.add(conv_id)
+            else:
+                busy_conversations.discard(conv_id)
+            any_busy = bool(busy_conversations)
+        bridge.conversation_busy_changed.emit(conv_id, busy)
+        bridge.island_state.emit("thinking" if any_busy else "idle")
+
+    def _ensure_active_conversation(seed_text: str | None = None) -> dict:
+        nonlocal active_conv
+        if active_conv is not None:
+            return active_conv
+        title = (conversations.smart_title(seed_text)
+                 if isinstance(seed_text, str) and seed_text.strip()
+                 else None)
+        active_conv = conversations.create_conversation(title=title)
+        bridge.conversations_changed.emit(active_conv["id"])
+        print(f"New conversation: {active_conv['id']}")
+        return active_conv
+
+    def _history_for_conversation(conv_id: str) -> list[dict]:
+        conv = conversations.get_conversation(conv_id)
+        return list((conv or {}).get("messages") or [])
 
     # ── Agent run helpers ────────────────────────────────────────────────
 
-    def _run_agent(user_text: str, *, voice_response: bool) -> None:
+    def _run_agent(
+        user_text: str,
+        conv_id: str,
+        history: list[dict],
+        *,
+        voice_response: bool,
+    ) -> None:
         """Run the agent in the current thread, persist + mirror the result.
 
-        Caller must hold ``handler_lock`` and have already echoed the
+        Caller has already marked ``conv_id`` busy and echoed the
         user's text into the popup. ``voice_response`` controls whether
         sentences are streamed to TTS as they arrive.
         """
         nonlocal active_conv
+        turn_agent = OSIAAgent()
+        selected_model = load_settings().get("selected_model")
+        if selected_model:
+            try:
+                turn_agent.set_model(selected_model)
+            except Exception as e:
+                print(f"[DEBUG] set_model({selected_model!r}) failed: {e}")
 
-        # No active conversation (fresh start, or the last one was deleted)
-        # — this first message creates it. Panel refresh goes through the
-        # bridge: this runs on a worker thread, never touch Qt directly.
-        if active_conv is None:
-            active_conv = conversations.create_conversation()
-            bridge.conversations_changed.emit(active_conv["id"])
-            print(f"🆕 New conversation: {active_conv['id']}")
-
-        prev_history_len = len(agent.messages) - 1  # skip system prompt
-        bridge.island_state.emit("thinking")
+        prev_history_len = len(history)
 
         def on_first_token(*_a, **_kw):
             if voice_response:
@@ -734,8 +782,9 @@ def wake_mode():
                     "[TTS] main.wake_mode: TTS disabled for this turn (text-only)",
                     flush=True,
                 )
-            reply = agent.run(
+            reply = turn_agent.run(
                 user_text,
+                history=history,
                 on_sentence=on_sentence,
                 on_first_token=on_first_token,
             )
@@ -745,20 +794,23 @@ def wake_mode():
                     f"({len(reply or '')} chars) — sentences were streamed during the run",
                     flush=True,
                 )
-            _persist_agent_delta(
-                active_conv["id"], agent, prev_history_len,
-            )
+            _persist_agent_delta(conv_id, turn_agent, prev_history_len)
             display = clean_response(reply or "")
             if display:
-                bridge.chat_message.emit("assistant", display)
+                bridge.chat_message_for_conversation.emit(
+                    conv_id, "assistant", display
+                )
         except Exception as e:
             err = f"Error: {e}"
-            bridge.chat_message.emit("assistant", err)
+            bridge.chat_message_for_conversation.emit(conv_id, "assistant", err)
             if voice_response:
                 print(f"[TTS] main.wake_mode: speaking error message: {err[:80]!r}", flush=True)
                 threading.Thread(target=lambda: speak(err), daemon=True).start()
         finally:
-            bridge.island_state.emit("idle")
+            _set_conversation_busy(conv_id, False)
+            bridge.conversations_changed.emit(
+                active_conv["id"] if active_conv else ""
+            )
 
     # ── Wake handler (voice path) ────────────────────────────────────────
 
@@ -825,8 +877,17 @@ def wake_mode():
                     speak(i18n.t("conversations.new_chat_confirm"))
                     bridge.island_state.emit("idle")
                     return
-                bridge.chat_message.emit("user", user_text)
-                _run_agent(user_text, voice_response=True)
+                conv = _ensure_active_conversation(user_text)
+                conv_id = conv["id"]
+                if _is_conversation_busy(conv_id):
+                    bridge.island_state.emit("speaking")
+                    speak(_desktop_busy_message())
+                    bridge.island_state.emit("idle")
+                    return
+                history = _history_for_conversation(conv_id)
+                _set_conversation_busy(conv_id, True)
+                bridge.chat_message_for_conversation.emit(conv_id, "user", user_text)
+                _run_agent(user_text, conv_id, history, voice_response=True)
             finally:
                 handler_lock.release()
 
@@ -835,17 +896,19 @@ def wake_mode():
     # ── Text handler (typed message in popup) ────────────────────────────
 
     def handle_send_text(text: str):
-        if not handler_lock.acquire(blocking=False):
-            print("⚠️  Send fired while a handler is running — ignored.")
+        conv = _ensure_active_conversation(text)
+        conv_id = conv["id"]
+        if _is_conversation_busy(conv_id):
+            popup.show_conversation_busy_notice()
+            print("Send fired while this conversation is busy; rejected.")
             return
         tts_stop()
-        bridge.chat_message.emit("user", text)
+        history = _history_for_conversation(conv_id)
+        _set_conversation_busy(conv_id, True)
+        bridge.chat_message_for_conversation.emit(conv_id, "user", text)
 
         def process():
-            try:
-                _run_agent(text, voice_response=False)
-            finally:
-                handler_lock.release()
+            _run_agent(text, conv_id, history, voice_response=False)
 
         threading.Thread(target=process, daemon=True).start()
 
@@ -853,6 +916,13 @@ def wake_mode():
 
     def handle_chat_message(role: str, text: str):
         popup.append_message(role, text)
+
+    def handle_chat_message_for_conversation(conv_id: str, role: str, text: str):
+        if active_conv and active_conv.get("id") == conv_id:
+            popup.append_message(role, text)
+
+    def handle_conversation_busy_changed(conv_id: str, busy: bool):
+        popup.set_conversation_busy(conv_id, busy)
 
     def handle_island_state(state: str):
         island.set_state(state)
@@ -903,6 +973,7 @@ def wake_mode():
 
     def handle_delete_conversation(conv_id: str):
         nonlocal active_conv
+        _set_conversation_busy(conv_id, False)
         ok = conversations.delete_conversation(conv_id)
         print(f"🗑  Deleted conversation {conv_id}: {'ok' if ok else 'not found'}")
         if active_conv and conv_id == active_conv.get("id"):
@@ -958,7 +1029,9 @@ def wake_mode():
 
     bridge.wake_detected.connect(handle_wake)
     bridge.chat_message.connect(handle_chat_message)
+    bridge.chat_message_for_conversation.connect(handle_chat_message_for_conversation)
     bridge.island_state.connect(handle_island_state)
+    bridge.conversation_busy_changed.connect(handle_conversation_busy_changed)
     bridge.autonomous_progress.connect(handle_autonomous_progress)
     bridge.remote_models_signal.connect(handle_remote_models)
     bridge.conversations_changed.connect(popup.refresh_conversations)
