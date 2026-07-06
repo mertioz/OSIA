@@ -593,11 +593,14 @@ def clean_response(text: str) -> str:
 # Tool implementations
 # ---------------------------------------------------------------------------
 
-DEFAULT_BASH_TIMEOUT_SECONDS = 30
-# Slow install/download/clone commands get a much larger time budget than the
-# default so a slow machine never reports a false timeout while the work is
-# still in progress (WOR-31). Both the command's own timeout AND the agent's
-# wall-clock tool budget (see ``_tool_timeout_seconds``) are raised for these.
+DEFAULT_BASH_TIMEOUT_SECONDS = 300
+# The executor gets a small grace window beyond the command timeout so
+# ``tool_bash`` can return its own precise timeout message before the generic
+# future timeout fires.
+COMMAND_EXECUTOR_GRACE_SECONDS = 10
+# Slow install/download/clone commands still use the long-running polling path
+# so a chatty installer cannot deadlock on a full pipe buffer while OSIA waits
+# up to the command timeout (WOR-31).
 LONG_RUNNING_TIMEOUT_SECONDS = 300
 # Install/download/clone keywords. Word-boundaried so a substring inside an
 # unrelated word (e.g. "adapter" containing "apt") never triggers the extended
@@ -623,7 +626,70 @@ def _is_long_running_command(command: str) -> bool:
     return any(p.search(command) for p in _LONG_RUNNING_PATTERNS)
 
 
-def tool_bash(command: str) -> str:
+def _command_timeout_seconds(timeout=None) -> float:
+    """Return the effective shell-command timeout in seconds.
+
+    The default is 300 s. Explicit shorter per-call timeouts are preserved; a
+    larger requested timeout is capped at the default command ceiling.
+    """
+    if timeout is None:
+        return float(DEFAULT_BASH_TIMEOUT_SECONDS)
+    try:
+        requested = float(timeout)
+    except (TypeError, ValueError):
+        raise ValueError("timeout must be a positive number of seconds")
+    if requested <= 0:
+        raise ValueError("timeout must be a positive number of seconds")
+    return min(requested, float(DEFAULT_BASH_TIMEOUT_SECONDS))
+
+
+def _format_timeout_seconds(timeout_s: float) -> str:
+    return f"{timeout_s:g}"
+
+
+def _write_windows_powershell_script(command: str) -> str:
+    fd, path = tempfile.mkstemp(prefix="osia_cmd_", suffix=".ps1")
+    with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as f:
+        f.write(command)
+    return path
+
+
+def _windows_powershell_file_args(script_path: str) -> list[str]:
+    return [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        script_path,
+    ]
+
+
+def _cleanup_temp_powershell_script(script_path: str | None) -> None:
+    if not script_path:
+        return
+    try:
+        os.remove(script_path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _run_windows_powershell(command: str, timeout_s: float) -> subprocess.CompletedProcess:
+    """Run PowerShell from a temp .ps1 so shell metacharacters survive intact."""
+    script_path = _write_windows_powershell_script(command)
+    try:
+        return subprocess.run(
+            _windows_powershell_file_args(script_path),
+            capture_output=True, text=True,
+            timeout=timeout_s, cwd=_PROJECT_DIR,
+        )
+    finally:
+        _cleanup_temp_powershell_script(script_path)
+
+
+def tool_bash(command: str, timeout=None) -> str:
     """Execute a bash command and return stdout + stderr (truncated).
 
     On Windows the command is run in PowerShell (not bash/sh), so use
@@ -631,23 +697,24 @@ def tool_bash(command: str) -> str:
 
     Install/download/clone commands (``pip install``, ``npm install``,
     ``apt``, ``dnf install``, ``wget``, ``curl -O``, ``git clone``) are
-    detected as long-running: they get a 300 s budget instead of 30 s and the
+    detected as long-running: they get a 300 s budget and the
     result reports how long the command actually took, so a slow install is
     waited out instead of failing blindly (WOR-31).
     """
+    try:
+        timeout_s = _command_timeout_seconds(timeout)
+    except ValueError as e:
+        return f"ERROR: {e}"
+
     if not _is_long_running_command(command):
         # Fast path: short commands keep the simple, proven blocking run.
         try:
             if sys.platform == "win32":
-                result = subprocess.run(
-                    ["powershell.exe", "-NoProfile", "-Command", command],
-                    capture_output=True, text=True,
-                    timeout=DEFAULT_BASH_TIMEOUT_SECONDS, cwd=_PROJECT_DIR,
-                )
+                result = _run_windows_powershell(command, timeout_s)
             else:
                 result = subprocess.run(
                     command, shell=True, capture_output=True, text=True,
-                    timeout=DEFAULT_BASH_TIMEOUT_SECONDS, cwd=_PROJECT_DIR,
+                    timeout=timeout_s, cwd=_PROJECT_DIR,
                 )
             out = result.stdout.strip()
             err = result.stderr.strip()
@@ -659,7 +726,7 @@ def tool_bash(command: str) -> str:
                 return f"STDERR:\n{err}"
             return "(no output)"
         except subprocess.TimeoutExpired:
-            return f"ERROR: command timed out after {DEFAULT_BASH_TIMEOUT_SECONDS}s"
+            return f"ERROR: command timed out after {_format_timeout_seconds(timeout_s)}s"
         except Exception as e:
             return f"ERROR: {e}"
 
@@ -673,10 +740,12 @@ def tool_bash(command: str) -> str:
         err_f = tempfile.TemporaryFile()
     except Exception as e:
         return f"ERROR: {e}"
+    script_path = None
     try:
         if sys.platform == "win32":
+            script_path = _write_windows_powershell_script(command)
             proc = subprocess.Popen(
-                ["powershell.exe", "-NoProfile", "-Command", command],
+                _windows_powershell_file_args(script_path),
                 stdout=out_f, stderr=err_f, cwd=_PROJECT_DIR,
             )
         else:
@@ -692,10 +761,11 @@ def tool_bash(command: str) -> str:
     except Exception as e:
         out_f.close()
         err_f.close()
+        _cleanup_temp_powershell_script(script_path)
         return f"ERROR: {e}"
     done, elapsed = wait_and_verify(
         lambda: proc.poll() is not None,
-        timeout_s=LONG_RUNNING_TIMEOUT_SECONDS,
+        timeout_s=timeout_s,
         poll_interval_s=1.0,
         description=f"bash: {command[:60]}",
     )
@@ -712,8 +782,9 @@ def tool_bash(command: str) -> str:
             pass
         out_f.close()
         err_f.close()
+        _cleanup_temp_powershell_script(script_path)
         return (
-            f"ERROR: command timed out after {LONG_RUNNING_TIMEOUT_SECONDS}s "
+            f"ERROR: command timed out after {_format_timeout_seconds(timeout_s)}s "
             f"(elapsed {elapsed:.1f}s, still running — killed)"
         )
     try:
@@ -724,6 +795,7 @@ def tool_bash(command: str) -> str:
     finally:
         out_f.close()
         err_f.close()
+        _cleanup_temp_powershell_script(script_path)
     suffix = f"\n\n[completed in {elapsed:.1f}s, exit code {proc.returncode}]"
     if out and err:
         return f"STDOUT:\n{out}\n\nSTDERR:\n{err}{suffix}"
@@ -1290,9 +1362,9 @@ def tool_delete_file(path: str) -> str:
         return f"ERROR: deleting {path}: {e}"
 
 
-def tool_run_command(command: str) -> str:
+def tool_run_command(command: str, timeout=None) -> str:
     """Run a bash command and return its output. Alias for bash."""
-    return tool_bash(command)
+    return tool_bash(command, timeout=timeout)
 
 
 def _screenshot_is_blank(path: str) -> bool:
@@ -3016,13 +3088,13 @@ def _is_tool_error(result) -> bool:
 
 
 def _tool_timeout_seconds(tool_name: str, kwargs: dict) -> float:
-    """Wall-clock budget for ONE tool execution in the executor. Slow
-    install/download/clone shell commands get the extended budget plus a small
-    grace so ``tool_bash``'s own timeout message fires before the executor's
-    generic one (WOR-31); ``desktop_click`` gets 120 s because it makes up to
-    three vision API calls (coarse locate + crop refinement + verification) and
-    each can traverse several key rotations when keys are rate-limited; every
-    other tool keeps the default 30 s.
+    """Wall-clock budget for ONE tool execution in the executor. Shell commands
+    get a 300 s default budget plus a small grace so ``tool_bash`` can return
+    its own timeout message before the executor's generic one; caller-supplied
+    shorter shell timeouts are preserved. ``desktop_click`` gets 120 s because
+    it makes up to three vision API calls (coarse locate + crop refinement +
+    verification) and each can traverse several key rotations when keys are
+    rate-limited; every other tool keeps the default 30 s.
     """
     # WOR-44 Phase 5 (5-conf-a): MCP tools may block on a confirmation prompt.
     if tool_name.startswith("mcp__"):
@@ -3030,16 +3102,21 @@ def _tool_timeout_seconds(tool_name: str, kwargs: dict) -> float:
     if tool_name in _GMAIL_WRITE_TOOL_NAMES:
         return _GMAIL_CONFIRM_TOOL_TIMEOUT
     if tool_name in ("bash", "run_command"):
-        if _is_long_running_command(kwargs.get("command", "") or ""):
-            return LONG_RUNNING_TIMEOUT_SECONDS + 30
+        try:
+            return (
+                _command_timeout_seconds(kwargs.get("timeout"))
+                + COMMAND_EXECUTOR_GRACE_SECONDS
+            )
+        except ValueError:
+            return DEFAULT_BASH_TIMEOUT_SECONDS + COMMAND_EXECUTOR_GRACE_SECONDS
     if tool_name == "desktop_click":
         return 120
     return TOOL_TIMEOUT_SECONDS
 
 
 def _execute_tool_once(tool_name: str, kwargs: dict, timeout_s: float | None = None):
-    """Run one tool with a wall-clock timeout (default 30 s; longer for
-    install/download/clone commands — see ``_tool_timeout_seconds``). Returns
+    """Run one tool with a wall-clock timeout (default 30 s; shell commands use
+    the command timeout plus grace — see ``_tool_timeout_seconds``). Returns
     the result (a string, or a ``{"text", "screenshot"}`` dict for navigation
     tools), or a clear [ERREUR] line on timeout/exception so the model can read
     the failure back and report it honestly. Submitting through a
@@ -3083,6 +3160,8 @@ def _execute_tool_with_retry(tool_name: str, kwargs: dict):
     result = _execute_tool_once(tool_name, kwargs, timeout_s=timeout_s)
     # Slow install/download/clone commands are NOT auto-retried: an immediate
     # identical retry would just double an already-long wait (WOR-31).
+    # Shell timeout results are also not retried: a retry would silently double
+    # the explicit/default command timeout while rerunning the same command.
     # ``desktop_click`` is also NOT auto-retried: a blind retry doubles the
     # (already long) wait and can double-click. Fast tools keep the
     # retry-once-on-error behavior.
@@ -3093,12 +3172,18 @@ def _execute_tool_with_retry(tool_name: str, kwargs: dict):
     # frequently non-idempotent (send/create/delete), so retrying a call that
     # errored AFTER its side effect landed would double it. The model still sees
     # the error result and can deliberately re-issue the call if appropriate.
+    shell_command = tool_name in ("bash", "run_command")
     long_running = (
-        tool_name in ("bash", "run_command")
+        shell_command
         and _is_long_running_command(kwargs.get("command", "") or "")
+    )
+    shell_timed_out = (
+        shell_command
+        and "timed out after" in _result_text(result).lower()
     )
     no_retry = (
         long_running
+        or shell_timed_out
         or tool_name == "desktop_click"
         or tool_name.startswith("mcp__")
         or tool_name in _GMAIL_WRITE_TOOL_NAMES
