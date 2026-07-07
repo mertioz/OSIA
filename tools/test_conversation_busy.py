@@ -171,6 +171,29 @@ class ConversationBusyTests(unittest.IsolatedAsyncioTestCase):
         )
         turn.cancel()
 
+    async def test_turn_progress_loop_sends_correlated_keepalive(self):
+        client = _FakeChannel()
+        meta = {
+            "conversation_id": "conv-long",
+            "client_request_id": "req-long",
+            "turn_id": "turn-long",
+            "persisted": True,
+        }
+
+        task = asyncio.create_task(
+            server._turn_progress_loop(client, meta, interval=0.01)
+        )
+        await asyncio.sleep(0.025)
+        await server._cancel_turn_progress_task(task)
+
+        self.assertGreaterEqual(len(client.frames), 1)
+        frame = client.frames[0]
+        self.assertEqual(frame["type"], "turn_status")
+        self.assertEqual(frame["status"], "working")
+        self.assertEqual(frame["conversation_id"], "conv-long")
+        self.assertEqual(frame["client_request_id"], "req-long")
+        self.assertEqual(frame["turn_id"], "turn-long")
+
     def test_accepted_user_message_persists_with_request_metadata(self):
         old_dir = server.conversations.CONVERSATIONS_DIR
         with tempfile.TemporaryDirectory() as tmp:

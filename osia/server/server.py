@@ -660,6 +660,7 @@ _ACTIVE_CONV_BY_REQUEST: dict[str, str] = {}
 _CONVERSATION_BUSY_MESSAGE = "OSIA is still working in this conversation."
 _TURN_ID_PREFIX = "turn-"
 _CLIENT_REQUEST_ID_MAX = 128
+_TURN_PROGRESS_INTERVAL_SECONDS = 10.0
 
 
 # Sentinel pushed onto an _OutboundChannel to tell its writer task to stop.
@@ -693,6 +694,9 @@ class _OutboundChannel:
 
     async def send_json(self, obj) -> None:
         await self._queue.put(("json", obj))
+
+    def send_json_nowait(self, obj) -> None:
+        self._queue.put_nowait(("json", obj))
 
     async def send_text(self, text: str) -> None:
         await self._queue.put(("text", text))
@@ -937,6 +941,34 @@ def _turn_status_frame(turn_meta: dict, status: str) -> dict:
     frame["type"] = "turn_status"
     frame["status"] = status
     return frame
+
+
+async def _turn_progress_loop(
+    channel: "_OutboundChannel",
+    turn_meta: dict | None,
+    *,
+    interval: float = _TURN_PROGRESS_INTERVAL_SECONDS,
+) -> None:
+    if not isinstance(turn_meta, dict):
+        return
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            await channel.send_json(_turn_status_frame(turn_meta, "working"))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[OSIA Server] turn progress loop stopped: {e}")
+
+
+async def _cancel_turn_progress_task(task: "asyncio.Task | None") -> None:
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 async def _send_existing_turn_status(
@@ -3590,6 +3622,12 @@ async def websocket_endpoint(ws: WebSocket):
             task.cancel()
             return False
         streaming_tasks[conv_id] = task
+        if isinstance(turn_meta, dict):
+            out.send_json_nowait(_turn_accepted_frame(turn_meta))
+            out.send_json_nowait(_turn_status_frame(turn_meta, "working"))
+            out.send_json_nowait(
+                _conversation_busy_changed_frame(conv_id, True, turn_meta)
+            )
         asyncio.create_task(
             _broadcast_conversation_busy_changed(conv_id, True, turn_meta)
         )
@@ -5575,6 +5613,11 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # Track everything we've actually streamed to the client so we can
     # detect a missing tail at the end of the run.
     sent_chunks: list[str] = []
+    progress_task: asyncio.Task | None = (
+        asyncio.create_task(_turn_progress_loop(ws, turn_meta))
+        if isinstance(turn_meta, dict)
+        else None
+    )
 
     def on_first_token() -> None:
         # Called from the agent worker thread the moment the first
@@ -5695,6 +5738,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
 
         # Off-thread so the event loop stays free to flush response_chunks.
         response_text = await asyncio.to_thread(_run_agent_busy_tracked)
+        await _cancel_turn_progress_task(progress_task)
+        progress_task = None
         print(
             f"[DEBUG] agent.run() returned: {repr((response_text or '')[:200])}",
             flush=True,
@@ -5705,6 +5750,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         # uncancellable and keeps feeding chunk_queue, so reap the child
         # sender task explicitly here — `except Exception` below does NOT
         # catch CancelledError — then propagate the cancellation.
+        await _cancel_turn_progress_task(progress_task)
+        progress_task = None
         sender_task.cancel()
         try:
             await sender_task
@@ -5712,6 +5759,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             pass
         raise
     except Exception as e:
+        await _cancel_turn_progress_task(progress_task)
+        progress_task = None
         print(f"[OSIA Server] Agent error: {e}")
         traceback.print_exc()
         # Drain any in-flight puts and shut the sender down cleanly.
