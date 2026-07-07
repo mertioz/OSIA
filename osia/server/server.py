@@ -2261,6 +2261,27 @@ def _ws_confirm_provider(server_id: str, tool_name: str, summary: str) -> bool |
 
 
 @app.on_event("startup")
+async def _start_server_cron_manager() -> None:
+    """Start the server-side cron owner when this process holds the cron lock."""
+
+    global _SERVER_CRON_MANAGER, _SERVER_CRON_UNSUBSCRIBE, _SERVER_CRON_LOOP
+    _SERVER_CRON_LOOP = asyncio.get_running_loop()
+    try:
+        from osia import scheduled_tasks
+        from osia.cron import CronManager
+
+        manager = CronManager(
+            _server_run_cron_task,
+            notify_task=_server_notify_cron_task,
+        )
+        _SERVER_CRON_MANAGER = manager
+        _SERVER_CRON_UNSUBSCRIBE = scheduled_tasks.add_change_callback(manager.wake)
+        manager.start()
+    except Exception as e:
+        print(f"[OSIA Server CRON] scheduler startup skipped: {e}")
+
+
+@app.on_event("startup")
 async def _register_mcp_confirm_provider() -> None:
     """WOR-44 Phase 5 (5-conf-c): register the SERVER's WS confirmation provider
     so a write/destructive MCP tool prompts the ORIGINATING mobile client before
@@ -2546,6 +2567,113 @@ def _agent_needs_model_apply(agent, selected_model: str) -> bool:
     if getattr(agent, "_active_base_url", None) != getattr(agent, "_primary_base_url", None):
         return True                       # a prior turn fell back to the secondary endpoint
     return False
+
+
+_SERVER_CRON_MANAGER = None
+_SERVER_CRON_UNSUBSCRIBE = None
+_SERVER_CRON_AGENT = None
+_SERVER_CRON_LOOP = None
+
+
+def _server_run_cron_task(
+    task_text: str,
+    conversation_id: str | None = None,
+    model: dict | None = None,
+) -> dict:
+    """Run one scheduled task from the background mobile server process."""
+
+    global _SERVER_CRON_AGENT
+    from osia.agent import OSIAAgent, clean_response
+    from osia.config import load_settings
+
+    if _SERVER_CRON_AGENT is None:
+        _SERVER_CRON_AGENT = OSIAAgent()
+    agent = _SERVER_CRON_AGENT
+    model_meta = model if isinstance(model, dict) else {}
+    selected_model = (
+        model_meta.get("id") or load_settings().get("selected_model") or ""
+    )
+    provider = model_meta.get("provider") or None
+    if selected_model:
+        try:
+            agent.set_model(selected_model, provider=provider)
+        except Exception as e:
+            print(f"[OSIA Server CRON] set_model({selected_model!r}) failed: {e}")
+
+    conversation_stale = False
+    conv = conversations.get_conversation(conversation_id) if conversation_id else None
+    if conversation_id and conv is None:
+        conversation_stale = True
+        print(
+            f"[OSIA Server CRON] linked conversation {conversation_id} not found; "
+            "running task without conversation persistence"
+        )
+    try:
+        agent._disable_hierarchy_for_turn = True
+        if conv is not None:
+            history = conv.get("messages") or []
+            reply = agent.run(
+                task_text,
+                history=history,
+                current_conversation_id=conversation_id,
+            )
+            display = clean_response(reply or "")
+            conversations.add_message(conversation_id, "user", task_text)
+            conversations.add_message(conversation_id, "assistant", display)
+            try:
+                loop = _SERVER_CRON_LOOP
+                if loop is not None:
+                    asyncio.run_coroutine_threadsafe(_broadcast_conversations(), loop)
+            except Exception:
+                pass
+        else:
+            agent.reset()
+            reply = agent.run(task_text)
+            display = clean_response(reply or "")
+        if conversation_stale:
+            return {
+                "status": "completed",
+                "conversation_stale": True,
+                "message": "linked conversation not found; ran unlinked",
+            }
+        return {"status": "completed"}
+    except Exception as e:
+        print(f"[OSIA Server CRON] task error: {e}")
+        traceback.print_exc()
+        return {"status": "failed", "message": str(e)}
+    finally:
+        agent._disable_hierarchy_for_turn = False
+
+
+def _server_notify_cron_task(
+    *,
+    task_id: str | None,
+    title: str | None,
+    status: str,
+    conversation_id: str | None,
+) -> None:
+    from osia.notifications import notify, safe_task_title
+
+    safe_title = safe_task_title(title)
+    if status == "failed":
+        body = f"Tâche planifiée échouée: {safe_title}"
+    else:
+        body = f"Tâche planifiée terminée: {safe_title}"
+    notify("OSIA", body)
+    frame = _cron_notification_frame({
+        "task_id": task_id,
+        "title": safe_title,
+        "status": status,
+        "conversation_id": conversation_id,
+    })
+    _remember_cron_notification(frame)
+    loop = _SERVER_CRON_LOOP
+    if loop is None:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_broadcast_cron_notification(frame), loop)
+    except Exception as e:
+        print(f"[OSIA Server CRON] notification broadcast failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -3208,6 +3336,19 @@ def _autonomous_resume_worker(my_gen: int) -> None:
 async def _stop_autonomous_on_shutdown() -> None:
     """Server cleanup: stop the autonomous loop (safe if never started) and
     release the single-runner slot so a restart isn't wrongly seen as busy."""
+    global _SERVER_CRON_MANAGER, _SERVER_CRON_UNSUBSCRIBE
+    if _SERVER_CRON_UNSUBSCRIBE is not None:
+        try:
+            _SERVER_CRON_UNSUBSCRIBE()
+        except Exception:
+            pass
+        _SERVER_CRON_UNSUBSCRIBE = None
+    if _SERVER_CRON_MANAGER is not None:
+        try:
+            _SERVER_CRON_MANAGER.stop()
+        except Exception as e:
+            print(f"[OSIA Server CRON] stop on shutdown failed: {e}")
+        _SERVER_CRON_MANAGER = None
     orch = _autonomous.get("orch")
     if orch is not None:
         try:
@@ -3239,6 +3380,7 @@ async def websocket_endpoint(ws: WebSocket):
     # worker-thread provider reads the right (channel, loop). Each connection has
     # its own context, so a confirm never reaches the wrong device.
     _turn_target.set((out, asyncio.get_running_loop()))
+    unsubscribe_scheduled_tasks = None
     try:
         from osia import scheduled_tasks as _scheduled_tasks
 
@@ -3253,7 +3395,9 @@ async def websocket_endpoint(ws: WebSocket):
             except Exception as e:
                 print(f"[OSIA Server] scheduled-task config broadcast failed: {e}")
 
-        _scheduled_tasks.set_change_callback(_scheduled_tasks_changed)
+        unsubscribe_scheduled_tasks = _scheduled_tasks.add_change_callback(
+            _scheduled_tasks_changed
+        )
     except Exception as e:
         print(f"[OSIA Server] scheduled-task broadcast hook unavailable: {e}")
     # Per-session state.
@@ -5101,6 +5245,11 @@ async def websocket_endpoint(ws: WebSocket):
         # Drop this client from the broadcast registry (WOR-10). discard() is
         # a no-op if it was never added (e.g. auth failed).
         _WS_CLIENTS.discard(out)
+        if unsubscribe_scheduled_tasks is not None:
+            try:
+                unsubscribe_scheduled_tasks()
+            except Exception:
+                pass
         # WOR-44 Phase 5 (5-conf-c): deny + drop any MCP confirmation still pending
         # for THIS connection so a blocked agent worker thread (a detached turn's
         # write tool awaiting approval) wakes immediately with a deny instead of

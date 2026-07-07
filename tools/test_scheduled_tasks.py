@@ -123,6 +123,77 @@ def test_create_daily_once_and_day_interval():
         check("three jobs persisted", len(store["cron_jobs"]) == 3)
 
 
+def test_natural_schedule_parsing_and_next_run():
+    now = datetime(2026, 7, 6, 15, 4)
+    with in_memory_cron_jobs() as store:
+        soon = scheduled_tasks.create_scheduled_task(
+            title="Soon",
+            instruction="Do soon",
+            schedule="dans 2 minutes",
+            now=now,
+        )
+        check("natural once ok", soon["ok"] is True)
+        check("natural once schedule", soon["job"]["schedule"] == "once:2026-07-06T15:06")
+        check("natural once next", soon["job"]["next_run_at"] == "2026-07-06T15:06")
+
+        daily = scheduled_tasks.create_scheduled_task(
+            title="Daily FR",
+            instruction="Do daily",
+            schedule="tous les jours à 15h06",
+            now=now,
+        )
+        check("natural daily ok", daily["ok"] is True)
+        check("natural daily schedule", daily["job"]["schedule"] == "at 15:06")
+        check("natural daily next today", daily["job"]["next_run_at"] == "2026-07-06T15:06")
+
+        day_at = scheduled_tasks.create_scheduled_task(
+            title="Every 3 days FR",
+            instruction="Do day interval",
+            schedule="tous les 3 jours à 20h",
+            now=now,
+        )
+        check("natural day interval ok", day_at["ok"] is True)
+        check("natural day interval schedule", day_at["job"]["schedule"] == "every 3 days at 20:00")
+        check("natural jobs persisted", len(store["cron_jobs"]) == 3)
+
+
+def test_daily_next_run_ahead_and_passed():
+    ahead = scheduled_tasks.next_run_at_for_schedule(
+        "at 15:06",
+        now=datetime(2026, 7, 6, 15, 4),
+    )
+    passed = scheduled_tasks.next_run_at_for_schedule(
+        "at 15:06",
+        now=datetime(2026, 7, 6, 15, 7),
+    )
+    check("daily next run ahead today", ahead == "2026-07-06T15:06")
+    check("daily next run passed tomorrow", passed == "2026-07-07T15:06")
+
+
+def test_interval_next_runs():
+    now = datetime(2026, 7, 6, 12, 0)
+    check(
+        "every minutes next",
+        scheduled_tasks.next_run_at_for_schedule("every 5 minutes", now=now)
+        == "2026-07-06T12:05",
+    )
+    check(
+        "every hours next",
+        scheduled_tasks.next_run_at_for_schedule("every 2 hours", now=now)
+        == "2026-07-06T14:00",
+    )
+    check(
+        "every days next",
+        scheduled_tasks.next_run_at_for_schedule("every 2 days", now=now)
+        == "2026-07-08T12:00",
+    )
+    check(
+        "every days at next today",
+        scheduled_tasks.next_run_at_for_schedule("every 2 days at 20:00", now=now)
+        == "2026-07-06T20:00",
+    )
+
+
 def test_rejections():
     now = datetime(2026, 7, 6, 12, 0)
     with in_memory_cron_jobs():
@@ -264,6 +335,72 @@ def test_list_update_delete_and_legacy_upgrade():
         check("deleted from store", store["cron_jobs"] == [])
 
 
+def test_change_callbacks_for_chat_and_settings_paths():
+    calls = []
+    with in_memory_cron_jobs() as store:
+        unsubscribe = scheduled_tasks.add_change_callback(lambda: calls.append("wake"))
+        try:
+            created = scheduled_tasks.create_scheduled_task(
+                title="Wake chat",
+                instruction="Do wake",
+                schedule={"type": "daily", "time": "17:00"},
+                now=datetime(2026, 7, 6, 12, 0),
+            )
+            check("chat path create ok", created["ok"] is True)
+            check("chat path callback", len(calls) == 1)
+
+            replaced = scheduled_tasks.replace_scheduled_tasks_from_settings(
+                store["cron_jobs"],
+                source_default="mobile_settings",
+            )
+            check("settings path replace ok", replaced["ok"] is True)
+            check("settings path callback", len(calls) == 2)
+        finally:
+            unsubscribe()
+
+
+def test_per_task_model_resolution():
+    now = datetime(2026, 7, 6, 12, 0)
+    with in_memory_cron_jobs():
+        defaulted = scheduled_tasks.create_scheduled_task(
+            title="Default model",
+            instruction="Do model",
+            schedule={"type": "daily", "time": "18:00"},
+            active_model={"provider": "openai", "id": "gpt-5.5"},
+            now=now,
+        )
+        check("default model create ok", defaulted["ok"] is True)
+        check("default model stored", defaulted["job"]["model"]["id"] == "gpt-5.5")
+
+        explicit = scheduled_tasks.create_scheduled_task(
+            title="Explicit model",
+            instruction="Do opus",
+            schedule={"type": "daily", "time": "18:00"},
+            model_query="opus 4.8",
+            now=now,
+        )
+        check("explicit model create ok", explicit["ok"] is True)
+        check("explicit model provider", explicit["job"]["model"]["provider"] == "anthropic")
+
+        missing = scheduled_tasks.create_scheduled_task(
+            title="Missing model",
+            instruction="Do missing",
+            schedule={"type": "daily", "time": "18:00"},
+            model_query="definitely-not-a-real-model",
+            now=now,
+        )
+        check("missing model rejected", missing["code"] == scheduled_tasks.ERROR_MODEL_NOT_FOUND)
+
+        ambiguous = scheduled_tasks.create_scheduled_task(
+            title="Ambiguous model",
+            instruction="Do ambiguous",
+            schedule={"type": "daily", "time": "18:00"},
+            model_query="gpt",
+            now=now,
+        )
+        check("ambiguous model rejected", ambiguous["code"] == scheduled_tasks.ERROR_MODEL_AMBIGUOUS)
+
+
 def test_cron_parser_extension():
     spec = parse_schedule("every 3 days at 20:00")
     check("parser day interval kind", spec["kind"] == "day_interval_at")
@@ -304,13 +441,80 @@ def test_cron_notification_callback_and_status():
         check("cron job status updated", store["cron_jobs"][0]["last_status"] == "completed")
 
 
+def test_cron_daily_next_run_prevents_poll_miss():
+    fired = []
+    created_at = datetime(2026, 7, 6, 15, 5)
+    job = {
+        "id": "cron_test_daily",
+        "title": "Daily exact",
+        "task": "Do exact",
+        "schedule": "at 15:06",
+        "enabled": True,
+        "created_at": created_at.isoformat(timespec="minutes"),
+        "next_run_at": "2026-07-06T15:06",
+        "next_run_schedule": "at 15:06",
+    }
+    with in_memory_cron_runtime([job]) as store:
+        manager = CronManager(lambda task, conv, model=None: fired.append((task, conv, model)))
+        manager._check_jobs(datetime(2026, 7, 6, 15, 6, 10))
+        deadline = time.time() + 2.0
+        while not fired and time.time() < deadline:
+            time.sleep(0.02)
+        check("daily fires after first late poll", len(fired) == 1)
+        check("daily next run tomorrow", store["cron_jobs"][0]["next_run_at"] == "2026-07-07T15:06")
+
+
+def test_cron_passes_model_and_legacy_without_model_runs():
+    fired = []
+    with_model = {
+        "id": "cron_test_model",
+        "title": "With model",
+        "task": "Do model",
+        "schedule": "once:2026-07-06T12:00",
+        "enabled": True,
+        "next_run_at": "2026-07-06T12:00",
+        "model": {"provider": "openai", "id": "gpt-5.5", "label": "GPT-5.5"},
+    }
+    with in_memory_cron_runtime([with_model]):
+        manager = CronManager(lambda task, conv, model=None: fired.append((task, model)))
+        manager._check_jobs(datetime(2026, 7, 6, 12, 0))
+        deadline = time.time() + 2.0
+        while len(fired) < 1 and time.time() < deadline:
+            time.sleep(0.02)
+        check("model task fired", fired[0][1]["id"] == "gpt-5.5")
+
+    fired.clear()
+    legacy = {
+        "id": "cron_test_legacy",
+        "title": "Legacy",
+        "task": "Do legacy",
+        "schedule": "once:2026-07-06T12:00",
+        "enabled": True,
+        "next_run_at": "2026-07-06T12:00",
+    }
+    with in_memory_cron_runtime([legacy]):
+        manager = CronManager(lambda task, conv, model=None: fired.append((task, model)))
+        manager._check_jobs(datetime(2026, 7, 6, 12, 0))
+        deadline = time.time() + 2.0
+        while len(fired) < 1 and time.time() < deadline:
+            time.sleep(0.02)
+        check("legacy task fired without model", fired[0][1] is None)
+
+
 def main():
     test_create_daily_once_and_day_interval()
+    test_natural_schedule_parsing_and_next_run()
+    test_daily_next_run_ahead_and_passed()
+    test_interval_next_runs()
     test_rejections()
     test_conversation_resolution_for_chat_tools()
     test_list_update_delete_and_legacy_upgrade()
+    test_change_callbacks_for_chat_and_settings_paths()
+    test_per_task_model_resolution()
     test_cron_parser_extension()
     test_cron_notification_callback_and_status()
+    test_cron_daily_next_run_prevents_poll_miss()
+    test_cron_passes_model_and_legacy_without_model_runs()
     print("scheduled task tests passed")
 
 

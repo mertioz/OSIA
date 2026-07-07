@@ -3455,6 +3455,8 @@ class _SettingsPanel(QWidget):
             self._render_cron()
 
     def _persist_cron(self) -> None:
+        from osia import scheduled_tasks
+
         clean = []
         for job in self._cron_jobs:
             entry = dict(job)
@@ -3465,7 +3467,17 @@ class _SettingsPanel(QWidget):
                 "conversation_id": job.get("conversation_id") or None,
             })
             clean.append(entry)
-        set_setting("cron_jobs", clean)
+        result = scheduled_tasks.replace_scheduled_tasks_from_settings(
+            clean,
+            source_default="settings",
+        )
+        if result.get("ok"):
+            self._cron_jobs = result.get("jobs", clean)
+        else:
+            print(
+                "[CRON] settings write rejected: "
+                f"{result.get('code')}: {result.get('message')}"
+            )
 
     # ── Heartbeat / system monitoring (Bloc 5) ──────────────────────────────
     # Master toggle + collapsible body: an interval field and one row per

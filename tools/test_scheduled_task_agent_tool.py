@@ -141,6 +141,10 @@ def test_run_turn_scheduled_task_dispatch_has_module_alias():
             "run turn default conversation",
             store["cron_jobs"][0]["conversation_id"] == conv["id"],
         )
+        check(
+            "run turn default model snapshot",
+            store["cron_jobs"][0]["model"]["id"] == "test-model",
+        )
 
 
 def test_explicit_conversation_title_tool_arg():
@@ -168,10 +172,34 @@ def test_explicit_conversation_title_tool_arg():
         check("missing explicit target code", bad["code"] == "conversation_not_found")
 
 
+def test_explicit_model_tool_arg():
+    with in_memory_cron_jobs() as store:
+        raw = agent.tool_create_scheduled_task(
+            title="Model task",
+            instruction="Do X",
+            schedule={"type": "daily", "time": "17:00"},
+            model_query="opus 4.8",
+        )
+        result = json.loads(raw)
+        check("explicit model wrapper ok", result["ok"] is True)
+        check("explicit model wrapper stored", store["cron_jobs"][0]["model"]["id"] == "claude-opus-4-8")
+
+        bad_raw = agent.tool_create_scheduled_task(
+            title="Missing model",
+            instruction="Do Y",
+            schedule={"type": "daily", "time": "17:00"},
+            model_query="not a real model",
+        )
+        bad = json.loads(bad_raw)
+        check("missing model wrapper rejected", bad["ok"] is False)
+        check("missing model wrapper code", bad["code"] == "model_not_found")
+
+
 def main():
     test_agent_tool_wrappers_return_structured_results()
     test_run_turn_scheduled_task_dispatch_has_module_alias()
     test_explicit_conversation_title_tool_arg()
+    test_explicit_model_tool_arg()
     print("scheduled task agent tool tests passed")
 
 

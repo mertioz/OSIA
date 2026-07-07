@@ -553,6 +553,7 @@ def wake_mode():
     )
     from osia.agent import clean_response
     from osia import i18n
+    from osia import scheduled_tasks
     from osia.config import load_settings, set_setting
     from osia.models import discover_models_async
     from osia.cron import CronManager
@@ -1127,7 +1128,11 @@ def wake_mode():
     except Exception as e:
         print(f"[CRON] could not preset model {initial_model!r}: {e}")
 
-    def run_cron_task(task_text: str, conversation_id: str | None = None) -> dict:
+    def run_cron_task(
+        task_text: str,
+        conversation_id: str | None = None,
+        model: dict | None = None,
+    ) -> dict:
         if not handler_lock.acquire(timeout=120):
             print(f"[CRON] busy — scheduled task skipped: {task_text[:60]}")
             return {
@@ -1137,12 +1142,15 @@ def wake_mode():
         conversation_stale = False
         try:
             tts_stop()
-            sel = load_settings().get("selected_model")
+            model_meta = model if isinstance(model, dict) else {}
+            sel = (model_meta.get("id") or load_settings().get("selected_model") or "")
+            provider = model_meta.get("provider") or None
             if sel:
                 try:
-                    cron_agent.set_model(sel)
+                    cron_agent.set_model(sel, provider=provider)
                 except Exception as e:
                     print(f"[CRON] set_model({sel!r}) failed: {e}")
+            cron_agent._disable_hierarchy_for_turn = True
             # Linked conversation (optional): load its history so context
             # carries across scheduled runs, and append this run's exchange so
             # the next run sees it. With none linked, each run is a fresh,
@@ -1179,8 +1187,6 @@ def wake_mode():
                     bridge.conversations_changed.emit(
                         active_conv["id"] if active_conv else ""
                     )
-                elif not conversation_stale:
-                    bridge.chat_message.emit("assistant", f"⏰ {display}")
                 speak(display)
             if conversation_stale:
                 return {
@@ -1193,6 +1199,7 @@ def wake_mode():
             print(f"[CRON] task error: {e}")
             return {"status": "failed", "message": str(e)}
         finally:
+            cron_agent._disable_hierarchy_for_turn = False
             bridge.island_state.emit("idle")
             handler_lock.release()
 
@@ -1219,9 +1226,9 @@ def wake_mode():
 
         safe_title = safe_task_title(title)
         if status == "failed":
-            body = f"Scheduled task failed: {safe_title}"
+            body = f"Tâche planifiée échouée: {safe_title}"
         else:
-            body = f"Scheduled task completed: {safe_title}"
+            body = f"Tâche planifiée terminée: {safe_title}"
         notify("OSIA", body)
         _notify_mobile_cron_notification(
             task_id=task_id,
@@ -1231,6 +1238,7 @@ def wake_mode():
         )
 
     cron_manager = CronManager(run_cron_task, notify_task=notify_cron_task)
+    unsubscribe_cron_wake = scheduled_tasks.add_change_callback(cron_manager.wake)
     heartbeat_monitor = HeartbeatMonitor(heartbeat_alert)
     cron_manager.start()
     heartbeat_monitor.start()
@@ -1358,6 +1366,7 @@ def wake_mode():
     def on_quit():
         # Stop the Bloc 5 background threads cleanly before the app tears down.
         cron_manager.stop()
+        unsubscribe_cron_wake()
         heartbeat_monitor.stop()
         # WOR-45 Phase 4 — stop the autonomous loop too (safe if never started).
         orchestrator.stop()

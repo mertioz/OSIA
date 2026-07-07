@@ -30,11 +30,13 @@ All log lines are prefixed ``[CRON]``.
 """
 
 import re
+import sys
 import threading
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Callable
 
-from osia.config import get_setting, set_setting
+from osia.config import CONFIG_DIR, get_setting, set_setting
 
 # How often the scheduler wakes to re-evaluate the job list. 20s keeps
 # "at HH:MM" jobs accurate to within one tick while staying cheap.
@@ -123,7 +125,11 @@ def parse_schedule(spec: str) -> dict | None:
 
 def _job_signature(job: dict) -> tuple:
     """Stable identity for a job slot, used to detect in-place edits."""
-    return (str(job.get("task", "")), str(job.get("schedule", "")))
+    return (
+        str(job.get("task", "")),
+        str(job.get("schedule", "")),
+        str(job.get("next_run_at", "")),
+    )
 
 
 def _parse_job_datetime(value) -> datetime | None:
@@ -174,6 +180,8 @@ class CronManager:
         self._tick = max(1.0, float(tick_seconds))
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._lock_handle = None
         # index -> {"sig": tuple, "last_run": datetime|None, "last_date": date|None}
         self._state: dict[int, dict] = {}
         # True while a fired task is still executing — prevents a long task
@@ -186,7 +194,11 @@ class CronManager:
         """Start the scheduler thread (idempotent)."""
         if self._thread and self._thread.is_alive():
             return
+        if not self._acquire_owner_lock():
+            print("[CRON] scheduler not started; another process owns cron")
+            return
         self._stop.clear()
+        self._wake.clear()
         self._thread = threading.Thread(
             target=self._loop, name="osia-cron", daemon=True
         )
@@ -196,11 +208,84 @@ class CronManager:
     def stop(self, timeout: float = 2.0) -> None:
         """Signal the scheduler to stop and wait briefly for it to exit."""
         self._stop.set()
+        self._wake.set()
         t = self._thread
         if t and t.is_alive():
             t.join(timeout=timeout)
         self._thread = None
+        self._release_owner_lock()
         print("[CRON] scheduler stopped")
+
+    def wake(self) -> None:
+        """Wake the scheduler so settings changes are observed immediately."""
+
+        self._wake.set()
+
+    def _acquire_owner_lock(self) -> bool:
+        if self._lock_handle is not None:
+            return True
+        lock_path = Path(CONFIG_DIR) / "cron.lock"
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(lock_path, "a+b")
+            try:
+                fh.seek(0)
+                if not fh.read(1):
+                    fh.write(b"0")
+                    fh.flush()
+                fh.seek(0)
+            except Exception:
+                pass
+            if sys.platform == "win32":
+                import msvcrt
+
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    fh.close()
+                    return False
+            else:
+                import fcntl
+
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    fh.close()
+                    return False
+            try:
+                fh.seek(0)
+                fh.truncate()
+                fh.write(str(threading.get_ident()).encode("ascii", "ignore"))
+                fh.flush()
+            except Exception:
+                pass
+            self._lock_handle = fh
+            return True
+        except Exception as e:
+            print(f"[CRON] owner lock unavailable: {e}")
+            return True
+
+    def _release_owner_lock(self) -> None:
+        fh = self._lock_handle
+        self._lock_handle = None
+        if fh is None:
+            return
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            fh.close()
+        except Exception:
+            pass
 
     # ── Main loop ─────────────────────────────────────────────────────────
 
@@ -210,9 +295,8 @@ class CronManager:
                 self._check_jobs(datetime.now())
             except Exception as e:  # never let a bad job kill the scheduler
                 print(f"[CRON] tick error: {e}")
-            # Event.wait returns early (True) when stop() is called, so the
-            # thread shuts down promptly instead of sleeping out the tick.
-            self._stop.wait(self._tick)
+            self._wake.wait(self._tick)
+            self._wake.clear()
 
     def _check_jobs(self, now: datetime) -> None:
         jobs = get_setting("cron_jobs", []) or []
@@ -248,14 +332,14 @@ class CronManager:
                     job.get("task", ""), job.get("schedule", ""), st, now,
                     conversation_id=job.get("conversation_id"),
                     job_index=idx, signature=sig, task_id=job.get("id"),
-                    title=job.get("title"))
+                    title=job.get("title"), model=job.get("model"))
                 # A one-shot job runs exactly once: as soon as it actually
                 # launches, flag it in-memory (so it never re-fires this
                 # session even if the persist below fails) and disable it on
                 # disk so it stays off across restarts.
                 if launched and spec["kind"] == "once":
                     st["once_fired"] = True
-                    self._disable_once_job(idx, sig)
+                    self._disable_once_job(idx, sig, job.get("id"))
 
         # Drop state for slots that no longer exist (jobs were removed).
         for stale in [i for i in self._state if i not in seen_indices]:
@@ -275,7 +359,10 @@ class CronManager:
             "last_run": now,
             "last_date": None,
             "anchor_date": _job_anchor_date(job, now),
+            "next_run": _parse_job_datetime(job.get("next_run_at")),
         }
+        if st["next_run"] is not None:
+            return st
         spec = parse_schedule(job.get("schedule", ""))
         if spec and spec["kind"] == "daily":
             scheduled = now.replace(
@@ -298,6 +385,9 @@ class CronManager:
 
     @staticmethod
     def _is_due(spec: dict, st: dict, now: datetime) -> bool:
+        next_run = st.get("next_run")
+        if next_run is not None:
+            return now >= next_run
         if spec["kind"] == "interval":
             last = st.get("last_run")
             if last is None:
@@ -338,7 +428,7 @@ class CronManager:
     def _fire(self, task: str, schedule: str, st: dict, now: datetime,
               conversation_id: str | None = None, job_index: int | None = None,
               signature: tuple | None = None, task_id: str | None = None,
-              title: str | None = None) -> bool:
+              title: str | None = None, model: dict | None = None) -> bool:
         """Launch a job's task on a worker thread.
 
         Returns ``True`` when the task was actually launched (timing state
@@ -356,6 +446,7 @@ class CronManager:
         if self._busy.is_set():
             print(f"[CRON] busy — deferring '{task[:60]}' to the next tick")
             return False
+        self._busy.set()
 
         # Commit the timing state only now that we are actually launching. The
         # scheduler loop is single-threaded, so this completes before any later
@@ -364,21 +455,29 @@ class CronManager:
         st["last_date"] = now.date()
         st["anchor_date"] = now.date()
         st.pop("pending_due_date", None)
+        next_run_at = self._next_run_after(schedule, now)
+        st["next_run"] = _parse_job_datetime(next_run_at)
         self._update_job_status(
             job_index, signature, task_id,
             last_run_at=now.astimezone().isoformat(timespec="seconds"),
             last_status="running",
+            next_run_at=next_run_at,
+            next_run_schedule=schedule,
         )
 
         print(f"[CRON] firing scheduled task ({schedule}): {task[:80]}")
 
         def _worker():
-            self._busy.set()
             status = "completed"
             job_status = "completed"
             last_error = ""
             try:
-                result = self._run_task(task, conversation_id)
+                try:
+                    result = self._run_task(task, conversation_id, model=model)
+                except TypeError as exc:
+                    if "model" not in str(exc):
+                        raise
+                    result = self._run_task(task, conversation_id)
                 if isinstance(result, dict):
                     raw_status = str(result.get("status") or "").strip().lower()
                     if raw_status in {"failed", "error"}:
@@ -411,6 +510,18 @@ class CronManager:
         threading.Thread(target=_worker, name="osia-cron-task", daemon=True).start()
         return True
 
+    @staticmethod
+    def _next_run_after(schedule: str, now: datetime) -> str | None:
+        try:
+            from osia.scheduled_tasks import next_run_at_for_schedule
+
+            spec = parse_schedule(schedule)
+            if spec and spec.get("kind") == "once":
+                return None
+            return next_run_at_for_schedule(schedule, after=now)
+        except Exception:
+            return None
+
     def _notify_completion(
         self,
         *,
@@ -432,7 +543,12 @@ class CronManager:
         except Exception as e:
             print(f"[CRON] notification callback failed: {e}")
 
-    def _disable_once_job(self, idx: int, sig: tuple) -> None:
+    def _disable_once_job(
+        self,
+        idx: int,
+        sig: tuple,
+        task_id: str | None = None,
+    ) -> None:
         """Persist ``enabled: false`` for the one-shot job at ``idx`` so it does
         not fire again after a restart. Matches on signature so a concurrent
         reorder/edit in the GUI never disables the wrong row."""
@@ -441,9 +557,17 @@ class CronManager:
             if not isinstance(jobs, list) or not (0 <= idx < len(jobs)):
                 return
             job = jobs[idx]
-            if not isinstance(job, dict) or _job_signature(job) != sig:
+            if not isinstance(job, dict):
+                return
+            if task_id:
+                matched = str(job.get("id") or "") == str(task_id)
+            else:
+                matched = _job_signature(job) == sig
+            if not matched:
                 return
             job["enabled"] = False
+            job["next_run_at"] = None
+            job["next_run_schedule"] = job.get("schedule")
             set_setting("cron_jobs", jobs)
             print(f"[CRON] one-shot complete — disabled: "
                   f"{str(job.get('task', ''))[:60]}")

@@ -13,7 +13,8 @@ import json
 import re
 import secrets
 import time
-from datetime import datetime
+import unicodedata
+from datetime import datetime, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -28,12 +29,15 @@ ERROR_UNSUPPORTED = "unsupported_schedule"
 ERROR_STORAGE = "storage_error"
 ERROR_CONVERSATION_NOT_FOUND = "conversation_not_found"
 ERROR_CONVERSATION_AMBIGUOUS = "conversation_ambiguous"
+ERROR_MODEL_NOT_FOUND = "model_not_found"
+ERROR_MODEL_AMBIGUOUS = "model_ambiguous"
 
 _TASK_ID_RE = re.compile(r"^cron_[A-Za-z0-9_-]{8,}$")
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 _DAY_NAMES = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
 _SUPPORTED_SOURCES = {"chat", "settings", "mobile_settings"}
 _CHANGE_CALLBACK: Callable[[], None] | None = None
+_CHANGE_CALLBACKS: list[Callable[[], None]] = []
 
 _UNSAFE_MARKUP_RE = re.compile(
     r"<\s*/?\s*(?:tool_call|tool_result|tool_code|think|thinking|system|developer)\b",
@@ -57,20 +61,41 @@ class ScheduledTaskError(Exception):
 
 
 def set_change_callback(callback: Callable[[], None] | None) -> None:
-    """Register a best-effort notification hook for config refresh broadcasts."""
+    """Replace change hooks.
+
+    Kept for older tests/call sites. Runtime code should prefer
+    add_change_callback() so the scheduler wake hook and mobile config
+    broadcast hook can coexist.
+    """
 
     global _CHANGE_CALLBACK
+    _CHANGE_CALLBACKS.clear()
     _CHANGE_CALLBACK = callback
+    if callback is not None:
+        _CHANGE_CALLBACKS.append(callback)
+
+
+def add_change_callback(callback: Callable[[], None]) -> Callable[[], None]:
+    """Register one best-effort change hook and return an unsubscribe function."""
+
+    if callback not in _CHANGE_CALLBACKS:
+        _CHANGE_CALLBACKS.append(callback)
+
+    def _unsubscribe() -> None:
+        try:
+            _CHANGE_CALLBACKS.remove(callback)
+        except ValueError:
+            pass
+
+    return _unsubscribe
 
 
 def _notify_changed() -> None:
-    callback = _CHANGE_CALLBACK
-    if callback is None:
-        return
-    try:
-        callback()
-    except Exception as exc:
-        print(f"[SCHEDULED_TASKS] change callback failed: {exc}")
+    for callback in list(_CHANGE_CALLBACKS):
+        try:
+            callback()
+        except Exception as exc:
+            print(f"[SCHEDULED_TASKS] change callback failed: {exc}")
 
 
 def _now() -> datetime:
@@ -107,6 +132,98 @@ def _time_parts(value: Any) -> tuple[int, int]:
 def _format_time(value: Any) -> str:
     hour, minute = _time_parts(value)
     return f"{hour:02d}:{minute:02d}"
+
+
+def _fold_text(value: Any) -> str:
+    text = str(value or "").strip().casefold()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _time_from_phrase(hour: str, minute: str | None = None) -> str:
+    h = int(hour)
+    m = int(minute or 0)
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ScheduledTaskError(
+            ERROR_VALIDATION,
+            "time must be a valid 24-hour HH:MM value",
+        )
+    return f"{h:02d}:{m:02d}"
+
+
+def _schedule_object_from_text(text: Any, *, now: datetime) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    folded = _fold_text(raw)
+    if not folded:
+        raise ScheduledTaskError(ERROR_VALIDATION, "schedule is required")
+
+    # Canonical strings emitted by the desktop/mobile settings editors.
+    m = re.match(r"^once:(\d{4}-\d{2}-\d{2}t\d{1,2}:\d{2})$", folded)
+    if m:
+        return {"type": "once", "run_at": m.group(1).replace("t", "T")}
+    m = re.match(r"^(?:at\s+)?([01]?\d|2[0-3]):([0-5]\d)$", folded)
+    if m:
+        return {"type": "daily", "time": _time_from_phrase(m.group(1), m.group(2))}
+    m = re.match(
+        r"^every\s+(\d+)\s*days?\s+at\s+([01]?\d|2[0-3]):([0-5]\d)$",
+        folded,
+    )
+    if m:
+        return {
+            "type": "interval",
+            "every": int(m.group(1)),
+            "unit": "days",
+            "time": _time_from_phrase(m.group(2), m.group(3)),
+        }
+    m = re.match(r"^every\s+(\d+)\s*(minute|hour|day)s?$", folded)
+    if m:
+        return {"type": "interval", "every": int(m.group(1)), "unit": m.group(2)}
+
+    # French/English natural reminders used by chat-created tasks.
+    m = re.search(
+        r"\b(?:dans|in)\s+(\d+)\s+"
+        r"(minutes?|mins?|heures?|hours?|jours?|days?)\b",
+        folded,
+    )
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit.startswith(("minute", "min")):
+            delta = timedelta(minutes=n)
+        elif unit.startswith(("heure", "hour")):
+            delta = timedelta(hours=n)
+        else:
+            delta = timedelta(days=n)
+        run_at = (now + delta).replace(second=0, microsecond=0)
+        return {"type": "once", "run_at": run_at.isoformat(timespec="minutes")}
+
+    time_pattern = r"([01]?\d|2[0-3])\s*(?:h|:)\s*([0-5]\d)?"
+    m = re.search(
+        r"\b(?:tous les|chaque|every)\s+(\d+)\s+"
+        r"(?:jours?|days?)\s+(?:a|at)?\s*" + time_pattern,
+        folded,
+    )
+    if m:
+        return {
+            "type": "interval",
+            "every": int(m.group(1)),
+            "unit": "days",
+            "time": _time_from_phrase(m.group(2), m.group(3)),
+        }
+
+    m = re.search(
+        r"\b(?:tous les jours|chaque jour|every day|daily)\s+"
+        r"(?:a|at)?\s*" + time_pattern,
+        folded,
+    )
+    if m:
+        return {"type": "daily", "time": _time_from_phrase(m.group(1), m.group(2))}
+
+    raise ScheduledTaskError(
+        ERROR_VALIDATION,
+        "schedule could not be parsed; use once, daily, or every N minutes/hours/days",
+    )
 
 
 def _parse_run_at(value: Any) -> datetime:
@@ -176,9 +293,11 @@ def _positive_int(value: Any, field: str) -> int:
 def normalize_schedule(schedule: Any, *, now: datetime | None = None) -> tuple[str, str]:
     """Return ``(canonical_schedule, timezone)`` after backend validation."""
 
+    current = (now or _now()).replace(second=0, microsecond=0)
+    if isinstance(schedule, str):
+        schedule = _schedule_object_from_text(schedule, now=current)
     if not isinstance(schedule, dict):
         raise ScheduledTaskError(ERROR_VALIDATION, "schedule must be an object")
-    current = (now or _now()).replace(second=0, microsecond=0)
     schedule_type = str(schedule.get("type") or "").strip().lower()
     if not schedule_type:
         raise ScheduledTaskError(ERROR_VALIDATION, "schedule.type is required")
@@ -244,6 +363,212 @@ def normalize_schedule(schedule: Any, *, now: datetime | None = None) -> tuple[s
         ERROR_UNSUPPORTED,
         "schedule.type must be once, daily, interval, weekly, or cron",
     )
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt.replace(second=0, microsecond=0)
+
+
+def next_run_at_for_schedule(
+    canonical_schedule: str,
+    *,
+    now: datetime | None = None,
+    after: datetime | None = None,
+) -> str | None:
+    """Return the next local run time for a canonical cron schedule."""
+
+    from osia.cron import parse_schedule
+
+    current = (after or now or _now()).replace(second=0, microsecond=0)
+    spec = parse_schedule(canonical_schedule)
+    if spec is None:
+        return None
+    if spec["kind"] == "once":
+        return spec["dt"].isoformat(timespec="minutes")
+    if spec["kind"] == "interval":
+        return (current + timedelta(seconds=spec["seconds"])).isoformat(
+            timespec="minutes"
+        )
+    if spec["kind"] == "daily":
+        candidate = current.replace(
+            hour=spec["hour"], minute=spec["minute"], second=0, microsecond=0
+        )
+        if candidate <= current:
+            candidate += timedelta(days=1)
+        return candidate.isoformat(timespec="minutes")
+    if spec["kind"] == "day_interval_at":
+        candidate = current.replace(
+            hour=spec["hour"], minute=spec["minute"], second=0, microsecond=0
+        )
+        if candidate <= current:
+            candidate += timedelta(days=spec["days"])
+        return candidate.isoformat(timespec="minutes")
+    return None
+
+
+def _model_match_text(*parts: Any) -> str:
+    return " ".join(_fold_text(part) for part in parts if str(part or "").strip())
+
+
+def _model_metadata_from_match(match: dict[str, Any]) -> dict[str, str]:
+    return {
+        "provider": str(match.get("provider") or "").strip(),
+        "id": str(match.get("id") or "").strip(),
+        "label": str(match.get("label") or match.get("id") or "").strip(),
+    }
+
+
+def _model_registry_snapshot() -> tuple[list[dict[str, Any]], Callable[[str], str]]:
+    try:
+        from osia.models import get_all_models, provider_for_model
+
+        return get_all_models(), provider_for_model
+    except Exception:
+        fallback_models = [
+            {"id": "claude-opus-4-8", "label": "Claude Opus 4.8", "provider": "anthropic"},
+            {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "provider": "anthropic"},
+            {"id": "gpt-5.5", "label": "GPT-5.5", "provider": "openai"},
+            {"id": "gpt-5.4", "label": "GPT-5.4", "provider": "openai"},
+            {"id": "gpt-4.1-mini", "label": "GPT-4.1 Mini", "provider": "openai"},
+            {"id": "deepseek-v4-pro", "label": "DeepSeek V4 Pro", "provider": "deepseek"},
+            {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash", "provider": "google"},
+        ]
+
+        def _provider_for_model(model_id: str) -> str:
+            lower = str(model_id or "").lower()
+            for item in fallback_models:
+                if item["id"] == model_id:
+                    return item["provider"]
+            if "claude" in lower:
+                return "anthropic"
+            if "gpt" in lower:
+                return "openai"
+            if "deepseek" in lower:
+                return "deepseek"
+            if "gemini" in lower:
+                return "google"
+            return "ollama"
+
+        return fallback_models, _provider_for_model
+
+
+def _resolve_model_metadata(
+    *,
+    model: Any = None,
+    model_id: Any = None,
+    model_provider: Any = None,
+    model_query: Any = None,
+    default_model: Any = None,
+    explicit: bool = False,
+) -> dict[str, str] | None:
+    raw_id = str(model_id or "").strip()
+    raw_provider = str(model_provider or "").strip()
+    raw_query = str(model_query or "").strip()
+
+    if isinstance(model, dict):
+        raw_id = raw_id or str(
+            model.get("id") or model.get("model") or model.get("model_id") or ""
+        ).strip()
+        raw_provider = raw_provider or str(
+            model.get("provider") or model.get("model_provider") or ""
+        ).strip()
+        raw_query = raw_query or str(model.get("query") or model.get("label") or "").strip()
+    elif model not in (None, ""):
+        raw_query = raw_query or str(model).strip()
+
+    if not explicit and not (raw_id or raw_provider or raw_query):
+        if isinstance(default_model, dict):
+            raw_id = str(default_model.get("id") or default_model.get("model") or "").strip()
+            raw_provider = str(default_model.get("provider") or "").strip()
+        elif default_model not in (None, ""):
+            raw_id = str(default_model).strip()
+    if not (raw_id or raw_provider or raw_query):
+        return None
+
+    models, provider_for_model = _model_registry_snapshot()
+    candidates = [
+        m for m in models
+        if isinstance(m, dict)
+        and str(m.get("id") or "").strip()
+        and (not raw_provider or str(m.get("provider") or "").strip() == raw_provider)
+    ]
+
+    if raw_id:
+        exact = [m for m in candidates if str(m.get("id") or "") == raw_id]
+        if len(exact) == 1:
+            return _model_metadata_from_match(exact[0])
+        if len(exact) > 1:
+            raise ScheduledTaskError(
+                ERROR_MODEL_AMBIGUOUS,
+                "model id matches more than one provider",
+                candidates=[_model_metadata_from_match(m) for m in exact[:8]],
+            )
+        if not raw_provider and not explicit:
+            provider = provider_for_model(raw_id)
+            return {"provider": provider, "id": raw_id, "label": raw_id}
+
+    query = raw_query or raw_id
+    folded_query = _fold_text(query)
+    if folded_query:
+        query_tokens = [t for t in re.split(r"\W+", folded_query) if t]
+        matches = []
+        for m in candidates:
+            haystack = _model_match_text(
+                m.get("provider"), m.get("id"), m.get("label"), m.get("name")
+            )
+            if all(token in haystack for token in query_tokens):
+                matches.append(m)
+        exact_label = [
+            m for m in matches
+            if folded_query in {
+                _fold_text(m.get("id")),
+                _fold_text(m.get("label")),
+                _fold_text(m.get("name")),
+            }
+        ]
+        if len(exact_label) == 1:
+            return _model_metadata_from_match(exact_label[0])
+        if len(matches) == 1:
+            return _model_metadata_from_match(matches[0])
+        if len(matches) > 1:
+            raise ScheduledTaskError(
+                ERROR_MODEL_AMBIGUOUS,
+                "model request is ambiguous; specify the provider or full model name",
+                candidates=[_model_metadata_from_match(m) for m in matches[:8]],
+            )
+
+    if explicit:
+        raise ScheduledTaskError(
+            ERROR_MODEL_NOT_FOUND,
+            "requested model was not found",
+        )
+    if raw_id:
+        provider = raw_provider or provider_for_model(raw_id)
+        return {"provider": provider, "id": raw_id, "label": raw_id}
+    return None
+
+
+def _normalize_model_field(job: dict[str, Any]) -> tuple[dict[str, str] | None, bool]:
+    if "model" not in job and not (job.get("model_id") or job.get("model_provider")):
+        return None, False
+    try:
+        meta = _resolve_model_metadata(
+            model=job.get("model"),
+            model_id=job.get("model_id"),
+            model_provider=job.get("model_provider"),
+            explicit=False,
+        )
+    except ScheduledTaskError:
+        return None, True
+    return meta, job.get("model") != meta
 
 
 def _reject_unsafe_text(title: str, instruction: str) -> None:
@@ -384,6 +709,28 @@ def _normalize_existing_job(
     if "last_status" not in clean:
         clean["last_status"] = None
         changed = True
+    model_meta, model_changed = _normalize_model_field(clean)
+    if model_changed:
+        if model_meta:
+            clean["model"] = model_meta
+        else:
+            clean.pop("model", None)
+        changed = True
+    next_run_dt = _parse_dt(clean.get("next_run_at"))
+    schedule_marker = str(clean.get("next_run_schedule") or "")
+    should_recompute_next = (
+        not next_run_dt
+        or schedule_marker != schedule
+        or (touch and bool(clean.get("enabled")) and next_run_dt < _now())
+    )
+    if should_recompute_next:
+        next_run = next_run_at_for_schedule(schedule)
+        if clean.get("next_run_at") != next_run:
+            clean["next_run_at"] = next_run
+            changed = True
+        if clean.get("next_run_schedule") != schedule:
+            clean["next_run_schedule"] = schedule
+            changed = True
     return clean, changed
 
 
@@ -425,6 +772,11 @@ def create_scheduled_task(
     conversation_title: str | None = None,
     conversation_query: str | None = None,
     source: str = "chat",
+    model: Any = None,
+    model_id: str | None = None,
+    model_provider: str | None = None,
+    model_query: str | None = None,
+    active_model: Any = None,
     now: datetime | None = None,
     **_extra: Any,
 ) -> dict[str, Any]:
@@ -435,6 +787,18 @@ def create_scheduled_task(
             raise ScheduledTaskError(ERROR_VALIDATION, "instruction is required")
         _reject_unsafe_text(clean_title, task_text)
         canonical, timezone_name = normalize_schedule(schedule, now=now)
+        explicit_model = any(
+            str(value or "").strip()
+            for value in (model, model_id, model_provider, model_query)
+        )
+        model_meta = _resolve_model_metadata(
+            model=model,
+            model_id=model_id,
+            model_provider=model_provider,
+            model_query=model_query,
+            default_model=active_model,
+            explicit=explicit_model,
+        )
         clean_source = source if source in _SUPPORTED_SOURCES else "chat"
         clean_conversation_id = conversation_id or None
         resolved_conversation_title = None
@@ -458,7 +822,11 @@ def create_scheduled_task(
             "updated_at": created_at,
             "last_run_at": None,
             "last_status": None,
+            "next_run_at": next_run_at_for_schedule(canonical, now=now),
+            "next_run_schedule": canonical,
         }
+        if model_meta:
+            job["model"] = model_meta
         if resolved_conversation_title:
             job["conversation_title"] = resolved_conversation_title
         jobs = _load_normalized_jobs()
@@ -497,6 +865,10 @@ def update_scheduled_task(
     conversation_title: str | None = None,
     conversation_query: str | None = None,
     source: str | None = None,
+    model: Any = None,
+    model_id: str | None = None,
+    model_provider: str | None = None,
+    model_query: str | None = None,
     now: datetime | None = None,
     **_extra: Any,
 ) -> dict[str, Any]:
@@ -524,8 +896,29 @@ def update_scheduled_task(
             canonical, timezone_name = normalize_schedule(schedule, now=now)
             job["schedule"] = canonical
             job["timezone"] = timezone_name
+            job["next_run_at"] = next_run_at_for_schedule(canonical, now=now)
+            job["next_run_schedule"] = canonical
         if enabled is not None:
             job["enabled"] = bool(enabled)
+            if bool(enabled) and _parse_dt(job.get("next_run_at")) is None:
+                job["next_run_at"] = next_run_at_for_schedule(
+                    str(job.get("schedule") or ""), now=now
+                )
+                job["next_run_schedule"] = str(job.get("schedule") or "")
+        explicit_model = any(
+            value is not None
+            for value in (model, model_id, model_provider, model_query)
+        )
+        if explicit_model:
+            model_meta = _resolve_model_metadata(
+                model=model,
+                model_id=model_id,
+                model_provider=model_provider,
+                model_query=model_query,
+                explicit=True,
+            )
+            if model_meta:
+                job["model"] = model_meta
         if (
             conversation_id is not None
             or _has_conversation_ref(conversation_title)
