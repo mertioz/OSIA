@@ -747,6 +747,22 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Keine geplanten Aufgaben.",
         "es": "No hay tareas programadas.",
     },
+    "cron.model_default": {
+        "en": "Default/current model",
+        "fr": "ModÃ¨le par dÃ©faut/actuel",
+        "zh": "é»˜è®¤/å½“å‰æ¨¡åž‹",
+        "ja": "ãƒ‡ãƒ•ã‚©ãƒ«ãƒˆ/ç¾åœ¨ã®ãƒ¢ãƒ‡ãƒ«",
+        "de": "Standard-/aktuelles Modell",
+        "es": "Modelo predeterminado/actual",
+    },
+    "cron.model_invalid": {
+        "en": "Choose a valid model.",
+        "fr": "Choisissez un modÃ¨le valide.",
+        "zh": "è¯·é€‰æ‹©æœ‰æ•ˆæ¨¡åž‹ã€‚",
+        "ja": "æœ‰åŠ¹ãªãƒ¢ãƒ‡ãƒ«ã‚’é¸ã‚“ã§ãã ã•ã„ã€‚",
+        "de": "WÃ¤hlen Sie ein gÃ¼ltiges Modell.",
+        "es": "Elige un modelo vÃ¡lido.",
+    },
     "cron.every_minutes": {
         "en": "Every … minutes",
         "fr": "Toutes les … minutes",

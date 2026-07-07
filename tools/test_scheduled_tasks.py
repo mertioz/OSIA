@@ -401,6 +401,71 @@ def test_per_task_model_resolution():
         check("ambiguous model rejected", ambiguous["code"] == scheduled_tasks.ERROR_MODEL_AMBIGUOUS)
 
 
+def test_settings_model_metadata_round_trip():
+    now = datetime(2026, 7, 6, 12, 0)
+    active_model = {"provider": "openai", "id": "gpt-5.5", "label": "GPT-5.5"}
+    with in_memory_cron_jobs():
+        created = scheduled_tasks.replace_scheduled_tasks_from_settings(
+            [{
+                "task": "Settings task",
+                "schedule": "at 18:00",
+                "enabled": True,
+                "conversation_id": "conv-a",
+                "model": active_model,
+                "next_run_at": "2026-07-06T18:00",
+            }],
+            source_default="settings",
+        )
+        check("settings model default write ok", created["ok"] is True)
+        job = created["jobs"][0]
+        check("settings model default stored", job["model"]["id"] == "gpt-5.5")
+        check("settings conversation preserved", job["conversation_id"] == "conv-a")
+
+        edited = dict(job)
+        edited["task"] = "Settings task edited"
+        preserved = scheduled_tasks.replace_scheduled_tasks_from_settings(
+            [edited],
+            source_default="settings",
+        )
+        check("settings edit preserve ok", preserved["ok"] is True)
+        check("settings edit preserves model", preserved["jobs"][0]["model"]["id"] == "gpt-5.5")
+
+        updated = dict(preserved["jobs"][0])
+        updated["model"] = {
+            "provider": "anthropic",
+            "id": "claude-opus-4-8",
+            "label": "Claude Opus 4.8",
+        }
+        changed = scheduled_tasks.replace_scheduled_tasks_from_settings(
+            [updated],
+            source_default="settings",
+        )
+        check("settings edit update model ok", changed["ok"] is True)
+        check("settings edit updates model", changed["jobs"][0]["model"]["id"] == "claude-opus-4-8")
+
+        legacy = scheduled_tasks.replace_scheduled_tasks_from_settings(
+            [{
+                "task": "Legacy no model",
+                "schedule": "every 1 hours",
+                "enabled": True,
+                "next_run_at": "2026-07-06T13:00",
+            }],
+            source_default="settings",
+        )
+        check("settings legacy no model ok", legacy["ok"] is True)
+        check("settings legacy no model preserved", "model" not in legacy["jobs"][0])
+
+        bad = scheduled_tasks.create_scheduled_task(
+            title="Bad model",
+            instruction="Do bad model",
+            schedule={"type": "daily", "time": "18:00"},
+            model_query="not a real settings model",
+            now=now,
+        )
+        check("invalid model selection rejected", bad["ok"] is False)
+        check("invalid model selection code", bad["code"] == scheduled_tasks.ERROR_MODEL_NOT_FOUND)
+
+
 def test_cron_parser_extension():
     spec = parse_schedule("every 3 days at 20:00")
     check("parser day interval kind", spec["kind"] == "day_interval_at")
@@ -511,6 +576,7 @@ def main():
     test_list_update_delete_and_legacy_upgrade()
     test_change_callbacks_for_chat_and_settings_paths()
     test_per_task_model_resolution()
+    test_settings_model_metadata_round_trip()
     test_cron_parser_extension()
     test_cron_notification_callback_and_status()
     test_cron_daily_next_run_prevents_poll_miss()

@@ -2022,6 +2022,7 @@ class _SettingsPanel(QWidget):
         self._provider_cards: dict[str, _ProviderCard] = {}
         self._tts_cards: dict[str, _ProviderCard] = {}
         self._liveapi_cards: dict[str, _ProviderCard] = {}
+        self._remote_models: list = []
         self._mobile_token: str = ""
         self._startup_refresh_guard = False
         # True while a background startup-status probe is in flight, so the 5s
@@ -2191,6 +2192,11 @@ class _SettingsPanel(QWidget):
         self._mcp_timer.timeout.connect(self._refresh_mcp_status)
 
     # ── Section builders ──────────────────────────────────────────────────
+
+    def set_remote_models(self, remote: list) -> None:
+        self._remote_models = remote or []
+        if hasattr(self, "_cron_host"):
+            self._render_cron()
 
     def _on_settings_category_changed(self, row: int) -> None:
         if row < 0:
@@ -3118,6 +3124,11 @@ class _SettingsPanel(QWidget):
         self._cron_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._cron_add_btn.clicked.connect(self._on_cron_add)
         l.addWidget(self._cron_add_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        self._cron_error = QLabel("")
+        self._cron_error.setObjectName("providerSub")
+        self._cron_error.setWordWrap(True)
+        self._cron_error.hide()
+        l.addWidget(self._cron_error)
         return wrap
 
     def _render_cron(self) -> None:
@@ -3260,7 +3271,138 @@ class _SettingsPanel(QWidget):
             bottom.addWidget(mode_combo, 1)
             bottom.addWidget(value_input)
         v.addLayout(bottom)
+
+        model_row = QHBoxLayout()
+        model_row.setSpacing(6)
+        model_label = QLabel(i18n.t("settings.model"))
+        model_label.setObjectName("fieldLabel")
+        model_label.setMinimumWidth(64)
+        model_combo = QComboBox()
+        model_combo.setObjectName("voiceCombo")
+        _cap_combo_width(model_combo)
+        self._populate_cron_model_combo(model_combo, job.get("model"))
+        model_combo.currentIndexChanged.connect(
+            lambda _i, idx=index, combo=model_combo:
+                self._on_cron_model_changed(idx, combo)
+        )
+        model_row.addWidget(model_label)
+        model_row.addWidget(model_combo, 1)
+        v.addLayout(model_row)
         return row
+
+    def _cron_model_choices(self) -> list[tuple[str, dict]]:
+        try:
+            models = get_all_models(remote_models=getattr(self, "_remote_models", []))
+        except Exception:
+            models = []
+        try:
+            keys = load_api_keys()
+        except Exception:
+            keys = {}
+        out: list[tuple[str, dict]] = []
+        seen: set[tuple[str, str]] = set()
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            model_id = str(m.get("id") or "").strip()
+            provider = str(m.get("provider") or "").strip()
+            if not model_id or not provider:
+                continue
+            if provider != "ollama" and not keys.get(provider):
+                continue
+            key = (provider, model_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            model_label = str(m.get("label") or model_id).strip()
+            provider_label = PROVIDERS.get(provider, {}).get("name", provider)
+            out.append((
+                f"{provider_label} · {model_label}",
+                {"provider": provider, "id": model_id, "label": model_label},
+            ))
+        out.sort(key=lambda item: item[0].casefold())
+        return out
+
+    def _cron_model_metadata_from_id(
+        self,
+        model_id: str | None,
+        *,
+        provider: str | None = None,
+        label: str | None = None,
+    ) -> dict | None:
+        model_id = str(model_id or "").strip()
+        if not model_id:
+            return None
+        provider = str(provider or "").strip()
+        for _display, meta in self._cron_model_choices():
+            if meta.get("id") == model_id and (not provider or meta.get("provider") == provider):
+                return dict(meta)
+        if not provider:
+            try:
+                provider = provider_for_model(model_id)
+            except Exception:
+                provider = ""
+        return {
+            "provider": provider or "ollama",
+            "id": model_id,
+            "label": str(label or model_id).strip() or model_id,
+        }
+
+    def _cron_current_model_metadata(self) -> dict | None:
+        try:
+            selected = (load_settings().get("selected_model") or "").strip()
+        except Exception:
+            selected = ""
+        return self._cron_model_metadata_from_id(selected)
+
+    def _populate_cron_model_combo(self, combo: QComboBox, model: object) -> None:
+        combo.clear()
+        combo.addItem(i18n.t("cron.model_default"), None)
+        selected_idx = 0
+        selected_id = ""
+        selected_provider = ""
+        if isinstance(model, dict):
+            selected_id = str(model.get("id") or model.get("model") or "").strip()
+            selected_provider = str(model.get("provider") or "").strip()
+        choices = self._cron_model_choices()
+        for label, meta in choices:
+            combo.addItem(label, meta)
+            if (
+                selected_id
+                and meta.get("id") == selected_id
+                and (not selected_provider or meta.get("provider") == selected_provider)
+            ):
+                selected_idx = combo.count() - 1
+        if selected_id and selected_idx == 0:
+            meta = self._cron_model_metadata_from_id(
+                selected_id,
+                provider=selected_provider,
+                label=str(model.get("label") or selected_id) if isinstance(model, dict) else selected_id,
+            )
+            provider_label = PROVIDERS.get(meta.get("provider"), {}).get(
+                "name", meta.get("provider")
+            )
+            combo.addItem(f"{provider_label} · {meta.get('label')}", meta)
+            selected_idx = combo.count() - 1
+        combo.setCurrentIndex(selected_idx)
+
+    def _on_cron_model_changed(self, index: int, combo: QComboBox) -> None:
+        if not (0 <= index < len(self._cron_jobs)):
+            return
+        meta = combo.currentData()
+        if isinstance(meta, dict):
+            self._cron_jobs[index]["model"] = dict(meta)
+        else:
+            self._cron_jobs[index].pop("model", None)
+        self._persist_cron()
+
+    @staticmethod
+    def _valid_cron_model(model: object) -> bool:
+        if model in (None, ""):
+            return True
+        if not isinstance(model, dict):
+            return False
+        return bool(str(model.get("id") or model.get("model") or "").strip())
 
     @staticmethod
     def _parse_cron_schedule(schedule: str) -> tuple[str, str]:
@@ -3417,9 +3559,13 @@ class _SettingsPanel(QWidget):
                 self._persist_cron()
 
     def _on_cron_add(self) -> None:
+        job = {"task": "", "schedule": "every 30 minutes", "enabled": False,
+               "conversation_id": None}
+        model_meta = self._cron_current_model_metadata()
+        if model_meta:
+            job["model"] = model_meta
         self._cron_jobs.append(
-            {"task": "", "schedule": "every 30 minutes", "enabled": False,
-             "conversation_id": None}
+            job
         )
         self._persist_cron()
         self._render_cron()
@@ -3454,11 +3600,22 @@ class _SettingsPanel(QWidget):
             self._persist_cron()
             self._render_cron()
 
+    def _set_cron_error(self, message: str | None) -> None:
+        label = getattr(self, "_cron_error", None)
+        if label is None:
+            return
+        text = (message or "").strip()
+        label.setText(text)
+        label.setVisible(bool(text))
+
     def _persist_cron(self) -> None:
         from osia import scheduled_tasks
 
         clean = []
         for job in self._cron_jobs:
+            if not self._valid_cron_model(job.get("model")):
+                self._set_cron_error(i18n.t("cron.model_invalid"))
+                return
             entry = dict(job)
             entry.update({
                 "task": (job.get("task") or "").strip(),
@@ -3473,7 +3630,11 @@ class _SettingsPanel(QWidget):
         )
         if result.get("ok"):
             self._cron_jobs = result.get("jobs", clean)
+            self._set_cron_error(None)
         else:
+            self._set_cron_error(
+                result.get("message") or i18n.t("cron.model_invalid")
+            )
             print(
                 "[CRON] settings write rejected: "
                 f"{result.get('code')}: {result.get('message')}"
@@ -7975,6 +8136,7 @@ class MainPopup(QWidget):
 
     def set_remote_models(self, remote: list) -> None:
         self._models.set_remote_models(remote)
+        self._settings.set_remote_models(remote)
 
     # ── Autonomous agent (WOR-45 Phase 4) ─────────────────────────────────
 
