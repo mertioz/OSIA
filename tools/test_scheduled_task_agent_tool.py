@@ -99,6 +99,40 @@ class FakeClient:
         self.chat = SimpleNamespace(completions=FakeCompletions())
 
 
+class FailedScheduleThenNormalCompletions:
+    def __init__(self):
+        self.calls = 0
+        self.messages_by_call = []
+
+    def create(self, **kwargs):
+        self.calls += 1
+        self.messages_by_call.append(copy.deepcopy(kwargs.get("messages") or []))
+        if self.calls == 1:
+            content = (
+                "<tool_call>\n"
+                '{"tool":"create_scheduled_task",'
+                '"title":"Weekly task",'
+                '"instruction":"Do the thing.",'
+                '"schedule":{"type":"weekly","days_of_week":["mon"],"time":"09:00"},'
+                '"enabled":true,'
+                '"source":"chat"}'
+                "\n</tool_call>"
+            )
+        elif self.calls == 2:
+            content = scheduled_tasks.not_scheduled_response("en")
+        else:
+            content = "Hello. This is a normal reply."
+        message = SimpleNamespace(content=content, tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+class FailedScheduleThenNormalClient:
+    def __init__(self):
+        self.chat = SimpleNamespace(
+            completions=FailedScheduleThenNormalCompletions()
+        )
+
+
 def test_agent_tool_wrappers_return_structured_results():
     with in_memory_cron_jobs() as store:
         ok_raw = agent.tool_create_scheduled_task(
@@ -195,11 +229,46 @@ def test_explicit_model_tool_arg():
         check("missing model wrapper code", bad["code"] == "model_not_found")
 
 
+def test_failed_schedule_tool_result_does_not_leak_to_next_turn():
+    with temporary_conversations(), in_memory_cron_jobs():
+        conv = conversations.create_conversation(title="Current chat")
+        osia = agent.OSIAAgent(model="test-model", lang="en")
+        osia.provider = "ollama"
+        fake_client = FailedScheduleThenNormalClient()
+        osia.client = fake_client
+
+        first = osia._run_turn(
+            "Schedule this every Monday at 9.",
+            history=[],
+            current_conversation_id=conv["id"],
+        )
+        check("first turn reports schedule failure", "could not schedule" in first.lower())
+
+        exported = osia.exported_history()
+        exported_text = json.dumps(exported, ensure_ascii=False)
+        check("export strips old tool result", "<tool_result>" not in exported_text)
+        check("export strips old tool call", "<tool_call>" not in exported_text)
+
+        second = osia._run_turn(
+            "Hello, what can you do?",
+            history=exported,
+            current_conversation_id=conv["id"],
+        )
+        check("second turn normal reply", "could not schedule" not in second.lower())
+
+        wire = fake_client.chat.completions.messages_by_call[-1]
+        wire_text = json.dumps(wire, ensure_ascii=False)
+        check("next provider call has no stale tool result", "<tool_result>" not in wire_text)
+        check("next provider call has no stale tool payload", "Weekly task" not in wire_text)
+        check("next provider call has normal user text", "Hello, what can you do?" in wire_text)
+
+
 def main():
     test_agent_tool_wrappers_return_structured_results()
     test_run_turn_scheduled_task_dispatch_has_module_alias()
     test_explicit_conversation_title_tool_arg()
     test_explicit_model_tool_arg()
+    test_failed_schedule_tool_result_does_not_leak_to_next_turn()
     print("scheduled task agent tool tests passed")
 
 

@@ -844,11 +844,16 @@ def _conversation_busy_frame(conv_id: str) -> dict:
     }
 
 
-def _conversation_busy_changed_frame(conv_id: str, busy: bool) -> dict:
+def _conversation_busy_changed_frame(
+    conv_id: str,
+    busy: bool,
+    turn_meta: dict | None = None,
+) -> dict:
     return {
         "type": "conversation_busy_changed",
         "conversation_id": conv_id,
         "busy": bool(busy),
+        **_turn_fields(turn_meta),
     }
 
 
@@ -1021,8 +1026,12 @@ async def _send_conversation_busy(channel: "_OutboundChannel", conv_id: str) -> 
     await channel.send_json(_conversation_busy_frame(conv_id))
 
 
-async def _broadcast_conversation_busy_changed(conv_id: str, busy: bool) -> None:
-    frame = _conversation_busy_changed_frame(conv_id, busy)
+async def _broadcast_conversation_busy_changed(
+    conv_id: str,
+    busy: bool,
+    turn_meta: dict | None = None,
+) -> None:
+    frame = _conversation_busy_changed_frame(conv_id, busy, turn_meta)
     for client in list(_WS_CLIENTS):
         try:
             await client.send_json(frame)
@@ -3581,14 +3590,17 @@ async def websocket_endpoint(ws: WebSocket):
             task.cancel()
             return False
         streaming_tasks[conv_id] = task
-        asyncio.create_task(_broadcast_conversation_busy_changed(conv_id, True))
+        asyncio.create_task(
+            _broadcast_conversation_busy_changed(conv_id, True, turn_meta)
+        )
 
         def _clear(t):
             if streaming_tasks.get(conv_id) is t:
                 streaming_tasks.pop(conv_id, None)
+            meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
             if _clear_conversation_turn(conv_id, t):
                 asyncio.create_task(
-                    _broadcast_conversation_busy_changed(conv_id, False)
+                    _broadcast_conversation_busy_changed(conv_id, False, meta)
                 )
 
         task.add_done_callback(_clear)
@@ -5885,7 +5897,11 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         and current_task is not None
         and _clear_conversation_turn(active_conv_id, current_task)
     ):
-        await _broadcast_conversation_busy_changed(active_conv_id, False)
+        await _broadcast_conversation_busy_changed(
+            active_conv_id,
+            False,
+            turn_meta,
+        )
     _ts(t0, "turn final frame sent")
 
     # Synthesize TTS off-thread so the event loop keeps serving.

@@ -71,7 +71,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from osia.agent import OSIAAgent, DEFAULT_LANG, get_system_prompt
+from osia.agent import (
+    OSIAAgent,
+    DEFAULT_LANG,
+    get_system_prompt,
+    _sanitize_persisted_history_message,
+)
 from osia import conversations
 from osia.tools import verify_tools
 
@@ -340,10 +345,11 @@ def _persist_agent_delta(conv_id, agent, prev_history_len):
             # share this conversation store. This is the desktop counterpart of
             # the server's exported_history() filter (the single persistence
             # boundary for the local app).
-            if isinstance(m, dict) and m.get("_internal"):
+            clean = _sanitize_persisted_history_message(m)
+            if clean is None:
                 continue
             conversations.add_message(
-                conv_id, m.get("role"), m.get("content", ""),
+                conv_id, clean.get("role"), clean.get("content", ""),
             )
     except Exception as e:
         print(f"[OSIA] failed to persist conversation: {e}")

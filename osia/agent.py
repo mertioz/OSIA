@@ -4389,6 +4389,48 @@ class _AntiLoopGuard:
         )
 
 
+def _history_text_for_hygiene(content) -> str:
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text", "")))
+        return "\n".join(parts)
+    return "" if content is None else str(content)
+
+
+def _sanitize_persisted_history_message(msg: dict) -> dict | None:
+    """Drop per-turn tool scaffolding before history crosses turn boundaries."""
+    if not isinstance(msg, dict):
+        return None
+    if msg.get("_internal"):
+        return None
+    role = msg.get("role")
+    if role == "system" or role not in ("user", "assistant"):
+        return None
+
+    raw = msg.get("content", "")
+    text = _history_text_for_hygiene(raw)
+    if "RÈGLES ABSOLUES" in text or "ABSOLUTE RULES" in text:
+        return None
+    if text.lstrip().startswith("##"):
+        return None
+
+    # Tool results are model-facing feedback for the turn that executed them.
+    # Keeping them in later turns lets stale errors steer unrelated replies.
+    if role == "user" and text.lstrip().startswith("<tool_result>"):
+        return None
+
+    clean = dict(msg)
+    if role == "assistant" and isinstance(raw, str):
+        stripped = strip_raw_tool_tags(raw)
+        stripped = strip_bare_tool_json(stripped).strip()
+        if not stripped:
+            return None
+        clean["content"] = stripped
+    return clean
+
+
 class OSIAAgent:
     def __init__(self, model: str = MODEL, base_url: str = OLLAMA_BASE_URL, lang: str = None):
         self.client = OpenAI(base_url=base_url, api_key="ollama")
@@ -4424,25 +4466,9 @@ class OSIAAgent:
         """
         safe: list = []
         for m in self.messages[1:]:
-            if not isinstance(m, dict):
-                continue
-            # WOR-83: internal model-steering frames (anti-loop / hallucination
-            # / empty-response guards) live in self.messages so the model reads
-            # them, but must NEVER be persisted — once stored they lose the
-            # _internal marker (add_message keeps only role+content) and would
-            # resurface on reload as a user bubble. This is the single
-            # persistence boundary, so dropping them here keeps them out of the
-            # store AND every conversation_history frame at once.
-            if m.get("_internal"):
-                continue
-            if m.get("role") == "system":
-                continue
-            content = str(m.get("content", ""))
-            if "RÈGLES ABSOLUES" in content or "ABSOLUTE RULES" in content:
-                continue
-            if content.lstrip().startswith("##"):
-                continue
-            safe.append(m)
+            clean = _sanitize_persisted_history_message(m)
+            if clean is not None:
+                safe.append(clean)
         return safe
 
     def set_model(self, model_id: str, provider: str | None = None) -> None:
@@ -5124,18 +5150,14 @@ class OSIAAgent:
         """
         if history is not None:
             # Defensively strip anything that looks like a system prompt
-            # from the incoming history — only the index-0 system message
-            # owned by THIS agent is allowed to carry system content.
-            sanitized = [
-                m for m in history
-                if isinstance(m, dict)
-                and m.get("role") in ("user", "assistant")
-                and not m.get("_internal")
-                and not m.get("_memory_context")
-                and "RÈGLES ABSOLUES" not in str(m.get("content", ""))
-                and "ABSOLUTE RULES" not in str(m.get("content", ""))
-                and not str(m.get("content", "")).lstrip().startswith("##")
-            ]
+            # from the incoming history, and drop per-turn tool feedback from
+            # previous turns. Only the index-0 system message owned by THIS
+            # agent is allowed to carry system content.
+            sanitized = []
+            for m in history:
+                clean = _sanitize_persisted_history_message(m)
+                if clean is not None and not clean.get("_memory_context"):
+                    sanitized.append(clean)
             self.messages = [{"role": "system", "content": get_system_prompt(self.lang, self.model, self.provider)}] + sanitized
         else:
             self.messages = [
