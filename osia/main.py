@@ -101,6 +101,7 @@ _SERVER_MCP_OAUTH_CANCEL_URL = "http://127.0.0.1:8765/internal/mcp_oauth_cancel"
 # REVOKES the grant (RFC 7009) AND forgets the DCR client (delete_mcp_oauth) so the
 # next Connect re-runs DCR + a fresh login, then rebroadcasts the reset.
 _SERVER_MCP_OAUTH_SWITCH_URL = "http://127.0.0.1:8765/internal/mcp_oauth_switch"
+_SERVER_CRON_NOTIFICATION_URL = "http://127.0.0.1:8765/internal/cron_notification"
 
 
 def _notify_mobile_new_chat() -> None:
@@ -137,6 +138,35 @@ def _notify_mobile_mcp_sync(server_id: str, action: str) -> None:
         urllib.request.urlopen(req, timeout=1.5).close()
     except Exception as e:
         print(f"[MCP sync] mobile mcp_sync notify skipped: {e}")
+
+
+def _notify_mobile_cron_notification(
+    *,
+    task_id: str | None,
+    title: str,
+    status: str,
+    conversation_id: str | None,
+) -> None:
+    """Best-effort: ask the mobile server to broadcast a cron notification."""
+
+    import json
+    import urllib.request
+    try:
+        payload = json.dumps({
+            "task_id": task_id or "",
+            "title": title,
+            "status": status,
+            "conversation_id": conversation_id or "",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            _SERVER_CRON_NOTIFICATION_URL,
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=1.5).close()
+    except Exception as e:
+        print(f"[CRON] mobile notification skipped: {e}")
 
 
 def request_oauth_tunnel_connect(server_id: str) -> bool:
@@ -434,7 +464,10 @@ def text_mode():
         prev_history_len = len(agent.messages) - 1  # skip system prompt
         print("\nOSIA is thinking...", flush=True)
         try:
-            response = agent.run(user_input)
+            response = agent.run(
+                user_input,
+                current_conversation_id=active_conv["id"],
+            )
             print(f"\nOSIA: {response}")
             _persist_agent_delta(active_conv["id"], agent, prev_history_len)
         except Exception as e:
@@ -481,7 +514,10 @@ def voice_mode():
             print(f"[New conversation: {active_conv['id']}]")
 
         print("🤔 Thinking...")
-        response = run_agent(user_text)
+        response = run_agent(
+            user_text,
+            current_conversation_id=active_conv["id"],
+        )
         response = clean_response(response)
         print(f"💬 OSIA: {response}")
 
@@ -788,6 +824,7 @@ def wake_mode():
                 history=history,
                 on_sentence=on_sentence,
                 on_first_token=on_first_token,
+                current_conversation_id=conv_id,
             )
             if voice_response:
                 print(
@@ -1090,10 +1127,14 @@ def wake_mode():
     except Exception as e:
         print(f"[CRON] could not preset model {initial_model!r}: {e}")
 
-    def run_cron_task(task_text: str, conversation_id: str | None = None) -> None:
+    def run_cron_task(task_text: str, conversation_id: str | None = None) -> dict:
         if not handler_lock.acquire(timeout=120):
             print(f"[CRON] busy — scheduled task skipped: {task_text[:60]}")
-            return
+            return {
+                "status": "failed",
+                "message": "OSIA was busy; scheduled task skipped",
+            }
+        conversation_stale = False
         try:
             tts_stop()
             sel = load_settings().get("selected_model")
@@ -1108,12 +1149,22 @@ def wake_mode():
             # one-shot turn exactly as before.
             conv = (conversations.get_conversation(conversation_id)
                     if conversation_id else None)
+            if conversation_id and conv is None:
+                conversation_stale = True
+                print(
+                    f"[CRON] linked conversation {conversation_id} not found; "
+                    "running task without conversation persistence"
+                )
             bridge.island_state.emit("thinking")
             if conv is not None:
                 history = conv.get("messages") or []
                 print(f"[CRON] conversation {conversation_id}: loaded "
                       f"{len(history)} messages for context")
-                reply = cron_agent.run(task_text, history=history)
+                reply = cron_agent.run(
+                    task_text,
+                    history=history,
+                    current_conversation_id=conversation_id,
+                )
                 _persist_exchange(conversation_id, task_text,
                                   clean_response(reply or ""))
             else:
@@ -1121,10 +1172,26 @@ def wake_mode():
                 reply = cron_agent.run(task_text)
             display = clean_response(reply or "")
             if display:
-                bridge.chat_message.emit("assistant", f"⏰ {display}")
+                if conv is not None and conversation_id:
+                    bridge.chat_message_for_conversation.emit(
+                        conversation_id, "assistant", f"⏰ {display}"
+                    )
+                    bridge.conversations_changed.emit(
+                        active_conv["id"] if active_conv else ""
+                    )
+                elif not conversation_stale:
+                    bridge.chat_message.emit("assistant", f"⏰ {display}")
                 speak(display)
+            if conversation_stale:
+                return {
+                    "status": "completed",
+                    "conversation_stale": True,
+                    "message": "linked conversation not found; ran unlinked",
+                }
+            return {"status": "completed"}
         except Exception as e:
             print(f"[CRON] task error: {e}")
+            return {"status": "failed", "message": str(e)}
         finally:
             bridge.island_state.emit("idle")
             handler_lock.release()
@@ -1141,7 +1208,29 @@ def wake_mode():
         finally:
             handler_lock.release()
 
-    cron_manager = CronManager(run_cron_task)
+    def notify_cron_task(
+        *,
+        task_id: str | None,
+        title: str | None,
+        status: str,
+        conversation_id: str | None,
+    ) -> None:
+        from osia.notifications import notify, safe_task_title
+
+        safe_title = safe_task_title(title)
+        if status == "failed":
+            body = f"Scheduled task failed: {safe_title}"
+        else:
+            body = f"Scheduled task completed: {safe_title}"
+        notify("OSIA", body)
+        _notify_mobile_cron_notification(
+            task_id=task_id,
+            title=safe_title,
+            status=status,
+            conversation_id=conversation_id,
+        )
+
+    cron_manager = CronManager(run_cron_task, notify_task=notify_cron_task)
     heartbeat_monitor = HeartbeatMonitor(heartbeat_alert)
     cron_manager.start()
     heartbeat_monitor.start()

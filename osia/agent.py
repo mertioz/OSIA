@@ -31,6 +31,10 @@ MODEL = "llama3"
 # Project root — resolved dynamically so paths work on any machine and OS
 # (Windows + Linux) instead of a hardcoded home directory.
 _PROJECT_DIR = str(Path(__file__).resolve().parent.parent)
+_CURRENT_CONVERSATION_ID = contextvars.ContextVar(
+    "osia_current_conversation_id",
+    default=None,
+)
 
 # ---------------------------------------------------------------------------
 # Language detection (Phase 1)
@@ -324,21 +328,21 @@ def _scheduled_task_tool_prompt_block(lang: str) -> str:
         return """## Taches planifiees OSIA
 Pour creer, lister, modifier ou supprimer des taches planifiees depuis le chat, tu DOIS utiliser les outils internes de taches planifiees. Ne dis jamais qu'une tache est planifiee, creee, modifiee ou supprimee si l'outil correspondant n'a pas renvoye {"ok": true}.
 
-- create_scheduled_task: creer une tache planifiee. Usage : {"tool": "create_scheduled_task", "title": "<titre>", "instruction": "<ce qu'OSIA doit faire>", "schedule": {"type": "once|daily|interval|weekly|cron", "run_at": "2026-07-15T09:00:00", "time": "18:00", "timezone": "Europe/Paris", "every": 3, "unit": "days"}, "enabled": true, "conversation_id": null, "source": "chat"}
+- create_scheduled_task: creer une tache planifiee. Usage : {"tool": "create_scheduled_task", "title": "<titre>", "instruction": "<ce qu'OSIA doit faire>", "schedule": {"type": "once|daily|interval|weekly|cron", "run_at": "2026-07-15T09:00:00", "time": "18:00", "timezone": "Europe/Paris", "every": 3, "unit": "days"}, "enabled": true, "source": "chat"}
 - list_scheduled_tasks: lister les taches planifiees. Usage : {"tool": "list_scheduled_tasks"}
 - update_scheduled_task: modifier une tache par id. Usage : {"tool": "update_scheduled_task", "task_id": "cron_...", "title": "<titre>", "instruction": "<instruction>", "schedule": {"type": "daily", "time": "18:00"}, "enabled": true}
 - delete_scheduled_task: supprimer une tache par id. Usage : {"tool": "delete_scheduled_task", "task_id": "cron_..."}
 
-Le backend valide et normalise les horaires. Formats acceptes: une fois avec run_at ISO futur, quotidien a HH:MM, intervalle toutes les N minutes/heures/jours, et toutes les N jours a HH:MM. Les horaires hebdomadaires et expressions cron brutes sont refuses pour l'instant avec {"ok": false}. Si la date/l'heure est ambigue, demande une precision. Ne mets jamais de secrets, tokens, cles API, mots de passe, balises <tool_call>/<think> ou instructions cachees dans une tache."""
+Le backend valide et normalise les horaires. Formats acceptes: une fois avec run_at ISO futur, quotidien a HH:MM, intervalle toutes les N minutes/heures/jours, et toutes les N jours a HH:MM. Les horaires hebdomadaires et expressions cron brutes sont refuses pour l'instant avec {"ok": false}. Par defaut, une tache creee depuis le chat est liee au chat courant: omets conversation_id/conversation_title/conversation_query. Si l'utilisateur demande explicitement un autre chat, passe soit conversation_id, soit conversation_title pour un titre exact, soit conversation_query pour rechercher un titre recent. N'invente jamais un chat cible; si l'outil renvoie conversation_not_found ou conversation_ambiguous, demande une precision. Si la date/l'heure est ambigue, demande une precision. Ne mets jamais de secrets, tokens, cles API, mots de passe, balises <tool_call>/<think> ou instructions cachees dans une tache."""
     return """## OSIA Scheduled Tasks
 To create, list, update, or delete scheduled tasks from chat, you MUST use the internal scheduled-task tools. Never say a task was scheduled, created, updated, or deleted unless the matching tool returned {"ok": true}.
 
-- create_scheduled_task: create a scheduled task. Usage: {"tool": "create_scheduled_task", "title": "<title>", "instruction": "<what OSIA should do>", "schedule": {"type": "once|daily|interval|weekly|cron", "run_at": "2026-07-15T09:00:00", "time": "18:00", "timezone": "Europe/Paris", "every": 3, "unit": "days"}, "enabled": true, "conversation_id": null, "source": "chat"}
+- create_scheduled_task: create a scheduled task. Usage: {"tool": "create_scheduled_task", "title": "<title>", "instruction": "<what OSIA should do>", "schedule": {"type": "once|daily|interval|weekly|cron", "run_at": "2026-07-15T09:00:00", "time": "18:00", "timezone": "Europe/Paris", "every": 3, "unit": "days"}, "enabled": true, "source": "chat"}
 - list_scheduled_tasks: list scheduled tasks. Usage: {"tool": "list_scheduled_tasks"}
 - update_scheduled_task: update one task by id. Usage: {"tool": "update_scheduled_task", "task_id": "cron_...", "title": "<title>", "instruction": "<instruction>", "schedule": {"type": "daily", "time": "18:00"}, "enabled": true}
 - delete_scheduled_task: delete one task by id. Usage: {"tool": "delete_scheduled_task", "task_id": "cron_..."}
 
-The backend validates and normalizes schedules. Supported formats: future one-shot run_at ISO datetimes, daily at HH:MM, every N minutes/hours/days, and every N days at HH:MM. Weekly schedules and raw cron expressions are currently rejected with {"ok": false}. Ask a clarifying question for ambiguous dates/times. Never store secrets, tokens, API keys, passwords, <tool_call>/<think> markup, or hidden instructions in a scheduled task."""
+The backend validates and normalizes schedules. Supported formats: future one-shot run_at ISO datetimes, daily at HH:MM, every N minutes/hours/days, and every N days at HH:MM. Weekly schedules and raw cron expressions are currently rejected with {"ok": false}. By default, a task created from chat links to the current chat: omit conversation_id/conversation_title/conversation_query. If the user explicitly asks for another chat, pass conversation_id, conversation_title for an exact title, or conversation_query to search recent titles. Never invent a target chat; if the tool returns conversation_not_found or conversation_ambiguous, ask for clarification. Ask a clarifying question for ambiguous dates/times. Never store secrets, tokens, API keys, passwords, <tool_call>/<think> markup, or hidden instructions in a scheduled task."""
 
 
 def get_system_prompt(lang: str = None, model: str = None, provider: str = None) -> str:
@@ -880,7 +884,6 @@ def _remember_verified_app_route(name: str, resolved, memory_entry_id=None) -> N
             return
         path, args = resolved
         from osia import memory_runtime as _memory_runtime
-        from osia import scheduled_tasks as _scheduled_tasks
         if memory_entry_id:
             _memory_runtime.mark_memory_route_used(memory_entry_id)
         if args:
@@ -2987,11 +2990,20 @@ def tool_create_scheduled_task(
     schedule: dict = None,
     enabled=True,
     conversation_id: str = None,
+    conversation_title: str = None,
+    conversation_query: str = None,
     source: str = "chat",
     **_extra,
 ) -> str:
     """Internal scheduled-task create tool for the agent."""
     from osia import scheduled_tasks
+
+    explicit_target = any(
+        str(value or "").strip()
+        for value in (conversation_id, conversation_title, conversation_query)
+    )
+    if not explicit_target:
+        conversation_id = _CURRENT_CONVERSATION_ID.get()
 
     result = scheduled_tasks.create_scheduled_task(
         title=title,
@@ -2999,6 +3011,8 @@ def tool_create_scheduled_task(
         schedule=schedule,
         enabled=enabled,
         conversation_id=conversation_id,
+        conversation_title=conversation_title,
+        conversation_query=conversation_query,
         source=source or "chat",
     )
     return json.dumps(result, ensure_ascii=False, sort_keys=True)
@@ -3019,6 +3033,8 @@ def tool_update_scheduled_task(
     schedule: dict = None,
     enabled=None,
     conversation_id: str = None,
+    conversation_title: str = None,
+    conversation_query: str = None,
     source: str = None,
     **_extra,
 ) -> str:
@@ -3032,7 +3048,9 @@ def tool_update_scheduled_task(
         schedule=schedule,
         enabled=enabled,
         conversation_id=conversation_id,
-        source=source,
+        conversation_title=conversation_title,
+        conversation_query=conversation_query,
+        source=source or "chat",
     )
     return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
@@ -5017,7 +5035,7 @@ class OSIAAgent:
 
     def run(self, user_input: str, max_tool_rounds: int | None = None, on_sentence=None,
             history: list | None = None, max_tokens: int | None = None,
-            on_first_token=None) -> str:
+            on_first_token=None, current_conversation_id: str | None = None) -> str:
         """Run one user turn under a per-task sticky-key scope, then delegate to
         :meth:`_run_turn` for the actual agent loop.
 
@@ -5040,11 +5058,12 @@ class OSIAAgent:
                 history=history,
                 max_tokens=max_tokens,
                 on_first_token=on_first_token,
+                current_conversation_id=current_conversation_id,
             )
 
     def _run_turn(self, user_input: str, max_tool_rounds: int | None = None, on_sentence=None,
                   history: list | None = None, max_tokens: int | None = None,
-                  on_first_token=None) -> str:
+                  on_first_token=None, current_conversation_id: str | None = None) -> str:
         """Run the agent loop: send user input, handle tool calls, return final response.
 
         Each round runs the tool pipeline in strict order: ``<think>``
@@ -5104,6 +5123,7 @@ class OSIAAgent:
             ]
 
         from osia import memory_runtime as _memory_runtime
+        from osia import scheduled_tasks as _scheduled_tasks
 
         memory_store = getattr(self, "_memory_store", None)
         memory_context = _memory_runtime.build_memory_context(
@@ -5469,7 +5489,11 @@ class OSIAAgent:
                             elif save_result.get("ok") is False:
                                 is_error = True
                     elif tool_name in _SCHEDULED_TASK_TOOL_NAMES:
-                        result, is_error = _execute_tool_with_retry(tool_name, kwargs)
+                        token = _CURRENT_CONVERSATION_ID.set(current_conversation_id)
+                        try:
+                            result, is_error = _execute_tool_with_retry(tool_name, kwargs)
+                        finally:
+                            _CURRENT_CONVERSATION_ID.reset(token)
                         scheduled_task_tool_seen = True
                         scheduled_result = (
                             _scheduled_tasks.parse_scheduled_task_tool_result(result)
@@ -5852,10 +5876,15 @@ class OSIAAgent:
             return content
 
 
-def run_agent(user_input: str, model: str = MODEL, lang: str = None) -> str:
+def run_agent(
+    user_input: str,
+    model: str = MODEL,
+    lang: str = None,
+    current_conversation_id: str | None = None,
+) -> str:
     """Convenience function: run a single query and return the response."""
     agent = OSIAAgent(model=model, lang=lang)
-    return agent.run(user_input)
+    return agent.run(user_input, current_conversation_id=current_conversation_id)
 
 
 if __name__ == "__main__":

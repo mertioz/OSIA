@@ -26,6 +26,8 @@ ERROR_SECRET = "secret_rejected"
 ERROR_NOT_FOUND = "not_found"
 ERROR_UNSUPPORTED = "unsupported_schedule"
 ERROR_STORAGE = "storage_error"
+ERROR_CONVERSATION_NOT_FOUND = "conversation_not_found"
+ERROR_CONVERSATION_AMBIGUOUS = "conversation_ambiguous"
 
 _TASK_ID_RE = re.compile(r"^cron_[A-Za-z0-9_-]{8,}$")
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
@@ -47,10 +49,11 @@ _SYSTEM_PROMPT_RE = re.compile(
 class ScheduledTaskError(Exception):
     """Structured error surfaced as ``ok:false`` to the agent."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, **details: Any):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.details = details
 
 
 def set_change_callback(callback: Callable[[], None] | None) -> None:
@@ -261,14 +264,61 @@ def _reject_unsafe_text(title: str, instruction: str) -> None:
         raise ScheduledTaskError(ERROR_SECRET, str(exc)) from exc
 
 
-def _result_error(code: str, message: str) -> dict[str, Any]:
-    return {"ok": False, "code": code, "message": message}
+def _result_error(code: str, message: str, **details: Any) -> dict[str, Any]:
+    result = {"ok": False, "code": code, "message": message}
+    result.update(details)
+    return result
 
 
 def _result_ok(**payload: Any) -> dict[str, Any]:
     result = {"ok": True}
     result.update(payload)
     return result
+
+
+def _has_conversation_ref(value: Any) -> bool:
+    if value is None:
+        return False
+    text = str(value).strip()
+    return bool(text and text.casefold() != "null")
+
+
+def _resolve_conversation_ref(
+    *,
+    conversation_id: str | None = None,
+    conversation_title: str | None = None,
+    conversation_query: str | None = None,
+) -> tuple[str | None, str | None]:
+    if not (
+        _has_conversation_ref(conversation_id)
+        or _has_conversation_ref(conversation_title)
+        or _has_conversation_ref(conversation_query)
+    ):
+        return None, None
+    from osia import conversations
+
+    resolved = conversations.resolve_conversation_reference(
+        conversation_id=conversation_id,
+        title=conversation_title,
+        query=conversation_query,
+    )
+    if resolved.get("ok") is True:
+        return (
+            str(resolved.get("conversation_id") or "").strip() or None,
+            str(resolved.get("title") or "").strip() or None,
+        )
+    code = str(resolved.get("code") or ERROR_CONVERSATION_NOT_FOUND)
+    if code not in {ERROR_CONVERSATION_NOT_FOUND, ERROR_CONVERSATION_AMBIGUOUS}:
+        code = ERROR_CONVERSATION_NOT_FOUND
+    details = {}
+    candidates = resolved.get("candidates")
+    if isinstance(candidates, list):
+        details["candidates"] = candidates
+    raise ScheduledTaskError(
+        code,
+        str(resolved.get("message") or "conversation could not be resolved"),
+        **details,
+    )
 
 
 def _load_jobs() -> list[dict[str, Any]]:
@@ -372,6 +422,8 @@ def create_scheduled_task(
     schedule: dict[str, Any] | None = None,
     enabled: bool = True,
     conversation_id: str | None = None,
+    conversation_title: str | None = None,
+    conversation_query: str | None = None,
     source: str = "chat",
     now: datetime | None = None,
     **_extra: Any,
@@ -384,6 +436,14 @@ def create_scheduled_task(
         _reject_unsafe_text(clean_title, task_text)
         canonical, timezone_name = normalize_schedule(schedule, now=now)
         clean_source = source if source in _SUPPORTED_SOURCES else "chat"
+        clean_conversation_id = conversation_id or None
+        resolved_conversation_title = None
+        if clean_source == "chat":
+            clean_conversation_id, resolved_conversation_title = _resolve_conversation_ref(
+                conversation_id=conversation_id,
+                conversation_title=conversation_title,
+                conversation_query=conversation_query,
+            )
         created_at = _iso()
         job = {
             "id": _new_task_id(),
@@ -391,7 +451,7 @@ def create_scheduled_task(
             "task": task_text,
             "schedule": canonical,
             "enabled": bool(enabled),
-            "conversation_id": conversation_id or None,
+            "conversation_id": clean_conversation_id,
             "source": clean_source,
             "timezone": timezone_name,
             "created_at": created_at,
@@ -399,6 +459,8 @@ def create_scheduled_task(
             "last_run_at": None,
             "last_status": None,
         }
+        if resolved_conversation_title:
+            job["conversation_title"] = resolved_conversation_title
         jobs = _load_normalized_jobs()
         jobs.append(job)
         _save_jobs(jobs)
@@ -411,7 +473,7 @@ def create_scheduled_task(
         _notify_changed()
         return _result_ok(task_id=job["id"], summary=_job_summary(job), job=job)
     except ScheduledTaskError as exc:
-        return _result_error(exc.code, exc.message)
+        return _result_error(exc.code, exc.message, **exc.details)
     except Exception as exc:
         return _result_error(ERROR_STORAGE, str(exc))
 
@@ -432,6 +494,8 @@ def update_scheduled_task(
     schedule: dict[str, Any] | None = None,
     enabled: bool | None = None,
     conversation_id: str | None = None,
+    conversation_title: str | None = None,
+    conversation_query: str | None = None,
     source: str | None = None,
     now: datetime | None = None,
     **_extra: Any,
@@ -453,6 +517,7 @@ def update_scheduled_task(
         if not next_task:
             raise ScheduledTaskError(ERROR_VALIDATION, "instruction cannot be empty")
         _reject_unsafe_text(next_title, next_task)
+        clean_source = source if source in _SUPPORTED_SOURCES else str(job.get("source") or "chat")
         job["title"] = next_title or next_task[:80] or "Scheduled task"
         job["task"] = next_task
         if schedule is not None:
@@ -461,8 +526,22 @@ def update_scheduled_task(
             job["timezone"] = timezone_name
         if enabled is not None:
             job["enabled"] = bool(enabled)
-        if conversation_id is not None:
-            job["conversation_id"] = conversation_id or None
+        if (
+            conversation_id is not None
+            or _has_conversation_ref(conversation_title)
+            or _has_conversation_ref(conversation_query)
+        ):
+            if clean_source == "chat":
+                resolved_id, resolved_title = _resolve_conversation_ref(
+                    conversation_id=conversation_id,
+                    conversation_title=conversation_title,
+                    conversation_query=conversation_query,
+                )
+                job["conversation_id"] = resolved_id
+                if resolved_title:
+                    job["conversation_title"] = resolved_title
+            else:
+                job["conversation_id"] = conversation_id or None
         if source is not None and source in _SUPPORTED_SOURCES:
             job["source"] = source
         job["updated_at"] = _iso()
@@ -477,7 +556,7 @@ def update_scheduled_task(
         _notify_changed()
         return _result_ok(task_id=clean_id, summary=_job_summary(job), job=job)
     except ScheduledTaskError as exc:
-        return _result_error(exc.code, exc.message)
+        return _result_error(exc.code, exc.message, **exc.details)
     except Exception as exc:
         return _result_error(ERROR_STORAGE, str(exc))
 

@@ -163,9 +163,14 @@ class CronManager:
         CPU cost.
     """
 
-    def __init__(self, run_task: Callable[..., None],
-                 tick_seconds: float = DEFAULT_TICK_SECONDS):
+    def __init__(
+        self,
+        run_task: Callable[..., object],
+        tick_seconds: float = DEFAULT_TICK_SECONDS,
+        notify_task: Callable[..., None] | None = None,
+    ):
         self._run_task = run_task
+        self._notify_task = notify_task
         self._tick = max(1.0, float(tick_seconds))
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -242,7 +247,8 @@ class CronManager:
                 launched = self._fire(
                     job.get("task", ""), job.get("schedule", ""), st, now,
                     conversation_id=job.get("conversation_id"),
-                    job_index=idx, signature=sig, task_id=job.get("id"))
+                    job_index=idx, signature=sig, task_id=job.get("id"),
+                    title=job.get("title"))
                 # A one-shot job runs exactly once: as soon as it actually
                 # launches, flag it in-memory (so it never re-fires this
                 # session even if the persist below fails) and disable it on
@@ -331,7 +337,8 @@ class CronManager:
 
     def _fire(self, task: str, schedule: str, st: dict, now: datetime,
               conversation_id: str | None = None, job_index: int | None = None,
-              signature: tuple | None = None, task_id: str | None = None) -> bool:
+              signature: tuple | None = None, task_id: str | None = None,
+              title: str | None = None) -> bool:
         """Launch a job's task on a worker thread.
 
         Returns ``True`` when the task was actually launched (timing state
@@ -368,20 +375,62 @@ class CronManager:
         def _worker():
             self._busy.set()
             status = "completed"
+            job_status = "completed"
+            last_error = ""
             try:
-                self._run_task(task, conversation_id)
+                result = self._run_task(task, conversation_id)
+                if isinstance(result, dict):
+                    raw_status = str(result.get("status") or "").strip().lower()
+                    if raw_status in {"failed", "error"}:
+                        status = "failed"
+                        job_status = "error"
+                    elif result.get("conversation_stale"):
+                        job_status = "completed_unlinked"
+                    message = str(result.get("message") or "").strip()
+                    if message:
+                        last_error = message[:240]
             except Exception as e:
-                status = "error"
+                status = "failed"
+                job_status = "error"
+                last_error = str(e)[:240]
                 print(f"[CRON] task failed: {e}")
             finally:
                 self._update_job_status(
                     job_index, signature, task_id,
-                    last_status=status,
+                    last_status=job_status,
+                    last_error=last_error,
+                )
+                self._notify_completion(
+                    task_id=task_id,
+                    title=title or task[:80],
+                    status=status,
+                    conversation_id=conversation_id,
                 )
                 self._busy.clear()
 
         threading.Thread(target=_worker, name="osia-cron-task", daemon=True).start()
         return True
+
+    def _notify_completion(
+        self,
+        *,
+        task_id: str | None,
+        title: str | None,
+        status: str,
+        conversation_id: str | None,
+    ) -> None:
+        callback = self._notify_task
+        if callback is None:
+            return
+        try:
+            callback(
+                task_id=task_id,
+                title=title,
+                status=status,
+                conversation_id=conversation_id,
+            )
+        except Exception as e:
+            print(f"[CRON] notification callback failed: {e}")
 
     def _disable_once_job(self, idx: int, sig: tuple) -> None:
         """Persist ``enabled: false`` for the one-shot job at ``idx`` so it does

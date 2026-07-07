@@ -21,6 +21,7 @@ import json
 import os
 import re
 import threading
+import unicodedata
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -176,6 +177,124 @@ def _make_title(content) -> str:
     return smart_title(content)
 
 
+def _normalize_lookup_text(value: str | None) -> str:
+    """Normalize conversation titles/queries for safe human-facing lookup."""
+
+    raw = str(value or "").strip().casefold()
+    if not raw:
+        return ""
+    decomposed = unicodedata.normalize("NFKD", raw)
+    asciiish = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    asciiish = re.sub(r"[^\w]+", " ", asciiish, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", asciiish).strip()
+
+
+def _conversation_candidate(item: dict) -> dict:
+    return {
+        "id": item.get("id"),
+        "title": item.get("title") or DEFAULT_TITLE,
+        "updated_at": item.get("updated_at"),
+    }
+
+
+def _resolve_ok(item: dict) -> dict:
+    return {
+        "ok": True,
+        "conversation_id": item.get("id"),
+        "title": item.get("title") or DEFAULT_TITLE,
+    }
+
+
+def _resolve_error(code: str, message: str, candidates: list[dict] | None = None) -> dict:
+    result = {"ok": False, "code": code, "message": message}
+    if candidates is not None:
+        result["candidates"] = candidates
+    return result
+
+
+def resolve_conversation_reference(
+    *,
+    conversation_id: str | None = None,
+    title: str | None = None,
+    query: str | None = None,
+    limit: int = 50,
+) -> dict:
+    """Resolve a user-specified conversation reference without guessing.
+
+    Resolution order is exact id, exact normalized title, then a unique
+    contains/token query over recent conversations. Ambiguous or missing
+    references return ``ok:false`` with candidates so the caller can ask for
+    clarification instead of silently picking the wrong chat.
+    """
+
+    raw_id = str(conversation_id or "").strip()
+    if raw_id and raw_id.casefold() != "null":
+        conv = get_conversation(raw_id)
+        if conv is None:
+            return _resolve_error(
+                "conversation_not_found",
+                "conversation_id does not match an existing conversation",
+            )
+        return _resolve_ok(conv)
+
+    items = list_conversations()[: max(1, int(limit or 50))]
+    norm_title = _normalize_lookup_text(title)
+    if norm_title:
+        matches = [
+            item for item in items
+            if _normalize_lookup_text(item.get("title")) == norm_title
+        ]
+        if len(matches) == 1:
+            return _resolve_ok(matches[0])
+        if len(matches) > 1:
+            return _resolve_error(
+                "conversation_ambiguous",
+                "more than one conversation has that title",
+                [_conversation_candidate(item) for item in matches[:8]],
+            )
+        return _resolve_error(
+            "conversation_not_found",
+            "no conversation has that exact title",
+        )
+
+    norm_query = _normalize_lookup_text(query)
+    if norm_query:
+        generic_tokens = {
+            "chat", "conversation", "convo", "discussion", "thread",
+            "le", "la", "les", "un", "une", "des", "du", "de", "au", "aux",
+            "the", "a", "an",
+        }
+        all_tokens = [token for token in norm_query.split(" ") if token]
+        query_tokens = [token for token in all_tokens if token not in generic_tokens]
+        if not query_tokens:
+            query_tokens = all_tokens
+
+        def matches_query(item: dict) -> bool:
+            norm = _normalize_lookup_text(item.get("title"))
+            if not norm:
+                return False
+            return norm_query in norm or all(token in norm for token in query_tokens)
+
+        matches = [item for item in items if matches_query(item)]
+        if len(matches) == 1:
+            return _resolve_ok(matches[0])
+        if len(matches) > 1:
+            return _resolve_error(
+                "conversation_ambiguous",
+                "more than one conversation matches that query",
+                [_conversation_candidate(item) for item in matches[:8]],
+            )
+        return _resolve_error(
+            "conversation_not_found",
+            "no recent conversation matches that query",
+        )
+
+    return _resolve_error(
+        "conversation_not_found",
+        "no conversation reference was provided",
+    )
+
+
 # ── Public API ─────────────────────────────────────────────────────────────
 
 def create_conversation(title: str | None = None) -> dict:
@@ -235,7 +354,13 @@ def list_conversations() -> list[dict]:
     return items
 
 
-def add_message(conv_id: str, role: str, content: str) -> dict | None:
+def add_message(
+    conv_id: str,
+    role: str,
+    content: str,
+    *,
+    metadata: dict | None = None,
+) -> dict | None:
     """Append a message to a conversation, bump ``updated_at``, and
     auto-set the title from the first non-tool user message (if the
     title is still the default).
@@ -247,10 +372,15 @@ def add_message(conv_id: str, role: str, content: str) -> dict | None:
         conv = get_conversation(conv_id)
         if conv is None:
             return None
-        conv.setdefault("messages", []).append({
+        entry = {
             "role": role,
             "content": content,
-        })
+        }
+        if isinstance(metadata, dict):
+            for key, value in metadata.items():
+                if isinstance(key, str) and key.startswith("_"):
+                    entry[key] = value
+        conv.setdefault("messages", []).append(entry)
         conv["updated_at"] = _now_iso()
         if (conv.get("title") in (None, "", DEFAULT_TITLE)
                 and not conv.get("manual_title")

@@ -62,6 +62,8 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "models_list",          "models": [{id,label,provider,tier}, ...], "current": "..."}
     {"type": "file_received",        "filename": "...", "path": "...", "success": true|false}
     {"type": "config",               "config": {...}}                  # full config snapshot (settings incl. api_key_fallbacks, personality, skills)
+    {"type": "cron_notification",    "id": "...", "task_id": "...", "title": "...",
+                                     "status": "completed|failed", "conversation_id": "...", "created_at": "..."}  # in-app fallback for scheduled task completion
     {"type": "status",               "status": "done|error"}           # ack for the config-family setters (create_skill adds "name", restart_server adds "message": "restarting")
     {"type": "autonomous_progress",  "event": "running|interrupted|aborted|plan_failed|busy|idle|task_done|task_failed|salvaged|done|failed",
                                      "tasks_done": int, "tasks_total": int, "phase_name": "...", "objective": "...", "status": "..."}
@@ -84,7 +86,7 @@ import tempfile
 import threading
 import time
 import traceback
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
 
@@ -596,6 +598,10 @@ app = FastAPI(title="OSIA Mobile Server", version="1.0.0")
 # disconnect.
 _WS_CLIENTS: set["_OutboundChannel"] = set()
 
+_CRON_NOTIFICATION_MAX = 30
+_CRON_NOTIFICATIONS: "deque[dict]" = deque(maxlen=_CRON_NOTIFICATION_MAX)
+_CRON_NOTIFICATIONS_LOCK = threading.Lock()
+
 # WOR-96 PART 2a: strong references to in-flight "drive OAuth" background tasks
 # spawned by the mobile mcp_connect handler. asyncio keeps only a WEAK reference
 # to a bare create_task() result, so a fire-and-forget task can be garbage
@@ -755,6 +761,81 @@ async def _broadcast_conversations(exclude: "_OutboundChannel | None" = None) ->
 
 
 # ── MCP / Connectors server-side plumbing (WOR-44 Phase 4) ──────────────────
+def _cron_notification_frame(payload: dict) -> dict:
+    from osia.notifications import safe_task_title
+
+    raw_status = str(payload.get("status") or "").strip().lower()
+    status = "failed" if raw_status in {"failed", "error"} else "completed"
+    created_at = str(payload.get("created_at") or "").strip()
+    if not created_at:
+        created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    task_id = str(payload.get("task_id") or "").strip()
+    conversation_id = str(payload.get("conversation_id") or "").strip()
+    note_id = str(payload.get("id") or "").strip()
+    if not note_id:
+        note_id = f"cron_note_{secrets.token_urlsafe(12).rstrip('=')}"
+    return {
+        "type": "cron_notification",
+        "id": note_id,
+        "task_id": task_id,
+        "title": safe_task_title(payload.get("title")),
+        "status": status,
+        "conversation_id": conversation_id,
+        "created_at": created_at,
+    }
+
+
+def _remember_cron_notification(frame: dict) -> None:
+    with _CRON_NOTIFICATIONS_LOCK:
+        _CRON_NOTIFICATIONS.append(dict(frame))
+
+
+def _pending_cron_notifications() -> list[dict]:
+    with _CRON_NOTIFICATIONS_LOCK:
+        return [dict(frame) for frame in _CRON_NOTIFICATIONS]
+
+
+async def _broadcast_cron_notification(
+    frame: dict,
+    exclude: "_OutboundChannel | None" = None,
+) -> None:
+    for client in list(_WS_CLIENTS):
+        if client is exclude:
+            continue
+        try:
+            await client.send_json(frame)
+        except Exception:
+            _WS_CLIENTS.discard(client)
+
+
+async def _send_pending_cron_notifications(channel: "_OutboundChannel") -> None:
+    for frame in _pending_cron_notifications():
+        try:
+            await channel.send_json(frame)
+        except Exception:
+            return
+
+
+async def _broadcast_conversation_history(conv_id: str | None) -> None:
+    if not conv_id:
+        return
+    conv = conversations.get_conversation(conv_id)
+    if not conv:
+        return
+    frame = {
+        "type": "conversation_history",
+        "id": conv_id,
+        "conversation_id": conv_id,
+        "title": conv.get("title"),
+        "messages": _displayable_history(list(conv.get("messages") or [])),
+    }
+    for client in list(_WS_CLIENTS):
+        try:
+            await client.send_json(frame)
+        except Exception:
+            _WS_CLIENTS.discard(client)
+
+
 def _conversation_busy_frame(conv_id: str) -> dict:
     return {
         "type": "conversation_busy",
@@ -1413,6 +1494,33 @@ async def internal_new_chat(request: Request):
         return {"ok": False, "error": "forbidden"}
     await _broadcast_new_chat()
     return {"ok": True, "clients": len(_WS_CLIENTS)}
+
+
+@app.post("/internal/cron_notification")
+async def internal_cron_notification(request: Request):
+    """Localhost-only desktop trigger for mobile cron notification fallback."""
+
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    frame = _cron_notification_frame(body)
+    _remember_cron_notification(frame)
+    await _broadcast_cron_notification(frame)
+    conv_id = frame.get("conversation_id")
+    if conv_id:
+        await _broadcast_conversations()
+        await _broadcast_conversation_history(str(conv_id))
+    return {
+        "ok": True,
+        "clients": len(_WS_CLIENTS),
+        "id": frame.get("id"),
+    }
 
 
 @app.post("/internal/mcp_sync")
@@ -3480,6 +3588,8 @@ async def websocket_endpoint(ws: WebSocket):
                         f"[WS] auth OK, sending: conversations "
                         f"({len(items)} items)"
                     )
+                    for _cron_frame in _pending_cron_notifications():
+                        await ws.send_json(_cron_frame)
                     for _busy_id in _active_conversation_busy_ids():
                         await ws.send_json(
                             _conversation_busy_changed_frame(_busy_id, True)
@@ -4222,6 +4332,7 @@ async def websocket_endpoint(ws: WebSocket):
                     # EXACT same shape this request/response path does.
                     cfg = _build_config_snapshot()
                     await out.send_json({"type": "config", "config": cfg})
+                    await _send_pending_cron_notifications(out)
                     print(
                         f"[OSIA Server] get_config sent "
                         f"({len(cfg.get('skills', []))} skills)"
@@ -5416,6 +5527,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     history=history,
                     on_sentence=on_sentence,
                     on_first_token=on_first_token,
+                    current_conversation_id=active_conv_id,
                 )
             finally:
                 agent._in_use = False
