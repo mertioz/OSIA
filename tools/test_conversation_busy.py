@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -193,6 +194,58 @@ class ConversationBusyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(frame["conversation_id"], "conv-long")
         self.assertEqual(frame["client_request_id"], "req-long")
         self.assertEqual(frame["turn_id"], "turn-long")
+
+    async def test_turn_progress_loop_continues_during_thread_work(self):
+        client = _FakeChannel()
+        meta = {
+            "conversation_id": "conv-thread",
+            "client_request_id": "req-thread",
+            "turn_id": "turn-thread",
+            "persisted": True,
+        }
+
+        task = asyncio.create_task(
+            server._turn_progress_loop(client, meta, interval=0.01)
+        )
+        worker = asyncio.create_task(asyncio.to_thread(time.sleep, 0.05))
+        await asyncio.sleep(0.035)
+        await worker
+        await server._cancel_turn_progress_task(task)
+
+        self.assertGreaterEqual(len(client.frames), 2)
+        self.assertTrue(
+            all(frame["client_request_id"] == "req-thread"
+                for frame in client.frames)
+        )
+        self.assertTrue(
+            all(frame["turn_id"] == "turn-thread"
+                for frame in client.frames)
+        )
+
+    async def test_turn_progress_loop_broadcasts_to_secondary_clients(self):
+        origin = _FakeChannel()
+        secondary = _FakeChannel()
+        server._WS_CLIENTS.add(origin)
+        server._WS_CLIENTS.add(secondary)
+        meta = {
+            "conversation_id": "conv-broadcast",
+            "client_request_id": "req-broadcast",
+            "turn_id": "turn-broadcast",
+            "persisted": True,
+        }
+
+        task = asyncio.create_task(
+            server._turn_progress_loop(origin, meta, interval=0.01)
+        )
+        await asyncio.sleep(0.025)
+        await server._cancel_turn_progress_task(task)
+
+        self.assertGreaterEqual(len(origin.frames), 1)
+        self.assertGreaterEqual(len(secondary.frames), 1)
+        self.assertEqual(secondary.frames[0]["type"], "turn_status")
+        self.assertEqual(secondary.frames[0]["client_request_id"],
+                         "req-broadcast")
+        self.assertEqual(secondary.frames[0]["turn_id"], "turn-broadcast")
 
     def test_accepted_user_message_persists_with_request_metadata(self):
         old_dir = server.conversations.CONVERSATIONS_DIR

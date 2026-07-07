@@ -943,6 +943,24 @@ def _turn_status_frame(turn_meta: dict, status: str) -> dict:
     return frame
 
 
+async def _broadcast_turn_status(
+    turn_meta: dict | None,
+    status: str,
+    *,
+    exclude: "_OutboundChannel | None" = None,
+) -> None:
+    if not isinstance(turn_meta, dict):
+        return
+    frame = _turn_status_frame(turn_meta, status)
+    for client in list(_WS_CLIENTS):
+        if client is exclude:
+            continue
+        try:
+            await client.send_json(frame)
+        except Exception:
+            _WS_CLIENTS.discard(client)
+
+
 async def _turn_progress_loop(
     channel: "_OutboundChannel",
     turn_meta: dict | None,
@@ -955,6 +973,7 @@ async def _turn_progress_loop(
         while True:
             await asyncio.sleep(interval)
             await channel.send_json(_turn_status_frame(turn_meta, "working"))
+            await _broadcast_turn_status(turn_meta, "working", exclude=channel)
     except asyncio.CancelledError:
         raise
     except Exception as e:
