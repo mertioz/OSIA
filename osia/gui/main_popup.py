@@ -29,7 +29,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import (
     Qt, QEvent, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
-    QRect, QRectF, QPointF, QSize,
+    QRect, QRectF, QPointF, QSize, QFileSystemWatcher,
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap,
@@ -39,6 +39,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QScrollArea, QStackedWidget, QListWidget, QFrame,
     QSizePolicy, QFileDialog, QCheckBox, QComboBox,
     QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog, QLayout, QMenu,
+    QToolTip,
 )
 
 from osia import conversations
@@ -723,7 +724,10 @@ class _ModelRow(QFrame):
 
     selected = pyqtSignal(str)
 
-    def __init__(self, model: dict, is_active: bool):
+    def __init__(
+        self, model: dict, is_active: bool,
+        reasoning_options: list[dict] | None = None,
+    ):
         super().__init__()
         self.setObjectName("modelRow")
         self.setProperty("active", is_active)
@@ -733,10 +737,15 @@ class _ModelRow(QFrame):
         self._name_text = str(model.get("label") or model["id"])
         self._sub_text = str(model.get("id", ""))
         self._reasoning_chip_text = ""
-        try:
-            self._reasoning_options = get_reasoning_options(self._provider, self._mid)
-        except Exception:
-            self._reasoning_options = []
+        if reasoning_options is not None:
+            self._reasoning_options = list(reasoning_options)
+        else:
+            try:
+                self._reasoning_options = get_reasoning_options(
+                    self._provider, self._mid
+                )
+            except Exception:
+                self._reasoning_options = []
 
         row = QHBoxLayout(self)
         row.setContentsMargins(12, 8, 10, 8)
@@ -838,8 +847,12 @@ class _ModelRow(QFrame):
         }
         try:
             cfg = get_reasoning_settings()
+            model_key = (
+                f"chatgpt_account:{self._mid}"
+                if self._provider == "chatgpt_account" else self._mid
+            )
             selected = (
-                (cfg.get("models") or {}).get(self._mid, "auto")
+                (cfg.get("models") or {}).get(model_key, "auto")
                 if isinstance(cfg, dict) else "auto"
             )
         except Exception:
@@ -921,7 +934,11 @@ class _ModelRow(QFrame):
             option_id = "auto"
         cfg = get_reasoning_settings()
         models = dict((cfg or {}).get("models") or {})
-        models[self._mid] = option_id
+        model_key = (
+            f"chatgpt_account:{self._mid}"
+            if self._provider == "chatgpt_account" else self._mid
+        )
+        models[model_key] = option_id
         cfg["models"] = models
         set_reasoning_settings(cfg)
         self._refresh_reasoning_chip()
@@ -955,6 +972,20 @@ class _InfoBadge(QLabel):
         self.setToolTip(i18n.t(self._i18n_key))
 
 
+class _FocusTooltipButton(QPushButton):
+    """Compact info control whose tooltip is also reachable by keyboard."""
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        QToolTip.showText(
+            self.mapToGlobal(self.rect().bottomLeft()), self.toolTip(), self
+        )
+
+    def focusOutEvent(self, event):
+        QToolTip.hideText()
+        super().focusOutEvent(event)
+
+
 class _ProviderGridCard(QFrame):
     """A provider tile in the model panel's first-level grid.
 
@@ -980,7 +1011,11 @@ class _ProviderGridCard(QFrame):
         dot = QLabel()
         dot.setFixedSize(8, 8)
         dot.setStyleSheet("background: #c4b5f5; border-radius: 4px;")
-        name = QLabel(PROVIDERS.get(provider, {}).get("name") or provider.title())
+        name = QLabel(
+            i18n.t("chatgpt_account.title")
+            if provider == "chatgpt_account"
+            else PROVIDERS.get(provider, {}).get("name") or provider.title()
+        )
         name.setObjectName("provGridName")
         top.addWidget(dot)
         top.addWidget(name)
@@ -1016,14 +1051,20 @@ class _ModelPanel(QWidget):
     to the provider grid.
     """
 
-    model_changed = pyqtSignal(str)
+    model_changed = pyqtSignal(str, str)
+    account_refresh_requested = pyqtSignal()
 
-    PROVIDER_ORDER = ("anthropic", "openai", "deepseek", "google", "xai", "groq", "mistral", "ollama")
+    PROVIDER_ORDER = (
+        "chatgpt_account", "anthropic", "openai", "deepseek", "google",
+        "xai", "groq", "mistral", "ollama",
+    )
 
     def __init__(self):
         super().__init__()
         self._current_model: str | None = None
+        self._current_provider: str | None = None
         self._remote: list = []
+        self._account_status: dict | None = None
         self._view: str | None = None   # None = provider grid, else provider key
 
         outer = QVBoxLayout(self)
@@ -1076,6 +1117,12 @@ class _ModelPanel(QWidget):
         i18n.add_listener(self._retranslate)
         self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
 
+        self._account_refresh_timer = QTimer(self)
+        self._account_refresh_timer.setInterval(5000)
+        self._account_refresh_timer.timeout.connect(
+            self.account_refresh_requested.emit
+        )
+
     def _retranslate(self) -> None:
         self._back_btn.setText("←  " + i18n.t("models.back"))
         self.refresh()
@@ -1084,9 +1131,69 @@ class _ModelPanel(QWidget):
         self._remote = remote or []
         self.refresh()
 
-    def set_current(self, model_id: str | None) -> None:
+    def set_current(self, model_id: str | None, provider: str | None = None) -> None:
         self._current_model = model_id
+        self._current_provider = provider
         self.refresh()
+
+    def set_account_status(self, status: dict) -> None:
+        self._account_status = dict(status or {})
+        self.refresh()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.account_refresh_requested.emit()
+        self._account_refresh_timer.start()
+
+    def hideEvent(self, event):
+        self._account_refresh_timer.stop()
+        super().hideEvent(event)
+
+    def _account_models(self) -> list[dict]:
+        status = self._account_status or {}
+        if not status.get("connected") or not status.get("available"):
+            return []
+        models = []
+        for item in status.get("models") or []:
+            if not isinstance(item, dict) or item.get("hidden"):
+                continue
+            model_id = str(item.get("id") or item.get("model") or "").strip()
+            modalities = item.get("inputModalities") or ["text", "image"]
+            if not model_id or "text" not in modalities:
+                continue
+            options = [{
+                "id": "auto", "label": "Default",
+                "label_key": "reasoning.default", "default": True,
+            }]
+            for effort in item.get("supportedReasoningEfforts") or []:
+                effort_id = str(
+                    effort.get("id") if isinstance(effort, dict) else ""
+                ).strip().lower()
+                if effort_id and effort_id != "auto":
+                    options.append({
+                        "id": effort_id,
+                        "label": "Extra high" if effort_id == "xhigh"
+                        else effort_id.title(),
+                        "label_key": f"reasoning.{effort_id}",
+                        "default": False,
+                    })
+            models.append({
+                "id": model_id,
+                "provider": "chatgpt_account",
+                "label": str(item.get("displayName") or model_id),
+                "reasoning_options": options if len(options) > 1 else [],
+            })
+        return models
+
+    def _account_is_visible(self, models: list[dict] | None = None) -> bool:
+        status = self._account_status or {}
+        usable_models = self._account_models() if models is None else models
+        return bool(
+            status.get("connected")
+            and status.get("available")
+            and not status.get("error")
+            and usable_models
+        )
 
     # ── Navigation ─────────────────────────────────────────────────────────
 
@@ -1103,7 +1210,10 @@ class _ModelPanel(QWidget):
             item = self._host_layout.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()
                 w.deleteLater()
+        if self._view == "chatgpt_account" and not self._account_is_visible():
+            self._view = None
         if self._view is None:
             self._build_grid()
         else:
@@ -1116,7 +1226,9 @@ class _ModelPanel(QWidget):
         self._title.setText(i18n.t("models.title"))
         self._sub.setText(i18n.t("models.choose_provider_sub"))
 
-        models = get_all_models(remote_models=self._remote)
+        account_models = self._account_models()
+        models = list(get_all_models(remote_models=self._remote))
+        models.extend(account_models)
         counts: dict[str, int] = {}
         for m in models:
             counts[m["provider"]] = counts.get(m["provider"], 0) + 1
@@ -1127,7 +1239,11 @@ class _ModelPanel(QWidget):
         keys = load_api_keys()
         configured = [
             p for p in self.PROVIDER_ORDER
-            if p == "ollama" or keys.get(p)
+            if (
+                self._account_is_visible(account_models)
+                if p == "chatgpt_account"
+                else bool(counts.get(p)) and (p == "ollama" or keys.get(p))
+            )
         ]
 
         grid_host = QWidget()
@@ -1150,14 +1266,16 @@ class _ModelPanel(QWidget):
     def _build_model_list(self, provider: str) -> None:
         self._back_btn.show()
         self._title.setText(
-            PROVIDERS.get(provider, {}).get("name") or provider.title()
+            i18n.t("chatgpt_account.title")
+            if provider == "chatgpt_account"
+            else PROVIDERS.get(provider, {}).get("name") or provider.title()
         )
         self._sub.setText(i18n.t("models.pick_model_sub"))
 
-        models = [
-            m for m in get_all_models(remote_models=self._remote)
-            if m["provider"] == provider
-        ]
+        all_models = list(get_all_models(remote_models=self._remote))
+        if provider == "chatgpt_account":
+            all_models += self._account_models()
+        models = [m for m in all_models if m["provider"] == provider]
         models.sort(key=lambda m: m.get("label", ""))
 
         if not models:
@@ -1168,10 +1286,34 @@ class _ModelPanel(QWidget):
 
         idx = 0
         for m in models:
-            row = _ModelRow(m, is_active=(m["id"] == self._current_model))
-            row.selected.connect(self.model_changed.emit)
+            is_account = provider == "chatgpt_account"
+            row = _ModelRow(
+                m,
+                is_active=(
+                    m["id"] == self._current_model
+                    and provider == self._current_provider
+                ),
+                reasoning_options=m.get("reasoning_options") if is_account else None,
+            )
+            if is_account:
+                row.selected.connect(self._select_account_model)
+            else:
+                row.selected.connect(
+                    lambda model_id, p=provider: self.model_changed.emit(model_id, p)
+                )
             self._host_layout.insertWidget(idx, row)
             idx += 1
+
+    def _select_account_model(self, model_id: str) -> None:
+        try:
+            from osia.chatgpt_account.provider import get_account_provider
+            get_account_provider().set_selected_model(str(model_id))
+        except Exception:
+            return
+        if self._account_status is not None:
+            self._account_status["selectedModel"] = str(model_id)
+        self.model_changed.emit(str(model_id), "chatgpt_account")
+        self.refresh()
 
 
 # ── Settings panel ──────────────────────────────────────────────────────────
@@ -1955,6 +2097,10 @@ class _SettingsPanel(QWidget):
     _startup_status_ready = pyqtSignal(list)
     # Carries token-safe native Gmail REST status from a background probe.
     _gmail_rest_status_ready = pyqtSignal(dict)
+    # Managed ChatGPT account operations always run off the GUI thread.
+    _chatgpt_status_ready = pyqtSignal(dict)
+    _chatgpt_login_ready = pyqtSignal(dict)
+    chatgpt_status_changed = pyqtSignal(dict)
 
     # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
     # last as an info-only row).
@@ -2047,6 +2193,19 @@ class _SettingsPanel(QWidget):
         self._gmail_rest_oauth_busy = False
         self._gmail_rest_credentials_editing = False
         self._gmail_rest_status_ready.connect(self._apply_gmail_rest_status)
+        self._chatgpt_probe_busy = False
+        self._chatgpt_action_busy = False
+        self._chatgpt_last_status = None
+        self._chatgpt_status_ready.connect(self._apply_chatgpt_status)
+        self._chatgpt_login_ready.connect(self._apply_chatgpt_login_action)
+        self._chatgpt_file_watcher = QFileSystemWatcher(self)
+        self._chatgpt_file_watcher.fileChanged.connect(
+            self._on_chatgpt_auth_storage_changed
+        )
+        self._chatgpt_file_watcher.directoryChanged.connect(
+            self._on_chatgpt_auth_storage_changed
+        )
+        self._configure_chatgpt_file_watcher()
         self._startup_rows: list[tuple[str, QLabel, QCheckBox]] = []
         # Guards the autostart toggle against re-entrant stateChanged while it is
         # being reverted (e.g. on an unsupported platform). See WOR-22.
@@ -2947,13 +3106,28 @@ class _SettingsPanel(QWidget):
         self._hier_add_btns[cat] = add_btn
 
     def _hier_model_choices(self) -> list:
-        """Return ``[(display, "provider:model"), …]`` for configured providers
-        only (those with a saved API key, plus keyless Ollama)."""
+        """Return ``[(display, "provider:model"), …]`` for usable providers."""
         keys = load_api_keys()
         choices = []
-        for m in get_all_models():
+        models = list(get_all_models())
+        account_status = self._chatgpt_last_status or {}
+        if account_status.get("connected") and account_status.get("available"):
+            for item in account_status.get("models") or []:
+                if not isinstance(item, dict) or item.get("hidden"):
+                    continue
+                model_id = str(item.get("id") or item.get("model") or "").strip()
+                modalities = item.get("inputModalities") or ["text", "image"]
+                if not model_id or "text" not in modalities:
+                    continue
+                models.append({
+                    "id": model_id,
+                    "provider": "chatgpt_account",
+                    "label": str(item.get("displayName") or model_id),
+                })
+        for m in models:
             provider = m["provider"]
-            if provider != "ollama" and not keys.get(provider):
+            if (provider not in ("ollama", "chatgpt_account")
+                    and not keys.get(provider)):
                 continue
             pname = PROVIDERS.get(provider, {}).get("name", provider)
             choices.append((f"{pname} · {m.get('label', m['id'])}",
@@ -5909,9 +6083,9 @@ class _SettingsPanel(QWidget):
         self._ai_desc.setWordWrap(True)
         l.addWidget(self._ai_desc)
 
-        # Compact "Choose provider" dropdown: picking a provider reveals only
-        # that provider's configuration card below, instead of stacking every
-        # provider's full card at once.
+        # Compact "Choose provider" dropdown: this is settings navigation only.
+        # The ChatGPT account is a distinct UI entry and remains independent of
+        # the existing OpenAI API-key provider and the effective runtime route.
         sel_row = QHBoxLayout()
         self._ai_prov_label = QLabel(i18n.t("settings.choose_provider"))
         self._ai_prov_label.setObjectName("fieldLabel")
@@ -5919,11 +6093,81 @@ class _SettingsPanel(QWidget):
         self._ai_prov_label.setWordWrap(True)
         self._ai_provider_combo = QComboBox()
         self._ai_provider_combo.setObjectName("voiceCombo")
+        self._ai_provider_combo.addItem(
+            i18n.t("chatgpt_account.title"), "chatgpt_account"
+        )
         for provider in (*self._AI_PROVIDER_ORDER, "ollama"):
             self._ai_provider_combo.addItem(PROVIDERS[provider]["name"], provider)
         sel_row.addWidget(self._ai_prov_label)
         sel_row.addWidget(self._ai_provider_combo, 1)
         l.addLayout(sel_row)
+
+        # Provider-style ChatGPT account surface. It is shown only when its
+        # dedicated settings-navigation entry is selected.
+        self._chatgpt_card = QFrame()
+        self._chatgpt_card.setObjectName("providerCard")
+        self._chatgpt_card.setProperty("settingsEntry", "chatgpt_account")
+        account_l = QVBoxLayout(self._chatgpt_card)
+        account_l.setContentsMargins(12, 10, 12, 10)
+        account_l.setSpacing(7)
+
+        account_head = QHBoxLayout()
+        account_head.setSpacing(7)
+        self._chatgpt_name = QLabel(i18n.t("chatgpt_account.title"))
+        self._chatgpt_name.setObjectName("providerName")
+        self._chatgpt_name.setWordWrap(True)
+        self._chatgpt_status = QLabel(i18n.t("chatgpt_account.checking"))
+        self._chatgpt_status.setObjectName("providerSub")
+        self._chatgpt_status.setWordWrap(True)
+        account_head.addWidget(self._chatgpt_name)
+        account_head.addStretch(1)
+        account_head.addWidget(self._chatgpt_status)
+        self._chatgpt_info_btn = _FocusTooltipButton("i")
+        self._chatgpt_info_btn.setObjectName("infoBadge")
+        self._chatgpt_info_btn.setFixedSize(18, 18)
+        self._chatgpt_info_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._chatgpt_info_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._set_chatgpt_info_text()
+        account_head.addWidget(self._chatgpt_info_btn)
+        account_l.addLayout(account_head)
+
+        self._chatgpt_account_detail = QLabel("")
+        self._chatgpt_account_detail.setObjectName("providerSub")
+        self._chatgpt_account_detail.setWordWrap(True)
+        self._chatgpt_account_detail.setVisible(False)
+        account_l.addWidget(self._chatgpt_account_detail)
+
+        self._chatgpt_usage = QLabel("")
+        self._chatgpt_usage.setObjectName("providerSub")
+        self._chatgpt_usage.setWordWrap(True)
+        self._chatgpt_usage.setVisible(False)
+        account_l.addWidget(self._chatgpt_usage)
+
+        account_actions = QHBoxLayout()
+        account_actions.setSpacing(7)
+        self._chatgpt_connect_btn = QPushButton(i18n.t("chatgpt_account.connect"))
+        self._chatgpt_connect_btn.setObjectName("ghostBtn")
+        self._chatgpt_connect_btn.clicked.connect(self._on_chatgpt_connect)
+        self._chatgpt_cancel_btn = QPushButton(i18n.t("chatgpt_account.cancel"))
+        self._chatgpt_cancel_btn.setObjectName("ghostBtn")
+        self._chatgpt_cancel_btn.clicked.connect(self._on_chatgpt_cancel)
+        self._chatgpt_disconnect_btn = QPushButton(i18n.t("chatgpt_account.disconnect"))
+        self._chatgpt_disconnect_btn.setObjectName("ghostBtn")
+        self._chatgpt_disconnect_btn.clicked.connect(self._on_chatgpt_disconnect)
+        self._chatgpt_retry_btn = QPushButton(i18n.t("chatgpt_account.retry"))
+        self._chatgpt_retry_btn.setObjectName("ghostBtn")
+        self._chatgpt_retry_btn.clicked.connect(self._probe_chatgpt_account)
+        for button in (
+            self._chatgpt_connect_btn, self._chatgpt_cancel_btn,
+            self._chatgpt_disconnect_btn, self._chatgpt_retry_btn,
+        ):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            account_actions.addWidget(button)
+        account_actions.addStretch(1)
+        account_l.addLayout(account_actions)
+        l.addWidget(self._chatgpt_card)
+
+        self._set_chatgpt_ui_state("checking")
 
         # One configuration card per API provider. Each card carries its own
         # "Configurer une clé API" + Naviguer row, key input and Save button
@@ -6058,8 +6302,259 @@ class _SettingsPanel(QWidget):
 
         return wrap
 
+    def _set_chatgpt_ui_state(self, state: str) -> None:
+        connecting = state == "connecting"
+        connected = state == "connected"
+        checking = state == "checking"
+        self._chatgpt_status.setVisible(state != "disconnected")
+        if not connected:
+            self._chatgpt_account_detail.setVisible(False)
+            self._chatgpt_usage.setVisible(False)
+        self._chatgpt_connect_btn.setVisible(state == "disconnected")
+        self._chatgpt_cancel_btn.setVisible(connecting)
+        self._chatgpt_disconnect_btn.setVisible(connected)
+        self._chatgpt_retry_btn.setVisible(state == "error")
+        if checking:
+            self._chatgpt_status.setText(i18n.t("chatgpt_account.checking"))
+        elif connecting:
+            self._chatgpt_status.setText(i18n.t("chatgpt_account.connecting"))
+        elif connected:
+            self._chatgpt_status.setText("✓ " + i18n.t("chatgpt_account.connected"))
+        elif state == "disconnected":
+            self._chatgpt_status.setText(i18n.t("chatgpt_account.disconnected"))
+        for button in (
+            self._chatgpt_connect_btn, self._chatgpt_disconnect_btn,
+            self._chatgpt_retry_btn,
+        ):
+            button.setEnabled(not self._chatgpt_action_busy and not checking)
+
+    def _set_chatgpt_info_text(self) -> None:
+        tooltip = i18n.t("chatgpt_account.info_tooltip")
+        self._chatgpt_info_btn.setToolTip(tooltip)
+        self._chatgpt_info_btn.setAccessibleName(
+            i18n.t("chatgpt_account.info_accessible")
+        )
+        self._chatgpt_info_btn.setAccessibleDescription(tooltip)
+
+    @staticmethod
+    def _chatgpt_status_with_usage(provider) -> dict:
+        status = provider.status(refresh_models=True)
+        if not status.get("connected"):
+            return status
+        selected = str(status.get("selectedModel") or "").strip()
+        if selected and str(get_setting("chatgpt_account_model", "") or "") != selected:
+            # Persist the provider's deterministic default/first valid model when
+            # a saved account model disappeared. This is account-only state and
+            # never touches the manual/API selected_model field.
+            try:
+                provider.set_selected_model(selected)
+            except Exception:
+                # The catalog may have changed between status() and this write.
+                # Keep the valid snapshot visible; the next async refresh retries.
+                pass
+        try:
+            payload = provider.rate_limits()
+            rate_limits = payload.get("rateLimits") if isinstance(payload, dict) else None
+            if isinstance(rate_limits, dict):
+                status = dict(status)
+                status["rateLimits"] = rate_limits
+        except Exception:
+            pass
+        return status
+
+    def _refresh_chatgpt_usage_text(self) -> None:
+        status = self._chatgpt_last_status or {}
+        rate_limits = status.get("rateLimits")
+        primary = rate_limits.get("primary") if isinstance(rate_limits, dict) else None
+        used = primary.get("usedPercent") if isinstance(primary, dict) else None
+        valid = (
+            isinstance(used, int) and not isinstance(used, bool) and 0 <= used <= 100
+        )
+        self._chatgpt_usage.setText(
+            i18n.t("chatgpt_account.usage", percent=used) if valid else ""
+        )
+        self._chatgpt_usage.setVisible(bool(valid and status.get("connected")))
+
+    def _probe_chatgpt_account(self) -> None:
+        if self._chatgpt_probe_busy or self._chatgpt_action_busy:
+            return
+        self._chatgpt_probe_busy = True
+        self._set_chatgpt_ui_state("checking")
+
+        def worker():
+            try:
+                from osia.chatgpt_account.provider import get_account_provider
+                status = self._chatgpt_status_with_usage(get_account_provider())
+            except Exception:
+                status = {
+                    "available": False, "runtimeAvailable": False,
+                    "connected": False, "models": [], "error": "runtime_missing",
+                }
+            self._chatgpt_status_ready.emit(status)
+
+        threading.Thread(
+            target=worker, name="osia-chatgpt-status", daemon=True
+        ).start()
+
+    def _configure_chatgpt_file_watcher(self) -> None:
+        """Watch the shared Codex home for cross-process account changes."""
+        try:
+            from osia.chatgpt_account.provider import get_account_provider
+
+            client = get_account_provider().client
+            home = Path(client.home_dir)
+            auth_file = home / "auth.json"
+            paths = [path for path in (home, auth_file) if path.exists()]
+            if not paths:
+                parent = Path(client.base_dir)
+                while not parent.exists() and parent != parent.parent:
+                    parent = parent.parent
+                if parent.exists():
+                    paths = [parent]
+            current = set(
+                self._chatgpt_file_watcher.files()
+                + self._chatgpt_file_watcher.directories()
+            )
+            wanted = {str(path) for path in paths}
+            stale = list(current - wanted)
+            if stale:
+                self._chatgpt_file_watcher.removePaths(stale)
+            missing = list(wanted - current)
+            if missing:
+                self._chatgpt_file_watcher.addPaths(missing)
+        except Exception:
+            pass
+
+    def _on_chatgpt_auth_storage_changed(self, _path: str) -> None:
+        self._configure_chatgpt_file_watcher()
+        self._probe_chatgpt_account()
+
+    def _apply_chatgpt_status(self, status: dict) -> None:
+        self._chatgpt_probe_busy = False
+        self._chatgpt_action_busy = False
+        self._chatgpt_last_status = dict(status or {})
+        self._refresh_chatgpt_usage_text()
+        connected = bool(status.get("connected"))
+        available = bool(status.get("available"))
+        error = str(status.get("error") or "")
+
+        if connected:
+            account = status.get("account") if isinstance(status.get("account"), dict) else {}
+            details = []
+            if account.get("email"):
+                details.append(str(account["email"]))
+            if account.get("planType") and account.get("planType") != "unknown":
+                details.append(str(account["planType"]).replace("_", " ").title())
+            self._chatgpt_account_detail.setText(" · ".join(details))
+            self._chatgpt_account_detail.setVisible(bool(details))
+            if available:
+                self._set_chatgpt_ui_state("connected")
+            else:
+                self._chatgpt_status.setText(i18n.t("chatgpt_account.error"))
+                self._set_chatgpt_ui_state("error")
+        elif error == "disconnected":
+            self._chatgpt_account_detail.setVisible(False)
+            self._set_chatgpt_ui_state("disconnected")
+        else:
+            self._chatgpt_account_detail.setVisible(False)
+            if error == "runtime_missing":
+                key = "chatgpt_account.runtime_missing"
+            elif error == "runtime_incompatible":
+                key = "chatgpt_account.runtime_incompatible"
+            elif error == "isolation_failed":
+                key = "chatgpt_account.isolation_error"
+            else:
+                key = "chatgpt_account.error"
+            self._chatgpt_status.setText(i18n.t(key))
+            self._set_chatgpt_ui_state("error")
+
+        if hasattr(self, "_hier_values"):
+            self._render_hier_category("heavy")
+            self._render_hier_category("medium")
+        self.chatgpt_status_changed.emit(dict(self._chatgpt_last_status))
+
+    def _on_chatgpt_connect(self) -> None:
+        if self._chatgpt_action_busy:
+            return
+        self._chatgpt_action_busy = True
+        self._set_chatgpt_ui_state("connecting")
+
+        def worker():
+            try:
+                from osia.chatgpt_account.provider import get_account_provider
+                provider = get_account_provider()
+                login = provider.begin_login()
+                self._chatgpt_login_ready.emit(
+                    {"authUrl": login["authUrl"], "loginId": login["loginId"]}
+                )
+                provider.wait_for_login(login["loginId"], timeout=300.0)
+                status = self._chatgpt_status_with_usage(provider)
+            except Exception as exc:
+                category = str(getattr(exc, "category", "login_failed"))
+                status = {
+                    "available": False, "runtimeAvailable": True,
+                    "connected": False, "models": [],
+                    "error": "disconnected" if category == "login_cancelled" else "login_failed",
+                }
+            self._chatgpt_status_ready.emit(status)
+
+        threading.Thread(
+            target=worker, name="osia-chatgpt-login", daemon=True
+        ).start()
+
+    def _apply_chatgpt_login_action(self, action: dict) -> None:
+        auth_url = str(action.get("authUrl") or "")
+        if auth_url:
+            # Exactly one system-browser open per single-flight login. The raw
+            # URL is never persisted or logged.
+            threading.Thread(
+                target=lambda: webbrowser.open(auth_url, new=2),
+                name="osia-chatgpt-browser", daemon=True,
+            ).start()
+
+    def _on_chatgpt_cancel(self) -> None:
+        if not self._chatgpt_action_busy:
+            return
+
+        def worker():
+            try:
+                from osia.chatgpt_account.provider import get_account_provider
+                get_account_provider().cancel_login()
+            except Exception:
+                pass
+            self._chatgpt_status_ready.emit(
+                {"available": False, "runtimeAvailable": True,
+                 "connected": False, "models": [], "error": "disconnected"}
+            )
+
+        threading.Thread(
+            target=worker, name="osia-chatgpt-login-cancel", daemon=True
+        ).start()
+
+    def _on_chatgpt_disconnect(self) -> None:
+        if self._chatgpt_action_busy:
+            return
+        self._chatgpt_action_busy = True
+        self._set_chatgpt_ui_state("checking")
+
+        def worker():
+            try:
+                from osia.chatgpt_account.provider import get_account_provider
+                get_account_provider().logout()
+            except Exception:
+                pass
+            self._chatgpt_status_ready.emit(
+                {"available": False, "runtimeAvailable": True,
+                 "connected": False, "models": [], "error": "disconnected"}
+            )
+
+        threading.Thread(
+            target=worker, name="osia-chatgpt-logout", daemon=True
+        ).start()
+
     def _on_ai_provider_changed(self, _idx: int) -> None:
         provider = self._ai_provider_combo.currentData()
+        self._chatgpt_card.setVisible(provider == "chatgpt_account")
         for p, card in self._provider_cards.items():
             card.setVisible(p == provider)
         self._ollama_row.setVisible(provider == "ollama")
@@ -6585,6 +7080,19 @@ class _SettingsPanel(QWidget):
         self._ai_sub.setText(i18n.t("settings.ai_providers_sub"))
         self._ai_desc.setText(i18n.t("settings.ai_providers_desc"))
         self._ai_prov_label.setText(i18n.t("settings.choose_provider"))
+        self._chatgpt_name.setText(i18n.t("chatgpt_account.title"))
+        for index in range(self._ai_provider_combo.count()):
+            if self._ai_provider_combo.itemData(index) == "chatgpt_account":
+                self._ai_provider_combo.setItemText(
+                    index, i18n.t("chatgpt_account.title")
+                )
+                break
+        self._set_chatgpt_info_text()
+        self._refresh_chatgpt_usage_text()
+        self._chatgpt_connect_btn.setText(i18n.t("chatgpt_account.connect"))
+        self._chatgpt_cancel_btn.setText(i18n.t("chatgpt_account.cancel"))
+        self._chatgpt_disconnect_btn.setText(i18n.t("chatgpt_account.disconnect"))
+        self._chatgpt_retry_btn.setText(i18n.t("chatgpt_account.retry"))
 
         # Vision companion (WOR-25)
         self._vision_heading.setText(i18n.t("settings.vision_model"))
@@ -6799,6 +7307,9 @@ class _SettingsPanel(QWidget):
         super().showEvent(event)
         with perf_timer("settings.showEvent: _load_state"):
             self._load_state()
+        # Lazy, asynchronous account discovery: constructing OSIA never starts
+        # Codex, and opening Settings remains responsive when it is unavailable.
+        self._probe_chatgpt_account()
         with perf_timer("settings.showEvent: _refresh_startup_status (async)"):
             self._refresh_startup_status()
         self._startup_timer.start()
@@ -7746,8 +8257,9 @@ class MainPopup(QWidget):
     open_conversation = pyqtSignal(str)
     rename_conversation = pyqtSignal(str, str)
     delete_conversation = pyqtSignal(str)
-    model_changed = pyqtSignal(str)
+    model_changed = pyqtSignal(str, str)
     api_keys_saved = pyqtSignal(dict)
+    chatgpt_status_changed = pyqtSignal(dict)
     # Re-emitted from the settings panel: the floating-capsule visibility toggle
     # (WOR-22). The host wires it to the Dynamic Island's set_capsule_visible.
     capsule_visibility_changed = pyqtSignal(bool)
@@ -7910,6 +8422,15 @@ class MainPopup(QWidget):
 
         self._settings = _SettingsPanel()
         self._settings.api_keys_saved.connect(self.api_keys_saved.emit)
+        self._settings.chatgpt_status_changed.connect(
+            self._models.set_account_status
+        )
+        self._settings.chatgpt_status_changed.connect(
+            self.chatgpt_status_changed.emit
+        )
+        self._models.account_refresh_requested.connect(
+            self._settings._probe_chatgpt_account
+        )
         self._settings.capsule_visibility_changed.connect(
             self.capsule_visibility_changed.emit
         )
@@ -8131,8 +8652,12 @@ class MainPopup(QWidget):
     def show_conversation_busy_notice(self) -> None:
         self._chat.show_notice(_ChatPage._BUSY_TEXT)
 
-    def set_current_model(self, model_id: str | None) -> None:
-        self._models.set_current(model_id)
+    def set_current_model(
+        self,
+        model_id: str | None,
+        provider: str | None = None,
+    ) -> None:
+        self._models.set_current(model_id, provider)
 
     def set_remote_models(self, remote: list) -> None:
         self._models.set_remote_models(remote)
@@ -8201,10 +8726,10 @@ class MainPopup(QWidget):
         self.open_conversation.emit(conv_id)
         self.show_chat()
 
-    def _on_model_selected(self, model_id: str) -> None:
-        self.model_changed.emit(model_id)
+    def _on_model_selected(self, model_id: str, provider: str) -> None:
+        self.model_changed.emit(model_id, provider)
         # Show the new selection state immediately.
-        self._models.set_current(model_id)
+        self._models.set_current(model_id, provider)
 
     # ── Dragging (WOR-74) ─────────────────────────────────────────────────
     # Buttons, inputs and list rows accept their own mouse presses, so any
@@ -8707,6 +9232,19 @@ class MainPopup(QWidget):
                 color: #c4b5f5;
                 font-size: 9px;
                 font-weight: 700;
+            }
+            QPushButton#infoBadge {
+                background: rgba(196, 181, 245, 0.18);
+                border: 1px solid #c4b5f5;
+                border-radius: 9px;
+                color: #c4b5f5;
+                padding: 0px;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QPushButton#infoBadge:hover, QPushButton#infoBadge:focus {
+                background: rgba(196, 181, 245, 0.30);
+                border-color: #e8e6f0;
             }
 
             /* Mobile token + reveal dialog ──────────────────────────────── */

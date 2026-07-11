@@ -15,7 +15,12 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "delete_conversation",  "id": "..."}
     {"type": "rename_conversation",  "id": "...", "title": "..."}       # WOR-76: rename a conversation; acks {conversation_renamed, success}, then sends the refreshed list to the caller and broadcasts it to other devices
     {"type": "get_models"}
-    {"type": "set_model",            "model": "..."}
+    {"type": "set_model",            "provider": "...", "model": "..."}
+    {"type": "set_model_reasoning",  "provider": "...", "model": "...", "reasoning": "..."}
+    {"type": "get_chatgpt_account"}
+    {"type": "chatgpt_account_login"}
+    {"type": "chatgpt_account_cancel_login"}
+    {"type": "chatgpt_account_logout"}
     {"type": "file",                 "filename": "...", "data": "<base64>"}
     {"type": "speak",                "text": "..."}      # synthesize text → audio frame sent back to the phone
     {"type": "set_api_key",          "provider": "...", "key": "..."}  # save a provider key; empty key deletes it entirely (config/api_keys.json)
@@ -59,7 +64,10 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "conversation_deleted", "id": "...", "success": true|false}
     {"type": "active_conversation",  "id": "...", "title": "..."}
     {"type": "new_chat"}                                               # broadcast to OTHER connected devices when one device starts a new chat, so every UI clears (WOR-10)
-    {"type": "models_list",          "models": [{id,label,provider,tier}, ...], "current": "..."}
+    {"type": "models_list",          "catalogue": {"version": 1, "providers": [...]},
+                                       "models": [...], "current": "...", "current_provider": "...",
+                                       "account": {...}}
+    {"type": "chatgpt_account_state", "account": {...}}
     {"type": "file_received",        "filename": "...", "path": "...", "success": true|false}
     {"type": "config",               "config": {...}}                  # full config snapshot (settings incl. api_key_fallbacks, personality, skills)
     {"type": "cron_notification",    "id": "...", "task_id": "...", "title": "...",
@@ -597,6 +605,7 @@ app = FastAPI(title="OSIA Mobile Server", version="1.0.0")
 # Starlette's send state). Populated after a successful auth, pruned on
 # disconnect.
 _WS_CLIENTS: set["_OutboundChannel"] = set()
+_MOBILE_CATALOGUE_BROADCAST_LOCK: asyncio.Lock | None = None
 
 _CRON_NOTIFICATION_MAX = 30
 _CRON_NOTIFICATIONS: "deque[dict]" = deque(maxlen=_CRON_NOTIFICATION_MAX)
@@ -1542,6 +1551,68 @@ async def _broadcast_memory_updated(
             await client.send_json(frame)
         except Exception:
             _WS_CLIENTS.discard(client)
+
+
+async def _broadcast_mobile_catalogue(
+    *, refresh_account: bool, include_account_state: bool = False
+) -> dict:
+    """Rebuild once and fan one sanitized catalogue to every mobile client."""
+    global _MOBILE_CATALOGUE_BROADCAST_LOCK
+    from osia.mobile_model_catalogue import build_catalogue
+
+    if _MOBILE_CATALOGUE_BROADCAST_LOCK is None:
+        _MOBILE_CATALOGUE_BROADCAST_LOCK = asyncio.Lock()
+    async with _MOBILE_CATALOGUE_BROADCAST_LOCK:
+        catalogue = await asyncio.to_thread(
+            build_catalogue,
+            refresh_local=False,
+            refresh_account=refresh_account,
+        )
+        frames = [{
+            "type": "models_list",
+            "catalogue": {
+                "version": catalogue["version"],
+                "providers": catalogue["providers"],
+            },
+            "models": catalogue["models"],
+            "current": catalogue["current"],
+            "current_provider": catalogue["currentProvider"],
+            "account": catalogue["account"],
+        }]
+        if include_account_state:
+            frames.append({
+                "type": "chatgpt_account_state",
+                "account": catalogue["account"],
+            })
+        for frame in frames:
+            for client in list(_WS_CLIENTS):
+                try:
+                    await client.send_json(frame)
+                except Exception:
+                    _WS_CLIENTS.discard(client)
+        return catalogue
+
+
+@app.post("/internal/mobile_catalogue_changed")
+async def internal_mobile_catalogue_changed(request: Request):
+    """Loopback-only PC Settings signal; carries no key or provider value."""
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    await _broadcast_mobile_catalogue(refresh_account=False)
+    return {"ok": True, "clients": len(_WS_CLIENTS)}
+
+
+@app.post("/internal/chatgpt_account_changed")
+async def internal_chatgpt_account_changed(request: Request):
+    """Loopback-only PC account signal; broadcasts sanitized state/catalogue."""
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    await _broadcast_mobile_catalogue(
+        refresh_account=True, include_account_state=True
+    )
+    return {"ok": True, "clients": len(_WS_CLIENTS)}
 
 
 @app.post("/internal/new_chat")
@@ -3440,11 +3511,12 @@ async def websocket_endpoint(ws: WebSocket):
     # worker-thread provider reads the right (channel, loop). Each connection has
     # its own context, so a confirm never reaches the wrong device.
     _turn_target.set((out, asyncio.get_running_loop()))
+    loop = asyncio.get_running_loop()
     unsubscribe_scheduled_tasks = None
+    unsubscribe_api_key_changes = None
+    unsubscribe_account_changes = None
     try:
         from osia import scheduled_tasks as _scheduled_tasks
-
-        loop = asyncio.get_running_loop()
 
         def _scheduled_tasks_changed() -> None:
             try:
@@ -3473,6 +3545,155 @@ async def websocket_endpoint(ws: WebSocket):
     # Live system-metrics push task (heartbeat_data frames). Created once after
     # a successful auth, cancelled in the finally block on disconnect.
     heartbeat_task: asyncio.Task | None = None
+    remote_catalogue_refresh_pending = False
+    chatgpt_login_started_here = False
+    catalogue_change_task: asyncio.Task | None = None
+    account_change_task: asyncio.Task | None = None
+    catalogue_change_again = False
+    account_change_again = False
+
+    async def _send_model_catalogue(
+        *, refresh_local: bool = True, refresh_account: bool = True
+    ) -> None:
+        """Send one safe PC-authoritative catalogue without blocking the loop."""
+        from osia.mobile_model_catalogue import build_catalogue
+
+        catalogue = await asyncio.to_thread(
+            build_catalogue,
+            refresh_local=refresh_local,
+            refresh_account=refresh_account,
+        )
+        await out.send_json({
+            "type": "models_list",
+            "catalogue": {
+                "version": catalogue["version"],
+                "providers": catalogue["providers"],
+            },
+            # Backward-compatible flat view for existing mobile consumers.
+            "models": catalogue["models"],
+            "current": catalogue["current"],
+            "current_provider": catalogue["currentProvider"],
+            "account": catalogue["account"],
+        })
+
+    def _request_remote_catalogue_refresh() -> None:
+        """Coalesce remote discovery and push its safe result on this socket."""
+        nonlocal remote_catalogue_refresh_pending
+        from osia.mobile_model_catalogue import request_remote_refresh
+
+        if remote_catalogue_refresh_pending:
+            return
+        remote_catalogue_refresh_pending = True
+
+        def ready() -> None:
+            nonlocal remote_catalogue_refresh_pending
+            remote_catalogue_refresh_pending = False
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _send_model_catalogue(
+                        refresh_local=False, refresh_account=False
+                    ),
+                    loop,
+                )
+            except Exception:
+                pass
+
+        request_remote_refresh(ready)
+
+    def _push_chatgpt_account_state(state: dict) -> None:
+        """Thread-safe, sanitized account update callback for login workers."""
+        nonlocal chatgpt_login_started_here
+        if not state.get("connecting"):
+            chatgpt_login_started_here = False
+        try:
+            asyncio.run_coroutine_threadsafe(
+                out.send_json({"type": "chatgpt_account_state", "account": state}),
+                loop,
+            )
+            if not state.get("connecting"):
+                asyncio.run_coroutine_threadsafe(
+                    _send_model_catalogue(
+                        refresh_local=False, refresh_account=False
+                    ),
+                    loop,
+                )
+        except Exception:
+            pass
+
+    def _api_key_changed(provider_id: str) -> None:
+        """Coalesce canonical PC/mobile key changes into one catalogue push."""
+        from osia.models import API_PROVIDERS
+
+        if not authenticated or provider_id not in API_PROVIDERS:
+            return
+
+        def schedule() -> None:
+            nonlocal catalogue_change_task, catalogue_change_again
+            if catalogue_change_task is not None and not catalogue_change_task.done():
+                catalogue_change_again = True
+                return
+
+            async def refresh() -> None:
+                nonlocal catalogue_change_task, catalogue_change_again
+                try:
+                    while True:
+                        catalogue_change_again = False
+                        await _send_model_catalogue(
+                            refresh_local=False, refresh_account=False
+                        )
+                        if not catalogue_change_again:
+                            break
+                finally:
+                    catalogue_change_task = None
+
+            catalogue_change_task = asyncio.create_task(refresh())
+
+        loop.call_soon_threadsafe(schedule)
+
+    def _account_changed() -> None:
+        """Push one fresh sanitized snapshot after a PC-side account change."""
+        if not authenticated:
+            return
+
+        def schedule() -> None:
+            nonlocal account_change_task, account_change_again
+            if account_change_task is not None and not account_change_task.done():
+                account_change_again = True
+                return
+
+            async def refresh() -> None:
+                nonlocal account_change_task, account_change_again
+                try:
+                    from osia.mobile_model_catalogue import account_snapshot
+
+                    while True:
+                        account_change_again = False
+                        state = await asyncio.to_thread(
+                            account_snapshot, refresh_models=False
+                        )
+                        await out.send_json({
+                            "type": "chatgpt_account_state", "account": state
+                        })
+                        await _send_model_catalogue(
+                            refresh_local=False, refresh_account=False
+                        )
+                        if not account_change_again:
+                            break
+                finally:
+                    account_change_task = None
+
+            account_change_task = asyncio.create_task(refresh())
+
+        loop.call_soon_threadsafe(schedule)
+
+    try:
+        from osia.config import add_api_key_change_listener
+        from osia.chatgpt_account.provider import add_account_change_listener
+
+        unsubscribe_api_key_changes = add_api_key_change_listener(_api_key_changed)
+        unsubscribe_account_changes = add_account_change_listener(_account_changed)
+    except Exception as e:
+        print(f"[OSIA Server] mobile catalogue change hooks unavailable: {e}")
 
     # ── Streaming-turn machinery (head-of-line fix) ──────────────────────
     # A user message (text / audio / image) runs in a SEPARATE task so the
@@ -3729,11 +3950,11 @@ async def websocket_endpoint(ws: WebSocket):
             # see whether auth arrives as text and in the expected shape.
             if not first_message_logged:
                 first_message_logged = True
-                print(f"[WS] first message: {repr(raw_msg)[:200]}")
+                print(f"[WS] first message received ({len(raw_msg)} chars)")
             try:
                 msg = json.loads(raw_msg)
             except json.JSONDecodeError:
-                print(f"[WS] bad JSON frame (not closing): {repr(raw_msg)[:120]}")
+                print(f"[WS] bad JSON frame (not closing, {len(raw_msg)} chars)")
                 # Post-auth, funnel through the writer (heartbeat/streams may be
                 # sending). Pre-auth there is no other sender AND the auth burst
                 # below sends on ws directly — so send directly too, never
@@ -3753,14 +3974,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # on load — tolerate stray whitespace/newlines from clients.
                 token = raw_token.strip() if isinstance(raw_token, str) else ""
                 matched = token == MOBILE_TOKEN
-                masked = (
-                    f"{token[:4]}…{token[-4:]} (len={len(token)})"
-                    if token else "<empty>"
-                )
-                print(
-                    f"[WS] auth attempt: token={masked} "
-                    f"expected_len={len(MOBILE_TOKEN)} matches={matched}"
-                )
+                print(f"[WS] auth attempt received (matches={matched})")
                 if matched:
                     authenticated = True
                     session_history = []
@@ -4068,33 +4282,149 @@ async def websocket_endpoint(ws: WebSocket):
             # --- Models ---
             if msg_type == "get_models":
                 try:
-                    from osia.models import get_all_models
-                    from osia.config import load_settings
-                    models = get_all_models()
-                    current = load_settings().get("selected_model")
+                    await _send_model_catalogue()
+                    _request_remote_catalogue_refresh()
                 except Exception as e:
                     print(f"[OSIA Server] get_models failed: {e}")
-                    models, current = [], None
-                await out.send_json({
-                    "type": "models_list",
-                    "models": models,
-                    "current": current,
-                })
+                    await out.send_json({
+                        "type": "models_list",
+                        "catalogue": {"version": 1, "providers": []},
+                        "models": [],
+                        "current": None,
+                        "current_provider": None,
+                        "account": {},
+                    })
                 continue
 
             if msg_type == "set_model":
+                provider_id = (msg.get("provider") or "").strip().lower()
                 model_id = (msg.get("model") or "").strip()
-                if not model_id:
+                if model_id and not provider_id:
+                    # Backward compatibility for older mobile builds. New
+                    # clients always send the exact provider/model pair.
+                    from osia.models import provider_for_model
+
+                    provider_id = provider_for_model(model_id)
+                if not provider_id or not model_id:
                     await out.send_json({"type": "status", "content": "error"})
                     continue
                 try:
-                    from osia.config import set_setting
-                    set_setting("selected_model", model_id)
-                    print(f"[OSIA Server] selected_model -> {model_id!r}")
-                    await out.send_json({"type": "status", "content": "done"})
+                    from osia.mobile_model_catalogue import validate_and_select
+
+                    selected = await asyncio.to_thread(
+                        validate_and_select, provider_id, model_id
+                    )
+                    if selected:
+                        print(
+                            "[OSIA Server] selected provider/model -> "
+                            f"{provider_id!r}/{model_id!r}"
+                        )
+                        await out.send_json({"type": "status", "content": "done"})
+                        await _send_model_catalogue(
+                            refresh_local=False, refresh_account=False
+                        )
+                    else:
+                        await out.send_json({"type": "status", "content": "error"})
                 except Exception as e:
-                    print(f"[OSIA Server] set_model({model_id!r}) failed: {e}")
+                    print(
+                        "[OSIA Server] set_model failed for sanitized "
+                        f"provider/model {provider_id!r}/{model_id!r}: {e}"
+                    )
                     await out.send_json({"type": "status", "content": "error"})
+                continue
+
+            if msg_type == "set_model_reasoning":
+                provider_id = (msg.get("provider") or "").strip().lower()
+                model_id = (msg.get("model") or "").strip()
+                option_id = (msg.get("reasoning") or "").strip().lower()
+                try:
+                    from osia.mobile_model_catalogue import validate_and_set_reasoning
+
+                    saved = await asyncio.to_thread(
+                        validate_and_set_reasoning,
+                        provider_id,
+                        model_id,
+                        option_id,
+                    )
+                    await out.send_json({
+                        "type": "status",
+                        "content": "done" if saved else "error",
+                    })
+                    if saved:
+                        await _send_model_catalogue(
+                            refresh_local=False, refresh_account=False
+                        )
+                except Exception:
+                    await out.send_json({"type": "status", "content": "error"})
+                continue
+
+            if msg_type == "get_chatgpt_account":
+                try:
+                    from osia.mobile_model_catalogue import account_snapshot
+
+                    state = await asyncio.to_thread(account_snapshot)
+                except Exception:
+                    state = {
+                        "providerId": "chatgpt_account",
+                        "runtimeAvailable": False,
+                        "connected": False,
+                        "connecting": False,
+                        "loginCancellable": False,
+                        "available": False,
+                        "error": "runtime_missing",
+                        "models": [],
+                    }
+                await out.send_json({
+                    "type": "chatgpt_account_state", "account": state
+                })
+                continue
+
+            if msg_type == "chatgpt_account_login":
+                chatgpt_login_started_here = True
+                try:
+                    from osia.mobile_model_catalogue import start_device_login
+
+                    state = await asyncio.to_thread(
+                        start_device_login, _push_chatgpt_account_state
+                    )
+                except Exception:
+                    state = {
+                        "providerId": "chatgpt_account",
+                        "runtimeAvailable": False,
+                        "connected": False,
+                        "connecting": False,
+                        "loginCancellable": False,
+                        "available": False,
+                        "error": "login_failed",
+                        "models": [],
+                    }
+                await out.send_json({
+                    "type": "chatgpt_account_state", "account": state
+                })
+                continue
+
+            if msg_type == "chatgpt_account_cancel_login":
+                from osia.mobile_model_catalogue import cancel_device_login
+
+                state = await asyncio.to_thread(cancel_device_login)
+                await out.send_json({
+                    "type": "chatgpt_account_state", "account": state
+                })
+                await _send_model_catalogue(
+                    refresh_local=False, refresh_account=False
+                )
+                continue
+
+            if msg_type == "chatgpt_account_logout":
+                from osia.mobile_model_catalogue import logout_account
+
+                state = await asyncio.to_thread(logout_account)
+                await out.send_json({
+                    "type": "chatgpt_account_state", "account": state
+                })
+                await _send_model_catalogue(
+                    refresh_local=False, refresh_account=False
+                )
                 continue
 
             # --- Autonomous agent (WOR-45 Phase 5) ---
@@ -4262,22 +4592,14 @@ async def websocket_endpoint(ws: WebSocket):
                     await out.send_json({"type": "status", "status": "error"})
                     continue
                 try:
-                    from osia.config import (
-                        set_api_key, load_api_keys, save_api_keys,
-                    )
+                    from osia.config import set_api_key
+                    set_api_key(provider, key)
                     if key:
-                        set_api_key(provider, key)
                         print(
                             f"[OSIA Server] set_api_key provider={provider!r} "
                             f"(set, len={len(key)})"
                         )
                     else:
-                        # An empty value means "delete": drop the entry from
-                        # api_keys.json entirely rather than storing "". Same
-                        # behavior as the delete_api_key handler below.
-                        keys = load_api_keys()
-                        keys.pop(provider, None)
-                        save_api_keys(keys)
                         print(
                             f"[OSIA Server] set_api_key provider={provider!r} "
                             f"(empty -> deleted)"
@@ -4285,6 +4607,7 @@ async def websocket_endpoint(ws: WebSocket):
                     # Reused agents must re-read this provider's key next turn.
                     _invalidate_cached_models(provider)
                     await out.send_json({"type": "status", "status": "done"})
+                    _request_remote_catalogue_refresh()
                 except Exception as e:
                     print(f"[OSIA Server] set_api_key({provider!r}) failed: {e}")
                     await out.send_json({"type": "status", "status": "error"})
@@ -4299,10 +4622,10 @@ async def websocket_endpoint(ws: WebSocket):
                     await out.send_json({"type": "status", "status": "error"})
                     continue
                 try:
-                    from osia.config import load_api_keys, save_api_keys
+                    from osia.config import load_api_keys, set_api_key
                     keys = load_api_keys()
-                    existed = keys.pop(provider, None) is not None
-                    save_api_keys(keys)
+                    existed = provider in keys
+                    set_api_key(provider, "")
                     print(
                         f"[OSIA Server] delete_api_key provider={provider!r} "
                         f"({'removed' if existed else 'absent'})"
@@ -4310,6 +4633,7 @@ async def websocket_endpoint(ws: WebSocket):
                     # Reused agents must re-read this provider's key next turn.
                     _invalidate_cached_models(provider)
                     await out.send_json({"type": "status", "status": "done"})
+                    _request_remote_catalogue_refresh()
                 except Exception as e:
                     print(f"[OSIA Server] delete_api_key({provider!r}) failed: {e}")
                     await out.send_json({"type": "status", "status": "error"})
@@ -4459,7 +4783,7 @@ async def websocket_endpoint(ws: WebSocket):
                         get_setting,
                         set_reasoning_settings,
                     )
-                    logged_value = setting_value
+                    logged_detail = "updated"
                     if setting_key in ("heavy_chain", "medium_chain"):
                         # heavy_chain/medium_chain are the flat names the mobile
                         # app uses for the two ordered fallback chains that live
@@ -4475,6 +4799,7 @@ async def websocket_endpoint(ws: WebSocket):
                             v for v in chain if isinstance(v, str) and v
                         ]
                         set_setting("ai_hierarchy", hierarchy)
+                        logged_detail = f"{len(hierarchy[category])} item(s)"
                     elif setting_key == "mcp_servers":
                         # mcp_servers is a list of NON-SECRET server configs. A
                         # token must NEVER reach the git-tracked settings.json —
@@ -4496,11 +4821,11 @@ async def websocket_endpoint(ws: WebSocket):
                                     e.pop("headers", None)
                                     clean.append(e)
                         set_setting("mcp_servers", clean)
-                        logged_value = clean
+                        logged_detail = f"{len(clean)} server(s)"
                     elif setting_key == "reasoning":
                         clean_reasoning = _normalize_mobile_reasoning_setting(setting_value)
                         set_reasoning_settings(clean_reasoning)
-                        logged_value = clean_reasoning
+                        logged_detail = "updated"
                     elif setting_key == "cron_jobs":
                         from osia import scheduled_tasks
 
@@ -4515,7 +4840,7 @@ async def websocket_endpoint(ws: WebSocket):
                             )
                             await out.send_json({"type": "status", "status": "error"})
                             continue
-                        logged_value = result.get("jobs", [])
+                        logged_detail = f"{len(result.get('jobs', []))} job(s)"
                     else:
                         set_setting(setting_key, setting_value)
                     # WOR-44 Phase 5: for mcp_servers log the SANITIZED `clean`
@@ -4526,7 +4851,7 @@ async def websocket_endpoint(ws: WebSocket):
                     # branch, where it is always bound.
                     print(
                         f"[OSIA Server] set_setting {setting_key!r} -> "
-                        f"{logged_value!r}"
+                        f"{logged_detail}"
                     )
                     await out.send_json({"type": "status", "status": "done"})
                 except Exception as e:
@@ -5096,7 +5421,7 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 print(
                     f"[OSIA Server] speak request "
-                    f"({len(speak_text)} chars: {speak_text[:60]!r})"
+                    f"({len(speak_text)} chars)"
                 )
                 try:
                     # Off-thread so the event loop keeps serving while the
@@ -5154,7 +5479,7 @@ async def websocket_endpoint(ws: WebSocket):
                         # Non-image: queue for the next text/audio turn.
                         pending_files.append(str(target))
                     print(
-                        f"[OSIA Server] file received: {safe_name!r} -> {target} "
+                        f"[OSIA Server] file received "
                         f"({target.stat().st_size} bytes)"
                     )
                     await out.send_json({
@@ -5315,6 +5640,22 @@ async def websocket_endpoint(ws: WebSocket):
         # Drop this client from the broadcast registry (WOR-10). discard() is
         # a no-op if it was never added (e.g. auth failed).
         _WS_CLIENTS.discard(out)
+        for unsubscribe in (
+            unsubscribe_api_key_changes,
+            unsubscribe_account_changes,
+        ):
+            if unsubscribe is not None:
+                try:
+                    unsubscribe()
+                except Exception:
+                    pass
+        if chatgpt_login_started_here:
+            try:
+                from osia.mobile_model_catalogue import cancel_device_login
+
+                await asyncio.to_thread(cancel_device_login)
+            except Exception:
+                pass
         if unsubscribe_scheduled_tasks is not None:
             try:
                 unsubscribe_scheduled_tasks()
@@ -5568,7 +5909,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     if t0 is None:
         t0 = time.perf_counter()
         if isinstance(text, str):
-            _ts(t0, "text received", f"({len(text)} chars: {text[:60]!r})")
+            _ts(t0, "text received", f"({len(text)} chars)")
         else:
             _ts(t0, "vision content received", f"({len(text)} parts)")
 
@@ -5672,9 +6013,13 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             if not first_chunk_sent_logged[0]:
                 first_chunk_sent_logged[0] = True
                 _ts(t0, "first response_chunk sent to mobile",
-                    f"({len(item)} chars: {item[:60]!r})")
+                    f"({len(item)} chars)")
             try:
-                print(f"[DEBUG] sending to mobile: {repr(item[:200])}", flush=True)
+                print(
+                    f"[DEBUG] sending response_chunk to mobile "
+                    f"({len(item)} chars)",
+                    flush=True,
+                )
                 await ws.send_json({
                     "type": "response_chunk", "content": item,
                     "conversation_id": active_conv_id,
@@ -5729,7 +6074,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 }
                 for m in history[-2:]
             ]
-            print(f"[OSIA Server]   last 2 history items: {tail_preview}")
+            print(f"[OSIA Server]   last 2 history item count: {len(tail_preview)}")
         _ts(t0, "agent.run started",
             f"(model={agent.model}, provider={agent.provider}, "
             f"history={len(history)} msgs, TOOL_MAP={len(TOOL_MAP)} tools, "
@@ -5761,7 +6106,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         await _cancel_turn_progress_task(progress_task)
         progress_task = None
         print(
-            f"[DEBUG] agent.run() returned: {repr((response_text or '')[:200])}",
+            f"[DEBUG] agent.run() returned "
+            f"({len(response_text or '')} chars)",
             flush=True,
         )
     except asyncio.CancelledError:
@@ -5825,7 +6171,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         from osia.agent import strip_raw_tool_tags
         response_text = strip_raw_tool_tags(response_text).strip()
     print(
-        f"[DEBUG] cleaned response: {repr((response_text or '')[:200])}",
+        f"[DEBUG] cleaned response ({len(response_text or '')} chars)",
         flush=True,
     )
     if not response_text and raw_response_text.strip():
@@ -5834,8 +6180,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         # means the agent-side cleaning/guards let markup through.
         print(
             "[WARN] agent reply stripped to empty by strip_raw_tool_tags() "
-            f"(raw was {len(raw_response_text)} chars: "
-            f"{raw_response_text[:200]!r})",
+            f"(raw was {len(raw_response_text)} chars)",
             flush=True,
         )
 
@@ -5852,7 +6197,11 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             tail = _tail_not_sent(cleaned_full, sent_concat)
             if tail:
                 try:
-                    print(f"[DEBUG] sending to mobile: {repr(tail[:200])}", flush=True)
+                    print(
+                        f"[DEBUG] sending tail response_chunk to mobile "
+                        f"({len(tail)} chars)",
+                        flush=True,
+                    )
                     await ws.send_json({
                         "type": "response_chunk", "content": tail,
                         "conversation_id": active_conv_id,
@@ -5860,7 +6209,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     })
                     sent_chunks.append(tail)
                     _ts(t0, "tail response_chunk flushed",
-                        f"({len(tail)} chars: {tail[:60]!r})")
+                        f"({len(tail)} chars)")
                 except Exception as e:
                     print(f"[OSIA Server] tail response_chunk send failed: {e}")
 
@@ -5906,7 +6255,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             }
             for m in new_history[-2:]
         ]
-        print(f"[OSIA Server]   last 2 history items: {tail_preview}")
+        print(f"[OSIA Server]   last 2 history item count: {len(tail_preview)}")
 
     if not response_text:
         # Prefer what was actually streamed to the client over a canned
@@ -5931,7 +6280,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             # render it instead of an empty reply.
             try:
                 print(
-                    f"[DEBUG] sending to mobile: {repr(response_text[:200])}",
+                    f"[DEBUG] sending fallback response_chunk to mobile "
+                    f"({len(response_text)} chars)",
                     flush=True,
                 )
                 await ws.send_json({
@@ -5945,7 +6295,10 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
 
     # Send the canonical full text once (clients that don't track chunks
     # can rely on this; clients that do can ignore it).
-    print(f"[DEBUG] sending to mobile: {repr(response_text[:200])}", flush=True)
+    print(
+        f"[DEBUG] sending response to mobile ({len(response_text)} chars)",
+        flush=True,
+    )
     await ws.send_json({
         "type": "response", "content": response_text,
         "conversation_id": active_conv_id,
@@ -5976,7 +6329,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # Synthesize TTS off-thread so the event loop keeps serving.
     try:
         tts_text = response_text
-        print(f"[DEBUG] sending to TTS: {repr(tts_text[:200])}", flush=True)
+        print(f"[DEBUG] sending to TTS ({len(tts_text)} chars)", flush=True)
         print(
             f"[TTS] server: calling synthesize_to_mp3_bytes() "
             f"({len(tts_text)} chars)",
@@ -6067,7 +6420,7 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
         # Whisper inference off-thread (sync, CPU-bound).
         transcript = await asyncio.to_thread(transcribe, audio, sample_rate=sr)
         _ts(t0, "transcription done",
-            f"({len(transcript)} chars: {transcript[:60]!r})")
+            f"({len(transcript)} chars)")
 
         if not transcript.strip():
             await ws.send_json({

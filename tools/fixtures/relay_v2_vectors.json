@@ -1,0 +1,93 @@
+{
+  "schema": "osia-relay-v2-cross-language-v1",
+  "token": "osia-e2e-test-token-v2",
+  "relay_proof_hex": "b307bc061f6d20815611175b21bcc9abef54d19d414ee6cfb65cfe5d884e487a",
+  "e2e_psk_b64": "c0mKUuNmxzDED4ll9gJZ4Zr9WXkAYIcs22efYIKPyL4",
+  "pair_id": "ae3edfcdfd5106b85d9d7280f6062b2388182e401a220cafc13ba9381463829b",
+  "pc_private_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "mobile_private_key_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "pc_public_key_b64": "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8",
+  "mobile_public_key_b64": "NYBy1jZYgNGu6jKa35EhODhR7SGijjt16WXQ0s0WYlQ",
+  "pc_nonce_base_hex": "a0a1a2a3",
+  "mobile_nonce_base_hex": "b0b1b2b3",
+  "transcript": {
+    "e2e_version": 1,
+    "alg": "CHACHA20-POLY1305",
+    "pair_id": "ae3edfcdfd5106b85d9d7280f6062b2388182e401a220cafc13ba9381463829b",
+    "roles": ["pc", "mobile"],
+    "pc_public_key": "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8",
+    "mobile_public_key": "NYBy1jZYgNGu6jKa35EhODhR7SGijjt16WXQ0s0WYlQ",
+    "pc_nonce_base": "oKGiow",
+    "mobile_nonce_base": "sLGysw"
+  },
+  "transcript_utf8_b64": "eyJhbGciOiJDSEFDSEEyMC1QT0xZMTMwNSIsImUyZV92ZXJzaW9uIjoxLCJtb2JpbGVfbm9uY2VfYmFzZSI6InNMR3lzdyIsIm1vYmlsZV9wdWJsaWNfa2V5IjoiTllCeTFqWllnTkd1NmpLYTM1RWhPRGhSN1NHaWpqdDE2V1hRMHMwV1lsUSIsInBhaXJfaWQiOiJhZTNlZGZjZGZkNTEwNmI4NWQ5ZDcyODBmNjA2MmIyMzg4MTgyZTQwMWEyMjBjYWZjMTNiYTkzODE0NjM4MjliIiwicGNfbm9uY2VfYmFzZSI6Im9LR2lvdyIsInBjX3B1YmxpY19rZXkiOiJqMERGcmJhUEpXSks1YklVNm5aNmJzbE5ncDA5ZTE0YTBicHZQaUU0S0Y4Iiwicm9sZXMiOlsicGMiLCJtb2JpbGUiXX0",
+  "transcript_sha256_hex": "ed03cee7d8b25d6cc1cb6e2019e75cc0ee7858517362a80f11aba7cdd2673f3d",
+  "kid": "Os0aysteDpsu4EbGSO320w",
+  "pc_to_mobile_key_hex": "6ae5a031f083e11f81820272ae571e8d675e69414787c0a43308a1a1bb83fd18",
+  "mobile_to_pc_key_hex": "c0b7fb6923796e756897e0485bfd9b0e953b55b173eca9d6dcb6160de9b80af0",
+  "pc_ready_tag": "hyVuSZT7XBSA81Bv8B1xqh3OYXU_nB_Rd04aSTnQ2lg",
+  "mobile_ready_tag": "USZLtvXVnTfF94s5CiMaqb_c2dADUmjnNyLa1mkS1w8",
+  "plaintext_frame": {
+    "type": "response_chunk",
+    "client_request_id": "req-test",
+    "turn_id": "turn-test",
+    "conversation_id": "conv-test",
+    "content": "hello encrypted osia"
+  },
+  "pc_to_mobile_envelope": {
+    "e2e_version": 1,
+    "alg": "CHACHA20-POLY1305",
+    "kid": "Os0aysteDpsu4EbGSO320w",
+    "pair_id": "ae3edfcdfd5106b85d9d7280f6062b2388182e401a220cafc13ba9381463829b",
+    "role": "pc",
+    "seq": 4,
+    "priority": "critical",
+    "final": false,
+    "nonce": "oKGiowAAAAAAAAAE",
+    "ciphertext": "r3TYM6zzSV35lXhoxqKs5io6g_nhhHMtjowN955c5DkJ324In0GSzAG5rhzpby7RsaviB1IeFWYPXE6fjJUoa-T-jMuU5cwfYE1MF2LI1GN_YLx5PI4bMtujEv2SFHwhzejifrO3OJEUUTiRWLAbS4FHwUJhtwhwqoxPIciyivUCaVxreXFYdFoHaADy-3aPFl-f6sBPFIJLDZEuMQ"
+  },
+  "mobile_to_pc_envelope": {
+    "e2e_version": 1,
+    "alg": "CHACHA20-POLY1305",
+    "kid": "Os0aysteDpsu4EbGSO320w",
+    "pair_id": "ae3edfcdfd5106b85d9d7280f6062b2388182e401a220cafc13ba9381463829b",
+    "role": "mobile",
+    "seq": 4,
+    "priority": "critical",
+    "final": false,
+    "nonce": "sLGyswAAAAAAAAAE",
+    "ciphertext": "mqT5WS2Pg2mHAIS_hArzAVOVAq66_wmikOK-VNfS0bfbySB5YuzjEBlBB9IdsdgfP_2ESkH6YTLUYunn6fx36ChrWYHWXQySpVlwom8whCwGx7Yh1flGGpcuyZlFIuKdcAq-ZKD7FmVR573lSX5cssgj29G91gKjLoiENUYaq89nj2g7kBVg1W4yWPJq1Qjni3b0H20DR_gWZQXt6Q"
+  },
+  "large_frame_template": {
+    "type": "response",
+    "client_request_id": "req-large",
+    "turn_id": "turn-large",
+    "conversation_id": "conv-large",
+    "content_char": "L",
+    "content_count": 36000
+  },
+  "large_pc_to_mobile": {
+    "seq": 5,
+    "priority": "critical",
+    "final": false,
+    "nonce": "oKGiowAAAAAAAAAF",
+    "ciphertext_sha256_hex": "06074a0253a5b23a8f76a3b994bba40548a622580228a31b9570730055df7c7a",
+    "ciphertext_chars": 48179,
+    "chunk_id": "AAECAwQFBgcICQoLDA0ODw",
+    "chunk_count": 2,
+    "first_chunk_chars": 40960,
+    "last_chunk_chars": 7219
+  },
+  "large_mobile_to_pc": {
+    "seq": 5,
+    "priority": "critical",
+    "final": false,
+    "nonce": "sLGyswAAAAAAAAAF",
+    "ciphertext_sha256_hex": "0fd89ebfd29df2b19293804d24202c5ecefba74b7775b81ce9a319da9ecbb858",
+    "ciphertext_chars": 48179,
+    "chunk_id": "EBESExQVFhcYGRobHB0eHw",
+    "chunk_count": 2,
+    "first_chunk_chars": 40960,
+    "last_chunk_chars": 7219
+  }
+}

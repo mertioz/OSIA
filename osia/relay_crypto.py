@@ -1,9 +1,4 @@
-"""Endpoint-only relay E2E crypto helpers for WOR-104 Phase 1.
-
-This module is intentionally not wired into the live relay path yet. It provides
-the deterministic primitives and test-vector surface that PC and mobile will use
-when the relay envelope is integrated in a later phase.
-"""
+"""Endpoint-only relay protocol-v2 E2E crypto helpers for WOR-104."""
 
 from __future__ import annotations
 
@@ -12,6 +7,8 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import json
+import re
+import secrets
 from typing import Any, Mapping
 
 from cryptography.exceptions import InvalidTag
@@ -25,10 +22,14 @@ E2E_VERSION = 1
 ALG_CHACHA20_POLY1305 = "CHACHA20-POLY1305"
 PC_TO_MOBILE = "pc_to_mobile"
 MOBILE_TO_PC = "mobile_to_pc"
+PRIORITY_CRITICAL = "critical"
+PRIORITY_NORMAL = "normal"
+PRIORITY_DROPPABLE = "droppable"
 
 _LEGACY_PAIR_SECRET_LABEL = b"osia-relay-secret-v1"
 _E2E_PSK_LABEL = b"osia-e2e-psk-v1"
 _SESSION_INFO = b"osia-relay-e2e-session-v1"
+_READY_TAG_LABEL = "osia-e2e-ready-v1"
 _KEY_MATERIAL_LEN = 80
 _KEY_LEN = 32
 _KID_LEN = 16
@@ -41,13 +42,12 @@ _AAD_FIELDS = (
     "alg",
     "kid",
     "pair_id",
-    "from",
-    "to",
-    "session_id",
+    "role",
     "seq",
     "priority",
     "final",
 )
+_LEGACY_IDENTITY_FIELDS = {"device_id", "session_id", "from", "to", "to_session_id"}
 
 
 class RelayCryptoError(Exception):
@@ -98,6 +98,14 @@ def derive_e2e_psk(token: str) -> bytes:
     ).digest()
 
 
+def generate_x25519_private_key() -> bytes:
+    return secrets.token_bytes(32)
+
+
+def generate_nonce_base() -> bytes:
+    return secrets.token_bytes(_NONCE_BASE_LEN)
+
+
 def x25519_public_key(private_key_bytes: bytes) -> bytes:
     private_key = x25519.X25519PrivateKey.from_private_bytes(private_key_bytes)
     return private_key.public_key().public_bytes(
@@ -109,10 +117,6 @@ def x25519_public_key(private_key_bytes: bytes) -> bytes:
 @dataclass(frozen=True)
 class RelaySessionContext:
     pair_id: str
-    pc_device_id: str
-    mobile_device_id: str
-    pc_session_id: str
-    mobile_session_id: str
     pc_public_key: bytes
     mobile_public_key: bytes
     pc_nonce_base: bytes
@@ -121,6 +125,8 @@ class RelaySessionContext:
     alg: str = ALG_CHACHA20_POLY1305
 
     def __post_init__(self) -> None:
+        if not re.fullmatch(r"[0-9a-f]{64}", self.pair_id):
+            raise ValueError("pair_id must be lowercase 64-hex")
         _require_len("pc_public_key", self.pc_public_key, 32)
         _require_len("mobile_public_key", self.mobile_public_key, 32)
         _require_len("pc_nonce_base", self.pc_nonce_base, _NONCE_BASE_LEN)
@@ -131,10 +137,7 @@ class RelaySessionContext:
             "e2e_version": self.e2e_version,
             "alg": self.alg,
             "pair_id": self.pair_id,
-            "pc_device_id": self.pc_device_id,
-            "mobile_device_id": self.mobile_device_id,
-            "pc_session_id": self.pc_session_id,
-            "mobile_session_id": self.mobile_session_id,
+            "roles": ["pc", "mobile"],
             "pc_public_key": b64url_encode(self.pc_public_key),
             "mobile_public_key": b64url_encode(self.mobile_public_key),
             "pc_nonce_base": b64url_encode(self.pc_nonce_base),
@@ -201,6 +204,36 @@ def derive_session_keys(
     )
 
 
+def handshake_confirmation_tag(
+    *,
+    token: str,
+    context: RelaySessionContext,
+    sender_role: str,
+) -> str:
+    body = {
+        "label": _READY_TAG_LABEL,
+        "sender_role": sender_role,
+        "transcript": context.transcript(),
+    }
+    tag = hmac.new(derive_e2e_psk(token), canonical_json(body), hashlib.sha256).digest()
+    return b64url_encode(tag)
+
+
+def verify_handshake_confirmation(
+    *,
+    token: str,
+    context: RelaySessionContext,
+    sender_role: str,
+    tag: str,
+) -> bool:
+    expected = handshake_confirmation_tag(
+        token=token,
+        context=context,
+        sender_role=sender_role,
+    )
+    return hmac.compare_digest(expected, tag)
+
+
 def nonce_for_seq(nonce_base: bytes, seq: int) -> bytes:
     _require_len("nonce_base", nonce_base, _NONCE_BASE_LEN)
     if not 0 <= seq < 2**64:
@@ -209,7 +242,7 @@ def nonce_for_seq(nonce_base: bytes, seq: int) -> bytes:
 
 
 class SequenceReplayGuard:
-    """Strict monotonic replay guard keyed by direction/session identifier."""
+    """Strict monotonic replay guard keyed by the active direction context."""
 
     def __init__(self) -> None:
         self._last_seen: dict[str, int] = {}
@@ -245,25 +278,66 @@ def aad_metadata(
     *,
     keys: RelaySessionKeys,
     pair_id: str,
-    from_device_id: str,
-    to_device_id: str,
-    session_id: str,
+    role: str,
     seq: int,
     priority: str,
     final: bool,
 ) -> dict[str, Any]:
+    if role not in {"pc", "mobile"}:
+        raise ValueError("role must be pc or mobile")
+    if not re.fullmatch(r"[0-9a-f]{64}", pair_id):
+        raise ValueError("pair_id must be lowercase 64-hex")
     return {
         "e2e_version": E2E_VERSION,
         "alg": ALG_CHACHA20_POLY1305,
         "kid": keys.kid,
         "pair_id": pair_id,
-        "from": from_device_id,
-        "to": to_device_id,
-        "session_id": session_id,
+        "role": role,
         "seq": seq,
         "priority": priority,
         "final": final,
     }
+
+
+def relay_frame_is_final(frame: Mapping[str, Any]) -> bool:
+    frame_type = str(frame.get("type") or "")
+    if frame_type == "status":
+        content = str(frame.get("content") or frame.get("status") or "")
+        return content in {"done", "error"}
+    if frame_type == "turn_status":
+        return str(frame.get("status") or "") in {"done", "error"}
+    if frame_type == "conversation_busy_changed":
+        return frame.get("busy") is False
+    return frame_type in {
+        "response_done",
+        "turn_complete",
+        "done",
+        "final",
+        "error",
+    }
+
+
+def relay_frame_priority(frame: Mapping[str, Any]) -> str:
+    frame_type = str(frame.get("type") or "")
+    if relay_frame_is_final(frame):
+        return PRIORITY_CRITICAL
+    if frame_type in {
+        "response",
+        "turn_accepted",
+        "turn_status",
+        "conversation_busy",
+        "conversation_busy_changed",
+        "active_conversation",
+        "conversation_history",
+        "relay_chunk_error",
+        "cron_notification",
+    }:
+        return PRIORITY_CRITICAL
+    if frame_type in {"heartbeat_data", "mcp_status"}:
+        return PRIORITY_DROPPABLE
+    if frame_type == "status":
+        return PRIORITY_DROPPABLE
+    return PRIORITY_NORMAL
 
 
 def encrypt_frame(
@@ -272,9 +346,7 @@ def encrypt_frame(
     keys: RelaySessionKeys,
     direction: str,
     pair_id: str,
-    from_device_id: str,
-    to_device_id: str,
-    session_id: str,
+    role: str,
     priority: str,
     final: bool,
     seq: int | None = None,
@@ -288,9 +360,7 @@ def encrypt_frame(
     metadata = aad_metadata(
         keys=keys,
         pair_id=pair_id,
-        from_device_id=from_device_id,
-        to_device_id=to_device_id,
-        session_id=session_id,
+        role=role,
         seq=seq,
         priority=priority,
         final=final,
@@ -316,6 +386,8 @@ def decrypt_frame(
     replay_guard: SequenceReplayGuard | None = None,
     replay_key: str | None = None,
 ) -> dict[str, Any]:
+    if any(field in envelope for field in _LEGACY_IDENTITY_FIELDS):
+        raise RelayCryptoError("legacy relay identity metadata is not allowed")
     metadata = _metadata_from_envelope(envelope)
     if metadata["kid"] != keys.kid:
         raise RelayCryptoError("unknown key id")
@@ -339,7 +411,7 @@ def decrypt_frame(
     if not isinstance(decoded, dict):
         raise RelayCryptoError("decrypted frame is not an object")
     if replay_guard is not None:
-        replay_guard.accept(replay_key or str(metadata["from"]), seq)
+        replay_guard.accept(replay_key or str(metadata["role"]), seq)
     return decoded
 
 

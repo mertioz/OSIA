@@ -17,6 +17,13 @@ from osia.perf import perf_timer
 # ── Provider configurations ───────────────────────────────────────────────
 
 PROVIDERS = {
+    # Logical cloud provider backed by official Codex managed authentication.
+    # It is intentionally absent from API_PROVIDERS and API-key discovery.
+    "chatgpt_account": {
+        "name": "ChatGPT account",
+        "base_url": "",
+        "models_endpoint": None,
+    },
     "anthropic": {
         "name": "Anthropic",
         "base_url": "https://api.anthropic.com/v1",
@@ -189,6 +196,13 @@ def vision_capable_models() -> list:
 _OLLAMA_CACHE: list | None = None
 _OLLAMA_CACHE_AT: float = 0.0
 _OLLAMA_TTL = 30.0  # seconds
+
+
+def invalidate_ollama_models_cache() -> None:
+    """Force the next local-model lookup to query the PC runtime again."""
+    global _OLLAMA_CACHE, _OLLAMA_CACHE_AT
+    _OLLAMA_CACHE = None
+    _OLLAMA_CACHE_AT = 0.0
 
 
 def get_ollama_models() -> list:

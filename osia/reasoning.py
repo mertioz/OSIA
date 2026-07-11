@@ -155,6 +155,28 @@ def get_reasoning_options(provider, model) -> list[dict]:
     if not provider_id or not model_id:
         return []
 
+    if provider_id == "chatgpt_account":
+        # App Server model/list is the source of truth. Keep account reasoning
+        # separate from the OpenAI API model tables and request parameters.
+        try:
+            from osia.chatgpt_account.provider import get_cached_account_models
+            entry = next(
+                (item for item in get_cached_account_models()
+                 if str(item.get("id") or "") == model_id),
+                None,
+            )
+        except Exception:
+            entry = None
+        if not entry:
+            return []
+        options = [_AUTO_OPTION]
+        for effort in entry.get("supportedReasoningEfforts") or []:
+            effort_id = str(effort.get("id") or "").strip().lower()
+            if effort_id and effort_id != "auto":
+                label = "Extra high" if effort_id == "xhigh" else effort_id.title()
+                options.append(_option(effort_id, label, {"effort": effort_id}))
+        return [copy.deepcopy(opt) for opt in options]
+
     if provider_id == "openai" and model_id in _OPENAI_REASONING_MODELS:
         options = [
             _AUTO_OPTION,
@@ -267,8 +289,15 @@ def resolve_reasoning_option_id(provider, model, settings=None) -> str:
     option_ids = _known_option_ids(options)
 
     model_levels = cfg.get("models") or {}
-    if model_id and model_id in model_levels:
-        selected = normalize_level(model_levels.get(model_id))
+    # Account and API catalogs can expose the same id. Namespace only account
+    # overrides so they can never collide with OpenAI API reasoning settings.
+    model_key = (
+        f"chatgpt_account:{model_id}"
+        if provider_id == "chatgpt_account" and model_id
+        else model_id
+    )
+    if model_key and model_key in model_levels:
+        selected = normalize_level(model_levels.get(model_key))
         return selected if selected in option_ids else "auto"
 
     provider_levels = cfg.get("providers") or {}

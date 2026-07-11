@@ -20,6 +20,7 @@ import stat
 import sys
 import threading
 from pathlib import Path
+from collections.abc import Callable
 
 # <repo>/osia/config.py → <repo>. Dynamic so the package works from any
 # install location / drive (no hardcoded /home/OSIA/code/... path).
@@ -47,6 +48,9 @@ API_KEYS_FILE = os.path.join(CONFIG_DIR, "api_keys.json")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 MOBILE_TOKEN_FILE = os.path.join(CONFIG_DIR, "mobile_token.txt")
 
+_API_KEY_CHANGE_LOCK = threading.Lock()
+_API_KEY_CHANGE_LISTENERS: set[Callable[[str], None]] = set()
+
 REASONING_LEVELS = ("auto", "off", "low", "medium", "high")
 REASONING_OPTION_IDS = (
     "auto", "off", "minimal", "low", "medium", "high", "xhigh", "normal", "max",
@@ -60,6 +64,12 @@ _DEFAULT_REASONING_SETTINGS = {
 
 DEFAULT_SETTINGS = {
     "selected_model": None,
+    "selected_model_provider": None,
+    # Official managed ChatGPT account provider (WOR-113). The capability gate
+    # fails closed when Codex is missing/incompatible; this model selection is
+    # deliberately separate from the OpenAI API selection above.
+    "chatgpt_account_feature_enabled": True,
+    "chatgpt_account_model": None,
     "tts_provider": "local",   # one of: "local", "openai", "google"
     "tts_voice": None,         # provider-specific voice id; None = provider default
     # Speech-to-text (Whisper). The active switching logic lands in Bloc 2;
@@ -241,6 +251,28 @@ def load_api_keys() -> dict:
         return {}
 
 
+def add_api_key_change_listener(callback: Callable[[str], None]) -> Callable[[], None]:
+    """Subscribe to provider-key changes without exposing credential values."""
+    with _API_KEY_CHANGE_LOCK:
+        _API_KEY_CHANGE_LISTENERS.add(callback)
+
+    def unsubscribe() -> None:
+        with _API_KEY_CHANGE_LOCK:
+            _API_KEY_CHANGE_LISTENERS.discard(callback)
+
+    return unsubscribe
+
+
+def _notify_api_key_changed(provider: str) -> None:
+    with _API_KEY_CHANGE_LOCK:
+        callbacks = tuple(_API_KEY_CHANGE_LISTENERS)
+    for callback in callbacks:
+        try:
+            callback(provider)
+        except Exception:
+            pass
+
+
 def save_api_keys(keys: dict) -> None:
     """Persist API keys to disk and chmod the file to 0600."""
     _ensure_config_dir()
@@ -268,6 +300,7 @@ def set_api_key(provider: str, key: str) -> None:
     else:
         keys.pop(provider, None)
     save_api_keys(keys)
+    _notify_api_key_changed(provider)
 
 
 # ── MCP / Connectors secret storage (WOR-44) ───────────────────────────────
@@ -569,6 +602,12 @@ def set_setting(key: str, value) -> None:
     if key == "reasoning":
         value = normalize_reasoning_settings(value)
     settings[key] = value
+    if key == "selected_model":
+        # Callers that only know a model id (for example the existing mobile
+        # server message) must not inherit a stale provider from an earlier
+        # provider-aware PC selection. The PC model picker writes the exact
+        # provider immediately after writing the model id.
+        settings["selected_model_provider"] = None
     save_settings(settings)
 
 

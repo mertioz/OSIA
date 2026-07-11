@@ -85,6 +85,12 @@ from osia.tools import verify_tools
 # a {"type": "new_chat"} reset to every connected device. The endpoint is
 # localhost-only on the server side.
 _SERVER_NEW_CHAT_URL = "http://127.0.0.1:8765/internal/new_chat"
+_SERVER_MOBILE_CATALOGUE_URL = (
+    "http://127.0.0.1:8765/internal/mobile_catalogue_changed"
+)
+_SERVER_CHATGPT_ACCOUNT_URL = (
+    "http://127.0.0.1:8765/internal/chatgpt_account_changed"
+)
 LIVEAPI_AVAILABLE = False
 # Desktop→server MCP state mirror (Phase 1, direction A). The desktop pings this
 # after a local MCP connect/disconnect so the mobile server reconciles its OWN
@@ -121,6 +127,29 @@ def _notify_mobile_new_chat() -> None:
         urllib.request.urlopen(req, timeout=1.5).close()
     except Exception as e:
         print(f"[WOR-10] mobile new_chat notify skipped: {e}")
+
+
+def _notify_mobile_state_changed(url: str, label: str) -> None:
+    """Best-effort non-blocking loopback signal carrying no state or secret."""
+    import urllib.request
+
+    def worker() -> None:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=b"{}",
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=1.5).close()
+        except Exception as e:
+            print(f"[OSIA] mobile {label} notify skipped: {e}")
+
+    threading.Thread(
+        target=worker,
+        name=f"osia-mobile-{label}-notify",
+        daemon=True,
+    ).start()
 
 
 def _notify_mobile_mcp_sync(server_id: str, action: str) -> None:
@@ -433,6 +462,13 @@ def _start_popup_hotkey_listener(callback):
 def text_mode():
     """Interactive text-based chat with OSIA."""
     agent = OSIAAgent()
+    settings = load_settings()
+    selected_model = settings.get("selected_model")
+    if selected_model:
+        agent.set_model(
+            selected_model,
+            provider=settings.get("selected_model_provider") or None,
+        )
     # No conversation is auto-created — one is created lazily when the
     # first message is sent, so the stored list never fills with empties.
     active_conv = None
@@ -484,7 +520,7 @@ def voice_mode():
     """Single-shot voice mode: listen → agent → speak."""
     from osia.voice.stt import listen
     from osia.voice.tts import speak
-    from osia.agent import run_agent, clean_response
+    from osia.agent import clean_response
 
     # No conversation is auto-created — one is created lazily when the
     # first spoken command arrives.
@@ -520,7 +556,15 @@ def voice_mode():
             print(f"[New conversation: {active_conv['id']}]")
 
         print("🤔 Thinking...")
-        response = run_agent(
+        turn_agent = OSIAAgent()
+        settings = load_settings()
+        selected_model = settings.get("selected_model")
+        if selected_model:
+            turn_agent.set_model(
+                selected_model,
+                provider=settings.get("selected_model_provider") or None,
+            )
+        response = turn_agent.run(
             user_text,
             current_conversation_id=active_conv["id"],
         )
@@ -651,12 +695,13 @@ def wake_mode():
 
     settings = load_settings()
     initial_model = settings.get("selected_model")
+    initial_provider = settings.get("selected_model_provider") or None
     if initial_model:
         try:
-            agent.set_model(initial_model)
+            agent.set_model(initial_model, provider=initial_provider)
         except Exception as e:
             print(f"[DEBUG] set_model({initial_model!r}) failed: {e}")
-    popup.set_current_model(agent.model)
+    popup.set_current_model(agent.model, agent.provider)
 
     # WOR-44 Phase 5 (5-conf-b): register the DESKTOP confirmation provider so a
     # write/destructive MCP tool prompts the user (modal) before it runs. The
@@ -800,10 +845,12 @@ def wake_mode():
         """
         nonlocal active_conv
         turn_agent = OSIAAgent()
-        selected_model = load_settings().get("selected_model")
+        settings = load_settings()
+        selected_model = settings.get("selected_model")
+        selected_provider = settings.get("selected_model_provider") or None
         if selected_model:
             try:
-                turn_agent.set_model(selected_model)
+                turn_agent.set_model(selected_model, provider=selected_provider)
             except Exception as e:
                 print(f"[DEBUG] set_model({selected_model!r}) failed: {e}")
 
@@ -1053,19 +1100,37 @@ def wake_mode():
 
     # ── Model + settings wiring ─────────────────────────────────────────
 
-    def handle_model_change(model: str):
+    def handle_model_change(model: str, provider: str):
         try:
-            agent.set_model(model)
+            agent.set_model(model, provider=provider)
         except Exception as e:
             print(f"⚠️  Could not switch model: {e}")
             return
         set_setting("selected_model", model)
-        popup.set_current_model(model)
+        set_setting("selected_model_provider", provider)
+        popup.set_current_model(model, provider)
         print(f"🔄 Model changed to: {model} (provider: {agent.provider})")
 
     def handle_keys_saved(_keys):
         discover_models_async(
             lambda remote: bridge.remote_models_signal.emit(remote)
+        )
+        _notify_mobile_state_changed(
+            _SERVER_MOBILE_CATALOGUE_URL, "catalogue-changed"
+        )
+
+    last_chatgpt_mobile_signature = [None]
+
+    def handle_chatgpt_status_changed(status: dict):
+        signature = (
+            bool(status.get("connected")),
+            str(status.get("error") or ""),
+        )
+        if signature == last_chatgpt_mobile_signature[0]:
+            return
+        last_chatgpt_mobile_signature[0] = signature
+        _notify_mobile_state_changed(
+            _SERVER_CHATGPT_ACCOUNT_URL, "chatgpt-account-changed"
         )
 
     def handle_remote_models(remote):
@@ -1100,6 +1165,7 @@ def wake_mode():
     popup.delete_conversation.connect(handle_delete_conversation)
     popup.model_changed.connect(handle_model_change)
     popup.api_keys_saved.connect(handle_keys_saved)
+    popup.chatgpt_status_changed.connect(handle_chatgpt_status_changed)
     # WOR-22: the "Show the floating capsule" toggle hides/shows the capsule.
     popup.capsule_visibility_changed.connect(island.set_capsule_visible)
 
@@ -1382,6 +1448,11 @@ def wake_mode():
             stop_hotkey()
         if stop_popup_hotkey:
             stop_popup_hotkey()
+        try:
+            from osia.chatgpt_account.provider import get_account_provider
+            get_account_provider().shutdown()
+        except Exception:
+            pass
 
     app.aboutToQuit.connect(on_quit)
 

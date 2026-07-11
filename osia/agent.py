@@ -4451,6 +4451,7 @@ class OSIAAgent:
         self._active_base_url = base_url
         self.messages = [{"role": "system", "content": get_system_prompt(self.lang, self.model, self.provider)}]
         self._memory_store = None
+        self._chatgpt_conversation_id = None
 
     def reset(self):
         """Clear conversation history except system prompt."""
@@ -4475,11 +4476,12 @@ class OSIAAgent:
         """Switch the agent to a new model, reconfiguring the client for that
         model's provider (Anthropic, OpenAI, DeepSeek, Google, xAI, Groq, Ollama).
 
-        ``provider`` is optional and defaults to the provider derived from the
-        model id (``provider_for_model``). Pass it explicitly to force a
-        specific provider — used by the task-hierarchy router, whose entries
-        are stored as ``"provider:model"`` and may pin a model to a provider
-        that differs from the id-based heuristic.
+        ``provider`` is optional. For the globally selected model, the saved
+        provider identity is used first; otherwise it defaults to the provider
+        derived from the model id (``provider_for_model``). Pass it explicitly
+        to force a specific provider — used by the task-hierarchy router, whose
+        entries are stored as ``"provider:model"`` and may pin a model to a
+        provider that differs from the id-based heuristic.
         """
         from osia.models import (
             provider_for_model, PROVIDERS,
@@ -4487,7 +4489,40 @@ class OSIAAgent:
         )
 
         if not provider:
+            try:
+                from osia.config import get_setting
+                saved_model = str(get_setting("selected_model", "") or "").strip()
+                saved_provider = str(
+                    get_setting("selected_model_provider", "") or ""
+                ).strip()
+                if model_id == saved_model and saved_provider in PROVIDERS:
+                    provider = saved_provider
+            except Exception:
+                pass
+        if not provider:
             provider = provider_for_model(model_id)
+
+        if provider == "chatgpt_account":
+            from osia.chatgpt_account.provider import get_account_provider
+            self.client = get_account_provider().chat_client(
+                conversation_id=self._chatgpt_conversation_id
+            )
+            self._api_key = ""
+            self._api_key_chain = []
+            self._api_key_index = 0
+            self._default_headers = None
+            self._primary_base_url = ""
+            self._fallback_base_url = None
+            self._active_base_url = ""
+            self.model = model_id
+            self.provider = provider
+            if (self.messages and isinstance(self.messages[0], dict)
+                    and self.messages[0].get("role") == "system"):
+                self.messages[0]["content"] = get_system_prompt(
+                    self.lang, self.model, self.provider
+                )
+            return
+
         cfg = PROVIDERS.get(provider, PROVIDERS["ollama"])
         # API key fallback hierarchy: when the user configured an ordered key
         # list for this provider (api_key_fallbacks), it is authoritative —
@@ -4675,6 +4710,8 @@ class OSIAAgent:
         that is not an API/transport failure — those must NOT silently switch
         the model.
         """
+        if hasattr(e, "allow_fallback"):
+            return bool(getattr(e, "allow_fallback"))
         if status is None:
             status = self._error_status(e)
         if isinstance(status, int):
@@ -5148,6 +5185,7 @@ class OSIAAgent:
         progress, or exceeds the per-turn time budget. In those cases it
         stops gracefully and returns a summary of what was done.
         """
+        self._chatgpt_conversation_id = current_conversation_id
         if history is not None:
             # Defensively strip anything that looks like a system prompt
             # from the incoming history, and drop per-turn tool feedback from
@@ -5229,6 +5267,10 @@ class OSIAAgent:
             print(f"[ROUTER] automatic task routing disabled — "
                   f"using selected model {self._fmt_route(_default_route)}")
 
+        if (self.provider == "chatgpt_account"
+                and hasattr(self.client, "set_conversation_id")):
+            self.client.set_conversation_id(current_conversation_id)
+
         # Streaming fallback safety: a mid-stream technical drop must NOT cause
         # the next model to re-speak sentences already streamed to TTS/mobile.
         # This tracks whether any sentence was emitted on the current attempt;
@@ -5255,6 +5297,9 @@ class OSIAAgent:
         scheduled_task_tool_succeeded = False
         scheduled_task_request_retry_used = False
         scheduled_task_claim_retry_used = False
+        # Once an account response emits an OSIA textual tool call, the attempt
+        # is committed. A later tool-result turn must never replay via an API.
+        _account_attempt_committed = False
         # Empty-response guard: whether the one allowed "your reply was
         # empty after stripping markup" retry has been spent.
         empty_retry_used = False
@@ -5337,7 +5382,12 @@ class OSIAAgent:
                 # re-speak the opening of the reply. Pre-token failures
                 # (429/401/403/connection-open) emit nothing, so fallback there
                 # stays fully effective.
-                _already_streamed = on_sentence is not None and _stream_emitted["v"]
+                _already_streamed = (
+                    (on_sentence is not None and _stream_emitted["v"])
+                    or bool(getattr(e, "output_started", False))
+                    or bool(getattr(e, "native_action", False))
+                    or _account_attempt_committed
+                )
 
                 # API endpoint fallback (Bloc 5): a connection/timeout failure
                 # against the PRIMARY endpoint is retried once against the
@@ -5428,6 +5478,8 @@ class OSIAAgent:
             tool_calls = _extract_tool_calls(
                 content, message=message, provider=self.provider,
             )
+            if tool_calls and self.provider == "chatgpt_account":
+                _account_attempt_committed = True
 
             # STEP 3 — execute the parsed tool calls.
             if tool_calls:

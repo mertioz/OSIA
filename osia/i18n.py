@@ -46,6 +46,50 @@ DEFAULT_LANG = "en"
 # English entry, then to the key itself. Use ``{name}``-style placeholders
 # and pass them as kwargs to :func:`t`.
 TRANSLATIONS: dict[str, dict[str, str]] = {
+    # Managed ChatGPT account provider (WOR-113).
+    "chatgpt_account.title": {
+        "en": "ChatGPT", "fr": "ChatGPT", "zh": "ChatGPT",
+        "ja": "ChatGPT", "de": "ChatGPT", "es": "ChatGPT",
+    },
+    "chatgpt_account.info_accessible": {
+        "en": "ChatGPT provider information",
+        "fr": "Informations sur le fournisseur ChatGPT",
+        "zh": "ChatGPT 提供商信息",
+        "ja": "ChatGPT プロバイダー情報",
+        "de": "Informationen zum ChatGPT-Anbieter",
+        "es": "Información del proveedor ChatGPT",
+    },
+    "chatgpt_account.info_tooltip": {
+        "en": "Cloud provider: prompts and responses are processed by OpenAI.\nOSIA does not automatically attach local files; local-model privacy guarantees do not apply.\nChatGPT models can be selected and used like other providers; API providers remain separately available.",
+        "fr": "Fournisseur cloud : les messages et réponses sont traités par OpenAI.\nOSIA ne joint pas automatiquement de fichiers locaux ; les garanties de confidentialité des modèles locaux ne s'appliquent pas.\nLes modèles ChatGPT peuvent être sélectionnés et utilisés comme ceux des autres fournisseurs ; les fournisseurs API restent disponibles séparément.",
+        "zh": "云端提供商：提示和回复由 OpenAI 处理。\nOSIA 不会自动附加本地文件；本地模型的隐私保证不适用。\nChatGPT 模型可像其他提供商的模型一样选择和使用；API 提供商仍可单独使用。",
+        "ja": "クラウドプロバイダー：プロンプトと応答は OpenAI によって処理されます。\nOSIA はローカルファイルを自動添付しません。ローカルモデルのプライバシー保証は適用されません。\nChatGPT モデルは他のプロバイダーと同様に選択して使用でき、API プロバイダーも個別に利用できます。",
+        "de": "Cloud-Anbieter: Prompts und Antworten werden von OpenAI verarbeitet.\nOSIA hängt lokale Dateien nicht automatisch an; die Datenschutzgarantien lokaler Modelle gelten nicht.\nChatGPT-Modelle können wie Modelle anderer Anbieter ausgewählt und verwendet werden; API-Anbieter bleiben separat verfügbar.",
+        "es": "Proveedor en la nube: OpenAI procesa los mensajes y las respuestas.\nOSIA no adjunta archivos locales automáticamente; no se aplican las garantías de privacidad de los modelos locales.\nLos modelos de ChatGPT se pueden seleccionar y usar como los de otros proveedores; los proveedores API siguen disponibles por separado.",
+    },
+    "chatgpt_account.disclosure": {
+        "en": "Cloud provider: prompts and responses sent through ChatGPT are processed by OpenAI. OSIA does not automatically attach local files; local-model privacy guarantees do not apply. ChatGPT models are selected and used like models from other providers; API providers remain separately available.",
+        "fr": "Fournisseur cloud : les messages et réponses envoyés via ChatGPT sont traités par OpenAI. OSIA ne joint pas automatiquement de fichiers locaux ; les garanties de confidentialité des modèles locaux ne s'appliquent pas. Les modèles ChatGPT sont sélectionnés et utilisés comme ceux des autres fournisseurs ; les fournisseurs API restent disponibles séparément.",
+        "zh": "云端提供商：通过 ChatGPT 发送的提示和回复由 OpenAI 处理。OSIA 不会自动附加本地文件；本地模型的隐私保证不适用。ChatGPT 模型的选择和使用方式与其他提供商的模型相同；API 提供商仍可单独使用。",
+        "ja": "クラウドプロバイダー：ChatGPT 経由のプロンプトと応答は OpenAI によって処理されます。OSIA はローカルファイルを自動添付しません。ローカルモデルのプライバシー保証は適用されません。ChatGPT モデルは他のプロバイダーのモデルと同様に選択して使用でき、API プロバイダーも個別に利用できます。",
+        "de": "Cloud-Anbieter: Über ChatGPT gesendete Prompts und Antworten werden von OpenAI verarbeitet. OSIA hängt keine lokalen Dateien automatisch an; die Datenschutzgarantien lokaler Modelle gelten nicht. ChatGPT-Modelle werden wie Modelle anderer Anbieter ausgewählt und verwendet; API-Anbieter bleiben separat verfügbar.",
+        "es": "Proveedor en la nube: OpenAI procesa los mensajes y respuestas enviados mediante ChatGPT. OSIA no adjunta archivos locales automáticamente; no se aplican las garantías de privacidad de los modelos locales. Los modelos de ChatGPT se seleccionan y usan como los de otros proveedores; los proveedores API siguen disponibles por separado.",
+    },
+    "chatgpt_account.checking": {"en": "Checking Codex…", "fr": "Vérification de Codex…"},
+    "chatgpt_account.disconnected": {"en": "Not connected", "fr": "Non connecté"},
+    "chatgpt_account.connecting": {"en": "Waiting for ChatGPT sign-in…", "fr": "Connexion à ChatGPT en attente…"},
+    "chatgpt_account.connected": {"en": "Connected", "fr": "Connecté"},
+    "chatgpt_account.runtime_missing": {"en": "Codex 0.144.1 is required. APIs continue to work normally.", "fr": "Codex 0.144.1 est requis. Les API continuent de fonctionner normalement."},
+    "chatgpt_account.runtime_incompatible": {"en": "This Codex version is incompatible. APIs continue to work normally.", "fr": "Cette version de Codex est incompatible. Les API continuent de fonctionner normalement."},
+    "chatgpt_account.isolation_error": {"en": "The isolated Codex configuration is not clean, so the account provider is disabled.", "fr": "La configuration Codex isolée n'est pas saine ; le fournisseur de compte est désactivé."},
+    "chatgpt_account.error": {"en": "ChatGPT account is temporarily unavailable. APIs remain available.", "fr": "Le compte ChatGPT est temporairement indisponible. Les API restent disponibles."},
+    "chatgpt_account.connect": {"en": "Connect with ChatGPT", "fr": "Se connecter avec ChatGPT"},
+    "chatgpt_account.cancel": {"en": "Cancel", "fr": "Annuler"},
+    "chatgpt_account.disconnect": {"en": "Disconnect", "fr": "Déconnecter"},
+    "chatgpt_account.retry": {"en": "Retry", "fr": "Réessayer"},
+    "chatgpt_account.model": {"en": "Account model", "fr": "Modèle du compte"},
+    "chatgpt_account.usage": {"en": "Usage: {percent}%", "fr": "Utilisation : {percent} %"},
+    "chatgpt_account.reasoning": {"en": "Reasoning", "fr": "Raisonnement"},
     # — Provider configuration card —
     "provider.key_placeholder": {
         "en": "{name} API key",
@@ -1405,6 +1449,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ja": "プロバイダーを選択してそのモデルを表示します。",
         "de": "Wählen Sie einen Anbieter, um seine Modelle anzuzeigen.",
         "es": "Elige un proveedor para ver sus modelos.",
+    },
+    "models.account_checking": {
+        "en": "Checking ChatGPT account models…",
+        "fr": "Vérification des modèles du compte ChatGPT…",
+    },
+    "models.account_connect_required": {
+        "en": "Connect ChatGPT in Settings to use account models.",
+        "fr": "Connectez ChatGPT dans les réglages pour utiliser les modèles du compte.",
+    },
+    "models.account_unavailable": {
+        "en": "ChatGPT account models are temporarily unavailable.",
+        "fr": "Les modèles du compte ChatGPT sont temporairement indisponibles.",
     },
     "models.pick_model_sub": {
         "en": "Pick the model OSIA will use for new messages.",
