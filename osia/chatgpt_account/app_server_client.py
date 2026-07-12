@@ -7,6 +7,7 @@ provider output; every native action item or approval request cancels the turn.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import os
 import queue
@@ -20,6 +21,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
+
+from .rate_limits import (
+    merge_rate_limit_payload,
+    sanitize_rate_limit_payload,
+)
 
 
 SUPPORTED_MIN_VERSION = (0, 144, 1)
@@ -102,12 +108,20 @@ class AppServerError(RuntimeError):
         native_action: bool = False,
         allow_fallback: bool = True,
         category: str = "app_server",
+        method: str | None = None,
+        server_code: int | None = None,
     ):
         super().__init__(message)
         self.output_started = bool(output_started)
         self.native_action = bool(native_action)
         self.allow_fallback = bool(allow_fallback)
         self.category = category
+        self.method = str(method) if method else None
+        self.server_code = (
+            server_code
+            if isinstance(server_code, int) and not isinstance(server_code, bool)
+            else None
+        )
 
 
 class RuntimeUnavailableError(AppServerError):
@@ -250,6 +264,9 @@ class AppServerClient:
         self._generation = 0
         self._stderr_categories: dict[str, int] = {}
         self._crash_times: list[float] = []
+        self._rate_limits_refresh_lock = threading.Lock()
+        self._rate_limits_cache: dict | None = None
+        self._rate_limits_pending_update: dict = {}
 
         self._login_lock = threading.Lock()
         self._active_login: dict | None = None
@@ -543,9 +560,22 @@ class AppServerClient:
             if isinstance(response, AppServerError):
                 raise response
             if not isinstance(response, dict) or "error" in response:
+                error = (
+                    response.get("error")
+                    if isinstance(response, dict)
+                    and isinstance(response.get("error"), dict)
+                    else {}
+                )
+                code = error.get("code")
+                if not isinstance(code, int) or isinstance(code, bool):
+                    code = None
+                from osia import i18n
+
                 raise AppServerError(
-                    "ERROR: the Codex App Server rejected the request.",
+                    i18n.t("chatgpt_account.request_rejected"),
                     category="request_rejected",
+                    method=method,
+                    server_code=code,
                 )
             result = response.get("result")
             return result if isinstance(result, dict) else {}
@@ -716,6 +746,23 @@ class AppServerClient:
                         }
                     )
                     waiter[0].set()
+            if params.get("success"):
+                with self._state_lock:
+                    self._rate_limits_cache = None
+                    self._rate_limits_pending_update = {}
+            return
+
+        if method == "account/rateLimits/updated":
+            update = sanitize_rate_limit_payload(params)
+            if update:
+                with self._state_lock:
+                    if self._rate_limits_cache is not None:
+                        self._rate_limits_cache = merge_rate_limit_payload(
+                            self._rate_limits_cache, update
+                        )
+                    self._rate_limits_pending_update = merge_rate_limit_payload(
+                        self._rate_limits_pending_update, update
+                    )
             return
 
         attempt = self._attempt_for(params)
@@ -801,6 +848,10 @@ class AppServerClient:
                 "email": account.get("email") if isinstance(account.get("email"), str) else None,
                 "planType": str(account.get("planType") or "unknown"),
             }
+        if safe_account is None:
+            with self._state_lock:
+                self._rate_limits_cache = None
+                self._rate_limits_pending_update = {}
         return {
             "connected": bool(safe_account),
             "account": safe_account,
@@ -908,6 +959,9 @@ class AppServerClient:
 
     def logout(self) -> None:
         self._request("account/logout", {})
+        with self._state_lock:
+            self._rate_limits_cache = None
+            self._rate_limits_pending_update = {}
         with self._login_lock:
             self._active_login = None
             self._login_events.clear()
@@ -952,10 +1006,25 @@ class AppServerClient:
                 return models
 
     def get_rate_limits(self) -> dict:
-        result = self._request("account/rateLimits/read", {})
-        # Rate-limit payloads contain no credentials, but keep the interface
-        # deliberately narrow and let the UI summarize only stable fields.
-        return {"rateLimits": result.get("rateLimits") or result.get("data") or result}
+        with self._rate_limits_refresh_lock:
+            with self._state_lock:
+                self._rate_limits_pending_update = {}
+            try:
+                result = self._request("account/rateLimits/read", {})
+            except AppServerError:
+                with self._state_lock:
+                    if self._rate_limits_cache is not None:
+                        return deepcopy(self._rate_limits_cache)
+                raise
+            safe = sanitize_rate_limit_payload(result)
+            with self._state_lock:
+                if self._rate_limits_pending_update:
+                    safe = merge_rate_limit_payload(
+                        safe, self._rate_limits_pending_update
+                    )
+                self._rate_limits_cache = safe
+                self._rate_limits_pending_update = {}
+                return deepcopy(safe)
 
     def start_or_resume_conversation(
         self,
@@ -974,7 +1043,7 @@ class AppServerClient:
                         "model": model,
                         "cwd": str(self.workspace_dir),
                         "approvalPolicy": "never",
-                        "sandbox": "readOnly",
+                        "sandbox": "read-only",
                     },
                 )
                 thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
@@ -995,7 +1064,7 @@ class AppServerClient:
                 "model": model,
                 "cwd": str(self.workspace_dir),
                 "approvalPolicy": "never",
-                "sandbox": "readOnly",
+                "sandbox": "read-only",
                 "ephemeral": True,
                 "serviceName": "osia_pc",
                 "baseInstructions": base_instructions,

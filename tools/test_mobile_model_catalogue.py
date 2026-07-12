@@ -24,7 +24,9 @@ def _account(*, connected=False, models=None):
         "error": "" if connected else "disconnected",
         "email": "safe@example.test" if connected else "",
         "plan": "plus" if connected else "",
-        "usagePercent": 12 if connected else None,
+        "quotaWindows": (
+            [{"label": "5 h", "remainingPercent": 88}] if connected else []
+        ),
         "selectedModel": models[0]["id"] if models else "",
         "models": models,
     }
@@ -105,6 +107,46 @@ class MobileModelCatalogueTests(unittest.TestCase):
         self.assertEqual(disconnected["providers"], [])
         self.assertEqual(connected["providers"][0]["providerId"], "chatgpt_account")
         self.assertEqual(zero_models["providers"], [])
+
+    def test_mobile_account_quota_is_remaining_only_and_sanitized(self):
+        provider = MagicMock()
+        provider.status.return_value = {
+            "available": True,
+            "runtimeAvailable": True,
+            "connected": True,
+            "account": {"email": "safe@example.test", "planType": "plus"},
+            "models": [],
+            "selectedModel": "",
+            "error": "",
+        }
+        provider.rate_limits.return_value = {
+            "rateLimits": {
+                "primary": {"usedPercent": 0, "windowDurationMins": 300},
+                "secondary": {"usedPercent": 21, "windowDurationMins": 10080},
+            },
+            "rateLimitsByLimitId": {
+                "codex_bengalfox": {
+                    "primary": {"usedPercent": 0, "windowDurationMins": 300},
+                    "secondary": {"usedPercent": 0, "windowDurationMins": 10080},
+                },
+            },
+            "credential": "must-not-leak",
+        }
+        with patch(
+            "osia.chatgpt_account.provider.get_account_provider",
+            return_value=provider,
+        ):
+            snapshot = catalogue.account_snapshot(refresh_models=False)
+
+        self.assertEqual(snapshot["quotaWindows"], [
+            {"label": "5 h", "remainingPercent": 100},
+            {"label": "Weekly", "remainingPercent": 79},
+        ])
+        self.assertNotIn("usagePercent", snapshot)
+        encoded = json.dumps(snapshot)
+        self.assertNotIn("usedPercent", encoded)
+        self.assertNotIn("bengalfox", encoded.lower())
+        self.assertNotIn("must-not-leak", encoded)
 
     def test_local_provider_requires_detected_models(self):
         absent = self.build({}, [])

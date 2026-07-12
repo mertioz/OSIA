@@ -43,12 +43,22 @@ _DEVELOPER_INSTRUCTIONS = (
 class AccountProviderError(RuntimeError):
     """Provider error carrying the no-duplicate-fallback boundary."""
 
-    def __init__(self, error: AppServerError):
+    def __init__(
+        self,
+        error: AppServerError,
+        *,
+        selected_model: str | None = None,
+        reasoning_level: str | None = None,
+    ):
         super().__init__(str(error))
         self.output_started = error.output_started
         self.native_action = error.native_action
         self.allow_fallback = error.allow_fallback
         self.category = error.category
+        self.method = error.method
+        self.server_code = error.server_code
+        self.selected_model = str(selected_model) if selected_model else None
+        self.reasoning_level = str(reasoning_level or "auto")
 
 
 @dataclass
@@ -299,7 +309,11 @@ class ChatGPTAccountProvider:
             if exc.category in {"thread_failed", "request_rejected", "process_crash"}:
                 with self._lock:
                     self._threads.pop(conversation_id, None)
-            raise AccountProviderError(exc) from exc
+            raise AccountProviderError(
+                exc,
+                selected_model=model,
+                reasoning_level=effort,
+            ) from exc
 
     def cancel_conversation(self, conversation_id: str) -> None:
         with self._lock:

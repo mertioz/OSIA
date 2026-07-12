@@ -12,6 +12,7 @@ from osia.config import (
     set_reasoning_settings,
     set_setting,
 )
+from osia.chatgpt_account.rate_limits import quota_windows
 from osia.models import (
     API_PROVIDERS,
     PROVIDERS,
@@ -62,6 +63,23 @@ _login_ephemeral: dict[str, str] = {}
 def _safe_error(value) -> str:
     category = str(value or "").strip().lower()
     return category if category in _SAFE_ACCOUNT_ERRORS else "provider_error"
+
+
+def _safe_quota_windows(raw) -> list[dict]:
+    safe = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        label = " ".join(str(item.get("label") or "").split())[:80]
+        remaining = item.get("remainingPercent")
+        if (
+            label
+            and isinstance(remaining, int)
+            and not isinstance(remaining, bool)
+            and 0 <= remaining <= 100
+        ):
+            safe.append({"label": label, "remainingPercent": remaining})
+    return safe
 
 
 def _reasoning_metadata(provider: str, model_id: str) -> dict:
@@ -121,12 +139,8 @@ def _account_status_with_usage(*, refresh_models: bool) -> dict:
         if status.get("connected"):
             try:
                 usage = provider.rate_limits()
-                limits = usage.get("rateLimits") if isinstance(usage, dict) else None
-                primary = limits.get("primary") if isinstance(limits, dict) else None
-                used = primary.get("usedPercent") if isinstance(primary, dict) else None
-                if isinstance(used, int) and not isinstance(used, bool) and 0 <= used <= 100:
-                    status = dict(status)
-                    status["usagePercent"] = used
+                status = dict(status)
+                status["quotaWindows"] = quota_windows(usage)
             except Exception:
                 pass
         return status
@@ -169,8 +183,7 @@ def account_snapshot(*, refresh_models: bool = True, include_ephemeral: bool = F
         "error": error,
         "email": str(account.get("email") or ""),
         "plan": str(account.get("planType") or ""),
-        "usagePercent": status.get("usagePercent")
-        if isinstance(status.get("usagePercent"), int) else None,
+        "quotaWindows": _safe_quota_windows(status.get("quotaWindows")),
         "selectedModel": str(status.get("selectedModel") or ""),
         "models": models,
     }

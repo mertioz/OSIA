@@ -102,6 +102,33 @@ class ProviderAdapterTests(unittest.TestCase):
         self.assertNotIn("C:\\private\\osia", required)
         self.assertIn("C:\\Users\\me\\Desktop", required)
 
+    def test_rejected_request_diagnostics_keep_safe_turn_context(self):
+        client = _ProviderClient()
+
+        def reject(**_kwargs):
+            raise AppServerError(
+                "ERROR: safe retry message",
+                category="request_rejected",
+                method="thread/start",
+                server_code=-32600,
+            )
+
+        client.start_or_resume_conversation = reject
+        provider = ChatGPTAccountProvider(client=client)
+        with self.assertRaises(AccountProviderError) as caught:
+            provider.complete(
+                conversation_id="c1",
+                model="account-model",
+                messages=[{"role": "user", "content": "hello"}],
+                effort="high",
+            )
+        error = caught.exception
+        self.assertEqual(error.method, "thread/start")
+        self.assertEqual(error.server_code, -32600)
+        self.assertEqual(error.selected_model, "account-model")
+        self.assertEqual(error.reasoning_level, "high")
+        self.assertFalse(error.output_started)
+
 
 class _FakeCompletions:
     def __init__(self, *, text=None, error=None, calls=None):
@@ -611,11 +638,18 @@ class GuiContractTests(unittest.TestCase):
                         "planType": "plus"},
             "models": [{"id": "m1", "displayName": "Model One"}],
             "selectedModel": "m1", "error": "",
-            "rateLimits": {"primary": {"usedPercent": 24}},
+            "quotaWindows": [
+                {"label": "5 h", "remainingPercent": 100},
+                {"label": "Weekly", "remainingPercent": 79},
+            ],
         })
         self.assertFalse(panel._chatgpt_status.isHidden())
         self.assertEqual(panel._chatgpt_account_detail.text(), "safe@example.test · Plus")
-        self.assertEqual(panel._chatgpt_usage.text(), "Usage: 24%")
+        self.assertEqual(
+            panel._chatgpt_usage.text(),
+            "5 h: 100% remaining · Weekly: 79% remaining",
+        )
+        self.assertNotIn("Usage", panel._chatgpt_usage.text())
         self.assertFalse(panel._chatgpt_usage.isHidden())
         self.assertFalse(panel._chatgpt_disconnect_btn.isHidden())
         self.assertFalse(panel._chatgpt_info_btn.isHidden())

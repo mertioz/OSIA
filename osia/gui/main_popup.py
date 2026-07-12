@@ -6354,26 +6354,43 @@ class _SettingsPanel(QWidget):
                 pass
         try:
             payload = provider.rate_limits()
-            rate_limits = payload.get("rateLimits") if isinstance(payload, dict) else None
-            if isinstance(rate_limits, dict):
-                status = dict(status)
-                status["rateLimits"] = rate_limits
+            from osia.chatgpt_account.rate_limits import quota_windows
+
+            status = dict(status)
+            status["quotaWindows"] = quota_windows(payload)
         except Exception:
             pass
         return status
 
     def _refresh_chatgpt_usage_text(self) -> None:
         status = self._chatgpt_last_status or {}
-        rate_limits = status.get("rateLimits")
-        primary = rate_limits.get("primary") if isinstance(rate_limits, dict) else None
-        used = primary.get("usedPercent") if isinstance(primary, dict) else None
-        valid = (
-            isinstance(used, int) and not isinstance(used, bool) and 0 <= used <= 100
-        )
-        self._chatgpt_usage.setText(
-            i18n.t("chatgpt_account.usage", percent=used) if valid else ""
-        )
-        self._chatgpt_usage.setVisible(bool(valid and status.get("connected")))
+        parts = []
+        for window in status.get("quotaWindows") or []:
+            if not isinstance(window, dict):
+                continue
+            label = str(window.get("label") or "").strip()
+            remaining = window.get("remainingPercent")
+            if (
+                not label
+                or not isinstance(remaining, int)
+                or isinstance(remaining, bool)
+                or not 0 <= remaining <= 100
+            ):
+                continue
+            if label.endswith("Weekly"):
+                label = label[:-len("Weekly")] + i18n.t(
+                    "chatgpt_account.quota_weekly"
+                )
+            parts.append(
+                i18n.t(
+                    "chatgpt_account.quota_remaining",
+                    label=label,
+                    percent=remaining,
+                )
+            )
+        text = " · ".join(parts)
+        self._chatgpt_usage.setText(text)
+        self._chatgpt_usage.setVisible(bool(text and status.get("connected")))
 
     def _probe_chatgpt_account(self) -> None:
         if self._chatgpt_probe_busy or self._chatgpt_action_busy:

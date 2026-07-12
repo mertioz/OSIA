@@ -12,9 +12,15 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from osia.chatgpt_account.app_server_client import (
     AppServerClient, AppServerError, RuntimeUnavailableError,
+)
+from osia.chatgpt_account.rate_limits import (
+    merge_rate_limit_payload,
+    quota_windows,
+    sanitize_rate_limit_payload,
 )
 
 
@@ -202,6 +208,135 @@ class AppServerClientTests(unittest.TestCase):
         self.assertIn('web_search = "disabled"', config)
         self.assertIn('inherit = "none"', config)
 
+    def test_rejected_rate_limit_refresh_preserves_sparse_updated_snapshot(self):
+        reads = 0
+
+        def handler(process, message):
+            nonlocal reads
+            if message.get("method") != "account/rateLimits/read":
+                _base_handler(process, message)
+                return
+            reads += 1
+            if reads == 1:
+                snapshot = {
+                    "primary": {"usedPercent": 37, "windowDurationMins": 300},
+                    "secondary": {"usedPercent": 21, "windowDurationMins": 10080},
+                }
+                process.emit({"id": message["id"], "result": {
+                    "rateLimits": snapshot,
+                    "rateLimitsByLimitId": {"codex": snapshot},
+                }})
+            else:
+                process.emit({"id": message["id"], "error": {
+                    "code": -32000, "message": "sensitive upstream detail"}})
+
+        client, _factory = self.make_client(handler)
+        first = client.get_rate_limits()
+        self.assertEqual(first["rateLimitsByLimitId"]["codex"]["primary"]["usedPercent"], 37)
+
+        client._dispatch_notification("account/rateLimits/updated", {
+            "rateLimits": {"primary": {"usedPercent": 0}},
+        })
+        preserved = client.get_rate_limits()
+        self.assertEqual(preserved["rateLimits"]["primary"]["usedPercent"], 0)
+        self.assertEqual(
+            preserved["rateLimitsByLimitId"]["codex"]["primary"]["usedPercent"], 0
+        )
+        self.assertEqual(
+            quota_windows(preserved),
+            [
+                {"label": "5 h", "remainingPercent": 100},
+                {"label": "Weekly", "remainingPercent": 79},
+            ],
+        )
+        self.assertNotIn("sensitive upstream detail", json.dumps(preserved))
+
+    def test_update_received_during_read_is_merged_after_response(self):
+        client, _factory = self.make_client()
+
+        def request(_method, _params):
+            client._dispatch_notification("account/rateLimits/updated", {
+                "rateLimits": {"primary": {"usedPercent": 0}},
+            })
+            return {"rateLimits": {
+                "primary": {"usedPercent": 48, "windowDurationMins": 300},
+            }}
+
+        client._request = request
+        snapshot = client.get_rate_limits()
+        self.assertEqual(snapshot["rateLimits"]["primary"], {
+            "usedPercent": 0, "windowDurationMins": 300,
+        })
+
+    def test_primary_secondary_and_used_to_remaining(self):
+        windows = quota_windows({"rateLimits": {
+            "primary": {"usedPercent": 0, "windowDurationMins": 300},
+            "secondary": {"usedPercent": 21, "windowDurationMins": 10080},
+        }})
+        self.assertEqual(windows, [
+            {"label": "5 h", "remainingPercent": 100},
+            {"label": "Weekly", "remainingPercent": 79},
+        ])
+
+    def test_multiple_internal_buckets_do_not_leak_into_ui_windows(self):
+        payload = {
+            "rateLimits": {
+                "primary": {"usedPercent": 10, "windowDurationMins": 300},
+                "secondary": {"usedPercent": 20, "windowDurationMins": 10080},
+            },
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "primary": {"usedPercent": 10, "windowDurationMins": 300},
+                    "secondary": {"usedPercent": 20, "windowDurationMins": 10080},
+                },
+                "codex_extra": {
+                    "primary": {"usedPercent": 30, "windowDurationMins": 300},
+                    "secondary": {"usedPercent": 40, "windowDurationMins": 10080},
+                },
+            },
+        }
+        safe = sanitize_rate_limit_payload(payload)
+        self.assertEqual(set(safe["rateLimitsByLimitId"]), {"codex", "codex_extra"})
+        self.assertEqual(quota_windows(payload), [
+            {"label": "5 h", "remainingPercent": 90},
+            {"label": "Weekly", "remainingPercent": 80},
+        ])
+
+    def test_missing_canonical_bucket_does_not_fabricate_ui_windows(self):
+        payload = {"rateLimitsByLimitId": {"codex_extra": {
+            "primary": {"usedPercent": 30, "windowDurationMins": 300},
+        }}}
+        self.assertIn("codex_extra", sanitize_rate_limit_payload(payload)["rateLimitsByLimitId"])
+        self.assertEqual(quota_windows(payload), [])
+
+    def test_sparse_window_reset_from_nonzero_to_zero(self):
+        base = {"rateLimits": {
+            "primary": {"usedPercent": 52, "windowDurationMins": 300},
+        }}
+        merged = merge_rate_limit_payload(
+            base, {"rateLimits": {"primary": {"usedPercent": 0}}}
+        )
+        self.assertEqual(merged["rateLimits"]["primary"], {
+            "usedPercent": 0, "windowDurationMins": 300,
+        })
+        self.assertEqual(quota_windows(merged)[0]["remainingPercent"], 100)
+
+    def test_missing_or_invalid_fields_do_not_fabricate_zero(self):
+        payload = {
+            "rateLimits": {
+                "primary": {"windowDurationMins": 300},
+                "secondary": {"usedPercent": True},
+            },
+            "rateLimitsByLimitId": {"unsafe id": {
+                "primary": {"usedPercent": 10},
+            }},
+            "credential": "must-not-pass",
+        }
+        self.assertEqual(quota_windows(payload), [])
+        encoded = json.dumps(sanitize_rate_limit_payload(payload))
+        self.assertNotIn("credential", encoded)
+        self.assertNotIn("must-not-pass", encoded)
+
     def test_disconnected_login_is_single_flight_and_cancel_is_correlated(self):
         client, factory = self.make_client()
         self.assertFalse(client.get_account_status()["connected"])
@@ -281,6 +416,89 @@ class AppServerClientTests(unittest.TestCase):
         models = client.list_models()
         self.assertEqual([item["id"] for item in models], ["visible"])
         self.assertEqual(models[0]["supportedReasoningEfforts"][0]["id"], "low")
+
+    def test_thread_start_uses_official_read_only_sandbox_value(self):
+        def handler(process, message):
+            if message.get("method") == "thread/start":
+                process.emit({"id": message["id"], "result": {
+                    "thread": {"id": "thread-1"},
+                    "instructionSources": [],
+                }})
+            else:
+                _base_handler(process, message)
+
+        client, factory = self.make_client(handler)
+        thread_id = client.start_or_resume_conversation(
+            thread_id=None,
+            model="visible",
+            base_instructions="base",
+            developer_instructions="developer",
+        )
+        self.assertEqual(thread_id, "thread-1")
+        request = next(
+            item for item in factory.processes[0].received
+            if item.get("method") == "thread/start"
+        )
+        self.assertEqual(request["params"]["sandbox"], "read-only")
+
+    def test_thread_resume_uses_official_read_only_sandbox_value(self):
+        def handler(process, message):
+            if message.get("method") == "thread/resume":
+                process.emit({"id": message["id"], "result": {
+                    "thread": {"id": "thread-existing"},
+                    "instructionSources": [],
+                }})
+            else:
+                _base_handler(process, message)
+
+        client, factory = self.make_client(handler)
+        thread_id = client.start_or_resume_conversation(
+            thread_id="thread-existing",
+            model="visible",
+            base_instructions="base",
+            developer_instructions="developer",
+        )
+        self.assertEqual(thread_id, "thread-existing")
+        request = next(
+            item for item in factory.processes[0].received
+            if item.get("method") == "thread/resume"
+        )
+        self.assertEqual(request["params"]["sandbox"], "read-only")
+
+    def test_rejected_request_exposes_only_sanitized_diagnostics(self):
+        def handler(process, message):
+            if message.get("method") == "thread/start":
+                process.emit({"id": message["id"], "error": {
+                    "code": -32600,
+                    "message": "secret prompt path token thread detail",
+                }})
+            else:
+                _base_handler(process, message)
+
+        client, _factory = self.make_client(handler)
+        with patch("osia.i18n.get_language", return_value="en"):
+            with self.assertRaises(AppServerError) as caught:
+                client.start_or_resume_conversation(
+                    thread_id=None,
+                    model="visible",
+                    base_instructions="base",
+                    developer_instructions="developer",
+                )
+        error = caught.exception
+        self.assertEqual(error.category, "request_rejected")
+        self.assertEqual(error.method, "thread/start")
+        self.assertEqual(error.server_code, -32600)
+        self.assertIn("Please retry", str(error))
+        self.assertNotIn("secret", str(error))
+
+    def test_rejected_request_message_is_translated_and_actionable(self):
+        from osia import i18n
+
+        with patch("osia.i18n.get_language", return_value="fr"):
+            message = i18n.t("chatgpt_account.request_rejected")
+        self.assertTrue(message.startswith("ERROR:"))
+        self.assertIn("Réessayez", message)
+        self.assertIn("API", message)
 
     def test_streamed_agent_text_and_textual_tool_call_are_accepted(self):
         def handler(process, message):

@@ -83,12 +83,25 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "chatgpt_account.runtime_incompatible": {"en": "This Codex version is incompatible. APIs continue to work normally.", "fr": "Cette version de Codex est incompatible. Les API continuent de fonctionner normalement."},
     "chatgpt_account.isolation_error": {"en": "The isolated Codex configuration is not clean, so the account provider is disabled.", "fr": "La configuration Codex isolée n'est pas saine ; le fournisseur de compte est désactivé."},
     "chatgpt_account.error": {"en": "ChatGPT account is temporarily unavailable. APIs remain available.", "fr": "Le compte ChatGPT est temporairement indisponible. Les API restent disponibles."},
+    "chatgpt_account.request_rejected": {
+        "en": "ERROR: ChatGPT could not start this request. Please retry; API providers remain available.",
+        "fr": "ERROR: ChatGPT n'a pas pu démarrer cette requête. Réessayez ; les fournisseurs API restent disponibles.",
+        "zh": "ERROR: ChatGPT 无法启动此请求。请重试；API 提供商仍然可用。",
+        "ja": "ERROR: ChatGPT はこのリクエストを開始できませんでした。再試行してください。API プロバイダーは引き続き利用できます。",
+        "de": "ERROR: ChatGPT konnte diese Anfrage nicht starten. Bitte erneut versuchen; API-Anbieter bleiben verfügbar.",
+        "es": "ERROR: ChatGPT no pudo iniciar esta solicitud. Inténtalo de nuevo; los proveedores de API siguen disponibles.",
+    },
     "chatgpt_account.connect": {"en": "Connect with ChatGPT", "fr": "Se connecter avec ChatGPT"},
     "chatgpt_account.cancel": {"en": "Cancel", "fr": "Annuler"},
     "chatgpt_account.disconnect": {"en": "Disconnect", "fr": "Déconnecter"},
     "chatgpt_account.retry": {"en": "Retry", "fr": "Réessayer"},
     "chatgpt_account.model": {"en": "Account model", "fr": "Modèle du compte"},
     "chatgpt_account.usage": {"en": "Usage: {percent}%", "fr": "Utilisation : {percent} %"},
+    "chatgpt_account.quota_remaining": {
+        "en": "{label}: {percent}% remaining",
+        "fr": "{label} : {percent} % restants",
+    },
+    "chatgpt_account.quota_weekly": {"en": "Weekly", "fr": "Hebdo"},
     "chatgpt_account.reasoning": {"en": "Reasoning", "fr": "Raisonnement"},
     # — Provider configuration card —
     "provider.key_placeholder": {
