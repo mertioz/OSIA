@@ -53,9 +53,11 @@ from osia.server import server
 class _FakeChannel:
     def __init__(self):
         self.frames = []
+        self.frame_received = asyncio.Event()
 
     async def send_json(self, frame):
         self.frames.append(dict(frame))
+        self.frame_received.set()
 
 
 class ConversationBusyTests(unittest.IsolatedAsyncioTestCase):
@@ -184,7 +186,7 @@ class ConversationBusyTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(
             server._turn_progress_loop(client, meta, interval=0.01)
         )
-        await asyncio.sleep(0.025)
+        await asyncio.wait_for(client.frame_received.wait(), timeout=1.0)
         await server._cancel_turn_progress_task(task)
 
         self.assertGreaterEqual(len(client.frames), 1)
@@ -237,15 +239,34 @@ class ConversationBusyTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(
             server._turn_progress_loop(origin, meta, interval=0.01)
         )
-        await asyncio.sleep(0.025)
+        await asyncio.wait_for(
+            asyncio.gather(
+                origin.frame_received.wait(),
+                secondary.frame_received.wait(),
+            ),
+            timeout=1.0,
+        )
         await server._cancel_turn_progress_task(task)
 
         self.assertGreaterEqual(len(origin.frames), 1)
         self.assertGreaterEqual(len(secondary.frames), 1)
-        self.assertEqual(secondary.frames[0]["type"], "turn_status")
-        self.assertEqual(secondary.frames[0]["client_request_id"],
-                         "req-broadcast")
-        self.assertEqual(secondary.frames[0]["turn_id"], "turn-broadcast")
+        self.assertEqual(origin.frames[0], secondary.frames[0])
+        first = origin.frames[0]
+        self.assertEqual(first["type"], "turn_status")
+        self.assertEqual(first["event_type"], "turn_status")
+        self.assertEqual(first["conversation_id"], "conv-broadcast")
+        self.assertEqual(first["request_id"], "req-broadcast")
+        self.assertEqual(first["client_request_id"], "req-broadcast")
+        self.assertEqual(first["turn_id"], "turn-broadcast")
+        self.assertFalse(first["terminal"])
+
+        stopped_counts = (len(origin.frames), len(secondary.frames))
+        self.assertTrue(task.done())
+        await asyncio.sleep(0)
+        self.assertEqual(
+            (len(origin.frames), len(secondary.frames)),
+            stopped_counts,
+        )
 
     def test_accepted_user_message_persists_with_request_metadata(self):
         old_dir = server.conversations.CONVERSATIONS_DIR
@@ -253,12 +274,16 @@ class ConversationBusyTests(unittest.IsolatedAsyncioTestCase):
             server.conversations.CONVERSATIONS_DIR = Path(tmp)
             try:
                 conv = server.conversations.create_conversation()
-                meta = {
-                    "conversation_id": conv["id"],
-                    "client_request_id": "req-accepted",
-                    "turn_id": "turn-accepted",
-                }
+                meta = server._new_turn_meta(conv["id"], "req-accepted")
+                meta["client_content_hash"] = "accepted-content-hash"
+                expected_turn_id = meta["turn_id"]
+                expected_message_id = meta["user_message_id"]
 
+                self.assertTrue(
+                    server._persist_accepted_user_message(
+                        conv["id"], "hello", meta,
+                    )
+                )
                 self.assertTrue(
                     server._persist_accepted_user_message(
                         conv["id"], "hello", meta,
@@ -270,10 +295,37 @@ class ConversationBusyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(messages), 1)
                 self.assertEqual(messages[0]["role"], "user")
                 self.assertEqual(messages[0]["content"], "hello")
+                self.assertEqual(messages[0]["_conversation_id"], conv["id"])
+                self.assertEqual(messages[0]["_request_id"], "req-accepted")
                 self.assertEqual(
                     messages[0]["_client_request_id"], "req-accepted",
                 )
-                self.assertEqual(messages[0]["_turn_id"], "turn-accepted")
+                self.assertEqual(messages[0]["_turn_id"], expected_turn_id)
+                self.assertEqual(messages[0]["_message_id"], expected_message_id)
+                self.assertEqual(
+                    messages[0]["_client_content_hash"],
+                    "accepted-content-hash",
+                )
+
+                found = server.conversations.find_correlated_turn(
+                    conv["id"], "req-accepted",
+                )
+                self.assertIsNotNone(found)
+                self.assertEqual(found["turn_id"], expected_turn_id)
+                self.assertEqual(found["user_message_id"], expected_message_id)
+
+                meta["persisted"] = True
+                accepted = server._turn_accepted_frame(meta)
+                self.assertEqual(accepted["conversation_id"], conv["id"])
+                self.assertEqual(accepted["request_id"], "req-accepted")
+                self.assertEqual(accepted["client_request_id"], "req-accepted")
+                self.assertEqual(accepted["turn_id"], expected_turn_id)
+                self.assertEqual(accepted["message_id"], expected_message_id)
+                self.assertEqual(accepted["event_type"], "turn_accepted")
+                self.assertEqual(accepted["sequence"], 1)
+                self.assertFalse(accepted["terminal"])
+                self.assertTrue(accepted["persisted"])
+                self.assertEqual(server._turn_accepted_frame(meta), accepted)
             finally:
                 server.conversations.CONVERSATIONS_DIR = old_dir
 

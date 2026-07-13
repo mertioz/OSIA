@@ -37,6 +37,8 @@ import time
 import socket
 import tempfile
 import subprocess
+import ctypes
+from ctypes import wintypes
 from pathlib import Path
 
 # windows/run_service.py → <repo>/windows → <repo>
@@ -51,9 +53,199 @@ _POLL_SEC = 2.0         # cadence for re-checking a live child / an external own
 _STARTUP_GRACE = 2.0    # head start before re-checking a freshly launched child
 _HANG_TIMEOUT = 75.0    # max time a server child may be alive-but-not-listening on
                         # 8765 before we treat it as HUNG and relaunch (WOR-47)
+_CHILD_STOP_TIMEOUT = 8.0
+_LIFECYCLE_MUTEX_TIMEOUT = 5.0
+
+_WIN_WAIT_OBJECT_0 = 0x00000000
+_WIN_WAIT_ABANDONED = 0x00000080
+_WIN_WAIT_TIMEOUT = 0x00000102
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 
 # No console window for the child console apps (python.exe / cloudflared.exe).
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+_KERNEL32 = None
+
+
+def _kernel32():
+    """Configured kernel32 handle API (loaded lazily for import-safe tests)."""
+    global _KERNEL32
+    if _KERNEL32 is not None:
+        return _KERNEL32
+    if sys.platform != "win32":
+        raise OSError("Windows lifecycle primitives are unavailable")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
+                                      wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateEventW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
+                                      wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _KERNEL32 = kernel32
+    return kernel32
+
+
+class _JobBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class _JobExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def _shutdown_event_name(kind: str) -> str:
+    return f"Local\\OSIA.SupervisorShutdown.{kind}"
+
+
+def _lifecycle_mutex_name(kind: str) -> str:
+    return f"Local\\OSIA.SupervisorLifecycle.{kind}"
+
+
+def _child_job_name(kind: str, supervisor_pid: int | None = None) -> str:
+    pid = os.getpid() if supervisor_pid is None else supervisor_pid
+    return f"Local\\OSIA.SupervisorChildren.{kind}.{pid}"
+
+
+class _ShutdownEvent:
+    """Manual-reset event used by service control to request a clean stop."""
+
+    def __init__(self, kind: str):
+        self._kernel32 = _kernel32()
+        self._handle = self._kernel32.CreateEventW(
+            None, True, False, _shutdown_event_name(kind),
+        )
+        if not self._handle:
+            raise OSError(ctypes.get_last_error(), "CreateEventW failed")
+
+    def is_set(self) -> bool:
+        return self._kernel32.WaitForSingleObject(
+            self._handle, 0,
+        ) == _WIN_WAIT_OBJECT_0
+
+    def wait(self, timeout: float) -> bool:
+        millis = max(0, min(int(timeout * 1000), 0xFFFFFFFE))
+        result = self._kernel32.WaitForSingleObject(self._handle, millis)
+        if result == _WIN_WAIT_OBJECT_0:
+            return True
+        if result == _WIN_WAIT_TIMEOUT:
+            return False
+        raise OSError(ctypes.get_last_error(), "shutdown event wait failed")
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+class _NamedMutex:
+    """Small named-mutex wrapper; abandoned ownership is safely recoverable."""
+
+    def __init__(self, name: str):
+        self._kernel32 = _kernel32()
+        self._handle = self._kernel32.CreateMutexW(None, False, name)
+        self._acquired = False
+        self.abandoned = False
+        if not self._handle:
+            raise OSError(ctypes.get_last_error(), "CreateMutexW failed")
+
+    def acquire(self, timeout: float) -> bool:
+        millis = max(0, min(int(timeout * 1000), 0xFFFFFFFE))
+        result = self._kernel32.WaitForSingleObject(self._handle, millis)
+        if result in (_WIN_WAIT_OBJECT_0, _WIN_WAIT_ABANDONED):
+            self._acquired = True
+            self.abandoned = result == _WIN_WAIT_ABANDONED
+            return True
+        if result == _WIN_WAIT_TIMEOUT:
+            return False
+        raise OSError(ctypes.get_last_error(), "mutex wait failed")
+
+    def release(self) -> None:
+        if self._handle and self._acquired:
+            self._kernel32.ReleaseMutex(self._handle)
+            self._acquired = False
+
+    def close(self) -> None:
+        self.release()
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+class _ChildJob:
+    """Own the supervised child tree and reap it if the supervisor disappears."""
+
+    def __init__(self, kind: str):
+        self._kernel32 = _kernel32()
+        self._handle = self._kernel32.CreateJobObjectW(None, _child_job_name(kind))
+        if not self._handle:
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+        info = _JobExtendedLimitInformation()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not self._kernel32.SetInformationJobObject(
+            self._handle,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            error = ctypes.get_last_error()
+            self.close()
+            raise OSError(error, "SetInformationJobObject failed")
+
+    def assign(self, child) -> bool:
+        process_handle = getattr(child, "_handle", None)
+        if process_handle is None:
+            return False
+        return bool(self._kernel32.AssignProcessToJobObject(
+            self._handle, wintypes.HANDLE(int(process_handle)),
+        ))
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
 
 
 def _norm_cmdline(cmdline: str) -> str:
@@ -223,6 +415,134 @@ def _port_listening(port: int) -> bool:
         return False
 
 
+def _stop_child(child) -> None:
+    """Stop and reap one supervised child without allowing a relaunch."""
+    if child is None:
+        return
+    try:
+        if child.poll() is not None:
+            return
+        _say(f"shutdown: terminating child pid={child.pid}")
+        child.terminate()
+        child.wait(timeout=_CHILD_STOP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _say(f"shutdown: child pid={child.pid} timed out; forcing exit")
+        try:
+            child.kill()
+            child.wait(timeout=_CHILD_STOP_TIMEOUT)
+        except Exception as exc:
+            _say(f"shutdown: forced child exit failed category={type(exc).__name__}")
+    except Exception as exc:
+        _say(f"shutdown: child stop failed category={type(exc).__name__}")
+
+
+def _supervise(kind: str, cmd, cwd: str, child_log, child_log_path: Path,
+               shutdown, lifecycle, child_job) -> int:
+    """Run the crash-restart loop until the named shutdown event is set."""
+    my_child = None
+    deferring = False
+    launched_at = 0.0
+    healthy = False
+    try:
+        while not shutdown.is_set():
+            if my_child is not None:
+                rc = my_child.poll()
+                if rc is None:
+                    if kind == "server" and not healthy:
+                        if _port_listening(8765):
+                            healthy = True
+                            _say(f"child pid={my_child.pid} is serving on 8765 "
+                                 f"({time.time() - launched_at:.1f}s after launch)")
+                        elif time.time() - launched_at > _HANG_TIMEOUT:
+                            _say(f"child pid={my_child.pid} alive but 8765 not "
+                                 f"listening after {_HANG_TIMEOUT:.0f}s — HUNG; killing "
+                                 f"for relaunch (stack in osia_server_boot.log)")
+                            try:
+                                my_child.kill()
+                                my_child.wait(timeout=10)
+                            except Exception as exc:
+                                _say(f"hung-child kill failed category={type(exc).__name__}")
+                            if shutdown.wait(_RESTART_SEC):
+                                break
+                            continue
+                    if shutdown.wait(_POLL_SEC):
+                        break
+                    continue
+                _say(f"child pid={my_child.pid} exited rc={rc}{_decode_rc(rc)} "
+                     f"(see {child_log_path.name} for its output)")
+            dead_pid = my_child.pid if my_child is not None else -1
+            my_child = None
+
+            if shutdown.is_set():
+                break
+            if _other_owner_running(kind, exclude_pid=dead_pid):
+                if not deferring:
+                    _say(f"another {kind} owner already running (pid!={dead_pid}); "
+                         f"deferring instead of racing for the port")
+                    deferring = True
+                if shutdown.wait(_POLL_SEC):
+                    break
+                continue
+            deferring = False
+
+            # Serialize the final event check with the controller's SetEvent.
+            # This closes the last check/Popen race during an expected shutdown.
+            if not lifecycle.acquire(_LIFECYCLE_MUTEX_TIMEOUT):
+                _say("launch coordination timed out; retrying")
+                if shutdown.wait(_RESTART_SEC):
+                    break
+                continue
+            try:
+                if shutdown.is_set():
+                    break
+                try:
+                    my_child = subprocess.Popen(
+                        cmd, cwd=cwd,
+                        stdout=(child_log or subprocess.DEVNULL),
+                        stderr=subprocess.STDOUT,
+                        creationflags=_NO_WINDOW,
+                        env={**os.environ, "PYTHONFAULTHANDLER": "1",
+                             "PYTHONUNBUFFERED": "1"},
+                    )
+                    try:
+                        assigned = child_job.assign(my_child)
+                    except Exception as exc:
+                        _say(f"child ownership failed pid={my_child.pid} "
+                             f"category={type(exc).__name__}; stopping")
+                        _stop_child(my_child)
+                        return 1
+                    if not assigned:
+                        _say(f"child ownership failed pid={my_child.pid}; stopping")
+                        _stop_child(my_child)
+                        return 1
+                    launched_at = time.time()
+                    healthy = False
+                    _say(f"launched {kind} child pid={my_child.pid}")
+                except Exception as exc:
+                    _say(f"failed to launch {kind} category={type(exc).__name__}")
+                    my_child = None
+            finally:
+                lifecycle.release()
+
+            if my_child is None:
+                if shutdown.wait(_RESTART_SEC):
+                    break
+                continue
+
+            if shutdown.wait(_STARTUP_GRACE):
+                break
+            rc = my_child.poll()
+            if rc is not None:
+                _say(f"child pid={my_child.pid} died within {_STARTUP_GRACE}s "
+                     f"rc={rc}{_decode_rc(rc)} (see {child_log_path.name})")
+                if shutdown.wait(_RESTART_SEC):
+                    break
+        _say("shutdown requested; supervision stopped")
+        return 0
+    finally:
+        _stop_child(my_child)
+
+
 def main() -> int:
     kind = (sys.argv[1] if len(sys.argv) > 1 else "").strip().lower()
     if kind not in ("server", "tunnel"):
@@ -272,94 +592,27 @@ def main() -> int:
             _say(f"rendezvous publisher not started (best-effort): {e!r}")
 
     cmd, cwd = _child_command(kind)
-    _say(f"child command: {cmd}  (cwd={cwd})")
-    my_child = None
-    deferring = False  # only log the defer decision on transitions, not every poll
-    launched_at = 0.0  # wall time of the current child's launch (for the hang check)
-    healthy = False    # set once a server child is observed LISTENING on 8765
-    while True:
-        # Our child is still alive — keep watching it.
-        if my_child is not None:
-            rc = my_child.poll()
-            if rc is None:
-                # Alive is not the same as serving. The WOR-47 cold-boot hang
-                # leaves the server worker blocked in its startup tail: poll()
-                # reports it alive forever while 8765 never binds. Promote it to
-                # "healthy" only once it actually listens; if it never does within
-                # the hang window, kill it so the next iteration relaunches a fresh
-                # one (its stack is in osia_server_boot.log via faulthandler).
-                if kind == "server" and not healthy:
-                    if _port_listening(8765):
-                        healthy = True
-                        _say(f"child pid={my_child.pid} is serving on 8765 "
-                             f"({time.time() - launched_at:.1f}s after launch)")
-                    elif time.time() - launched_at > _HANG_TIMEOUT:
-                        _say(f"child pid={my_child.pid} alive but 8765 not "
-                             f"listening after {_HANG_TIMEOUT:.0f}s — HUNG; killing "
-                             f"for relaunch (stack in osia_server_boot.log)")
-                        try:
-                            my_child.kill()
-                            # Reap the corpse before relaunching, and deliberately
-                            # KEEP my_child set (do not null it here): the next loop
-                            # iteration then runs the normal exited-child path, which
-                            # captures the real dead_pid and EXCLUDES it from the
-                            # _other_owner_running defer check. Otherwise the just-
-                            # killed child (TerminateProcess is not an immediate reap)
-                            # could still be visible to psutil and match its own
-                            # "run_server.py" cmdline, making the supervisor defer to
-                            # its own corpse instead of relaunching — delaying the
-                            # self-heal this watchdog exists to deliver.
-                            my_child.wait(timeout=10)
-                        except Exception as e:
-                            _say(f"kill of hung child failed: {e!r}")
-                        time.sleep(_RESTART_SEC)
-                        continue
-                time.sleep(_POLL_SEC)
-                continue
-            _say(f"child pid={my_child.pid} exited rc={rc}{_decode_rc(rc)} "
-                 f"(see {child_log_path.name} for its output)")
-        dead_pid = my_child.pid if my_child is not None else -1
-        my_child = None
-        # Did a detached replacement (restart_server) or another instance take
-        # over? If so, defer to it instead of racing for the port.
-        if _other_owner_running(kind, exclude_pid=dead_pid):
-            if not deferring:
-                _say(f"another {kind} owner already running (pid!={dead_pid}); "
-                     f"deferring instead of racing for the port")
-                deferring = True
-            time.sleep(_POLL_SEC)
-            continue
-        deferring = False
-        # Nobody is serving — (re)launch the child.
-        try:
-            my_child = subprocess.Popen(
-                cmd, cwd=cwd,
-                stdout=(child_log or subprocess.DEVNULL),
-                stderr=subprocess.STDOUT,
-                creationflags=_NO_WINDOW,
-                # COPY os.environ (never replace it — a bare dict would drop PATH
-                # and break Windows DLL resolution at interpreter startup).
-                # PYTHONFAULTHANDLER arms faulthandler from the first instruction
-                # (belt-and-suspenders with run_server's own _init_boot_diag);
-                # PYTHONUNBUFFERED matches the `-u` flag so the child log keeps
-                # its tail even if the child is killed.
-                env={**os.environ, "PYTHONFAULTHANDLER": "1", "PYTHONUNBUFFERED": "1"},
-            )
-            launched_at = time.time()
-            healthy = False
-            _say(f"launched {kind} child pid={my_child.pid}")
-        except Exception as e:
-            _say(f"failed to launch {kind}: {e!r}")
-            time.sleep(_RESTART_SEC)
-            continue
-        # Give it a head start, then if it died immediately (e.g. the port was
-        # still held during a restart) back off so we don't hot-loop.
-        time.sleep(_STARTUP_GRACE)
-        rc = my_child.poll()
-        if rc is not None:
-            _say(f"child pid={my_child.pid} died within {_STARTUP_GRACE}s "
-                 f"rc={rc}{_decode_rc(rc)} (see {child_log_path.name})")
-            time.sleep(_RESTART_SEC)
+    shutdown = None
+    lifecycle = None
+    child_job = None
+    try:
+        shutdown = _ShutdownEvent(kind)
+        lifecycle = _NamedMutex(_lifecycle_mutex_name(kind))
+        child_job = _ChildJob(kind)
+        return _supervise(
+            kind, cmd, cwd, child_log, child_log_path,
+            shutdown, lifecycle, child_job,
+        )
+    except Exception as exc:
+        _say(f"supervisor lifecycle setup failed category={type(exc).__name__}")
+        return 1
+    finally:
+        if child_job is not None:
+            child_job.close()
+        if lifecycle is not None:
+            lifecycle.close()
+        if shutdown is not None:
+            shutdown.close()
 
 
 if __name__ == "__main__":

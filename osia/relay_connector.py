@@ -22,6 +22,10 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 
 from osia.config import load_mobile_token
+from osia.transport_coordinator import (
+    acquire_application_transport,
+    application_transport_coordination_enabled,
+)
 from osia.relay_crypto import (
     ALG_CHACHA20_POLY1305,
     E2E_VERSION,
@@ -69,6 +73,8 @@ TYPE_E2E_HELLO = "E2E_HELLO"
 TYPE_E2E_READY = "E2E_READY"
 TYPE_E2E_FRAME = "E2E_FRAME"
 TYPE_E2E_CHUNK = "E2E_CHUNK"
+TYPE_TRANSPORT_COMMIT = "transport_commit"
+TYPE_TRANSPORT_COMMITTED = "transport_committed"
 
 _CHUNK_PRIORITY_VALUES = {"critical", "normal", "droppable"}
 _LEGACY_IDENTITY_FIELDS = {
@@ -218,11 +224,15 @@ class RelayBridge:
         self.seq = 0
         self._terminal_error_code = ""
         self.allow_plaintext = _relay_allow_plaintext(relay_url)
+        self._transport_coordination_enabled = (
+            application_transport_coordination_enabled()
+        )
         self._reset_relay_chunk_capabilities()
         self._reset_e2e_state()
         self._relay_send_lock = asyncio.Lock()
         self._local_ws = None
         self._local_reader_task: asyncio.Task | None = None
+        self._application_transport_lease = None
 
     def _reset_e2e_state(self) -> None:
         self.e2e_private_key = generate_x25519_private_key()
@@ -236,10 +246,12 @@ class RelayBridge:
         self.e2e_ready_sent = False
         self.e2e_peer_ready = False
         self.e2e_pc_ready_sent = False
+        self.lan_provisioning_sent = False
         self.e2e_peer_chunk_version = 0
         self.pending_e2e_ready: tuple[dict, dict] | None = None
         self.e2e_replay_guard = SequenceReplayGuard()
         self.mobile_ready = False
+        self._relay_commit_attempt_id: str | None = None
         self._chunk_transfers: dict[tuple, _ChunkTransfer] = {}
         self._chunk_tombstones: dict[tuple, _ChunkTombstone] = {}
         self._chunk_tombstone_order: deque[tuple] = deque()
@@ -452,10 +464,12 @@ class RelayBridge:
         self.e2e_ready_sent = False
         self.e2e_peer_ready = False
         self.e2e_pc_ready_sent = False
+        self.lan_provisioning_sent = False
         self.e2e_peer_chunk_version = 0
         self.pending_e2e_ready = None
         self.e2e_replay_guard = SequenceReplayGuard()
         self.mobile_ready = False
+        self._relay_commit_attempt_id = None
         self._chunk_transfers.clear()
         self._chunk_tombstones.clear()
         self._chunk_tombstone_order.clear()
@@ -524,30 +538,114 @@ class RelayBridge:
         # which may have been sent before this PC joined the relay session.
         if not self.e2e_peer_ready or self.e2e_keys is None:
             return
-        if self._local_ws is None:
-            await self._connect_local(relay_ws)
         if self.e2e_pc_ready_sent:
             return
-        await self._send_relay(relay_ws, "PC_READY", {"e2e": True})
+        if self._transport_coordination_enabled:
+            # Remain E2E-authenticated but application-idle until mobile has
+            # completed its LAN-first attempt and explicitly commits to relay.
+            await self._send_relay(
+                relay_ws,
+                "PC_READY",
+                {"e2e": True, "standby": True},
+            )
+            try:
+                from osia.lan_gateway import lan_provisioning_snapshot
+
+                provisioning = lan_provisioning_snapshot()
+            except Exception:
+                provisioning = None
+            if provisioning is not None and not self.lan_provisioning_sent:
+                alias = str(provisioning.get("instance_alias") or "")
+                pin = str(provisioning.get("certificate_sha256") or "")
+                if (
+                    re.fullmatch(r"[0-9a-f]{16}", alias)
+                    and re.fullmatch(r"[0-9a-f]{64}", pin)
+                    and provisioning.get("protocol_version") == 1
+                    and provisioning.get("port") == 8766
+                    and provisioning.get("path") == "/lan"
+                ):
+                    sent = await self._send_e2e_frame(
+                        relay_ws,
+                        {"type": "lan_provisioning", **provisioning},
+                        priority="critical",
+                        final=False,
+                    )
+                    self.lan_provisioning_sent = bool(sent)
+        else:
+            # Preserve the established relay-v2 path byte-for-byte in behavior
+            # when LAN-direct coordination is disabled.
+            if self._local_ws is None:
+                await self._connect_local(relay_ws)
+            await self._send_relay(relay_ws, "PC_READY", {"e2e": True})
         self.e2e_pc_ready_sent = True
 
-    async def _connect_local(self, relay_ws) -> None:
+    async def _handle_transport_commit(self, relay_ws, frame: dict) -> None:
+        if (
+            set(frame) != {"type", "transport", "attempt_id"}
+            or frame.get("type") != TYPE_TRANSPORT_COMMIT
+            or frame.get("transport") != "relay"
+        ):
+            await relay_ws.close()
+            return
+        attempt_id = str(frame.get("attempt_id") or "")
+        if not re.fullmatch(r"[0-9a-f]{32}", attempt_id):
+            await relay_ws.close()
+            return
+        current = self._relay_commit_attempt_id
+        if current is not None and current != attempt_id:
+            await relay_ws.close()
+            return
+        if self._local_ws is None:
+            await self._connect_local(relay_ws, start_reader=False)
+        self._relay_commit_attempt_id = attempt_id
+        await self._send_e2e_frame(
+            relay_ws,
+            {
+                "type": TYPE_TRANSPORT_COMMITTED,
+                "transport": "relay",
+                "attempt_id": attempt_id,
+            },
+            priority="critical",
+            final=False,
+        )
+        local_ws = self._local_ws
+        if local_ws is not None and self._local_reader_task is None:
+            self._local_reader_task = asyncio.create_task(
+                self._local_to_relay(local_ws, relay_ws)
+            )
+
+    async def _connect_local(self, relay_ws, *, start_reader: bool = True) -> None:
         if self._local_ws is not None:
             return
         import websockets
 
-        local_ws = await websockets.connect(
-            LOCAL_WS_URL,
-            max_size=MAX_LOCAL_SERVER_FRAME_BYTES,
-            ping_interval=20,
-            ping_timeout=20,
-        )
-        await local_ws.send(json.dumps({"type": "auth", "token": self.token}))
-        self._local_ws = local_ws
-        self._local_reader_task = asyncio.create_task(
-            self._local_to_relay(local_ws, relay_ws)
-        )
-        print("[OSIA Relay] local OSIA websocket connected")
+        lease = acquire_application_transport("relay", self)
+        if lease is None:
+            raise RuntimeError("another application transport owns the local bridge")
+        local_ws = None
+        try:
+            local_ws = await websockets.connect(
+                LOCAL_WS_URL,
+                max_size=MAX_LOCAL_SERVER_FRAME_BYTES,
+                ping_interval=20,
+                ping_timeout=20,
+            )
+            await local_ws.send(json.dumps({"type": "auth", "token": self.token}))
+            self._local_ws = local_ws
+            self._application_transport_lease = lease
+            if start_reader:
+                self._local_reader_task = asyncio.create_task(
+                    self._local_to_relay(local_ws, relay_ws)
+                )
+            print("[OSIA Relay] local OSIA websocket connected")
+        except Exception:
+            if local_ws is not None:
+                try:
+                    await local_ws.close()
+                except Exception:
+                    pass
+            lease.release()
+            raise
 
     async def _close_local(self) -> None:
         local_ws = self._local_ws
@@ -565,6 +663,10 @@ class RelayBridge:
                 await local_ws.close()
             except Exception:
                 pass
+        lease = self._application_transport_lease
+        self._application_transport_lease = None
+        if lease is not None:
+            lease.release()
 
     async def _local_to_relay(self, local_ws, relay_ws) -> None:
         try:
@@ -588,6 +690,10 @@ class RelayBridge:
         finally:
             if self._local_ws is local_ws:
                 self._local_ws = None
+                lease = self._application_transport_lease
+                self._application_transport_lease = None
+                if lease is not None:
+                    lease.release()
                 print("[OSIA Relay] local bridge ended; reconnecting relay")
                 try:
                     await relay_ws.close()
@@ -859,6 +965,20 @@ class RelayBridge:
             return
         if _safe_frame_type(frame) == "relay_chunk_error":
             self._handle_chunk_error_frame(frame)
+            return
+        if (
+            self._transport_coordination_enabled
+            and _safe_frame_type(frame) == TYPE_TRANSPORT_COMMIT
+        ):
+            try:
+                await self._handle_transport_commit(relay_ws, frame)
+            except Exception as exc:
+                print(f"[OSIA Relay] relay activation failed: {type(exc).__name__}")
+                await relay_ws.close()
+            return
+        if self._transport_coordination_enabled and self._local_ws is None:
+            print("[OSIA Relay] app frame rejected before relay transport commit")
+            await relay_ws.close()
             return
         if not await self._forward_mobile_frame(frame):
             print("[OSIA Relay] local bridge unavailable; closing relay")

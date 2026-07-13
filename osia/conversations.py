@@ -372,14 +372,81 @@ def add_message(
         conv = get_conversation(conv_id)
         if conv is None:
             return None
+        correlation = {
+            key: value
+            for key, value in (metadata or {}).items()
+            if isinstance(key, str) and key.startswith("_")
+        }
+        message_id = str(correlation.get("_message_id") or "")
+        turn_id = str(correlation.get("_turn_id") or "")
+        request_id = str(
+            correlation.get("_request_id")
+            or correlation.get("_client_request_id")
+            or ""
+        )
+        if message_id or turn_id or request_id:
+            if role not in {"user", "assistant"}:
+                raise ValueError("correlated messages must be user or assistant")
+            if not message_id or not turn_id or not request_id:
+                raise ValueError("correlated messages require request, turn, and message ids")
+            messages = conv.setdefault("messages", [])
+            for existing in messages:
+                if not isinstance(existing, dict):
+                    continue
+                existing_message_id = str(existing.get("_message_id") or "")
+                existing_turn_id = str(existing.get("_turn_id") or "")
+                existing_request_id = str(
+                    existing.get("_request_id")
+                    or existing.get("_client_request_id")
+                    or ""
+                )
+                if existing_message_id == message_id:
+                    if (
+                        existing.get("role") != role
+                        or existing_turn_id != turn_id
+                        or existing_request_id != request_id
+                        or existing.get("content") != content
+                    ):
+                        raise ValueError("message id correlation conflict")
+                    return conv
+                if existing_turn_id == turn_id and existing.get("role") == role:
+                    raise ValueError("one correlated message per role and turn")
+            if role == "assistant":
+                accepted_user = next(
+                    (
+                        item
+                        for item in reversed(messages)
+                        if isinstance(item, dict)
+                        and item.get("role") == "user"
+                        and str(item.get("_turn_id") or "") == turn_id
+                        and str(
+                            item.get("_request_id")
+                            or item.get("_client_request_id")
+                            or ""
+                        )
+                        == request_id
+                    ),
+                    None,
+                )
+                if accepted_user is None:
+                    raise ValueError("assistant message has no accepted user turn")
+                visible_tail = next(
+                    (
+                        item
+                        for item in reversed(messages)
+                        if isinstance(item, dict)
+                        and item.get("role") in {"user", "assistant"}
+                        and not item.get("_internal")
+                    ),
+                    None,
+                )
+                if visible_tail is not accepted_user:
+                    raise ValueError("assistant-to-assistant persistence rejected")
         entry = {
             "role": role,
             "content": content,
         }
-        if isinstance(metadata, dict):
-            for key, value in metadata.items():
-                if isinstance(key, str) and key.startswith("_"):
-                    entry[key] = value
+        entry.update(correlation)
         conv.setdefault("messages", []).append(entry)
         conv["updated_at"] = _now_iso()
         if (conv.get("title") in (None, "", DEFAULT_TITLE)
@@ -389,6 +456,72 @@ def add_message(
             conv["title"] = _make_title(content)
         _write_atomic(_path_for(conv_id), conv)
         return conv
+
+
+def find_correlated_turn(conv_id: str, request_id: str) -> dict | None:
+    """Return one persisted correlated turn without mutating conversation data."""
+
+    if not conv_id or not request_id:
+        return None
+    with _lock:
+        conv = get_conversation(conv_id)
+        if conv is None:
+            return None
+        user_message = None
+        assistant_message = None
+        for item in conv.get("messages") or []:
+            if not isinstance(item, dict):
+                continue
+            item_request_id = str(
+                item.get("_request_id")
+                or item.get("_client_request_id")
+                or ""
+            )
+            if item_request_id != request_id:
+                continue
+            if item.get("role") == "user":
+                user_message = item
+            elif item.get("role") == "assistant":
+                assistant_message = item
+        if user_message is None:
+            return None
+        turn_id = str(user_message.get("_turn_id") or "")
+        if not turn_id:
+            return None
+        if assistant_message is not None and str(
+            assistant_message.get("_turn_id") or ""
+        ) != turn_id:
+            raise ValueError("persisted turn correlation conflict")
+        return {
+            "conversation_id": conv_id,
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "user_message_id": str(user_message.get("_message_id") or ""),
+            "assistant_message_id": str(
+                (assistant_message or {}).get("_message_id") or ""
+            ),
+            "user_content": user_message.get("content"),
+            "client_content_hash": str(
+                user_message.get("_client_content_hash") or ""
+            ),
+            "response_event_id": str(
+                (assistant_message or {}).get("_response_event_id") or ""
+            ),
+            "response_sequence": int(
+                (assistant_message or {}).get("_response_sequence") or 0
+            ),
+            "terminal_event_id": str(
+                (assistant_message or {}).get("_terminal_event_id") or ""
+            ),
+            "terminal_sequence": int(
+                (assistant_message or {}).get("_terminal_sequence") or 0
+            ),
+            "assistant_content": (
+                (assistant_message or {}).get("content")
+                if assistant_message is not None
+                else None
+            ),
+        }
 
 
 def delete_conversation(conv_id: str) -> bool:

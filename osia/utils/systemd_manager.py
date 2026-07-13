@@ -28,6 +28,10 @@ The public function names/signatures are unchanged across platforms so the GUI
 import os
 import subprocess
 import sys
+import time
+import ctypes
+from ctypes import wintypes
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # ── Windows detection + mappings ────────────────────────────────────────────
@@ -45,6 +49,18 @@ _TUNNEL_LOG = _WINDOWS_DIR / "tunnel.log"
 
 # Local port the OSIA mobile server listens on (see osia/server/run_server.py).
 _SERVER_PORT = 8765
+_SERVER_PORTS = (8765, 8766)
+
+_WIN_RESTART_MUTEX_TIMEOUT = 30.0
+_WIN_LIFECYCLE_MUTEX_TIMEOUT = 5.0
+_WIN_GRACEFUL_STOP_TIMEOUT = 12.0
+_WIN_FORCED_STOP_TIMEOUT = 20.0
+_WIN_STOP_POLL_SEC = 0.5
+
+_WIN_WAIT_OBJECT_0 = 0x00000000
+_WIN_WAIT_ABANDONED = 0x00000080
+_WIN_WAIT_TIMEOUT = 0x00000102
+_JOB_OBJECT_TERMINATE = 0x0008
 
 # Map the systemd unit names the GUI uses to a logical kind so the Windows
 # implementation can pick the right control path.
@@ -97,6 +113,118 @@ def _run(args: list[str], timeout: float = 5.0) -> subprocess.CompletedProcess:
 # No console window when a GUI (pythonw) process shells out to these tools.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+_KERNEL32 = None
+
+
+def _kernel32():
+    """Configured kernel32 synchronization API, loaded only on Windows."""
+    global _KERNEL32
+    if _KERNEL32 is not None:
+        return _KERNEL32
+    if sys.platform != "win32":
+        raise OSError("Windows lifecycle primitives are unavailable")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
+                                      wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateEventW.restype = wintypes.HANDLE
+    kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+    kernel32.SetEvent.restype = wintypes.BOOL
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
+                                      wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                        wintypes.LPCWSTR]
+    kernel32.OpenJobObjectW.restype = wintypes.HANDLE
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    _KERNEL32 = kernel32
+    return kernel32
+
+
+def _win_shutdown_event_name(kind: str) -> str:
+    return f"Local\\OSIA.SupervisorShutdown.{kind}"
+
+
+def _win_lifecycle_mutex_name(kind: str) -> str:
+    return f"Local\\OSIA.SupervisorLifecycle.{kind}"
+
+
+def _win_restart_mutex_name(kind: str) -> str:
+    return f"Local\\OSIA.ServiceRestart.{kind}"
+
+
+def _win_child_job_name(kind: str, supervisor_pid: int) -> str:
+    return f"Local\\OSIA.SupervisorChildren.{kind}.{supervisor_pid}"
+
+
+class _WinNamedMutex:
+    """Named interprocess mutex with bounded and abandoned-owner handling."""
+
+    def __init__(self, name: str):
+        self._kernel32 = _kernel32()
+        self._handle = self._kernel32.CreateMutexW(None, False, name)
+        self._acquired = False
+        self.abandoned = False
+        if not self._handle:
+            raise OSError(ctypes.get_last_error(), "CreateMutexW failed")
+
+    def acquire(self, timeout: float) -> bool:
+        millis = max(0, min(int(timeout * 1000), 0xFFFFFFFE))
+        result = self._kernel32.WaitForSingleObject(self._handle, millis)
+        if result in (_WIN_WAIT_OBJECT_0, _WIN_WAIT_ABANDONED):
+            self._acquired = True
+            self.abandoned = result == _WIN_WAIT_ABANDONED
+            return True
+        if result == _WIN_WAIT_TIMEOUT:
+            return False
+        raise OSError(ctypes.get_last_error(), "mutex wait failed")
+
+    def release(self) -> None:
+        if self._handle and self._acquired:
+            self._kernel32.ReleaseMutex(self._handle)
+            self._acquired = False
+
+    def close(self) -> None:
+        self.release()
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+class _WinShutdownSignal:
+    """Hold a manual-reset event signaled until the old tree is fully gone."""
+
+    def __init__(self, kind: str):
+        self._kernel32 = _kernel32()
+        self._handle = self._kernel32.CreateEventW(
+            None, True, False, _win_shutdown_event_name(kind),
+        )
+        if not self._handle:
+            raise OSError(ctypes.get_last_error(), "CreateEventW failed")
+        if not self._kernel32.SetEvent(self._handle):
+            error = ctypes.get_last_error()
+            self.close()
+            raise OSError(error, "SetEvent failed")
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+@dataclass
+class _WinServiceTree:
+    """PID/create-time identities proven to belong to old OSIA supervisors."""
+
+    processes: dict[int, float] = field(default_factory=dict)
+    supervisors: set[int] = field(default_factory=set)
+
 
 def _schtasks(args: list[str], timeout: float = 15.0) -> subprocess.CompletedProcess:
     """Run ``schtasks`` (native, fast). Callers must rely on the **exit code**
@@ -125,6 +253,291 @@ def _win_norm_cmdline(cmdline: str) -> str:
 
 def _win_cmdline_has_path(cmdline: str, path: Path) -> bool:
     return str(path).lower().replace("/", "\\") in _win_norm_cmdline(cmdline)
+
+
+def _win_process_snapshot():
+    """Return the process fields needed for ancestry/identity ownership checks."""
+    import psutil
+
+    snapshot = []
+    for proc in psutil.process_iter(["pid", "ppid", "cmdline", "create_time"]):
+        try:
+            info = dict(proc.info)
+            if info.get("pid") is None or info.get("create_time") is None:
+                continue
+            snapshot.append(info)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return snapshot
+
+
+def _win_is_supervisor(info: dict, kind: str) -> bool:
+    cmdline = [str(arg) for arg in (info.get("cmdline") or [])]
+    return (
+        _win_cmdline_has_path(" ".join(cmdline), _RUN_SERVICE)
+        and kind in {arg.lower() for arg in cmdline}
+    )
+
+
+def _win_is_service_owner(info: dict, kind: str) -> bool:
+    cmdline = " ".join(str(arg) for arg in (info.get("cmdline") or []))
+    if kind == "server":
+        return _win_cmdline_has_path(
+            cmdline, _REPO_ROOT / "osia" / "server" / "run_server.py",
+        )
+    if kind == "tunnel":
+        return _win_cmdline_has_path(cmdline, _TUNNEL_LOG)
+    return False
+
+
+def _win_collect_supervised_tree(kind: str,
+                                 tree: _WinServiceTree | None = None
+                                 ) -> _WinServiceTree:
+    """Expand identities rooted at every matching old OSIA supervisor.
+
+    Re-expansion after ``schtasks /end`` also catches a legacy supervisor child
+    launched immediately before its parent exited: Windows retains the creator
+    PID as ``ppid``, so it remains provably connected to the captured root.
+    """
+    tree = tree or _WinServiceTree()
+    snapshot = _win_process_snapshot()
+    for info in snapshot:
+        if not _win_is_supervisor(info, kind):
+            continue
+        pid = int(info["pid"])
+        tree.processes[pid] = float(info["create_time"])
+        tree.supervisors.add(pid)
+
+    changed = True
+    while changed:
+        changed = False
+        for info in snapshot:
+            pid = int(info["pid"])
+            if pid in tree.processes:
+                continue
+            ppid = int(info.get("ppid") or 0)
+            parent_created = tree.processes.get(ppid)
+            if parent_created is None:
+                continue
+            created = float(info["create_time"])
+            if created + 0.001 < parent_created:
+                continue
+            tree.processes[pid] = created
+            changed = True
+    return tree
+
+
+def _win_process_for_identity(pid: int, created: float):
+    """Return the same live process, or None after exit/PID reuse."""
+    import psutil
+
+    try:
+        proc = psutil.Process(pid)
+        if abs(float(proc.create_time()) - created) > 0.001:
+            return None
+        return proc
+    except psutil.NoSuchProcess:
+        return None
+
+
+def _win_owned_alive_pids(tree: _WinServiceTree) -> set[int]:
+    import psutil
+
+    alive = set()
+    for pid, created in tree.processes.items():
+        try:
+            if _win_process_for_identity(pid, created) is not None:
+                alive.add(pid)
+        except psutil.AccessDenied:
+            alive.add(pid)  # inaccessible is not proof of exit: fail closed
+    return alive
+
+
+def _win_listener_pids(ports=_SERVER_PORTS) -> set[int]:
+    import psutil
+
+    listeners = set()
+    wanted = set(ports)
+    connections = psutil.net_connections(kind="tcp")
+    for conn in connections:
+        try:
+            if str(conn.status).upper() != "LISTEN":
+                continue
+            port = getattr(conn.laddr, "port", None)
+            if port is None and len(conn.laddr) >= 2:
+                port = conn.laddr[1]
+            if port in wanted:
+                # An unattributed listener is still a conflict; the sentinel can
+                # never match an owned PID and therefore fails closed as foreign.
+                listeners.add(-1 if conn.pid is None else int(conn.pid))
+        except (AttributeError, IndexError, TypeError):
+            continue
+    return listeners
+
+
+def _win_unowned_service_pids(kind: str, tree: _WinServiceTree) -> set[int]:
+    """Identify exact OSIA owners outside the captured tree; never kill them."""
+    unowned = set()
+    for info in _win_process_snapshot():
+        pid = int(info["pid"])
+        if pid not in tree.processes and _win_is_service_owner(info, kind):
+            unowned.add(pid)
+    return unowned
+
+
+def _win_stop_barrier_state(task: str, kind: str,
+                            tree: _WinServiceTree) -> tuple[bool, dict[str, int]]:
+    _win_collect_supervised_tree(kind, tree)
+    alive = _win_owned_alive_pids(tree)
+    listener_pids = _win_listener_pids()
+    old_listener_pids = listener_pids & set(tree.processes)
+    foreign_listener_pids = listener_pids - set(tree.processes)
+    unowned = _win_unowned_service_pids(kind, tree)
+    state = {
+        "task_running": int(_win_task_running_for_barrier(task)),
+        "supervisors_alive": len(alive & tree.supervisors),
+        "descendants_alive": len(alive - tree.supervisors),
+        "old_listeners": len(old_listener_pids),
+        "foreign_listeners": len(foreign_listener_pids),
+        "unowned_owners": len(unowned),
+    }
+    return not any(state.values()), state
+
+
+def _win_wait_stop_barrier(task: str, kind: str, tree: _WinServiceTree,
+                           timeout: float) -> tuple[bool, dict[str, int]]:
+    deadline = time.monotonic() + timeout
+    last_state: dict[str, int] = {}
+    while True:
+        ready, last_state = _win_stop_barrier_state(task, kind, tree)
+        if ready:
+            return True, last_state
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, last_state
+        time.sleep(min(_WIN_STOP_POLL_SEC, remaining))
+
+
+def _win_try_stop_barrier(task: str, kind: str, tree: _WinServiceTree,
+                          timeout: float) -> tuple[bool, dict[str, int]]:
+    """Convert a probe failure into fail-closed barrier state for escalation."""
+    try:
+        return _win_wait_stop_barrier(task, kind, tree, timeout)
+    except Exception as exc:
+        print(f"[win-service] stop barrier probe failed "
+              f"category={type(exc).__name__}")
+        return False, {"barrier_probe_error": 1}
+
+
+def _win_terminate_identities(identities: dict[int, float], timeout: float) -> None:
+    """Terminate only exact PID/create-time identities already proven owned."""
+    import psutil
+
+    targets = []
+    for pid, created in identities.items():
+        try:
+            proc = _win_process_for_identity(pid, created)
+            if proc is None:
+                continue
+            proc.terminate()
+            targets.append(proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    if not targets:
+        return
+    _gone, alive = psutil.wait_procs(targets, timeout=timeout)
+    for proc in alive:
+        try:
+            proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    if alive:
+        psutil.wait_procs(alive, timeout=min(2.0, timeout))
+
+
+def _win_terminate_child_jobs(kind: str, supervisor_pids: set[int]) -> bool:
+    """Terminate members of the captured supervisors' named child jobs."""
+    kernel32 = _kernel32()
+    terminated = False
+    for pid in supervisor_pids:
+        handle = kernel32.OpenJobObjectW(
+            _JOB_OBJECT_TERMINATE, False, _win_child_job_name(kind, pid),
+        )
+        if not handle:
+            continue
+        try:
+            terminated = bool(kernel32.TerminateJobObject(handle, 1)) or terminated
+        finally:
+            kernel32.CloseHandle(handle)
+    return terminated
+
+
+def _win_force_stop_owned(task: str, kind: str,
+                          tree: _WinServiceTree) -> None:
+    """Escalate after graceful timeout without touching unrelated processes."""
+    _win_end_task(task)
+    _win_collect_supervised_tree(kind, tree)
+    supervisors = {
+        pid: tree.processes[pid]
+        for pid in tree.supervisors if pid in tree.processes
+    }
+    _win_terminate_identities(supervisors, timeout=3.0)
+    _win_collect_supervised_tree(kind, tree)
+    _win_terminate_child_jobs(kind, set(tree.supervisors))
+    _win_terminate_identities(dict(tree.processes), timeout=5.0)
+
+
+def _win_coordinated_restart(kind: str) -> bool:
+    """Signal, prove complete old-tree exit, and only then start one task."""
+    task = _TASK_NAME[kind]
+    lifecycle = None
+    shutdown = None
+    tree = _WinServiceTree()
+    try:
+        lifecycle = _WinNamedMutex(_win_lifecycle_mutex_name(kind))
+        if not lifecycle.acquire(_WIN_LIFECYCLE_MUTEX_TIMEOUT):
+            print("[win-service] restart failed category=lifecycle-mutex-timeout")
+            return False
+        try:
+            _win_collect_supervised_tree(kind, tree)
+            shutdown = _WinShutdownSignal(kind)
+        finally:
+            lifecycle.close()
+            lifecycle = None
+
+        stopped, state = _win_try_stop_barrier(
+            task, kind, tree, _WIN_GRACEFUL_STOP_TIMEOUT,
+        )
+        if not stopped:
+            _win_force_stop_owned(task, kind, tree)
+            stopped, state = _win_try_stop_barrier(
+                task, kind, tree, _WIN_FORCED_STOP_TIMEOUT,
+            )
+        if not stopped:
+            details = ",".join(f"{key}={value}" for key, value in state.items())
+            print(f"[win-service] restart failed category=stop-barrier-timeout {details}")
+            return False
+
+        # The old supervisors have closed their handles, so closing this final
+        # signaled handle destroys the event. The replacement creates a fresh,
+        # non-signaled event and cannot inherit stale shutdown state.
+        shutdown.close()
+        shutdown = None
+        if not _win_task_registered(task) and not _win_register_task(kind):
+            print("[win-service] restart failed category=task-registration")
+            return False
+        if not _win_run_task(task):
+            print("[win-service] restart failed category=task-start")
+            return False
+        return True
+    except Exception as exc:
+        print(f"[win-service] restart failed category={type(exc).__name__}")
+        return False
+    finally:
+        if lifecycle is not None:
+            lifecycle.close()
+        if shutdown is not None:
+            shutdown.close()
 
 
 def _win_proc_running(image: str) -> bool:
@@ -217,6 +630,29 @@ def _win_task_running(task: str) -> bool:
         return r.returncode == 0
     except Exception:
         return False
+
+
+def _win_task_running_for_barrier(task: str) -> bool:
+    """Task state probe that fails closed when Task Scheduler cannot be queried."""
+    if not _win_task_registered(task):
+        return False
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "try {"
+        " $t = Get-ScheduledTask -TaskName $env:OSIA_TASK -ErrorAction Stop;"
+        " if ($t.State -eq 'Running') { exit 0 } else { exit 1 }"
+        "} catch { exit 2 }"
+    )
+    result = _ps(script, {"OSIA_TASK": task}, timeout=15.0)
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    # A concurrent delete is also proof that no old task instance can be
+    # Running; every other query failure leaves ownership uncertain.
+    if not _win_task_registered(task):
+        return False
+    raise RuntimeError("scheduled-task state unavailable")
 
 
 def _win_register_task(kind: str) -> bool:
@@ -330,13 +766,13 @@ def _win_run_task(task: str) -> bool:
 
 
 def _win_end_task(task: str) -> bool:
-    """End any running instances of the task (terminates the supervisor + its
-    child, which share the task's job object). Best-effort."""
+    """Request Task Scheduler to end its launched program; descendants are
+    handled separately by OSIA's explicit ownership barrier."""
     try:
-        _schtasks(["/end", "/TN", task])
+        result = _schtasks(["/end", "/TN", task])
     except Exception:
         return False
-    return True
+    return result.returncode == 0
 
 
 def _win_delete_task(task: str) -> bool:
@@ -621,14 +1057,21 @@ def restart_service(name: str) -> bool:
         kind = _UNIT_KIND.get(name)
         if kind not in ("server", "tunnel"):
             return False
-        task = _TASK_NAME[kind]
-        # Stop the running service (and reap leftovers so the port/binary is
-        # free) WITHOUT unregistering the task, then start it again.
-        _win_end_task(task)
-        _win_kill_leftovers(kind)
-        if not _win_task_registered(task):
-            _win_register_task(kind)  # self-heal if it was never installed
-        return _win_run_task(task)
+        mutex = None
+        try:
+            mutex = _WinNamedMutex(_win_restart_mutex_name(kind))
+            if not mutex.acquire(_WIN_RESTART_MUTEX_TIMEOUT):
+                print("[win-service] restart failed category=restart-mutex-timeout")
+                return False
+            if mutex.abandoned:
+                print("[win-service] restart recovered category=abandoned-mutex")
+            return _win_coordinated_restart(kind)
+        except Exception as exc:
+            print(f"[win-service] restart failed category={type(exc).__name__}")
+            return False
+        finally:
+            if mutex is not None:
+                mutex.close()
     try:
         result = _run(
             ["pkexec", "systemctl", "restart", name],
