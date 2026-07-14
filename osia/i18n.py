@@ -46,6 +46,43 @@ DEFAULT_LANG = "en"
 # English entry, then to the key itself. Use ``{name}``-style placeholders
 # and pass them as kwargs to :func:`t`.
 TRANSLATIONS: dict[str, dict[str, str]] = {
+    "settings.cat.legal": {"en": "Legal", "fr": "Légal"},
+    "settings.legal": {"en": "Legal and privacy", "fr": "Informations légales"},
+    "settings.legal_sub": {
+        "en": "Bundled versions and canonical documents",
+        "fr": "Versions intégrées et documents canoniques",
+    },
+    "settings.legal_desc": {
+        "en": "Legal acceptance is stored only on this PC. Draft documents never block developer or test workflows.",
+        "fr": "L’acceptation juridique reste stockée uniquement sur ce PC. Les projets ne bloquent jamais les parcours de développement ou de test.",
+    },
+    "legal.review_status": {
+        "en": "Draft for legal review — not in force",
+        "fr": "Projet pour revue juridique — non en vigueur",
+    },
+    "legal.terms_version": {"en": "Terms: {version}", "fr": "Conditions : {version}"},
+    "legal.privacy_version": {"en": "Privacy: {version}", "fr": "Confidentialité : {version}"},
+    "legal.effective_year": {
+        "en": "Planned effective year: {year}; no exact date is set",
+        "fr": "Entrée en vigueur prévue en {year} ; aucune date exacte n’est fixée",
+    },
+    "legal.contact": {"en": "Public contact: {email}", "fr": "Contact public : {email}"},
+    "legal.governing_law": {
+        "en": "French law applies, subject to mandatory consumer protections",
+        "fr": "Le droit français s’applique, sous réserve des protections impératives des consommateurs",
+    },
+    "legal.open_terms": {"en": "Open Terms", "fr": "Ouvrir les Conditions"},
+    "legal.open_privacy": {"en": "Open Privacy Policy", "fr": "Ouvrir la Politique"},
+    "legal.open_manifest": {"en": "Version manifest", "fr": "Manifeste des versions"},
+    "legal.gate_title": {"en": "Before continuing", "fr": "Avant de continuer"},
+    "legal.gate_desc": {
+        "en": "Read the Terms and Privacy Policy. Accepting the Terms does not turn every privacy processing operation into consent.",
+        "fr": "Lisez les Conditions et la Politique de confidentialité. Accepter les Conditions ne transforme pas chaque traitement en consentement.",
+    },
+    "legal.accept_terms": {
+        "en": "I accept Terms version {version}",
+        "fr": "J’accepte les Conditions version {version}",
+    },
     # Managed ChatGPT account provider (WOR-113).
     "chatgpt_account.title": {
         "en": "ChatGPT", "fr": "ChatGPT", "zh": "ChatGPT",

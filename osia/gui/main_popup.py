@@ -44,6 +44,7 @@ from PyQt6.QtWidgets import (
 
 from osia import conversations
 from osia import personality
+from osia import legal
 from osia.agent import strip_tool_artifacts
 from osia.memory import MemoryStore
 from osia.models import (
@@ -2279,6 +2280,7 @@ class _SettingsPanel(QWidget):
         sec_startup   = self._build_startup_section()       # Autostart services
         sec_memory    = self._build_memory_section()        # Local Memory
         sec_mcp       = self._build_mcp_section()           # MCP / Connectors (WOR-44)
+        sec_legal     = self._build_legal_section()         # Legal versions + links
 
         # (nav i18n key, [sections on that page]) — 8 categories, all 15 frames,
         # each frame used exactly once. MCP/Connectors gets its OWN category (not
@@ -2293,6 +2295,7 @@ class _SettingsPanel(QWidget):
             ("settings.cat.mcp",      [sec_mcp]),
             ("settings.cat.mobile",   [sec_mobile, sec_startup]),
             ("settings.cat.advanced", [sec_cron, sec_heartbeat]),
+            ("settings.cat.legal",    [sec_legal]),
         ]
 
         for _key, _sections in self._settings_pages:
@@ -5999,6 +6002,76 @@ class _SettingsPanel(QWidget):
 
     # ── Mobile connection (pairing token) ──────────────────────────────────
 
+    def _build_legal_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        self._legal_title = QLabel(i18n.t("settings.legal"))
+        self._legal_title.setObjectName("sectionTitle")
+        self._legal_title.setWordWrap(True)
+        self._legal_sub = QLabel(i18n.t("settings.legal_sub"))
+        self._legal_sub.setObjectName("sectionSub")
+        self._legal_sub.setWordWrap(True)
+        self._legal_desc = QLabel(i18n.t("settings.legal_desc"))
+        self._legal_desc.setObjectName("sectionDesc")
+        self._legal_desc.setWordWrap(True)
+        self._legal_status = QLabel(i18n.t("legal.review_status"))
+        self._legal_status.setObjectName("warnLabel")
+        self._legal_status.setWordWrap(True)
+        self._legal_terms_version = QLabel(
+            i18n.t("legal.terms_version", version=legal.TERMS_VERSION)
+        )
+        self._legal_terms_version.setWordWrap(True)
+        self._legal_privacy_version = QLabel(
+            i18n.t("legal.privacy_version", version=legal.PRIVACY_VERSION)
+        )
+        self._legal_privacy_version.setWordWrap(True)
+        self._legal_effective_year = QLabel(
+            i18n.t("legal.effective_year", year=legal.PLANNED_EFFECTIVE_YEAR)
+        )
+        self._legal_effective_year.setWordWrap(True)
+        self._legal_contact = QLabel(
+            i18n.t("legal.contact", email=legal.PUBLIC_CONTACT_EMAIL)
+        )
+        self._legal_contact.setWordWrap(True)
+        self._legal_governing_law = QLabel(i18n.t("legal.governing_law"))
+        self._legal_governing_law.setWordWrap(True)
+        layout.addWidget(self._legal_title)
+        layout.addWidget(self._legal_sub)
+        layout.addWidget(self._legal_desc)
+        layout.addWidget(self._legal_status)
+        layout.addWidget(self._legal_terms_version)
+        layout.addWidget(self._legal_privacy_version)
+        layout.addWidget(self._legal_effective_year)
+        layout.addWidget(self._legal_contact)
+        layout.addWidget(self._legal_governing_law)
+
+        self._legal_terms_btn = QPushButton(i18n.t("legal.open_terms"))
+        self._legal_terms_btn.setObjectName("ghostBtn")
+        self._legal_terms_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._legal_terms_btn.clicked.connect(
+            lambda: webbrowser.open(legal.TERMS_URL)
+        )
+        self._legal_privacy_btn = QPushButton(i18n.t("legal.open_privacy"))
+        self._legal_privacy_btn.setObjectName("ghostBtn")
+        self._legal_privacy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._legal_privacy_btn.clicked.connect(
+            lambda: webbrowser.open(legal.PRIVACY_URL)
+        )
+        self._legal_manifest_btn = QPushButton(i18n.t("legal.open_manifest"))
+        self._legal_manifest_btn.setObjectName("ghostBtn")
+        self._legal_manifest_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._legal_manifest_btn.clicked.connect(
+            lambda: webbrowser.open(legal.LEGAL_MANIFEST_URL)
+        )
+        layout.addWidget(self._legal_terms_btn)
+        layout.addWidget(self._legal_privacy_btn)
+        layout.addWidget(self._legal_manifest_btn)
+        return wrap
+
     def _build_mobile_section(self) -> QFrame:
         wrap = QFrame()
         wrap.setObjectName("section")
@@ -7214,6 +7287,27 @@ class _SettingsPanel(QWidget):
         self._mobile_show_btn.setText(i18n.t("settings.show"))
         self._mobile_regen_btn.setText(i18n.t("settings.regenerate"))
         self._mobile_warn.setText(i18n.t("settings.mobile_token_warning"))
+
+        self._legal_title.setText(i18n.t("settings.legal"))
+        self._legal_sub.setText(i18n.t("settings.legal_sub"))
+        self._legal_desc.setText(i18n.t("settings.legal_desc"))
+        self._legal_status.setText(i18n.t("legal.review_status"))
+        self._legal_terms_version.setText(
+            i18n.t("legal.terms_version", version=legal.TERMS_VERSION)
+        )
+        self._legal_privacy_version.setText(
+            i18n.t("legal.privacy_version", version=legal.PRIVACY_VERSION)
+        )
+        self._legal_effective_year.setText(
+            i18n.t("legal.effective_year", year=legal.PLANNED_EFFECTIVE_YEAR)
+        )
+        self._legal_contact.setText(
+            i18n.t("legal.contact", email=legal.PUBLIC_CONTACT_EMAIL)
+        )
+        self._legal_governing_law.setText(i18n.t("legal.governing_law"))
+        self._legal_terms_btn.setText(i18n.t("legal.open_terms"))
+        self._legal_privacy_btn.setText(i18n.t("legal.open_privacy"))
+        self._legal_manifest_btn.setText(i18n.t("legal.open_manifest"))
 
         self._memory_title.setText(i18n.t("settings.memory"))
         self._memory_sub.setText(i18n.t("settings.memory_sub"))

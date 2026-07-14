@@ -682,6 +682,17 @@ def wake_mode():
     popup = MainPopup()
     perf_mark("wake_mode: GUI constructed (island + popup)")
 
+    # Release-only legal gate. The bundled documents are currently review
+    # drafts, so this is a no-op. Developer/test runs stay unblocked even after
+    # approval unless they explicitly opt into OSIA_RELEASE_BUILD=1.
+    def _run_release_legal_gate() -> None:
+        from osia.gui.legal_dialog import maybe_show_release_legal_gate
+
+        if not maybe_show_release_legal_gate(popup):
+            app.quit()
+
+    QTimer.singleShot(0, _run_release_legal_gate)
+
     # Toggle the popup when the island is clicked; the popup opens below
     # the capsule's current (possibly dragged) position.
     popup.set_anchor(island)
