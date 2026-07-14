@@ -493,7 +493,7 @@ class StartupOrderTests(unittest.TestCase):
         self.assertTrue(launched)
         self.assertEqual(
             calls,
-            ["guard", "prepare", "relay", "lan", "server"],
+            ["guard", "prepare", "lan", "relay", "server"],
         )
 
 
@@ -582,7 +582,17 @@ class RelayPriorityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(connect_calls, 1)
         self.assertEqual(
-            acknowledgements,
+            acknowledgements[0],
+            {
+                "type": "webrtc_capabilities",
+                "protocol_version": 1,
+                "enabled": False,
+                "configuration_id": bridge._webrtc_manager.configuration_id,
+                "ice_servers": [],
+            },
+        )
+        self.assertEqual(
+            acknowledgements[1:],
             [
                 {
                     "type": "transport_committed",

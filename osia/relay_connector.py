@@ -26,6 +26,13 @@ from osia.transport_coordinator import (
     acquire_application_transport,
     application_transport_coordination_enabled,
 )
+from osia.webrtc_signaling import (
+    WebRtcSignalingError,
+    capability_frame as webrtc_capability_frame,
+    load_webrtc_ice_servers,
+    webrtc_direct_enabled,
+)
+from osia.webrtc_transport import WebRtcTransportManager
 from osia.relay_crypto import (
     ALG_CHACHA20_POLY1305,
     E2E_VERSION,
@@ -230,9 +237,24 @@ class RelayBridge:
         self._reset_relay_chunk_capabilities()
         self._reset_e2e_state()
         self._relay_send_lock = asyncio.Lock()
+        self._active_relay_ws = None
         self._local_ws = None
         self._local_reader_task: asyncio.Task | None = None
         self._application_transport_lease = None
+        try:
+            webrtc_enabled = webrtc_direct_enabled()
+            webrtc_ice_servers = load_webrtc_ice_servers()
+        except WebRtcSignalingError:
+            print("[OSIA WebRTC] disabled: invalid ICE configuration")
+            webrtc_enabled = False
+            webrtc_ice_servers = []
+        self._webrtc_manager = WebRtcTransportManager(
+            token=token,
+            pair_id=self.pair_id,
+            enabled=webrtc_enabled,
+            ice_servers=webrtc_ice_servers,
+            send_signal=self._send_webrtc_signal,
+        )
 
     def _reset_e2e_state(self) -> None:
         self.e2e_private_key = generate_x25519_private_key()
@@ -247,6 +269,7 @@ class RelayBridge:
         self.e2e_peer_ready = False
         self.e2e_pc_ready_sent = False
         self.lan_provisioning_sent = False
+        self.webrtc_capabilities_sent = False
         self.e2e_peer_chunk_version = 0
         self.pending_e2e_ready: tuple[dict, dict] | None = None
         self.e2e_replay_guard = SequenceReplayGuard()
@@ -457,6 +480,7 @@ class RelayBridge:
         """Discard only peer-bound state; keep this socket's seq/key material."""
 
         await self._close_local()
+        self._webrtc_manager.reset_signaling_epoch()
         self.e2e_context = None
         self.e2e_keys = None
         self.e2e_peer_hello_fingerprint = None
@@ -465,6 +489,7 @@ class RelayBridge:
         self.e2e_peer_ready = False
         self.e2e_pc_ready_sent = False
         self.lan_provisioning_sent = False
+        self.webrtc_capabilities_sent = False
         self.e2e_peer_chunk_version = 0
         self.pending_e2e_ready = None
         self.e2e_replay_guard = SequenceReplayGuard()
@@ -571,6 +596,17 @@ class RelayBridge:
                         final=False,
                     )
                     self.lan_provisioning_sent = bool(sent)
+            if not self.webrtc_capabilities_sent:
+                sent = await self._send_e2e_frame(
+                    relay_ws,
+                    webrtc_capability_frame(
+                        self._webrtc_manager.enabled,
+                        self._webrtc_manager.ice_servers,
+                    ),
+                    priority="critical",
+                    final=False,
+                )
+                self.webrtc_capabilities_sent = bool(sent)
         else:
             # Preserve the established relay-v2 path byte-for-byte in behavior
             # when LAN-direct coordination is disabled.
@@ -613,6 +649,19 @@ class RelayBridge:
             self._local_reader_task = asyncio.create_task(
                 self._local_to_relay(local_ws, relay_ws)
             )
+
+    async def _send_webrtc_signal(self, frame: dict) -> bool:
+        relay_ws = self._active_relay_ws
+        if relay_ws is None or not self.e2e_peer_ready or self.e2e_keys is None:
+            return False
+        return bool(
+            await self._send_e2e_frame(
+                relay_ws,
+                frame,
+                priority="critical",
+                final=bool(frame.get("terminal")),
+            )
+        )
 
     async def _connect_local(self, relay_ws, *, start_reader: bool = True) -> None:
         if self._local_ws is not None:
@@ -966,6 +1015,14 @@ class RelayBridge:
         if _safe_frame_type(frame) == "relay_chunk_error":
             self._handle_chunk_error_frame(frame)
             return
+        if self._transport_coordination_enabled:
+            try:
+                if await self._webrtc_manager.handle_signal(frame):
+                    return
+            except Exception as exc:
+                print(f"[OSIA WebRTC] signaling failed: {type(exc).__name__}")
+                await relay_ws.close()
+                return
         if (
             self._transport_coordination_enabled
             and _safe_frame_type(frame) == TYPE_TRANSPORT_COMMIT
@@ -1475,6 +1532,7 @@ class RelayBridge:
             ping_interval=20,
             ping_timeout=20,
         ) as relay_ws:
+            self._active_relay_ws = relay_ws
             print("[OSIA Relay] connected to relay")
             await self._send_relay(relay_ws, "PAIR_START", {"secret": self.secret})
             expiry_task = asyncio.create_task(self._chunk_expiry_loop(relay_ws))
@@ -1493,6 +1551,9 @@ class RelayBridge:
                     await expiry_task
                 except asyncio.CancelledError:
                     pass
+                if self._active_relay_ws is relay_ws:
+                    self._active_relay_ws = None
+                await self._webrtc_manager.cancel_preparing()
         if self._terminal_error_code == "session_superseded":
             raise RelaySessionSuperseded("relay connection replaced")
         if self._terminal_error_code in {

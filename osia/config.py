@@ -162,6 +162,12 @@ DEFAULT_SETTINGS = {
     # ``{<provider>: ["key1", "key2", ...]}``. Empty/absent = use the single
     # saved key (api_keys.json) unchanged. See OSIAAgent.set_model/run().
     "api_key_fallbacks": {},
+    # Direct-first mobile transport gates. LAN is safe for fresh installs and
+    # provisions its certificate automatically. Remote WebRTC remains off until
+    # an approved production STUN endpoint is configured.
+    "lan_direct_v1": True,
+    "webrtc_direct_v1": False,
+    "webrtc_stun_urls": [],
     # Skills (Bloc 6): enabled/disabled flag per skill file. The skill prose
     # itself lives as Markdown under ``~/.osia/skills/*.md``; only the on/off
     # state is stored here. Shape: ``{"<name>.md": true}``. A skill with no

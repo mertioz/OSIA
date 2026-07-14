@@ -114,6 +114,12 @@ class _StreamingLocalWs(_FakeLocalWs):
 
 class RelayConnectorE2ETests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        environment = mock.patch.dict(
+            os.environ,
+            {"OSIA_LAN_DIRECT_V1": "0", "OSIA_WEBRTC_DIRECT_V1": "0"},
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
         self.token = "osia-e2e-test-token-v2"
         self.bridge = RelayBridge(self.token, "wss://relay.test/ws")
         self.bridge.e2e_private_key = bytes.fromhex(
@@ -525,6 +531,8 @@ class RelayConnectorE2ETests(unittest.IsolatedAsyncioTestCase):
         self.bridge._chunk_transfers[("old",)] = object()
         self.bridge._chunk_tombstones[("old",)] = object()
         self.bridge._outbound_chunk_ids["old"] = 1.0
+        self.bridge.webrtc_capabilities_sent = True
+        self.bridge._webrtc_manager._latest_generation = 3
 
         new_private_key = bytes(range(64, 96))
         new_public_key = x25519_public_key(new_private_key)
@@ -552,6 +560,8 @@ class RelayConnectorE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bridge._chunk_transfers, {})
         self.assertEqual(self.bridge._chunk_tombstones, {})
         self.assertEqual(self.bridge._outbound_chunk_ids, {})
+        self.assertFalse(self.bridge.webrtc_capabilities_sent)
+        self.assertEqual(self.bridge._webrtc_manager._latest_generation, 0)
         self.assertFalse(self.bridge.e2e_peer_ready)
         self.assertFalse(self.bridge.e2e_pc_ready_sent)
 

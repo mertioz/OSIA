@@ -3,6 +3,22 @@
 OSIA uses the following third-party packages. These notices do not change
 OSIA's own license.
 
+## WebRTC transport packages
+
+The validated dependency set for the pinned data-only transport build is:
+
+- `aiortc 1.15.0` — BSD 3-Clause
+- `aioice 0.10.2` — BSD 3-Clause
+- `dnspython 2.8.0` — ISC
+- `google-crc32c 1.8.0` — Apache License 2.0
+- `pylibsrtp 1.0.0` — BSD 3-Clause
+- `pyOpenSSL 26.3.0` — Apache License 2.0
+
+The complete license texts are distributed in each installed wheel's
+`.dist-info/licenses/LICENSE` file. Project sources are available from
+https://github.com/aiortc/aiortc and the dependency links published in its
+package metadata.
+
 ## zeroconf 0.150.0
 
 - Project: https://github.com/python-zeroconf/python-zeroconf

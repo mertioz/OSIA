@@ -37,6 +37,7 @@ playwright>=1.40.0
 openai>=1.0.0                      # OpenAI-compatible client (OpenAI/DeepSeek/Groq)
 requests>=2.31.0
 cryptography>=42.0.0               # X25519 / HKDF / ChaCha20-Poly1305 for relay E2E crypto
+aiortc==1.15.0                     # data-only WebRTC direct transport (ordered reliable SCTP)
 zeroconf==0.150.0                 # DNS-SD advertisement for feature-gated LAN transport
 
 # ── MCP / Connectors client (WOR-44) ─────────────────────────────────────────

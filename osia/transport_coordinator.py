@@ -1,8 +1,8 @@
 """Exclusive ownership for the single mobile application bridge.
 
-The relay and LAN transports may both keep control/signalling sockets, but only
+The relay, LAN and WebRTC transports may keep control/signalling sockets, but only
 the holder of this lease may connect to the loopback OSIA WebSocket server.
-When LAN-direct is enabled, the production coordinator also takes an OS-backed
+When either direct transport is enabled, the production coordinator takes an OS-backed
 interprocess lock so detached or manually launched processes cannot create a
 second authoritative bridge.
 """
@@ -167,8 +167,8 @@ class ApplicationTransportCoordinator:
         transport: str,
         owner: object,
     ) -> Optional[ApplicationTransportLease]:
-        if transport not in {"relay", "lan"}:
-            raise ValueError("transport must be relay or lan")
+        if transport not in {"relay", "lan", "webrtc"}:
+            raise ValueError("transport must be relay, lan or webrtc")
         with self._lock:
             if self._lease is not None:
                 return None
@@ -210,7 +210,7 @@ class ApplicationTransportCoordinator:
             return self._lease.transport if self._lease is not None else None
 
 
-# Production LAN and relay paths share this exact coordinator and OS lock.
+# Production LAN, WebRTC and relay paths share this coordinator and OS lock.
 # Test-local coordinators can omit lock_path to avoid touching user state.
 APPLICATION_TRANSPORT_COORDINATOR = ApplicationTransportCoordinator(_LOCK_FILE)
 
@@ -232,16 +232,22 @@ class UncoordinatedApplicationTransportLease:
 
 
 def application_transport_coordination_enabled() -> bool:
-    raw = os.getenv("OSIA_LAN_DIRECT_V1")
-    if raw is not None:
-        return raw.strip().lower() in {"1", "true", "yes", "on"}
     from osia.config import load_settings
 
-    return load_settings().get("lan_direct_v1") is True
+    settings = load_settings()
+    def enabled(variable: str, setting: str) -> bool:
+        raw = os.getenv(variable)
+        if raw is not None:
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+        return settings.get(setting) is True
+
+    return enabled("OSIA_LAN_DIRECT_V1", "lan_direct_v1") or enabled(
+        "OSIA_WEBRTC_DIRECT_V1", "webrtc_direct_v1"
+    )
 
 
 def acquire_application_transport(transport: str, owner: object):
-    """Acquire exclusively only when LAN-direct is explicitly enabled."""
+    """Acquire exclusively when either direct transport is explicitly enabled."""
 
     if not application_transport_coordination_enabled():
         return UncoordinatedApplicationTransportLease(transport, owner)
