@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextvars
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import osia.utils.key_chain as kc
 
@@ -26,6 +27,14 @@ class FakeHTTPError(Exception):
     def __init__(self, status):
         super().__init__(f"HTTP {status}")
         self.status_code = status
+
+
+class FakeProviderError(FakeHTTPError):
+    def __init__(self, status, *, body=None, retry_after=None):
+        super().__init__(status)
+        self.body = body or {}
+        headers = {} if retry_after is None else {"Retry-After": retry_after}
+        self.response = SimpleNamespace(headers=headers)
 
 
 def _install_chain(keys=CHAIN):
@@ -365,6 +374,50 @@ def test_copy_context_propagates_active_key_across_threads():
         ex.shutdown(wait=True)
 
 
+def test_provider_failure_categories_and_retry_after_are_sanitized():
+    quota = FakeProviderError(
+        429,
+        body={"error": {"code": "insufficient_quota", "message": "private"}},
+        retry_after="30",
+    )
+    transient = FakeProviderError(
+        429,
+        body={"error": {"message": "rate limit reached"}},
+        retry_after="1.5",
+    )
+    assert kc.provider_failure_category(quota) == "quota_exhausted"
+    assert kc.provider_failure_category(transient) == "transient_rate_limit"
+    assert kc.provider_failure_category(FakeProviderError(401)) == "authentication"
+    assert kc.bounded_retry_after_seconds(quota) is None
+    assert kc.bounded_retry_after_seconds(transient) == 1.5
+
+
+def test_short_retry_after_retries_same_key_once_then_succeeds():
+    _reset(); _install_chain(["k1"])
+    attempts = []
+    sleeps = []
+    log, lines = _silent()
+    original_sleep = kc.time.sleep
+    kc.time.sleep = lambda seconds: sleeps.append(seconds)
+    try:
+        def call_fn(key):
+            attempts.append(key)
+            if len(attempts) == 1:
+                raise FakeProviderError(
+                    429,
+                    body={"error": {"message": "rate limit reached"}},
+                    retry_after="1",
+                )
+            return "ok"
+
+        assert kc.with_key_rotation("p", call_fn, log=log) == "ok"
+    finally:
+        kc.time.sleep = original_sleep
+    assert attempts == ["k1", "k1"]
+    assert sleeps == [1.0]
+    assert any("bounded Retry-After" in line for line in lines)
+
+
 TESTS = [
     test_sticky_across_three_calls,
     test_active_dies_advances_forward_not_restart,
@@ -377,6 +430,8 @@ TESTS = [
     test_record_active_key_resolves_index_and_seeds_start,
     test_record_active_key_noops_outside_scope_and_for_unknown_key,
     test_copy_context_propagates_active_key_across_threads,
+    test_provider_failure_categories_and_retry_after_are_sanitized,
+    test_short_retry_after_retries_same_key_once_then_succeeds,
 ]
 
 

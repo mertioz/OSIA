@@ -5319,7 +5319,12 @@ class OSIAAgent:
         # _activate_next_api_key), so it never reaches with_key_rotation's
         # active-key recording. Import the explicit recorder to publish each
         # successful chat key into the task scope (no-op outside a task_scope).
-        from osia.utils.key_chain import record_active_key
+        from osia.utils.key_chain import (
+            bounded_retry_after_seconds,
+            provider_failure_category,
+            record_active_key,
+        )
+        retry_after_attempted = set()
 
         while True:
             try:
@@ -5345,31 +5350,18 @@ class OSIAAgent:
                     message = response.choices[0].message
                     content = message.content or ""
             except Exception as e:
-                # Surface the full 429 response so we can tell a real rate
-                # limit apart from an auth problem masquerading as one.
                 status = (
                     getattr(e, "status_code", None)
                     or getattr(getattr(e, "response", None), "status_code", None)
                 )
+                failure_category = provider_failure_category(e, status)
+                retry_after = bounded_retry_after_seconds(e)
                 if status == 429:
-                    resp = getattr(e, "response", None)
-                    body = None
-                    if resp is not None:
-                        try:
-                            body = resp.text
-                        except Exception:
-                            body = None
-                    if not body:
-                        body = getattr(e, "body", None)
                     print(
-                        f"[DEBUG] 429 from provider={self.provider} model={self.model}"
+                        f"[PROVIDER] provider={self.provider} model={self.model} "
+                        f"status=429 category={failure_category} "
+                        f"retry_after={'bounded' if retry_after is not None else 'absent_or_unbounded'}"
                     )
-                    print(f"[DEBUG] 429 response body: {body!r}")
-                    try:
-                        headers = dict(getattr(resp, "headers", {}) or {})
-                        print(f"[DEBUG] 429 response headers: {headers}")
-                    except Exception:
-                        pass
                 # Task-hierarchy fallback (Bloc 3): on a technical/API error,
                 # advance to the next model in the chain and retry this turn.
                 # `self.messages` is unchanged on a failed call, so the retry
@@ -5388,6 +5380,23 @@ class OSIAAgent:
                     or bool(getattr(e, "native_action", False))
                     or _account_attempt_committed
                 )
+
+                # Honor one short Retry-After on a transient 429. Quota/billing
+                # failures and a repeated 429 rotate immediately instead.
+                retry_marker = (
+                    self.provider,
+                    self.model,
+                    getattr(self, "_api_key_pos", 0),
+                )
+                if (status == 429
+                        and failure_category == "transient_rate_limit"
+                        and retry_after is not None
+                        and not _already_streamed
+                        and retry_marker not in retry_after_attempted):
+                    retry_after_attempted.add(retry_marker)
+                    if retry_after:
+                        time.sleep(retry_after)
+                    continue
 
                 # API endpoint fallback (Bloc 5): a connection/timeout failure
                 # against the PRIMARY endpoint is retried once against the

@@ -43,6 +43,40 @@ DATA_SDP = (
 
 
 class WebRtcSignalingTests(unittest.TestCase):
+    def test_production_stun_default_is_exact_deduplicated_and_credential_free(self) -> None:
+        production = "stun:stun.cloudflare.com:3478"
+        with mock.patch(
+            "osia.webrtc_signaling.load_settings",
+            return_value={"webrtc_stun_urls": [production, production]},
+        ):
+            loaded = load_webrtc_ice_servers()
+        self.assertEqual(loaded, [{"urls": [production]}])
+        self.assertNotIn("username", loaded[0])
+        self.assertNotIn("credential", loaded[0])
+
+        for invalid in (
+            "stun:stun.cloudflare.com:0",
+            "stun:stun.cloudflare.com:65536",
+            "stun://stun.cloudflare.com:3478",
+            "stun:stun.cloudflare.com:3478?transport=udp",
+            "turn:turn.cloudflare.com:3478",
+            "turns:turn.cloudflare.com:5349?transport=tcp",
+        ):
+            with self.subTest(url=invalid), self.assertRaises(WebRtcSignalingError):
+                validate_ice_servers([{"urls": [invalid]}], allow_turn=False)
+
+        with self.assertRaises(WebRtcSignalingError):
+            validate_ice_servers(
+                [{"urls": [production], "username": "u", "credential": "p"}],
+                allow_turn=False,
+            )
+
+        with self.assertRaises(WebRtcSignalingError):
+            validate_ice_servers(
+                [{"urls": [f"stun:stun-{index}.example:3478"]} for index in range(5)],
+                allow_turn=False,
+            )
+
     def test_configuration_is_bounded_deterministic_and_secret_safe(self) -> None:
         stun = [{"urls": ["stun:stun.example.test:3478"]}]
         normalized = validate_ice_servers(stun, allow_turn=False)

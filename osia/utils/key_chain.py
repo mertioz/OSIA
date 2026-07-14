@@ -45,6 +45,8 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import threading
 import time
 
@@ -83,6 +85,7 @@ _COOLDOWN_RATE_LIMIT = 60.0    # 429
 _COOLDOWN_SERVER = 30.0        # 5xx
 _COOLDOWN_AUTH = 600.0         # 401 / 403
 _COOLDOWN_TRANSIENT = 30.0     # 408 / timeout / connection drop
+_MAX_RETRY_AFTER = 5.0         # one bounded same-key retry for a short 429
 
 
 def _cooldown_seconds(status) -> float:
@@ -336,6 +339,81 @@ def technical_error_reason(e, status=None) -> str:
     return type(e).__name__
 
 
+def provider_failure_category(e, status=None) -> str:
+    """Return a sanitized category without exposing provider payloads."""
+    if status is None:
+        status = error_status(e)
+    if status in (401, 403):
+        return "authentication"
+    if status == 402:
+        return "billing_restriction"
+    if status == 429:
+        body = getattr(e, "body", None)
+        if not isinstance(body, dict):
+            response = getattr(e, "response", None)
+            try:
+                candidate = response.json() if response is not None else None
+            except Exception:
+                candidate = None
+            body = candidate if isinstance(candidate, dict) else {}
+
+        def _safe_fields(value) -> list[str]:
+            if not isinstance(value, dict):
+                return []
+            out = []
+            for key, item in value.items():
+                if key.lower() in {"code", "type", "status", "message", "reason"}:
+                    out.append(str(item).lower())
+                elif isinstance(item, dict):
+                    out.extend(_safe_fields(item))
+                elif isinstance(item, list):
+                    for child in item:
+                        if isinstance(child, dict):
+                            out.extend(_safe_fields(child))
+            return out
+
+        detail = " ".join(_safe_fields(body))
+        if any(marker in detail for marker in (
+                "billing", "payment", "credit balance", "spending limit")):
+            return "billing_restriction"
+        if any(marker in detail for marker in (
+                "insufficient_quota", "quota_exceeded", "quota exceeded",
+                "exceeded your current quota", "usage limit")):
+            return "quota_exhausted"
+        return "transient_rate_limit"
+    if isinstance(status, int) and status >= 500:
+        return "provider_unavailable"
+    if status in (400, 404, 422):
+        return "content_or_model_error"
+    if status == 408:
+        return "transient_timeout"
+    if status is None and is_technical_error(e, status):
+        return "transient_transport"
+    return f"http_{status}" if isinstance(status, int) else "non_technical"
+
+
+def bounded_retry_after_seconds(e, *, maximum: float = _MAX_RETRY_AFTER):
+    """Return a safe ``Retry-After`` delay, or ``None`` if absent/too long."""
+    response = getattr(e, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        seconds = float(str(raw).strip())
+    except (TypeError, ValueError):
+        try:
+            when = parsedate_to_datetime(str(raw).strip())
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            seconds = (when - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if 0.0 <= seconds <= max(0.0, float(maximum)):
+        return seconds
+    return None
+
+
 def _default_log(msg: str) -> None:
     print(msg, flush=True)
 
@@ -433,10 +511,28 @@ def with_key_rotation(provider, call_fn, *, label=None, log=None):
             f"— cooldown {int(left)}s left")
     attempts = len(live)
     last_exc = None
+
+    def _call_with_bounded_retry_after(key):
+        try:
+            return call_fn(key)
+        except Exception as exc:
+            status = error_status(exc)
+            category = provider_failure_category(exc, status)
+            delay = bounded_retry_after_seconds(exc)
+            if (status != 429
+                    or category != "transient_rate_limit"
+                    or delay is None):
+                raise
+            log(f"[key-chain {tag}] transient 429 - honoring bounded "
+                f"Retry-After ({delay:.1f}s) once")
+            if delay:
+                time.sleep(delay)
+            return call_fn(key)
+
     for pos, idx in enumerate(live):
         key = chain[idx]
         try:
-            result = call_fn(key)
+            result = _call_with_bounded_retry_after(key)
         except KeyChainEmpty:
             raise
         except Exception as e:  # classify, then rotate or re-raise

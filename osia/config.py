@@ -18,6 +18,7 @@ import os
 import secrets
 import stat
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from collections.abc import Callable
@@ -25,6 +26,9 @@ from collections.abc import Callable
 # <repo>/osia/config.py → <repo>. Dynamic so the package works from any
 # install location / drive (no hardcoded /home/OSIA/code/... path).
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+TRANSPORT_DEFAULTS_SCHEMA_VERSION = 1
+PRODUCTION_STUN_URL = "stun:stun.cloudflare.com:3478"
 
 
 def _resolve_config_dir() -> str:
@@ -162,12 +166,12 @@ DEFAULT_SETTINGS = {
     # ``{<provider>: ["key1", "key2", ...]}``. Empty/absent = use the single
     # saved key (api_keys.json) unchanged. See OSIAAgent.set_model/run().
     "api_key_fallbacks": {},
-    # Direct-first mobile transport gates. LAN is safe for fresh installs and
-    # provisions its certificate automatically. Remote WebRTC remains off until
-    # an approved production STUN endpoint is configured.
+    # Direct-first production transport policy. The schema marker makes the
+    # one-time upgrade from the pre-activation defaults explicit and idempotent.
+    "transport_defaults_schema": TRANSPORT_DEFAULTS_SCHEMA_VERSION,
     "lan_direct_v1": True,
-    "webrtc_direct_v1": False,
-    "webrtc_stun_urls": [],
+    "webrtc_direct_v1": True,
+    "webrtc_stun_urls": [PRODUCTION_STUN_URL],
     # Skills (Bloc 6): enabled/disabled flag per skill file. The skill prose
     # itself lives as Markdown under ``~/.osia/skills/*.md``; only the on/off
     # state is stored here. Shape: ``{"<name>.md": true}``. A skill with no
@@ -581,15 +585,29 @@ def save_settings(settings: dict) -> None:
     # self-heals a lost ENABLE (it keeps converging toward mcp_servers[].enabled);
     # a lost DISABLE would be re-connected by the reconcile until the user re-acts
     # — rare and recoverable, not fully self-healing.)
-    tmp = SETTINGS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=2)
-        f.flush()
+    descriptor, tmp = tempfile.mkstemp(
+        prefix=f".{Path(SETTINGS_FILE).name}.",
+        suffix=".tmp",
+        dir=str(Path(SETTINGS_FILE).parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as f:
+            descriptor = -1
+            json.dump(settings, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, SETTINGS_FILE)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
         try:
-            os.fsync(f.fileno())
-        except Exception:
+            os.unlink(tmp)
+        except FileNotFoundError:
             pass
-    os.replace(tmp, SETTINGS_FILE)
     # Invalidate the read cache so the very next load_settings() re-reads what
     # we just wrote. Hard invalidation (not in-place update) keeps the cache
     # byte-for-byte identical to disk — a populate-from-memory shortcut could
@@ -597,6 +615,45 @@ def save_settings(settings: dict) -> None:
     with _settings_cache_lock:
         _settings_cache_signature = None
         _settings_cache_data = {}
+
+
+_transport_migration_lock = threading.Lock()
+
+
+def migrate_transport_defaults() -> bool:
+    """Activate direct-first defaults once for pre-schema installations.
+
+    A valid pre-schema file is migrated even when it materialized the former
+    ``False`` defaults. Once the marker is present, later administrator opt-outs
+    remain untouched. Missing or invalid files are never overwritten here;
+    first-run bootstrap owns missing files, while corrupt files are preserved
+    for recovery instead of risking unrelated local state.
+    """
+
+    with _transport_migration_lock:
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8", errors="strict") as f:
+                raw = json.load(f)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(raw, dict):
+            return False
+        marker = raw.get("transport_defaults_schema")
+        if (
+            isinstance(marker, int)
+            and not isinstance(marker, bool)
+            and marker >= TRANSPORT_DEFAULTS_SCHEMA_VERSION
+        ):
+            return False
+        migrated = dict(raw)
+        migrated.update({
+            "transport_defaults_schema": TRANSPORT_DEFAULTS_SCHEMA_VERSION,
+            "lan_direct_v1": True,
+            "webrtc_direct_v1": True,
+            "webrtc_stun_urls": [PRODUCTION_STUN_URL],
+        })
+        save_settings(migrated)
+        return True
 
 
 def get_setting(key: str, default=None):
@@ -722,6 +779,11 @@ def ensure_config_files(create_token: bool = True) -> None:
             print("[CONFIG] Created settings.json from defaults (saved to disk)")
         except Exception as e:
             print(f"[CONFIG] could not create settings.json: {e}")
+    try:
+        if migrate_transport_defaults():
+            print("[CONFIG] Activated direct-first transport defaults")
+    except Exception as e:
+        print(f"[CONFIG] could not migrate transport defaults: {e}")
     # Mobile pairing token — generate + persist BEFORE the WebSocket server
     # starts so the server reads the same token the GUI displays. load_mobile_token()
     # returns "" for both a missing and an empty/whitespace-only token file.

@@ -22,6 +22,7 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 
 from osia.config import load_mobile_token
+from osia.stun_health import start_stun_health_probe
 from osia.transport_coordinator import (
     acquire_application_transport,
     application_transport_coordination_enabled,
@@ -1612,6 +1613,18 @@ def start_background_connector() -> None:
     global _started
     if not _relay_enabled():
         return
+    try:
+        if webrtc_direct_enabled():
+            records = load_webrtc_ice_servers()
+            urls = [
+                str(url)
+                for record in records
+                for url in record.get("urls", [])
+                if str(url).startswith("stun:")
+            ]
+            start_stun_health_probe(urls)
+    except WebRtcSignalingError:
+        pass
     with _started_lock:
         if _started:
             return

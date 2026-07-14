@@ -132,6 +132,7 @@ def validate_ice_servers(
         if not isinstance(raw_urls, list) or not raw_urls:
             raise WebRtcSignalingError("ICE URLs must be a non-empty list")
         urls: list[str] = []
+        seen_urls: set[str] = set()
         has_turn = False
         for raw_url in raw_urls:
             if not isinstance(raw_url, str) or len(raw_url) > 512:
@@ -151,7 +152,9 @@ def validate_ice_servers(
                 if not allow_turn:
                     raise WebRtcSignalingError("TURN is not allowed in persisted settings")
                 has_turn = True
-            urls.append(url)
+            if url not in seen_urls:
+                seen_urls.add(url)
+                urls.append(url)
         total_urls += len(urls)
         if total_urls > MAX_ICE_URLS:
             raise WebRtcSignalingError("too many ICE URLs")
