@@ -105,6 +105,13 @@ import soundfile as sf
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 
 from osia import conversations
+from osia.attachments import (
+    ATTACHMENT_EVENT_TYPES,
+    AttachmentBatchManager,
+    AttachmentProtocolError,
+    build_agent_input,
+    cleanup_orphan_batches,
+)
 from osia.config import CONFIG_DIR as _CONFIG_DIR, regenerate_mobile_token
 from osia.memory import (
     MemoryError as OsiaMemoryError,
@@ -148,6 +155,8 @@ TOKEN_FILE = CONFIG_DIR / "mobile_token.txt"
 # Cross-platform scratch dir for mobile uploads — ``/tmp`` does not exist on
 # Windows, so derive it from the OS temp dir instead.
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "osia_uploads"
+ATTACHMENT_UPLOAD_DIR = Path(tempfile.gettempdir()) / "osia_attachment_batches"
+cleanup_orphan_batches(ATTACHMENT_UPLOAD_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -1239,20 +1248,24 @@ def _persist_accepted_user_message(
     if not request_id or not turn_id or not message_id:
         return False
     try:
+        metadata = {
+            "_conversation_id": conv_id,
+            "_request_id": request_id,
+            "_client_request_id": request_id,
+            "_turn_id": turn_id,
+            "_message_id": message_id,
+            "_client_content_hash": str(
+                turn_meta.get("client_content_hash") or ""
+            ),
+        }
+        attachment_metadata = turn_meta.get("attachment_metadata")
+        if isinstance(attachment_metadata, list) and attachment_metadata:
+            metadata["_attachments"] = attachment_metadata
         updated = conversations.add_message(
             conv_id,
             "user",
             content,
-            metadata={
-                "_conversation_id": conv_id,
-                "_request_id": request_id,
-                "_client_request_id": request_id,
-                "_turn_id": turn_id,
-                "_message_id": message_id,
-                "_client_content_hash": str(
-                    turn_meta.get("client_content_hash") or ""
-                ),
-            },
+            metadata=metadata,
         )
     except Exception as e:
         print(f"[OSIA Server] failed to persist accepted user turn: {e}")
@@ -3817,6 +3830,14 @@ async def websocket_endpoint(ws: WebSocket):
     # Files uploaded by the client that haven't been consumed by a turn yet.
     # The next text/audio turn consumes and clears this list.
     pending_files: list[str] = []
+    attachment_batches = AttachmentBatchManager(ATTACHMENT_UPLOAD_DIR)
+
+    async def _expire_attachment_batches() -> None:
+        while True:
+            await asyncio.sleep(15)
+            attachment_batches.expire()
+
+    attachment_cleanup_task = asyncio.create_task(_expire_attachment_batches())
     # Live system-metrics push task (heartbeat_data frames). Created once after
     # a successful auth, cancelled in the finally block on disconnect.
     heartbeat_task: asyncio.Task | None = None
@@ -5840,7 +5861,13 @@ async def websocket_endpoint(ws: WebSocket):
                             pass
                 continue
 
-            # --- File upload ---
+            # --- Transactional attachment upload ---
+            if msg_type in ATTACHMENT_EVENT_TYPES:
+                for response in attachment_batches.handle(msg):
+                    await out.send_json(response)
+                continue
+
+            # --- Legacy file upload (preserved for older mobile clients) ---
             if msg_type == "file":
                 filename = (msg.get("filename") or "upload.bin").strip()
                 b64_data = msg.get("data", "")
@@ -5965,11 +5992,60 @@ async def websocket_endpoint(ws: WebSocket):
                         })
                         continue
                     client_request_id = _legacy_request_id()
+                attachment_batch_id = str(msg.get("attachment_batch_id") or "")
+                requested_conversation_id = str(
+                    msg.get("conversation_id") or ""
+                ).strip()
+                content_identity = (
+                    f"{user_text}\0{attachment_batch_id}"
+                    if attachment_batch_id else user_text
+                )
                 if await _send_existing_turn_status_for_request(
                     out,
                     client_request_id,
                 ):
                     continue
+                # A completed attachment turn has already released its
+                # temporary batch.  Replay it from canonical persistence before
+                # requiring the live batch, provided the client names the
+                # conversation (which it learns from turn acceptance).
+                if attachment_batch_id and requested_conversation_id:
+                    try:
+                        if await _send_persisted_turn_for_request(
+                            out,
+                            requested_conversation_id,
+                            client_request_id,
+                            expected_user_content=content_identity,
+                        ):
+                            continue
+                    except ValueError:
+                        await out.send_json({
+                            "type": "status",
+                            "content": "error",
+                            "error": "request_id_conflict",
+                            "conversation_id": requested_conversation_id,
+                        })
+                        continue
+                if attachment_batch_id:
+                    try:
+                        attachment_batches.validate_turn_reference(
+                            attachment_batch_id,
+                            requested_conversation_id,
+                            client_request_id,
+                        )
+                    except AttachmentProtocolError as exc:
+                        await out.send_json({
+                            "type": "attachment_batch_failed",
+                            "protocol_version": 1,
+                            "batch_id": attachment_batch_id,
+                            "conversation_id": requested_conversation_id,
+                            "client_request_id": client_request_id,
+                            "request_id": client_request_id,
+                            "event_id": f"event_{secrets.token_hex(16)}",
+                            "sequence": 0,
+                            "category": exc.code,
+                        })
+                        continue
                 # Consume pending files synchronously (clears the shared list)
                 # so this turn — and only this turn — carries them. Resolve the
                 # conversation synchronously (creating it on the first message)
@@ -5982,7 +6058,7 @@ async def websocket_endpoint(ws: WebSocket):
                             out,
                             _conv,
                             client_request_id,
-                            expected_user_content=user_text,
+                            expected_user_content=content_identity,
                         ):
                             continue
                     except ValueError:
@@ -6002,20 +6078,80 @@ async def websocket_endpoint(ws: WebSocket):
                             continue
                         await _send_conversation_busy(out, _conv)
                         continue
-                    user_text = _consume_pending_files(user_text, pending_files)
+                    committed_attachments = []
+                    if attachment_batch_id:
+                        try:
+                            committed_attachments = attachment_batches.consume_for_turn(
+                                attachment_batch_id,
+                                _conv,
+                                client_request_id,
+                            )
+                        except AttachmentProtocolError as exc:
+                            await out.send_json({
+                                "type": "attachment_batch_failed",
+                                "protocol_version": 1,
+                                "batch_id": attachment_batch_id,
+                                "conversation_id": _conv,
+                                "client_request_id": client_request_id,
+                                "request_id": client_request_id,
+                                "event_id": f"event_{secrets.token_hex(16)}",
+                                "sequence": 0,
+                                "category": exc.code,
+                            })
+                            continue
+                        agent_input = build_agent_input(
+                            user_text,
+                            committed_attachments,
+                        )
+                        display_names = ", ".join(
+                            item.display_name for item in committed_attachments
+                        )
+                        persisted_user_content = (
+                            f"📎 {display_names}\n{user_text}".strip()
+                        )
+                    else:
+                        agent_input = _consume_pending_files(
+                            user_text, pending_files,
+                        )
+                        persisted_user_content = user_text
                     turn_meta = _new_turn_meta(_conv, client_request_id)
                     turn_meta["client_content_hash"] = hashlib.sha256(
-                        str(msg.get("content") or "").strip().encode("utf-8")
+                        content_identity.encode("utf-8")
                     ).hexdigest()
-                    _spawn_turn(
-                        _conv,
-                        lambda snap, _t=user_text, _c=_conv, _m=turn_meta:
-                            _run_agent_and_respond(
-                                out, _t, snap, _c,
+                    if committed_attachments:
+                        turn_meta["persisted_user_content"] = persisted_user_content
+                        turn_meta["attachment_metadata"] = [
+                            item.persistence_metadata()
+                            for item in committed_attachments
+                        ]
+
+                    async def _run_text_turn_with_attachment_cleanup(
+                        snap,
+                        _input=agent_input,
+                        _c=_conv,
+                        _m=turn_meta,
+                        _batch_id=attachment_batch_id,
+                    ):
+                        try:
+                            return await _run_agent_and_respond(
+                                out,
+                                _input,
+                                snap,
+                                _c,
                                 get_agent=_get_conn_agent,
-                                turn_meta=_m),
+                                turn_meta=_m,
+                            )
+                        finally:
+                            if _batch_id:
+                                attachment_batches.release(_batch_id)
+
+                    spawned = _spawn_turn(
+                        _conv,
+                        _run_text_turn_with_attachment_cleanup,
                         turn_meta,
                     )
+                    if not spawned and attachment_batch_id:
+                        attachment_batches.release(attachment_batch_id)
 
             # --- Audio message ---
             elif msg_type == "audio":
@@ -6102,6 +6238,12 @@ async def websocket_endpoint(ws: WebSocket):
         except Exception:
             pass
     finally:
+        attachment_batches.cleanup_disconnected()
+        attachment_cleanup_task.cancel()
+        try:
+            await attachment_cleanup_task
+        except (asyncio.CancelledError, Exception):
+            pass
         # Drop this client from the broadcast registry (WOR-10). discard() is
         # a no-op if it was never added (e.g. auth failed).
         _WS_CLIENTS.discard(out)
@@ -6491,9 +6633,13 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         if isinstance(item, dict)
     ]
     prev_len = len(history)
+    persisted_user_content = (
+        turn_meta.get("persisted_user_content", text)
+        if isinstance(turn_meta, dict) else text
+    )
     accepted_user_persisted = _persist_accepted_user_message(
         active_conv_id,
-        text,
+        persisted_user_content,
         turn_meta,
     )
     if isinstance(turn_meta, dict):
