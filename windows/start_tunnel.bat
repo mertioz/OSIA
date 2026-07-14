@@ -34,7 +34,7 @@ if not errorlevel 1 (
 
 echo [tunnel] Launching cloudflared (hidden). Public URL will be in "%LOGFILE%".
 REM Paths are passed via env vars ($env:) so an apostrophe in the install path
-REM (e.g. C:\Users\O'Brien\...) cannot break the single-quoted PowerShell string.
+REM (e.g. %USERPROFILE%\...) cannot break the single-quoted PowerShell string.
 powershell -NoProfile -Command "Start-Process -FilePath $env:CLOUDFLARED -ArgumentList 'tunnel','--no-autoupdate','--config','NUL','--logfile',$env:LOGFILE,'--url','http://127.0.0.1:8765' -WindowStyle Hidden"
 endlocal
 exit /b 0

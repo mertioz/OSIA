@@ -111,7 +111,7 @@ class MemoryStoreTests(unittest.TestCase):
                     category="folder",
                     key="projects",
                     title="Projects Folder",
-                    value={"kind": "path", "data": r"C:\Users\vertu\Projects"},
+                    value={"kind": "path", "data": r"C:/Users/example/Projects"},
                 )
             )
 

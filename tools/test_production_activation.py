@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import json
 import hashlib
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import unittest
@@ -43,6 +46,28 @@ class ProductionDefaultsTests(unittest.TestCase):
         self.assertNotIn("lan_certificate", serialized)
         self.assertNotIn("certificate_sha256", serialized)
 
+    def test_settings_example_is_valid_safe_and_matches_supported_defaults(self):
+        root = Path(__file__).resolve().parents[1]
+        example = json.loads(
+            (root / "config" / "settings.example.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(example, config.DEFAULT_SETTINGS)
+        self.assertEqual(example["api_key_fallbacks"], {})
+        self.assertEqual(example["mcp_servers"], [])
+        self.assertIsNone(example["selected_model"])
+        self.assertIsNone(example["selected_model_provider"])
+        serialized = json.dumps(example, sort_keys=True)
+        self.assertNotRegex(
+            serialized,
+            r"(?:[A-Za-z]:[\\/]Users[\\/]|/(?:home|Users)/[^/]+/)",
+        )
+        self.assertNotRegex(
+            serialized,
+            r"(?:10\.(?:\d{1,3}\.){2}\d{1,3}|"
+            r"192\.168\.\d{1,3}\.\d{1,3}|"
+            r"172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})",
+        )
+
     def test_windows_installer_is_dependency_complete_and_private_firewall_only(self):
         root = Path(__file__).resolve().parents[1]
         requirements = (root / "requirements.txt").read_text(encoding="utf-8")
@@ -57,6 +82,7 @@ class ProductionDefaultsTests(unittest.TestCase):
         self.assertIn("configure_lan_firewall.ps1", install)
         self.assertIn("install_windows_services", install)
         self.assertIn("-Action Install", install)
+        self.assertNotIn("print('Mobile token:'", install)
 
         firewall = (root / "windows" / "configure_lan_firewall.ps1").read_text(
             encoding="utf-8"
@@ -96,11 +122,13 @@ class TransportMigrationTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.settings = self.root / "settings.json"
         self.api_keys = self.root / "api_keys.json"
+        self.oauth_tokens = self.root / "oauth_tokens.json"
         self.mobile_token = self.root / "mobile_token.txt"
         self.patchers = (
             mock.patch.object(config, "CONFIG_DIR", str(self.root)),
             mock.patch.object(config, "SETTINGS_FILE", str(self.settings)),
             mock.patch.object(config, "API_KEYS_FILE", str(self.api_keys)),
+            mock.patch.object(config, "OAUTH_TOKENS_FILE", str(self.oauth_tokens)),
             mock.patch.object(config, "MOBILE_TOKEN_FILE", str(self.mobile_token)),
         )
         for patcher in self.patchers:
@@ -130,7 +158,54 @@ class TransportMigrationTests(unittest.TestCase):
     def test_brand_new_install_persists_production_defaults(self):
         config.ensure_config_files(create_token=False)
         self.assertEqual(self._read(), config.DEFAULT_SETTINGS)
+        self.assertFalse(self.api_keys.exists())
+        self.assertFalse(self.oauth_tokens.exists())
+        self.assertFalse(self.mobile_token.exists())
         self.assertFalse(config.migrate_transport_defaults())
+
+    def test_valid_existing_settings_are_not_overwritten(self):
+        existing = {
+            "transport_defaults_schema": config.TRANSPORT_DEFAULTS_SCHEMA_VERSION,
+            "lan_direct_v1": False,
+            "webrtc_direct_v1": False,
+            "custom_non_secret": "preserved",
+        }
+        self._write(existing)
+        before = self.settings.read_bytes()
+        config.ensure_config_files(create_token=False)
+        self.assertEqual(self.settings.read_bytes(), before)
+
+    def test_clean_first_run_creates_only_required_runtime_files(self):
+        output = io.StringIO()
+        generated = "ab" * 10
+        with mock.patch.object(config.secrets, "token_hex", return_value=generated):
+            with redirect_stdout(output):
+                config.ensure_config_files(create_token=True)
+        self.assertEqual(self._read(), config.DEFAULT_SETTINGS)
+        self.assertEqual(self.mobile_token.read_text(encoding="utf-8"), generated)
+        self.assertNotIn(generated, output.getvalue())
+        self.assertFalse(self.api_keys.exists())
+        self.assertFalse(self.oauth_tokens.exists())
+        if sys.platform != "win32":
+            self.assertEqual(
+                stat.S_IMODE(self.settings.stat().st_mode),
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+            self.assertEqual(
+                stat.S_IMODE(self.mobile_token.stat().st_mode),
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+
+    def test_interrupted_mobile_token_write_preserves_existing_token(self):
+        original = "cd" * 10
+        self.mobile_token.write_text(original, encoding="utf-8")
+        with mock.patch.object(
+            config.os, "replace", side_effect=OSError("simulated interruption")
+        ):
+            with self.assertRaises(OSError):
+                config.regenerate_mobile_token()
+        self.assertEqual(self.mobile_token.read_text(encoding="utf-8"), original)
+        self.assertEqual(list(self.root.glob(".mobile_token.txt.*.tmp")), [])
 
     def test_old_install_with_missing_keys_is_migrated_once(self):
         self._write({"selected_model": "preserved-model"})
@@ -205,13 +280,16 @@ class TransportMigrationTests(unittest.TestCase):
         invalid = b'{"truncated":'
         api_secret = b'{"provider":"secret-sentinel"}'
         token_secret = b"pairing-secret-sentinel"
+        oauth_secret = b'{"oauth":"secret-sentinel"}'
         self.settings.write_bytes(invalid)
         self.api_keys.write_bytes(api_secret)
         self.mobile_token.write_bytes(token_secret)
+        self.oauth_tokens.write_bytes(oauth_secret)
         self.assertFalse(config.migrate_transport_defaults())
         self.assertEqual(self.settings.read_bytes(), invalid)
         self.assertEqual(self.api_keys.read_bytes(), api_secret)
         self.assertEqual(self.mobile_token.read_bytes(), token_secret)
+        self.assertEqual(self.oauth_tokens.read_bytes(), oauth_secret)
 
     def test_upgrade_preserves_pairing_identity_and_valid_certificate(self):
         relay_device = self.root / "relay_device.json"

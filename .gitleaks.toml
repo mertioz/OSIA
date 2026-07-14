@@ -1,0 +1,22 @@
+title = "OSIA PC secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public deterministic relay vectors; only their key-material fields trigger generic entropy detection."
+targetRules = ["generic-api-key"]
+paths = ['''(^|[\/])tools[\/]fixtures[\/]relay_(e2e|v2)_vectors\.json$''']
+
+[[allowlists]]
+description = "Synthetic sanitizer fixtures; structured OSIA provider rules remain active for this exact test path."
+targetRules = ["generic-api-key", "jwt"]
+paths = ['''(^|[\/])tools[\/]test_memory_store\.py$''']
+
+[[allowlists]]
+description = "Non-secret OAuth UI placeholder text, constrained to the exact path and explicit placeholder marker."
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|[\/])osia[\/]gui[\/]main_popup\.py$''']
+regexTarget = "line"
+regexes = ['''(?i)(example|placeholder|dummy|fake|test|redacted|<[a-z0-9_-]+>)''']

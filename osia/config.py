@@ -600,6 +600,11 @@ def save_settings(settings: dict) -> None:
                 os.fsync(f.fileno())
             except Exception:
                 pass
+        if sys.platform != "win32":
+            try:
+                os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+            except Exception:
+                pass
         os.replace(tmp, SETTINGS_FILE)
     finally:
         if descriptor >= 0:
@@ -730,15 +735,34 @@ def regenerate_mobile_token() -> str:
     """Generate a fresh 20-char mobile token, persist it (0600), and return it."""
     _ensure_config_dir()
     token = secrets.token_hex(10)  # 20 hex chars
-    with open(MOBILE_TOKEN_FILE, "w", encoding="utf-8") as f:
-        f.write(token)
-    if sys.platform != "win32":
+    descriptor, tmp = tempfile.mkstemp(
+        prefix=f".{Path(MOBILE_TOKEN_FILE).name}.",
+        suffix=".tmp",
+        dir=str(Path(MOBILE_TOKEN_FILE).parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as f:
+            descriptor = -1
+            f.write(token)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        if sys.platform != "win32":
+            try:
+                os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+            except Exception:
+                pass
+        os.replace(tmp, MOBILE_TOKEN_FILE)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
         try:
-            os.chmod(MOBILE_TOKEN_FILE, stat.S_IRUSR | stat.S_IWUSR)
-        except Exception:
+            os.unlink(tmp)
+        except FileNotFoundError:
             pass
-    else:
-        print("[config] ACL hardening (0o600) not applied on Windows")
     return token
 
 
@@ -789,12 +813,7 @@ def ensure_config_files(create_token: bool = True) -> None:
     # returns "" for both a missing and an empty/whitespace-only token file.
     if create_token and not load_mobile_token():
         try:
-            token = regenerate_mobile_token()
-            masked = (
-                f"{token[:4]}...{token[-4:]}" if len(token) >= 8 else "****"
-            )
-            print(
-                f"[CONFIG] Generated new mobile token: {masked} (saved to disk)"
-            )
+            regenerate_mobile_token()
+            print("[CONFIG] Generated new mobile token (saved to disk)")
         except Exception as e:
             print(f"[CONFIG] could not generate mobile token: {e}")

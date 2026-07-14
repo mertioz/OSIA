@@ -1,0 +1,70 @@
+{
+  "selected_model": null,
+  "selected_model_provider": null,
+  "chatgpt_account_feature_enabled": true,
+  "chatgpt_account_model": null,
+  "tts_provider": "local",
+  "tts_voice": null,
+  "stt_provider": "local",
+  "stt_fallback_provider": "local",
+  "stt_local_model": "small",
+  "stt_groq_model": "whisper-large-v3-turbo",
+  "language": "en",
+  "show_capsule": true,
+  "time_format": "24h",
+  "ai_hierarchy": {
+    "heavy": [],
+    "medium": []
+  },
+  "ai_hierarchy_enabled": false,
+  "reasoning": {
+    "default": "auto",
+    "providers": {},
+    "models": {}
+  },
+  "vision_provider": "",
+  "vision_model": "",
+  "liveapi_enabled": false,
+  "liveapi_provider": "google",
+  "liveapi_model": "gemini-3.1-flash-live",
+  "wake_word_enabled": true,
+  "wake_greeting_enabled": false,
+  "wake_greeting_text": "",
+  "cron_jobs": [],
+  "heartbeat_enabled": false,
+  "heartbeat_interval_minutes": 5,
+  "heartbeat_interval_seconds": 30,
+  "heartbeat_checks": {
+    "cpu": {
+      "enabled": true,
+      "threshold": 80
+    },
+    "ram": {
+      "enabled": true,
+      "threshold": 90
+    },
+    "disk": {
+      "enabled": true,
+      "threshold": 10
+    },
+    "network": {
+      "enabled": true
+    }
+  },
+  "api_fallbacks": {},
+  "api_key_fallbacks": {},
+  "transport_defaults_schema": 1,
+  "lan_direct_v1": true,
+  "webrtc_direct_v1": true,
+  "webrtc_stun_urls": [
+    "stun:stun.cloudflare.com:3478"
+  ],
+  "skills_enabled": {},
+  "mcp_servers": [],
+  "mcp_confirm_writes": true,
+  "mcp_allow_unattended_writes": false,
+  "island_shape": "capsule",
+  "island_dock_side": "right",
+  "island_x": null,
+  "island_y": null
+}

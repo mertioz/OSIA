@@ -109,7 +109,7 @@ for %%F in (api_keys.json settings.json mobile_token.txt) do (
 REM Ensure a mobile pairing token exists (writes %USERPROFILE%\.osia\mobile_token.txt).
 REM PYTHONPATH guarantees `osia` is importable even if cd above failed.
 set "PYTHONPATH=%PROJECT_DIR%"
-"%VENV_PY%" -c "from osia.config import load_mobile_token, regenerate_mobile_token; print('Mobile token:', load_mobile_token() or regenerate_mobile_token())"
+"%VENV_PY%" -c "from osia.config import load_mobile_token, regenerate_mobile_token; load_mobile_token() or regenerate_mobile_token()"
 
 REM --- 6. Private-network-only LAN firewall rule -----------------------------
 REM Elevation is requested once during installation. Normal application runtime
