@@ -41,8 +41,10 @@ Design notes
 
 import json
 import re
+from typing import NamedTuple
 
 from osia.autonomous import state
+from osia.utils.key_chain import error_status, provider_failure_category
 
 # ── Bounded autonomy defaults ────────────────────────────────────────────────
 # A SMALL plan is the goal (research: long, sprawling plans drift). These are
@@ -57,6 +59,24 @@ _SCHEMA_HINT = (
     '{"phases":[{"name":"...","tasks":'
     '[{"objective":"...","success_criterion":"..."}]}]}'
 )
+
+
+class PlanFailure(NamedTuple):
+    """Sanitized final planning failure exposed to an optional callback.
+
+    No provider payload or exception text is retained: callers receive only a
+    stable reason, an optional HTTP status, and the shared key-chain category.
+    The planner's public fail-closed return remains ``None``.
+    """
+
+    reason: str
+    status_code: int | None = None
+    provider_category: str = ""
+
+
+class _AttemptOutcome(NamedTuple):
+    phases: list | None
+    failure: PlanFailure | None
 
 
 # ── Prompt construction ──────────────────────────────────────────────────────
@@ -258,32 +278,64 @@ def _validate_and_normalize(obj, max_phases: int, max_tasks_per_phase: int):
 
 # ── One planning attempt ─────────────────────────────────────────────────────
 
+def _provider_failure(exc: Exception) -> PlanFailure:
+    """Classify a provider exception without retaining its payload or text."""
+    status = error_status(exc)
+    category = provider_failure_category(exc, status)
+    if status in (401, 403):
+        reason = "provider_authentication"
+    elif status == 429:
+        reason = "provider_rate_limit"
+    elif status == 408 or "timeout" in type(exc).__name__.lower():
+        reason = "provider_timeout"
+    else:
+        reason = "provider_error"
+    return PlanFailure(reason, status, category)
+
+
 def _attempt(agent, message, max_phases, max_tasks_per_phase):
     """Run ONE planning message through the agent and parse/validate the reply.
 
-    Returns the normalized ``phases`` list, or ``None`` if the agent errored or
-    its output failed extraction/validation. The whole attempt — ``agent.run``
-    plus extraction and validation — is wrapped in ``except Exception`` so a
-    transient provider error OR any pathological model output (e.g. JSON nested
-    deep enough to make ``json.loads`` raise ``RecursionError``) yields ``None``
-    instead of crashing the caller. This is the module-level enforcement of the
-    "never raises on bad model output" contract.
+    Returns an internal :class:`_AttemptOutcome` that distinguishes provider,
+    JSON-extraction and schema failures without retaining response/error text.
+    The public API still returns only validated phases or ``None``.
     """
     try:
         raw = agent.run(message)
-        obj = _extract_json_object(raw)
-        if obj is None:
-            return None
-        return _validate_and_normalize(obj, max_phases, max_tasks_per_phase)
+    except Exception as exc:
+        return _AttemptOutcome(None, _provider_failure(exc))
+
+    obj = _extract_json_object(raw)
+    if obj is None:
+        return _AttemptOutcome(None, PlanFailure("invalid_json"))
+    try:
+        phases = _validate_and_normalize(
+            obj, max_phases, max_tasks_per_phase,
+        )
     except Exception:
-        return None
+        # Fail closed on a pathological decoded object and discard all content.
+        phases = None
+    if phases is None:
+        return _AttemptOutcome(None, PlanFailure("invalid_schema"))
+    return _AttemptOutcome(phases, None)
+
+
+def _report_failure(failure_cb, failure: PlanFailure | None) -> None:
+    """Best-effort final failure notification; callback errors never escape."""
+    if failure_cb is None or failure is None:
+        return
+    try:
+        failure_cb(failure)
+    except Exception:
+        pass
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
 def plan_objective(objective: str, agent, *,
                    max_phases: int = DEFAULT_MAX_PHASES,
-                   max_tasks_per_phase: int = DEFAULT_MAX_TASKS_PER_PHASE):
+                   max_tasks_per_phase: int = DEFAULT_MAX_TASKS_PER_PHASE,
+                   failure_cb=None):
     """Decompose ``objective`` into a validated, normalized ``phases`` list.
 
     ``agent`` is a ready :class:`osia.agent.OSIAAgent` (already model-set by the
@@ -291,11 +343,14 @@ def plan_objective(objective: str, agent, *,
     ``agent.run(planning_prompt)`` — extracts and validates the JSON plan, and on
     any parse/shape failure retries ONCE with a corrective "raw JSON only"
     message (keeping the failed turn in context so the model can self-correct).
+    Provider/auth/rate-limit/timeout failures are not malformed output, so they
+    fail immediately instead of spending a second request on the JSON reminder.
 
     Returns the ``phases`` list ready for
     :func:`osia.autonomous.state.new_task_state`, or ``None`` if planning failed
     after the retry (blank objective, agent error, or unparseable/invalid
-    output). **Never raises** on bad model output.
+    output). **Never raises** on bad model output. If ``failure_cb`` is supplied,
+    it receives one sanitized :class:`PlanFailure` for the final failure only.
     """
     if not _nonempty_str(objective):
         return None
@@ -305,19 +360,30 @@ def plan_objective(objective: str, agent, *,
     # First attempt: fresh context (reset clears history except the system
     # prompt). The agent is the caller's; reset() is part of its public contract.
     agent.reset()
-    phases = _attempt(agent, prompt, max_phases, max_tasks_per_phase)
-    if phases is not None:
-        return phases
+    outcome = _attempt(agent, prompt, max_phases, max_tasks_per_phase)
+    if outcome.phases is not None:
+        return outcome.phases
+
+    if outcome.failure and outcome.failure.reason.startswith("provider_"):
+        _report_failure(failure_cb, outcome.failure)
+        return None
 
     # Corrective retry — NO reset, so the model sees its own bad output plus a
     # restated exact-schema demand. Exactly one retry; its result (possibly
     # None) is final.
-    return _attempt(agent, _CORRECTIVE_PROMPT, max_phases, max_tasks_per_phase)
+    outcome = _attempt(
+        agent, _CORRECTIVE_PROMPT, max_phases, max_tasks_per_phase,
+    )
+    if outcome.phases is not None:
+        return outcome.phases
+    _report_failure(failure_cb, outcome.failure)
+    return None
 
 
 def create_plan_state(objective: str, provider: str, model: str, agent, *,
                       max_phases: int = DEFAULT_MAX_PHASES,
-                      max_tasks_per_phase: int = DEFAULT_MAX_TASKS_PER_PHASE):
+                      max_tasks_per_phase: int = DEFAULT_MAX_TASKS_PER_PHASE,
+                      failure_cb=None):
     """Plan ``objective`` and build a fresh (UNSAVED) ``task_state`` dict.
 
     Thin convenience over :func:`plan_objective` +
@@ -327,7 +393,8 @@ def create_plan_state(objective: str, provider: str, model: str, agent, *,
     :func:`osia.autonomous.state.save_task_state`) is the caller's decision.
     """
     phases = plan_objective(objective, agent, max_phases=max_phases,
-                            max_tasks_per_phase=max_tasks_per_phase)
+                            max_tasks_per_phase=max_tasks_per_phase,
+                            failure_cb=failure_cb)
     if phases is None:
         return None
     return state.new_task_state(objective, provider, model, phases)

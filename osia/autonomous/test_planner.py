@@ -19,6 +19,8 @@ that ids / statuses match the Phase-1 state schema.
 
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 # Make the repo root importable when run as a bare script (…/osia/autonomous/
 # → …/osia → <repo>).
@@ -56,16 +58,25 @@ class FakeAgent:
 class RaisingAgent:
     """Agent whose run() always raises — exercises the defensive wrap."""
 
-    def __init__(self):
+    def __init__(self, error=None):
         self.run_inputs = []
         self.reset_calls = 0
+        self.error = error or RuntimeError("simulated provider/network failure")
 
     def reset(self):
         self.reset_calls += 1
 
     def run(self, user_input, *args, **kwargs):
         self.run_inputs.append(user_input)
-        raise RuntimeError("simulated provider/network failure")
+        raise self.error
+
+
+class StatusError(RuntimeError):
+    """Provider-style failure carrying only a safe HTTP status."""
+
+    def __init__(self, status_code):
+        super().__init__("simulated provider failure")
+        self.status_code = status_code
 
 
 # ── Canned model outputs ───────────────────────────────────────────────────────
@@ -158,6 +169,12 @@ def test_malformed_then_none():
           "ONLY raw JSON" in agent.run_inputs[1])
     check("reset() still called only once (no reset on retry)", agent.reset_calls == 1)
 
+    failures = []
+    agent = FakeAgent([MALFORMED_JSON, MALFORMED_JSON])
+    planner.plan_objective("Objectif", agent, failure_cb=failures.append)
+    check("malformed output is reported as invalid_json",
+          len(failures) == 1 and failures[0].reason == "invalid_json")
+
 
 def test_shape_rejects_missing_criterion():
     print("test_shape_rejects_missing_criterion")
@@ -171,6 +188,11 @@ def test_shape_rejects_missing_criterion():
     phases = planner.plan_objective("Objectif", agent)
     check("missing success_criterion → None after retry", phases is None)
     check("retried exactly once", len(agent.run_inputs) == 2)
+    failures = []
+    agent = FakeAgent([MISSING_CRITERION, MISSING_CRITERION])
+    planner.plan_objective("Objectif", agent, failure_cb=failures.append)
+    check("incomplete output is reported as invalid_schema",
+          len(failures) == 1 and failures[0].reason == "invalid_schema")
 
 
 def test_more_shape_rejections():
@@ -205,9 +227,55 @@ def test_never_raises_on_bad_output():
     try:
         phases = planner.plan_objective("Obj", ragent)
         check("agent.run raising → None (no propagation)", phases is None)
-        check("raising agent still retried (run called twice)", len(ragent.run_inputs) == 2)
+        check("provider failure is not retried as malformed JSON",
+              len(ragent.run_inputs) == 1)
     except Exception as exc:  # pragma: no cover
         check(f"agent.run exception propagated: {exc!r}", False)
+
+
+def test_provider_failure_classification():
+    print("test_provider_failure_classification")
+    cases = [
+        (StatusError(401), "provider_authentication", 401),
+        (StatusError(403), "provider_authentication", 403),
+        (StatusError(429), "provider_rate_limit", 429),
+        (TimeoutError("simulated timeout"), "provider_timeout", None),
+    ]
+    for error, reason, status in cases:
+        failures = []
+        agent = RaisingAgent(error)
+        phases = planner.plan_objective(
+            "Objectif", agent, failure_cb=failures.append,
+        )
+        check(f"{reason}: planning fails closed", phases is None)
+        check(f"{reason}: no JSON corrective retry", len(agent.run_inputs) == 1)
+        check(
+            f"{reason}: sanitized classification",
+            len(failures) == 1
+            and failures[0].reason == reason
+            and failures[0].status_code == status,
+        )
+
+
+def test_failed_plan_leaves_no_checkpoint():
+    print("test_failed_plan_leaves_no_checkpoint")
+    original = state.TASK_STATE_FILE
+    with tempfile.TemporaryDirectory(prefix="osia-planner-failure-") as tmp:
+        checkpoint = Path(tmp) / "task_state.json"
+        state.TASK_STATE_FILE = checkpoint
+        try:
+            failures = []
+            planned = planner.create_plan_state(
+                "Objectif", "deepseek", "deepseek-v4-pro",
+                RaisingAgent(StatusError(401)),
+                failure_cb=failures.append,
+            )
+            check("provider failure returns no partial plan", planned is None)
+            check("provider failure writes no checkpoint", not checkpoint.exists())
+            check("provider authentication reason retained",
+                  failures and failures[0].reason == "provider_authentication")
+        finally:
+            state.TASK_STATE_FILE = original
 
 
 def test_deeply_nested_no_crash():
@@ -296,6 +364,8 @@ def main():
         test_shape_rejects_missing_criterion,
         test_more_shape_rejections,
         test_never_raises_on_bad_output,
+        test_provider_failure_classification,
+        test_failed_plan_leaves_no_checkpoint,
         test_deeply_nested_no_crash,
         test_blank_objective,
         test_caps_truncate,

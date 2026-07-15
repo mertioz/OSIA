@@ -3482,12 +3482,30 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
             provider = provider_for_model(model) if model else ""
         except Exception:
             provider = ""
+        planning_failures = []
         try:
-            st = _aplanner.create_plan_state(objective, provider, model, agent)
+            st = _aplanner.create_plan_state(
+                objective, provider, model, agent,
+                failure_cb=planning_failures.append,
+            )
         except Exception as e:
             print(f"[WOR-45] autonomous planning crashed: {e}")
             st = None
         if not st:
+            if planning_failures:
+                failure = planning_failures[-1]
+                status = (
+                    f" status={failure.status_code}"
+                    if failure.status_code is not None else ""
+                )
+                category = (
+                    f" provider_category={failure.provider_category}"
+                    if failure.provider_category else ""
+                )
+                print(
+                    f"[WOR-125] autonomous planning failed "
+                    f"reason={failure.reason}{status}{category}"
+                )
             _broadcast_autonomous(_autonomous_frame({"event": "plan_failed"}, None))
             _release_single_runner_if_gen(my_gen)
             return

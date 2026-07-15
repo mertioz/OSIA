@@ -56,6 +56,9 @@ import argparse
 import asyncio
 import json
 import sys
+import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -117,6 +120,170 @@ def _fmt_progress(frame: dict) -> str:
         if frame.get(k):
             extra += f"  {k}={frame[k]!r}"
     return f"event={ev:<12} {counts:>5}  phase={phase!r:<24} status={status!r}{extra}"
+
+
+@contextmanager
+def _isolated_task_state(state_module):
+    """Redirect only the mutable autonomous checkpoint to a temporary root."""
+    original = state_module.TASK_STATE_FILE
+    with tempfile.TemporaryDirectory(prefix="osia-wor125-autonomous-") as tmp:
+        root = Path(tmp)
+        checkpoint = root / "task_state.json"
+        state_module.TASK_STATE_FILE = checkpoint
+        try:
+            yield root, checkpoint
+        finally:
+            state_module.TASK_STATE_FILE = original
+
+
+def _run_isolation_self_test() -> int:
+    """Deterministically prove isolation never redirects/copies user config."""
+    class _FakeState:
+        TASK_STATE_FILE = Path("original-task-state.json")
+
+    original = _FakeState.TASK_STATE_FILE
+    home = Path.home()
+    root = None
+    checks = {}
+    with _isolated_task_state(_FakeState) as (temp_root, checkpoint):
+        root = temp_root
+        checks["checkpoint_redirected"] = checkpoint.parent == temp_root
+        checks["home_unchanged"] = Path.home() == home
+        checks["no_config_copied"] = not any(
+            (temp_root / name).exists()
+            for name in ("settings.json", "api_keys.json", "mobile_token.txt")
+        )
+        checkpoint.write_text("temporary", encoding="utf-8")
+    checks["state_path_restored"] = _FakeState.TASK_STATE_FILE == original
+    checks["temp_cleaned"] = root is not None and not root.exists()
+    for name, passed in checks.items():
+        print(f"AUTONOMOUS_ISOLATION_CHECK {name}={str(bool(passed)).lower()}")
+    return 0 if checks and all(checks.values()) else 1
+
+
+def _run_direct_isolated(args) -> int:
+    """Exercise real planning while isolating only mutable autonomous state.
+
+    Provider settings and credentials remain in their authoritative user config
+    and are read in place; they are never copied into the temporary directory.
+    The plan checkpoint lives under a TemporaryDirectory and is removed after a
+    controlled cancellation immediately after the orchestrator starts.
+    """
+    repo = Path(__file__).resolve().parent.parent
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
+
+    from osia.agent import OSIAAgent
+    from osia.autonomous import planner, state
+    from osia.autonomous.orchestrator import Orchestrator
+    from osia.config import load_settings
+    from osia.models import provider_for_model
+
+    objective = (args.objective or "").strip()
+    model = (args.model or load_settings().get("selected_model") or "").strip()
+    if not objective or not model:
+        print("AUTONOMOUS_DIAGNOSTIC_FAILURE reason=invalid_request")
+        return 2
+    provider = provider_for_model(model)
+
+    agent = OSIAAgent()
+    agent.set_model(model, provider=provider)
+    failures = []
+    frames = []
+    original_state_file = state.TASK_STATE_FILE
+    temp_root = None
+    checks = {}
+
+    try:
+        with _isolated_task_state(state) as (temp_root, checkpoint):
+
+            planned = planner.create_plan_state(
+                objective, provider, model, agent,
+                failure_cb=failures.append,
+            )
+            if not isinstance(planned, dict):
+                failure = failures[-1] if failures else None
+                reason = failure.reason if failure else "unknown"
+                status = (
+                    f" status={failure.status_code}"
+                    if failure and failure.status_code is not None else ""
+                )
+                print(
+                    f"AUTONOMOUS_DIAGNOSTIC_FAILURE event=plan_failed "
+                    f"reason={reason}{status}"
+                )
+                checks["checkpoint_absent_after_failure"] = not checkpoint.exists()
+                return 1
+
+            phases = planned.get("phases") or []
+            tasks = [task for phase in phases for task in phase.get("tasks", [])]
+            checks["valid_plan"] = bool(phases and tasks)
+            state.save_task_state(planned)
+            persisted = state.load_task_state()
+            checks["run_id_correlated"] = (
+                isinstance(persisted, dict)
+                and persisted.get("task_id") == planned.get("task_id")
+            )
+
+            # Planning above used the real selected provider. Hold execution at
+            # the agent boundary so starting the real orchestrator cannot invoke
+            # tools or perform computer-control side effects before cancellation.
+            release_execution = threading.Event()
+            original_run = agent.run
+
+            def _held_execution(*_args, **_kwargs):
+                release_execution.wait(timeout=max(5.0, args.timeout))
+                return "controlled cancellation"
+
+            agent.run = _held_execution
+            orch = Orchestrator(agent, progress_cb=lambda frame: frames.append(dict(frame)))
+            try:
+                orch.start(planned)
+                first_thread = orch._thread
+                orch.start(planned)
+                checks["no_duplicate_run"] = orch._thread is first_thread
+                checks["orchestrator_started"] = (
+                    first_thread is not None and first_thread.is_alive()
+                )
+                planned["status"] = "aborted"
+                orch.stop()
+                release_execution.set()
+                if first_thread is not None:
+                    first_thread.join(timeout=max(5.0, args.timeout))
+                checks["no_orphan_run"] = not any(
+                    thread.name == "osia-orchestrator" and thread.is_alive()
+                    for thread in threading.enumerate()
+                )
+            finally:
+                release_execution.set()
+                agent.run = original_run
+
+            state.clear_task_state()
+            checks["checkpoint_cleaned"] = not checkpoint.exists()
+            checks["no_plan_failed"] = all(
+                frame.get("event") != "plan_failed" for frame in frames
+            )
+
+            print(
+                "AUTONOMOUS_DIAGNOSTIC_PLAN_CREATED "
+                f"run_id={planned.get('task_id')} phases={len(phases)} "
+                f"tasks={len(tasks)}"
+            )
+            print(
+                "AUTONOMOUS_DIAGNOSTIC_EVENT event=running "
+                f"phase_index=0 task_id={tasks[0].get('id')}"
+            )
+    finally:
+        state.TASK_STATE_FILE = original_state_file
+
+    checks["temp_cleaned"] = temp_root is not None and not temp_root.exists()
+    for name, passed in checks.items():
+        print(f"AUTONOMOUS_DIAGNOSTIC_CHECK {name}={str(bool(passed)).lower()}")
+    if checks and all(checks.values()):
+        print("AUTONOMOUS_DIAGNOSTIC_PASS marker=OSIA-WOR125-AUTONOMOUS-PASS")
+        return 0
+    print("AUTONOMOUS_DIAGNOSTIC_FAILURE reason=acceptance_check")
+    return 1
 
 
 async def _run(args) -> int:
@@ -200,6 +367,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Drive the OSIA autonomous server over WebSocket.")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument(
+        "--direct-isolated", action="store_true",
+        help=("run real provider planning in-process with only the mutable "
+              "autonomous checkpoint isolated; no WebSocket server required"),
+    )
+    ap.add_argument(
+        "--self-test-isolation", action="store_true",
+        help="run deterministic temporary-state isolation checks and exit",
+    )
     ap.add_argument("--token", default=None, help="mobile token (default: read mobile_token.txt)")
     ap.add_argument("--action", choices=["start", "interrupt", "abort", "status", "resume"],
                     default="start")
@@ -213,6 +389,10 @@ def main() -> int:
                     help="seconds to listen before exiting (default 600)")
     args = ap.parse_args()
     try:
+        if args.self_test_isolation:
+            return _run_isolation_self_test()
+        if args.direct_isolated:
+            return _run_direct_isolated(args)
         return asyncio.run(_run(args))
     except KeyboardInterrupt:
         print("\n[client] interrupted by user (Ctrl-C)")
