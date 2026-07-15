@@ -57,11 +57,15 @@ class LanCorrelationTests(unittest.IsolatedAsyncioTestCase):
         server._ACTIVE_TURNS_BY_CONV.clear()
         server._ACTIVE_TURN_META_BY_CONV.clear()
         server._ACTIVE_CONV_BY_REQUEST.clear()
+        with server._CRON_NOTIFICATIONS_LOCK:
+            server._CRON_NOTIFICATIONS.clear()
 
     def tearDown(self):
         server._ACTIVE_TURNS_BY_CONV.clear()
         server._ACTIVE_TURN_META_BY_CONV.clear()
         server._ACTIVE_CONV_BY_REQUEST.clear()
+        with server._CRON_NOTIFICATIONS_LOCK:
+            server._CRON_NOTIFICATIONS.clear()
         server.conversations.CONVERSATIONS_DIR = self._old_dir
         self._tmp.cleanup()
 
@@ -288,6 +292,24 @@ class LanCorrelationTests(unittest.IsolatedAsyncioTestCase):
             [(item["role"], item["content"]) for item in stored],
             [("user", "accepted user"), ("assistant", "final answer")],
         )
+        turn_frames = [
+            frame for frame in channel.frames
+            if frame.get("request_id") == "request-provider-rounds"
+        ]
+        sequences = [frame["sequence"] for frame in turn_frames]
+        self.assertEqual(sequences, sorted(sequences))
+        self.assertEqual(len(sequences), len(set(sequences)))
+        self.assertEqual(
+            sum(frame["type"] == "response" for frame in turn_frames),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                frame["type"] == "turn_status" and frame.get("terminal")
+                for frame in turn_frames
+            ),
+            1,
+        )
 
     def test_media_events_do_not_create_or_finalize_text_messages(self):
         conv = server.conversations.create_conversation()
@@ -345,6 +367,31 @@ class LanCorrelationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first["turn_id"], foreground["turn_id"])
         self.assertTrue(first["terminal"])
         self.assertEqual(foreground["_event_sequence"], 7)
+
+    async def test_replayed_cron_failure_keeps_its_own_stable_correlation(self):
+        current = server._new_turn_meta("current-conv", "current-request")
+        current["_event_sequence"] = 3
+        frame = server._cron_notification_frame({
+            "id": "cron-note-stale-failure",
+            "task_id": "cron-task-stale-failure",
+            "title": "Synthetic failure",
+            "status": "failed",
+            "conversation_id": "scheduled-conv",
+            "created_at": "2026-07-15T09:00:00+02:00",
+        })
+        server._remember_cron_notification(frame)
+        channel = _FakeChannel()
+
+        await server._send_pending_cron_notifications(channel)
+        await server._send_pending_cron_notifications(channel)
+
+        self.assertEqual(channel.frames, [frame, frame])
+        self.assertNotEqual(frame["conversation_id"], current["conversation_id"])
+        self.assertNotEqual(frame["request_id"], current["request_id"])
+        self.assertNotEqual(frame["turn_id"], current["turn_id"])
+        self.assertEqual(frame["event_type"], "cron_notification")
+        self.assertTrue(frame["terminal"])
+        self.assertEqual(current["_event_sequence"], 3)
 
 
 if __name__ == "__main__":

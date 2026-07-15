@@ -2998,6 +2998,7 @@ def _server_run_cron_task(
     task_text: str,
     conversation_id: str | None = None,
     model: dict | None = None,
+    scheduled_execution: dict | None = None,
 ) -> dict:
     """Run one scheduled task from the background mobile server process."""
 
@@ -3031,11 +3032,19 @@ def _server_run_cron_task(
         agent._disable_hierarchy_for_turn = True
         if conv is not None:
             history = conv.get("messages") or []
-            reply = agent.run(
-                task_text,
-                history=history,
-                current_conversation_id=conversation_id,
-            )
+            if scheduled_execution is not None:
+                reply = agent.run_scheduled(
+                    task_text,
+                    scheduled_execution,
+                    history=history,
+                    current_conversation_id=conversation_id,
+                )
+            else:
+                reply = agent.run(
+                    task_text,
+                    history=history,
+                    current_conversation_id=conversation_id,
+                )
             display = clean_response(reply or "")
             conversations.add_message(conversation_id, "user", task_text)
             conversations.add_message(conversation_id, "assistant", display)
@@ -3047,7 +3056,13 @@ def _server_run_cron_task(
                 pass
         else:
             agent.reset()
-            reply = agent.run(task_text)
+            if scheduled_execution is not None:
+                reply = agent.run_scheduled(
+                    task_text,
+                    scheduled_execution,
+                )
+            else:
+                reply = agent.run(task_text)
             display = clean_response(reply or "")
         if conversation_stale:
             return {

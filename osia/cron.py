@@ -20,15 +20,18 @@ daemon thread drives everything; :meth:`CronManager.start` and
 :meth:`CronManager.stop` bracket its lifetime and shut it down cleanly.
 
 This module is intentionally decoupled from the agent: the caller passes a
-``run_task(description: str, conversation_id: str | None) -> None`` callback
+``run_task(description, conversation_id, scheduled_execution=...)`` callback
 (see ``osia/main.py``) that actually executes the task and speaks the reply.
 When a job is linked to a conversation, its id is passed through so the
 callback can load that conversation's history and keep context across runs.
-The manager only decides *when* to call it.
+The structured execution context identifies the already-scheduled occurrence;
+the manager otherwise only decides *when* to call it.
 
 All log lines are prefixed ``[CRON]``.
 """
 
+import hashlib
+import inspect
 import re
 import sys
 import threading
@@ -152,6 +155,72 @@ def _job_anchor_date(job: dict, now: datetime):
         if dt is not None:
             return dt.date()
     return now.date()
+
+
+def _scheduled_execution_context(
+    *,
+    task_id: str | None,
+    schedule: str,
+    conversation_id: str | None,
+    scheduled_for: datetime,
+    signature: tuple | None,
+    original_request_id: str | None = None,
+) -> dict:
+    """Return stable, body-free provenance for one scheduled occurrence."""
+
+    stable_task_id = str(task_id or "").strip()
+    if not stable_task_id:
+        stable_task_id = "legacy_" + hashlib.sha256(
+            repr(signature or ()).encode("utf-8")
+        ).hexdigest()[:24]
+    scheduled_marker = scheduled_for.isoformat(timespec="seconds")
+    occurrence_id = "cron_occ_" + hashlib.sha256(
+        f"{stable_task_id}\n{schedule}\n{scheduled_marker}".encode("utf-8")
+    ).hexdigest()[:32]
+    spec = parse_schedule(schedule) or {}
+    kind = str(spec.get("kind") or "unknown")
+    context = {
+        "source": "scheduled_task",
+        "task_id": stable_task_id,
+        "occurrence_id": occurrence_id,
+        "execution_id": occurrence_id,
+        "conversation_id": conversation_id or None,
+        "recurrence": {
+            "schedule": schedule,
+            "kind": kind,
+            "recurring": kind != "once",
+        },
+    }
+    if original_request_id:
+        context["original_request_id"] = str(original_request_id)
+    return context
+
+
+def _run_task_kwargs(
+    callback: Callable[..., object],
+    *,
+    model: dict | None,
+    scheduled_execution: dict,
+) -> dict:
+    """Select additive callback keywords without retrying callback bodies."""
+
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        return {
+            "model": model,
+            "scheduled_execution": scheduled_execution,
+        }
+    accepts_extra = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    kwargs = {}
+    if accepts_extra or "model" in parameters:
+        kwargs["model"] = model
+    if accepts_extra or "scheduled_execution" in parameters:
+        kwargs["scheduled_execution"] = scheduled_execution
+    return kwargs
 
 
 class CronManager:
@@ -332,7 +401,8 @@ class CronManager:
                     job.get("task", ""), job.get("schedule", ""), st, now,
                     conversation_id=job.get("conversation_id"),
                     job_index=idx, signature=sig, task_id=job.get("id"),
-                    title=job.get("title"), model=job.get("model"))
+                    title=job.get("title"), model=job.get("model"),
+                    original_request_id=job.get("original_request_id"))
                 # A one-shot job runs exactly once: as soon as it actually
                 # launches, flag it in-memory (so it never re-fires this
                 # session even if the persist below fails) and disable it on
@@ -428,7 +498,8 @@ class CronManager:
     def _fire(self, task: str, schedule: str, st: dict, now: datetime,
               conversation_id: str | None = None, job_index: int | None = None,
               signature: tuple | None = None, task_id: str | None = None,
-              title: str | None = None, model: dict | None = None) -> bool:
+              title: str | None = None, model: dict | None = None,
+              original_request_id: str | None = None) -> bool:
         """Launch a job's task on a worker thread.
 
         Returns ``True`` when the task was actually launched (timing state
@@ -451,6 +522,15 @@ class CronManager:
         # Commit the timing state only now that we are actually launching. The
         # scheduler loop is single-threaded, so this completes before any later
         # tick and cannot double-fire.
+        scheduled_for = st.get("next_run") or now
+        execution_context = _scheduled_execution_context(
+            task_id=task_id,
+            schedule=schedule,
+            conversation_id=conversation_id,
+            scheduled_for=scheduled_for,
+            signature=signature,
+            original_request_id=original_request_id,
+        )
         st["last_run"] = now
         st["last_date"] = now.date()
         st["anchor_date"] = now.date()
@@ -463,6 +543,7 @@ class CronManager:
             last_status="running",
             next_run_at=next_run_at,
             next_run_schedule=schedule,
+            last_occurrence_id=execution_context["occurrence_id"],
         )
 
         print(f"[CRON] firing scheduled task ({schedule}): {task[:80]}")
@@ -472,12 +553,15 @@ class CronManager:
             job_status = "completed"
             last_error = ""
             try:
-                try:
-                    result = self._run_task(task, conversation_id, model=model)
-                except TypeError as exc:
-                    if "model" not in str(exc):
-                        raise
-                    result = self._run_task(task, conversation_id)
+                result = self._run_task(
+                    task,
+                    conversation_id,
+                    **_run_task_kwargs(
+                        self._run_task,
+                        model=model,
+                        scheduled_execution=execution_context,
+                    ),
+                )
                 if isinstance(result, dict):
                     raw_status = str(result.get("status") or "").strip().lower()
                     if raw_status in {"failed", "error"}:

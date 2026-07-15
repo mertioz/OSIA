@@ -39,6 +39,37 @@ _CURRENT_MODEL_METADATA = contextvars.ContextVar(
     "osia_current_model_metadata",
     default=None,
 )
+_SCHEDULED_EXECUTION_CONTEXT = contextvars.ContextVar(
+    "osia_scheduled_execution_context",
+    default=None,
+)
+
+
+def _scheduled_execution_prompt(context: dict) -> str:
+    """Build provider-only context for one already-scheduled occurrence."""
+
+    provenance = {
+        key: context.get(key)
+        for key in (
+            "source",
+            "task_id",
+            "occurrence_id",
+            "execution_id",
+            "conversation_id",
+            "recurrence",
+            "original_request_id",
+        )
+        if context.get(key) not in (None, "")
+    }
+    return (
+        "[OSIA SCHEDULED EXECUTION CONTEXT]\n"
+        "The following message is the payload of an existing scheduled task "
+        "occurrence, not a new user request to create or manage a schedule. "
+        "Execute the payload now and return its result. Do not call "
+        "create_scheduled_task, list_scheduled_tasks, update_scheduled_task, "
+        "or delete_scheduled_task during this occurrence.\n"
+        f"Provenance: {json.dumps(provenance, ensure_ascii=True, sort_keys=True)}"
+    )
 
 # ---------------------------------------------------------------------------
 # Language detection (Phase 1)
@@ -5145,6 +5176,38 @@ class OSIAAgent:
                 current_conversation_id=current_conversation_id,
             )
 
+    def run_scheduled(
+        self,
+        user_input: str,
+        execution_context: dict,
+        **run_kwargs,
+    ) -> str:
+        """Run one existing scheduled occurrence with scoped provenance.
+
+        Normal user turns continue to use :meth:`run`.  The context is visible
+        to the provider only for this call, is excluded from exported history,
+        and lets the tool loop restrict recursive scheduler mutations without
+        changing normal chat tool availability.
+        """
+
+        context = dict(execution_context or {})
+        if context.get("source") != "scheduled_task":
+            raise ValueError("scheduled execution source must be scheduled_task")
+        if not context.get("task_id") or not context.get("occurrence_id"):
+            raise ValueError("scheduled execution correlation is incomplete")
+        token = _SCHEDULED_EXECUTION_CONTEXT.set(context)
+        try:
+            return self.run(user_input, **run_kwargs)
+        finally:
+            self.messages = [
+                message for message in self.messages
+                if not (
+                    isinstance(message, dict)
+                    and message.get("_scheduled_execution")
+                )
+            ]
+            _SCHEDULED_EXECUTION_CONTEXT.reset(token)
+
     def _run_turn(self, user_input: str, max_tool_rounds: int | None = None, on_sentence=None,
                   history: list | None = None, max_tokens: int | None = None,
                   on_first_token=None, current_conversation_id: str | None = None) -> str:
@@ -5185,6 +5248,7 @@ class OSIAAgent:
         progress, or exceeds the per-turn time budget. In those cases it
         stops gracefully and returns a summary of what was done.
         """
+        scheduled_execution = _SCHEDULED_EXECUTION_CONTEXT.get()
         self._chatgpt_conversation_id = current_conversation_id
         if history is not None:
             # Defensively strip anything that looks like a system prompt
@@ -5202,6 +5266,14 @@ class OSIAAgent:
                 m for m in self.messages
                 if not (isinstance(m, dict) and m.get("_memory_context"))
             ]
+
+        if scheduled_execution is not None:
+            self.messages.append({
+                "role": "user",
+                "_internal": True,
+                "_scheduled_execution": True,
+                "content": _scheduled_execution_prompt(scheduled_execution),
+            })
 
         from osia import memory_runtime as _memory_runtime
         from osia import scheduled_tasks as _scheduled_tasks
@@ -5277,8 +5349,21 @@ class OSIAAgent:
         # the except block only takes the streaming fallback when nothing was
         # emitted yet (pre-token failures: 429/401/403/connection-open).
         _stream_emitted = {"v": False}
+        schedule_guard_state = {
+            "ignored_unrelated_tool": False,
+            "failure_retry_used": False,
+            "buffered_sentences": [],
+        }
         if on_sentence is not None:
-            def _on_sentence_cb(_text, _orig=on_sentence, _flag=_stream_emitted):
+            def _on_sentence_cb(
+                _text,
+                _orig=on_sentence,
+                _flag=_stream_emitted,
+                _schedule_state=schedule_guard_state,
+            ):
+                if _schedule_state["ignored_unrelated_tool"]:
+                    _schedule_state["buffered_sentences"].append(_text)
+                    return None
                 _flag["v"] = True
                 return _orig(_text)
         else:
@@ -5327,6 +5412,7 @@ class OSIAAgent:
         retry_after_attempted = set()
 
         while True:
+            schedule_guard_state["buffered_sentences"] = []
             try:
                 if on_sentence is not None:
                     # on_first_token only fires the first time a delta arrives
@@ -5573,6 +5659,22 @@ class OSIAAgent:
                             )
                         break
 
+                    if (
+                        tool_name in _SCHEDULED_TASK_TOOL_NAMES
+                        and scheduled_execution is None
+                        and not _scheduled_tasks.allows_scheduled_task_tool(
+                            user_input,
+                            tool_name,
+                        )
+                    ):
+                        schedule_guard_state["ignored_unrelated_tool"] = True
+                        print(
+                            "[SCHEDULED_TASKS] ignored model-selected scheduler "
+                            "tool without explicit user scheduling intent "
+                            f"(tool={tool_name})"
+                        )
+                        continue
+
                     kwargs = {k: v for k, v in tc.items() if k != "tool"}
                     kwargs_preview = {
                         k: (v[:80] + "..." if isinstance(v, str) and len(v) > 80 else v)
@@ -5596,16 +5698,32 @@ class OSIAAgent:
                             elif save_result.get("ok") is False:
                                 is_error = True
                     elif tool_name in _SCHEDULED_TASK_TOOL_NAMES:
-                        token = _CURRENT_CONVERSATION_ID.set(current_conversation_id)
-                        model_token = _CURRENT_MODEL_METADATA.set({
-                            "provider": self.provider,
-                            "id": self.model,
-                        })
-                        try:
-                            result, is_error = _execute_tool_with_retry(tool_name, kwargs)
-                        finally:
-                            _CURRENT_CONVERSATION_ID.reset(token)
-                            _CURRENT_MODEL_METADATA.reset(model_token)
+                        if scheduled_execution is not None:
+                            result = json.dumps({
+                                "ok": False,
+                                "code": "scheduled_execution_restricted",
+                                "message": (
+                                    "Scheduled-task tools are unavailable while "
+                                    "executing an existing scheduled occurrence."
+                                ),
+                            }, sort_keys=True)
+                            is_error = True
+                        else:
+                            token = _CURRENT_CONVERSATION_ID.set(
+                                current_conversation_id
+                            )
+                            model_token = _CURRENT_MODEL_METADATA.set({
+                                "provider": self.provider,
+                                "id": self.model,
+                            })
+                            try:
+                                result, is_error = _execute_tool_with_retry(
+                                    tool_name,
+                                    kwargs,
+                                )
+                            finally:
+                                _CURRENT_CONVERSATION_ID.reset(token)
+                                _CURRENT_MODEL_METADATA.reset(model_token)
                         scheduled_task_tool_seen = True
                         scheduled_result = (
                             _scheduled_tasks.parse_scheduled_task_tool_result(result)
@@ -5706,6 +5824,15 @@ class OSIAAgent:
                         "more information to finish the task, call another tool "
                         "instead — otherwise answer in plain text, with no "
                         "<tool_call> tags.)"
+                    )
+                if schedule_guard_state["ignored_unrelated_tool"]:
+                    synthesis_instruction = (
+                        "A model-selected scheduled-task tool call was ignored "
+                        "because the current user turn contains no explicit "
+                        "scheduling intent. Do not mention scheduling or a "
+                        "scheduling failure. Continue the immediate request and "
+                        "write one complete final answer from the valid tool "
+                        "results."
                     )
                 feedback_text = (
                     f"<tool_result>\n{feedback}\n</tool_result>\n"
@@ -5856,7 +5983,43 @@ class OSIAAgent:
                     continue
 
             if (
-                not scheduled_task_tool_succeeded
+                schedule_guard_state["ignored_unrelated_tool"]
+                and _scheduled_tasks.is_schedule_failure_response(content)
+            ):
+                print(
+                    "[WARN] Suppressing an unrelated scheduling failure from "
+                    "a non-scheduling turn."
+                )
+                if not schedule_guard_state["failure_retry_used"]:
+                    schedule_guard_state["failure_retry_used"] = True
+                    self.messages.append({
+                        "role": "assistant",
+                        "_internal": True,
+                        "content": content,
+                    })
+                    self.messages.append({
+                        "role": "user",
+                        "_internal": True,
+                        "content": (
+                            "The current user turn did not request scheduling. "
+                            "Your previous reply was therefore unrelated. Do "
+                            "not mention scheduling. Return one complete answer "
+                            "for the immediate request using only valid tool "
+                            "results from this turn."
+                        ),
+                    })
+                    continue
+                content = self._empty_response_fallback(guard)
+                schedule_guard_state["buffered_sentences"] = []
+                if on_sentence is not None:
+                    try:
+                        on_sentence(clean_response(content))
+                    except Exception:
+                        pass
+
+            if (
+                scheduled_execution is None
+                and not scheduled_task_tool_succeeded
                 and _scheduled_tasks.claims_scheduled_task_saved(content)
             ):
                 print(
@@ -5887,7 +6050,8 @@ class OSIAAgent:
                 content = _scheduled_tasks.not_scheduled_response(self.lang)
 
             if (
-                not scheduled_task_tool_seen
+                scheduled_execution is None
+                and not scheduled_task_tool_seen
                 and not any_tool_executed
                 and _scheduled_tasks.looks_like_schedule_request(user_input)
             ):
@@ -5984,6 +6148,15 @@ class OSIAAgent:
                     except Exception:
                         pass
 
+            if (
+                on_sentence is not None
+                and schedule_guard_state["ignored_unrelated_tool"]
+            ):
+                for sentence in schedule_guard_state["buffered_sentences"]:
+                    try:
+                        on_sentence(sentence)
+                    except Exception:
+                        pass
             self.messages.append({"role": "assistant", "content": content})
             return content
 

@@ -1215,6 +1215,7 @@ def wake_mode():
         task_text: str,
         conversation_id: str | None = None,
         model: dict | None = None,
+        scheduled_execution: dict | None = None,
     ) -> dict:
         if not handler_lock.acquire(timeout=120):
             print(f"[CRON] busy — scheduled task skipped: {task_text[:60]}")
@@ -1251,16 +1252,30 @@ def wake_mode():
                 history = conv.get("messages") or []
                 print(f"[CRON] conversation {conversation_id}: loaded "
                       f"{len(history)} messages for context")
-                reply = cron_agent.run(
-                    task_text,
-                    history=history,
-                    current_conversation_id=conversation_id,
-                )
+                if scheduled_execution is not None:
+                    reply = cron_agent.run_scheduled(
+                        task_text,
+                        scheduled_execution,
+                        history=history,
+                        current_conversation_id=conversation_id,
+                    )
+                else:
+                    reply = cron_agent.run(
+                        task_text,
+                        history=history,
+                        current_conversation_id=conversation_id,
+                    )
                 _persist_exchange(conversation_id, task_text,
                                   clean_response(reply or ""))
             else:
                 cron_agent.reset()  # each scheduled run is a fresh, one-shot turn
-                reply = cron_agent.run(task_text)
+                if scheduled_execution is not None:
+                    reply = cron_agent.run_scheduled(
+                        task_text,
+                        scheduled_execution,
+                    )
+                else:
+                    reply = cron_agent.run(task_text)
             display = clean_response(reply or "")
             if display:
                 if conv is not None and conversation_id:

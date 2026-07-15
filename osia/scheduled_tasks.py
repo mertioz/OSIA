@@ -49,6 +49,50 @@ _SYSTEM_PROMPT_RE = re.compile(
     r"(?:regles|r\u00e8gles) absolues|absolute rules)\b"
 )
 
+_SCHEDULE_OBJECT_RE = re.compile(
+    r"\b(?:scheduled tasks?|schedules?|reminders?|cron jobs?|crons?|"
+    r"taches? planifiees?|taches? programmees?|rappels?)\b"
+)
+_SCHEDULE_CREATE_RE = re.compile(
+    r"\b(?:remind me|set (?:me )?(?:a )?reminder|"
+    r"create (?:a )?(?:scheduled task|reminder)|"
+    r"rappelle(?:-moi| moi)|planifie(?:-moi)?|programme-moi)\b|"
+    r"(?:^|\b(?:please|to|me|you)\s+)schedule\b"
+)
+_EXPLICIT_TEMPORAL_RE = re.compile(
+    r"\b(?:every|each)\s+(?:(?:\d+|one|two|three)\s+)?"
+    r"(?:minutes?|hours?|days?|weeks?|months?)\b|"
+    r"\b(?:daily|hourly|weekly|monthly)\b|"
+    r"\b(?:tomorrow|tonight)\s+(?:at\s+)?\d{1,2}(?::\d{2})?\b|"
+    r"\bin\s+\d+\s+(?:minutes?|hours?|days?|weeks?)\b|"
+    r"\b(?:tous les|toutes les|chaque)\s+"
+    r"(?:(?:\d+|un|une|deux|trois)\s+)?"
+    r"(?:minutes?|heures?|jours?|semaines?|mois)\b|"
+    r"\bquotidiennement\b|"
+    r"\b(?:demain|ce soir)\s+(?:a\s+)?\d{1,2}(?:h\d{0,2}|:\d{2})?\b|"
+    r"\bdans\s+\d+\s+(?:minutes?|heures?|jours?|semaines?)\b"
+)
+_SCHEDULE_LIST_RE = re.compile(
+    r"\b(?:list|show|display|what|which|liste|affiche|montre|quels?|quelles?)\b"
+)
+_SCHEDULE_UPDATE_RE = re.compile(
+    r"\b(?:update|change|edit|modify|reschedule|move|postpone|"
+    r"mets? a jour|change|modifie|replanifie|decale|reporte)\b"
+)
+_SCHEDULE_DELETE_RE = re.compile(
+    r"\b(?:delete|remove|cancel|stop|supprime|annule|arrete)\b"
+)
+_SCHEDULE_FAILURE_WORDS = (
+    "not scheduled",
+    "could not schedule",
+    "couldn't schedule",
+    "was not scheduled",
+    "wasn't scheduled",
+    "pas planifie",
+    "pas programme",
+    "n'ai pas pu planifier",
+)
+
 
 class ScheduledTaskError(Exception):
     """Structured error surfaced as ``ok:false`` to the agent."""
@@ -1027,20 +1071,8 @@ def parse_scheduled_task_tool_result(result: Any) -> dict[str, Any] | None:
 
 
 def claims_scheduled_task_saved(text: str) -> bool:
-    folded = str(text or "").casefold()
-    negative_words = (
-        "not scheduled",
-        "could not schedule",
-        "couldn't schedule",
-        "was not scheduled",
-        "wasn't scheduled",
-        "pas planifie",
-        "pas planifi\u00e9",
-        "pas programm\u00e9",
-        "pas programme",
-        "n'ai pas pu planifier",
-    )
-    if any(word in folded for word in negative_words):
+    folded = _fold_text(text)
+    if any(word in folded for word in _SCHEDULE_FAILURE_WORDS):
         return False
     success_words = (
         "scheduled",
@@ -1058,25 +1090,52 @@ def claims_scheduled_task_saved(text: str) -> bool:
     return any(word in folded for word in success_words)
 
 
+def is_schedule_failure_response(text: str) -> bool:
+    """Return whether text reports a scheduling failure."""
+
+    folded = _fold_text(text)
+    return any(word in folded for word in _SCHEDULE_FAILURE_WORDS)
+
+
+def allows_scheduled_task_tool(text: str, tool_name: str) -> bool:
+    """Authorize a scheduler tool only for explicit scheduler intent.
+
+    Immediate sequencing words such as ``then``, ``after that`` and ``puis``
+    carry no scheduling meaning by themselves.  Creation is authorized by an
+    explicit reminder/scheduling command or a concrete future/recurring time;
+    management tools additionally require both the matching operation and a
+    scheduled-task/reminder noun.
+    """
+
+    folded = _fold_text(text)
+    if not folded:
+        return False
+    if tool_name == "create_scheduled_task":
+        return bool(
+            _SCHEDULE_CREATE_RE.search(folded)
+            or _EXPLICIT_TEMPORAL_RE.search(folded)
+        )
+    if not _SCHEDULE_OBJECT_RE.search(folded):
+        return False
+    if tool_name == "list_scheduled_tasks":
+        return bool(_SCHEDULE_LIST_RE.search(folded))
+    if tool_name == "update_scheduled_task":
+        return bool(_SCHEDULE_UPDATE_RE.search(folded))
+    if tool_name == "delete_scheduled_task":
+        return bool(_SCHEDULE_DELETE_RE.search(folded))
+    return False
+
+
 def looks_like_schedule_request(text: str) -> bool:
-    folded = str(text or "").casefold()
-    hints = (
-        "every day",
-        "every ",
-        "daily",
-        "schedule",
-        "scheduled task",
-        "remind me",
-        "rappelle-moi",
-        "rappelle moi",
-        "tous les jours",
-        "toutes les",
-        "chaque jour",
-        "planifie",
-        "planifie-moi",
-        "programme",
+    return any(
+        allows_scheduled_task_tool(text, tool_name)
+        for tool_name in (
+            "create_scheduled_task",
+            "list_scheduled_tasks",
+            "update_scheduled_task",
+            "delete_scheduled_task",
+        )
     )
-    return any(hint in folded for hint in hints)
 
 
 def not_scheduled_response(lang: str = "en") -> str:
