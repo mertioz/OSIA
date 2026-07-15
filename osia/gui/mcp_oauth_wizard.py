@@ -2,14 +2,14 @@
 """Guided Google OAuth setup wizard for BYO Google clients.
 
 Google Drive MCP and native Gmail REST both use a PRE-REGISTERED OAuth client
-(model B, per user): the user must create their own Google "Desktop app" OAuth
-client and paste its ``client_id`` + ``client_secret`` into the connector card
+(model B, per user): the user creates a Google OAuth client and pastes its
+``client_id`` + ``client_secret`` into the connector card
 (see ``main_popup._build_mcp_card``). That Google Cloud setup is ~15-30 min and
 has two mode-specific gotchas: Drive MCP still needs Google's MCP-specific
 ``drivemcp`` API, while native Gmail REST needs the classic Gmail API
-(``gmail.googleapis.com``). Both modes need a "Desktop app" client (loopback
-redirect), not a "Web" client. This dialog walks the user through it in 5
-numbered steps with a direct "Open this page" link per step.
+(``gmail.googleapis.com``). Drive uses a Desktop client; Gmail uses a Web client
+with both the PC loopback and stable Mobile rendezvous redirects registered.
+This dialog walks the user through it in 5 numbered steps.
 
 Design (audited)
 ----------------
@@ -24,8 +24,9 @@ Design (audited)
   ``FramelessWindowHint | Dialog | WindowStaysOnTopHint`` (so the modal surfaces
   above the always-on-top popup on X11/Wayland), ``WA_TranslucentBackground``,
   ``setModal(True)`` and a ``showEvent`` that centres on the parent window.
-* Imports ONLY PyQt6 + ``osia.i18n`` (+ stdlib ``webbrowser``) — no circular import
-  (``i18n`` pulls in no GUI module), same as ``mcp_confirm``.
+* Imports PyQt6 + ``osia.i18n`` (+ stdlib ``webbrowser``), and lazily imports
+  ``google_oauth`` only to display the stable Mobile redirect. No GUI module is
+  pulled back in, so the dependency remains acyclic.
 
 URLs live HERE (code), never in i18n — links are not translated and must not be
 mistranslated. Only the step-2 enable link, the step-2 API name, the step-3
@@ -93,7 +94,7 @@ _LINK_CLIENTS = "https://console.cloud.google.com/auth/clients"
 
 
 class _MCPOAuthWizardDialog(QDialog):
-    """5-step guide for creating a Google "Desktop app" OAuth client.
+    """5-step guide for creating the connector's Google OAuth client.
 
     Constructed with ``(parent, entry, mode=None)`` where ``entry`` is the
     connector catalog dict and ``mode`` can force a specific guide such as
@@ -147,6 +148,10 @@ class _MCPOAuthWizardDialog(QDialog):
             "mcp.wizard.gmail_rest.step4_body"
             if gmail_rest else "mcp.wizard.step4_body"
         )
+        step4_title_key = (
+            "mcp.wizard.gmail_rest.step4_title"
+            if gmail_rest else "mcp.wizard.step4_title"
+        )
         step5_title_key = (
             "mcp.wizard.gmail_rest.step5_title"
             if gmail_rest else "mcp.wizard.step5_title"
@@ -178,6 +183,14 @@ class _MCPOAuthWizardDialog(QDialog):
 
         # ── Step pages ───────────────────────────────────────────────────────
         # (title_key, body_text, optional url). Step 5 has no link (back to OSIA).
+        mobile_callback = ""
+        if gmail_rest:
+            try:
+                from osia.integrations.google_oauth import mobile_redirect_uri
+
+                mobile_callback = mobile_redirect_uri()
+            except Exception:
+                pass
         steps = [
             (
                 "mcp.wizard.step1_title",
@@ -195,8 +208,11 @@ class _MCPOAuthWizardDialog(QDialog):
                 _LINK_CONSENT,
             ),
             (
-                "mcp.wizard.step4_title",
-                i18n.t(step4_body_key),
+                step4_title_key,
+                i18n.t(
+                    step4_body_key,
+                    callback=mobile_callback or "Pair OSIA Mobile first",
+                ),
                 _LINK_CLIENTS,
             ),
             (

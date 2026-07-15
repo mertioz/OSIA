@@ -223,6 +223,21 @@ def gmail_modify_capability_status(*, validate: bool = False) -> dict:
     return gmail_connection_status(validate=validate)
 
 
+def gmail_reconnect_scopes() -> tuple[str, ...]:
+    """Return the least scope set that preserves current Gmail capabilities."""
+    try:
+        blob = get_oauth_token(GMAIL_REST_KEY)
+    except Exception:
+        blob = {}
+    token = blob.get("token") if isinstance(blob, dict) else None
+    token = token if isinstance(token, dict) else {}
+    if _token_has_modify_scope(token):
+        return GMAIL_MODIFY_SCOPES
+    if _token_has_compose_scope(token):
+        return GMAIL_COMPOSE_SCOPES
+    return (GMAIL_READONLY_SCOPE,)
+
+
 def gmail_profile(*, interactive: bool = False) -> dict | str:
     """Return the Gmail profile for the connected account."""
     def run() -> dict:

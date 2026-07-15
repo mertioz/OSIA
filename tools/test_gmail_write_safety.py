@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused WOR-101 Gmail write-safety and OAuth-flow smokes."""
+"""Focused WOR-101/102 Gmail write-safety and OAuth-flow smokes."""
 
 from __future__ import annotations
 
@@ -238,8 +238,91 @@ class GmailWriteSafetyTests(unittest.TestCase):
         self.assertIsInstance(result, str)
         self.assertTrue(result.startswith("ERROR:"))
 
+    def test_server_provider_without_live_target_defers_to_unattended_policy(self):
+        from osia.server import server as server_mod
+
+        token = server_mod._turn_target.set(None)
+        try:
+            self.assertIsNone(
+                server_mod._ws_confirm_provider(
+                    "gmail", "gmail_create_draft", "safe summary"
+                )
+            )
+        finally:
+            server_mod._turn_target.reset(token)
+
+    def test_native_gmail_chat_tools_remain_in_pc_tool_map(self):
+        from osia import agent
+
+        for name in (
+            "gmail_list_latest",
+            "gmail_search",
+            "gmail_read_message",
+            "gmail_read_thread",
+            "gmail_create_draft",
+            "gmail_send_draft",
+            "gmail_mark_read",
+            "gmail_mark_unread",
+            "gmail_apply_label",
+            "gmail_remove_label",
+        ):
+            self.assertIn(name, agent.TOOL_MAP)
+
 
 class MobileGmailSnapshotTests(unittest.TestCase):
+    def test_missing_mobile_oauth_configuration_is_safe_and_precise(self):
+        from osia.server import server as server_mod
+
+        disconnected = {
+            "connected": False,
+            "status": "disconnected",
+            "emailAddress": None,
+            "capabilities": {},
+            "access_token": "must-not-leak",
+            "refresh_token": "must-not-leak-either",
+            "client_secret": "also-must-not-leak",
+        }
+        with patched(
+            gmail, "gmail_connection_status", lambda validate=False: disconnected
+        ), patched(
+            google_oauth, "mobile_redirect_uri", lambda: ""
+        ), patched(
+            google_oauth, "oauth_client_configured", lambda _key: False
+        ), patched(
+            google_oauth,
+            "oauth_client_supports_redirect",
+            lambda _key, _uri: False,
+        ), patched(
+            google_oauth,
+            "remote_authorization_status",
+            lambda _key: {
+                "connecting": False,
+                "status": "authorization_required",
+                "error_category": "",
+                "message": "",
+            },
+        ):
+            snapshot = server_mod._gmail_rest_config_snapshot()
+
+        self.assertEqual(snapshot["status"], "configuration_missing")
+        self.assertEqual(snapshot["errorCategory"], "configuration_missing")
+        self.assertFalse(snapshot["oauthClientConfigured"])
+        self.assertFalse(snapshot["mobileOAuthConfigured"])
+        self.assertTrue(snapshot["configureOnPc"])
+        self.assertFalse(snapshot["canConnect"])
+        payload = json.dumps(snapshot, sort_keys=True)
+        for forbidden in (
+            "must-not-leak",
+            "must-not-leak-either",
+            "also-must-not-leak",
+            "access_token",
+            "refresh_token",
+            "client_secret",
+            "C:\\\\Users\\\\",
+            "/home/",
+        ):
+            self.assertNotIn(forbidden, payload)
+
     def test_snapshot_adds_safe_gmail_rest_and_sanitizes_legacy_mcp(self):
         from osia import personality
         from osia.server import server as server_mod
@@ -310,6 +393,25 @@ class MobileGmailSnapshotTests(unittest.TestCase):
         ), patched(config, "get_setting", fake_get_setting), patched(
             config, "get_mcp_token", lambda _sid: ""
         ), patched(gmail, "gmail_connection_status", fake_gmail_status), patched(
+            google_oauth,
+            "mobile_redirect_uri",
+            lambda: "https://callback.example/oauth/cb/" + ("a" * 64),
+        ), patched(
+            google_oauth, "oauth_client_configured", lambda _key: True
+        ), patched(
+            google_oauth,
+            "oauth_client_supports_redirect",
+            lambda _key, _uri: True,
+        ), patched(
+            google_oauth,
+            "remote_authorization_status",
+            lambda _key: {
+                "connecting": False,
+                "status": "authorization_required",
+                "error_category": "",
+                "message": "",
+            },
+        ), patched(
             personality, "load_personality", lambda: ""
         ), patched(
             personality, "list_skills", lambda: []
@@ -321,7 +423,10 @@ class MobileGmailSnapshotTests(unittest.TestCase):
         self.assertEqual(
             cfg["gmail_rest"],
             {
+                "type": "native_rest",
+                "id": "gmail-rest",
                 "connected": True,
+                "connecting": False,
                 "status": "connected",
                 "emailAddress": "me@example.com",
                 "capabilities": {
@@ -329,9 +434,19 @@ class MobileGmailSnapshotTests(unittest.TestCase):
                     "compose": True,
                     "modify": False,
                 },
+                "errorCategory": "",
+                "message": "",
                 "reason": "",
+                "oauthClientConfigured": True,
+                "mobileOAuthConfigured": True,
+                "userActionRequired": False,
+                "attemptId": None,
+                "attemptExpiresAt": None,
+                "canConnect": False,
+                "canCancel": False,
+                "canReconnect": True,
                 "canDisconnect": True,
-                "configureOnPc": True,
+                "configureOnPc": False,
                 "elevateOnPc": True,
                 "guideAvailable": True,
             },
@@ -405,7 +520,17 @@ class MobileGmailSnapshotTests(unittest.TestCase):
         )
         self.assertFalse(
             server_mod._is_native_gmail_rest_mobile_action(
+                "mcp_connect", "gmail"
+            )
+        )
+        self.assertTrue(
+            server_mod._is_native_gmail_rest_mobile_action(
                 "mcp_connect", "gmail-rest"
+            )
+        )
+        self.assertTrue(
+            server_mod._is_native_gmail_rest_mobile_action(
+                "mcp_oauth_cancel", "gmail-rest"
             )
         )
 
@@ -424,6 +549,8 @@ class MobileGmailSnapshotTests(unittest.TestCase):
             ],
         }
         with patched(gmail, "gmail_disconnect", fake_disconnect), patched(
+            google_oauth, "cancel_remote_authorization", lambda _key: False
+        ), patched(
             server_mod, "_build_config_snapshot", lambda: safe_cfg
         ), patched(
             server_mod, "_broadcast_config", fake_broadcast_config
@@ -439,6 +566,286 @@ class MobileGmailSnapshotTests(unittest.TestCase):
             broadcasts,
             [{"type": "config", "config": safe_cfg}],
         )
+
+
+class MobileGoogleOAuthAttemptTests(unittest.TestCase):
+    redirect_uri = "https://callback.example/oauth/cb/" + ("b" * 64)
+
+    def tearDown(self) -> None:
+        for key in list(google_oauth._REMOTE_FLOW_BY_INTEGRATION):
+            google_oauth.cancel_remote_authorization(key)
+        with google_oauth._REMOTE_FLOW_LOCK:
+            google_oauth._REMOTE_RESULTS.clear()
+
+    def _client(self):
+        return google_oauth.GoogleOAuthClient(
+            "client-id",
+            "client-secret",
+            redirect_uris=(google_oauth.OAUTH_REDIRECT_URI, self.redirect_uri),
+        )
+
+    def _active_state(self) -> str:
+        with google_oauth._REMOTE_FLOW_LOCK:
+            return next(iter(google_oauth._REMOTE_FLOWS))
+
+    def test_connect_is_bounded_and_idempotent(self):
+        with patched(google_oauth, "load_client_config", lambda _key: self._client()):
+            first = google_oauth.begin_remote_authorization(
+                gmail.GMAIL_REST_KEY,
+                [gmail.GMAIL_READONLY_SCOPE],
+                redirect_uri=self.redirect_uri,
+            )
+            second = google_oauth.begin_remote_authorization(
+                gmail.GMAIL_REST_KEY,
+                [gmail.GMAIL_READONLY_SCOPE],
+                redirect_uri=self.redirect_uri,
+            )
+
+        self.assertFalse(first["reused"])
+        self.assertTrue(second["reused"])
+        self.assertEqual(first["attempt_id"], second["attempt_id"])
+        self.assertEqual(first["auth_url"], second["auth_url"])
+        self.assertGreater(first["expires_at"], 0)
+        self.assertLessEqual(
+            first["expires_at"] - google_oauth.time.time(),
+            google_oauth.REMOTE_AUTHORIZATION_TIMEOUT_S,
+        )
+        with google_oauth._REMOTE_FLOW_LOCK:
+            self.assertEqual(len(google_oauth._REMOTE_FLOWS), 1)
+
+    def test_cancel_and_timeout_return_to_retryable_state(self):
+        with patched(google_oauth, "load_client_config", lambda _key: self._client()):
+            first = google_oauth.begin_remote_authorization(
+                gmail.GMAIL_REST_KEY,
+                [gmail.GMAIL_READONLY_SCOPE],
+                redirect_uri=self.redirect_uri,
+            )
+            self.assertTrue(
+                google_oauth.cancel_remote_authorization(
+                    gmail.GMAIL_REST_KEY,
+                    attempt_id=first["attempt_id"],
+                )
+            )
+            self.assertFalse(
+                google_oauth.remote_authorization_status(
+                    gmail.GMAIL_REST_KEY
+                )["connecting"]
+            )
+            second = google_oauth.begin_remote_authorization(
+                gmail.GMAIL_REST_KEY,
+                [gmail.GMAIL_READONLY_SCOPE],
+                redirect_uri=self.redirect_uri,
+            )
+            future = second["expires_at"] + 1.0
+            with patched(google_oauth.time, "time", lambda: future):
+                expired = google_oauth.remote_authorization_status(
+                    gmail.GMAIL_REST_KEY
+                )
+
+        self.assertFalse(expired["connecting"])
+        self.assertEqual(expired["status"], "authorization_timeout")
+        self.assertEqual(expired["error_category"], "authorization_timeout")
+
+    def test_successful_callback_stores_once_and_preserves_refresh_fields(self):
+        stored: list[dict] = []
+        exchanges: list[tuple[str, str]] = []
+
+        def fake_exchange(_client, _code, _verifier, *, redirect_uri):
+            exchanges.append((_code, redirect_uri))
+            return {"access_token": "new-access", "expires_in": 3600}
+
+        def fake_store(_key, token, _client):
+            stored.append(dict(token))
+            return {"token": dict(token)}
+
+        old_blob = {
+            "token": {
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "scope": gmail.GMAIL_READONLY_SCOPE,
+            }
+        }
+        with patched(google_oauth, "load_client_config", lambda _key: self._client()), patched(
+            google_oauth, "_exchange_authorization_code", fake_exchange
+        ), patched(
+            google_oauth, "get_oauth_token", lambda _key: old_blob
+        ), patched(
+            google_oauth, "_store_token", fake_store
+        ):
+            google_oauth.begin_remote_authorization(
+                gmail.GMAIL_REST_KEY,
+                [gmail.GMAIL_READONLY_SCOPE],
+                redirect_uri=self.redirect_uri,
+            )
+            state = self._active_state()
+            result = google_oauth.complete_remote_authorization(
+                state, "authorization-code", None
+            )
+            replay = google_oauth.complete_remote_authorization(
+                state, "authorization-code", None
+            )
+
+        self.assertTrue(result["matched"])
+        self.assertTrue(result["success"])
+        self.assertFalse(replay["matched"])
+        self.assertEqual(exchanges, [("authorization-code", self.redirect_uri)])
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["access_token"], "new-access")
+        self.assertEqual(stored[0]["refresh_token"], "old-refresh")
+        self.assertEqual(stored[0]["scope"], gmail.GMAIL_READONLY_SCOPE)
+
+    def test_failed_callback_preserves_old_token_and_classifies_safely(self):
+        store_calls: list[bool] = []
+
+        def fail_exchange(*_args, **_kwargs):
+            raise google_oauth.GoogleOAuthError(
+                "HTTP 401 invalid_grant raw-provider-body private-value"
+            )
+
+        with patched(google_oauth, "load_client_config", lambda _key: self._client()), patched(
+            google_oauth, "_exchange_authorization_code", fail_exchange
+        ), patched(
+            google_oauth, "_store_token", lambda *_args: store_calls.append(True)
+        ):
+            google_oauth.begin_remote_authorization(
+                gmail.GMAIL_REST_KEY,
+                [gmail.GMAIL_READONLY_SCOPE],
+                redirect_uri=self.redirect_uri,
+            )
+            result = google_oauth.complete_remote_authorization(
+                self._active_state(), "bad-code", None
+            )
+
+        self.assertTrue(result["matched"])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_category"], "authentication_failed")
+        self.assertEqual(store_calls, [])
+        serialized = json.dumps(result, sort_keys=True)
+        self.assertNotIn("private-value", serialized)
+        self.assertNotIn("invalid_grant", serialized)
+        self.assertNotIn("bad-code", serialized)
+
+    def test_cancel_during_exchange_prevents_late_callback_token_install(self):
+        exchange_started = threading.Event()
+        release_exchange = threading.Event()
+        store_calls: list[bool] = []
+
+        def delayed_exchange(*_args, **_kwargs):
+            exchange_started.set()
+            self.assertTrue(release_exchange.wait(timeout=2.0))
+            return {"access_token": "late-access", "expires_in": 3600}
+
+        with patched(google_oauth, "load_client_config", lambda _key: self._client()), patched(
+            google_oauth, "_exchange_authorization_code", delayed_exchange
+        ), patched(
+            google_oauth, "_store_token", lambda *_args: store_calls.append(True)
+        ):
+            attempt = google_oauth.begin_remote_authorization(
+                gmail.GMAIL_REST_KEY,
+                [gmail.GMAIL_READONLY_SCOPE],
+                redirect_uri=self.redirect_uri,
+            )
+            state = self._active_state()
+            result_holder: list[dict] = []
+            worker = threading.Thread(
+                target=lambda: result_holder.append(
+                    google_oauth.complete_remote_authorization(
+                        state, "late-code", None
+                    )
+                )
+            )
+            worker.start()
+            self.assertTrue(exchange_started.wait(timeout=2.0))
+            self.assertTrue(
+                google_oauth.cancel_remote_authorization(
+                    gmail.GMAIL_REST_KEY,
+                    attempt_id=attempt["attempt_id"],
+                )
+            )
+            release_exchange.set()
+            worker.join(timeout=2.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(store_calls, [])
+        self.assertEqual(result_holder[0]["error_category"], "authorization_cancelled")
+
+    def test_oauth_url_frame_contains_no_credentials_or_private_path(self):
+        from osia.server import server as server_mod
+
+        result = {
+            "auth_url": (
+                "https://accounts.google.com/o/oauth2/v2/auth?"
+                "client_id=public-id&state=opaque&code_challenge=challenge"
+            ),
+            "attempt_id": "attempt-safe",
+            "expires_at": 12345.0,
+        }
+        frame = server_mod._gmail_rest_oauth_url_frame(result, "request-safe")
+        self.assertEqual(frame["id"], "gmail-rest")
+        self.assertEqual(frame["attempt_id"], "attempt-safe")
+        payload = json.dumps(frame, sort_keys=True)
+        for forbidden in (
+            "access_token",
+            "refresh_token",
+            "client_secret",
+            "authorization_code",
+            "oauth_tokens.json",
+            "C:\\\\Users\\\\",
+            "/home/",
+        ):
+            self.assertNotIn(forbidden, payload)
+
+    def test_second_live_mobile_cannot_take_over_pending_attempt(self):
+        from osia.server import server as server_mod
+
+        owner_one = object()
+        owner_two = object()
+
+        async def no_broadcast():
+            return None
+
+        async def scenario():
+            server_mod._WS_CLIENTS.update({owner_one, owner_two})
+            try:
+                first = await server_mod._begin_native_gmail_rest_mobile_connect(
+                    owner=owner_one
+                )
+                second = await server_mod._begin_native_gmail_rest_mobile_connect(
+                    owner=owner_two
+                )
+                return first, second
+            finally:
+                server_mod._WS_CLIENTS.discard(owner_one)
+                server_mod._WS_CLIENTS.discard(owner_two)
+
+        with patched(google_oauth, "mobile_redirect_uri", lambda: self.redirect_uri), patched(
+            google_oauth,
+            "oauth_client_supports_redirect",
+            lambda _key, _uri: True,
+        ), patched(
+            google_oauth, "load_client_config", lambda _key: self._client()
+        ), patched(
+            gmail, "gmail_reconnect_scopes", lambda: (gmail.GMAIL_READONLY_SCOPE,)
+        ), patched(
+            server_mod, "_broadcast_gmail_rest_config", no_broadcast
+        ):
+            first, second = asyncio.run(scenario())
+
+        self.assertTrue(first["ok"])
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["error_category"], "authorization_pending")
+
+    def test_reconnect_scope_selection_preserves_capabilities(self):
+        modify_blob = {"token": {"scope": " ".join(gmail.GMAIL_MODIFY_SCOPES)}}
+        compose_blob = {"token": {"scope": " ".join(gmail.GMAIL_COMPOSE_SCOPES)}}
+        with patched(gmail, "get_oauth_token", lambda _key: modify_blob):
+            self.assertEqual(gmail.gmail_reconnect_scopes(), gmail.GMAIL_MODIFY_SCOPES)
+        with patched(gmail, "get_oauth_token", lambda _key: compose_blob):
+            self.assertEqual(gmail.gmail_reconnect_scopes(), gmail.GMAIL_COMPOSE_SCOPES)
+        with patched(gmail, "get_oauth_token", lambda _key: {}):
+            self.assertEqual(
+                gmail.gmail_reconnect_scopes(), (gmail.GMAIL_READONLY_SCOPE,)
+            )
 
 
 class GoogleOAuthFlowTests(unittest.TestCase):

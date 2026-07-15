@@ -628,6 +628,12 @@ _CRON_NOTIFICATIONS_LOCK = threading.Lock()
 # here until it completes prevents that; the done-callback prunes it.
 _OAUTH_DRIVE_TASKS: set = set()
 
+# Native Gmail REST mobile OAuth expiry broadcasters. The PKCE attempt itself
+# lives in ``osia.integrations.google_oauth``; these tasks only ensure a phone
+# receives a retryable timeout snapshot even when no further request arrives.
+_GMAIL_OAUTH_WATCHDOG_TASKS: dict[str, "asyncio.Task"] = {}
+_GMAIL_OAUTH_ATTEMPT_OWNERS: dict[str, object] = {}
+
 
 # WOR-62: in-flight turns DETACHED on client disconnect so they run to
 # completion and persist (instead of being cancelled, which dropped the reply
@@ -1578,12 +1584,15 @@ _MOBILE_MCP_SERVER_SECRET_KEYS = {
 
 def _gmail_rest_config_snapshot() -> dict:
     """Token-safe native Gmail REST status for the mobile config snapshot."""
+    from osia.integrations import google_oauth
+
     try:
-        from osia.tools.gmail import gmail_connection_status
+        from osia.tools.gmail import GMAIL_REST_KEY, gmail_connection_status
 
         raw = gmail_connection_status(validate=False)
         status = raw if isinstance(raw, dict) else {}
     except Exception:
+        GMAIL_REST_KEY = _NATIVE_GMAIL_REST_ID
         status = {
             "connected": False,
             "status": "failed",
@@ -1600,10 +1609,6 @@ def _gmail_rest_config_snapshot() -> dict:
     email = email.strip() if isinstance(email, str) else None
     if not email:
         email = None
-    reason = ""
-    if not connected:
-        error = status.get("error") or status.get("reason") or ""
-        reason = str(error).strip()[:500] if error else ""
     capabilities = {
         "readonly": bool(
             caps.get("readOnly")
@@ -1613,14 +1618,60 @@ def _gmail_rest_config_snapshot() -> dict:
         "compose": bool(caps.get("compose") or status.get("composeEnabled")),
         "modify": bool(caps.get("modify") or status.get("modifyEnabled")),
     }
+    redirect_uri = google_oauth.mobile_redirect_uri()
+    client_configured = google_oauth.oauth_client_configured(GMAIL_REST_KEY)
+    mobile_configured = bool(
+        redirect_uri
+        and google_oauth.oauth_client_supports_redirect(
+            GMAIL_REST_KEY, redirect_uri
+        )
+    )
+    attempt = google_oauth.remote_authorization_status(GMAIL_REST_KEY)
+    connecting = bool(attempt.get("connecting"))
+    error_category = str(attempt.get("error_category") or "").strip()
+    message = str(attempt.get("message") or "").strip()[:300]
+    if connecting:
+        state = "authorization_pending"
+        message = "Complete Google authorization in the browser."
+    elif connected:
+        state = "connected"
+        error_category = ""
+        message = ""
+    elif not mobile_configured:
+        state = "configuration_missing"
+        error_category = "configuration_missing"
+        message = (
+            "Configure Google OAuth on the PC for the Mobile callback, then retry."
+        )
+    elif error_category:
+        state = str(attempt.get("status") or error_category).strip()
+    else:
+        state = "authorization_required"
+        message = "Connect Gmail to authorize the PC-hosted OSIA instance."
+    attempt_id = str(attempt.get("attempt_id") or "").strip() if connecting else ""
+    expires_at = attempt.get("expires_at") if connecting else None
     return {
+        "type": "native_rest",
+        "id": _NATIVE_GMAIL_REST_ID,
         "connected": connected,
+        "connecting": connecting,
         "status": state,
         "emailAddress": email,
         "capabilities": capabilities,
-        "reason": reason,
-        "canDisconnect": connected,
-        "configureOnPc": True,
+        "errorCategory": error_category,
+        "message": message,
+        # ``reason`` is retained additively for older Mobile builds.
+        "reason": message,
+        "oauthClientConfigured": client_configured,
+        "mobileOAuthConfigured": mobile_configured,
+        "userActionRequired": bool(not connected and not connecting),
+        "attemptId": attempt_id or None,
+        "attemptExpiresAt": expires_at,
+        "canConnect": bool(mobile_configured and not connected and not connecting),
+        "canCancel": connecting,
+        "canReconnect": bool(mobile_configured and connected and not connecting),
+        "canDisconnect": bool(connected and not connecting),
+        "configureOnPc": not mobile_configured,
         "elevateOnPc": bool(
             connected and (not capabilities["compose"] or not capabilities["modify"])
         ),
@@ -1629,17 +1680,160 @@ def _gmail_rest_config_snapshot() -> dict:
 
 
 def _is_native_gmail_rest_mobile_action(msg_type: str, server_id: str) -> bool:
-    return msg_type == "mcp_disconnect" and server_id == _NATIVE_GMAIL_REST_ID
+    return (
+        msg_type in {"mcp_connect", "mcp_disconnect", "mcp_oauth_cancel"}
+        and server_id == _NATIVE_GMAIL_REST_ID
+    )
+
+
+async def _broadcast_gmail_rest_config() -> None:
+    cfg = _build_config_snapshot()
+    await _broadcast_config({"type": "config", "config": cfg})
+
+
+def _gmail_rest_oauth_url_frame(result: dict, request_id: str = "") -> dict:
+    """Build the presentation-only OAuth URL frame for the requesting phone."""
+    return {
+        "type": "mcp_oauth_url",
+        "id": _NATIVE_GMAIL_REST_ID,
+        "url": str(result.get("auth_url") or ""),
+        "attempt_id": str(result.get("attempt_id") or ""),
+        "expires_at": result.get("expires_at"),
+        **({"request_id": request_id} if request_id else {}),
+    }
+
+
+async def _gmail_rest_oauth_watchdog(attempt_id: str, expires_at: float) -> None:
+    finished = False
+    try:
+        from osia.integrations.google_oauth import remote_authorization_status
+
+        next_expiry = float(expires_at)
+        while True:
+            await asyncio.sleep(max(0.0, next_expiry - time.time()) + 0.1)
+            status = remote_authorization_status(_NATIVE_GMAIL_REST_ID)
+            if not status.get("connecting"):
+                finished = True
+                await _broadcast_gmail_rest_config()
+                return
+            next_expiry = float(status.get("expires_at") or (time.time() + 1.0))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    finally:
+        _GMAIL_OAUTH_WATCHDOG_TASKS.pop(attempt_id, None)
+        if finished:
+            _GMAIL_OAUTH_ATTEMPT_OWNERS.pop(attempt_id, None)
+
+
+async def _begin_native_gmail_rest_mobile_connect(owner=None) -> dict:
+    """Start/reuse the PC-owned Gmail flow and broadcast its safe snapshot."""
+    from osia.integrations import google_oauth
+    from osia.tools.gmail import GMAIL_REST_KEY, gmail_reconnect_scopes
+
+    redirect_uri = google_oauth.mobile_redirect_uri()
+    if not (
+        redirect_uri
+        and google_oauth.oauth_client_supports_redirect(
+            GMAIL_REST_KEY, redirect_uri
+        )
+    ):
+        await _broadcast_gmail_rest_config()
+        return {
+            "ok": False,
+            "error_category": "configuration_missing",
+            "message": "Configure Google OAuth on the PC for the Mobile callback.",
+        }
+    try:
+        result = google_oauth.begin_remote_authorization(
+            GMAIL_REST_KEY,
+            gmail_reconnect_scopes(),
+            redirect_uri=redirect_uri,
+            force_consent=True,
+        )
+    except Exception:
+        await _broadcast_gmail_rest_config()
+        return {
+            "ok": False,
+            "error_category": "authentication_failed",
+            "message": "Unable to start Google authorization. Try again.",
+        }
+    attempt_id = str(result.get("attempt_id") or "")
+    previous_owner = _GMAIL_OAUTH_ATTEMPT_OWNERS.get(attempt_id)
+    if (
+        previous_owner is not None
+        and previous_owner is not owner
+        and previous_owner in _WS_CLIENTS
+    ):
+        return {
+            "ok": False,
+            "error_category": "authorization_pending",
+            "message": "Google authorization is already pending on another device.",
+        }
+    if attempt_id:
+        _GMAIL_OAUTH_ATTEMPT_OWNERS[attempt_id] = owner
+    await _broadcast_gmail_rest_config()
+    expires_at = result.get("expires_at")
+    if (
+        attempt_id
+        and isinstance(expires_at, (int, float))
+        and attempt_id not in _GMAIL_OAUTH_WATCHDOG_TASKS
+    ):
+        task = asyncio.create_task(
+            _gmail_rest_oauth_watchdog(attempt_id, float(expires_at))
+        )
+        _GMAIL_OAUTH_WATCHDOG_TASKS[attempt_id] = task
+    return {"ok": True, **result}
+
+
+async def _cancel_native_gmail_rest_mobile_connect(
+    attempt_id: str = "", owner=None
+) -> bool:
+    from osia.integrations.google_oauth import cancel_remote_authorization
+
+    if not attempt_id and owner is not None:
+        attempt_id = next(
+            (
+                aid
+                for aid, registered_owner in _GMAIL_OAUTH_ATTEMPT_OWNERS.items()
+                if registered_owner is owner
+            ),
+            "",
+        )
+    registered_owner = _GMAIL_OAUTH_ATTEMPT_OWNERS.get(attempt_id)
+    if (
+        registered_owner is not None
+        and registered_owner is not owner
+        and registered_owner in _WS_CLIENTS
+    ):
+        return False
+    cancelled = cancel_remote_authorization(
+        _NATIVE_GMAIL_REST_ID,
+        attempt_id=attempt_id or None,
+    )
+    if attempt_id:
+        _GMAIL_OAUTH_ATTEMPT_OWNERS.pop(attempt_id, None)
+        task = _GMAIL_OAUTH_WATCHDOG_TASKS.pop(attempt_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+    await _broadcast_gmail_rest_config()
+    return cancelled
 
 
 def _disconnect_native_gmail_rest_and_broadcast(loop) -> None:
     """Disconnect native Gmail REST, then push the existing safe config frame."""
     try:
+        from osia.integrations.google_oauth import cancel_remote_authorization
         from osia.tools.gmail import gmail_disconnect
 
+        cancel_remote_authorization(_NATIVE_GMAIL_REST_ID)
         gmail_disconnect()
-    except Exception as e:
-        print(f"[OSIA Server] gmail-rest disconnect worker failed: {e}")
+    except Exception as exc:
+        print(
+            "[OSIA Server] gmail-rest disconnect worker failed: "
+            f"{type(exc).__name__}"
+        )
         return
     try:
         cfg = _build_config_snapshot()
@@ -2142,6 +2336,30 @@ async def oauth_callback(request: Request):
     # Well-formed-input gate before touching the registry.
     if not state or (not code and not error):
         return HTMLResponse(_OAUTH_CB_NOT_FOUND_HTML, status_code=404)
+
+    # Native Gmail REST reuses this established public callback but keeps its
+    # own PKCE registry/token exchange in google_oauth. Try it first; an unknown
+    # state has no side effect and falls through to the generic MCP registry.
+    try:
+        from osia.integrations import google_oauth
+
+        google_result = await asyncio.to_thread(
+            google_oauth.complete_remote_authorization,
+            state,
+            code or None,
+            error or None,
+        )
+    except Exception:
+        google_result = {"matched": False, "success": False}
+    if google_result.get("matched"):
+        _GMAIL_OAUTH_ATTEMPT_OWNERS.clear()
+        try:
+            await _broadcast_gmail_rest_config()
+        except Exception:
+            pass
+        if google_result.get("success"):
+            return HTMLResponse(google_oauth._CLOSE_TAB_HTML, status_code=200)
+        return HTMLResponse(_OAUTH_CB_NOT_FOUND_HTML, status_code=400)
 
     try:
         from osia.mcp_client.oauth import resolve_oauth_flow, _CLOSE_TAB_HTML
@@ -5380,10 +5598,33 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "mcp_oauth_cancel":
                 raw_id = msg.get("id")
                 server_id = raw_id.strip() if isinstance(raw_id, str) else ""
+                raw_request_id = msg.get("request_id")
+                request_id = (
+                    raw_request_id.strip()
+                    if isinstance(raw_request_id, str)
+                    else ""
+                )
                 if not server_id:
                     await out.send_json(
                         {"type": "status", "status": "error", "error": "missing id"}
                     )
+                    continue
+                if _is_native_gmail_rest_mobile_action(msg_type, server_id):
+                    raw_attempt_id = msg.get("attempt_id")
+                    attempt_id = (
+                        raw_attempt_id.strip()
+                        if isinstance(raw_attempt_id, str)
+                        else ""
+                    )
+                    await _cancel_native_gmail_rest_mobile_connect(
+                        attempt_id, owner=out
+                    )
+                    await out.send_json({
+                        "type": "status",
+                        "status": "done",
+                        "id": server_id,
+                        **({"request_id": request_id} if request_id else {}),
+                    })
                     continue
                 loop = asyncio.get_running_loop()
 
@@ -5427,6 +5668,12 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type in ("mcp_connect", "mcp_disconnect", "mcp_status"):
                 raw_id = msg.get("id")
                 server_id = raw_id.strip() if isinstance(raw_id, str) else ""
+                raw_request_id = msg.get("request_id")
+                request_id = (
+                    raw_request_id.strip()
+                    if isinstance(raw_request_id, str)
+                    else ""
+                )
 
                 if msg_type == "mcp_status":
                     # Pure, non-blocking read of the manager snapshot (never
@@ -5447,13 +5694,52 @@ async def websocket_endpoint(ws: WebSocket):
                     )
                     continue
                 if _is_native_gmail_rest_mobile_action(msg_type, server_id):
+                    if msg_type == "mcp_connect":
+                        result = await _begin_native_gmail_rest_mobile_connect(
+                            owner=out
+                        )
+                        if result.get("ok"):
+                            await out.send_json(
+                                _gmail_rest_oauth_url_frame(result, request_id)
+                            )
+                            await out.send_json({
+                                "type": "status",
+                                "status": "done",
+                                "id": server_id,
+                                **(
+                                    {"request_id": request_id}
+                                    if request_id
+                                    else {}
+                                ),
+                            })
+                        else:
+                            await out.send_json({
+                                "type": "status",
+                                "status": "error",
+                                "id": server_id,
+                                "error_category": result.get("error_category")
+                                or "authentication_failed",
+                                "error": result.get("message")
+                                or "Unable to start Google authorization.",
+                                **(
+                                    {"request_id": request_id}
+                                    if request_id
+                                    else {}
+                                ),
+                            })
+                        continue
                     threading.Thread(
                         target=_disconnect_native_gmail_rest_and_broadcast,
                         args=(asyncio.get_running_loop(),),
                         name="osia-gmail-rest-disconnect",
                         daemon=True,
                     ).start()
-                    await out.send_json({"type": "status", "status": "done"})
+                    await out.send_json({
+                        "type": "status",
+                        "status": "done",
+                        "id": server_id,
+                        **({"request_id": request_id} if request_id else {}),
+                    })
                     continue
                 saved = _mcp_find_saved_server(server_id)
                 if saved is None:

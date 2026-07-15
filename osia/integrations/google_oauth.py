@@ -44,7 +44,9 @@ GOOGLE_REVOCATION_ENDPOINT = "https://oauth2.googleapis.com/revoke"
 DEFAULT_TIMEOUT_S = 30.0
 CALLBACK_TIMEOUT_S = 300.0
 TOKEN_EXPIRY_MARGIN_S = 60.0
+REMOTE_AUTHORIZATION_TIMEOUT_S = 165.0
 _AUTH_FLOW_LOCK = threading.Lock()
+_REMOTE_FLOW_LOCK = threading.Lock()
 
 _CLIENT_FALLBACK_KEYS = {
     "gmail-rest": ("gmail",),
@@ -87,16 +89,40 @@ class GoogleOAuthClient:
     client_secret: str = ""
     token_endpoint_auth_method: str = "client_secret_post"
     source_key: str = ""
+    redirect_uris: tuple[str, ...] = (OAUTH_REDIRECT_URI,)
 
     def as_dict(self) -> dict:
         data = {
             "client_id": self.client_id,
-            "redirect_uris": [OAUTH_REDIRECT_URI],
+            "redirect_uris": list(self.redirect_uris or (OAUTH_REDIRECT_URI,)),
             "token_endpoint_auth_method": self.token_endpoint_auth_method,
         }
         if self.client_secret:
             data["client_secret"] = self.client_secret
         return data
+
+
+@dataclass
+class _RemoteOAuthAttempt:
+    integration_key: str
+    attempt_id: str
+    state: str
+    verifier: str
+    redirect_uri: str
+    auth_url: str
+    client: GoogleOAuthClient
+    expires_at: float
+    claimed: bool = False
+    cancelled: bool = False
+    lock_held: bool = True
+
+
+# Remote/mobile attempts are process-local because PKCE verifier + state must
+# stay in the same PC server process that receives the public callback. Only a
+# safe attempt id and expiry leave this module; state/verifier never do.
+_REMOTE_FLOWS: dict[str, _RemoteOAuthAttempt] = {}
+_REMOTE_FLOW_BY_INTEGRATION: dict[str, str] = {}
+_REMOTE_RESULTS: dict[str, dict] = {}
 
 
 class _LoopbackHTTPServer(ThreadingHTTPServer):
@@ -162,25 +188,315 @@ def load_client_config(integration_key: str) -> GoogleOAuthClient:
     if not key:
         raise GoogleOAuthError("OAuth integration key is empty.")
 
-    for source_key in (key, *(_CLIENT_FALLBACK_KEYS.get(key) or ())):
-        client = get_oauth_client(source_key)
-        loaded = _client_from_blob(client, source_key)
-        if loaded:
-            if source_key != key:
-                set_oauth_client(key, loaded.as_dict())
-            return loaded
-
-    loaded = _client_from_environment(key)
+    loaded = _find_client_config(key)
     if loaded:
-        set_oauth_client(key, loaded.as_dict())
+        if loaded.source_key != key:
+            set_oauth_client(key, loaded.as_dict())
         return loaded
 
     raise GoogleOAuthError(
-        f"OAuth client not configured for {key}. Add a Google Desktop OAuth "
-        "client to the local oauth_tokens.json store via the existing Google "
+        f"OAuth client not configured for {key}. Add a Google OAuth client "
+        "to the local oauth_tokens.json store via the existing Google "
         "setup path, or set OSIA_GMAIL_REST_CLIENT_ID and "
         "OSIA_GMAIL_REST_CLIENT_SECRET before connecting."
     )
+
+
+def oauth_client_configured(integration_key: str) -> bool:
+    """Return whether any local OAuth client exists, without persisting it."""
+    key = str(integration_key or "").strip()
+    return bool(key and _find_client_config(key))
+
+
+def oauth_client_supports_redirect(integration_key: str, redirect_uri: str) -> bool:
+    """Return whether the local client declares the exact trusted redirect."""
+    key = str(integration_key or "").strip()
+    uri = str(redirect_uri or "").strip()
+    client = _find_client_config(key) if key and uri else None
+    return bool(client and uri in client.redirect_uris)
+
+
+def mobile_redirect_uri() -> str:
+    """Build the existing stable per-pair rendezvous callback URI.
+
+    The raw pairing token never leaves ``osia.config``; only its established
+    one-way rendezvous key is used in the HTTPS path. An empty result means the
+    PC has not created pairing state yet, so Mobile OAuth cannot be configured.
+    """
+    try:
+        from osia.config import load_mobile_token, rendezvous_key
+        from osia.rendezvous import WORKER_URL
+
+        token = load_mobile_token()
+        if not token:
+            return ""
+        uri = WORKER_URL.rstrip("/") + "/oauth/cb/" + rendezvous_key(token)
+        split = urlsplit(uri)
+        worker = urlsplit(WORKER_URL)
+        suffix = split.path.removeprefix("/oauth/cb/")
+        if (
+            split.scheme != "https"
+            or split.netloc != worker.netloc
+            or not split.path.startswith("/oauth/cb/")
+            or split.query
+            or split.fragment
+            or len(suffix) != 64
+            or any(ch not in "0123456789abcdef" for ch in suffix)
+        ):
+            return ""
+        return uri
+    except Exception:
+        return ""
+
+
+def begin_remote_authorization(
+    integration_key: str,
+    scopes: Iterable[str] | str,
+    *,
+    redirect_uri: str,
+    force_consent: bool = True,
+) -> dict:
+    """Create or reuse one bounded browser flow without opening a PC browser.
+
+    The caller supplies a server-derived redirect URI; it is accepted only when
+    it exactly matches one of the locally recorded client redirect URIs. The
+    returned dict contains presentation data only (authorization URL, opaque
+    attempt id, expiry). PKCE verifier/state and client secret remain here.
+    """
+    key = str(integration_key or "").strip()
+    uri = str(redirect_uri or "").strip()
+    scope_text = _scope_string(scopes)
+    if not key or not scope_text:
+        raise GoogleOAuthError("OAuth integration key or scope list is empty.")
+    client = load_client_config(key)
+    if not uri or uri not in client.redirect_uris:
+        raise GoogleOAuthError(
+            "OAuth client is not configured for the trusted Mobile callback."
+        )
+
+    now = time.time()
+    with _REMOTE_FLOW_LOCK:
+        _prune_remote_flows_locked(now)
+        current_state = _REMOTE_FLOW_BY_INTEGRATION.get(key)
+        current = _REMOTE_FLOWS.get(current_state or "")
+        if current is not None and not current.cancelled:
+            return _remote_attempt_public(current, reused=True)
+        if not _AUTH_FLOW_LOCK.acquire(blocking=False):
+            raise GoogleOAuthError(
+                "Another Google OAuth flow is already in progress. Finish it "
+                "in the browser, then try again."
+            )
+
+        state = secrets.token_urlsafe(32)
+        verifier = secrets.token_urlsafe(64)
+        auth_params = {
+            "response_type": "code",
+            "client_id": client.client_id,
+            "redirect_uri": uri,
+            "scope": scope_text,
+            "state": state,
+            "code_challenge": _pkce_challenge(verifier),
+            "code_challenge_method": "S256",
+            "access_type": "offline",
+        }
+        if force_consent:
+            auth_params["prompt"] = "consent"
+        attempt = _RemoteOAuthAttempt(
+            integration_key=key,
+            attempt_id=secrets.token_urlsafe(12),
+            state=state,
+            verifier=verifier,
+            redirect_uri=uri,
+            auth_url=f"{GOOGLE_AUTHORIZATION_ENDPOINT}?{urlencode(auth_params)}",
+            client=client,
+            expires_at=now + REMOTE_AUTHORIZATION_TIMEOUT_S,
+        )
+        _REMOTE_FLOWS[state] = attempt
+        _REMOTE_FLOW_BY_INTEGRATION[key] = state
+        _REMOTE_RESULTS.pop(key, None)
+        return _remote_attempt_public(attempt, reused=False)
+
+
+def remote_authorization_status(integration_key: str) -> dict:
+    """Return token-safe in-memory status for one remote OAuth flow."""
+    key = str(integration_key or "").strip()
+    with _REMOTE_FLOW_LOCK:
+        _prune_remote_flows_locked(time.time())
+        state = _REMOTE_FLOW_BY_INTEGRATION.get(key)
+        attempt = _REMOTE_FLOWS.get(state or "")
+        if attempt is not None and not attempt.cancelled:
+            return {
+                "connecting": True,
+                "status": "authorization_pending",
+                "error_category": "",
+                "message": "Complete Google authorization in the browser.",
+                "attempt_id": attempt.attempt_id,
+                "expires_at": attempt.expires_at,
+            }
+        result = _REMOTE_RESULTS.get(key)
+        if isinstance(result, dict):
+            return dict(result)
+    return {
+        "connecting": False,
+        "status": "authorization_required",
+        "error_category": "",
+        "message": "",
+    }
+
+
+def cancel_remote_authorization(
+    integration_key: str,
+    *,
+    attempt_id: str | None = None,
+) -> bool:
+    """Cancel only the matching active attempt; never touch stored tokens."""
+    key = str(integration_key or "").strip()
+    expected = str(attempt_id or "").strip()
+    with _REMOTE_FLOW_LOCK:
+        _prune_remote_flows_locked(time.time())
+        state = _REMOTE_FLOW_BY_INTEGRATION.get(key)
+        attempt = _REMOTE_FLOWS.get(state or "")
+        if attempt is None or (expected and attempt.attempt_id != expected):
+            return False
+        attempt.cancelled = True
+        _finish_remote_flow_locked(
+            attempt,
+            status="authorization_required",
+            error_category="authorization_cancelled",
+            message="Google authorization was cancelled.",
+        )
+        return True
+
+
+def complete_remote_authorization(
+    state: str,
+    code: str | None,
+    error: str | None,
+) -> dict:
+    """Resolve one public callback and atomically install its token on success.
+
+    Unknown/replayed state is not matched. Provider failures are reduced to a
+    fixed safe category/message. The existing token blob is left byte-for-byte
+    untouched until token exchange has succeeded.
+    """
+    state_text = str(state or "").strip()
+    with _REMOTE_FLOW_LOCK:
+        _prune_remote_flows_locked(time.time())
+        attempt = _REMOTE_FLOWS.get(state_text)
+        if attempt is None or attempt.claimed or attempt.cancelled:
+            return {"matched": False, "success": False}
+        attempt.claimed = True
+
+    provider_error = str(error or "").strip().lower()
+    code_text = str(code or "").strip()
+    if provider_error or not code_text:
+        category = (
+            "authorization_denied"
+            if provider_error in {"access_denied", "user_cancelled"}
+            else "authentication_failed"
+        )
+        message = (
+            "Google authorization was denied."
+            if category == "authorization_denied"
+            else "Google authorization failed. Try again."
+        )
+        with _REMOTE_FLOW_LOCK:
+            if attempt.cancelled:
+                category = "authorization_required"
+                error_category = "authorization_cancelled"
+                message = "Google authorization was cancelled."
+            else:
+                error_category = category
+            _finish_remote_flow_locked(
+                attempt,
+                status=category,
+                error_category=error_category,
+                message=message,
+            )
+        return {
+            "matched": True,
+            "success": False,
+            "status": category,
+            "error_category": error_category,
+            "message": message,
+        }
+
+    try:
+        token = _exchange_authorization_code(
+            attempt.client,
+            code_text,
+            attempt.verifier,
+            redirect_uri=attempt.redirect_uri,
+        )
+    except Exception as exc:
+        category, message = _safe_remote_oauth_failure(exc)
+        with _REMOTE_FLOW_LOCK:
+            if attempt.cancelled:
+                category = "authorization_required"
+                message = "Google authorization was cancelled."
+                _finish_remote_flow_locked(
+                    attempt,
+                    status=category,
+                    error_category="authorization_cancelled",
+                    message=message,
+                )
+            else:
+                _finish_remote_flow_locked(
+                    attempt,
+                    status=category,
+                    error_category=category,
+                    message=message,
+                )
+        return {
+            "matched": True,
+            "success": False,
+            "status": category,
+            "error_category": (
+                "authorization_cancelled"
+                if attempt.cancelled
+                else category
+            ),
+            "message": message,
+        }
+
+    with _REMOTE_FLOW_LOCK:
+        if attempt.cancelled:
+            _finish_remote_flow_locked(
+                attempt,
+                status="authorization_required",
+                error_category="authorization_cancelled",
+                message="Google authorization was cancelled.",
+            )
+            return {
+                "matched": True,
+                "success": False,
+                "status": "authorization_required",
+                "error_category": "authorization_cancelled",
+                "message": "Google authorization was cancelled.",
+            }
+        # Google may omit a replacement refresh token/scope. Preserve those
+        # fields from the still-valid old token only after exchange succeeds.
+        old_blob = get_oauth_token(attempt.integration_key)
+        old_token = old_blob.get("token") if isinstance(old_blob, dict) else None
+        old_token = old_token if isinstance(old_token, dict) else {}
+        merged_token = dict(token)
+        for field in ("refresh_token", "scope"):
+            if not merged_token.get(field) and old_token.get(field):
+                merged_token[field] = old_token[field]
+        _store_token(attempt.integration_key, merged_token, attempt.client)
+        _finish_remote_flow_locked(
+            attempt,
+            status="connected",
+            error_category="",
+            message="",
+        )
+    return {
+        "matched": True,
+        "success": True,
+        "status": "connected",
+        "error_category": "",
+        "message": "",
+    }
 
 
 def authorize(
@@ -415,6 +731,17 @@ def authorized_request(
         ) from exc
 
 
+def _find_client_config(integration_key: str) -> GoogleOAuthClient | None:
+    for source_key in (
+        integration_key,
+        *(_CLIENT_FALLBACK_KEYS.get(integration_key) or ()),
+    ):
+        loaded = _client_from_blob(get_oauth_client(source_key), source_key)
+        if loaded:
+            return loaded
+    return _client_from_environment(integration_key)
+
+
 def _client_from_blob(blob: dict, source_key: str) -> GoogleOAuthClient | None:
     if not isinstance(blob, dict):
         return None
@@ -426,11 +753,21 @@ def _client_from_blob(blob: dict, source_key: str) -> GoogleOAuthClient | None:
         blob.get("token_endpoint_auth_method")
         or ("client_secret_post" if client_secret else "none")
     ).strip() or "client_secret_post"
+    raw_redirects = blob.get("redirect_uris")
+    redirects: list[str] = []
+    if isinstance(raw_redirects, (list, tuple)):
+        for raw in raw_redirects:
+            uri = str(raw or "").strip()
+            if uri and uri not in redirects:
+                redirects.append(uri)
+    if not redirects:
+        redirects.append(OAUTH_REDIRECT_URI)
     return GoogleOAuthClient(
         client_id=client_id,
         client_secret=client_secret,
         token_endpoint_auth_method=auth_method,
         source_key=source_key,
+        redirect_uris=tuple(redirects),
     )
 
 
@@ -445,8 +782,77 @@ def _client_from_environment(integration_key: str) -> GoogleOAuthClient | None:
             client_secret=client_secret,
             token_endpoint_auth_method="client_secret_post" if client_secret else "none",
             source_key="environment",
+            redirect_uris=(OAUTH_REDIRECT_URI,),
         )
     return None
+
+
+def _remote_attempt_public(attempt: _RemoteOAuthAttempt, *, reused: bool) -> dict:
+    return {
+        "attempt_id": attempt.attempt_id,
+        "auth_url": attempt.auth_url,
+        "expires_at": attempt.expires_at,
+        "reused": bool(reused),
+    }
+
+
+def _finish_remote_flow_locked(
+    attempt: _RemoteOAuthAttempt,
+    *,
+    status: str,
+    error_category: str,
+    message: str,
+) -> None:
+    _REMOTE_FLOWS.pop(attempt.state, None)
+    if _REMOTE_FLOW_BY_INTEGRATION.get(attempt.integration_key) == attempt.state:
+        _REMOTE_FLOW_BY_INTEGRATION.pop(attempt.integration_key, None)
+    _REMOTE_RESULTS[attempt.integration_key] = {
+        "connecting": False,
+        "status": str(status),
+        "error_category": str(error_category),
+        "message": str(message),
+    }
+    if attempt.lock_held:
+        attempt.lock_held = False
+        try:
+            _AUTH_FLOW_LOCK.release()
+        except RuntimeError:
+            pass
+
+
+def _prune_remote_flows_locked(now: float) -> None:
+    expired = [
+        attempt
+        for attempt in _REMOTE_FLOWS.values()
+        if not attempt.claimed and now >= attempt.expires_at
+    ]
+    for attempt in expired:
+        _finish_remote_flow_locked(
+            attempt,
+            status="authorization_timeout",
+            error_category="authorization_timeout",
+            message="Google authorization timed out. Try again.",
+        )
+
+
+def _safe_remote_oauth_failure(exc: Exception) -> tuple[str, str]:
+    text = str(exc or "").lower()
+    if "redirect_uri" in text or "not configured" in text:
+        return (
+            "configuration_missing",
+            "Configure Google OAuth on the PC, then try again.",
+        )
+    if "invalid_grant" in text or "http 401" in text:
+        return (
+            "authentication_failed",
+            "Google authentication is no longer valid. Reconnect Gmail.",
+        )
+    if "timeout" in text or "timed out" in text:
+        return (
+            "authorization_timeout",
+            "Google authorization timed out. Try again.",
+        )
+    return "authentication_failed", "Google authorization failed. Try again."
 
 
 def _capture_authorization_code(auth_url: str, expected_state: str) -> str:
@@ -494,13 +900,17 @@ def _capture_authorization_code(auth_url: str, expected_state: str) -> str:
 
 
 def _exchange_authorization_code(
-    client: GoogleOAuthClient, code: str, verifier: str
+    client: GoogleOAuthClient,
+    code: str,
+    verifier: str,
+    *,
+    redirect_uri: str = OAUTH_REDIRECT_URI,
 ) -> dict:
     requests = _requests()
     data = {
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": OAUTH_REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         "client_id": client.client_id,
         "code_verifier": verifier,
     }

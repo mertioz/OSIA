@@ -4637,9 +4637,18 @@ class _SettingsPanel(QWidget):
             and str(existing.get("client_secret") or "").strip()
         ):
             client_secret = str(existing.get("client_secret") or "").strip()
+        redirect_uris = ["http://127.0.0.1:8975/callback"]
+        try:
+            from osia.integrations.google_oauth import mobile_redirect_uri
+
+            mobile_callback = mobile_redirect_uri()
+            if mobile_callback:
+                redirect_uris.append(mobile_callback)
+        except Exception:
+            pass
         client = {
             "client_id": client_id,
-            "redirect_uris": ["http://127.0.0.1:8975/callback"],
+            "redirect_uris": redirect_uris,
             "token_endpoint_auth_method": (
                 "client_secret_post" if client_secret else "none"
             ),
@@ -4874,7 +4883,7 @@ class _SettingsPanel(QWidget):
                 v.addWidget(cidlab)
                 cidin = QLineEdit(str(client.get("client_id") or ""))
                 cidin.setObjectName("keyInput")
-                cidin.setPlaceholderText(i18n.t("mcp.ph_client_id"))
+                cidin.setPlaceholderText(i18n.t("mcp.gmail_ph_client_id"))
                 self._mcp_client_id_inputs[sid] = cidin
                 v.addWidget(cidin)
 
@@ -4888,7 +4897,7 @@ class _SettingsPanel(QWidget):
                 csecin.setPlaceholderText(
                     i18n.t("mcp.ph_client_secret_replace")
                     if client_configured
-                    else i18n.t("mcp.ph_client_secret")
+                    else i18n.t("mcp.gmail_ph_client_secret")
                 )
                 self._mcp_client_secret_inputs[sid] = csecin
                 v.addWidget(csecin)
