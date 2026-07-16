@@ -193,6 +193,7 @@ def themed_stylesheet(template: str, palette: ThemePalette) -> str:
         "#e8e6f0": palette.text,
         "#9d9aad": palette.muted_text,
         "#8a8798": palette.muted_text,
+        "#777480": palette.disabled,
         "#e0a3a3": palette.error,
         "#ff6b6b": palette.error,
         "#e0a23c": palette.warning,
@@ -209,6 +210,7 @@ def themed_stylesheet(template: str, palette: ThemePalette) -> str:
         ((13, 11, 18), "background"),
         ((15, 13, 22), "surface"),
         ((19, 17, 26), "elevated_surface"),
+        ((119, 116, 128), "disabled"),
         ((220, 80, 80), "error"),
     )
     for (red, green, blue), field in rgb_fields:

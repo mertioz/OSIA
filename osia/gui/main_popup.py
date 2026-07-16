@@ -103,6 +103,9 @@ POPUP_H = 560
 POPUP_W_WIDE = 640
 WIDTH_ANIM_MS = 280
 RADIUS = 16     # WOR-48 P3: 20 → 16, lightly-rounded rectangle (not pill-like)
+COMPOSER_BUTTON_SIZE = 34
+COMPOSER_BUTTON_RADIUS = 8
+COMPOSER_ICON_SIZE = 14
 # WOR-48 audit #2 — the drop shadow is painted BY HAND in MainPopup.paintEvent
 # (no QGraphicsDropShadowEffect, which makes Qt render the widget off-screen and
 # thereby defeats the per-frame transparent clear, leaving ghost rectangles on
@@ -305,6 +308,63 @@ class _Bubble(QFrame):
 
 # ── Chat page ───────────────────────────────────────────────────────────────
 
+class _ComposerButton(QPushButton):
+    """Square composer control with a geometry-centred painted icon."""
+
+    def __init__(self, kind: str):
+        super().__init__()
+        if kind not in ("attach", "send"):
+            raise ValueError(f"Unsupported composer button kind: {kind}")
+        self._kind = kind
+        self.setFixedSize(COMPOSER_BUTTON_SIZE, COMPOSER_BUTTON_SIZE)
+
+    def _icon_bounds(self) -> QRectF:
+        side = float(COMPOSER_ICON_SIZE)
+        return QRectF(
+            (self.width() - side) / 2.0,
+            (self.height() - side) / 2.0,
+            side,
+            side,
+        )
+
+    def _icon_path(self) -> QPainterPath:
+        bounds = self._icon_bounds()
+        center = bounds.center()
+        path = QPainterPath()
+        if self._kind == "attach":
+            path.moveTo(bounds.left() + 2.0, center.y())
+            path.lineTo(bounds.right() - 2.0, center.y())
+            path.moveTo(center.x(), bounds.top() + 2.0)
+            path.lineTo(center.x(), bounds.bottom() - 2.0)
+        else:
+            path.moveTo(bounds.left() + 2.0, center.y())
+            path.lineTo(bounds.right() - 2.0, center.y())
+            path.moveTo(bounds.right() - 6.0, bounds.top() + 3.0)
+            path.lineTo(bounds.right() - 2.0, center.y())
+            path.lineTo(bounds.right() - 6.0, bounds.bottom() - 3.0)
+        return path
+
+    def _icon_color(self) -> QColor:
+        palette = get_theme_manager().palette
+        if not self.isEnabled():
+            return palette.color("disabled")
+        if self._kind == "send":
+            return palette.color("background")
+        return palette.color("text", 215)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(self._icon_color(), 2.0)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(self._icon_path())
+        painter.end()
+
+
 class _ChatPage(QWidget):
     """Scrollable message list + text input row at the bottom."""
 
@@ -385,9 +445,8 @@ class _ChatPage(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
 
-        self._file_btn = QPushButton("+")
+        self._file_btn = _ComposerButton("attach")
         self._file_btn.setObjectName("iconBtn")
-        self._file_btn.setFixedSize(34, 34)
         self._file_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._file_btn.setToolTip(i18n.t("chat.attach_file"))
         self._file_btn.clicked.connect(self._on_pick_file)
@@ -397,12 +456,13 @@ class _ChatPage(QWidget):
         self._input.setPlaceholderText(i18n.t("chat.input_placeholder"))
         self._input.returnPressed.connect(self._on_send)
 
-        self._send_btn = QPushButton("➤")
+        self._send_btn = _ComposerButton("send")
         self._send_btn.setObjectName("sendBtn")
-        self._send_btn.setFixedSize(34, 34)
         self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._send_btn.setToolTip(i18n.t("chat.send"))
         self._send_btn.clicked.connect(self._on_send)
+        self._input.textChanged.connect(self._sync_send_state)
+        self._sync_send_state()
 
         row.addWidget(self._file_btn)
         row.addWidget(self._input, 1)
@@ -525,16 +585,18 @@ class _ChatPage(QWidget):
     def set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
         self._input.setEnabled(not self._busy)
-        self._send_btn.setEnabled(not self._busy)
-        self._send_btn.setCursor(
-            Qt.CursorShape.ArrowCursor
-            if self._busy else Qt.CursorShape.PointingHandCursor
-        )
+        self._sync_send_state()
         self._input.setPlaceholderText(
             self._BUSY_TEXT if self._busy else i18n.t("chat.input_placeholder")
         )
-        self._send_btn.style().unpolish(self._send_btn)
-        self._send_btn.style().polish(self._send_btn)
+
+    def _sync_send_state(self, _text: str | None = None) -> None:
+        enabled = not self._busy and bool(self._input.text().strip())
+        self._send_btn.setEnabled(enabled)
+        self._send_btn.setCursor(
+            Qt.CursorShape.ArrowCursor
+            if not enabled else Qt.CursorShape.PointingHandCursor
+        )
 
     def show_notice(self, text: str) -> None:
         self._notice.setText(text)
@@ -625,6 +687,7 @@ class _ChatPage(QWidget):
             return
         text = self._input.text().strip()
         if not text:
+            self._sync_send_state()
             return
         self._input.clear()
         self.send_text.emit(text)
@@ -9397,44 +9460,50 @@ class MainPopup(QWidget):
                 font-size: 12px;
                 padding: 4px 2px;
             }
+            QPushButton#iconBtn, QPushButton#sendBtn {
+                border: 1px solid rgba(196, 181, 245, 0.18);
+                border-radius: 8px;
+                padding: 0px;
+            }
             QPushButton#iconBtn {
                 background: rgba(196, 181, 245, 0.06);
-                border: 1px solid rgba(196, 181, 245, 0.12);
-                border-radius: 17px;
                 color: rgba(232, 230, 240, 0.8);
-                font-size: 20px;
-                font-weight: 600;
             }
             QPushButton#iconBtn:hover {
-                background: rgba(196, 181, 245, 0.20);
+                background: rgba(196, 181, 245, 0.16);
+                border-color: rgba(196, 181, 245, 0.42);
                 color: #e8e6f0;
+            }
+            QPushButton#iconBtn:pressed {
+                background: rgba(196, 181, 245, 0.10);
+                border-color: rgba(196, 181, 245, 0.58);
             }
             QPushButton#sendBtn {
                 background: rgba(196, 181, 245, 0.85);
-                border: none;
-                border-radius: 17px;
+                border-color: rgba(196, 181, 245, 0.85);
                 color: #0d0b12;
-                font-size: 20px;
-                font-weight: 700;
             }
             QPushButton#sendBtn:hover {
                 background: rgba(196, 181, 245, 1.0);
+                border-color: rgba(196, 181, 245, 1.0);
             }
             QPushButton#sendBtn:pressed {
                 background: rgba(196, 181, 245, 0.70);
+                border-color: rgba(196, 181, 245, 0.70);
             }
-            QPushButton#sendBtn:focus {
-                border: 2px solid #e8e6f0;
+            QPushButton#iconBtn:focus, QPushButton#sendBtn:focus {
+                border: 2px solid rgba(196, 181, 245, 0.72);
             }
             QLineEdit#chatInput:focus {
                 background: rgba(196, 181, 245, 0.06);
                 border-radius: 6px;
             }
 
-            /* Bottom nav (icons are painted by _NavButton) ───────────── */
-            QPushButton#sendBtn:disabled {
-                background: rgba(196, 181, 245, 0.18);
-                color: rgba(232, 230, 240, 0.35);
+            /* Disabled composer controls stay visually inactive. */
+            QPushButton#iconBtn:disabled, QPushButton#sendBtn:disabled {
+                background: rgba(119, 116, 128, 0.14);
+                border: 1px solid rgba(119, 116, 128, 0.32);
+                color: #777480;
             }
             QLineEdit#chatInput:disabled {
                 color: rgba(232, 230, 240, 0.46);
@@ -9445,6 +9514,7 @@ class MainPopup(QWidget):
                 padding: 0 2px 2px 2px;
             }
 
+            /* Bottom nav (icons are painted by _NavButton) ───────────── */
             QPushButton#navBtn {
                 background: transparent;
                 border: none;
