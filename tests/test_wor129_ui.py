@@ -27,6 +27,15 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication, QWidget
 
+from osia.gui.dynamic_island import (
+    CIRCLE_SIZE,
+    DOCK_PILL_H,
+    DOCK_PILL_W,
+    ISLAND_H,
+    ISLAND_W,
+    MORPH_MS,
+    DynamicIsland,
+)
 from osia.gui.main_popup import (
     MainPopup,
     POPUP_H,
@@ -193,6 +202,18 @@ class QtUiLifecycleTests(unittest.TestCase):
         self.popup._stack.setCurrentIndex(self.popup.PAGE_SETTINGS)
         self.popup._animate_width(POPUP_W_WIDE)
         self.assertEqual((self.popup.width(), self.popup.height()), (640, 560))
+
+        self.assertEqual(
+            (ISLAND_W, ISLAND_H, CIRCLE_SIZE, DOCK_PILL_W, DOCK_PILL_H),
+            (320, 52, 60, 28, 80),
+        )
+        self.assertEqual(MORPH_MS, 300)
+        island = DynamicIsland()
+        self.app.processEvents()
+        self.assertEqual((island.width(), island.height()), (320, 52))
+        self.assertEqual(island._morph_anim.duration(), 300)
+        island.close()
+        island.deleteLater()
 
     def test_opacity_transitions_preserve_geometry_and_replace_rapid_runs(self):
         widget = QWidget()

@@ -72,7 +72,7 @@ SHAPE_CAPSULE = "capsule"   # default horizontal pill (ISLAND_W x ISLAND_H)
 SHAPE_CIRCLE = "circle"     # compact logo+mic disc, snapped into a bottom corner
 SHAPE_DOCKED = "docked"     # vertical pill tucked behind a side edge ("ear")
 
-MORPH_MS = 220              # shape-morph animation duration
+MORPH_MS = 300              # preserved pre-WOR-129 geometry contract
 CIRCLE_SIZE = 60           # circle diameter (px)
 # The pill-sized active animations (≈72px wide) are scaled by this factor when
 # painted inside the compact circle so they read as a centred glyph rather than
