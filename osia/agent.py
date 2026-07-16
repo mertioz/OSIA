@@ -4055,26 +4055,40 @@ _TOOL_CLAIM_PATTERNS = [
         r"scrolled|took|taken|ran(?!\s+into))\b",
         re.IGNORECASE,
     ),
-    # "The command has been executed", "the file was created", "is now open"
+    # "The command has been executed", "the file was created", "is now open".
+    # Require a concrete tool-effect subject for passive claims.  A bare
+    # ``was created`` / ``a été créé`` occurs constantly in informational
+    # answers (history, definitions, architecture) and does not mean OSIA
+    # claims to have changed the user's PC.
     re.compile(
-        r"\b(?:has|have|was|were) been (?:opened|launched|executed|run|"
-        r"created|deleted|written|killed|copied|renamed|moved|completed)\b"
-        r"|\b(?:was|were) (?:opened|launched|executed|run|created|deleted|"
-        r"written|killed|copied|renamed|moved|completed)\b"
-        r"|\bis now (?:open(?:ed)?|running|launched|playing)\b",
+        r"\b(?:the|this|that|your|my)\s+"
+        r"(?:command|file|folder|directory|app|application|browser|page|"
+        r"window|process|task|document|spreadsheet|presentation|email|"
+        r"message|link|game|program|script)s?\s+"
+        r"(?:(?:has|have) been|was|were)\s+"
+        r"(?:opened|launched|executed|run|created|deleted|written|killed|"
+        r"copied|renamed|moved|completed)\b"
+        r"|\b(?:the|this|that|your|my)\s+"
+        r"(?:app|application|browser|page|window|process|game|program)s?\s+"
+        r"is now (?:open(?:ed)?|running|launched|playing)\b",
         re.IGNORECASE,
     ),
     # "J'ai ouvert…", "j'ai lancé…", "j'ai exécuté…"
     re.compile(
-        r"\bj'ai\s+(?:ouvert|lancé|exécuté|navigué|cliqué|créé|supprimé|"
+        r"\bj['’]ai\s+(?:ouvert|lancé|exécuté|navigué|cliqué|créé|supprimé|"
         r"écrit|tué|copié|renommé|déplacé|rempli|tapé|pris)\b",
         re.IGNORECASE,
     ),
-    # "a été ouvert", "ont été supprimés", "est maintenant ouvert"
+    # "le fichier a été créé", "les dossiers ont été supprimés".
     re.compile(
-        r"\b(?:a|ont) été (?:ouvert|lancé|exécuté|créé|supprimé|écrit|tué|"
-        r"copié|renommé|déplacé)"
-        r"|\best maintenant (?:ouvert|lancé|en cours)\b",
+        r"\b(?:le|la|les|ce|cet|cette|ces|votre|vos|ton|ta|tes|mon|ma|mes)\s+"
+        r"(?:commande|fichier|dossier|application|navigateur|page|fenêtre|"
+        r"processus|tâche|document|tableur|présentation|e-?mail|message|"
+        r"lien|jeu|programme|script)s?\s+(?:a|ont) été\s+"
+        r"(?:ouvert|lancé|exécuté|créé|supprimé|écrit|tué|copié|renommé|déplacé)"
+        r"|\b(?:le|la|les|ce|cet|cette|ces|votre|vos|ton|ta|tes|mon|ma|mes)\s+"
+        r"(?:application|navigateur|page|fenêtre|processus|jeu|programme)s?\s+"
+        r"est maintenant (?:ouvert|lancé|en cours)\b",
         re.IGNORECASE,
     ),
 ]
@@ -5901,7 +5915,14 @@ class OSIAAgent:
                     print(
                         "[OSIA Agent] ↻ retrying with explicit tool-call instruction"
                     )
-                    self.messages.append({"role": "assistant", "content": content})
+                    self.messages.append({
+                        "role": "assistant",
+                        # This rejected candidate only supplies context for the
+                        # corrective retry.  It is not a finalized assistant
+                        # answer and must never cross the persistence boundary.
+                        "_internal": True,
+                        "content": content,
+                    })
                     self.messages.append({
                         "role": "user",
                         # WOR-83: internal model-steering frame (see _wire_messages

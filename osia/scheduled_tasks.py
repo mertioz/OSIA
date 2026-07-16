@@ -1071,23 +1071,35 @@ def parse_scheduled_task_tool_result(result: Any) -> dict[str, Any] | None:
 
 
 def claims_scheduled_task_saved(text: str) -> bool:
+    """Return whether a reply claims that OSIA changed a scheduled task.
+
+    Scheduling vocabulary also appears in ordinary informational prose
+    (``programme``, ``planifié``, ``scheduled``).  Match an acknowledgement or
+    a concrete task/reminder claim instead of treating any occurrence of those
+    words as proof of a scheduler action.
+    """
+
     folded = _fold_text(text)
     if any(word in folded for word in _SCHEDULE_FAILURE_WORDS):
         return False
-    success_words = (
-        "scheduled",
-        "planifie",
-        "planifi\u00e9",
-        "programm\u00e9",
-        "programme",
-        "cron created",
-        "task created",
-        "reminder set",
-        "rappel est",
-        "rappel a ete",
-        "rappel a \u00e9t\u00e9",
+    success_patterns = (
+        r"^\s*(?:scheduled|planifie|programme)[.!]?\s*$",
+        r"\b(?:i(?:'ve| have)?|we(?:'ve| have)?) (?:successfully )?"
+        r"(?:scheduled|programmed|created|updated|deleted|set)\b",
+        r"\b(?:the|this|that|your|my) "
+        r"(?:task|reminder|scheduled job|event) "
+        r"(?:(?:has|have) been|was|is now) "
+        r"(?:scheduled|programmed|created|updated|deleted|set)\b",
+        r"\b(?:cron|task) created\b|\breminder set\b",
+        r"\b(?:j['’ ]ai|nous avons) (?:bien )?"
+        r"(?:planifie|programme|cree|mis a jour|supprime)\b",
+        r"\bc['’ ]est (?:bien )?(?:planifie|programme)\b",
+        r"\b(?:le|la|ce|cette|votre|vos|ton|ta|tes|mon|ma|mes) "
+        r"(?:rappel|tache|taches|evenement) "
+        r"(?:a ete|ont ete|est maintenant|sont maintenant) "
+        r"(?:planifie|programme|cree|mis a jour|supprime)\b",
     )
-    return any(word in folded for word in success_words)
+    return any(re.search(pattern, folded) for pattern in success_patterns)
 
 
 def is_schedule_failure_response(text: str) -> bool:
