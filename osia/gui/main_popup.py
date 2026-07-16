@@ -29,10 +29,10 @@ from pathlib import Path
 
 from PyQt6.QtCore import (
     Qt, QEvent, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
-    QRect, QRectF, QPointF, QSize, QFileSystemWatcher,
+    QRect, QRectF, QPointF, QSize, QFileSystemWatcher, QVariantAnimation,
 )
 from PyQt6.QtGui import (
-    QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap,
+    QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap, QIcon,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -68,6 +68,11 @@ from osia.utils.assets import LOGO_PATH, autostart_enabled, set_autostart
 from osia import i18n
 from osia import timefmt
 from osia.perf import perf_timer
+from osia.gui.motion import (
+    MOTION, MotionController, reduced_motion_requested,
+)
+from osia.gui.streaming import DesktopTextStreamController
+from osia.gui.theme import PALETTES, get_theme_manager, themed_stylesheet
 
 # sip lets us detect widgets whose C++ side has already been destroyed
 # (accessing them raises RuntimeError otherwise). It ships with PyQt6 but
@@ -117,16 +122,6 @@ SHADOW_ALPHA = 45     # alpha of the innermost (darkest) ring; fades to 0 outwar
 # panel where the desktop shows through (Arch-Linux translucent-terminal look).
 # Inner surfaces (assistant bubble, input frame) keep a higher alpha so text
 # stays legible while this outer card is strongly translucent.
-BG_COLOR = QColor(13, 11, 18, 125)
-BG_BLUR_LAYER = QColor(26, 22, 37, 85)      # #1a1625 wash for a frosted feel
-BORDER_COLOR = QColor(196, 181, 245, 70)    # subtle violet edge
-PANEL_BG = QColor(255, 255, 255, 10)
-ACCENT = QColor(196, 181, 245)      # #c4b5f5
-ACCENT_DARK = QColor(140, 110, 220)
-SUCCESS = QColor(105, 200, 140)
-TEXT = QColor(245, 245, 250)
-TEXT_DIM = QColor(245, 245, 250, 150)
-DIVIDER = QColor(255, 255, 255, 18)
 
 STARTUP_SERVICES = ("osia-server.service", "osia-tunnel.service")
 
@@ -301,6 +296,12 @@ class _Bubble(QFrame):
     def append_text(self, more: str) -> None:
         self._label.setText(self._label.text() + more)
 
+    def set_text(self, text: str) -> None:
+        self._label.setText(text)
+
+    def text(self) -> str:
+        return self._label.text()
+
 
 # ── Chat page ───────────────────────────────────────────────────────────────
 
@@ -314,6 +315,26 @@ class _ChatPage(QWidget):
     def __init__(self):
         super().__init__()
         self._busy = False
+        self._motion = MotionController(
+            self,
+            reduced_motion=lambda: (
+                reduced_motion_requested(self) or not self.isVisible()
+            ),
+        )
+        self._stream = DesktopTextStreamController(
+            self,
+            reduced_motion=lambda: (
+                reduced_motion_requested(self) or not self.isVisible()
+            ),
+        )
+        self._stream.text_changed.connect(self._on_stream_text_changed)
+        self._stream_bubble: _Bubble | None = None
+        self._stream_wrap: QWidget | None = None
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.timeout.connect(self._scroll_to_bottom)
+        self._notice_timer = QTimer(self)
+        self._notice_timer.setSingleShot(True)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -357,6 +378,7 @@ class _ChatPage(QWidget):
         self._notice.setObjectName("chatNotice")
         self._notice.setWordWrap(True)
         self._notice.hide()
+        self._notice_timer.timeout.connect(self._notice.hide)
         input_layout.addWidget(self._notice)
 
         row = QHBoxLayout()
@@ -404,6 +426,10 @@ class _ChatPage(QWidget):
     # ── Public API ────────────────────────────────────────────────────────
 
     def clear_messages(self) -> None:
+        self._stream.clear()
+        self._stream_bubble = None
+        self._stream_wrap = None
+        self._motion.settle()
         # Remove every widget except the trailing stretch + empty label.
         # Every Qt access is guarded: widgets can already be deleted on the
         # C++ side (e.g. when the last conversation is removed), and touching
@@ -447,7 +473,7 @@ class _ChatPage(QWidget):
                 self._empty.hide()
             for role, text in renderable:
                 self._append_bubble(role, text)
-            QTimer.singleShot(0, self._scroll_to_bottom)
+            self._scroll_timer.start(0)
         except RuntimeError:
             pass
 
@@ -459,7 +485,40 @@ class _ChatPage(QWidget):
             return
         self._empty.hide()
         self._append_bubble(role, text)
-        QTimer.singleShot(0, self._scroll_to_bottom)
+        self._scroll_timer.start(0)
+
+    def append_assistant_stream_chunk(self, text: str) -> None:
+        """Extend the active assistant target with one cleaned sentence chunk."""
+        self._stream.append_chunk(_display_text(text), separator=" ")
+
+    def finalize_assistant_stream(self, text: str) -> None:
+        """Synchronously replace the presentation with the canonical final."""
+        final = _display_text(text)
+        if not final:
+            if self._stream.active or self._stream_bubble is not None:
+                self._stream.finalize("")
+                self._discard_stream_bubble()
+            return
+        if not self._stream.active and self._stream_bubble is None:
+            self.append_message("assistant", final)
+            return
+        self._stream.finalize(final)
+        self._mark_stream_finished()
+
+    def fail_assistant_stream(self, text: str) -> None:
+        error = _display_text(text)
+        if not error:
+            self.cancel_assistant_stream(flush=True)
+            return
+        if not self._stream.active and self._stream_bubble is None:
+            self.append_message("assistant", error)
+            return
+        self._stream.error(error)
+        self._mark_stream_finished(error=True)
+
+    def cancel_assistant_stream(self, *, flush: bool = True) -> None:
+        self._stream.cancel(flush=flush)
+        self._mark_stream_finished()
 
     # ── Internals ─────────────────────────────────────────────────────────
 
@@ -480,7 +539,8 @@ class _ChatPage(QWidget):
     def show_notice(self, text: str) -> None:
         self._notice.setText(text)
         self._notice.show()
-        QTimer.singleShot(2600, self._notice.hide)
+        self._motion.fade_in(self._notice, MOTION.state_ms)
+        self._notice_timer.start(2600)
 
     @staticmethod
     def _build_empty_label() -> QLabel:
@@ -489,15 +549,13 @@ class _ChatPage(QWidget):
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         return label
 
-    def _append_bubble(self, role: str, text: str) -> None:
+    def _append_bubble(self, role: str, text: str) -> tuple[QWidget, _Bubble] | None:
         # Defense in depth: never create a bubble (or its wrapper row
         # widget) for empty text — a blank QFrame collapses into a thin
         # violet line in the chat.
         if not text or not str(text).strip():
-            return
+            return None
         bubble = _Bubble(role, text)
-        align = (Qt.AlignmentFlag.AlignRight if role == "user"
-                 else Qt.AlignmentFlag.AlignLeft)
         # Insert just before the trailing stretch so the chat grows down.
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
@@ -513,6 +571,49 @@ class _ChatPage(QWidget):
         self._messages_layout.insertWidget(
             self._messages_layout.count() - 1, wrap
         )
+        self._motion.fade_in(wrap, MOTION.appearance_ms)
+        return wrap, bubble
+
+    def _on_stream_text_changed(self, text: str) -> None:
+        if self._stream_bubble is None:
+            if not text:
+                return
+            try:
+                self._empty.hide()
+            except RuntimeError:
+                return
+            created = self._append_bubble("assistant", text)
+            if created is None:
+                return
+            self._stream_wrap, self._stream_bubble = created
+            self._stream_bubble.setProperty("streaming", True)
+            self._stream_bubble.style().unpolish(self._stream_bubble)
+            self._stream_bubble.style().polish(self._stream_bubble)
+        else:
+            self._stream_bubble.set_text(text)
+        self._scroll_to_bottom()
+
+    def _discard_stream_bubble(self) -> None:
+        wrap = self._stream_wrap
+        self._stream_bubble = None
+        self._stream_wrap = None
+        if wrap is not None:
+            self._messages_layout.removeWidget(wrap)
+            wrap.deleteLater()
+        if self._messages_layout.count() <= 2:
+            self._empty.show()
+        self._scroll_to_bottom()
+
+    def _mark_stream_finished(self, *, error: bool = False) -> None:
+        bubble = self._stream_bubble
+        if bubble is not None:
+            bubble.setProperty("streaming", False)
+            bubble.setProperty("error", error)
+            bubble.style().unpolish(bubble)
+            bubble.style().polish(bubble)
+        self._stream_bubble = None
+        self._stream_wrap = None
+        self._scroll_to_bottom()
 
     def _scroll_to_bottom(self) -> None:
         bar = self._scroll.verticalScrollBar()
@@ -892,7 +993,7 @@ class _ModelRow(QFrame):
         current = self._explicit_reasoning_option_id()
         menu = QMenu(self)
         menu.setObjectName("reasoningMenu")
-        menu.setStyleSheet("""
+        menu.setStyleSheet(themed_stylesheet("""
             QMenu#reasoningMenu {
                 background: #0d0b12;
                 border: 1px solid rgba(196, 181, 245, 0.28);
@@ -908,7 +1009,7 @@ class _ModelRow(QFrame):
                 background: rgba(196, 181, 245, 0.20);
                 color: #ffffff;
             }
-        """)
+        """, get_theme_manager().palette))
         title = menu.addAction(i18n.t("settings.reasoning"))
         title.setEnabled(False)
         menu.addSeparator()
@@ -1010,8 +1111,8 @@ class _ProviderGridCard(QFrame):
         top.setSpacing(8)
         # Single subtle violet dot for every provider (no per-provider colour).
         dot = QLabel()
+        dot.setObjectName("themeDot")
         dot.setFixedSize(8, 8)
-        dot.setStyleSheet("background: #c4b5f5; border-radius: 4px;")
         name = QLabel(
             i18n.t("chatgpt_account.title")
             if provider == "chatgpt_account"
@@ -1669,7 +1770,9 @@ class _MemoryEditDialog(_PopoverDialog):
         self._error = QLabel("")
         self._error.setObjectName("providerSub")
         self._error.setWordWrap(True)
-        self._error.setStyleSheet("color: #e0a3a3;")
+        self._error.setStyleSheet(
+            f"color: {get_theme_manager().palette.error};"
+        )
         lay.addWidget(self._error)
 
         row = QHBoxLayout()
@@ -2011,7 +2114,9 @@ class _McpCustomDialog(_PopoverDialog):
         self._error = QLabel("")
         self._error.setObjectName("providerSub")
         self._error.setWordWrap(True)
-        self._error.setStyleSheet("color: #e0a3a3;")
+        self._error.setStyleSheet(
+            f"color: {get_theme_manager().palette.error};"
+        )
         self._card_layout.addWidget(self._error)
 
         row = QHBoxLayout()
@@ -2166,6 +2271,13 @@ class _SettingsPanel(QWidget):
     def __init__(self):
         super().__init__()
 
+        self._theme = get_theme_manager()
+        self._motion = MotionController(
+            self,
+            reduced_motion=lambda: (
+                reduced_motion_requested(self) or not self.isVisible()
+            ),
+        )
         self._provider_cards: dict[str, _ProviderCard] = {}
         self._tts_cards: dict[str, _ProviderCard] = {}
         self._liveapi_cards: dict[str, _ProviderCard] = {}
@@ -2266,6 +2378,7 @@ class _SettingsPanel(QWidget):
         # Build every section ONCE, in the original column order, so any
         # construction-time ordering assumptions are preserved unchanged.
         sec_language  = self._build_language_section()
+        sec_theme     = self._build_theme_section()
         sec_capsule   = self._build_capsule_section()       # Capsule + autostart
         sec_ai_prov   = self._build_ai_providers_section()  # Section 1
         sec_voice     = self._build_voice_section()         # Section 2 (TTS)
@@ -2282,12 +2395,12 @@ class _SettingsPanel(QWidget):
         sec_mcp       = self._build_mcp_section()           # MCP / Connectors (WOR-44)
         sec_legal     = self._build_legal_section()         # Legal versions + links
 
-        # (nav i18n key, [sections on that page]) — 8 categories, all 15 frames,
+        # (nav i18n key, [sections on that page]) — 9 categories, all 17 frames,
         # each frame used exactly once. MCP/Connectors gets its OWN category (not
         # folded into Advanced) — it is a central, growing capability that
         # warrants top-level discoverability.
         self._settings_pages = [
-            ("settings.cat.general",  [sec_language, sec_capsule]),
+            ("settings.cat.general",  [sec_language, sec_theme, sec_capsule]),
             ("settings.cat.models",   [sec_ai_prov, sec_hierarchy, sec_apikeys]),
             ("settings.cat.voice",    [sec_voice, sec_stt, sec_liveapi]),
             ("settings.cat.wake",     [sec_wake]),
@@ -2364,6 +2477,9 @@ class _SettingsPanel(QWidget):
         if row < 0:
             return
         self._settings_stack.setCurrentIndex(row)
+        page = self._settings_stack.currentWidget()
+        if page is not None:
+            self._motion.fade_in(page, MOTION.page_ms)
         try:
             key = self._settings_pages[row][0]
         except Exception:
@@ -2417,6 +2533,77 @@ class _SettingsPanel(QWidget):
             lambda: i18n.remove_listener(self._retranslate_language_section)
         )
         return wrap
+
+    def _build_theme_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        self._theme_title = QLabel(i18n.t("theme.section"))
+        self._theme_title.setObjectName("sectionTitle")
+        layout.addWidget(self._theme_title)
+        self._theme_sub = QLabel(i18n.t("theme.section_sub"))
+        self._theme_sub.setObjectName("sectionSub")
+        self._theme_sub.setWordWrap(True)
+        layout.addWidget(self._theme_sub)
+        self._theme_desc = QLabel(i18n.t("theme.section_desc"))
+        self._theme_desc.setObjectName("sectionDesc")
+        self._theme_desc.setWordWrap(True)
+        layout.addWidget(self._theme_desc)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 2, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(7)
+        self._theme_group = QButtonGroup(self)
+        self._theme_group.setExclusive(True)
+        self._theme_buttons: dict[str, QPushButton] = {}
+        for index, palette in enumerate(PALETTES.values()):
+            button = QPushButton(i18n.t(palette.name_key))
+            button.setObjectName("themeChoice")
+            button.setCheckable(True)
+            button.setProperty("themeKey", palette.key)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            preview = QPixmap(36, 12)
+            preview.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(preview)
+            painter.fillRect(0, 0, 12, 12, palette.color("background"))
+            painter.fillRect(12, 0, 12, 12, palette.color("surface"))
+            painter.fillRect(24, 0, 12, 12, palette.color("primary"))
+            painter.end()
+            button.setIcon(QIcon(preview))
+            button.setIconSize(QSize(36, 12))
+            button.clicked.connect(
+                lambda checked=False, key=palette.key:
+                self._on_theme_selected(key) if checked else None
+            )
+            self._theme_group.addButton(button)
+            self._theme_buttons[palette.key] = button
+            grid.addWidget(button, index // 2, index % 2)
+        layout.addLayout(grid)
+        self._sync_theme_buttons()
+        self._theme.theme_changed.connect(self._on_theme_changed)
+        return wrap
+
+    def _on_theme_selected(self, key: str) -> None:
+        self._theme.set_theme(key)
+
+    def _on_theme_changed(self, _key: str) -> None:
+        self._sync_theme_buttons()
+        for pill in getattr(self, "_mcp_pills", {}).values():
+            state = getattr(pill, "_mcp_state", "disconnected")
+            pill._mcp_state = None
+            self._set_mcp_pill(pill, state)
+        if hasattr(self, "_theme_title"):
+            self._motion.fade_in(self._theme_title, MOTION.state_ms)
+
+    def _sync_theme_buttons(self) -> None:
+        for key, button in getattr(self, "_theme_buttons", {}).items():
+            blocked = button.blockSignals(True)
+            button.setChecked(key == self._theme.key)
+            button.blockSignals(blocked)
 
     def _retranslate_language_section(self) -> None:
         self._language_title.setText(i18n.t("settings.language"))
@@ -4402,13 +4589,6 @@ class _SettingsPanel(QWidget):
         pass
 
     # (background, foreground) per status — inline-styled so no global QSS edit.
-    _MCP_PILL_COLORS = {
-        "connected":    ("#6fcf97", "#10241a"),
-        "connecting":   ("#e6c878", "#2a2410"),
-        "failed":       ("#e0a3a3", "#2a1414"),
-        "disconnected": ("rgba(255,255,255,0.10)", "rgba(255,255,255,0.65)"),
-    }
-
     def _build_mcp_section(self) -> QFrame:
         wrap = QFrame()
         wrap.setObjectName("section")
@@ -4827,7 +5007,9 @@ class _SettingsPanel(QWidget):
         if entry.get("temporarily_unavailable"):
             badge = QLabel(i18n.t("mcp.badge_unavailable"))
             badge.setObjectName("providerSub")
-            badge.setStyleSheet("color: #c79030; font-size: 11px;")
+            badge.setStyleSheet(
+                f"color: {self._theme.palette.warning}; font-size: 11px;"
+            )
             badge.setToolTip(i18n.t("mcp.tooltip_google_bug"))
             head.addWidget(badge)
         if self._is_gmail_rest_entry(entry):
@@ -5124,7 +5306,7 @@ class _SettingsPanel(QWidget):
         return row
 
     def _set_mcp_pill(self, pill: QLabel, state: str) -> None:
-        if state not in self._MCP_PILL_COLORS:
+        if state not in {"connected", "connecting", "failed", "disconnected"}:
             state = "disconnected"
         # Re-apply ONLY when the state actually changed. The status poll calls
         # this every ~1.2s; re-setting an identical stylesheet forces Qt to
@@ -5135,7 +5317,14 @@ class _SettingsPanel(QWidget):
         if getattr(pill, "_mcp_state", None) == state:
             return
         pill._mcp_state = state
-        bg, fg = self._MCP_PILL_COLORS[state]
+        palette = self._theme.palette
+        colors = {
+            "connected": (palette.success, palette.background),
+            "connecting": (palette.warning, palette.background),
+            "failed": (palette.error, palette.background),
+            "disconnected": (palette.border, palette.muted_text),
+        }
+        bg, fg = colors[state]
         pill.setText(i18n.t("mcp.status_" + state))
         # Single closing brace: the trailing fragment was previously a NON-f
         # literal ending in "}}", so Qt saw a stray extra "}" and rejected the
@@ -5150,7 +5339,8 @@ class _SettingsPanel(QWidget):
         """Outline a required-but-empty input in red so a no-op Connect is not
         silent. Cleared on the next render."""
         if widget is not None:
-            widget.setStyleSheet("QLineEdit{border:1px solid #e0a3a3;}")
+            error = get_theme_manager().palette.error
+            widget.setStyleSheet(f"QLineEdit{{border:1px solid {error};}}")
 
     def _mcp_build_connect_cfg(self, entry: dict):
         """Return ``(connect_cfg, persist_cfg, token, client_id, client_secret)``.
@@ -6761,6 +6951,7 @@ class _SettingsPanel(QWidget):
 
     def _load_state(self) -> None:
         self._sync_all_cards_keys()
+        self._sync_theme_buttons()
 
         settings = load_settings()
 
@@ -7168,6 +7359,11 @@ class _SettingsPanel(QWidget):
 
     def _retranslate_sections(self) -> None:
         self._settings_title.setText(i18n.t("settings.title"))
+        self._theme_title.setText(i18n.t("theme.section"))
+        self._theme_sub.setText(i18n.t("theme.section_sub"))
+        self._theme_desc.setText(i18n.t("theme.section_desc"))
+        for key, button in self._theme_buttons.items():
+            button.setText(i18n.t(PALETTES[key].name_key))
 
         self._capsule_title.setText(i18n.t("settings.capsule"))
         self._capsule_sub.setText(i18n.t("settings.capsule_sub"))
@@ -8173,37 +8369,69 @@ class _NavButton(QPushButton):
         self.setToolTip(tooltip)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._hovered = False
+        self._hover_progress = 0.0
+        self._hover_anim = QVariantAnimation(self)
+        self._hover_anim.setDuration(MOTION.micro_ms)
+        self._hover_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._hover_anim.valueChanged.connect(self._on_hover_progress)
 
     def enterEvent(self, event):
         self._hovered = True
-        self.update()
+        self._animate_hover(1.0)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         self._hovered = False
-        self.update()
+        self._animate_hover(0.0)
         super().leaveEvent(event)
+
+    def _animate_hover(self, target: float) -> None:
+        self._hover_anim.stop()
+        if reduced_motion_requested(self):
+            self._hover_progress = target
+            self.update()
+            return
+        self._hover_anim.setStartValue(self._hover_progress)
+        self._hover_anim.setEndValue(target)
+        self._hover_anim.start()
+
+    def _on_hover_progress(self, value) -> None:
+        self._hover_progress = float(value)
+        self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        palette = get_theme_manager().palette
 
         rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
         active = self.isChecked()
 
         # Rounded pill background — a subtle violet wash when active (no border
         # line), a softer one on hover.
-        if active:
+        if self.isDown():
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(196, 181, 245, 31))  # rgba(196,181,245,0.12)
+            p.setBrush(palette.color("primary", 55))
+            p.drawRoundedRect(rect, 9, 9)
+        elif active:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(palette.color("primary", 31))
             p.drawRoundedRect(rect, 10, 10)
-        elif self._hovered:
+        elif self._hover_progress > 0.0:
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(196, 181, 245, 36))
+            p.setBrush(
+                palette.color("primary", round(36 * self._hover_progress))
+            )
             p.drawRoundedRect(rect, 12, 12)
 
+        if self.hasFocus():
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(palette.color("focus", 190), 1.2))
+            p.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 9, 9)
+
         # Icon colour: violet accent when active, dim white otherwise.
-        color = ACCENT if active else QColor(245, 245, 250, 200)
+        color = (palette.color("primary") if active
+                 else palette.color("text", 200))
 
         cx = self.width() / 2
         cy = self.height() / 2
@@ -8404,6 +8632,20 @@ class MainPopup(QWidget):
     def __init__(self):
         super().__init__()
 
+        self._theme = get_theme_manager()
+        self._motion = MotionController(
+            self,
+            reduced_motion=lambda: reduced_motion_requested(self),
+        )
+        self._window_opacity_anim = QPropertyAnimation(
+            self, b"windowOpacity", self
+        )
+        self._window_opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._window_opacity_anim.finished.connect(
+            self._on_window_opacity_finished
+        )
+        self._hiding = False
+
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -8500,7 +8742,7 @@ class MainPopup(QWidget):
         # (radius in the #closeBtn QSS) instead of the previous 26px circle.
         close_btn.setFixedSize(30, 30)
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.clicked.connect(self.hide)
+        close_btn.clicked.connect(self._hide_animated)
 
         header.addWidget(logo)
         header.addStretch()
@@ -8618,6 +8860,7 @@ class MainPopup(QWidget):
         nav.addStretch()
         outer.addLayout(nav)
 
+        self._theme.theme_changed.connect(self._on_theme_changed)
         self._apply_style()
         self._stack.setCurrentIndex(self.PAGE_CHAT)
 
@@ -8721,18 +8964,64 @@ class MainPopup(QWidget):
                 self.setGeometry(end)
 
     def toggle(self) -> None:
-        if self.isVisible():
-            self.hide()
+        if self.isVisible() and not self._hiding:
+            self._hide_animated()
         else:
-            self.anchor_below_island()
+            self._show_animated()
+
+    def _show_animated(self) -> None:
+        self._window_opacity_anim.stop()
+        self._hiding = False
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.anchor_below_island()
+        if reduced_motion_requested(self):
+            self.setWindowOpacity(1.0)
             self.show()
-            self.raise_()
-            self.activateWindow()
+        else:
+            self.setWindowOpacity(0.0)
+            self.show()
+            self._window_opacity_anim.setDuration(MOTION.appearance_ms)
+            self._window_opacity_anim.setStartValue(0.0)
+            self._window_opacity_anim.setEndValue(1.0)
+            self._window_opacity_anim.start()
+        self.raise_()
+        self.activateWindow()
+
+    def _hide_animated(self) -> None:
+        if not self.isVisible():
+            return
+        self._window_opacity_anim.stop()
+        if reduced_motion_requested(self):
+            self._hiding = False
+            self.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents, False
+            )
+            self.hide()
+            self.setWindowOpacity(1.0)
+            return
+        self._hiding = True
+        # The fading surface stops intercepting desktop clicks immediately.
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._window_opacity_anim.setDuration(MOTION.micro_ms)
+        self._window_opacity_anim.setStartValue(self.windowOpacity())
+        self._window_opacity_anim.setEndValue(0.0)
+        self._window_opacity_anim.start()
+
+    def _on_window_opacity_finished(self) -> None:
+        if not self._hiding:
+            return
+        self._hiding = False
+        self.hide()
+        self.setWindowOpacity(1.0)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
 
     # ── Public API ────────────────────────────────────────────────────────
 
     def show_chat(self) -> None:
+        changed = self._stack.currentIndex() != self.PAGE_CHAT
         self._stack.setCurrentIndex(self.PAGE_CHAT)
+        if changed:
+            self._motion.fade_in(self._chat, MOTION.page_ms)
         for b in self._nav_buttons.values():
             b.setChecked(False)
         self._apply_current_busy()
@@ -8754,6 +9043,18 @@ class MainPopup(QWidget):
 
     def append_message(self, role: str, text: str) -> None:
         self._chat.append_message(role, text)
+
+    def append_assistant_stream_chunk(self, text: str) -> None:
+        self._chat.append_assistant_stream_chunk(text)
+
+    def finalize_assistant_stream(self, text: str) -> None:
+        self._chat.finalize_assistant_stream(text)
+
+    def fail_assistant_stream(self, text: str) -> None:
+        self._chat.fail_assistant_stream(text)
+
+    def cancel_assistant_stream(self, *, flush: bool = True) -> None:
+        self._chat.cancel_assistant_stream(flush=flush)
 
     def refresh_conversations(self, active_id: str | None) -> None:
         self._active_conversation_id = active_id
@@ -8796,10 +9097,7 @@ class MainPopup(QWidget):
         self._animate_width(POPUP_W)   # autonomous page uses the COMPACT width
         self._autonomous.seed_from_state(state)
         if not self.isVisible():
-            self.anchor_below_island()
-            self.show()
-            self.raise_()
-            self.activateWindow()
+            self._show_animated()
 
     def update_autonomous_progress(self, payload) -> None:
         """Forward a progress snapshot (already on the GUI thread) to the panel."""
@@ -8826,6 +9124,9 @@ class MainPopup(QWidget):
                 self.show_chat()
                 return
             self._stack.setCurrentIndex(page_idx)
+            page = self._stack.currentWidget()
+            if page is not None:
+                self._motion.fade_in(page, MOTION.page_ms)
             # WOR-48 P3: settings hosts the master-detail layout and needs the
             # WIDE window; every other page uses the COMPACT width.
             self._animate_width(
@@ -8893,7 +9194,7 @@ class MainPopup(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         # Wipe the entire widget (corners + shadow margin) to fully
         # transparent each frame before repainting. Without this, the
-        # semi-transparent BG_COLOR / BG_BLUR_LAYER wash accumulates residue
+        # semi-transparent background wash accumulates residue
         # on the translucent window (ghost rectangles, drag smear, and a
         # stale settings detail page that swallows the first category click).
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
@@ -8945,23 +9246,33 @@ class MainPopup(QWidget):
             card.width(), card.height(),
             RADIUS, RADIUS,
         )
-        painter.fillPath(path, BG_COLOR)
+        palette = self._theme.palette
+        painter.fillPath(path, palette.color("background", 125))
         # A second, slightly lighter wash layered on top fakes a frosted-glass
         # blur — the panel reads as semi-transparent glass rather than a flat
         # dark fill.
-        painter.fillPath(path, BG_BLUR_LAYER)
-        painter.setPen(BORDER_COLOR)
+        painter.fillPath(path, palette.color("glass", 85))
+        painter.setPen(palette.color("primary", 70))
         painter.drawPath(path)
         painter.end()
 
     # ── Style ─────────────────────────────────────────────────────────────
 
     def _apply_style(self) -> None:
-        self.setStyleSheet("""
+        self.setStyleSheet(themed_stylesheet("""
             QWidget {
                 color: #e8e6f0;
                 font-family: -apple-system, "Segoe UI", "SF Pro Text",
                              "Helvetica Neue", sans-serif;
+            }
+
+            /* Shared state affordances never change a widget's box metrics. */
+            QPushButton:focus {
+                outline: none;
+                border-color: rgba(196, 181, 245, 0.72);
+            }
+            QPushButton:pressed {
+                color: #e8e6f0;
             }
 
             /* WOR-48 P3: square close button with lightly rounded corners
@@ -8991,6 +9302,10 @@ class MainPopup(QWidget):
                 color: #9d9aad;
                 font-size: 12px;
                 padding: 30px 10px;
+            }
+            QLabel#themeDot {
+                background: #c4b5f5;
+                border-radius: 4px;
             }
 
             QScrollArea#chatScroll, QScrollArea#panelScroll,
@@ -9054,6 +9369,12 @@ class MainPopup(QWidget):
                 background: rgba(15, 13, 22, 0.62);
                 border: 1px solid rgba(196, 181, 245, 0.08);
             }
+            QFrame#msgBubble[streaming="true"] {
+                border: 1px solid rgba(196, 181, 245, 0.22);
+            }
+            QFrame#msgBubble[error="true"] {
+                border: 1px solid rgba(220, 80, 80, 0.55);
+            }
             QLabel#msgText {
                 color: #e8e6f0;
                 font-size: 12px;
@@ -9098,6 +9419,16 @@ class MainPopup(QWidget):
             }
             QPushButton#sendBtn:hover {
                 background: rgba(196, 181, 245, 1.0);
+            }
+            QPushButton#sendBtn:pressed {
+                background: rgba(196, 181, 245, 0.70);
+            }
+            QPushButton#sendBtn:focus {
+                border: 2px solid #e8e6f0;
+            }
+            QLineEdit#chatInput:focus {
+                background: rgba(196, 181, 245, 0.06);
+                border-radius: 6px;
             }
 
             /* Bottom nav (icons are painted by _NavButton) ───────────── */
@@ -9284,6 +9615,23 @@ class MainPopup(QWidget):
             }
             QFrame#section:hover {
                 border: 1px solid rgba(196, 181, 245, 0.32);
+            }
+            QPushButton#themeChoice {
+                background: rgba(196, 181, 245, 0.04);
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                border-radius: 9px;
+                padding: 6px 8px;
+                color: #e8e6f0;
+                font-size: 11px;
+                text-align: left;
+            }
+            QPushButton#themeChoice:hover, QPushButton#themeChoice:focus {
+                background: rgba(196, 181, 245, 0.12);
+                border: 1px solid rgba(196, 181, 245, 0.38);
+            }
+            QPushButton#themeChoice:checked {
+                background: rgba(196, 181, 245, 0.20);
+                border: 1px solid rgba(196, 181, 245, 0.62);
             }
             QLabel#sectionTitle {
                 font-size: 13px;
@@ -9599,13 +9947,19 @@ class MainPopup(QWidget):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0;
             }
-        """)
+        """, self._theme.palette))
+
+    def _on_theme_changed(self, _key: str) -> None:
+        self._apply_style()
+        for nav_button in self._nav_buttons.values():
+            nav_button.update()
+        self.update()
 
     # ── Keys ──────────────────────────────────────────────────────────────
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
-            self.hide()
+            self._hide_animated()
             return
         super().keyPressEvent(event)
 

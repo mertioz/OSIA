@@ -621,6 +621,11 @@ def wake_mode():
         chat_message = pyqtSignal(str, str)
         # Update the chat only if the popup is still viewing this conversation.
         chat_message_for_conversation = pyqtSignal(str, str, str)
+        # Presentation-only desktop assistant streaming. Sentence chunks extend
+        # one bounded typewriter target; final/error frames flush it exactly.
+        assistant_stream_chunk = pyqtSignal(str, str)
+        assistant_stream_final = pyqtSignal(str, str)
+        assistant_stream_error = pyqtSignal(str, str)
         # Drive the island's visual state from a worker thread.
         island_state = pyqtSignal(str)
         # Per-conversation desktop busy state for the popup input controls.
@@ -871,8 +876,12 @@ def wake_mode():
             if voice_response:
                 bridge.island_state.emit("speaking")
 
+        def on_stream_sentence(sentence: str) -> None:
+            bridge.assistant_stream_chunk.emit(conv_id, sentence)
+            if voice_response:
+                speak_streaming(sentence)
+
         try:
-            on_sentence = speak_streaming if voice_response else None
             if voice_response:
                 print(
                     "[TTS] main.wake_mode: streaming TTS wired for this turn "
@@ -887,7 +896,7 @@ def wake_mode():
             reply = turn_agent.run(
                 user_text,
                 history=history,
-                on_sentence=on_sentence,
+                on_sentence=on_stream_sentence,
                 on_first_token=on_first_token,
                 current_conversation_id=conv_id,
             )
@@ -899,13 +908,10 @@ def wake_mode():
                 )
             _persist_agent_delta(conv_id, turn_agent, prev_history_len)
             display = clean_response(reply or "")
-            if display:
-                bridge.chat_message_for_conversation.emit(
-                    conv_id, "assistant", display
-                )
+            bridge.assistant_stream_final.emit(conv_id, display)
         except Exception as e:
             err = f"Error: {e}"
-            bridge.chat_message_for_conversation.emit(conv_id, "assistant", err)
+            bridge.assistant_stream_error.emit(conv_id, err)
             if voice_response:
                 print(f"[TTS] main.wake_mode: speaking error message: {err[:80]!r}", flush=True)
                 threading.Thread(target=lambda: speak(err), daemon=True).start()
@@ -1029,6 +1035,18 @@ def wake_mode():
     def handle_chat_message_for_conversation(conv_id: str, role: str, text: str):
         if active_conv and active_conv.get("id") == conv_id:
             popup.append_message(role, text)
+
+    def handle_assistant_stream_chunk(conv_id: str, text: str):
+        if active_conv and active_conv.get("id") == conv_id:
+            popup.append_assistant_stream_chunk(text)
+
+    def handle_assistant_stream_final(conv_id: str, text: str):
+        if active_conv and active_conv.get("id") == conv_id:
+            popup.finalize_assistant_stream(text)
+
+    def handle_assistant_stream_error(conv_id: str, text: str):
+        if active_conv and active_conv.get("id") == conv_id:
+            popup.fail_assistant_stream(text)
 
     def handle_conversation_busy_changed(conv_id: str, busy: bool):
         popup.set_conversation_busy(conv_id, busy)
@@ -1157,6 +1175,9 @@ def wake_mode():
     bridge.wake_detected.connect(handle_wake)
     bridge.chat_message.connect(handle_chat_message)
     bridge.chat_message_for_conversation.connect(handle_chat_message_for_conversation)
+    bridge.assistant_stream_chunk.connect(handle_assistant_stream_chunk)
+    bridge.assistant_stream_final.connect(handle_assistant_stream_final)
+    bridge.assistant_stream_error.connect(handle_assistant_stream_error)
     bridge.island_state.connect(handle_island_state)
     bridge.conversation_busy_changed.connect(handle_conversation_busy_changed)
     bridge.autonomous_progress.connect(handle_autonomous_progress)

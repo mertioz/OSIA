@@ -84,6 +84,9 @@ DEFAULT_SETTINGS = {
     "stt_local_model": "small",                 # faster-whisper size: "small", "medium"
     "stt_groq_model": "whisper-large-v3-turbo", # "whisper-large-v3", "whisper-large-v3-turbo"
     "language": "en",          # UI language; one of osia.i18n.LANGUAGES
+    # Local desktop visual palette (WOR-129). Additive PC-only preference;
+    # absent/unknown values resolve to the established OSIA violet palette.
+    "ui_theme": "osia",
     # Floating Dynamic Island capsule (WOR-22): when False the capsule window
     # is hidden entirely. The capsule's adaptive shape (capsule/circle/docked)
     # is driven by its on-screen position, persisted in island_shape /

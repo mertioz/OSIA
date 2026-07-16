@@ -1747,6 +1747,54 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "es": "Ajustes",
     },
     # — Settings category nav (WOR-48 P2 master-detail) —
+    "theme.section": {
+        "en": "Themes",
+        "fr": "Th\u00e8mes",
+        "zh": "\u4e3b\u9898",
+        "ja": "\u30c6\u30fc\u30de",
+        "de": "Themen",
+        "es": "Temas",
+    },
+    "theme.section_sub": {
+        "en": "Color palette for the PC interface",
+        "fr": "Palette de couleurs de l'interface PC",
+        "zh": "PC \u754c\u9762\u7684\u989c\u8272\u65b9\u6848",
+        "ja": "PC \u30a4\u30f3\u30bf\u30fc\u30d5\u30a7\u30fc\u30b9\u306e\u30ab\u30e9\u30fc\u30d1\u30ec\u30c3\u30c8",
+        "de": "Farbpalette der PC-Oberfl\u00e4che",
+        "es": "Paleta de colores de la interfaz de PC",
+    },
+    "theme.section_desc": {
+        "en": "Applied immediately and kept for the next OSIA restart.",
+        "fr": "Appliqu\u00e9 imm\u00e9diatement et conserv\u00e9 au prochain d\u00e9marrage d'OSIA.",
+        "zh": "\u7acb\u5373\u5e94\u7528\uff0c\u5e76\u5728 OSIA \u4e0b\u6b21\u542f\u52a8\u65f6\u4fdd\u7559\u3002",
+        "ja": "\u3059\u3050\u306b\u9069\u7528\u3055\u308c\u3001\u6b21\u56de\u306e OSIA \u8d77\u52d5\u6642\u306b\u3082\u4fdd\u6301\u3055\u308c\u307e\u3059\u3002",
+        "de": "Wird sofort angewendet und beim n\u00e4chsten OSIA-Start beibehalten.",
+        "es": "Se aplica al instante y se conserva al reiniciar OSIA.",
+    },
+    "theme.osia": {
+        "en": "OSIA Violet", "fr": "Violet OSIA", "zh": "OSIA \u7d2b",
+        "ja": "OSIA \u30d0\u30a4\u30aa\u30ec\u30c3\u30c8", "de": "OSIA Violett", "es": "Violeta OSIA",
+    },
+    "theme.azure": {
+        "en": "Azure", "fr": "Azur", "zh": "\u5929\u84dd", "ja": "\u30a2\u30ba\u30fc\u30eb",
+        "de": "Azurblau", "es": "Azur",
+    },
+    "theme.emerald": {
+        "en": "Emerald", "fr": "\u00c9meraude", "zh": "\u7fe1\u7fe0", "ja": "\u30a8\u30e1\u30e9\u30eb\u30c9",
+        "de": "Smaragd", "es": "Esmeralda",
+    },
+    "theme.rose": {
+        "en": "Rose", "fr": "Rose", "zh": "\u73ab\u7470", "ja": "\u30ed\u30fc\u30ba",
+        "de": "Ros\u00e9", "es": "Rosa",
+    },
+    "theme.amber": {
+        "en": "Amber", "fr": "Ambre", "zh": "\u7425\u73c0", "ja": "\u30a2\u30f3\u30d0\u30fc",
+        "de": "Bernstein", "es": "\u00c1mbar",
+    },
+    "theme.neutral": {
+        "en": "Neutral", "fr": "Neutre", "zh": "\u4e2d\u6027", "ja": "\u30cb\u30e5\u30fc\u30c8\u30e9\u30eb",
+        "de": "Neutral", "es": "Neutro",
+    },
     "settings.cat.general": {
         "en": "General",
         "fr": "Général",

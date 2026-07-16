@@ -31,16 +31,14 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont, QPen, QPixmap
 from PyQt6.QtWidgets import QApplication, QWidget
 
+from osia.gui.motion import MOTION, reduced_motion_requested
+from osia.gui.theme import get_theme_manager
+
 
 # Visual constants
 ISLAND_W = 320
 ISLAND_H = 52
 RADIUS = 26
-BG_COLOR = QColor(13, 11, 18)               # #0d0b12
-ACCENT = QColor(196, 181, 245)              # #c4b5f5
-ACCENT_DIM = QColor(196, 181, 245, 80)
-WHITE = QColor(255, 255, 255)
-
 IDLE_OPACITY = 0.55
 ACTIVE_OPACITY = 1.0
 
@@ -48,7 +46,7 @@ ACTIVE_OPACITY = 1.0
 # to its full size, with the "OSIA" wordmark fading in at the tail end.
 LAUNCH_W = 60
 LAUNCH_H = 20
-LAUNCH_MS = 600
+LAUNCH_MS = 220
 
 # Idle state — the OSIA logo sits to the left of the "OSIA" wordmark.
 IDLE_LOGO_H = 44               # px; the capsule is 52px tall
@@ -74,7 +72,7 @@ SHAPE_CAPSULE = "capsule"   # default horizontal pill (ISLAND_W x ISLAND_H)
 SHAPE_CIRCLE = "circle"     # compact logo+mic disc, snapped into a bottom corner
 SHAPE_DOCKED = "docked"     # vertical pill tucked behind a side edge ("ear")
 
-MORPH_MS = 300              # shape-morph animation duration
+MORPH_MS = 220              # shape-morph animation duration
 CIRCLE_SIZE = 60           # circle diameter (px)
 # The pill-sized active animations (≈72px wide) are scaled by this factor when
 # painted inside the compact circle so they read as a centred glyph rather than
@@ -110,6 +108,10 @@ class DynamicIsland(QWidget):
 
     def __init__(self):
         super().__init__()
+
+        self._theme = get_theme_manager()
+        self._theme.theme_changed.connect(self._on_theme_changed)
+        self._refresh_theme_colors()
 
         flags = (
             Qt.WindowType.FramelessWindowHint
@@ -193,7 +195,7 @@ class DynamicIsland(QWidget):
 
         # Opacity is animated on state changes so the transitions feel smooth.
         self._opacity_anim = QPropertyAnimation(self, b"windowOpacity")
-        self._opacity_anim.setDuration(220)
+        self._opacity_anim.setDuration(MOTION.state_ms)
         self._opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
         # Shape-morph animation — smoothly animates the window geometry (size +
@@ -231,7 +233,11 @@ class DynamicIsland(QWidget):
         handle = self.windowHandle()
         if handle is not None:
             handle.setFlag(Qt.WindowType.FramelessWindowHint, True)
-        self._launch_anim.start()
+        if reduced_motion_requested(self):
+            self._launch_t = 1.0
+            self.update()
+        else:
+            self._launch_anim.start()
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -246,9 +252,12 @@ class DynamicIsland(QWidget):
         self._anim_ms = 0
         target = IDLE_OPACITY if state == "idle" else ACTIVE_OPACITY
         self._opacity_anim.stop()
-        self._opacity_anim.setStartValue(self.windowOpacity())
-        self._opacity_anim.setEndValue(target)
-        self._opacity_anim.start()
+        if reduced_motion_requested(self):
+            self.setWindowOpacity(target)
+        else:
+            self._opacity_anim.setStartValue(self.windowOpacity())
+            self._opacity_anim.setEndValue(target)
+            self._opacity_anim.start()
 
         # A docked capsule slides out from behind the edge while OSIA is active
         # (so the mic + thinking animation are fully visible) and tucks back in
@@ -276,6 +285,17 @@ class DynamicIsland(QWidget):
             self.hide()
 
     # ── Internals ─────────────────────────────────────────────────────────
+
+    def _refresh_theme_colors(self) -> None:
+        palette = self._theme.palette
+        self._background_color = palette.color("background")
+        self._primary_color = palette.color("primary")
+        self._primary_color_31 = palette.color("primary", 31)
+        self._text_color_200 = palette.color("text", 200)
+
+    def _on_theme_changed(self, _key: str) -> None:
+        self._refresh_theme_colors()
+        self.update()
 
     def _position_at_top(self) -> None:
         screen = self.screen() or QApplication.primaryScreen()
@@ -356,6 +376,8 @@ class DynamicIsland(QWidget):
         self.raise_()
 
     def _tick(self) -> None:
+        if reduced_motion_requested(self):
+            return
         self._phase += 0.10
         if self._phase > 2 * math.pi:
             self._phase -= 2 * math.pi
@@ -508,6 +530,8 @@ class DynamicIsland(QWidget):
         """Move/resize the window to the current shape's target geometry."""
         target = self._target_geometry(self._shape, self._dock_side, slid_out)
         self._morph_anim.stop()
+        if reduced_motion_requested(self):
+            animate = False
         if animate and self.isVisible():
             self._morph_anim.setStartValue(self.geometry())
             self._morph_anim.setEndValue(target)
@@ -641,8 +665,8 @@ class DynamicIsland(QWidget):
 
         # Background capsule
         path = self._capsule_path()
-        painter.setPen(QPen(QColor(196, 181, 245, 31), 1))
-        painter.fillPath(path, BG_COLOR)
+        painter.setPen(QPen(self._primary_color_31, 1))
+        painter.fillPath(path, self._background_color)
         painter.drawPath(path)
 
         # Content overlay.
@@ -694,7 +718,7 @@ class DynamicIsland(QWidget):
         else:
             gx = rect.right() - rect.width() * 0.30
         p.setPen(Qt.PenStyle.NoPen)
-        color = QColor(ACCENT)
+        color = QColor(self._primary_color)
         color.setAlpha(200)
         p.setBrush(color)
         for dy in (-7.0, 0.0, 7.0):
@@ -733,7 +757,7 @@ class DynamicIsland(QWidget):
 
     def _draw_mini_mic(self, p: QPainter, cx: float, cy: float) -> None:
         """A small static microphone glyph centred at (cx, cy), ~16px tall."""
-        pen = QPen(ACCENT, 1.4)
+        pen = QPen(self._primary_color, 1.4)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
@@ -786,7 +810,7 @@ class DynamicIsland(QWidget):
                 self._logo,
             )
             x += logo_w + gap
-        p.setPen(QColor(232, 230, 240, 200))
+        p.setPen(self._text_color_200)
         text_rect = QRectF(x, rect.top(), text_w + 2, rect.height())
         p.drawText(
             text_rect,
@@ -813,14 +837,18 @@ class DynamicIsland(QWidget):
             ring_alpha = int(150 * (1.0 - t))
             if ring_alpha <= 0:
                 continue
-            p.setPen(QPen(QColor(ACCENT.red(), ACCENT.green(), ACCENT.blue(),
-                                 ring_alpha), 2))
+            p.setPen(QPen(QColor(
+                self._primary_color.red(),
+                self._primary_color.green(),
+                self._primary_color.blue(),
+                ring_alpha,
+            ), 2))
             p.drawEllipse(QPointF(cx, cy), ring_r, ring_r)
 
         # Organic, hand-drawn microphone — a calligraphic sketch rather than a
         # crisp UI glyph. Everything is stroke-only with round caps so the
         # bezier curves read like a single flowing pen line.
-        pen = QPen(ACCENT, 1.5)
+        pen = QPen(self._primary_color, 1.5)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
@@ -872,7 +900,7 @@ class DynamicIsland(QWidget):
         omega_t = 2 * math.pi * self._anim_ms / THINK_WAVE_PERIOD_MS
 
         p.setPen(Qt.PenStyle.NoPen)
-        color = QColor(ACCENT)              # #c4b5f5
+        color = QColor(self._primary_color)
         color.setAlpha(235)
         p.setBrush(color)
         for i in range(n):
@@ -898,7 +926,7 @@ class DynamicIsland(QWidget):
             h = amp * (0.4 + 0.6 * abs(math.sin(phase)))
             x = start_x + i * (bar_w + gap)
             rect = QRectF(x, cy - h, bar_w, h * 2)
-            color = QColor(ACCENT)
+            color = QColor(self._primary_color)
             color.setAlpha(220)
             p.setBrush(color)
             p.drawRoundedRect(rect, 1.5, 1.5)
