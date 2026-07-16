@@ -50,7 +50,7 @@ Protocol (JSON over WebSocket, port 8765):
                                      "cpu_temp": float|null, "gpu_temp": float|null,
                                      "timestamp": "<ISO>"}              # pushed every heartbeat_interval_seconds while heartbeat_enabled
     {"type": "transcript",           "content": "...", "conversation_id": "..."}
-    {"type": "response_chunk",       "content": "...", "conversation_id": "..."}  # streamed sentence-by-sentence
+    {"type": "response_chunk",       "content": "...", "conversation_id": "..."}  # progressively streamed coalesced text deltas
     {"type": "response",             "content": "...", "conversation_id": "..."}  # final assembled reply
     {"type": "audio",                "format": "mp3", "data": "<base64>", "source": "response|speak", "conversation_id": "..."}
     {"type": "status",               "content": "thinking|done|error", "conversation_id": "..."}
@@ -119,6 +119,7 @@ from osia.memory import (
     MemoryStore,
     MemoryValidationError,
 )
+from osia.server.text_coalescer import AssistantTextCoalescer
 
 # Windows consoles default to cp1252, which raises UnicodeEncodeError the moment
 # a log line contains a non-ASCII char (e.g. the "▶" in "[OSIA Agent] ▶ tool:")
@@ -710,29 +711,54 @@ class _OutboundChannel:
     The public surface mirrors the subset of ``WebSocket`` the handlers use
     (``send_json`` / ``send_text``), so a call site that previously held a
     ``ws`` for sending can hold an ``_OutboundChannel`` instead with no other
-    change. ``put`` on an unbounded queue never blocks, so
-    ``await channel.send_json(...)`` returns immediately — it does NOT wait for
-    the network. That is exactly what keeps the receive loop free while a
-    response streams.
+    change. Adjacent correlated ``response_chunk`` frames may wait for the
+    bounded text-coalescing deadline; every other frame flushes them first.
+    Queueing still never waits for the network, which keeps the receive loop
+    free while a response streams.
     """
 
-    __slots__ = ("_queue",)
+    __slots__ = ("_closed", "_queue", "_text_coalescer")
 
     def __init__(self) -> None:
         self._queue: asyncio.Queue = asyncio.Queue()
+        self._closed = False
+        self._text_coalescer = AssistantTextCoalescer(
+            lambda frame: self._queue.put_nowait(("json", frame)),
+            loop=asyncio.get_running_loop(),
+        )
 
     async def send_json(self, obj) -> None:
+        if self._closed:
+            return
+        if self._text_coalescer.offer(obj):
+            return
         await self._queue.put(("json", obj))
 
     def send_json_nowait(self, obj) -> None:
+        if self._closed:
+            return
+        if self._text_coalescer.offer(obj):
+            return
         self._queue.put_nowait(("json", obj))
 
     async def send_text(self, text: str) -> None:
+        if self._closed:
+            return
+        self._text_coalescer.flush()
         await self._queue.put(("text", text))
 
     async def close(self) -> None:
         """Signal the writer task to drain what's queued, then stop."""
+        if self._closed:
+            return
+        self._text_coalescer.flush()
+        self._closed = True
         await self._queue.put((_WRITER_STOP, None))
+
+    def abort(self) -> None:
+        """Clear pending coalesced text after the transport has failed."""
+        self._closed = True
+        self._text_coalescer.clear()
 
 
 async def _writer(ws: WebSocket, channel: "_OutboundChannel") -> None:
@@ -755,6 +781,7 @@ async def _writer(ws: WebSocket, channel: "_OutboundChannel") -> None:
                 await ws.send_text(payload)
         except Exception as e:
             print(f"[OSIA Server] writer send failed, stopping writer: {e}")
+            channel.abort()
             return
 
 
@@ -7039,11 +7066,11 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 continue
             if not first_chunk_sent_logged[0]:
                 first_chunk_sent_logged[0] = True
-                _ts(t0, "first response_chunk sent to mobile",
+                _ts(t0, "first response_chunk queued for mobile",
                     f"({len(item)} chars)")
             try:
                 print(
-                    f"[DEBUG] sending response_chunk to mobile "
+                    f"[DEBUG] queueing response_chunk for mobile "
                     f"({len(item)} chars)",
                     flush=True,
                 )
@@ -7247,7 +7274,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             if tail:
                 try:
                     print(
-                        f"[DEBUG] sending tail response_chunk to mobile "
+                        f"[DEBUG] queueing tail response_chunk for mobile "
                         f"({len(tail)} chars)",
                         flush=True,
                     )
@@ -7323,7 +7350,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             # render it instead of an empty reply.
             try:
                 print(
-                    f"[DEBUG] sending fallback response_chunk to mobile "
+                    f"[DEBUG] queueing fallback response_chunk for mobile "
                     f"({len(response_text)} chars)",
                     flush=True,
                 )
