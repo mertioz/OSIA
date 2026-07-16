@@ -6777,6 +6777,12 @@ def _displayable_history(history: list) -> list[dict]:
     return out
 
 
+def _join_sent_chunks(chunks: list[str]) -> str:
+    """Rebuild the text Mobile sees from stripped sentence chunks."""
+
+    return " ".join(chunks)
+
+
 def _tail_not_sent(full: str, sent: str) -> str:
     """Return the portion of ``full`` that hasn't been delivered yet.
 
@@ -7267,7 +7273,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # of a reply.
     if response_text:
         from osia.agent import clean_response
-        sent_concat = "".join(sent_chunks)
+        sent_concat = _join_sent_chunks(sent_chunks)
         cleaned_full = clean_response(response_text).strip()
         if cleaned_full:
             tail = _tail_not_sent(cleaned_full, sent_concat)

@@ -310,6 +310,20 @@ def _text_frames_with_times(
 
 
 class OutboundChannelIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sentence_chunk_boundaries_do_not_trigger_duplicate_tail(self) -> None:
+        from osia.server.server import _join_sent_chunks, _tail_not_sent
+
+        chunks = [
+            "Sentence one.",
+            "Sentence two.",
+            "OSIA-WOR122-LAN-PASS",
+        ]
+        full = "Sentence one. Sentence two. OSIA-WOR122-LAN-PASS"
+        streamed = _join_sent_chunks(chunks)
+
+        self.assertEqual(streamed, full)
+        self.assertEqual(_tail_not_sent(full, streamed), "")
+
     async def test_channel_flushes_text_before_control_and_close(self) -> None:
         from osia.server.server import _OutboundChannel, _WRITER_STOP
 
