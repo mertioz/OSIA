@@ -7327,6 +7327,12 @@ class _SettingsPanel(QWidget):
     # ── Handlers ──────────────────────────────────────────────────────────
 
     def _on_tts_provider_changed(self, _idx: int) -> None:
+        # A provider change must not let an already-queued response continue
+        # with a mixture of old/new voices.  Import lazily so GUI startup keeps
+        # the existing lightweight path.
+        from osia.voice.tts import stop as stop_tts
+
+        stop_tts()
         provider = self._tts_provider_combo.currentData()
         set_setting("tts_provider", provider)
         default_voice = self._provider_default_voice.get(provider)

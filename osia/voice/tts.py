@@ -112,6 +112,23 @@ KOKORO_SR = 24000
 KOKORO_SPEED = TTS_SPEED  # also imported by osia.server.server
 
 _kokoro_pipelines = {}
+_stream_playback_context = threading.local()
+_playback_start_lock = threading.Lock()
+
+
+def _play_samples_if_current(samples, samplerate: int) -> bool:
+    """Start playback atomically only while the streaming epoch is current."""
+
+    epoch = getattr(_stream_playback_context, "epoch", None)
+    with _playback_start_lock:
+        if epoch is not None and epoch != _current_epoch():
+            _debug(
+                f"discarding stale synthesized audio "
+                f"(epoch {epoch} != current {_current_epoch()})"
+            )
+            return False
+        sd.play(samples, samplerate=samplerate)
+        return True
 
 
 def _get_kokoro_pipeline(lang_code: str):
@@ -154,7 +171,8 @@ def speak_kokoro(text: str, block: bool = True) -> bool:
         )
         _log_audio_device()
         _debug("kokoro: playback start")
-        sd.play(samples, samplerate=KOKORO_SR)
+        if not _play_samples_if_current(samples, KOKORO_SR):
+            return True
         if block:
             sd.wait()
             _debug("kokoro: playback finished")
@@ -217,7 +235,8 @@ def speak_openai(text: str, voice: str | None = None, block: bool = True) -> boo
         _debug(f"openai: synthesis done ({len(audio)} samples @ {sr}Hz)")
         _log_audio_device()
         _debug("openai: playback start")
-        sd.play(audio, samplerate=sr)
+        if not _play_samples_if_current(audio, int(sr)):
+            return True
         if block:
             sd.wait()
             _debug("openai: playback finished")
@@ -348,7 +367,8 @@ def speak_google(text: str, voice: str | None = None, block: bool = True) -> boo
     try:
         _log_audio_device()
         _debug("google(gemini): playback start")
-        sd.play(samples, samplerate=GEMINI_TTS_SR)
+        if not _play_samples_if_current(samples, GEMINI_TTS_SR):
+            return True
         if block:
             sd.wait()
             _debug("google(gemini): playback finished")
@@ -669,20 +689,42 @@ def _stream_worker():
             )
             continue
         try:
-            print(f"🔊 Speaking: {text[:80]}{'...' if len(text) > 80 else ''}")
-            _speak_blocking(text)
+            print(f"[TTS] Speaking: {text[:80]}{'...' if len(text) > 80 else ''}")
+            _stream_playback_context.epoch = epoch
+            try:
+                _speak_blocking(text)
+            finally:
+                _stream_playback_context.epoch = None
         except Exception as e:
-            print(f"⚠️  TTS stream error: {e}")
+            print(f"[TTS] stream error: {e}")
 
 
-def speak_streaming(text: str):
+def start_streaming_session() -> int:
+    """Invalidate older speech and return a stable token for one new turn."""
+
+    stop()
+    session_id = _current_epoch()
+    _debug(f"start_streaming_session(): epoch={session_id}")
+    return session_id
+
+
+def speak_streaming(text: str, session_id: int | None = None):
     """Queue a sentence for sequential playback. Use this while a chat
     response is streaming in — each call appends to a single FIFO so
-    sentences play in order without overlapping. Non-blocking.
+    sentences play in order without overlapping. ``session_id`` is the stable
+    token returned by :func:`start_streaming_session`; late callbacks from an
+    invalidated turn are discarded. Non-blocking.
     """
     global _stream_thread
     if not text or not text.strip():
         _debug("speak_streaming() called with empty text — nothing to queue")
+        return
+    epoch = _current_epoch() if session_id is None else session_id
+    if epoch != _current_epoch():
+        _debug(
+            f"speak_streaming(): dropping stale enqueue "
+            f"(epoch {epoch} != current {_current_epoch()})"
+        )
         return
     _debug(f"speak_streaming() queued ({len(text)} chars): {text[:60]!r}")
     with _stream_lock:
@@ -692,7 +734,7 @@ def speak_streaming(text: str):
                 target=_stream_worker, daemon=True, name="osia-tts-stream",
             )
             _stream_thread.start()
-    _stream_queue.put((_current_epoch(), text))
+    _stream_queue.put((epoch, text))
 
 
 def stop() -> None:
@@ -722,9 +764,27 @@ def stop() -> None:
         _debug(f"stop(): drained {drained} pending sentence(s)")
     try:
         if _AUDIO_OK:
-            sd.stop()
+            with _playback_start_lock:
+                sd.stop()
     except Exception as e:
         print(f"⚠️  sd.stop() failed: {e}")
+
+
+def shutdown(join_timeout: float = 2.0) -> None:
+    """Stop playback and reap the streaming worker during application exit."""
+
+    global _stream_thread
+    stop()
+    with _stream_lock:
+        thread = _stream_thread
+        if thread is None or not thread.is_alive():
+            _stream_thread = None
+            return
+        _stream_queue.put(None)
+    thread.join(timeout=max(0.0, join_timeout))
+    with _stream_lock:
+        if not thread.is_alive() and _stream_thread is thread:
+            _stream_thread = None
 
 
 if __name__ == "__main__":

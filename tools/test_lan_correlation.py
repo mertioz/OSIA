@@ -272,18 +272,18 @@ class LanCorrelationTests(unittest.IsolatedAsyncioTestCase):
     async def test_provider_internal_rounds_are_not_persisted_as_messages(self):
         conv = server.conversations.create_conversation()
         meta = self._new_meta(conv["id"], "request-provider-rounds")
+        meta["tts_enabled"] = False
         channel = _FakeChannel()
         agent = _ProviderHistoryAgent()
 
-        with patch.object(server, "_schedule_response_audio", return_value=None):
-            new_history, returned_conv = await server._run_agent_and_respond(
-                channel,
-                "accepted user",
-                [],
-                conv["id"],
-                get_agent=lambda _conv_id: agent,
-                turn_meta=meta,
-            )
+        new_history, returned_conv = await server._run_agent_and_respond(
+            channel,
+            "accepted user",
+            [],
+            conv["id"],
+            get_agent=lambda _conv_id: agent,
+            turn_meta=meta,
+        )
 
         self.assertEqual(returned_conv, conv["id"])
         self.assertGreater(len(new_history), 2)

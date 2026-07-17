@@ -685,6 +685,7 @@ _ACTIVE_TURN_META_BY_CONV: dict[str, dict] = {}
 _ACTIVE_CONV_BY_REQUEST: dict[str, str] = {}
 _POST_TURN_MEDIA_TASKS: set["asyncio.Task"] = set()
 _POST_TURN_MEDIA_BY_CONV: dict[str, "asyncio.Task"] = {}
+_TTS_MAX_PENDING_SEGMENTS = 8
 _CONVERSATION_BUSY_MESSAGE = "OSIA is still working in this conversation."
 _TURN_ID_PREFIX = "turn-"
 _EVENT_ID_PREFIX = "event-"
@@ -4053,6 +4054,13 @@ async def _stop_autonomous_on_shutdown() -> None:
         except Exception as e:
             print(f"[WOR-45] orchestrator.stop on shutdown failed: {e}")
     _release_single_runner()
+    media_tasks = list(_POST_TURN_MEDIA_TASKS)
+    for task in media_tasks:
+        task.cancel()
+    if media_tasks:
+        await asyncio.gather(*media_tasks, return_exceptions=True)
+    _POST_TURN_MEDIA_TASKS.clear()
+    _POST_TURN_MEDIA_BY_CONV.clear()
 
 
 @app.websocket("/ws")
@@ -6299,6 +6307,9 @@ async def websocket_endpoint(ws: WebSocket):
                                 await _send_conversation_busy(out, _conv)
                                 continue
                             turn_meta = _new_turn_meta(_conv, client_request_id)
+                            turn_meta["tts_enabled"] = (
+                                msg.get("tts_enabled", True) is not False
+                            )
                             turn_meta["client_content_hash"] = hashlib.sha256(
                                 img_b64.encode("ascii")
                             ).hexdigest()
@@ -6461,6 +6472,9 @@ async def websocket_endpoint(ws: WebSocket):
                         )
                         persisted_user_content = user_text
                     turn_meta = _new_turn_meta(_conv, client_request_id)
+                    turn_meta["tts_enabled"] = (
+                        msg.get("tts_enabled", True) is not False
+                    )
                     turn_meta["client_content_hash"] = hashlib.sha256(
                         content_identity.encode("utf-8")
                     ).hexdigest()
@@ -6553,6 +6567,9 @@ async def websocket_endpoint(ws: WebSocket):
                     _pf = list(pending_files)
                     pending_files.clear()
                     turn_meta = _new_turn_meta(_conv, client_request_id)
+                    turn_meta["tts_enabled"] = (
+                        msg.get("tts_enabled", True) is not False
+                    )
                     turn_meta["client_content_hash"] = hashlib.sha256(
                         b64_data.encode("ascii")
                     ).hexdigest()
@@ -6640,6 +6657,12 @@ async def websocket_endpoint(ws: WebSocket):
         # block this receive-loop teardown until the agent finishes. They run
         # independently and persist on their own.
         for _cid, _task in list(streaming_tasks.items()):
+            # Text generation stays detached so it can persist, but media has no
+            # live recipient on this channel. Invalidate its per-turn worker now;
+            # late provider bytes can no longer reach a later connection.
+            _media_task = _POST_TURN_MEDIA_BY_CONV.pop(_cid, None)
+            if _media_task is not None:
+                _media_task.cancel()
             _DETACHED_TURNS.add(_task)
             # Also index by conversation id (WOR-62 follow-up) so a reconnecting
             # client's load_conversation can await THIS turn before reading disk.
@@ -6833,83 +6856,315 @@ def _consume_pending_files(user_text: str, pending_files: list[str]) -> str:
 # ---------------------------------------------------------------------------
 # Message handlers
 # ---------------------------------------------------------------------------
-async def _synthesize_response_audio(
+async def _send_response_media_terminal(
     ws: "_OutboundChannel",
-    text: str,
     turn_meta: dict,
-    t0: float,
+    status: str,
 ) -> None:
-    """Generate one correlated media event without affecting text lifecycle."""
+    """Close one correlated media phase without changing the text lifecycle."""
 
-    try:
-        print(f"[TTS] server: synthesizing correlated response ({len(text)} chars)")
-        mp3_bytes = await asyncio.to_thread(synthesize_to_mp3_bytes, text)
-        mp3_b64 = base64.b64encode(mp3_bytes).decode("ascii")
-        frame = _turn_event_frame(
+    await ws.send_json(
+        _turn_event_frame(
             turn_meta,
-            "audio",
+            "media_status",
             message_id=str(turn_meta.get("assistant_message_id") or ""),
             payload={
-                "format": "mp3",
-                "data": mp3_b64,
-                "source": "response",
                 "phase": "media",
+                "status": status,
                 "media_terminal": True,
             },
         )
-        await ws.send_json(frame)
-        _ts(t0, "response audio queued", f"({len(mp3_bytes)} bytes)")
-    except Exception as exc:
-        print(f"[OSIA Server] TTS synthesis failed: {exc}")
+    )
+
+
+class _TTSSettingsChanged(RuntimeError):
+    """Raised inside the worker when a turn's provider/voice was changed."""
+
+
+def _tts_settings_signature() -> tuple[str, str]:
+    from osia.config import get_setting
+
+    return (
+        str(get_setting("tts_provider", "local") or "local"),
+        str(get_setting("tts_voice") or ""),
+    )
+
+
+class _ResponseTTSSession:
+    """One bounded, ordered progressive-TTS pipeline for one assistant turn."""
+
+    def __init__(
+        self,
+        ws: "_OutboundChannel",
+        turn_meta: dict,
+        t0: float,
+        *,
+        synthesize=None,
+        max_pending: int = _TTS_MAX_PENDING_SEGMENTS,
+    ) -> None:
+        self.ws = ws
+        self.turn_meta = turn_meta
+        self.t0 = t0
+        self._synthesize = synthesize or synthesize_to_mp3_bytes
+        self._max_pending = max(1, int(max_pending))
+        self._pending: deque[tuple[int, int, str]] = deque()
+        self._wake = asyncio.Event()
+        self._text_final_sent = asyncio.Event()
+        self._input_finished = False
+        self._cancelled = False
+        self._settings_invalidated = False
+        self._settings_signature: tuple[str, str] | None = None
+        self._next_sequence = 0
+        self._task: asyncio.Task | None = None
+        self._first_synthesis_logged = False
+        self.queued: list[tuple[int, str]] = []
+        self.synthesized: list[tuple[int, int, str]] = []
+        self.delivered: list[tuple[int, int, str]] = []
+
+    @property
+    def task(self) -> "asyncio.Task | None":
+        return self._task
+
+    def start(self) -> "asyncio.Task":
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+        return self._task
+
+    def enqueue(self, text: str) -> int | None:
+        """Queue one speakable fragment without blocking streamed text."""
+
+        cleaned = str(text or "").strip()
+        if not cleaned or self._cancelled or self._input_finished:
+            return None
+        self._next_sequence += 1
+        sequence = self._next_sequence
+        self.queued.append((sequence, cleaned))
+        if len(self._pending) >= self._max_pending:
+            start, _end, previous = self._pending.pop()
+            self._pending.append((start, sequence, f"{previous} {cleaned}"))
+        else:
+            self._pending.append((sequence, sequence, cleaned))
+        self._wake.set()
+        return sequence
+
+    def finish_input(self, canonical_text: str) -> None:
+        """Freeze input and append only the canonical tail not already queued."""
+
+        if self._cancelled or self._input_finished:
+            return
+        queued_text = _join_sent_chunks([text for _seq, text in self.queued])
+        tail = _tail_not_sent(str(canonical_text or "").strip(), queued_text)
+        if tail:
+            self.enqueue(tail)
+        self._input_finished = True
+        self._wake.set()
+
+    def mark_text_final_sent(self) -> None:
+        self._text_final_sent.set()
+        self._wake.set()
+
+    def cancel(self) -> None:
+        """Invalidate pending and in-flight media; late synthesis is discarded."""
+
+        self._cancelled = True
+        self._pending.clear()
+        self._wake.set()
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _synthesize_with_stable_settings(self, text: str) -> bytes:
+        """Run off-loop and reject audio if provider/voice changed mid-turn."""
+
+        current = _tts_settings_signature()
+        if self._settings_signature is None:
+            self._settings_signature = current
+        elif current != self._settings_signature:
+            raise _TTSSettingsChanged("TTS provider or voice changed")
         try:
-            await ws.send_json(
-                _turn_event_frame(
-                    turn_meta,
-                    "media_status",
-                    message_id=str(turn_meta.get("assistant_message_id") or ""),
-                    payload={
-                        "phase": "media",
-                        "status": "error",
-                        "media_terminal": True,
-                    },
-                )
+            return self._synthesize(text)
+        finally:
+            if _tts_settings_signature() != self._settings_signature:
+                raise _TTSSettingsChanged("TTS provider or voice changed")
+
+    @staticmethod
+    def _merge_segments(
+        first: tuple[int, int, str],
+        second: tuple[int, int, str],
+    ) -> tuple[int, int, str]:
+        return first[0], second[1], f"{first[2]} {second[2]}"
+
+    async def _synthesize_segment(
+        self,
+        segment: tuple[int, int, str],
+    ) -> bytes | None:
+        if not self._first_synthesis_logged:
+            self._first_synthesis_logged = True
+            _ts(
+                self.t0,
+                "first TTS request started",
+                f"(sequence={segment[0]}, {len(segment[2])} chars)",
             )
-        except Exception:
-            pass
+        try:
+            mp3_bytes = await asyncio.to_thread(
+                self._synthesize_with_stable_settings,
+                segment[2],
+            )
+            if not mp3_bytes:
+                raise RuntimeError("TTS produced no audio bytes")
+            if not self.synthesized:
+                _ts(
+                    self.t0,
+                    "first audio bytes ready",
+                    f"({len(mp3_bytes)} bytes)",
+                )
+            self.synthesized.append(segment)
+            return mp3_bytes
+        except asyncio.CancelledError:
+            raise
+        except _TTSSettingsChanged as exc:
+            self._settings_invalidated = True
+            print(f"[OSIA Server] progressive TTS invalidated: {exc}")
+            return None
+        except Exception as exc:
+            print(
+                f"[OSIA Server] TTS segment {segment[0]}-{segment[1]} failed: {exc}"
+            )
+            return None
+
+    async def _send_audio(
+        self,
+        segment: tuple[int, int, str],
+        mp3_bytes: bytes,
+        *,
+        terminal: bool,
+    ) -> bool:
+        if self._cancelled:
+            return False
+        frame = _turn_event_frame(
+            self.turn_meta,
+            "audio",
+            message_id=str(self.turn_meta.get("assistant_message_id") or ""),
+            payload={
+                "format": "mp3",
+                "data": base64.b64encode(mp3_bytes).decode("ascii"),
+                "source": "response",
+                "phase": "media",
+                "media_terminal": terminal,
+            },
+        )
+        try:
+            await self.ws.send_json(frame)
+        except Exception as exc:
+            print(f"[OSIA Server] response audio send failed: {exc}")
+            self._cancelled = True
+            return False
+        self.delivered.append(segment)
+        if len(self.delivered) == 1:
+            _ts(
+                self.t0,
+                "first response audio queued",
+                f"({len(mp3_bytes)} bytes)",
+            )
+        return True
+
+    async def _run(self) -> None:
+        carry: tuple[int, int, str] | None = None
+        final_retry_attempted = False
+        try:
+            while not self._cancelled:
+                segment = None
+                if self._pending:
+                    segment = self._pending.popleft()
+                    if carry is not None:
+                        segment = self._merge_segments(carry, segment)
+                        carry = None
+                elif self._input_finished and carry is not None:
+                    if final_retry_attempted:
+                        await self._text_final_sent.wait()
+                        if not self._cancelled:
+                            await _send_response_media_terminal(
+                                self.ws, self.turn_meta, "error"
+                            )
+                        return
+                    final_retry_attempted = True
+                    segment = carry
+                    carry = None
+                elif self._input_finished:
+                    await self._text_final_sent.wait()
+                    if not self._cancelled:
+                        await _send_response_media_terminal(
+                            self.ws, self.turn_meta, "done"
+                        )
+                    return
+                else:
+                    self._wake.clear()
+                    if self._pending or self._input_finished:
+                        continue
+                    await self._wake.wait()
+                    continue
+
+                mp3_bytes = await self._synthesize_segment(segment)
+                if mp3_bytes is None:
+                    if self._settings_invalidated:
+                        self._pending.clear()
+                        await self._text_final_sent.wait()
+                        if not self._cancelled:
+                            await _send_response_media_terminal(
+                                self.ws, self.turn_meta, "error"
+                            )
+                        return
+                    carry = segment
+                    continue
+                if self._cancelled:
+                    return
+                terminal = (
+                    self._input_finished
+                    and not self._pending
+                    and carry is None
+                    and self._text_final_sent.is_set()
+                )
+                if not await self._send_audio(segment, mp3_bytes, terminal=terminal):
+                    return
+                if terminal:
+                    return
+        except asyncio.CancelledError:
+            self._cancelled = True
+            self._pending.clear()
+            raise
 
 
-def _schedule_response_audio(
-    ws: "_OutboundChannel",
-    text: str,
-    turn_meta: dict | None,
-    t0: float,
-) -> None:
-    if not isinstance(turn_meta, dict) or not text:
-        return
+def _track_response_audio_task(
+    task: "asyncio.Task",
+    turn_meta: dict,
+) -> bool:
+    """Track one media worker and keep per-conversation completion ordered."""
+
     conv_id = str(turn_meta.get("conversation_id") or "")
     if not conv_id:
-        return
-    task = asyncio.create_task(_synthesize_response_audio(ws, text, turn_meta, t0))
+        task.cancel()
+        return False
     _POST_TURN_MEDIA_TASKS.add(task)
-    coordinated = _application_transport_coordination_enabled()
-    if not coordinated:
+    if not _application_transport_coordination_enabled():
         task.add_done_callback(_POST_TURN_MEDIA_TASKS.discard)
-        return
+        return True
     if _POST_TURN_MEDIA_BY_CONV.get(conv_id) is not None:
         task.cancel()
         _POST_TURN_MEDIA_TASKS.discard(task)
-        return
+        return False
     _POST_TURN_MEDIA_BY_CONV[conv_id] = task
 
     def _media_done(done_task: "asyncio.Task") -> None:
         _POST_TURN_MEDIA_TASKS.discard(done_task)
         if _POST_TURN_MEDIA_BY_CONV.get(conv_id) is done_task:
             _POST_TURN_MEDIA_BY_CONV.pop(conv_id, None)
-            asyncio.create_task(
-                _broadcast_conversation_busy_changed(conv_id, False, turn_meta)
-            )
+            if not _is_conversation_busy(conv_id):
+                asyncio.create_task(
+                    _broadcast_conversation_busy_changed(conv_id, False, turn_meta)
+                )
 
     task.add_done_callback(_media_done)
+    return True
 
 
 async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
@@ -7034,6 +7289,17 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # Track everything we've actually streamed to the client so we can
     # detect a missing tail at the end of the run.
     sent_chunks: list[str] = []
+    tts_session: _ResponseTTSSession | None = None
+    tts_enabled = (
+        not isinstance(turn_meta, dict)
+        or turn_meta.get("tts_enabled", True) is not False
+    )
+    if tts_enabled and isinstance(turn_meta, dict):
+        candidate = _ResponseTTSSession(ws, turn_meta, t0)
+        if _track_response_audio_task(candidate.start(), turn_meta):
+            tts_session = candidate
+        else:
+            candidate.cancel()
     progress_task: asyncio.Task | None = (
         asyncio.create_task(_turn_progress_loop(ws, turn_meta))
         if isinstance(turn_meta, dict)
@@ -7093,6 +7359,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     )
                 )
                 sent_chunks.append(item)
+                if tts_session is not None:
+                    tts_session.enqueue(item)
                 # Yield to the event loop after every chunk. Enqueuing a frame
                 # does NOT itself yield (unbounded queue put returns straight
                 # away), so without this the sender could monopolise the loop
@@ -7185,6 +7453,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         # catch CancelledError — then propagate the cancellation.
         await _cancel_turn_progress_task(progress_task)
         progress_task = None
+        if tts_session is not None:
+            tts_session.cancel()
         sender_task.cancel()
         try:
             await sender_task
@@ -7194,6 +7464,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     except Exception as e:
         await _cancel_turn_progress_task(progress_task)
         progress_task = None
+        if tts_session is not None:
+            tts_session.cancel()
         print(f"[OSIA Server] Agent error: {e}")
         traceback.print_exc()
         # Drain any in-flight puts and shut the sender down cleanly.
@@ -7297,6 +7569,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                         )
                     )
                     sent_chunks.append(tail)
+                    if tts_session is not None:
+                        tts_session.enqueue(tail)
                     _ts(t0, "tail response_chunk flushed",
                         f"({len(tail)} chars)")
                 except Exception as e:
@@ -7373,8 +7647,13 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     )
                 )
                 sent_chunks.append(response_text)
+                if tts_session is not None:
+                    tts_session.enqueue(response_text)
             except Exception as e:
                 print(f"[OSIA Server] fallback response_chunk send failed: {e}")
+
+    if tts_session is not None:
+        tts_session.finish_input(response_text)
 
     # Send the canonical full text once (clients that don't track chunks
     # can rely on this; clients that do can ignore it).
@@ -7398,6 +7677,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         response_frame,
         terminal_frame,
     ):
+        if tts_session is not None:
+            tts_session.cancel()
         await ws.send_json(_turn_status_frame(turn_meta, "error"))
         current_task = asyncio.current_task()
         if (
@@ -7420,7 +7701,10 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # conversation remains unavailable for another turn until that phase emits
     # its correlated terminal event.
     await ws.send_json(terminal_frame)
-    _schedule_response_audio(ws, response_text, turn_meta, t0)
+    if tts_session is not None:
+        tts_session.mark_text_final_sent()
+    else:
+        await _send_response_media_terminal(ws, turn_meta, "done")
     current_task = asyncio.current_task()
     if (
         active_conv_id

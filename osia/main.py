@@ -599,7 +599,12 @@ def wake_mode():
     # import never blocks GUI startup (WOR perf fix).
     from osia.voice.commands import is_new_chat_command
     from osia.voice.tts import (
-        speak, speak_greeting_cached, speak_streaming, stop as tts_stop,
+        shutdown as tts_shutdown,
+        speak,
+        speak_greeting_cached,
+        speak_streaming,
+        start_streaming_session,
+        stop as tts_stop,
     )
     from osia.agent import clean_response
     from osia import i18n
@@ -861,6 +866,7 @@ def wake_mode():
         """
         nonlocal active_conv
         turn_agent = OSIAAgent()
+        tts_session_id = start_streaming_session() if voice_response else None
         settings = load_settings()
         selected_model = settings.get("selected_model")
         selected_provider = settings.get("selected_model_provider") or None
@@ -879,7 +885,7 @@ def wake_mode():
         def on_stream_sentence(sentence: str) -> None:
             bridge.assistant_stream_chunk.emit(conv_id, sentence)
             if voice_response:
-                speak_streaming(sentence)
+                speak_streaming(sentence, session_id=tts_session_id)
 
         try:
             if voice_response:
@@ -913,8 +919,9 @@ def wake_mode():
             err = f"Error: {e}"
             bridge.assistant_stream_error.emit(conv_id, err)
             if voice_response:
+                error_tts_session = start_streaming_session()
                 print(f"[TTS] main.wake_mode: speaking error message: {err[:80]!r}", flush=True)
-                threading.Thread(target=lambda: speak(err), daemon=True).start()
+                speak_streaming(err, session_id=error_tts_session)
         finally:
             _set_conversation_busy(conv_id, False)
             bridge.conversations_changed.emit(
@@ -1062,6 +1069,7 @@ def wake_mode():
 
     def handle_new_conversation():
         nonlocal active_conv
+        tts_stop()
         agent.reset()
         active_conv = conversations.create_conversation()
         popup.set_messages([])
@@ -1073,6 +1081,7 @@ def wake_mode():
         # Same effect as clicking "Nouveau chat": clear agent history, start a
         # fresh conversation, and reset the chat view + Dynamic Island.
         nonlocal active_conv
+        tts_stop()
         agent.reset()
         active_conv = conversations.create_conversation()
         popup.reset_conversation()
@@ -1085,6 +1094,7 @@ def wake_mode():
         conv = conversations.get_conversation(conv_id)
         if not conv:
             return
+        tts_stop()
         agent.reset()
         msgs = conv.get("messages") or []
         # Seed the agent with history so the next turn keeps context.
@@ -1101,6 +1111,8 @@ def wake_mode():
     def handle_delete_conversation(conv_id: str):
         nonlocal active_conv
         _set_conversation_busy(conv_id, False)
+        if active_conv and conv_id == active_conv.get("id"):
+            tts_stop()
         ok = conversations.delete_conversation(conv_id)
         print(f"🗑  Deleted conversation {conv_id}: {'ok' if ok else 'not found'}")
         if active_conv and conv_id == active_conv.get("id"):
@@ -1484,6 +1496,7 @@ def wake_mode():
 
     def on_quit():
         # Stop the Bloc 5 background threads cleanly before the app tears down.
+        tts_shutdown()
         cron_manager.stop()
         unsubscribe_cron_wake()
         heartbeat_monitor.stop()
