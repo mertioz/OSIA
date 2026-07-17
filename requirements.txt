@@ -52,7 +52,7 @@ zeroconf==0.150.0                 # DNS-SD advertisement for feature-gated LAN t
 # RFC 8707 resource-binding — introduced in mcp 1.28). For local stdio servers
 # like @modelcontextprotocol/server-filesystem a Node toolchain (npx) must also
 # be present, but that is a runtime/user dependency, not a pip one.
-mcp>=1.28.0
+mcp==1.28.0
 
 # ── System / input / utilities ──────────────────────────────────────────────
 psutil>=5.9.0                      # heartbeat metrics + Windows service control

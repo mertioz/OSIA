@@ -10,6 +10,7 @@
   "stt_local_model": "small",
   "stt_groq_model": "whisper-large-v3-turbo",
   "language": "en",
+  "ui_theme": "osia",
   "show_capsule": true,
   "time_format": "24h",
   "ai_hierarchy": {
