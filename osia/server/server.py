@@ -113,6 +113,13 @@ from osia.attachments import (
     cleanup_orphan_batches,
 )
 from osia.config import CONFIG_DIR as _CONFIG_DIR, regenerate_mobile_token
+from osia.legacy_uploads import (
+    LegacyUploadError,
+    LegacyUploadManager,
+    reconcile_legacy_uploads,
+    run_with_legacy_cleanup,
+    safe_legacy_display_name,
+)
 from osia.memory import (
     MemoryError as OsiaMemoryError,
     MemorySecretError,
@@ -267,16 +274,6 @@ def _image_mime_for(path: Path) -> str | None:
     return _IMAGE_MIME.get(path.suffix.lower().lstrip("."))
 
 
-# Windows reserved device basenames — invalid as filenames (with or without an
-# extension, case-insensitive) on Windows. Sanitized on every OS so uploads are
-# portable.
-_WINDOWS_RESERVED_NAMES = {
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
-}
-
-
 def _sanitize_upload_filename(filename: str) -> str:
     """Return a safe basename for a client-supplied upload filename.
 
@@ -285,18 +282,7 @@ def _sanitize_upload_filename(filename: str) -> str:
     dots and spaces, and rename Windows reserved basenames. Always returns a
     non-empty name (falls back to ``upload.bin``).
     """
-    name = os.path.basename(filename or "")
-    name = "".join(
-        ch for ch in name
-        if ch not in '<>:"/\\|?*' and ord(ch) >= 32
-    )
-    name = name.strip(" .")
-    if not name:
-        return "upload.bin"
-    stem = name.split(".", 1)[0]
-    if stem.upper() in _WINDOWS_RESERVED_NAMES:
-        name = f"_{name}"
-    return name
+    return safe_legacy_display_name(filename or "")
 
 # ---------------------------------------------------------------------------
 # Token management
@@ -2926,6 +2912,15 @@ def _ws_confirm_provider(server_id: str, tool_name: str, summary: str) -> bool |
 
 
 @app.on_event("startup")
+async def _reconcile_legacy_uploads_at_startup() -> None:
+    """Remove only server-owned legacy orphans from the dedicated directory."""
+
+    removed = reconcile_legacy_uploads(UPLOAD_DIR)
+    if removed:
+        print(f"[OSIA Server] removed {removed} orphaned legacy upload(s)")
+
+
+@app.on_event("startup")
 async def _start_server_cron_manager() -> None:
     """Start the server-side cron owner when this process holds the cron lock."""
 
@@ -4116,6 +4111,7 @@ async def websocket_endpoint(ws: WebSocket):
     # Files uploaded by the client that haven't been consumed by a turn yet.
     # The next text/audio turn consumes and clears this list.
     pending_files: list[str] = []
+    legacy_uploads = LegacyUploadManager(UPLOAD_DIR)
     attachment_batches = AttachmentBatchManager(ATTACHMENT_UPLOAD_DIR)
 
     async def _expire_attachment_batches() -> None:
@@ -6223,31 +6219,36 @@ async def websocket_endpoint(ws: WebSocket):
 
             # --- Legacy file upload (preserved for older mobile clients) ---
             if msg_type == "file":
-                filename = (msg.get("filename") or "upload.bin").strip()
-                b64_data = msg.get("data", "")
-                if not b64_data:
+                raw_filename = msg.get("filename", "upload.bin")
+                safe_name = _sanitize_upload_filename(
+                    raw_filename if isinstance(raw_filename, str) else ""
+                )
+                try:
+                    upload = legacy_uploads.save_frame(msg)
+                except LegacyUploadError as exc:
+                    print(f"[OSIA Server] legacy file rejected ({exc.code})")
                     await out.send_json({
                         "type": "file_received",
-                        "filename": filename,
+                        "filename": safe_name,
                         "path": "",
                         "success": False,
+                        "error": {"code": exc.code},
                     })
                     continue
+
+                target = upload.path
+                safe_name = upload.display_name
+                ownership_transferred = False
+                ack_sent = False
                 try:
-                    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-                    # Sanitize the client-supplied name (basename only, strip
-                    # illegal/reserved chars & Windows device names), prefix
-                    # with a timestamp to avoid clobbering.
-                    safe_name = _sanitize_upload_filename(filename)
-                    target = UPLOAD_DIR / f"{int(time.time() * 1000)}_{safe_name}"
-                    target.write_bytes(base64.b64decode(b64_data))
-                    image_mime = _image_mime_for(target)
+                    image_mime = _image_mime_for(upload.path)
                     if image_mime is None:
                         # Non-image: queue for the next text/audio turn.
                         pending_files.append(str(target))
+                        ownership_transferred = True
                     print(
                         f"[OSIA Server] file received "
-                        f"({target.stat().st_size} bytes)"
+                        f"({upload.byte_size} bytes)"
                     )
                     await out.send_json({
                         "type": "file_received",
@@ -6255,6 +6256,7 @@ async def websocket_endpoint(ws: WebSocket):
                         "path": str(target),
                         "success": True,
                     })
+                    ack_sent = True
                     if image_mime is not None:
                         # Image: re-read from disk, base64-encode, and trigger
                         # the agent immediately with a DeepSeek Vision message
@@ -6313,23 +6315,57 @@ async def websocket_endpoint(ws: WebSocket):
                             turn_meta["client_content_hash"] = hashlib.sha256(
                                 img_b64.encode("ascii")
                             ).hexdigest()
-                            _spawn_turn(
-                                _conv,
-                                lambda snap, _vc=vision_content, _c=_conv, _m=turn_meta:
-                                    _run_agent_and_respond(
-                                        out, _vc, snap, _c,
+
+                            async def _run_legacy_image_turn(
+                                snap,
+                                _vc=vision_content,
+                                _c=_conv,
+                                _m=turn_meta,
+                                _path=target,
+                            ):
+                                async def _operation():
+                                    return await _run_agent_and_respond(
+                                        out,
+                                        _vc,
+                                        snap,
+                                        _c,
                                         get_agent=_get_conn_agent,
-                                        turn_meta=_m),
+                                        turn_meta=_m,
+                                    )
+
+                                return await run_with_legacy_cleanup(
+                                    legacy_uploads,
+                                    [_path],
+                                    _operation,
+                                )
+
+                            ownership_transferred = _spawn_turn(
+                                _conv,
+                                _run_legacy_image_turn,
                                 turn_meta,
                             )
                 except Exception as e:
-                    print(f"[OSIA Server] file upload failed: {e}")
-                    await out.send_json({
-                        "type": "file_received",
-                        "filename": filename,
-                        "path": "",
-                        "success": False,
-                    })
+                    print(
+                        "[OSIA Server] legacy file processing failed "
+                        f"({type(e).__name__})"
+                    )
+                    if ack_sent:
+                        await out.send_json({
+                            "type": "status",
+                            "content": "error",
+                            "error": "legacy_file_processing_failed",
+                        })
+                    else:
+                        await out.send_json({
+                            "type": "file_received",
+                            "filename": safe_name,
+                            "path": "",
+                            "success": False,
+                            "error": {"code": "legacy_file_processing_failed"},
+                        })
+                finally:
+                    if not ownership_transferred:
+                        legacy_uploads.cleanup([target])
                 continue
 
             # --- Text message ---
@@ -6467,8 +6503,12 @@ async def websocket_endpoint(ws: WebSocket):
                             f"📎 {display_names}\n{user_text}".strip()
                         )
                     else:
+                        # Render from a copy first.  Ownership remains in
+                        # ``pending_files`` until the turn metadata is ready,
+                        # so a handler exception before spawn is still covered
+                        # by connection teardown.
                         agent_input = _consume_pending_files(
-                            user_text, pending_files,
+                            user_text, list(pending_files),
                         )
                         persisted_user_content = user_text
                     turn_meta = _new_turn_meta(_conv, client_request_id)
@@ -6491,27 +6531,53 @@ async def websocket_endpoint(ws: WebSocket):
                         _c=_conv,
                         _m=turn_meta,
                         _batch_id=attachment_batch_id,
+                        _legacy_paths=(
+                            list(pending_files)
+                            if not attachment_batch_id
+                            else []
+                        ),
                     ):
-                        try:
-                            return await _run_agent_and_respond(
-                                out,
-                                _input,
-                                snap,
-                                _c,
-                                get_agent=_get_conn_agent,
-                                turn_meta=_m,
-                            )
-                        finally:
-                            if _batch_id:
-                                attachment_batches.release(_batch_id)
+                        async def _operation():
+                            try:
+                                return await _run_agent_and_respond(
+                                    out,
+                                    _input,
+                                    snap,
+                                    _c,
+                                    get_agent=_get_conn_agent,
+                                    turn_meta=_m,
+                                )
+                            finally:
+                                if _batch_id:
+                                    attachment_batches.release(_batch_id)
 
-                    spawned = _spawn_turn(
-                        _conv,
-                        _run_text_turn_with_attachment_cleanup,
-                        turn_meta,
+                        return await run_with_legacy_cleanup(
+                            legacy_uploads,
+                            _legacy_paths,
+                            _operation,
+                        )
+
+                    legacy_turn_files = (
+                        list(pending_files) if not attachment_batch_id else []
                     )
+                    if legacy_turn_files:
+                        pending_files.clear()
+
+                    try:
+                        spawned = _spawn_turn(
+                            _conv,
+                            _run_text_turn_with_attachment_cleanup,
+                            turn_meta,
+                        )
+                    except BaseException:
+                        legacy_uploads.cleanup(legacy_turn_files)
+                        if attachment_batch_id:
+                            attachment_batches.release(attachment_batch_id)
+                        raise
                     if not spawned and attachment_batch_id:
                         attachment_batches.release(attachment_batch_id)
+                    if not spawned:
+                        legacy_uploads.cleanup(legacy_turn_files)
 
             # --- Audio message ---
             elif msg_type == "audio":
@@ -6565,7 +6631,6 @@ async def websocket_endpoint(ws: WebSocket):
                         await _send_conversation_busy(out, _conv)
                         continue
                     _pf = list(pending_files)
-                    pending_files.clear()
                     turn_meta = _new_turn_meta(_conv, client_request_id)
                     turn_meta["tts_enabled"] = (
                         msg.get("tts_enabled", True) is not False
@@ -6573,15 +6638,45 @@ async def websocket_endpoint(ws: WebSocket):
                     turn_meta["client_content_hash"] = hashlib.sha256(
                         b64_data.encode("ascii")
                     ).hexdigest()
-                    _spawn_turn(
-                        _conv,
-                        lambda snap, _b=b64_data, _f=audio_format, _c=_conv, _files=_pf, _m=turn_meta:
-                            _handle_audio(out, _b, _f, snap, _c,
-                                          pending_files=_files,
-                                          get_agent=_get_conn_agent,
-                                          turn_meta=_m),
-                        turn_meta,
-                    )
+
+                    async def _run_legacy_audio_turn(
+                        snap,
+                        _b=b64_data,
+                        _f=audio_format,
+                        _c=_conv,
+                        _files=_pf,
+                        _m=turn_meta,
+                    ):
+                        async def _operation():
+                            return await _handle_audio(
+                                out,
+                                _b,
+                                _f,
+                                snap,
+                                _c,
+                                pending_files=_files,
+                                get_agent=_get_conn_agent,
+                                turn_meta=_m,
+                            )
+
+                        return await run_with_legacy_cleanup(
+                            legacy_uploads,
+                            _files,
+                            _operation,
+                        )
+
+                    pending_files.clear()
+                    try:
+                        spawned = _spawn_turn(
+                            _conv,
+                            _run_legacy_audio_turn,
+                            turn_meta,
+                        )
+                    except BaseException:
+                        legacy_uploads.cleanup(_pf)
+                        raise
+                    if not spawned:
+                        legacy_uploads.cleanup(_pf)
 
             else:
                 await out.send_json({"type": "status", "content": "error"})
@@ -6601,6 +6696,7 @@ async def websocket_endpoint(ws: WebSocket):
         except Exception:
             pass
     finally:
+        legacy_uploads.cleanup(pending_files)
         attachment_batches.cleanup_disconnected()
         attachment_cleanup_task.cancel()
         try:
