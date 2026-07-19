@@ -6,13 +6,13 @@ remote model discovery.
 """
 
 import re
-import subprocess
 import threading
 import time
 
 import requests
 
 from osia.perf import perf_timer
+from osia.utils.subprocess_policy import run_background_probe
 
 # ── Provider configurations ───────────────────────────────────────────────
 
@@ -196,28 +196,27 @@ def vision_capable_models() -> list:
 _OLLAMA_CACHE: list | None = None
 _OLLAMA_CACHE_AT: float = 0.0
 _OLLAMA_TTL = 30.0  # seconds
+_OLLAMA_CACHE_LOCK = threading.Lock()
+_OLLAMA_CACHE_EPOCH = 0
+_OLLAMA_REFRESH_IN_FLIGHT = False
+_OLLAMA_REFRESH_PENDING = False
+_OLLAMA_REFRESH_CALLBACKS: list = []
 
 
 def invalidate_ollama_models_cache() -> None:
     """Force the next local-model lookup to query the PC runtime again."""
-    global _OLLAMA_CACHE, _OLLAMA_CACHE_AT
-    _OLLAMA_CACHE = None
-    _OLLAMA_CACHE_AT = 0.0
+    global _OLLAMA_CACHE_AT, _OLLAMA_CACHE_EPOCH, _OLLAMA_REFRESH_PENDING
+    with _OLLAMA_CACHE_LOCK:
+        _OLLAMA_CACHE_AT = 0.0
+        _OLLAMA_CACHE_EPOCH += 1
+        if _OLLAMA_REFRESH_IN_FLIGHT:
+            _OLLAMA_REFRESH_PENDING = True
 
 
-def get_ollama_models() -> list:
-    """List locally-installed Ollama models (cached for ``_OLLAMA_TTL`` seconds).
-
-    Returns a fresh copy each call so callers may mutate the result without
-    corrupting the cache.
-    """
-    global _OLLAMA_CACHE, _OLLAMA_CACHE_AT
-    now = time.monotonic()
-    if _OLLAMA_CACHE is not None and (now - _OLLAMA_CACHE_AT) < _OLLAMA_TTL:
-        return list(_OLLAMA_CACHE)
+def _query_ollama_models() -> list:
     with perf_timer("models.get_ollama_models (ollama list subprocess)"):
         try:
-            result = subprocess.run(
+            result = run_background_probe(
                 ["ollama", "list"], capture_output=True, text=True, timeout=2
             )
             out = []
@@ -231,11 +230,96 @@ def get_ollama_models() -> list:
                         "provider": "ollama",
                         "tier": "light",
                     })
+            return out
         except Exception:
-            out = []
-    _OLLAMA_CACHE = out
-    _OLLAMA_CACHE_AT = now
-    return list(out)
+            return []
+
+
+def cached_ollama_models() -> list:
+    """Return the last known local-model snapshot without starting a process."""
+    with _OLLAMA_CACHE_LOCK:
+        return list(_OLLAMA_CACHE or [])
+
+
+def _ollama_cache_fresh(now: float | None = None) -> bool:
+    now = time.monotonic() if now is None else now
+    return _OLLAMA_CACHE is not None and (now - _OLLAMA_CACHE_AT) < _OLLAMA_TTL
+
+
+def _finish_ollama_refresh(out: list, epoch: int) -> None:
+    global _OLLAMA_CACHE, _OLLAMA_CACHE_AT, _OLLAMA_REFRESH_IN_FLIGHT
+    global _OLLAMA_REFRESH_PENDING
+
+    callbacks = []
+    follow_up = False
+    with _OLLAMA_CACHE_LOCK:
+        if epoch == _OLLAMA_CACHE_EPOCH:
+            _OLLAMA_CACHE = list(out)
+            _OLLAMA_CACHE_AT = time.monotonic()
+            callbacks = list(_OLLAMA_REFRESH_CALLBACKS)
+            _OLLAMA_REFRESH_CALLBACKS.clear()
+        else:
+            _OLLAMA_REFRESH_PENDING = True
+        _OLLAMA_REFRESH_IN_FLIGHT = False
+        if _OLLAMA_REFRESH_PENDING:
+            _OLLAMA_REFRESH_PENDING = False
+            follow_up = True
+    for callback in callbacks:
+        try:
+            callback(list(out))
+        except Exception:
+            pass
+    if follow_up:
+        refresh_ollama_models_async()
+
+
+def refresh_ollama_models_async(callback=None, *, force: bool = False):
+    """Refresh local models on one daemon thread, coalescing concurrent callers."""
+    global _OLLAMA_CACHE_AT, _OLLAMA_CACHE_EPOCH, _OLLAMA_REFRESH_IN_FLIGHT
+    global _OLLAMA_REFRESH_PENDING
+
+    with _OLLAMA_CACHE_LOCK:
+        if force:
+            _OLLAMA_CACHE_AT = 0.0
+            _OLLAMA_CACHE_EPOCH += 1
+            if _OLLAMA_REFRESH_IN_FLIGHT:
+                _OLLAMA_REFRESH_PENDING = True
+        if _ollama_cache_fresh() and not force:
+            return None
+        if callback is not None and callback not in _OLLAMA_REFRESH_CALLBACKS:
+            _OLLAMA_REFRESH_CALLBACKS.append(callback)
+        if _OLLAMA_REFRESH_IN_FLIGHT:
+            return None
+        _OLLAMA_REFRESH_IN_FLIGHT = True
+        epoch = _OLLAMA_CACHE_EPOCH
+
+    def worker():
+        _finish_ollama_refresh(_query_ollama_models(), epoch)
+
+    thread = threading.Thread(
+        target=worker, name="osia-ollama-models", daemon=True
+    )
+    thread.start()
+    return thread
+
+
+def get_ollama_models() -> list:
+    """List locally-installed Ollama models (cached for ``_OLLAMA_TTL`` seconds).
+
+    Returns a fresh copy each call so callers may mutate the result without
+    corrupting the cache.
+    """
+    global _OLLAMA_REFRESH_IN_FLIGHT
+    with _OLLAMA_CACHE_LOCK:
+        if _ollama_cache_fresh():
+            return list(_OLLAMA_CACHE or [])
+        if _OLLAMA_REFRESH_IN_FLIGHT:
+            return list(_OLLAMA_CACHE or [])
+        _OLLAMA_REFRESH_IN_FLIGHT = True
+        epoch = _OLLAMA_CACHE_EPOCH
+    out = _query_ollama_models()
+    _finish_ollama_refresh(out, epoch)
+    return cached_ollama_models()
 
 
 # ── Remote model discovery ────────────────────────────────────────────────
@@ -341,6 +425,25 @@ def get_all_models(api_keys: dict | None = None,
             continue
         seen.add(key)
         deduped.append(m)
+    return deduped
+
+
+def get_all_models_cached(api_keys: dict | None = None,
+                          remote_models: list | None = None) -> list:
+    """Return the UI-safe registry without synchronously probing local runtimes."""
+    models = list(HARDCODED_MODELS)
+    models.extend(cached_ollama_models())
+    if remote_models:
+        models.extend(remote_models)
+
+    seen = set()
+    deduped = []
+    for model in models:
+        key = (model["provider"], model["id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(model)
     return deduped
 
 
@@ -497,3 +600,8 @@ def provider_for_model(model_id: str, models: list | None = None) -> str:
     if "grok" in lower:
         return "xai"
     return "ollama"
+
+
+def provider_for_model_cached(model_id: str) -> str:
+    """Resolve a model for UI rendering without starting a runtime probe."""
+    return provider_for_model(model_id, models=get_all_models_cached())

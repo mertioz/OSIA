@@ -5,7 +5,6 @@ Dark glassmorphism style, positioned right side of screen.
 Contains: model selector, chat input, response area, status indicator.
 """
 
-import subprocess
 import threading
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -18,12 +17,13 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QColor, QPainter, QBrush, QPen, QFont, QFontMetrics,
 )
+from osia.utils.subprocess_policy import run_background_probe
 
 
 def get_ollama_models():
     """Run 'ollama list' and return list of model names."""
     try:
-        result = subprocess.run(
+        result = run_background_probe(
             ["ollama", "list"], capture_output=True, text=True, timeout=10
         )
         lines = result.stdout.strip().split("\n")

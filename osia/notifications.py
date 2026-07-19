@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 
+from osia.utils.subprocess_policy import run_background_probe
+
 _SECRET_HINT_RE = re.compile(
     r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|bearer)\b|"
     r"\b(?:sk|pk)-[A-Za-z0-9_-]{16,}\b"
@@ -79,9 +81,8 @@ def _notify_windows(title: str, body: str) -> bool:
         "New-BurntToastNotification -Text @($args[0], $args[1]); exit 0 "
         "} exit 1"
     )
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        result = subprocess.run(
+        result = run_background_probe(
             [
                 powershell,
                 "-NoProfile",
@@ -94,10 +95,9 @@ def _notify_windows(title: str, body: str) -> bool:
                 body,
             ],
             check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
             timeout=8,
-            creationflags=creationflags,
         )
         return result.returncode == 0
     except Exception:

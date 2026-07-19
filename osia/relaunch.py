@@ -17,6 +17,7 @@ from osia.runtime import (
     application_executable,
     is_frozen,
 )
+from osia.utils.subprocess_policy import ProcessMode, process_kwargs
 
 
 DESKTOP_MUTEX_NAME = "Local\\OSIA.Desktop"
@@ -55,19 +56,32 @@ def _detached_kwargs() -> dict:
     kwargs = {
         "cwd": str(application_dir()),
         "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
         "close_fds": True,
     }
+    try:
+        log_path = Path(CONFIG_DIR) / "logs" / "relaunch.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_stream = log_path.open("a", encoding="utf-8", errors="replace")
+        kwargs["stdout"] = log_stream
+        kwargs["stderr"] = log_stream
+    except OSError:
+        # Inherit the current diagnostic handles if the OSIA log is unavailable.
+        pass
     if sys.platform == "win32":
-        kwargs["creationflags"] = (
-            subprocess.CREATE_NEW_PROCESS_GROUP
-            | subprocess.DETACHED_PROCESS
-            | subprocess.CREATE_NO_WINDOW
-        )
+        kwargs = process_kwargs(ProcessMode.RELAUNCH_COORDINATOR, kwargs)
     else:
         kwargs["start_new_session"] = True
     return kwargs
+
+
+def _close_child_streams(kwargs: dict) -> None:
+    streams = {kwargs.get("stdout"), kwargs.get("stderr")}
+    for stream in streams:
+        if hasattr(stream, "close"):
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 def _write_marker(parent_pid: int) -> None:
@@ -101,7 +115,11 @@ def prepare_relaunch(*, parent_pid: int | None = None, process_factory=None) -> 
     factory = process_factory or subprocess.Popen
     try:
         _write_marker(pid)
-        factory(coordinator_command(pid), **_detached_kwargs())
+        kwargs = _detached_kwargs()
+        try:
+            factory(coordinator_command(pid), **kwargs)
+        finally:
+            _close_child_streams(kwargs)
     except Exception:
         clear_stale_restart_state()
         with _request_lock:
@@ -214,7 +232,11 @@ def run_coordinator(
             _release_windows_mutex(desktop_mutex)
         elif not wait_desktop_mutex(MUTEX_RELEASE_TIMEOUT):
             return 4
-        factory(desktop_command(), **_detached_kwargs())
+        kwargs = _detached_kwargs()
+        try:
+            factory(desktop_command(), **kwargs)
+        finally:
+            _close_child_streams(kwargs)
         return 0
     except Exception:
         return 5

@@ -48,8 +48,8 @@ from osia import legal
 from osia.agent import strip_tool_artifacts
 from osia.memory import MemoryStore
 from osia.models import (
-    PROVIDERS, get_all_models,
-    provider_for_model, model_has_vision, vision_capable_models,
+    PROVIDERS, get_all_models_cached as get_all_models, provider_for_model_cached,
+    refresh_ollama_models_async, model_has_vision, vision_capable_models,
 )
 from osia.config import (
     load_api_keys, save_api_keys, load_settings, set_setting, set_api_key,
@@ -1223,6 +1223,7 @@ class _ModelPanel(QWidget):
 
     model_changed = pyqtSignal(str, str)
     account_refresh_requested = pyqtSignal()
+    local_models_refresh_requested = pyqtSignal()
 
     PROVIDER_ORDER = (
         "chatgpt_account", "anthropic", "openai", "deepseek", "google",
@@ -1312,8 +1313,14 @@ class _ModelPanel(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.account_refresh_requested.emit()
+        QTimer.singleShot(50, self._request_visible_refreshes)
         self._account_refresh_timer.start()
+
+    def _request_visible_refreshes(self) -> None:
+        if not self.isVisible():
+            return
+        self.account_refresh_requested.emit()
+        self.local_models_refresh_requested.emit()
 
     def hideEvent(self, event):
         self._account_refresh_timer.stop()
@@ -2275,10 +2282,14 @@ class _SettingsPanel(QWidget):
     _chatgpt_status_ready = pyqtSignal(dict)
     _chatgpt_login_ready = pyqtSignal(dict)
     chatgpt_status_changed = pyqtSignal(dict)
+    local_models_refresh_requested = pyqtSignal()
 
     # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
     # last as an info-only row).
     _AI_PROVIDER_ORDER = ("anthropic", "openai", "google", "deepseek", "xai", "groq", "mistral")
+    _SETTINGS_STATE_TTL = timedelta(seconds=5)
+    _CHATGPT_STATUS_TTL = timedelta(seconds=15)
+    _STARTUP_STATUS_TTL = timedelta(seconds=5)
 
     # Active TTS provider options: (settings value, combo label / i18n key).
     _TTS_PROVIDERS = (
@@ -2355,6 +2366,8 @@ class _SettingsPanel(QWidget):
         # True while a background startup-status probe is in flight, so the 5s
         # timer / repeated shows never pile up overlapping probe threads.
         self._startup_probe_busy = False
+        self._startup_refresh_pending = False
+        self._startup_last_probe = datetime.min
         self._startup_status_ready.connect(self._apply_startup_status)
         self._gmail_rest_status = {
             "status": "disconnected",
@@ -2377,6 +2390,10 @@ class _SettingsPanel(QWidget):
         self._chatgpt_probe_busy = False
         self._chatgpt_action_busy = False
         self._chatgpt_last_status = None
+        self._chatgpt_last_probe = datetime.min
+        self._chatgpt_request_generation = 0
+        self._chatgpt_active_probe_generation: int | None = None
+        self._chatgpt_refresh_pending = False
         self._chatgpt_retry_view_state: tuple[int, int] | None = None
         self._chatgpt_status_ready.connect(self._apply_chatgpt_status)
         self._chatgpt_login_ready.connect(self._apply_chatgpt_login_action)
@@ -2516,6 +2533,8 @@ class _SettingsPanel(QWidget):
         )
 
         self._apply_style()
+        self._state_loaded_at = datetime.min
+        self._state_refresh_scheduled = False
         self._load_state()
 
         # WOR-48 P3 — cap every combo's minimum width so no page's minimum
@@ -3828,7 +3847,9 @@ class _SettingsPanel(QWidget):
 
     def _cron_model_choices(self) -> list[tuple[str, dict]]:
         try:
-            models = get_all_models(remote_models=getattr(self, "_remote_models", []))
+            models = get_all_models(
+                remote_models=getattr(self, "_remote_models", [])
+            )
         except Exception:
             models = []
         try:
@@ -3875,7 +3896,7 @@ class _SettingsPanel(QWidget):
                 return dict(meta)
         if not provider:
             try:
-                provider = provider_for_model(model_id)
+                provider = provider_for_model_cached(model_id)
             except Exception:
                 provider = ""
         return {
@@ -6838,11 +6859,30 @@ class _SettingsPanel(QWidget):
         self._chatgpt_usage.setText(text)
         self._chatgpt_usage.setVisible(bool(text and status.get("connected")))
 
-    def _probe_chatgpt_account(self) -> None:
-        if self._chatgpt_probe_busy or self._chatgpt_action_busy:
+    def _probe_chatgpt_account(self, force: bool = False) -> None:
+        now = datetime.now()
+        if self._chatgpt_action_busy:
+            if force:
+                self._chatgpt_refresh_pending = True
             return
+        if (
+            not force
+            and self._chatgpt_last_status is not None
+            and now - self._chatgpt_last_probe < self._CHATGPT_STATUS_TTL
+        ):
+            return
+        if self._chatgpt_probe_busy:
+            if force:
+                self._chatgpt_request_generation += 1
+                self._chatgpt_refresh_pending = True
+            return
+
         self._chatgpt_probe_busy = True
-        self._set_chatgpt_ui_state("checking")
+        self._chatgpt_request_generation += 1
+        generation = self._chatgpt_request_generation
+        self._chatgpt_active_probe_generation = generation
+        if self._chatgpt_last_status is None:
+            self._set_chatgpt_ui_state("checking")
 
         def worker():
             try:
@@ -6853,7 +6893,14 @@ class _SettingsPanel(QWidget):
                     "available": False, "runtimeAvailable": False,
                     "connected": False, "models": [], "error": "runtime_missing",
                 }
-            self._chatgpt_status_ready.emit(status)
+            status = dict(status)
+            status["_osiaRequestGeneration"] = generation
+            status["_osiaRequestKind"] = "probe"
+            try:
+                self._chatgpt_status_ready.emit(status)
+            except RuntimeError:
+                # The Settings panel may have been destroyed during shutdown.
+                pass
 
         threading.Thread(
             target=worker, name="osia-chatgpt-status", daemon=True
@@ -6901,12 +6948,39 @@ class _SettingsPanel(QWidget):
 
     def _on_chatgpt_auth_storage_changed(self, _path: str) -> None:
         self._configure_chatgpt_file_watcher()
-        self._probe_chatgpt_account()
+        self._probe_chatgpt_account(force=True)
 
     def _apply_chatgpt_status(self, status: dict) -> None:
-        self._chatgpt_probe_busy = False
-        self._chatgpt_action_busy = False
-        self._chatgpt_last_status = dict(status or {})
+        status = dict(status or {})
+        generation = status.pop("_osiaRequestGeneration", None)
+        request_kind = status.pop("_osiaRequestKind", None)
+        if generation is not None and generation != self._chatgpt_request_generation:
+            if (
+                request_kind == "probe"
+                and generation == self._chatgpt_active_probe_generation
+            ):
+                self._chatgpt_probe_busy = False
+                self._chatgpt_active_probe_generation = None
+            if (
+                self._chatgpt_refresh_pending
+                and not self._chatgpt_probe_busy
+                and not self._chatgpt_action_busy
+            ):
+                self._chatgpt_refresh_pending = False
+                QTimer.singleShot(0, lambda: self._probe_chatgpt_account(force=True))
+            return
+
+        if request_kind == "probe":
+            self._chatgpt_probe_busy = False
+            self._chatgpt_active_probe_generation = None
+        elif request_kind == "action":
+            self._chatgpt_action_busy = False
+        else:
+            self._chatgpt_probe_busy = False
+            self._chatgpt_action_busy = False
+        self._chatgpt_refresh_pending = False
+        self._chatgpt_last_probe = datetime.now()
+        self._chatgpt_last_status = status
         self._refresh_chatgpt_usage_text()
         connected = bool(status.get("connected"))
         available = bool(status.get("available"))
@@ -6972,6 +7046,9 @@ class _SettingsPanel(QWidget):
         if self._chatgpt_action_busy:
             return
         self._chatgpt_action_busy = True
+        self._chatgpt_last_probe = datetime.min
+        self._chatgpt_request_generation += 1
+        generation = self._chatgpt_request_generation
         self._set_chatgpt_ui_state("connecting")
         if self._chatgpt_retry_view_state is not None:
             QTimer.singleShot(0, self._restore_chatgpt_retry_view)
@@ -6994,7 +7071,10 @@ class _SettingsPanel(QWidget):
                     except Exception:
                         pass
                     raise RuntimeError("browser_failed")
-                self._chatgpt_login_ready.emit({"state": "waiting"})
+                self._chatgpt_login_ready.emit({
+                    "state": "waiting",
+                    "_osiaRequestGeneration": generation,
+                })
                 provider.wait_for_login(login["loginId"], timeout=300.0)
                 status = self._chatgpt_status_with_usage(provider)
             except Exception as exc:
@@ -7013,6 +7093,9 @@ class _SettingsPanel(QWidget):
                 }
                 if category != "login_cancelled":
                     status["error"] = category
+            status = dict(status)
+            status["_osiaRequestGeneration"] = generation
+            status["_osiaRequestKind"] = "action"
             self._chatgpt_status_ready.emit(status)
 
         threading.Thread(
@@ -7020,12 +7103,19 @@ class _SettingsPanel(QWidget):
         ).start()
 
     def _apply_chatgpt_login_action(self, action: dict) -> None:
-        if action.get("state") == "waiting" and self._chatgpt_action_busy:
+        if (
+            action.get("_osiaRequestGeneration") == self._chatgpt_request_generation
+            and action.get("state") == "waiting"
+            and self._chatgpt_action_busy
+        ):
             self._set_chatgpt_ui_state("waiting")
 
     def _on_chatgpt_cancel(self) -> None:
         if not self._chatgpt_action_busy:
             return
+        self._chatgpt_last_probe = datetime.min
+        self._chatgpt_request_generation += 1
+        generation = self._chatgpt_request_generation
 
         def worker():
             try:
@@ -7033,10 +7123,12 @@ class _SettingsPanel(QWidget):
                 get_account_provider().cancel_login()
             except Exception:
                 pass
-            self._chatgpt_status_ready.emit(
-                {"available": False, "runtimeAvailable": True,
-                 "connected": False, "models": [], "error": "disconnected"}
-            )
+            self._chatgpt_status_ready.emit({
+                "available": False, "runtimeAvailable": True,
+                "connected": False, "models": [], "error": "disconnected",
+                "_osiaRequestGeneration": generation,
+                "_osiaRequestKind": "action",
+            })
 
         threading.Thread(
             target=worker, name="osia-chatgpt-login-cancel", daemon=True
@@ -7046,6 +7138,9 @@ class _SettingsPanel(QWidget):
         if self._chatgpt_action_busy:
             return
         self._chatgpt_action_busy = True
+        self._chatgpt_last_probe = datetime.min
+        self._chatgpt_request_generation += 1
+        generation = self._chatgpt_request_generation
         self._set_chatgpt_ui_state("checking")
 
         def worker():
@@ -7054,10 +7149,12 @@ class _SettingsPanel(QWidget):
                 get_account_provider().logout()
             except Exception:
                 pass
-            self._chatgpt_status_ready.emit(
-                {"available": False, "runtimeAvailable": True,
-                 "connected": False, "models": [], "error": "disconnected"}
-            )
+            self._chatgpt_status_ready.emit({
+                "available": False, "runtimeAvailable": True,
+                "connected": False, "models": [], "error": "disconnected",
+                "_osiaRequestGeneration": generation,
+                "_osiaRequestKind": "action",
+            })
 
         threading.Thread(
             target=worker, name="osia-chatgpt-logout", daemon=True
@@ -7076,7 +7173,7 @@ class _SettingsPanel(QWidget):
         """Show the vision-companion row only when the selected main model
         can't process images, and prefill it from ``settings`` (WOR-25)."""
         main_model = (settings.get("selected_model") or "").strip()
-        main_provider = provider_for_model(main_model) if main_model else None
+        main_provider = provider_for_model_cached(main_model) if main_model else None
         show = bool(main_model) and not model_has_vision(main_provider, main_model)
         self._vision_row.setVisible(show)
         if not show or not self._vision_provider_order:
@@ -7368,6 +7465,7 @@ class _SettingsPanel(QWidget):
         # Mobile token (masked)
         self._mobile_token = load_mobile_token()
         self._update_token_mask()
+        self._state_loaded_at = datetime.now()
 
     @staticmethod
     def _stt_selected_model(settings: dict, provider: str) -> str | None:
@@ -7802,9 +7900,9 @@ class _SettingsPanel(QWidget):
             self._startup_refresh_guard = True
             toggle.setChecked(not checked)
             self._startup_refresh_guard = False
-        self._refresh_startup_status()
+        self._refresh_startup_status(force=True)
 
-    def _refresh_startup_status(self) -> None:
+    def _refresh_startup_status(self, force: bool = False) -> None:
         """Probe each startup service OFF the UI thread.
 
         ``get_service_status`` / ``is_service_enabled`` shell out to ``tasklist``
@@ -7815,6 +7913,13 @@ class _SettingsPanel(QWidget):
         (WOR perf fix). A guard prevents overlapping probes from stacking up.
         """
         if self._startup_probe_busy:
+            if force:
+                self._startup_refresh_pending = True
+            return
+        if (
+            not force
+            and datetime.now() - self._startup_last_probe < self._STARTUP_STATUS_TTL
+        ):
             return
         units = [unit for unit, _dot, _toggle in self._startup_rows]
         if not units:
@@ -7838,6 +7943,7 @@ class _SettingsPanel(QWidget):
     def _apply_startup_status(self, results: list) -> None:
         """Apply background startup-status probe results on the GUI thread."""
         self._startup_probe_busy = False
+        self._startup_last_probe = datetime.now()
         status = {unit: (state, enabled) for (unit, state, enabled) in results}
         self._startup_refresh_guard = True
         for unit, dot, toggle in self._startup_rows:
@@ -7851,21 +7957,60 @@ class _SettingsPanel(QWidget):
             if toggle.isChecked() != enabled:
                 toggle.setChecked(enabled)
         self._startup_refresh_guard = False
+        if self._startup_refresh_pending:
+            self._startup_refresh_pending = False
+            QTimer.singleShot(
+                0, lambda: self._refresh_startup_status(force=True)
+            )
 
     # ── Visibility hooks ──────────────────────────────────────────────────
 
+    def _apply_local_models_snapshot(self) -> None:
+        """Repaint local-model consumers after the worker publishes its cache."""
+        if hasattr(self, "_hier_values"):
+            self._render_hier_category("heavy")
+            self._render_hier_category("medium")
+        if hasattr(self, "_cron_host"):
+            self._render_cron()
+        self._apply_vision_row(load_settings())
+
+    def _schedule_state_refresh_if_stale(self) -> None:
+        if (
+            datetime.now() - self._state_loaded_at < self._SETTINGS_STATE_TTL
+            or self._state_refresh_scheduled
+        ):
+            return
+        self._state_refresh_scheduled = True
+        # Let Qt paint the already-cached page before rebuilding stale controls.
+        QTimer.singleShot(50, self._refresh_scheduled_state)
+
+    def _refresh_scheduled_state(self) -> None:
+        self._state_refresh_scheduled = False
+        if not self.isVisible():
+            return
+        with perf_timer("settings.deferred: _load_state"):
+            self._load_state()
+
     def showEvent(self, event):
         super().showEvent(event)
-        with perf_timer("settings.showEvent: _load_state"):
-            self._load_state()
+        self._schedule_state_refresh_if_stale()
         # Lazy, asynchronous account discovery: constructing OSIA never starts
         # Codex, and opening Settings remains responsive when it is unavailable.
-        self._probe_chatgpt_account()
-        with perf_timer("settings.showEvent: _refresh_startup_status (async)"):
-            self._refresh_startup_status()
+        # Queue the thread starts behind the show event.  The probes themselves
+        # remain off-thread; a zero-delay callback also prevents an unrelated
+        # delayed probe from racing a Retry/login action shortly afterwards.
+        QTimer.singleShot(0, self._refresh_visible_probes)
         self._startup_timer.start()
-        self._refresh_mcp_status()
         self._mcp_timer.start()
+
+    def _refresh_visible_probes(self) -> None:
+        if not self.isVisible():
+            return
+        self.local_models_refresh_requested.emit()
+        self._probe_chatgpt_account()
+        with perf_timer("settings.deferred: _refresh_startup_status (async)"):
+            self._refresh_startup_status()
+        self._refresh_mcp_status()
 
     def hideEvent(self, event):
         super().hideEvent(event)
@@ -8402,7 +8547,7 @@ class _AutonomousPanel(QWidget):
             # providers, so an empty selection means no API key is set anywhere.
             # Don't launch a task that would fail immediately.
             return
-        provider = provider_for_model(model) if model else ""
+        provider = provider_for_model_cached(model) if model else ""
         self._prog_objective.setText(objective)
         # Lock the panel immediately (planning runs off the GUI thread); the host
         # flips us to "running" or re-opens us via a progress event.
@@ -8855,6 +9000,7 @@ class MainPopup(QWidget):
     autonomous_start_requested = pyqtSignal(str, str, str)
     autonomous_interrupt_requested = pyqtSignal()
     autonomous_abort_requested = pyqtSignal()
+    _ollama_models_ready = pyqtSignal(list)
 
     # Index of the chat page in the QStackedWidget.
     PAGE_CHAT = 0
@@ -9028,6 +9174,13 @@ class MainPopup(QWidget):
         self._models.account_refresh_requested.connect(
             self._settings._probe_chatgpt_account
         )
+        self._models.local_models_refresh_requested.connect(
+            self._request_local_models_refresh
+        )
+        self._settings.local_models_refresh_requested.connect(
+            self._request_local_models_refresh
+        )
+        self._ollama_models_ready.connect(self._apply_local_models)
         self._settings.capsule_visibility_changed.connect(
             self.capsule_visibility_changed.emit
         )
@@ -9098,6 +9251,7 @@ class MainPopup(QWidget):
         self._theme.theme_changed.connect(self._on_theme_changed)
         self._apply_style()
         self._stack.setCurrentIndex(self.PAGE_CHAT)
+        QTimer.singleShot(0, self._request_local_models_refresh)
 
     # ── Window placement ──────────────────────────────────────────────────
 
@@ -9319,6 +9473,17 @@ class MainPopup(QWidget):
         self._models.set_remote_models(remote)
         self._settings.set_remote_models(remote)
 
+    def _request_local_models_refresh(self) -> None:
+        refresh_ollama_models_async(self._publish_local_models)
+
+    def _publish_local_models(self, models: list) -> None:
+        self._ollama_models_ready.emit(list(models))
+
+    def _apply_local_models(self, _models: list) -> None:
+        self._models.refresh()
+        self._settings._apply_local_models_snapshot()
+        self._autonomous._populate_models()
+
     # ── Autonomous agent (WOR-45 Phase 4) ─────────────────────────────────
 
     def show_autonomous(self, state) -> None:
@@ -9369,8 +9534,6 @@ class MainPopup(QWidget):
             )
             if page_idx == self.PAGE_CONVS:
                 self._convs.refresh()
-            elif page_idx == self.PAGE_MODELS:
-                self._models.refresh()
             elif page_idx == self.PAGE_OSIA:
                 self._osia.refresh()
 

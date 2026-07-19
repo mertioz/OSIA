@@ -23,6 +23,11 @@ from typing import Callable
 from urllib.parse import urlparse
 
 from osia.runtime import resource_path
+from osia.utils.subprocess_policy import (
+    ProcessMode,
+    process_kwargs,
+    run_background_probe,
+)
 
 from .rate_limits import (
     merge_rate_limit_payload,
@@ -225,18 +230,14 @@ def _native_candidates(base_dir: Path | None = None) -> list[Path]:
 def _probe_executable(candidate: Path) -> str | None:
     if not candidate.is_file():
         return None
-    kwargs = {}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
-        result = subprocess.run(
+        result = run_background_probe(
             [str(candidate), "--version"],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=5,
-            **kwargs,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -469,11 +470,10 @@ class AppServerClient:
                 "bufsize": 1,
             }
             if sys.platform == "win32":
-                kwargs["creationflags"] = (
-                    subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-                )
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
             else:
                 kwargs["start_new_session"] = True
+            kwargs = process_kwargs(ProcessMode.BACKGROUND_SUPERVISED, kwargs)
             try:
                 self._process = self._process_factory(command, **kwargs)
             except (OSError, subprocess.SubprocessError) as exc:

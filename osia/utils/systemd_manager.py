@@ -45,6 +45,7 @@ from osia.runtime import (
     is_frozen,
     resource_root,
 )
+from osia.utils.subprocess_policy import run_background_probe
 
 # ── Windows detection + mappings ────────────────────────────────────────────
 _IS_WINDOWS = sys.platform == "win32"
@@ -114,7 +115,7 @@ _LEGACY_TASK_NAMES = {
 
 
 def _run(args: list[str], timeout: float = 5.0) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    return run_background_probe(
         args,
         capture_output=True,
         text=True,
@@ -124,9 +125,6 @@ def _run(args: list[str], timeout: float = 5.0) -> subprocess.CompletedProcess:
 
 
 # ── Windows helpers ─────────────────────────────────────────────────────────
-
-# No console window when a GUI (pythonw) process shells out to these tools.
-_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 _KERNEL32 = None
 
@@ -244,10 +242,9 @@ class _WinServiceTree:
 def _schtasks(args: list[str], timeout: float = 15.0) -> subprocess.CompletedProcess:
     """Run ``schtasks`` (native, fast). Callers must rely on the **exit code**
     only — schtasks' text output is localized and must never be parsed."""
-    return subprocess.run(
+    return run_background_probe(
         ["schtasks", *args],
         capture_output=True, text=True, timeout=timeout, check=False,
-        creationflags=_NO_WINDOW,
     )
 
 
@@ -255,10 +252,10 @@ def _ps(script: str, env_extra: dict, timeout: float = 30.0) -> subprocess.Compl
     """Run a PowerShell snippet, passing values via env vars (no quoting hell)."""
     env = dict(os.environ)
     env.update({k: str(v) for k, v in env_extra.items()})
-    return subprocess.run(
+    return run_background_probe(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True, text=True, timeout=timeout, check=False,
-        env=env, creationflags=_NO_WINDOW,
+        env=env,
     )
 
 
@@ -563,10 +560,9 @@ def _win_coordinated_restart(kind: str) -> bool:
 def _win_proc_running(image: str) -> bool:
     """True if a process with executable name ``image`` is running (tasklist)."""
     try:
-        result = subprocess.run(
+        result = run_background_probe(
             ["tasklist", "/FI", f"IMAGENAME eq {image}", "/NH"],
             capture_output=True, text=True, timeout=10, check=False,
-            creationflags=_NO_WINDOW,
         )
     except Exception:
         return False

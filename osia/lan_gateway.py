@@ -30,6 +30,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from osia.config import CONFIG_DIR, load_mobile_token, load_settings
+from osia.utils.subprocess_policy import run_background_probe
 from osia.relay_crypto import (
     ALG_CHACHA20_POLY1305,
     E2E_VERSION,
@@ -412,7 +413,7 @@ foreach ($sid in $required) {
 }
 Set-Acl -LiteralPath $path -AclObject $acl
 """
-    result = subprocess.run(
+    result = run_background_probe(
         [
             "powershell.exe",
             "-NoLogo",
@@ -461,7 +462,7 @@ foreach ($sid in $allowed) {
 exit 0
 """
     try:
-        result = subprocess.run(
+        result = run_background_probe(
             [
                 "powershell.exe",
                 "-NoLogo",

@@ -53,6 +53,7 @@ from osia.runtime import (
     is_frozen,
     resource_root,
 )
+from osia.utils.subprocess_policy import ProcessMode, process_kwargs
 
 # windows/run_service.py → <repo>/windows → <repo>
 _REPO = resource_root()
@@ -74,9 +75,6 @@ _WIN_WAIT_ABANDONED = 0x00000080
 _WIN_WAIT_TIMEOUT = 0x00000102
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-
-# No console window for the child console apps (python.exe / cloudflared.exe).
-_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 _KERNEL32 = None
 
@@ -514,14 +512,20 @@ def _supervise(kind: str, cmd, cwd: str, child_log, child_log_path: Path,
                 if shutdown.is_set():
                     break
                 try:
-                    my_child = subprocess.Popen(
-                        cmd, cwd=cwd,
-                        stdout=(child_log or subprocess.DEVNULL),
-                        stderr=subprocess.STDOUT,
-                        creationflags=_NO_WINDOW,
-                        env={**os.environ, "PYTHONFAULTHANDLER": "1",
-                             "PYTHONUNBUFFERED": "1"},
+                    child_kwargs = process_kwargs(
+                        ProcessMode.BACKGROUND_SUPERVISED,
+                        {
+                            "cwd": cwd,
+                            "stdout": (child_log or subprocess.DEVNULL),
+                            "stderr": subprocess.STDOUT,
+                            "env": {
+                                **os.environ,
+                                "PYTHONFAULTHANDLER": "1",
+                                "PYTHONUNBUFFERED": "1",
+                            },
+                        },
                     )
+                    my_child = subprocess.Popen(cmd, **child_kwargs)
                     try:
                         assigned = child_job.assign(my_child)
                     except Exception as exc:

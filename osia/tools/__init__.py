@@ -5,8 +5,9 @@ OSIA tools package — startup health check for the major tool categories.
 
 import os
 import shutil
-import subprocess
 import sys
+
+from osia.utils.subprocess_policy import run_background_probe
 
 
 def verify_tools() -> dict:
@@ -31,7 +32,7 @@ def verify_tools() -> dict:
             if shutil.which("powershell"):
                 results["bash"] = True
             else:
-                proc = subprocess.run(
+                proc = run_background_probe(
                     ["powershell.exe", "-NoProfile", "-Command",
                      "echo osia-health-check"],
                     capture_output=True, text=True, timeout=5,
@@ -41,7 +42,7 @@ def verify_tools() -> dict:
                     and proc.stdout.strip() == "osia-health-check"
                 )
         else:
-            proc = subprocess.run(
+            proc = run_background_probe(
                 ["bash", "-c", "echo osia-health-check"],
                 capture_output=True, text=True, timeout=5,
             )
