@@ -2377,6 +2377,7 @@ class _SettingsPanel(QWidget):
         self._chatgpt_probe_busy = False
         self._chatgpt_action_busy = False
         self._chatgpt_last_status = None
+        self._chatgpt_retry_view_state: tuple[int, int] | None = None
         self._chatgpt_status_ready.connect(self._apply_chatgpt_status)
         self._chatgpt_login_ready.connect(self._apply_chatgpt_login_action)
         self._chatgpt_file_watcher = QFileSystemWatcher(self)
@@ -2429,14 +2430,14 @@ class _SettingsPanel(QWidget):
 
         # RIGHT — keep a QScrollArea#panelScroll (so the transparent-bg QSS and
         # ScrollBarAlwaysOff still apply) wrapping a QStackedWidget of pages.
-        scroll = QScrollArea()
-        scroll.setObjectName("panelScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(
+        self._settings_scroll = QScrollArea()
+        self._settings_scroll.setObjectName("panelScroll")
+        self._settings_scroll.setWidgetResizable(True)
+        self._settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._settings_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        scroll.setVerticalScrollBarPolicy(
+        self._settings_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
 
@@ -2493,8 +2494,8 @@ class _SettingsPanel(QWidget):
             self._settings_stack.addWidget(page)
             self._settings_nav.addItem(i18n.t(_key))
 
-        scroll.setWidget(self._settings_stack)
-        body.addWidget(scroll, 1)
+        self._settings_scroll.setWidget(self._settings_stack)
+        body.addWidget(self._settings_scroll, 1)
         outer.addLayout(body, 1)
 
         # Wire the nav -> stack, default to the first category.
@@ -2521,6 +2522,8 @@ class _SettingsPanel(QWidget):
         # Combos created later at runtime (_build_hier_row) apply it themselves.
         for _combo in self.findChildren(QComboBox):
             _cap_combo_width(_combo)
+            self._guard_settings_wheel(_combo)
+        self._settings_nav.installEventFilter(self)
 
         # Refresh startup status while visible.
         self._startup_timer = QTimer(self)
@@ -2554,6 +2557,38 @@ class _SettingsPanel(QWidget):
             return
         if key == "settings.cat.memory":
             self._refresh_memory_entries()
+
+    def _guard_settings_wheel(self, combo: QComboBox) -> None:
+        """Keep a closed Settings combo from consuming the page wheel."""
+        combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        combo.installEventFilter(self)
+
+    def _scroll_settings_from_wheel(self, event) -> bool:
+        """Apply one wheel event to the Settings detail scrollbar."""
+        bar = self._settings_scroll.verticalScrollBar()
+        pixel_y = event.pixelDelta().y()
+        angle_y = event.angleDelta().y()
+        if pixel_y:
+            delta = pixel_y
+        elif angle_y:
+            steps = angle_y / 120.0
+            delta = round(steps * max(24, bar.singleStep() * 3))
+        else:
+            return False
+        bar.setValue(bar.value() - delta)
+        event.accept()
+        return True
+
+    def eventFilter(self, watched, event):  # noqa: N802 (Qt method name)
+        if event.type() == QEvent.Type.Wheel:
+            if isinstance(watched, QComboBox):
+                # An explicitly opened popup remains a normal Qt item view.
+                if watched.view().isVisible():
+                    return False
+                return self._scroll_settings_from_wheel(event)
+            if watched is self._settings_nav:
+                return self._scroll_settings_from_wheel(event)
+        return super().eventFilter(watched, event)
 
     def _build_language_section(self) -> QFrame:
         wrap = QFrame()
@@ -3421,6 +3456,7 @@ class _SettingsPanel(QWidget):
         combo = QComboBox()
         combo.setObjectName("voiceCombo")
         _cap_combo_width(combo)   # WOR-48 P3 — created at runtime, cap it here
+        self._guard_settings_wheel(combo)
         choices = self._hier_model_choices()
         # Preserve a stored model whose provider is no longer configured by
         # showing its raw "provider:model" value so the chain isn't silently
@@ -3641,6 +3677,7 @@ class _SettingsPanel(QWidget):
 
         type_combo = QComboBox()
         type_combo.setObjectName("voiceCombo")
+        self._guard_settings_wheel(type_combo)
         type_combo.addItem(i18n.t("cron.type_repeat"), "repeat")
         type_combo.addItem(i18n.t("cron.type_once"), "once")
         type_combo.setCurrentIndex(1 if is_once else 0)
@@ -3672,6 +3709,7 @@ class _SettingsPanel(QWidget):
         else:
             mode_combo = QComboBox()
             mode_combo.setObjectName("voiceCombo")
+            self._guard_settings_wheel(mode_combo)
             for m in self._CRON_MODES:
                 label = (
                     i18n.t(self._CRON_MODE_KEYS[m])
@@ -3708,6 +3746,7 @@ class _SettingsPanel(QWidget):
         model_label.setMinimumWidth(64)
         model_combo = QComboBox()
         model_combo.setObjectName("voiceCombo")
+        self._guard_settings_wheel(model_combo)
         _cap_combo_width(model_combo)
         self._populate_cron_model_combo(model_combo, job.get("model"))
         model_combo.currentIndexChanged.connect(
@@ -6732,8 +6771,17 @@ class _SettingsPanel(QWidget):
     def _probe_chatgpt_account(self) -> None:
         if self._chatgpt_probe_busy or self._chatgpt_action_busy:
             return
+        if self.sender() is self._chatgpt_retry_btn:
+            self._chatgpt_retry_view_state = (
+                self._settings_nav.currentRow(),
+                self._settings_scroll.verticalScrollBar().value(),
+            )
+            if self._chatgpt_retry_btn.hasFocus():
+                self._chatgpt_info_btn.setFocus(Qt.FocusReason.OtherFocusReason)
         self._chatgpt_probe_busy = True
         self._set_chatgpt_ui_state("checking")
+        if self._chatgpt_retry_view_state is not None:
+            QTimer.singleShot(0, self._restore_chatgpt_retry_view)
 
         def worker():
             try:
@@ -6749,6 +6797,17 @@ class _SettingsPanel(QWidget):
         threading.Thread(
             target=worker, name="osia-chatgpt-status", daemon=True
         ).start()
+
+    def _restore_chatgpt_retry_view(self, *, clear: bool = False) -> None:
+        state = self._chatgpt_retry_view_state
+        if state is None:
+            return
+        row, scroll_value = state
+        if self._settings_nav.currentRow() != row:
+            self._settings_nav.setCurrentRow(row)
+        self._settings_scroll.verticalScrollBar().setValue(scroll_value)
+        if clear:
+            self._chatgpt_retry_view_state = None
 
     def _configure_chatgpt_file_watcher(self) -> None:
         """Watch the shared Codex home for cross-process account changes."""
@@ -6825,6 +6884,7 @@ class _SettingsPanel(QWidget):
         if hasattr(self, "_hier_values"):
             self._render_hier_category("heavy")
             self._render_hier_category("medium")
+        self._restore_chatgpt_retry_view(clear=True)
         self.chatgpt_status_changed.emit(dict(self._chatgpt_last_status))
 
     def _on_chatgpt_connect(self) -> None:
