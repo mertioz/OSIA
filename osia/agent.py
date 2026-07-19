@@ -412,6 +412,11 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
             body = body + "\n\n" + skills
     except Exception:
         pass
+    try:
+        from osia.action_policy import action_policy_prompt_block
+        body = body + "\n\n" + action_policy_prompt_block(lang)
+    except Exception:
+        pass
     body = body + "\n\n" + _memory_tool_prompt_block(lang)
     body = body + "\n\n" + _scheduled_task_tool_prompt_block(lang)
     body = body + "\n\n" + _gmail_rest_prompt_block(lang)
@@ -5748,7 +5753,22 @@ class OSIAAgent:
                             elif scheduled_result.get("ok") is False:
                                 is_error = True
                     else:
-                        result, is_error = _execute_tool_with_retry(tool_name, kwargs)
+                        try:
+                            from osia.action_policy import guard_tool_call
+                            policy_error = guard_tool_call(
+                                user_input, tool_name, kwargs,
+                            )
+                        except Exception:
+                            policy_error = (
+                                "ERROR: action policy check failed; "
+                                "the action was not executed"
+                            )
+                        if policy_error:
+                            result, is_error = policy_error, True
+                        else:
+                            result, is_error = _execute_tool_with_retry(
+                                tool_name, kwargs,
+                            )
                     any_tool_executed = True
                     text_part = _result_text(result)
                     screenshot = (

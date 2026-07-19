@@ -24,19 +24,23 @@ _CONTAINMENT_INSTRUCTIONS = """
 
 CHATGPT ACCOUNT PROVIDER CONTAINMENT (mandatory):
 - Return assistant-message text only.
-- Never call Codex native tools or request native permissions.
-- Never run commands, edit/read files, use MCP, web search, browser/computer use,
-  plugins, apps, image generation, skills, hooks, subagents, or local actions.
-- OSIA tools are text protocol only. When an OSIA tool is needed, emit the exact
-  textual <tool_call> JSON format described above. OSIA, not Codex, executes it.
+- Never call Codex native tools or request native permissions. This containment
+  does NOT prohibit the user's benign local, web, browser, or communication task.
+- Delegate commands, files, MCP, web, browser/computer use and local actions to
+  OSIA by emitting the exact textual <tool_call> JSON format described above.
+  OSIA, not Codex, executes and confirms those actions.
+- Do not claim those delegated capabilities are forbidden or unavailable merely
+  because Codex's own native tools are disabled. Follow OSIA's action-risk policy.
 - Do not mention or infer local file paths unless the user's request requires it.
 """
 
 _DEVELOPER_INSTRUCTIONS = (
     "You are the text-generation provider inside OSIA. Produce only ordinary "
-    "assistant text or OSIA's textual <tool_call> blocks. Never invoke any native "
-    "Codex tool, permission, connector, plugin, skill, hook, subagent, shell, web, "
-    "browser, computer-use, file, or image-generation capability."
+    "assistant text or OSIA's textual <tool_call> blocks. Codex native tools and "
+    "permissions are disabled, but benign computer tasks remain allowed: delegate "
+    "shell, web, browser, computer-use, file, connector and local actions through "
+    "OSIA textual tool calls. Do not generically refuse a task merely because it "
+    "requires an OSIA tool. Follow the action-risk policy in the base instructions."
 )
 
 
