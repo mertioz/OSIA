@@ -39,7 +39,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QScrollArea, QStackedWidget, QListWidget, QFrame,
     QSizePolicy, QFileDialog, QCheckBox, QComboBox,
     QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog, QLayout, QMenu,
-    QToolTip,
+    QToolTip, QMessageBox,
 )
 
 from osia import conversations
@@ -2449,6 +2449,7 @@ class _SettingsPanel(QWidget):
         sec_language  = self._build_language_section()
         sec_theme     = self._build_theme_section()
         sec_capsule   = self._build_capsule_section()       # Capsule + autostart
+        sec_restart   = self._build_restart_section()       # Controlled relaunch
         sec_ai_prov   = self._build_ai_providers_section()  # Section 1
         sec_voice     = self._build_voice_section()         # Section 2 (TTS)
         sec_wake      = self._build_wake_section()           # Wake-word greeting
@@ -2469,7 +2470,7 @@ class _SettingsPanel(QWidget):
         # folded into Advanced) — it is a central, growing capability that
         # warrants top-level discoverability.
         self._settings_pages = [
-            ("settings.cat.general",  [sec_language, sec_theme, sec_capsule]),
+            ("settings.cat.general",  [sec_language, sec_theme, sec_capsule, sec_restart]),
             ("settings.cat.models",   [sec_ai_prov, sec_hierarchy, sec_apikeys]),
             ("settings.cat.voice",    [sec_voice, sec_stt, sec_liveapi]),
             ("settings.cat.wake",     [sec_wake]),
@@ -2797,6 +2798,73 @@ class _SettingsPanel(QWidget):
             self._autostart_guard = True
             self._autostart_toggle.setChecked(not checked)
             self._autostart_guard = False
+
+    def _build_restart_section(self) -> QFrame:
+        """Controlled desktop relaunch without changing background services."""
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        self._restart_title = QLabel(i18n.t("settings.restart"))
+        self._restart_title.setObjectName("sectionTitle")
+        self._restart_title.setWordWrap(True)
+        self._restart_sub = QLabel(i18n.t("settings.restart_sub"))
+        self._restart_sub.setObjectName("sectionSub")
+        self._restart_sub.setWordWrap(True)
+        self._restart_desc = QLabel(i18n.t("settings.restart_desc"))
+        self._restart_desc.setObjectName("sectionDesc")
+        self._restart_desc.setWordWrap(True)
+        layout.addWidget(self._restart_title)
+        layout.addWidget(self._restart_sub)
+        layout.addWidget(self._restart_desc)
+
+        self._restart_status = QLabel()
+        self._restart_status.setObjectName("sectionSub")
+        self._restart_status.setWordWrap(True)
+        self._restart_status.hide()
+        layout.addWidget(self._restart_status)
+
+        self._restart_btn = QPushButton(i18n.t("settings.restart_button"))
+        self._restart_btn.setObjectName("primaryBtn")
+        self._restart_btn.clicked.connect(self._on_restart_clicked)
+        layout.addWidget(self._restart_btn)
+        self._restart_pending = False
+        return wrap
+
+    def _on_restart_clicked(self) -> None:
+        """Confirm once, prepare the coordinator, then quit Qt gracefully."""
+        if self._restart_pending:
+            return
+        answer = QMessageBox.question(
+            self,
+            i18n.t("settings.restart_confirm_title"),
+            i18n.t("settings.restart_confirm_text"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self._restart_pending = True
+        self._restart_btn.setEnabled(False)
+        self._restart_status.setText(i18n.t("settings.restart_pending"))
+        self._restart_status.show()
+        try:
+            from osia.relaunch import prepare_relaunch
+
+            prepare_relaunch()
+        except Exception:
+            self._restart_pending = False
+            self._restart_btn.setEnabled(True)
+            self._restart_status.setText(i18n.t("settings.restart_error"))
+            self._restart_status.show()
+            return
+
+        app = QApplication.instance()
+        if app is not None:
+            QTimer.singleShot(0, app.quit)
 
     def _build_startup_section(self) -> QFrame:
         wrap = QFrame()
@@ -7530,6 +7598,13 @@ class _SettingsPanel(QWidget):
         self._capsule_desc.setText(i18n.t("settings.capsule_desc"))
         self._show_capsule_label.setText(i18n.t("settings.show_capsule"))
         self._autostart_label.setText(i18n.t("settings.autostart_gui"))
+        self._restart_title.setText(i18n.t("settings.restart"))
+        self._restart_sub.setText(i18n.t("settings.restart_sub"))
+        self._restart_desc.setText(i18n.t("settings.restart_desc"))
+        self._restart_btn.setText(i18n.t("settings.restart_button"))
+        if self._restart_status.isVisible():
+            key = "settings.restart_pending" if self._restart_pending else "settings.restart_error"
+            self._restart_status.setText(i18n.t(key))
 
         self._ai_title.setText(i18n.t("settings.ai_providers"))
         self._ai_sub.setText(i18n.t("settings.ai_providers_sub"))

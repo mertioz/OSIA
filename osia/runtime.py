@@ -17,6 +17,7 @@ WAKE_RECOVERY_MODE = "--osia-wake-recovery"
 INSTALL_INTEGRATION_MODE = "--osia-install-integration"
 REMOVE_INTEGRATION_MODE = "--osia-remove-integration"
 PACKAGE_SMOKE_MODE = "--osia-package-smoke"
+RELAUNCH_MODE = "--osia-relaunch"
 
 
 def is_frozen() -> bool:

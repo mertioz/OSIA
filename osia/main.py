@@ -1513,6 +1513,16 @@ def wake_mode():
             get_account_provider().shutdown()
         except Exception:
             pass
+        try:
+            from osia.mcp_client import get_manager
+            get_manager().shutdown()
+        except Exception:
+            pass
+        try:
+            from osia.tools.browser import close_browser
+            close_browser()
+        except Exception:
+            pass
 
     app.aboutToQuit.connect(on_quit)
 
@@ -1581,6 +1591,12 @@ def wake_mode():
 
 
 def main():
+    try:
+        from osia.relaunch import clear_stale_restart_state
+        clear_stale_restart_state()
+    except Exception:
+        pass
+
     # First-launch config bootstrap: create any missing config files
     # (settings.json, mobile pairing token) BEFORE anything starts the mobile
     # WebSocket server, so a fresh install works out of the box on any OS and the

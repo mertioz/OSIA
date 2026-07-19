@@ -8,6 +8,7 @@ import sys
 from osia.runtime import (
     INSTALL_INTEGRATION_MODE,
     PACKAGE_SMOKE_MODE,
+    RELAUNCH_MODE,
     REMOVE_INTEGRATION_MODE,
     SERVER_MODE,
     SERVICE_MODE,
@@ -152,6 +153,18 @@ def main(args: list[str] | None = None) -> int:
         return 0 if remove_windows_services() else 1
     if mode == PACKAGE_SMOKE_MODE:
         return _package_smoke()
+    if mode == RELAUNCH_MODE:
+        if len(argv) != 2:
+            return 2
+        try:
+            parent_pid = int(argv[1])
+        except (TypeError, ValueError):
+            return 2
+        if parent_pid <= 0:
+            return 2
+        from osia.relaunch import run_coordinator
+
+        return run_coordinator(parent_pid)
 
     mutex = _acquire_gui_mutex()
     if mutex is False:
