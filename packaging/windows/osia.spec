@@ -20,6 +20,7 @@ datas = [
     (str(ROOT / "osia" / "wake_training" / "osia_verifier.pkl"), "osia/wake_training"),
     (str(ROOT / "windows" / "configure_lan_firewall.ps1"), "windows"),
     (str(STAGE / "models"), "models"),
+    (str(STAGE / "runtimes"), "runtimes"),
     (str(STAGE / "legal"), "legal"),
     (str(ROOT / "packaging" / "windows" / "THIRD_PARTY_NOTICES.md"), "."),
 ]

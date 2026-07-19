@@ -94,12 +94,12 @@ def test_retry_keeps_models_category_scroll_and_focus(settings_panel, qt_app):
     assert panel._settings_nav.currentRow() == 1
     assert bar.value() == 0
     assert qt_app.focusWidget() is panel._chatgpt_info_btn
-    assert panel._chatgpt_probe_busy is True
-    assert _DormantThread.started == ["osia-chatgpt-status"]
+    assert panel._chatgpt_action_busy is True
+    assert _DormantThread.started == ["osia-chatgpt-login"]
 
     # A second activation while the first retry is in flight is a no-op.
     panel._chatgpt_retry_btn.click()
-    assert _DormantThread.started == ["osia-chatgpt-status"]
+    assert _DormantThread.started == ["osia-chatgpt-login"]
 
     # The async completion rebuilds Hiérarchisation but restores the same view.
     panel._apply_chatgpt_status(

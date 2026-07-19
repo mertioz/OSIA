@@ -664,6 +664,111 @@ class GuiContractTests(unittest.TestCase):
         self.assertFalse(panel._chatgpt_info_btn.isHidden())
         panel.deleteLater()
 
+    def test_retry_resets_stale_login_opens_browser_once_and_redacts_errors(self):
+        from osia.chatgpt_account.app_server_client import AppServerError
+        from osia.chatgpt_account import provider as provider_module
+        from osia.gui import main_popup
+
+        panel, _save_setting, _settings = self._build_panel()
+        self._select(panel, "chatgpt_account")
+        observed = {"reset": 0, "begin": 0, "wait": 0, "waiting_text": ""}
+
+        class FakeProvider:
+            def reset_login(self):
+                observed["reset"] += 1
+
+            def begin_login(self):
+                observed["begin"] += 1
+                return {
+                    "authUrl": "https://chatgpt.com/auth/test-only",
+                    "loginId": "login-test",
+                }
+
+            def wait_for_login(self, _login_id, timeout):
+                observed["wait"] += 1
+                observed["waiting_text"] = panel._chatgpt_status.text()
+                self.assert_timeout = timeout
+                raise AppServerError(
+                    "ERROR: SECRET session detail",
+                    category="login_timeout",
+                )
+
+            def cancel_login(self):
+                raise AssertionError("browser opened; cancellation is not expected")
+
+        class ImmediateThread:
+            def __init__(self, *, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        fake_provider = FakeProvider()
+        panel._chatgpt_status.setText("previous failure")
+        panel._set_chatgpt_ui_state("error")
+        with (
+            patch.object(provider_module, "get_account_provider", return_value=fake_provider),
+            patch.object(main_popup.webbrowser, "open", return_value=True) as browser,
+            patch.object(main_popup.threading, "Thread", ImmediateThread),
+        ):
+            panel._on_chatgpt_retry()
+
+        self.assertEqual(observed["reset"], 1)
+        self.assertEqual(observed["begin"], 1)
+        self.assertEqual(observed["wait"], 1)
+        self.assertEqual(fake_provider.assert_timeout, 300.0)
+        self.assertIn("Waiting for validation", observed["waiting_text"])
+        browser.assert_called_once_with("https://chatgpt.com/auth/test-only", new=2)
+        self.assertEqual(panel._chatgpt_status.text(), "Connection failed")
+        self.assertNotIn("SECRET", panel._chatgpt_status.text())
+        panel.deleteLater()
+
+    def test_browser_launch_failure_is_visible_and_retry_is_single_flight(self):
+        from osia.chatgpt_account import provider as provider_module
+        from osia.gui import main_popup
+
+        panel, _save_setting, _settings = self._build_panel()
+        self._select(panel, "chatgpt_account")
+        cancelled = []
+
+        class FakeProvider:
+            def reset_login(self):
+                pass
+
+            def begin_login(self):
+                return {
+                    "authUrl": "https://chatgpt.com/auth/test-only",
+                    "loginId": "login-test",
+                }
+
+            def cancel_login(self):
+                cancelled.append(True)
+
+        class ImmediateThread:
+            def __init__(self, *, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with (
+            patch.object(provider_module, "get_account_provider", return_value=FakeProvider()),
+            patch.object(main_popup.webbrowser, "open", return_value=False),
+            patch.object(main_popup.threading, "Thread", ImmediateThread),
+        ):
+            panel._on_chatgpt_retry()
+        self.assertEqual(cancelled, [True])
+        self.assertIn("could not open", panel._chatgpt_status.text().lower())
+
+        panel._chatgpt_action_busy = False
+        panel._set_chatgpt_ui_state("error")
+        with patch.object(main_popup.threading, "Thread") as thread:
+            panel._on_chatgpt_retry()
+            panel._on_chatgpt_retry()
+            thread.assert_called_once()
+            thread.return_value.start.assert_called_once()
+        panel.deleteLater()
+
     def test_switching_keeps_openai_unchanged_and_connect_signal_single(self):
         from unittest.mock import MagicMock
         handler = MagicMock()

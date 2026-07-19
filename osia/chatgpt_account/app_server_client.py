@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
+from osia.runtime import resource_path
+
 from .rate_limits import (
     merge_rate_limit_payload,
     sanitize_rate_limit_payload,
@@ -171,8 +173,23 @@ def _version_tuple(raw: str) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups())
 
 
-def _native_candidates() -> list[Path]:
+def _managed_runtime_candidates(base_dir: Path | None = None) -> list[Path]:
+    """Return OSIA-owned runtimes before any machine-global installation."""
+    executable = "codex.exe" if sys.platform == "win32" else "codex"
     candidates: list[Path] = []
+    if base_dir is not None:
+        candidates.extend(
+            (
+                Path(base_dir) / "runtime" / "current" / "bin" / executable,
+                Path(base_dir) / "runtime" / "bin" / executable,
+            )
+        )
+    candidates.append(resource_path("runtimes", "codex", "bin", executable))
+    return candidates
+
+
+def _native_candidates(base_dir: Path | None = None) -> list[Path]:
+    candidates: list[Path] = _managed_runtime_candidates(base_dir)
     override = os.environ.get("OSIA_CODEX_EXECUTABLE")
     if override:
         candidates.append(Path(override))
@@ -307,7 +324,7 @@ class AppServerClient:
             return self._runtime_executable, version
 
         incompatible = False
-        for candidate in _native_candidates():
+        for candidate in _native_candidates(self.base_dir):
             version = _probe_executable(candidate)
             if not version:
                 continue
@@ -925,18 +942,23 @@ class AppServerClient:
             return dict(self._active_login)
 
     def wait_for_login(self, login_id: str, timeout: float = 300.0) -> dict:
+        login_id = str(login_id)
         with self._login_lock:
-            waiter = self._login_events.get(str(login_id))
+            waiter = self._login_events.get(login_id)
         if waiter is None:
             raise AppServerError("ERROR: no ChatGPT login is active.", category="login_missing")
         if not waiter[0].wait(timeout):
+            try:
+                self._request(
+                    "account/login/cancel", {"loginId": login_id}, timeout=10.0,
+                )
+            except AppServerError:
+                pass
+            self._clear_login_state(login_id, cancelled=True)
             raise AppServerError("ERROR: ChatGPT login timed out.", category="login_timeout")
         success = bool(waiter[1].get("success"))
         cancelled = bool(waiter[1].get("cancelled"))
-        with self._login_lock:
-            self._login_events.pop(str(login_id), None)
-            if self._active_login and self._active_login.get("loginId") == str(login_id):
-                self._active_login = None
+        self._clear_login_state(login_id)
         if cancelled:
             raise AppServerError("ERROR: ChatGPT login was cancelled.", category="login_cancelled")
         if not success:
@@ -949,12 +971,39 @@ class AppServerClient:
         if not active:
             return
         login_id = str(active["loginId"])
-        self._request("account/login/cancel", {"loginId": login_id})
+        error = None
+        try:
+            self._request("account/login/cancel", {"loginId": login_id})
+        except AppServerError as exc:
+            error = exc
+        finally:
+            self._clear_login_state(login_id, cancelled=True)
+        if error is not None:
+            raise error
+
+    def reset_login(self) -> None:
+        """Best-effort cancellation used before retrying a stale login."""
         with self._login_lock:
-            waiter = self._login_events.pop(login_id, None)
-            self._active_login = None
+            active = dict(self._active_login) if self._active_login else None
+        if not active:
+            return
+        login_id = str(active["loginId"])
+        try:
+            self._request(
+                "account/login/cancel", {"loginId": login_id}, timeout=10.0,
+            )
+        except AppServerError:
+            pass
+        self._clear_login_state(login_id, cancelled=True)
+
+    def _clear_login_state(self, login_id: str, *, cancelled: bool = False) -> None:
+        with self._login_lock:
+            waiter = self._login_events.pop(str(login_id), None)
+            if self._active_login and self._active_login.get("loginId") == str(login_id):
+                self._active_login = None
         if waiter:
-            waiter[1].update({"success": False, "cancelled": True})
+            if cancelled:
+                waiter[1].update({"success": False, "cancelled": True})
             waiter[0].set()
 
     def logout(self) -> None:

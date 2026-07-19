@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from osia.chatgpt_account import app_server_client as client_module
 from osia.chatgpt_account.app_server_client import (
     AppServerClient, AppServerError, RuntimeUnavailableError,
 )
@@ -208,6 +209,29 @@ class AppServerClientTests(unittest.TestCase):
         self.assertIn('web_search = "disabled"', config)
         self.assertIn('inherit = "none"', config)
 
+    def test_managed_runtime_is_primary_and_global_codex_is_not_required(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        managed = Path(temp.name) / "bundle" / "runtimes" / "codex" / "bin" / "codex.exe"
+        managed.parent.mkdir(parents=True)
+        managed.touch()
+        client = AppServerClient(base_dir=Path(temp.name) / "profile")
+        with (
+            patch.object(client_module, "resource_path", return_value=managed),
+            patch.object(client_module.shutil, "which", return_value=None),
+            patch.object(
+                client_module,
+                "_probe_executable",
+                side_effect=lambda path: (
+                    "codex-cli 0.144.1" if Path(path) == managed else None
+                ),
+            ),
+            patch.dict(os.environ, {"OSIA_CODEX_EXECUTABLE": ""}),
+        ):
+            executable, version = client._resolve_runtime()
+        self.assertEqual(executable, managed)
+        self.assertEqual(version, "codex-cli 0.144.1")
+
     def test_rejected_rate_limit_refresh_preserves_sparse_updated_snapshot(self):
         reads = 0
 
@@ -349,6 +373,45 @@ class AppServerClientTests(unittest.TestCase):
         cancels = [m for m in process.received if m.get("method") == "account/login/cancel"]
         self.assertEqual(len(starts), 1)
         self.assertEqual(cancels[0]["params"], {"loginId": "login-1"})
+
+    def test_login_timeout_clears_stale_state_and_allows_real_retry(self):
+        client, factory = self.make_client()
+        login = client.begin_login()
+        with self.assertRaises(AppServerError) as caught:
+            client.wait_for_login(login["loginId"], timeout=0.01)
+        self.assertEqual(caught.exception.category, "login_timeout")
+        self.assertIsNone(client._active_login)
+        self.assertEqual(client._login_events, {})
+
+        retry = client.begin_login()
+        self.assertEqual(retry["loginId"], "login-1")
+        starts = [
+            message for message in factory.processes[0].received
+            if message.get("method") == "account/login/start"
+        ]
+        self.assertEqual(len(starts), 2)
+
+    def test_reset_login_clears_state_even_when_remote_cancel_fails(self):
+        def handler(process, message):
+            if message.get("method") == "account/login/cancel":
+                process.emit({
+                    "id": message["id"],
+                    "error": {"code": -32000, "message": "SECRET remote detail"},
+                })
+            else:
+                _base_handler(process, message)
+
+        client, factory = self.make_client(handler)
+        client.begin_login()
+        client.reset_login()
+        self.assertIsNone(client._active_login)
+        self.assertEqual(client._login_events, {})
+        client.begin_login()
+        starts = [
+            message for message in factory.processes[0].received
+            if message.get("method") == "account/login/start"
+        ]
+        self.assertEqual(len(starts), 2)
 
     def test_official_device_code_login_is_single_flight_and_cancelled(self):
         client, factory = self.make_client()

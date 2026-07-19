@@ -199,6 +199,7 @@ def test_package_spec_is_allowlist_based_and_excludes_user_config():
     assert "console=False" in spec
     assert 'ROOT / "assets"' in spec
     assert 'STAGE / "models"' in spec
+    assert 'STAGE / "runtimes"' in spec
     assert 'ROOT / "config"' not in spec
     assert "settings.json" not in spec
     assert "api_keys.json" not in spec
@@ -210,6 +211,15 @@ def test_build_uses_product_version_and_exact_installer_name():
     assert 'ROOT / "osia" / "lan_discovery.py"' in build
     assert 'installer = RELEASE / "OSIA-Setup.exe"' in build
     assert "def _write_bundle_file_manifest" in build
+    assert 'CODEX_RUNTIME_VERSION = "0.144.1"' in build
+    assert "def _stage_codex_runtime" in build
+    assert "CODEX_RUNTIME_SHA256" in build
+
+
+def test_package_smoke_requires_the_managed_codex_runtime():
+    launcher = (ROOT / "packaging" / "windows" / "launcher.py").read_text("utf-8")
+    assert 'resource_path("runtimes", "codex", "bin", "codex.exe")' in launcher
+    assert "managed Codex runtime did not initialize" in launcher
 
 
 def test_firewall_rule_is_private_local_subnet_and_executable_scoped():

@@ -11,6 +11,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +24,14 @@ MODEL_STAGE = STAGE / "models"
 LEGAL_STAGE = STAGE / "legal"
 DIST = ROOT / "dist" / "OSIA"
 RELEASE = ROOT / "release" / "windows"
+CODEX_RUNTIME_STAGE = STAGE / "runtimes" / "codex"
+CODEX_RUNTIME_VERSION = "0.144.1"
+CODEX_RUNTIME_ARCHIVE = "codex-package-x86_64-pc-windows-msvc.tar.gz"
+CODEX_RUNTIME_SHA256 = "ce94e1fb84693d3f7332ceeab5be73e93de38725da4b82dff863cd2c795b4730"
+CODEX_RUNTIME_URL = (
+    "https://github.com/openai/codex/releases/download/"
+    f"rust-v{CODEX_RUNTIME_VERSION}/{CODEX_RUNTIME_ARCHIVE}"
+)
 _VERSION_SOURCE = (ROOT / "osia" / "lan_discovery.py").read_text("utf-8")
 _VERSION_MATCH = re.search(r'^PRODUCT_VERSION\s*=\s*["\']([^"\']+)["\']', _VERSION_SOURCE, re.M)
 if _VERSION_MATCH is None:
@@ -116,6 +126,65 @@ def _stage_models() -> list[dict]:
     return manifests
 
 
+def _stage_codex_runtime() -> dict:
+    """Stage OSIA's pinned native Codex runtime without consulting PATH."""
+    cache_root = Path(
+        os.environ.get("LOCALAPPDATA") or (Path.home() / ".cache")
+    ) / "OSIA" / "build-cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    archive = cache_root / CODEX_RUNTIME_ARCHIVE
+    if not archive.is_file() or _sha256(archive) != CODEX_RUNTIME_SHA256:
+        archive.unlink(missing_ok=True)
+        partial = archive.with_suffix(archive.suffix + ".partial")
+        partial.unlink(missing_ok=True)
+        request = urllib.request.Request(
+            CODEX_RUNTIME_URL,
+            headers={"User-Agent": "OSIA-Windows-Builder/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                with partial.open("wb") as output:
+                    shutil.copyfileobj(response, output)
+            if _sha256(partial) != CODEX_RUNTIME_SHA256:
+                raise RuntimeError("Codex runtime archive checksum mismatch")
+            partial.replace(archive)
+        finally:
+            partial.unlink(missing_ok=True)
+
+    _clean_dir(CODEX_RUNTIME_STAGE)
+    CODEX_RUNTIME_STAGE.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "r:gz") as package:
+        package.extractall(CODEX_RUNTIME_STAGE, filter="data")
+
+    required = (
+        "codex-package.json",
+        "bin/codex.exe",
+        "bin/codex-code-mode-host.exe",
+        "codex-path/rg.exe",
+        "codex-resources/codex-command-runner.exe",
+        "codex-resources/codex-windows-sandbox-setup.exe",
+    )
+    missing = [name for name in required if not (CODEX_RUNTIME_STAGE / name).is_file()]
+    if missing:
+        raise RuntimeError("Codex runtime package is incomplete: " + ", ".join(missing))
+    probe = subprocess.run(
+        [str(CODEX_RUNTIME_STAGE / "bin" / "codex.exe"), "--version"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if probe.returncode != 0 or CODEX_RUNTIME_VERSION not in (probe.stdout or probe.stderr):
+        raise RuntimeError("staged Codex runtime failed version verification")
+    return {
+        "version": CODEX_RUNTIME_VERSION,
+        "archive": CODEX_RUNTIME_ARCHIVE,
+        "sha256": CODEX_RUNTIME_SHA256,
+    }
+
+
 def _stage_legal() -> list[dict]:
     license_root = LEGAL_STAGE / "licenses"
     license_root.mkdir(parents=True, exist_ok=True)
@@ -202,7 +271,9 @@ VSVersionInfo(
     (GENERATED / "version_info.txt").write_text(version_info, encoding="utf-8")
 
 
-def _write_manifest(models: list[dict], dependencies: list[dict]) -> Path:
+def _write_manifest(
+    models: list[dict], dependencies: list[dict], codex_runtime: dict,
+) -> Path:
     commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True,
     ).stdout.strip()
@@ -220,6 +291,7 @@ def _write_manifest(models: list[dict], dependencies: list[dict]) -> Path:
         "pyinstaller": importlib.metadata.version("pyinstaller"),
         "pyinstaller_hooks_contrib": importlib.metadata.version("pyinstaller-hooks-contrib"),
         "models": models,
+        "codex_runtime": codex_runtime,
         "build_environment_dependencies": dependencies,
     }
     path = LEGAL_STAGE / "BUILD_MANIFEST.json"
@@ -384,9 +456,10 @@ def build(skip_installer: bool = False) -> Path | None:
     RELEASE.mkdir(parents=True, exist_ok=True)
     LEGAL_STAGE.mkdir(parents=True, exist_ok=True)
     models = _stage_models()
+    codex_runtime = _stage_codex_runtime()
     dependencies = _stage_legal()
     _generate_branding()
-    _write_manifest(models, dependencies)
+    _write_manifest(models, dependencies, codex_runtime)
 
     _run([sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm",
           str(ROOT / "packaging" / "windows" / "osia.spec")])

@@ -225,6 +225,9 @@ class ChatGPTAccountProvider:
         self.client.cancel_login()
         _notify_account_changed()
 
+    def reset_login(self) -> None:
+        self.client.reset_login()
+
     def logout(self) -> None:
         with self._lock:
             states = list(self._threads.values())

@@ -6532,7 +6532,7 @@ class _SettingsPanel(QWidget):
         self._chatgpt_disconnect_btn.clicked.connect(self._on_chatgpt_disconnect)
         self._chatgpt_retry_btn = QPushButton(i18n.t("chatgpt_account.retry"))
         self._chatgpt_retry_btn.setObjectName("ghostBtn")
-        self._chatgpt_retry_btn.clicked.connect(self._probe_chatgpt_account)
+        self._chatgpt_retry_btn.clicked.connect(self._on_chatgpt_retry)
         for button in (
             self._chatgpt_connect_btn, self._chatgpt_cancel_btn,
             self._chatgpt_disconnect_btn, self._chatgpt_retry_btn,
@@ -6679,7 +6679,7 @@ class _SettingsPanel(QWidget):
         return wrap
 
     def _set_chatgpt_ui_state(self, state: str) -> None:
-        connecting = state == "connecting"
+        connecting = state in {"connecting", "waiting"}
         connected = state == "connected"
         checking = state == "checking"
         self._chatgpt_status.setVisible(state != "disconnected")
@@ -6692,8 +6692,10 @@ class _SettingsPanel(QWidget):
         self._chatgpt_retry_btn.setVisible(state == "error")
         if checking:
             self._chatgpt_status.setText(i18n.t("chatgpt_account.checking"))
-        elif connecting:
+        elif state == "connecting":
             self._chatgpt_status.setText(i18n.t("chatgpt_account.connecting"))
+        elif state == "waiting":
+            self._chatgpt_status.setText(i18n.t("chatgpt_account.waiting"))
         elif connected:
             self._chatgpt_status.setText("✓ " + i18n.t("chatgpt_account.connected"))
         elif state == "disconnected":
@@ -6771,17 +6773,8 @@ class _SettingsPanel(QWidget):
     def _probe_chatgpt_account(self) -> None:
         if self._chatgpt_probe_busy or self._chatgpt_action_busy:
             return
-        if self.sender() is self._chatgpt_retry_btn:
-            self._chatgpt_retry_view_state = (
-                self._settings_nav.currentRow(),
-                self._settings_scroll.verticalScrollBar().value(),
-            )
-            if self._chatgpt_retry_btn.hasFocus():
-                self._chatgpt_info_btn.setFocus(Qt.FocusReason.OtherFocusReason)
         self._chatgpt_probe_busy = True
         self._set_chatgpt_ui_state("checking")
-        if self._chatgpt_retry_view_state is not None:
-            QTimer.singleShot(0, self._restore_chatgpt_retry_view)
 
         def worker():
             try:
@@ -6876,6 +6869,12 @@ class _SettingsPanel(QWidget):
                 key = "chatgpt_account.runtime_incompatible"
             elif error == "isolation_failed":
                 key = "chatgpt_account.isolation_error"
+            elif error == "browser_failed":
+                key = "chatgpt_account.browser_failed"
+            elif error == "startup_failed":
+                key = "chatgpt_account.runtime_start_failed"
+            elif error in {"login_failed", "login_timeout", "login_invalid"}:
+                key = "chatgpt_account.login_failed"
             else:
                 key = "chatgpt_account.error"
             self._chatgpt_status.setText(i18n.t(key))
@@ -6888,28 +6887,64 @@ class _SettingsPanel(QWidget):
         self.chatgpt_status_changed.emit(dict(self._chatgpt_last_status))
 
     def _on_chatgpt_connect(self) -> None:
+        self._start_chatgpt_login(reset_stale=False)
+
+    def _on_chatgpt_retry(self) -> None:
+        if self._chatgpt_action_busy:
+            return
+        self._chatgpt_retry_view_state = (
+            self._settings_nav.currentRow(),
+            self._settings_scroll.verticalScrollBar().value(),
+        )
+        if self._chatgpt_retry_btn.hasFocus():
+            self._chatgpt_info_btn.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._start_chatgpt_login(reset_stale=True)
+
+    def _start_chatgpt_login(self, *, reset_stale: bool) -> None:
         if self._chatgpt_action_busy:
             return
         self._chatgpt_action_busy = True
         self._set_chatgpt_ui_state("connecting")
+        if self._chatgpt_retry_view_state is not None:
+            QTimer.singleShot(0, self._restore_chatgpt_retry_view)
 
         def worker():
             try:
                 from osia.chatgpt_account.provider import get_account_provider
                 provider = get_account_provider()
+                if reset_stale:
+                    provider.reset_login()
                 login = provider.begin_login()
-                self._chatgpt_login_ready.emit(
-                    {"authUrl": login["authUrl"], "loginId": login["loginId"]}
-                )
+                auth_url = str(login.get("authUrl") or "")
+                try:
+                    browser_opened = bool(auth_url and webbrowser.open(auth_url, new=2))
+                except Exception:
+                    browser_opened = False
+                if not browser_opened:
+                    try:
+                        provider.cancel_login()
+                    except Exception:
+                        pass
+                    raise RuntimeError("browser_failed")
+                self._chatgpt_login_ready.emit({"state": "waiting"})
                 provider.wait_for_login(login["loginId"], timeout=300.0)
                 status = self._chatgpt_status_with_usage(provider)
             except Exception as exc:
-                category = str(getattr(exc, "category", "login_failed"))
+                category = (
+                    "browser_failed"
+                    if str(exc) == "browser_failed"
+                    else str(getattr(exc, "category", "login_failed"))
+                )
                 status = {
-                    "available": False, "runtimeAvailable": True,
+                    "available": False,
+                    "runtimeAvailable": category not in {
+                        "runtime_missing", "runtime_incompatible", "startup_failed",
+                    },
                     "connected": False, "models": [],
                     "error": "disconnected" if category == "login_cancelled" else "login_failed",
                 }
+                if category != "login_cancelled":
+                    status["error"] = category
             self._chatgpt_status_ready.emit(status)
 
         threading.Thread(
@@ -6917,14 +6952,8 @@ class _SettingsPanel(QWidget):
         ).start()
 
     def _apply_chatgpt_login_action(self, action: dict) -> None:
-        auth_url = str(action.get("authUrl") or "")
-        if auth_url:
-            # Exactly one system-browser open per single-flight login. The raw
-            # URL is never persisted or logged.
-            threading.Thread(
-                target=lambda: webbrowser.open(auth_url, new=2),
-                name="osia-chatgpt-browser", daemon=True,
-            ).start()
+        if action.get("state") == "waiting" and self._chatgpt_action_busy:
+            self._set_chatgpt_ui_state("waiting")
 
     def _on_chatgpt_cancel(self) -> None:
         if not self._chatgpt_action_busy:

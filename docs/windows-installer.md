@@ -22,6 +22,10 @@ or a network connection after download.
   SHA-256 hashes: Kokoro-82M with the `af_sky`/`ff_siwis` voices, and
   faster-whisper-small. MP3 encoding is in-process through PyAV; no external
   `ffmpeg.exe` is required.
+- The managed ChatGPT-account provider uses the pinned Codex 0.144.1 standalone
+  package shipped inside OSIA. It is resolved before any machine-wide `PATH`
+  entry, so users do not need to install the Codex CLI separately. Its isolated
+  persistent profile remains under `%LOCALAPPDATA%\OSIA\Codex`.
 - User settings, API/OAuth tokens, conversations, memories, certificates,
   skills, and browser profiles remain outside the installation under the
   existing OSIA user-data paths. Normal uninstall deliberately preserves them.

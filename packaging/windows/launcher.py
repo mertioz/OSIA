@@ -14,6 +14,7 @@ from osia.runtime import (
     WAKE_RECOVERY_MODE,
     bundled_model_path,
     is_frozen,
+    resource_path,
 )
 
 
@@ -38,6 +39,7 @@ def _package_smoke() -> int:
         ("logo", LOGO_PATH),
         ("whisper", bundled_model_path("faster-whisper-small")),
         ("kokoro", bundled_model_path("kokoro")),
+        ("codex", resource_path("runtimes", "codex", "bin", "codex.exe")),
     ]
     missing = [label for label, path in required if path is None or not os.path.exists(path)]
     if missing:
@@ -57,6 +59,7 @@ def _package_smoke() -> int:
         from PyQt6.QtWidgets import QApplication
         from faster_whisper import WhisperModel
         from playwright._impl._driver import compute_driver_executable
+        from osia.chatgpt_account.app_server_client import AppServerClient
 
         node, cli = compute_driver_executable()
         if not os.path.isfile(node) or not os.path.isfile(cli):
@@ -73,6 +76,13 @@ def _package_smoke() -> int:
             raise RuntimeError("Windows UI Automation did not initialize")
         if _DllClient.instance().dll is None:
             raise RuntimeError("uiautomation native bitmap client did not initialize")
+
+        codex_path = resource_path("runtimes", "codex", "bin", "codex.exe")
+        codex_version = AppServerClient(
+            runtime_executable=codex_path,
+        ).get_runtime_version()
+        if not codex_version or "0.144.1" not in codex_version:
+            raise RuntimeError("managed Codex runtime did not initialize")
 
         whisper_path = bundled_model_path("faster-whisper-small")
         WhisperModel(
