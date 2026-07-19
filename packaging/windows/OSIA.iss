@@ -32,11 +32,10 @@ OutputDir={#ReleaseRoot}
 OutputBaseFilename=OSIA-Setup
 SetupIconFile={#BuildRoot}\generated\osia.ico
 UninstallDisplayIcon={app}\OSIA.exe
-WizardStyle=modern
+WizardStyle=modern dynamic hidebevels
 WizardSizePercent=115
 WizardImageFile={#BuildRoot}\generated\wizard-large.png
 WizardSmallImageFile={#BuildRoot}\generated\wizard-small.png
-WizardBackColor=$120B0D
 Compression=lzma2/ultra64
 SolidCompression=yes
 LZMAUseSeparateProcess=yes
@@ -59,10 +58,88 @@ DisableWelcomePage=no
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "french"; MessagesFile: "compiler:Languages\French.isl"
 
+[CustomMessages]
+english.AutostartTask=Launch OSIA when I sign in
+english.AutostartGroup=Startup
+english.DesktopTask=Create a desktop shortcut
+english.ShortcutsGroup=Shortcuts
+english.FirewallTask=Enable secure phone access on private local networks
+english.MobileGroup=Mobile connectivity
+english.LaunchOSIA=Launch OSIA
+english.UninstallOSIA=Uninstall OSIA
+english.BrandEyebrow=OSIA  ·  WINDOWS SETUP
+english.StepLocation=STEP 1 OF 3  ·  LOCATION
+english.StepTasks=STEP 2 OF 3  ·  OPTIONS
+english.StepReady=STEP 3 OF 3  ·  REVIEW
+english.StepInstalling=INSTALLING  ·  REAL-TIME PROGRESS
+english.StepPreparing=PREPARING  ·  SAFETY CHECK
+english.WelcomeHeading=Meet OSIA
+english.WelcomeBody=Your personal AI assistant, ready to run on this PC.
+english.VersionArchitecture=Version %s  ·  Windows x64
+english.PreviewState=Internal preview  ·  Unsigned build
+english.ReadyVersion=OSIA %s  ·  Windows x64
+english.Destination=Destination: %s
+english.FinishedHeading=OSIA is ready
+english.FinishedBody=Installation completed successfully. Launch OSIA to get started.
+english.FinishedState=SUCCESS  ·  YOUR SETTINGS STAY IN YOUR USER PROFILE
+english.ShowDetails=Show details
+english.HideDetails=Hide details
+english.PhasePreparing=Preparing OSIA…
+english.PhaseInstalling=Installing application files… %d%%
+english.PhaseConfiguring=Configuring Windows integration…
+english.PhaseFirewall=Securing private-network access…
+english.PhaseFinalizing=Finalizing installation…
+english.DetailStopping=Stopping the existing OSIA background service…
+english.DetailCopying=Copying the self-contained application and offline speech models.
+english.DetailIntegration=Registering the per-user OSIA Server and wake-recovery tasks.
+english.DetailFirewall=Requesting the narrow Private/LocalSubnet TCP 8766 firewall rule.
+english.DetailComplete=Installation completed. Your settings remain in your user profile.
+english.ExistingServiceError=The existing OSIA background service could not be stopped. Close OSIA and try again.
+english.IntegrationError=OSIA could not configure its background mobile service. The installation was rolled back safely.
+english.FirewallWarning=OSIA was installed, but Windows did not create the optional private-network firewall rule. You can retry from the installer repair flow.
+french.AutostartTask=Lancer OSIA à l’ouverture de ma session
+french.AutostartGroup=Démarrage
+french.DesktopTask=Créer un raccourci sur le Bureau
+french.ShortcutsGroup=Raccourcis
+french.FirewallTask=Autoriser l’accès sécurisé du téléphone sur le réseau privé local
+french.MobileGroup=Connexion mobile
+french.LaunchOSIA=Lancer OSIA
+french.UninstallOSIA=Désinstaller OSIA
+french.BrandEyebrow=OSIA  ·  INSTALLATION WINDOWS
+french.StepLocation=ÉTAPE 1 SUR 3  ·  EMPLACEMENT
+french.StepTasks=ÉTAPE 2 SUR 3  ·  OPTIONS
+french.StepReady=ÉTAPE 3 SUR 3  ·  VÉRIFICATION
+french.StepInstalling=INSTALLATION  ·  PROGRESSION RÉELLE
+french.StepPreparing=PRÉPARATION  ·  CONTRÔLE DE SÉCURITÉ
+french.WelcomeHeading=Découvrez OSIA
+french.WelcomeBody=Votre assistant IA personnel, prêt à fonctionner sur ce PC.
+french.VersionArchitecture=Version %s  ·  Windows x64
+french.PreviewState=Aperçu interne  ·  Build non signé
+french.ReadyVersion=OSIA %s  ·  Windows x64
+french.Destination=Destination : %s
+french.FinishedHeading=OSIA est prêt
+french.FinishedBody=L’installation est terminée. Lancez OSIA pour commencer.
+french.FinishedState=SUCCÈS  ·  VOS RÉGLAGES RESTENT DANS VOTRE PROFIL UTILISATEUR
+french.ShowDetails=Afficher les détails
+french.HideDetails=Masquer les détails
+french.PhasePreparing=Préparation d’OSIA…
+french.PhaseInstalling=Installation des fichiers de l’application… %d%%
+french.PhaseConfiguring=Configuration de l’intégration Windows…
+french.PhaseFirewall=Sécurisation de l’accès au réseau privé…
+french.PhaseFinalizing=Finalisation de l’installation…
+french.DetailStopping=Arrêt du service OSIA existant…
+french.DetailCopying=Copie de l’application autonome et des modèles vocaux hors ligne.
+french.DetailIntegration=Enregistrement du serveur OSIA et des tâches de reprise pour cet utilisateur.
+french.DetailFirewall=Demande de la règle TCP 8766 limitée au profil privé et au sous-réseau local.
+french.DetailComplete=Installation terminée. Vos réglages restent dans votre profil utilisateur.
+french.ExistingServiceError=Le service OSIA existant n’a pas pu être arrêté. Fermez OSIA puis réessayez.
+french.IntegrationError=OSIA n’a pas pu configurer son service mobile en arrière-plan. L’installation a été annulée en toute sécurité.
+french.FirewallWarning=OSIA est installé, mais Windows n’a pas créé la règle facultative du pare-feu privé. Vous pourrez réessayer depuis le mode réparation de l’installateur.
+
 [Tasks]
-Name: "autostart"; Description: "Launch OSIA when I sign in"; GroupDescription: "Startup:"; Flags: checkedonce
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
-Name: "firewall"; Description: "Enable secure phone access on private local networks"; GroupDescription: "Mobile connectivity:"; Flags: checkedonce
+Name: "autostart"; Description: "{cm:AutostartTask}"; GroupDescription: "{cm:AutostartGroup}:"; Flags: checkedonce
+Name: "desktopicon"; Description: "{cm:DesktopTask}"; GroupDescription: "{cm:ShortcutsGroup}:"; Flags: unchecked
+Name: "firewall"; Description: "{cm:FirewallTask}"; GroupDescription: "{cm:MobileGroup}:"; Flags: checkedonce
 
 [Files]
 Source: "{#RepoRoot}\dist\OSIA\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -70,11 +147,11 @@ Source: "{#RepoRoot}\windows\configure_lan_firewall.ps1"; DestDir: "{app}\tools"
 
 [Icons]
 Name: "{group}\OSIA"; Filename: "{app}\OSIA.exe"; WorkingDir: "{app}"; IconFilename: "{app}\OSIA.exe"
-Name: "{group}\Uninstall OSIA"; Filename: "{uninstallexe}"
+Name: "{group}\{cm:UninstallOSIA}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\OSIA"; Filename: "{app}\OSIA.exe"; WorkingDir: "{app}"; IconFilename: "{app}\OSIA.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\OSIA.exe"; Description: "Launch OSIA"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\OSIA.exe"; Description: "{cm:LaunchOSIA}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 Filename: "{app}\OSIA.exe"; Parameters: "--osia-remove-integration"; Flags: runhidden waituntilterminated; RunOnceId: "OSIAIntegration"; Check: ShouldRemoveIntegration
@@ -84,10 +161,31 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -N
 Type: files; Name: "{app}\.osia-no-integration-test"
 
 [Code]
+const
+  OSIA_MAIN_BACKGROUND = $00120B0D;
+  OSIA_ELEVATED_SURFACE = $00211217;
+  OSIA_SECONDARY_SURFACE = $002F1821;
+  OSIA_ACCENT = $00F5B5C4;
+  OSIA_PRIMARY_TEXT = $00FFF6F8;
+  OSIA_SECONDARY_TEXT = $00E7CED5;
+  OSIA_HELPER_TEXT = $00C2A4AD;
+  OSIA_DISABLED_TEXT = $00907981;
+  OSIA_SUCCESS_TEXT = $00C1E3A7;
+  OSIA_ERROR_TEXT = $00A7A7F3;
+  OSIA_WARNING_TEXT = $007DC2F1;
+
 var
   StageLabel: TNewStaticText;
   DetailsButton: TNewButton;
   DetailsMemo: TNewMemo;
+  HeaderStepLabel: TNewStaticText;
+  WelcomeLogo: TBitmapImage;
+  WelcomeMetaLabel: TNewStaticText;
+  WelcomePreviewLabel: TNewStaticText;
+  FinishedLogo: TBitmapImage;
+  FinishedStateLabel: TNewStaticText;
+  ReadySummaryLabel: TNewStaticText;
+  ProductVersionText: String;
   ExistingIntegrationStopped: Boolean;
   IntegrationInstalled: Boolean;
   FirewallInstalled: Boolean;
@@ -119,33 +217,220 @@ procedure ToggleDetails(Sender: TObject);
 begin
   DetailsMemo.Visible := not DetailsMemo.Visible;
   if DetailsMemo.Visible then
-    DetailsButton.Caption := 'Hide details'
+    DetailsButton.Caption := CustomMessage('HideDetails')
   else
-    DetailsButton.Caption := 'Show details';
+    DetailsButton.Caption := CustomMessage('ShowDetails');
+end;
+
+procedure StyleLabel(Control: TNewStaticText; Foreground, Background: TColor);
+begin
+  Control.Color := Background;
+  Control.Font.Name := 'Segoe UI';
+  Control.Font.Color := Foreground;
+end;
+
+procedure StylePage(Page: TNewNotebookPage);
+begin
+  Page.Color := TColor(OSIA_MAIN_BACKGROUND);
+end;
+
+procedure StyleDarkMemo(Control: TNewMemo);
+begin
+  Control.Color := TColor(OSIA_SECONDARY_SURFACE);
+  Control.Font.Name := 'Segoe UI';
+  Control.Font.Color := TColor(OSIA_SECONDARY_TEXT);
+end;
+
+procedure StyleDarkList(Control: TNewCheckListBox);
+begin
+  Control.Color := TColor(OSIA_SECONDARY_SURFACE);
+  Control.Font.Name := 'Segoe UI';
+  Control.Font.Color := TColor(OSIA_PRIMARY_TEXT);
+  Control.MinItemHeight := ScaleY(24);
 end;
 
 procedure InitializeWizard;
+var
+  ContentLeft: Integer;
+  ContentWidth: Integer;
 begin
-  WizardForm.Color := TColor($00120B0D);
-  WizardForm.MainPanel.Color := TColor($00120B0D);
-  WizardForm.PageNameLabel.Font.Color := TColor($00F5F1FF);
-  WizardForm.PageNameLabel.Font.Size := 13;
-  WizardForm.PageDescriptionLabel.Font.Color := TColor($00C5BDE0);
+  ProductVersionText := '{#AppVersion}';
+  WizardForm.Font.Name := 'Segoe UI';
+  WizardForm.Font.Size := 9;
+  WizardForm.Color := TColor(OSIA_MAIN_BACKGROUND);
+  WizardForm.MainPanel.Color := TColor(OSIA_ELEVATED_SURFACE);
+  WizardForm.InnerPage.Color := TColor(OSIA_MAIN_BACKGROUND);
+  StylePage(WizardForm.WelcomePage);
+  StylePage(WizardForm.FinishedPage);
+  StylePage(WizardForm.SelectDirPage);
+  StylePage(WizardForm.SelectTasksPage);
+  StylePage(WizardForm.ReadyPage);
+  StylePage(WizardForm.PreparingPage);
+  StylePage(WizardForm.InstallingPage);
+
+  { Keep Windows task dialogs and UAC native. The main wizard alone owns the
+    dark OSIA surface, so system dialogs retain their accessible system colors. }
+  WizardForm.WizardBitmapImage.Visible := False;
+  WizardForm.WizardBitmapImage2.Visible := False;
+  WizardForm.WizardSmallBitmapImage.BackColor := TColor(OSIA_ELEVATED_SURFACE);
+  WizardForm.WizardSmallBitmapImage.SetBounds(
+    WizardForm.MainPanel.ClientWidth - ScaleX(66), ScaleY(8),
+    ScaleX(54), ScaleY(54));
+  WizardForm.WizardSmallBitmapImage.Stretch := True;
+
+  HeaderStepLabel := TNewStaticText.Create(WizardForm);
+  HeaderStepLabel.Parent := WizardForm.MainPanel;
+  HeaderStepLabel.SetBounds(ScaleX(20), ScaleY(5),
+    WizardForm.MainPanel.ClientWidth - ScaleX(98), ScaleY(13));
+  HeaderStepLabel.Caption := CustomMessage('BrandEyebrow');
+  StyleLabel(HeaderStepLabel, TColor(OSIA_ACCENT), TColor(OSIA_ELEVATED_SURFACE));
+  HeaderStepLabel.Font.Size := 8;
+  HeaderStepLabel.Font.Style := [fsBold];
+
+  WizardForm.PageNameLabel.SetBounds(ScaleX(20), ScaleY(19),
+    WizardForm.MainPanel.ClientWidth - ScaleX(100), ScaleY(23));
+  StyleLabel(WizardForm.PageNameLabel, TColor(OSIA_PRIMARY_TEXT),
+    TColor(OSIA_ELEVATED_SURFACE));
+  WizardForm.PageNameLabel.Font.Size := 14;
+  WizardForm.PageNameLabel.Font.Style := [fsBold];
+  WizardForm.PageDescriptionLabel.SetBounds(ScaleX(20), ScaleY(42),
+    WizardForm.MainPanel.ClientWidth - ScaleX(100), ScaleY(16));
+  StyleLabel(WizardForm.PageDescriptionLabel, TColor(OSIA_SECONDARY_TEXT),
+    TColor(OSIA_ELEVATED_SURFACE));
+
+  ContentLeft := ScaleX(28);
+  ContentWidth := WizardForm.WelcomePage.ClientWidth - ContentLeft - ScaleX(28);
+  WelcomeLogo := TBitmapImage.Create(WizardForm);
+  WelcomeLogo.Parent := WizardForm.WelcomePage;
+  WelcomeLogo.SetBounds(ContentLeft, ScaleY(34), ScaleX(74), ScaleY(74));
+  WelcomeLogo.BackColor := TColor(OSIA_MAIN_BACKGROUND);
+  WelcomeLogo.PngImage.Assign(WizardForm.WizardSmallBitmapImage.PngImage);
+  WelcomeLogo.Center := True;
+  WelcomeLogo.Stretch := True;
+
+  WizardForm.WelcomeLabel1.SetBounds(ContentLeft + ScaleX(98), ScaleY(35),
+    ContentWidth - ScaleX(98), ScaleY(47));
+  WizardForm.WelcomeLabel1.Caption := CustomMessage('WelcomeHeading');
+  WizardForm.WelcomeLabel1.WordWrap := True;
+  StyleLabel(WizardForm.WelcomeLabel1, TColor(OSIA_PRIMARY_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  WizardForm.WelcomeLabel1.Font.Size := 18;
+  WizardForm.WelcomeLabel1.Font.Style := [fsBold];
+  WizardForm.WelcomeLabel2.SetBounds(ContentLeft + ScaleX(98), ScaleY(88),
+    ContentWidth - ScaleX(98), ScaleY(48));
+  WizardForm.WelcomeLabel2.Caption := CustomMessage('WelcomeBody');
+  WizardForm.WelcomeLabel2.WordWrap := True;
+  StyleLabel(WizardForm.WelcomeLabel2, TColor(OSIA_SECONDARY_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  WizardForm.WelcomeLabel2.Font.Size := 10;
+
+  WelcomeMetaLabel := TNewStaticText.Create(WizardForm);
+  WelcomeMetaLabel.Parent := WizardForm.WelcomePage;
+  WelcomeMetaLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(147),
+    ContentWidth - ScaleX(98), ScaleY(24));
+  WelcomeMetaLabel.Caption :=
+    Format(CustomMessage('VersionArchitecture'), [ProductVersionText]);
+  StyleLabel(WelcomeMetaLabel, TColor(OSIA_HELPER_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+
+  WelcomePreviewLabel := TNewStaticText.Create(WizardForm);
+  WelcomePreviewLabel.Parent := WizardForm.WelcomePage;
+  WelcomePreviewLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(179),
+    ContentWidth - ScaleX(98), ScaleY(24));
+  WelcomePreviewLabel.Caption := CustomMessage('PreviewState');
+  StyleLabel(WelcomePreviewLabel, TColor(OSIA_WARNING_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  WelcomePreviewLabel.Font.Style := [fsBold];
+
+  FinishedLogo := TBitmapImage.Create(WizardForm);
+  FinishedLogo.Parent := WizardForm.FinishedPage;
+  FinishedLogo.SetBounds(ContentLeft, ScaleY(34), ScaleX(74), ScaleY(74));
+  FinishedLogo.BackColor := TColor(OSIA_MAIN_BACKGROUND);
+  FinishedLogo.PngImage.Assign(WizardForm.WizardSmallBitmapImage.PngImage);
+  FinishedLogo.Center := True;
+  FinishedLogo.Stretch := True;
+  WizardForm.FinishedHeadingLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(38),
+    ContentWidth - ScaleX(98), ScaleY(42));
+  WizardForm.FinishedHeadingLabel.Caption := CustomMessage('FinishedHeading');
+  StyleLabel(WizardForm.FinishedHeadingLabel, TColor(OSIA_PRIMARY_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  WizardForm.FinishedHeadingLabel.Font.Size := 17;
+  WizardForm.FinishedHeadingLabel.Font.Style := [fsBold];
+  WizardForm.FinishedLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(88),
+    ContentWidth - ScaleX(98), ScaleY(48));
+  WizardForm.FinishedLabel.Caption := CustomMessage('FinishedBody');
+  WizardForm.FinishedLabel.WordWrap := True;
+  StyleLabel(WizardForm.FinishedLabel, TColor(OSIA_SECONDARY_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  FinishedStateLabel := TNewStaticText.Create(WizardForm);
+  FinishedStateLabel.Parent := WizardForm.FinishedPage;
+  FinishedStateLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(151),
+    ContentWidth - ScaleX(98), ScaleY(26));
+  FinishedStateLabel.Caption := CustomMessage('FinishedState');
+  StyleLabel(FinishedStateLabel, TColor(OSIA_SUCCESS_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  FinishedStateLabel.Font.Size := 8;
+  FinishedStateLabel.Font.Style := [fsBold];
+  WizardForm.RunList.SetBounds(ContentLeft + ScaleX(98), ScaleY(199),
+    ContentWidth - ScaleX(98), ScaleY(58));
+  StyleDarkList(WizardForm.RunList);
+
+  StyleLabel(WizardForm.SelectDirLabel, TColor(OSIA_SECONDARY_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  StyleLabel(WizardForm.SelectDirBrowseLabel, TColor(OSIA_HELPER_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  StyleLabel(WizardForm.DiskSpaceLabel, TColor(OSIA_HELPER_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  WizardForm.DirEdit.Color := TColor($00FFFFFF);
+  WizardForm.DirEdit.Font.Color := TColor($0021182F);
+  WizardForm.DirEdit.Font.Name := 'Segoe UI';
+
+  StyleLabel(WizardForm.SelectTasksLabel, TColor(OSIA_SECONDARY_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  StyleDarkList(WizardForm.TasksList);
+
+  StyleLabel(WizardForm.ReadyLabel, TColor(OSIA_SECONDARY_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  ReadySummaryLabel := TNewStaticText.Create(WizardForm);
+  ReadySummaryLabel.Parent := WizardForm.ReadyPage;
+  ReadySummaryLabel.SetBounds(WizardForm.ReadyMemo.Left,
+    WizardForm.ReadyMemo.Top + ScaleY(12), WizardForm.ReadyMemo.Width, ScaleY(62));
+  ReadySummaryLabel.WordWrap := True;
+  StyleLabel(ReadySummaryLabel, TColor(OSIA_HELPER_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  WizardForm.ReadyMemo.Top := WizardForm.ReadyMemo.Top + ScaleY(82);
+  WizardForm.ReadyMemo.Height := WizardForm.ReadyMemo.Height - ScaleY(82);
+  StyleDarkMemo(WizardForm.ReadyMemo);
+
+  StyleLabel(WizardForm.PreparingLabel, TColor(OSIA_ERROR_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  StyleDarkMemo(WizardForm.PreparingMemo);
+  WizardForm.PreparingYesRadio.Color := TColor(OSIA_MAIN_BACKGROUND);
+  WizardForm.PreparingYesRadio.Font.Color := TColor(OSIA_SECONDARY_TEXT);
+  WizardForm.PreparingNoRadio.Color := TColor(OSIA_MAIN_BACKGROUND);
+  WizardForm.PreparingNoRadio.Font.Color := TColor(OSIA_SECONDARY_TEXT);
+
+  StyleLabel(WizardForm.StatusLabel, TColor(OSIA_SECONDARY_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  StyleLabel(WizardForm.FilenameLabel, TColor(OSIA_HELPER_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
 
   StageLabel := TNewStaticText.Create(WizardForm);
   StageLabel.Parent := WizardForm.InstallingPage;
   StageLabel.Left := 0;
   StageLabel.Top := WizardForm.ProgressGauge.Top - ScaleY(28);
   StageLabel.Width := WizardForm.InstallingPage.ClientWidth;
-  StageLabel.Font.Color := TColor($00F5F1FF);
-  StageLabel.Caption := 'Preparing installation…';
+  StageLabel.Height := ScaleY(22);
+  StageLabel.Caption := CustomMessage('PhasePreparing');
+  StyleLabel(StageLabel, TColor(OSIA_PRIMARY_TEXT), TColor(OSIA_MAIN_BACKGROUND));
+  StageLabel.Font.Style := [fsBold];
 
   DetailsButton := TNewButton.Create(WizardForm);
   DetailsButton.Parent := WizardForm.InstallingPage;
   DetailsButton.Left := 0;
   DetailsButton.Top := WizardForm.ProgressGauge.Top + ScaleY(42);
   DetailsButton.Width := ScaleX(110);
-  DetailsButton.Caption := 'Show details';
+  DetailsButton.Caption := CustomMessage('ShowDetails');
   DetailsButton.OnClick := @ToggleDetails;
 
   DetailsMemo := TNewMemo.Create(WizardForm);
@@ -157,6 +442,12 @@ begin
   DetailsMemo.ReadOnly := True;
   DetailsMemo.ScrollBars := ssVertical;
   DetailsMemo.Visible := False;
+  StyleDarkMemo(DetailsMemo);
+
+  StyleLabel(WizardForm.BeveledLabel, TColor(OSIA_DISABLED_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  WizardForm.NextButton.Default := True;
+  WizardForm.CancelButton.Cancel := True;
 
   HadPreviousRunValue := RegQueryStringValue(
     HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'OSIA', PreviousRunValue);
@@ -173,12 +464,12 @@ begin
   ExistingExe := ExpandConstant('{app}\OSIA.exe');
   if (not IntegrationSuppressed) and FileExists(ExistingExe) then
   begin
-    AddDetail('Stopping the existing OSIA background service…');
+    AddDetail(CustomMessage('DetailStopping'));
     if Exec(ExistingExe, '--osia-remove-integration', '', SW_HIDE,
       ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
       ExistingIntegrationStopped := True
     else
-      Result := 'The existing OSIA background service could not be stopped.';
+      Result := CustomMessage('ExistingServiceError');
   end;
 end;
 
@@ -190,7 +481,29 @@ begin
     Percent := (CurProgress * 100) div MaxProgress
   else
     Percent := 0;
-  StageLabel.Caption := Format('Installing OSIA files… %d%%', [Percent]);
+  StageLabel.Caption := Format(CustomMessage('PhaseInstalling'), [Percent]);
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if CurPageID = wpSelectDir then
+    HeaderStepLabel.Caption := CustomMessage('StepLocation')
+  else if CurPageID = wpSelectTasks then
+    HeaderStepLabel.Caption := CustomMessage('StepTasks')
+  else if CurPageID = wpReady then
+  begin
+    HeaderStepLabel.Caption := CustomMessage('StepReady');
+    ReadySummaryLabel.Caption :=
+      Format(CustomMessage('ReadyVersion'), [ProductVersionText]) + #13#10 +
+      Format(CustomMessage('Destination'), [WizardDirValue]) + #13#10 +
+      WizardForm.DiskSpaceLabel.Caption;
+  end
+  else if CurPageID = wpPreparing then
+    HeaderStepLabel.Caption := CustomMessage('StepPreparing')
+  else if CurPageID = wpInstalling then
+    HeaderStepLabel.Caption := CustomMessage('StepInstalling')
+  else
+    HeaderStepLabel.Caption := CustomMessage('BrandEyebrow');
 end;
 
 procedure RestorePreviousAutostart;
@@ -211,8 +524,8 @@ var
 begin
   if CurStep = ssInstall then
   begin
-    StageLabel.Caption := 'Installing OSIA files…';
-    AddDetail('Copying the self-contained application and offline speech models.');
+    StageLabel.Caption := Format(CustomMessage('PhaseInstalling'), [0]);
+    AddDetail(CustomMessage('DetailCopying'));
   end;
 
   if CurStep = ssPostInstall then
@@ -224,15 +537,15 @@ begin
     end
     else
     begin
-      StageLabel.Caption := 'Configuring mobile connectivity…';
-      AddDetail('Registering the per-user OSIA Server and wake-recovery tasks.');
+      StageLabel.Caption := CustomMessage('PhaseConfiguring');
+      AddDetail(CustomMessage('DetailIntegration'));
       if (not Exec(AppExe, '--osia-install-integration', '', SW_HIDE,
         ewWaitUntilTerminated, ResultCode)) or (ResultCode <> 0) then
       begin
         Exec(AppExe, '--osia-remove-integration', '', SW_HIDE,
           ewWaitUntilTerminated, ResultCode);
         RestorePreviousAutostart;
-        RaiseException('OSIA could not configure its background mobile service.');
+        RaiseException(CustomMessage('IntegrationError'));
       end;
       IntegrationInstalled := True;
     end;
@@ -246,8 +559,8 @@ begin
 
     if WizardIsTaskSelected('firewall') then
     begin
-      StageLabel.Caption := 'Securing private-network access…';
-      AddDetail('Requesting the narrow Private/LocalSubnet TCP 8766 firewall rule.');
+      StageLabel.Caption := CustomMessage('PhaseFirewall');
+      AddDetail(CustomMessage('DetailFirewall'));
       FirewallScript := ExpandConstant('{app}\tools\configure_lan_firewall.ps1');
       if Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
         '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
@@ -255,15 +568,33 @@ begin
         '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
         FirewallInstalled := True
       else
-        MsgBox('OSIA was installed, but Windows did not create the optional private-network firewall rule. You can retry from the installer repair flow.',
+        MsgBox(CustomMessage('FirewallWarning'),
           mbInformation, MB_OK);
     end;
-    StageLabel.Caption := 'Finalizing OSIA…';
-    AddDetail('Installation completed. Your settings remain in your user profile.');
+    StageLabel.Caption := CustomMessage('PhaseFinalizing');
+    AddDetail(CustomMessage('DetailComplete'));
   end;
 
   if CurStep = ssDone then
     InstallSucceeded := True;
+end;
+
+procedure InitializeUninstallProgressForm;
+begin
+  UninstallProgressForm.Font.Name := 'Segoe UI';
+  UninstallProgressForm.Color := TColor(OSIA_MAIN_BACKGROUND);
+  UninstallProgressForm.InnerPage.Color := TColor(OSIA_MAIN_BACKGROUND);
+  UninstallProgressForm.InstallingPage.Color := TColor(OSIA_MAIN_BACKGROUND);
+  UninstallProgressForm.MainPanel.Color := TColor(OSIA_ELEVATED_SURFACE);
+  StyleLabel(UninstallProgressForm.PageNameLabel, TColor(OSIA_PRIMARY_TEXT),
+    TColor(OSIA_ELEVATED_SURFACE));
+  UninstallProgressForm.PageNameLabel.Font.Style := [fsBold];
+  StyleLabel(UninstallProgressForm.PageDescriptionLabel, TColor(OSIA_SECONDARY_TEXT),
+    TColor(OSIA_ELEVATED_SURFACE));
+  StyleLabel(UninstallProgressForm.StatusLabel, TColor(OSIA_SECONDARY_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
+  StyleLabel(UninstallProgressForm.BeveledLabel, TColor(OSIA_DISABLED_TEXT),
+    TColor(OSIA_MAIN_BACKGROUND));
 end;
 
 procedure DeinitializeSetup;

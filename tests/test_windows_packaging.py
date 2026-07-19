@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
 import re
 import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -191,6 +193,144 @@ def test_installer_contract_preserves_user_data_and_has_real_progress():
     assert "OutputBaseFilename=OSIA-Setup" in script
     assert "{userappdata}\\.osia" not in script.lower()
     assert "Path.home()" not in script
+
+
+def test_installer_ui_uses_explicit_accessible_osia_palette():
+    script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
+    for color in (
+        "OSIA_MAIN_BACKGROUND = $00120B0D",
+        "OSIA_ELEVATED_SURFACE = $00211217",
+        "OSIA_SECONDARY_SURFACE = $002F1821",
+        "OSIA_ACCENT = $00F5B5C4",
+        "OSIA_PRIMARY_TEXT = $00FFF6F8",
+        "OSIA_SECONDARY_TEXT = $00E7CED5",
+        "OSIA_HELPER_TEXT = $00C2A4AD",
+        "OSIA_DISABLED_TEXT = $00907981",
+        "OSIA_SUCCESS_TEXT = $00C1E3A7",
+        "OSIA_ERROR_TEXT = $00A7A7F3",
+        "OSIA_WARNING_TEXT = $007DC2F1",
+    ):
+        assert color in script
+
+    # WizardBackColor also affects pre-wizard native task dialogs, whose text
+    # follows the Windows theme. Only the main wizard receives the dark skin.
+    assert "WizardBackColor=" not in script
+    for control in (
+        "WizardForm.WelcomeLabel1",
+        "WizardForm.WelcomeLabel2",
+        "WizardForm.PageNameLabel",
+        "WizardForm.PageDescriptionLabel",
+        "WizardForm.SelectDirLabel",
+        "WizardForm.SelectDirBrowseLabel",
+        "WizardForm.DiskSpaceLabel",
+        "WizardForm.SelectTasksLabel",
+        "WizardForm.ReadyLabel",
+        "WizardForm.PreparingLabel",
+        "WizardForm.StatusLabel",
+        "WizardForm.FilenameLabel",
+        "WizardForm.FinishedHeadingLabel",
+        "WizardForm.FinishedLabel",
+    ):
+        assert f"StyleLabel({control}" in script
+    assert "StyleDarkList(WizardForm.TasksList)" in script
+    assert "StyleDarkList(WizardForm.RunList)" in script
+    assert "StyleDarkMemo(WizardForm.ReadyMemo)" in script
+    assert "StyleDarkMemo(DetailsMemo)" in script
+
+
+def test_installer_ui_keeps_native_accessibility_and_shows_real_state():
+    script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
+    assert "WizardStyle=modern dynamic hidebevels" in script
+    assert "WizardSizePercent=115" in script
+    assert "WizardForm.WizardBitmapImage.Visible := False" in script
+    assert "WizardForm.WizardBitmapImage2.Visible := False" in script
+    assert "WizardForm.NextButton.Default := True" in script
+    assert "WizardForm.CancelButton.Cancel := True" in script
+    assert "CurInstallProgressChanged" in script
+    assert "StageLabel.Caption := Format(CustomMessage('PhaseInstalling')" in script
+    assert "StyleLabel(StageLabel, TColor(OSIA_PRIMARY_TEXT)" in script
+    assert "VersionArchitecture=Version %s  ·  Windows x64" in script
+    assert "PreviewState=Internal preview  ·  Unsigned build" in script
+    assert "ReadySummaryLabel.Caption" in script
+    assert "WizardForm.DiskSpaceLabel.Caption" in script
+    assert "FinishedHeading=OSIA is ready" in script
+    assert "FinishedState=SUCCESS" in script
+    assert "Result := CustomMessage('ExistingServiceError')" in script
+    assert "RaiseException(CustomMessage('IntegrationError'))" in script
+    assert "MsgBox(CustomMessage('FirewallWarning')" in script
+    assert "procedure InitializeUninstallProgressForm" in script
+    # A future update-mode switch must not bypass the shared styled wizard.
+    assert "ShouldSkipPage" not in script
+
+
+def test_installer_branding_references_generated_assets_that_have_sources():
+    script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
+    build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
+    assert (ROOT / "assets" / "osia_icon.png").is_file()
+    assert (ROOT / "assets" / "osia_logo.png").is_file()
+    for filename in ("osia.ico", "wizard-large.png", "wizard-small.png"):
+        assert filename in script
+        assert filename in build
+
+
+def test_installer_identity_scope_and_output_name_are_unchanged():
+    script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
+    assert "AppId={{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}" in script
+    assert "PrivilegesRequired=lowest" in script
+    assert "PrivilegesRequiredOverridesAllowed=dialog" in script
+    assert "DefaultDirName={localappdata}\\Programs\\OSIA" in script
+    assert "OutputBaseFilename=OSIA-Setup" in script
+
+
+def _find_iscc_for_test() -> Path | None:
+    candidates = (
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Inno Setup 6" / "ISCC.exe",
+        Path(os.environ.get("ProgramFiles(x86)", "")) / "Inno Setup 6" / "ISCC.exe",
+        Path(os.environ.get("ProgramFiles", "")) / "Inno Setup 6" / "ISCC.exe",
+    )
+    return next((path for path in candidates if path.is_file()), None)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Inno Setup is Windows-only")
+def test_inno_script_compiles_with_a_non_installing_minimal_payload(tmp_path):
+    iscc = _find_iscc_for_test()
+    if iscc is None:
+        pytest.skip("Inno Setup 6 is not installed")
+
+    from PIL import Image
+
+    source = tmp_path / "source"
+    payload = source / "dist" / "OSIA"
+    windows = source / "windows"
+    generated = tmp_path / "build" / "generated"
+    output = tmp_path / "output"
+    for directory in (payload, windows, generated, output):
+        directory.mkdir(parents=True)
+    (payload / "OSIA.exe").write_bytes(b"non-installing compile fixture")
+    (windows / "configure_lan_firewall.ps1").write_text("# fixture\n", "utf-8")
+    Image.new("RGBA", (64, 64), "#c4b5f5").save(generated / "osia.ico")
+    Image.new("RGB", (410, 790), "#0d0b12").save(generated / "wizard-large.png")
+    Image.new("RGB", (164, 164), "#171221").save(generated / "wizard-small.png")
+
+    completed = subprocess.run(
+        [
+            str(iscc),
+            "/Qp",
+            "/DAppVersion=1.0.0",
+            f"/DRepoRoot={source}",
+            f"/DBuildRoot={tmp_path / 'build'}",
+            f"/DReleaseRoot={output}",
+            str(ROOT / "packaging" / "windows" / "OSIA.iss"),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=90,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert (output / "OSIA-Setup.exe").is_file()
 
 
 def test_package_spec_is_allowlist_based_and_excludes_user_config():
