@@ -88,7 +88,6 @@ import io
 import json
 import os
 import secrets
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -501,32 +500,40 @@ def _google_to_mp3_bytes(text: str) -> bytes:
 
 
 def _wav_to_mp3(wav_bytes: bytes, bitrate: str = "128k") -> bytes:
-    """Convert WAV audio bytes to MP3 via ffmpeg pipe."""
-    # Resolve ffmpeg robustly: prefer one on PATH; on Windows fall back to the
-    # bundled <project_root>/windows/ffmpeg.exe if present.
-    ffmpeg_exe = shutil.which("ffmpeg")
-    if ffmpeg_exe is None:
-        bundled = PROJECT_DIR / "windows" / "ffmpeg.exe"
-        if bundled.exists():
-            ffmpeg_exe = str(bundled)
-    if ffmpeg_exe is None:
-        msg = (
-            "ffmpeg not found: install ffmpeg and ensure it is on PATH "
-            "(or provide windows/ffmpeg.exe on Windows)."
+    """Convert WAV audio bytes to MP3 in-process through PyAV/libmp3lame."""
+    import av
+
+    try:
+        bit_rate = int(bitrate.lower().removesuffix("k")) * 1000
+    except (AttributeError, ValueError):
+        raise ValueError(f"invalid MP3 bitrate: {bitrate!r}") from None
+
+    output = io.BytesIO()
+    source = av.open(io.BytesIO(wav_bytes), mode="r")
+    target = av.open(output, mode="w", format="mp3")
+    try:
+        stream = target.add_stream("libmp3lame", rate=24000)
+        stream.bit_rate = bit_rate
+        resampler = av.AudioResampler(
+            format=stream.codec_context.format.name,
+            layout="mono",
+            rate=24000,
         )
-        print(f"[OSIA Server] {msg}", flush=True)
-        raise RuntimeError(msg)
-    proc = subprocess.run(
-        [ffmpeg_exe, "-y", "-i", "pipe:0", "-f", "mp3", "-b:a", bitrate, "pipe:1"],
-        input=wav_bytes,
-        capture_output=True,
-        timeout=30,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg conversion failed: {proc.stderr.decode('utf-8', 'replace')}"
-        )
-    return proc.stdout
+        for frame in source.decode(audio=0):
+            for converted in resampler.resample(frame):
+                converted.pts = None
+                for packet in stream.encode(converted):
+                    target.mux(packet)
+        for converted in resampler.resample(None):
+            converted.pts = None
+            for packet in stream.encode(converted):
+                target.mux(packet)
+        for packet in stream.encode(None):
+            target.mux(packet)
+    finally:
+        target.close()
+        source.close()
+    return output.getvalue()
 
 
 def synthesize_to_mp3_bytes(text: str) -> bytes:

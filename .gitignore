@@ -61,6 +61,8 @@ preferences.txt
 Thumbs.db
 build/
 dist/
+release/
+packaging/windows/.build-venv/
 # Windows runtime artifacts (cloudflared.exe and ffmpeg.exe are downloaded by
 # install.bat; tunnel.log is written at runtime by the tunnel service) — never
 # commit these.

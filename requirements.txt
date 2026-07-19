@@ -18,7 +18,7 @@ faster-whisper>=1.0.0              # on-device Whisper (CTranslate2 backend)
 
 # ── Wake word ───────────────────────────────────────────────────────────────
 openwakeword>=0.6.0
-scikit-learn>=1.3.0                # logistic-regression verifier (osia_verifier.pkl)
+scikit-learn==1.8.0               # must match the serialized osia_verifier.pkl
 
 # ── Audio I/O + DSP ─────────────────────────────────────────────────────────
 sounddevice>=0.4.6                 # PortAudio bindings (mic capture / playback)
@@ -28,6 +28,8 @@ scipy>=1.11.0
 
 # ── Text-to-speech ──────────────────────────────────────────────────────────
 kokoro>=0.7.0                      # offline Kokoro TTS (pulls torch/transformers)
+spacy>=3.8,<3.9                    # Kokoro English phonemizer
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85
 langdetect>=1.0.9                  # language detection for TTS voice routing
 
 # ── Browser automation tool ─────────────────────────────────────────────────
@@ -38,6 +40,7 @@ openai>=1.0.0                      # OpenAI-compatible client (OpenAI/DeepSeek/G
 requests>=2.31.0
 cryptography>=42.0.0               # X25519 / HKDF / ChaCha20-Poly1305 for relay E2E crypto
 aiortc==1.15.0                     # data-only WebRTC direct transport (ordered reliable SCTP)
+av==17.1.0                         # in-process MP3 encode/decode and aiortc media runtime
 dnspython==2.8.0                   # bounded DNS for privacy-safe STUN health classification
 zeroconf==0.150.0                 # DNS-SD advertisement for feature-gated LAN transport
 

@@ -1,7 +1,9 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('Install', 'Remove')]
-    [string]$Action
+    [string]$Action,
+
+    [string]$ProgramPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,6 +19,9 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
         '-File', ('"{0}"' -f $PSCommandPath),
         '-Action', $Action
     )
+    if (-not [string]::IsNullOrWhiteSpace($ProgramPath)) {
+        $arguments += @('-ProgramPath', ('"{0}"' -f $ProgramPath))
+    }
     $elevated = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru `
         -ArgumentList $arguments
     exit $elevated.ExitCode
@@ -30,9 +35,12 @@ if ($Action -eq 'Remove') {
     exit 0
 }
 
-$pythonPath = $env:OSIA_FIREWALL_PYTHON
-if ([string]::IsNullOrWhiteSpace($pythonPath) -or -not (Test-Path -LiteralPath $pythonPath)) {
-    throw 'The OSIA virtual-environment Python executable was not found.'
+$targetProgram = $ProgramPath
+if ([string]::IsNullOrWhiteSpace($targetProgram)) {
+    $targetProgram = $env:OSIA_FIREWALL_PYTHON
+}
+if ([string]::IsNullOrWhiteSpace($targetProgram) -or -not (Test-Path -LiteralPath $targetProgram)) {
+    throw 'The OSIA executable was not found.'
 }
 
 New-NetFirewallRule `
@@ -45,7 +53,7 @@ New-NetFirewallRule `
     -Protocol TCP `
     -LocalPort 8766 `
     -RemoteAddress LocalSubnet `
-    -Program ([IO.Path]::GetFullPath($pythonPath)) | Out-Null
+    -Program ([IO.Path]::GetFullPath($targetProgram)) | Out-Null
 
 $rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction Stop
 if ($rule.Direction -ne 'Inbound' -or $rule.Action -ne 'Allow' -or

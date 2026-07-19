@@ -126,7 +126,7 @@ SHADOW_ALPHA = 45     # alpha of the innermost (darkest) ring; fades to 0 outwar
 # Inner surfaces (assistant bubble, input frame) keep a higher alpha so text
 # stays legible while this outer card is strongly translucent.
 
-STARTUP_SERVICES = ("osia-server.service", "osia-tunnel.service")
+STARTUP_SERVICES = ("osia-server.service",)
 
 # Official API-key pages opened by the "Get API key" → Browse button on each
 # provider's configuration card. Ollama is local and has no key page.
@@ -259,8 +259,13 @@ def _downloaded_whisper_models() -> set[str]:
     directories. Never raises — an absent or unreadable cache yields an empty
     set, so the selector simply offers nothing as downloaded.
     """
+    from osia.runtime import bundled_model_path
+
     hub = Path.home() / ".cache" / "huggingface" / "hub"
     found: set[str] = set()
+    for size in ("tiny", "base", "small", "medium", "large-v3"):
+        if bundled_model_path(f"faster-whisper-{size}") is not None:
+            found.add(size)
     try:
         for entry in hub.iterdir():
             if entry.is_dir() and entry.name.startswith(_FASTER_WHISPER_REPO_PREFIX):
@@ -2781,10 +2786,7 @@ class _SettingsPanel(QWidget):
         # (unit, i18n key) — the label widget + key are tracked in
         # self._startup_labels so they re-translate on language change.
         self._startup_labels: list[tuple[QLabel, str]] = []
-        rows = [
-            (STARTUP_SERVICES[0], "settings.startup_mobile_server"),
-            (STARTUP_SERVICES[1], "settings.startup_cloudflare"),
-        ]
+        rows = [(STARTUP_SERVICES[0], "settings.startup_mobile_server")]
         for unit, label_key in rows:
             row = QHBoxLayout()
             label = QLabel(i18n.t(label_key))

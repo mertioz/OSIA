@@ -17,8 +17,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-_HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent
+_SOURCE_ROOT = Path(__file__).resolve().parent.parent
+if (_SOURCE_ROOT / "osia").is_dir() and str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
+
+from osia.runtime import SERVER_MODE, cmdline_has_mode, is_frozen, resource_root
+
+_REPO = resource_root()
+_HERE = _REPO / "windows"
 _TUNNEL_LOG = _HERE / "tunnel.log"
 _LOG_PATH = Path(tempfile.gettempdir()) / "osia_wake_recovery.log"
 _LOCK_PATH = Path(tempfile.gettempdir()) / "osia_wake_recovery.lock"
@@ -164,8 +170,11 @@ def _find_server_children() -> list[tuple[int, str]]:
     run_server = _REPO / "osia" / "server" / "run_server.py"
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
-            cmdline = " ".join(proc.info.get("cmdline") or [])
-            if _cmdline_has_path(cmdline, run_server):
+            raw_cmdline = proc.info.get("cmdline") or []
+            cmdline = " ".join(raw_cmdline)
+            if _cmdline_has_path(cmdline, run_server) or (
+                is_frozen() and cmdline_has_mode(raw_cmdline, SERVER_MODE)
+            ):
                 matches.append((int(proc.info["pid"]), cmdline))
         except Exception:
             continue
@@ -272,6 +281,13 @@ def main() -> int:
             if len(set(listeners)) > 1:
                 _log(log_fh, "failed: duplicate server port listeners detected")
                 return 1
+
+            if is_frozen():
+                if not server_restart_ok:
+                    _log(log_fh, "failed: server scheduled-task restart command failed")
+                    return 1
+                _log(log_fh, "wake recovery completed successfully")
+                return 0
 
             tunnel_restart_ok = _restart(log_fh, restart_service, _TUNNEL_UNIT, "tunnel")
             tunnel_matches = _wait_for_cloudflared(log_fh)

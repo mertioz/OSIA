@@ -37,6 +37,7 @@ except Exception as _audio_exc:  # PortAudio missing / no audio device
     )
 
 from osia.config import get_setting
+from osia.runtime import bundled_model_path, is_frozen
 from osia.utils.key_chain import with_key_rotation, has_key
 from osia.voice.commands import is_new_chat_command
 
@@ -93,6 +94,12 @@ def _get_model(model_size: str = None):
     """
     global _model, _model_size
     size = model_size or get_setting("stt_local_model", MODEL_SIZE) or MODEL_SIZE
+    bundled = bundled_model_path(f"faster-whisper-{size}")
+    if is_frozen() and bundled is None:
+        fallback = bundled_model_path("faster-whisper-small")
+        if fallback is not None:
+            size = "small"
+            bundled = fallback
     # Fast path: already built for this size — no lock, no import.
     if _model is not None and _model_size == size:
         return _model, size
@@ -100,7 +107,13 @@ def _get_model(model_size: str = None):
         # Re-check under the lock: another thread may have built it meanwhile.
         if _model is None or _model_size != size:
             from faster_whisper import WhisperModel  # lazy: native ext, cold-boot-crash-prone (WOR-47)
-            _model = WhisperModel(size, device="cpu", compute_type="int8")
+            model_ref = str(bundled) if bundled is not None else size
+            _model = WhisperModel(
+                model_ref,
+                device="cpu",
+                compute_type="int8",
+                local_files_only=is_frozen(),
+            )
             _model_size = size
         return _model, size
 

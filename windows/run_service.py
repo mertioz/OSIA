@@ -41,9 +41,22 @@ import ctypes
 from ctypes import wintypes
 from pathlib import Path
 
+_SOURCE_ROOT = Path(__file__).resolve().parent.parent
+if (_SOURCE_ROOT / "osia").is_dir() and str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
+
+from osia.runtime import (
+    SERVER_MODE,
+    application_dir,
+    application_executable,
+    cmdline_has_mode,
+    is_frozen,
+    resource_root,
+)
+
 # windows/run_service.py → <repo>/windows → <repo>
-_HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent
+_REPO = resource_root()
+_HERE = _REPO / "windows"
 _RUN_SERVER = _REPO / "osia" / "server" / "run_server.py"
 _CLOUDFLARED = _HERE / "cloudflared.exe"
 _TUNNEL_LOG = _HERE / "tunnel.log"
@@ -316,6 +329,8 @@ def _open_log(path: Path, line_buffered: bool):
 def _child_command(kind: str):
     """(argv, cwd) for the supervised child."""
     if kind == "server":
+        if is_frozen():
+            return [str(application_executable()), SERVER_MODE], str(application_dir())
         # ``-u`` (unbuffered, exactly like the working console run
         # ``python -u run_server.py``) makes the child's uvicorn startup lines
         # and any crash traceback reach the child log *immediately* instead of
@@ -355,7 +370,8 @@ def _other_owner_running(kind: str, exclude_pid: int) -> bool:
             pid = proc.info.get("pid")
             if pid in (me, exclude_pid):
                 continue
-            cmdline = " ".join(proc.info.get("cmdline") or [])
+            raw_cmdline = proc.info.get("cmdline") or []
+            cmdline = " ".join(raw_cmdline)
             if kind == "tunnel":
                 # Only OSIA's *own* quick tunnel counts as another owner — match
                 # the unique logfile path we always pass (windows\tunnel.log),
@@ -368,7 +384,9 @@ def _other_owner_running(kind: str, exclude_pid: int) -> bool:
                         and _cmdline_has_path(cmdline, _TUNNEL_LOG):
                     return True
             else:
-                if _cmdline_has_path(cmdline, _RUN_SERVER):
+                if _cmdline_has_path(cmdline, _RUN_SERVER) or (
+                    is_frozen() and cmdline_has_mode(raw_cmdline, SERVER_MODE)
+                ):
                     return True
         except Exception:
             continue
@@ -543,9 +561,12 @@ def _supervise(kind: str, cmd, cwd: str, child_log, child_log_path: Path,
         _stop_child(my_child)
 
 
-def main() -> int:
-    kind = (sys.argv[1] if len(sys.argv) > 1 else "").strip().lower()
+def main(args: list[str] | None = None) -> int:
+    values = sys.argv[1:] if args is None else args
+    kind = (values[0] if values else "").strip().lower()
     if kind not in ("server", "tunnel"):
+        return 2
+    if is_frozen() and kind == "tunnel":
         return 2
 
     # Two separate logs in the OS temp dir: the supervisor's own timestamped

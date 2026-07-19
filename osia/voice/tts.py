@@ -15,6 +15,7 @@ import io
 import json
 import os
 import queue
+import sys
 import threading
 
 import numpy as np
@@ -37,6 +38,7 @@ except Exception as _audio_exc:  # PortAudio missing / no audio device
     )
 
 from osia.config import CONFIG_DIR, get_setting
+from osia.runtime import bundled_model_path
 from osia.utils.key_chain import with_key_rotation, has_key, KeyChainEmpty
 
 # Make langdetect deterministic
@@ -112,8 +114,43 @@ KOKORO_SR = 24000
 KOKORO_SPEED = TTS_SPEED  # also imported by osia.server.server
 
 _kokoro_pipelines = {}
+_kokoro_model = None
 _stream_playback_context = threading.local()
 _playback_start_lock = threading.Lock()
+
+
+def _patch_windows_espeak_data_path() -> None:
+    """Keep eSpeak's narrow Windows API away from non-ASCII install paths."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from pathlib import Path
+
+    from phonemizer.backend.espeak.wrapper import EspeakWrapper
+
+    if hasattr(EspeakWrapper, "_osia_data_path_getter"):
+        return
+    original_getter = EspeakWrapper.data_path.fget
+    if original_getter is None:
+        return
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_short_path = kernel32.GetShortPathNameW
+    get_short_path.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+    get_short_path.restype = ctypes.c_uint
+
+    def _short_data_path(wrapper):
+        value = original_getter(wrapper)
+        if value is None:
+            return None
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = get_short_path(str(value), buffer, len(buffer))
+        if 0 < length < len(buffer):
+            return Path(buffer.value)
+        return value
+
+    EspeakWrapper._osia_data_path_getter = original_getter
+    EspeakWrapper.data_path = property(_short_data_path)
 
 
 def _play_samples_if_current(samples, samplerate: int) -> bool:
@@ -132,9 +169,34 @@ def _play_samples_if_current(samples, samplerate: int) -> bool:
 
 
 def _get_kokoro_pipeline(lang_code: str):
-    from kokoro import KPipeline
+    global _kokoro_model
+    from kokoro import KModel, KPipeline
+    _patch_windows_espeak_data_path()
     if lang_code not in _kokoro_pipelines:
-        _kokoro_pipelines[lang_code] = KPipeline(lang_code=lang_code)
+        local = bundled_model_path("kokoro")
+        if local is None:
+            pipeline = KPipeline(lang_code=lang_code)
+        else:
+            if _kokoro_model is None:
+                _kokoro_model = KModel(
+                    repo_id="hexgrad/Kokoro-82M",
+                    config=str(local / "config.json"),
+                    model=str(local / "kokoro-v1_0.pth"),
+                ).to("cpu").eval()
+            pipeline = KPipeline(
+                lang_code=lang_code,
+                repo_id="hexgrad/Kokoro-82M",
+                model=_kokoro_model,
+                device="cpu",
+            )
+            import torch
+            for voice in (KOKORO_VOICE_EN, KOKORO_VOICE_FR):
+                voice_file = local / "voices" / f"{voice}.pt"
+                if voice_file.is_file():
+                    pipeline.voices[voice] = torch.load(
+                        voice_file, map_location="cpu", weights_only=True,
+                    )
+        _kokoro_pipelines[lang_code] = pipeline
     return _kokoro_pipelines[lang_code]
 
 

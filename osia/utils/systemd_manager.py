@@ -34,15 +34,30 @@ from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from osia.config import CONFIG_DIR
+from osia.runtime import (
+    SERVER_MODE,
+    SERVICE_MODE,
+    WAKE_RECOVERY_MODE,
+    application_dir,
+    application_executable,
+    cmdline_has_mode,
+    is_frozen,
+    resource_root,
+)
+
 # ── Windows detection + mappings ────────────────────────────────────────────
 _IS_WINDOWS = sys.platform == "win32"
 
 # windows/ control scripts live at <repo>/windows. This file is at
 # <repo>/osia/utils/systemd_manager.py, so three parents up is the repo root.
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_REPO_ROOT = resource_root()
 _WINDOWS_DIR = _REPO_ROOT / "windows"
 _RUN_SERVICE = _WINDOWS_DIR / "run_service.py"
 _WAKE_RECOVERY = _WINDOWS_DIR / "wake_recovery.py"
+_APP_EXE = application_executable()
+_APP_DIR = application_dir()
+_SERVER_DISABLED_MARKER = Path(CONFIG_DIR) / "windows_server_disabled"
 # Same path windows\run_service.py passes to cloudflared (--logfile). It is the
 # OSIA-specific signature used to kill exactly OSIA's quick tunnel (WOR-64).
 _TUNNEL_LOG = _WINDOWS_DIR / "tunnel.log"
@@ -273,18 +288,23 @@ def _win_process_snapshot():
 
 def _win_is_supervisor(info: dict, kind: str) -> bool:
     cmdline = [str(arg) for arg in (info.get("cmdline") or [])]
-    return (
+    return bool(
         _win_cmdline_has_path(" ".join(cmdline), _RUN_SERVICE)
+        and kind in {arg.lower() for arg in cmdline}
+    ) or bool(
+        is_frozen()
+        and cmdline_has_mode(cmdline, SERVICE_MODE)
         and kind in {arg.lower() for arg in cmdline}
     )
 
 
 def _win_is_service_owner(info: dict, kind: str) -> bool:
-    cmdline = " ".join(str(arg) for arg in (info.get("cmdline") or []))
+    args = [str(arg) for arg in (info.get("cmdline") or [])]
+    cmdline = " ".join(args)
     if kind == "server":
         return _win_cmdline_has_path(
             cmdline, _REPO_ROOT / "osia" / "server" / "run_server.py",
-        )
+        ) or (is_frozen() and cmdline_has_mode(args, SERVER_MODE))
     if kind == "tunnel":
         return _win_cmdline_has_path(cmdline, _TUNNEL_LOG)
     return False
@@ -588,6 +608,8 @@ def _win_osia_tunnel_running() -> bool:
 
 def _win_pythonw() -> str:
     """Prefer the venv's windowless pythonw.exe; fall back to the running one."""
+    if is_frozen():
+        return str(_APP_EXE)
     pythonw = _REPO_ROOT / "venv" / "Scripts" / "pythonw.exe"
     return str(pythonw) if pythonw.exists() else (sys.executable or "pythonw.exe")
 
@@ -667,6 +689,8 @@ def _win_register_task(kind: str) -> bool:
     task = _TASK_NAME.get(kind)
     if not task:
         return False
+    if is_frozen() and kind != "server":
+        return False
     # Drop any pre-rename task with the old display name so an upgrade never
     # leaves an orphan that also fires AtLogOn (best-effort; no-op if absent).
     for legacy in _LEGACY_TASK_NAMES.get(kind, ()):
@@ -687,10 +711,17 @@ def _win_register_task(kind: str) -> bool:
         " -Settings $s -Principal $p -Description $env:OSIA_DESC -Force | Out-Null"
     )
     try:
+        executable = _win_pythonw()
+        arguments = (
+            f"{SERVICE_MODE} {kind}"
+            if is_frozen()
+            else f'"{_RUN_SERVICE}" {kind}'
+        )
+        working_dir = str(_APP_DIR if is_frozen() else _REPO_ROOT)
         r = _ps(script, {
-            "OSIA_PYW": _win_pythonw(),
-            "OSIA_ARG": f'"{_RUN_SERVICE}" {kind}',
-            "OSIA_REPO": str(_REPO_ROOT),
+            "OSIA_PYW": executable,
+            "OSIA_ARG": arguments,
+            "OSIA_REPO": working_dir,
             "OSIA_USER": user,
             "OSIA_TASK": task,
             "OSIA_DESC": _TASK_DESC.get(kind, task),
@@ -743,8 +774,10 @@ def _win_register_wake_recovery_task() -> bool:
     try:
         r = _ps(script, {
             "OSIA_PYW": _win_pythonw(),
-            "OSIA_ARG": f'"{_WAKE_RECOVERY}"',
-            "OSIA_REPO": str(_REPO_ROOT),
+            "OSIA_ARG": (
+                WAKE_RECOVERY_MODE if is_frozen() else f'"{_WAKE_RECOVERY}"'
+            ),
+            "OSIA_REPO": str(_APP_DIR if is_frozen() else _REPO_ROOT),
             "OSIA_USER": user,
             "OSIA_TASK": _WAKE_TASK_NAME,
             "OSIA_DESC": _WAKE_TASK_DESC,
@@ -810,7 +843,13 @@ def _win_supervisor_running(kind: str) -> bool:
         except Exception:
             continue
         joined = " ".join(cmdline)
-        if _win_cmdline_has_path(joined, _RUN_SERVICE) and kind in cmdline:
+        source_match = _win_cmdline_has_path(joined, _RUN_SERVICE) and kind in cmdline
+        frozen_match = (
+            is_frozen()
+            and cmdline_has_mode(cmdline, SERVICE_MODE)
+            and kind in cmdline
+        )
+        if source_match or frozen_match:
             return True
     return False
 
@@ -850,7 +889,10 @@ def _win_stop_server() -> bool:
             cmdline = " ".join(proc.info.get("cmdline") or [])
         except Exception:
             continue
-        if _win_cmdline_has_path(cmdline, _REPO_ROOT / "osia" / "server" / "run_server.py"):
+        raw_cmdline = proc.info.get("cmdline") or []
+        if _win_cmdline_has_path(
+            cmdline, _REPO_ROOT / "osia" / "server" / "run_server.py"
+        ) or (is_frozen() and cmdline_has_mode(raw_cmdline, SERVER_MODE)):
             try:
                 proc.terminate()
                 targets.append(proc)
@@ -922,6 +964,13 @@ def _win_enable(name: str) -> bool:
     if kind not in ("server", "tunnel"):
         print(f"[win-service] unknown unit: {name}")
         return False
+    if is_frozen() and kind == "tunnel":
+        return False
+    if is_frozen() and kind == "server":
+        try:
+            _SERVER_DISABLED_MARKER.unlink(missing_ok=True)
+        except OSError:
+            return False
     ok = _win_register_task(kind)
     if _win_should_start(kind):
         _win_run_task(_TASK_NAME[kind])
@@ -934,6 +983,12 @@ def _win_disable(name: str) -> bool:
     if kind not in ("server", "tunnel"):
         print(f"[win-service] unknown unit: {name}")
         return False
+    if is_frozen() and kind == "server":
+        try:
+            _SERVER_DISABLED_MARKER.parent.mkdir(parents=True, exist_ok=True)
+            _SERVER_DISABLED_MARKER.touch()
+        except OSError:
+            return False
     task = _TASK_NAME[kind]
     _win_end_task(task)      # stop the supervisor + its child (task job object)
     _win_delete_task(task)   # so it won't relaunch at the next login
@@ -952,6 +1007,24 @@ def install_windows_services() -> bool:
     """
     if not _IS_WINDOWS:
         return True
+    if is_frozen():
+        # Retire the obsolete quick-tunnel task without touching unrelated
+        # cloudflared processes. Current connectivity is LAN -> WebRTC -> relay.
+        _win_end_task(_TASK_NAME["tunnel"])
+        _win_delete_task(_TASK_NAME["tunnel"])
+        for legacy in _LEGACY_TASK_NAMES["tunnel"]:
+            _win_delete_task(legacy)
+        _win_kill_tunnel()
+        if _SERVER_DISABLED_MARKER.exists():
+            _win_end_task(_TASK_NAME["server"])
+            _win_delete_task(_TASK_NAME["server"])
+            _win_delete_task(_WAKE_TASK_NAME)
+            return True
+        if not _win_register_task("server"):
+            return False
+        if _win_should_start("server"):
+            _win_run_task(_TASK_NAME["server"])
+        return _win_register_wake_recovery_task()
     ok = True
     for kind in ("server", "tunnel"):
         if not _win_register_task(kind):
@@ -961,6 +1034,25 @@ def install_windows_services() -> bool:
             _win_run_task(_TASK_NAME[kind])
     if not _win_register_wake_recovery_task():
         ok = False
+    return ok
+
+
+def remove_windows_services() -> bool:
+    """Stop and unregister OSIA's Windows tasks without deleting user data."""
+    if not _IS_WINDOWS:
+        return True
+    ok = True
+    for kind in ("server", "tunnel"):
+        task = _TASK_NAME[kind]
+        if _win_task_registered(task):
+            _win_end_task(task)
+            ok = _win_delete_task(task) and ok
+        _win_kill_leftovers(kind)
+        for legacy in _LEGACY_TASK_NAMES.get(kind, ()):
+            _win_delete_task(legacy)
+    if _win_task_registered(_WAKE_TASK_NAME):
+        _win_end_task(_WAKE_TASK_NAME)
+        ok = _win_delete_task(_WAKE_TASK_NAME) and ok
     return ok
 
 
@@ -975,6 +1067,10 @@ def ensure_service_running(name: str) -> bool:
     kind = _UNIT_KIND.get(name)
     if kind not in ("server", "tunnel"):
         return False
+    if is_frozen() and kind == "tunnel":
+        return False
+    if is_frozen() and kind == "server" and _SERVER_DISABLED_MARKER.exists():
+        return True
     task = _TASK_NAME[kind]
     if not _win_task_registered(task):
         _win_register_task(kind)

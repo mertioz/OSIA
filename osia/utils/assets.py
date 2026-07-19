@@ -11,10 +11,10 @@ import os
 import platform
 import sys
 
+from osia.runtime import application_executable, is_frozen, resource_root
+
 # <root>/osia/utils/assets.py → <root>
-PROJECT_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
+PROJECT_ROOT = str(resource_root())
 ASSETS_DIR = os.path.join(PROJECT_ROOT, "assets")
 
 # The OSIA logo — shown inside the GUI (popup header, Dynamic Island idle
@@ -118,6 +118,8 @@ def _windows_autostart_command() -> str:
     the interpreter and ``main.py`` are derived from this module's own location
     (``PROJECT_ROOT`` / ``Path(__file__)``), never a hardcoded path — WOR-11.
     """
+    if is_frozen():
+        return f'"{application_executable()}" --wake'
     main_py = os.path.join(PROJECT_ROOT, "osia", "main.py")
     pythonw = os.path.join(PROJECT_ROOT, "venv", "Scripts", "pythonw.exe")
     py = pythonw if os.path.exists(pythonw) else (sys.executable or "pythonw.exe")
