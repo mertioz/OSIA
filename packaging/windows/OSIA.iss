@@ -99,7 +99,34 @@ english.VersionArchitecture=Version %s  ·  Windows x64
 english.PreviewState=Internal preview  ·  Unsigned build
 english.StableState=Stable channel  ·  Signed build
 english.UpdateState=In-place update  ·  Your data stays in your profile
-english.UpdateDowngrade=This installer cannot replace a newer OSIA version with %s.
+english.UpdateHeading=Update OSIA
+english.UpdateDescription=A focused update that preserves your OSIA environment.
+english.UpdateVersions=OSIA %s → OSIA %s
+english.UpdatePreserved=Your settings, memory, and connections will be preserved.
+english.UpdateUnsigned=Internal preview · Unsigned installer
+english.UpdateButton=Update
+english.UpdateMissingInstall=OSIA Update could not find an existing OSIA installation for this user.
+english.UpdateInvalidDir=OSIA Update found an invalid existing installation directory. Reinstall OSIA before retrying the update.
+english.UpdateInvalidVersion=OSIA Update could not validate the installed OSIA version.
+english.UpdateNotNewer=OSIA %s cannot update the installed version %s. The target version must be newer.
+english.UpdateBackupError=OSIA Update could not prepare a safe rollback copy. The existing installation was not changed.
+english.UpdateStepConfirm=UPDATE  ·  CONFIRMATION
+english.UpdateStepProgress=UPDATING  ·  REAL-TIME PROGRESS
+english.UpdateProgressHeading=Updating OSIA
+english.UpdateProgressDescription=OSIA is applying the verified update on this PC.
+english.UpdatePhasePreparing=Preparing the update
+english.UpdatePhaseClosing=Closing OSIA components
+english.UpdatePhaseFiles=Updating OSIA files… %d%%
+english.UpdatePhaseIntegration=Restoring Windows integration
+english.UpdatePhaseFinalizing=Finalizing
+english.UpdatePhaseRelaunch=Relaunching OSIA
+english.UpdateDetailCopying=Replacing the verified self-contained OSIA payload.
+english.UpdateDetailIntegration=Verifying and repairing the per-user OSIA Server and wake-recovery tasks.
+english.UpdateDetailComplete=Update completed. Your personal data was preserved.
+english.UpdateIntegrationError=OSIA could not restore its background mobile service. The update was rolled back safely.
+english.UpdateFinishedHeading=OSIA has been updated
+english.UpdateFinishedVersion=Version %s was installed successfully.
+english.UpdateFinishedPreserved=Your personal data was preserved.
 english.ReadyVersion=OSIA %s  ·  Windows x64
 english.Destination=Destination: %s
 english.FinishedHeading=OSIA is ready
@@ -140,7 +167,34 @@ french.VersionArchitecture=Version %s  ·  Windows x64
 french.PreviewState=Aperçu interne  ·  Build non signé
 french.StableState=Canal stable  ·  Build signé
 french.UpdateState=Mise à jour sur place  ·  Vos données restent dans votre profil
-french.UpdateDowngrade=Cet installateur ne peut pas remplacer une version plus récente d’OSIA par la version %s.
+french.UpdateHeading=Mise à jour d’OSIA
+french.UpdateDescription=Une mise à jour ciblée qui préserve votre environnement OSIA.
+french.UpdateVersions=OSIA %s → OSIA %s
+french.UpdatePreserved=Vos réglages, votre mémoire et vos connexions seront conservés.
+french.UpdateUnsigned=Aperçu interne · Installateur non signé
+french.UpdateButton=Mettre à jour
+french.UpdateMissingInstall=OSIA Update n’a trouvé aucune installation OSIA existante pour cet utilisateur.
+french.UpdateInvalidDir=OSIA Update a trouvé un dossier d’installation existant invalide. Réinstallez OSIA avant de relancer la mise à jour.
+french.UpdateInvalidVersion=OSIA Update n’a pas pu valider la version OSIA installée.
+french.UpdateNotNewer=OSIA %s ne peut pas mettre à jour la version %s installée. La version cible doit être plus récente.
+french.UpdateBackupError=OSIA Update n’a pas pu préparer une copie de restauration sûre. L’installation existante n’a pas été modifiée.
+french.UpdateStepConfirm=MISE À JOUR  ·  CONFIRMATION
+french.UpdateStepProgress=MISE À JOUR  ·  PROGRESSION RÉELLE
+french.UpdateProgressHeading=Mise à jour d’OSIA
+french.UpdateProgressDescription=OSIA applique la mise à jour vérifiée sur ce PC.
+french.UpdatePhasePreparing=Préparation de la mise à jour
+french.UpdatePhaseClosing=Fermeture des composants OSIA
+french.UpdatePhaseFiles=Mise à jour des fichiers OSIA… %d%%
+french.UpdatePhaseIntegration=Restauration de l’intégration Windows
+french.UpdatePhaseFinalizing=Finalisation
+french.UpdatePhaseRelaunch=Relance d’OSIA
+french.UpdateDetailCopying=Remplacement du paquet OSIA autonome vérifié.
+french.UpdateDetailIntegration=Vérification et réparation du serveur OSIA et des tâches de reprise pour cet utilisateur.
+french.UpdateDetailComplete=Mise à jour terminée. Vos données personnelles ont été conservées.
+french.UpdateIntegrationError=OSIA n’a pas pu restaurer son service mobile en arrière-plan. La mise à jour a été annulée en toute sécurité.
+french.UpdateFinishedHeading=OSIA a été mise à jour
+french.UpdateFinishedVersion=Version %s installée avec succès.
+french.UpdateFinishedPreserved=Vos données personnelles ont été conservées.
 french.ReadyVersion=OSIA %s  ·  Windows x64
 french.Destination=Destination : %s
 french.FinishedHeading=OSIA est prêt
@@ -212,6 +266,11 @@ var
   WelcomeLogo: TBitmapImage;
   WelcomeMetaLabel: TNewStaticText;
   WelcomePreviewLabel: TNewStaticText;
+  UpdatePage: TWizardPage;
+  UpdateLogo: TBitmapImage;
+  UpdateVersionsLabel: TNewStaticText;
+  UpdatePreservedLabel: TNewStaticText;
+  UpdateUnsignedLabel: TNewStaticText;
   FinishedLogo: TBitmapImage;
   FinishedStateLabel: TNewStaticText;
   ReadySummaryLabel: TNewStaticText;
@@ -223,6 +282,98 @@ var
   HadPreviousRunValue: Boolean;
   PreviousRunValue: String;
   IntegrationSuppressed: Boolean;
+  UpdateModeActive: Boolean;
+  ExistingInstallDir: String;
+  ExistingVersionText: String;
+  UpdateBackupPrepared: Boolean;
+  UpdateBackupInternal: String;
+  UpdateBackupExe: String;
+
+function HasExactUpdateSwitch: Boolean;
+var
+  Index: Integer;
+begin
+  Result := False;
+  for Index := 1 to ParamCount do
+    if CompareText(ParamStr(Index), '/OSIAUPDATE=1') = 0 then
+    begin
+      Result := True;
+      exit;
+    end;
+end;
+
+function InitializeSetup: Boolean;
+var
+  UninstallKey: String;
+  RegistryVersion: String;
+  ExistingExe: String;
+  ExistingPackedVersion: Int64;
+  RegistryPackedVersion: Int64;
+  PackagePackedVersion: Int64;
+  ExistingMajor, ExistingMinor, ExistingPatch, ExistingBuild: Word;
+begin
+  Result := True;
+  UpdateModeActive := False;
+  if not HasExactUpdateSwitch then
+    exit;
+
+  UninstallKey :=
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}_is1';
+  if (not RegKeyExists(HKCU, UninstallKey)) or
+    (not RegQueryStringValue(HKCU, UninstallKey, 'InstallLocation',
+      ExistingInstallDir)) then
+  begin
+    MsgBox(CustomMessage('UpdateMissingInstall'), mbError, MB_OK);
+    Result := False;
+    exit;
+  end;
+
+  ExistingInstallDir := RemoveBackslashUnlessRoot(Trim(ExistingInstallDir));
+  ExistingExe := AddBackslash(ExistingInstallDir) + 'OSIA.exe';
+  if (ExistingInstallDir = '') or (not DirExists(ExistingInstallDir)) or
+    (not DirExists(AddBackslash(ExistingInstallDir) + '_internal')) or
+    (not FileExists(ExistingExe)) then
+  begin
+    MsgBox(CustomMessage('UpdateInvalidDir'), mbError, MB_OK);
+    Result := False;
+    exit;
+  end;
+
+  if (not RegQueryStringValue(HKCU, UninstallKey, 'DisplayVersion',
+      RegistryVersion)) or
+    (not StrToVersion(RegistryVersion, RegistryPackedVersion)) or
+    (not GetVersionComponents(ExistingExe, ExistingMajor, ExistingMinor,
+      ExistingPatch, ExistingBuild)) then
+  begin
+    MsgBox(CustomMessage('UpdateInvalidVersion'), mbError, MB_OK);
+    Result := False;
+    exit;
+  end;
+  ExistingPackedVersion := PackVersionComponents(ExistingMajor, ExistingMinor,
+    ExistingPatch, ExistingBuild);
+  ExistingVersionText := Format('%d.%d.%d', [ExistingMajor, ExistingMinor,
+    ExistingPatch]);
+  if (ExistingBuild <> 0) or
+    (CompareStr(RegistryVersion, ExistingVersionText) <> 0) or
+    (not SamePackedVersion(RegistryPackedVersion, ExistingPackedVersion)) then
+  begin
+    MsgBox(CustomMessage('UpdateInvalidVersion'), mbError, MB_OK);
+    Result := False;
+    exit;
+  end;
+
+  PackagePackedVersion := PackVersionComponents(
+    {#AppVersionMajor}, {#AppVersionMinor}, {#AppVersionPatch}, 0);
+  if ComparePackedVersion(PackagePackedVersion, ExistingPackedVersion) <= 0 then
+  begin
+    MsgBox(Format(CustomMessage('UpdateNotNewer'), ['{#AppVersion}',
+      ExistingVersionText]), mbError, MB_OK);
+    Result := False;
+    exit;
+  end;
+
+  UpdateModeActive := True;
+end;
 
 function IntegrationMarker: String;
 begin
@@ -231,23 +382,7 @@ end;
 
 function IsUpdateMode: Boolean;
 begin
-  Result := CompareText(ExpandConstant('{param:OSIAUPDATE|0}'), '1') = 0;
-end;
-
-function IsDowngrade: Boolean;
-var
-  Major, Minor, Revision, Build: Word;
-  InstalledVersion, PackageVersion: Int64;
-begin
-  Result := False;
-  if GetVersionComponents(ExpandConstant('{app}\OSIA.exe'),
-    Major, Minor, Revision, Build) then
-  begin
-    InstalledVersion := PackVersionComponents(Major, Minor, Revision, Build);
-    PackageVersion := PackVersionComponents(
-      {#AppVersionMajor}, {#AppVersionMinor}, {#AppVersionPatch}, 0);
-    Result := PackageVersion < InstalledVersion;
-  end;
+  Result := UpdateModeActive;
 end;
 
 function ShouldRemoveIntegration: Boolean;
@@ -306,6 +441,11 @@ var
   ContentWidth: Integer;
 begin
   ProductVersionText := '{#AppVersion}';
+  if IsUpdateMode then
+  begin
+    WizardForm.Caption := CustomMessage('UpdateHeading');
+    WizardForm.DirEdit.Text := ExistingInstallDir;
+  end;
   WizardForm.Font.Name := 'Segoe UI';
   WizardForm.Font.Size := 9;
   WizardForm.Color := TColor(OSIA_MAIN_BACKGROUND);
@@ -351,6 +491,54 @@ begin
 
   ContentLeft := ScaleX(28);
   ContentWidth := WizardForm.WelcomePage.ClientWidth - ContentLeft - ScaleX(28);
+
+  if IsUpdateMode then
+  begin
+    UpdatePage := CreateCustomPage(wpWelcome, CustomMessage('UpdateHeading'),
+      CustomMessage('UpdateDescription'));
+    StylePage(UpdatePage.Surface);
+    UpdateLogo := TBitmapImage.Create(WizardForm);
+    UpdateLogo.Parent := UpdatePage.Surface;
+    UpdateLogo.SetBounds(ContentLeft, ScaleY(36), ScaleX(74), ScaleY(74));
+    UpdateLogo.BackColor := TColor(OSIA_MAIN_BACKGROUND);
+    UpdateLogo.PngImage.Assign(WizardForm.WizardSmallBitmapImage.PngImage);
+    UpdateLogo.Center := True;
+    UpdateLogo.Stretch := True;
+
+    UpdateVersionsLabel := TNewStaticText.Create(WizardForm);
+    UpdateVersionsLabel.Parent := UpdatePage.Surface;
+    UpdateVersionsLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(39),
+      ContentWidth - ScaleX(98), ScaleY(34));
+    UpdateVersionsLabel.Caption := Format(CustomMessage('UpdateVersions'), [
+      ExistingVersionText, ProductVersionText]);
+    UpdateVersionsLabel.WordWrap := False;
+    UpdateVersionsLabel.AutoSize := True;
+    StyleLabel(UpdateVersionsLabel, TColor(OSIA_PRIMARY_TEXT),
+      TColor(OSIA_MAIN_BACKGROUND));
+    UpdateVersionsLabel.Font.Size := 14;
+    UpdateVersionsLabel.Font.Style := [fsBold];
+
+    UpdatePreservedLabel := TNewStaticText.Create(WizardForm);
+    UpdatePreservedLabel.Parent := UpdatePage.Surface;
+    UpdatePreservedLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(91),
+      ContentWidth - ScaleX(98), ScaleY(62));
+    UpdatePreservedLabel.Caption := CustomMessage('UpdatePreserved');
+    UpdatePreservedLabel.WordWrap := True;
+    StyleLabel(UpdatePreservedLabel, TColor(OSIA_SECONDARY_TEXT),
+      TColor(OSIA_MAIN_BACKGROUND));
+    UpdatePreservedLabel.Font.Size := 10;
+
+    UpdateUnsignedLabel := TNewStaticText.Create(WizardForm);
+    UpdateUnsignedLabel.Parent := UpdatePage.Surface;
+    UpdateUnsignedLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(169),
+      ContentWidth - ScaleX(98), ScaleY(28));
+    UpdateUnsignedLabel.Caption := CustomMessage('UpdateUnsigned');
+    UpdateUnsignedLabel.Visible := ({#InternalBuild} = 1) and ({#SignedBuild} = 0);
+    StyleLabel(UpdateUnsignedLabel, TColor(OSIA_WARNING_TEXT),
+      TColor(OSIA_MAIN_BACKGROUND));
+    UpdateUnsignedLabel.Font.Style := [fsBold];
+  end;
+
   WelcomeLogo := TBitmapImage.Create(WizardForm);
   WelcomeLogo.Parent := WizardForm.WelcomePage;
   WelcomeLogo.SetBounds(ContentLeft, ScaleY(34), ScaleX(74), ScaleY(74));
@@ -511,18 +699,71 @@ begin
     CompareText(ExpandConstant('{param:NOINTEGRATION|0}'), '1') = 0;
 end;
 
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := IsUpdateMode and
+    ((PageID = wpWelcome) or (PageID = wpSelectDir) or
+     (PageID = wpSelectProgramGroup) or (PageID = wpSelectTasks) or
+     (PageID = wpReady));
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if IsUpdateMode and Assigned(UpdatePage) and (CurPageID = UpdatePage.ID) then
+    WizardForm.DirEdit.Text := ExistingInstallDir;
+end;
+
+procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);
+begin
+  if IsUpdateMode then
+    Confirm := False;
+end;
+
+function PrepareUpdateRollback: Boolean;
+var
+  BackupRoot: String;
+  ExistingInternal: String;
+  ExistingExe: String;
+begin
+  Result := False;
+  ExistingInternal := AddBackslash(ExistingInstallDir) + '_internal';
+  ExistingExe := AddBackslash(ExistingInstallDir) + 'OSIA.exe';
+  BackupRoot := AddBackslash(ExpandConstant('{tmp}')) + 'osia-update-rollback';
+  UpdateBackupInternal := AddBackslash(BackupRoot) + '_internal';
+  UpdateBackupExe := AddBackslash(BackupRoot) + 'OSIA.exe';
+  if (not ForceDirectories(BackupRoot)) or
+    (not FileCopy(ExistingExe, UpdateBackupExe, True)) then
+    exit;
+  if not RenameFile(ExistingInternal, UpdateBackupInternal) then
+  begin
+    DeleteFile(UpdateBackupExe);
+    exit;
+  end;
+  UpdateBackupPrepared := True;
+  Result := True;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
   ExistingExe: String;
 begin
   Result := '';
-  if IsUpdateMode and IsDowngrade then
+  if IsUpdateMode and
+    (CompareText(RemoveBackslashUnlessRoot(WizardDirValue),
+      ExistingInstallDir) <> 0) then
   begin
-    Result := Format(CustomMessage('UpdateDowngrade'), ['{#AppVersion}']);
+    Result := CustomMessage('UpdateInvalidDir');
     exit;
   end;
   ExistingExe := ExpandConstant('{app}\OSIA.exe');
+  if IsUpdateMode then
+  begin
+    StageLabel.Caption := CustomMessage('UpdatePhasePreparing');
+    AddDetail(CustomMessage('UpdatePhasePreparing'));
+    AddDetail(CustomMessage('UpdatePhaseClosing'));
+  end;
   if (not IntegrationSuppressed) and FileExists(ExistingExe) then
   begin
     AddDetail(CustomMessage('DetailStopping'));
@@ -532,6 +773,8 @@ begin
     else
       Result := CustomMessage('ExistingServiceError');
   end;
+  if (Result = '') and IsUpdateMode and (not PrepareUpdateRollback) then
+    Result := CustomMessage('UpdateBackupError');
 end;
 
 procedure CurInstallProgressChanged(CurProgress, MaxProgress: Integer);
@@ -542,12 +785,48 @@ begin
     Percent := (CurProgress * 100) div MaxProgress
   else
     Percent := 0;
-  StageLabel.Caption := Format(CustomMessage('PhaseInstalling'), [Percent]);
+  if IsUpdateMode then
+    StageLabel.Caption := Format(CustomMessage('UpdatePhaseFiles'), [Percent])
+  else
+    StageLabel.Caption := Format(CustomMessage('PhaseInstalling'), [Percent]);
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
-  if CurPageID = wpSelectDir then
+  if IsUpdateMode then
+    WizardForm.Caption := CustomMessage('UpdateHeading');
+  if IsUpdateMode and Assigned(UpdatePage) and (CurPageID = UpdatePage.ID) then
+  begin
+    HeaderStepLabel.Caption := CustomMessage('UpdateStepConfirm');
+    WizardForm.NextButton.Caption := CustomMessage('UpdateButton');
+    WizardForm.CancelButton.Caption := SetupMessage(msgButtonCancel);
+  end
+  else if IsUpdateMode and (CurPageID = wpInstalling) then
+  begin
+    HeaderStepLabel.Caption := CustomMessage('UpdateStepProgress');
+    WizardForm.PageNameLabel.Caption := CustomMessage('UpdateProgressHeading');
+    WizardForm.PageDescriptionLabel.Caption :=
+      CustomMessage('UpdateProgressDescription');
+  end
+  else if IsUpdateMode and (CurPageID = wpPreparing) then
+  begin
+    HeaderStepLabel.Caption := CustomMessage('UpdateStepProgress');
+    WizardForm.PageNameLabel.Caption := CustomMessage('UpdateProgressHeading');
+    WizardForm.PageDescriptionLabel.Caption :=
+      CustomMessage('UpdatePhasePreparing');
+  end
+  else if IsUpdateMode and (CurPageID = wpFinished) then
+  begin
+    HeaderStepLabel.Caption := CustomMessage('UpdatePhaseRelaunch');
+    WizardForm.FinishedHeadingLabel.Caption :=
+      CustomMessage('UpdateFinishedHeading');
+    WizardForm.FinishedLabel.Caption :=
+      Format(CustomMessage('UpdateFinishedVersion'), [ProductVersionText]) + #13#10 +
+      CustomMessage('UpdateFinishedPreserved');
+    FinishedStateLabel.Caption := CustomMessage('UpdatePhaseRelaunch');
+    WizardForm.RunList.Visible := False;
+  end
+  else if CurPageID = wpSelectDir then
     HeaderStepLabel.Caption := CustomMessage('StepLocation')
   else if CurPageID = wpSelectTasks then
     HeaderStepLabel.Caption := CustomMessage('StepTasks')
@@ -585,8 +864,16 @@ var
 begin
   if CurStep = ssInstall then
   begin
-    StageLabel.Caption := Format(CustomMessage('PhaseInstalling'), [0]);
-    AddDetail(CustomMessage('DetailCopying'));
+    if IsUpdateMode then
+    begin
+      StageLabel.Caption := Format(CustomMessage('UpdatePhaseFiles'), [0]);
+      AddDetail(CustomMessage('UpdateDetailCopying'));
+    end
+    else
+    begin
+      StageLabel.Caption := Format(CustomMessage('PhaseInstalling'), [0]);
+      AddDetail(CustomMessage('DetailCopying'));
+    end;
   end;
 
   if CurStep = ssPostInstall then
@@ -598,21 +885,32 @@ begin
     end
     else
     begin
-      StageLabel.Caption := CustomMessage('PhaseConfiguring');
-      AddDetail(CustomMessage('DetailIntegration'));
+      if IsUpdateMode then
+        StageLabel.Caption := CustomMessage('UpdatePhaseIntegration')
+      else
+        StageLabel.Caption := CustomMessage('PhaseConfiguring');
+      if IsUpdateMode then
+        AddDetail(CustomMessage('UpdateDetailIntegration'))
+      else
+        AddDetail(CustomMessage('DetailIntegration'));
       if (not Exec(AppExe, '--osia-install-integration', '', SW_HIDE,
         ewWaitUntilTerminated, ResultCode)) or (ResultCode <> 0) then
       begin
         Exec(AppExe, '--osia-remove-integration', '', SW_HIDE,
           ewWaitUntilTerminated, ResultCode);
         RestorePreviousAutostart;
-        RaiseException(CustomMessage('IntegrationError'));
+        if IsUpdateMode then
+          RaiseException(CustomMessage('UpdateIntegrationError'))
+        else
+          RaiseException(CustomMessage('IntegrationError'));
       end;
       IntegrationInstalled := True;
     end;
 
     AutoCommand := '"' + AppExe + '" --wake';
-    if WizardIsTaskSelected('autostart') then
+    if IsUpdateMode then
+      RestorePreviousAutostart
+    else if WizardIsTaskSelected('autostart') then
       RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run',
         'OSIA', AutoCommand)
     else
@@ -632,12 +930,28 @@ begin
         MsgBox(CustomMessage('FirewallWarning'),
           mbInformation, MB_OK);
     end;
-    StageLabel.Caption := CustomMessage('PhaseFinalizing');
-    AddDetail(CustomMessage('DetailComplete'));
+    if IsUpdateMode then
+    begin
+      StageLabel.Caption := CustomMessage('UpdatePhaseFinalizing');
+      AddDetail(CustomMessage('UpdateDetailComplete'));
+    end
+    else
+    begin
+      StageLabel.Caption := CustomMessage('PhaseFinalizing');
+      AddDetail(CustomMessage('DetailComplete'));
+    end;
   end;
 
   if CurStep = ssDone then
+  begin
     InstallSucceeded := True;
+    if UpdateBackupPrepared then
+    begin
+      DelTree(UpdateBackupInternal, True, True, True);
+      DeleteFile(UpdateBackupExe);
+      UpdateBackupPrepared := False;
+    end;
+  end;
 end;
 
 procedure InitializeUninstallProgressForm;
@@ -669,8 +983,16 @@ begin
   AppExe := ExpandConstant('{app}\OSIA.exe');
   if IntegrationInstalled and FileExists(AppExe) then
     Exec(AppExe, '--osia-remove-integration', '', SW_HIDE,
-      ewWaitUntilTerminated, ResultCode)
-  else if ExistingIntegrationStopped and FileExists(AppExe) then
+      ewWaitUntilTerminated, ResultCode);
+  if IsUpdateMode and UpdateBackupPrepared then
+  begin
+    DelTree(ExpandConstant('{app}\_internal'), True, True, True);
+    DeleteFile(AppExe);
+    RenameFile(UpdateBackupInternal, ExpandConstant('{app}\_internal'));
+    FileCopy(UpdateBackupExe, AppExe, False);
+    UpdateBackupPrepared := False;
+  end;
+  if ExistingIntegrationStopped and FileExists(AppExe) then
     Exec(AppExe, '--osia-install-integration', '', SW_HIDE,
       ewWaitUntilTerminated, ResultCode);
   if FirewallInstalled then

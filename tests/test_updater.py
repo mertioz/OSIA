@@ -107,7 +107,7 @@ def test_app_metadata_is_strict_and_records_only_internal_override():
         "buildTimestamp": "2026-07-20T10:00:00Z", "commitSha": None,
         "updaterSchemaVersion": 1,
         "buildOverride": {
-            "sourceVersion": "1.0.2", "version": "1.0.1",
+            "sourceVersion": "1.0.3", "version": "1.0.1",
             "channel": "internal-preview",
         },
     }
@@ -312,6 +312,7 @@ def test_launch_plan_rehashes_uses_fixed_args_and_no_shell(tmp_path):
 
     updater.launch_update_installer(manifest, path, store, process_factory=factory)
     assert tuple(captured["command"][1:]) == updater.INSTALLER_ARGUMENTS
+    assert captured["command"][1] == "/CURRENTUSER"
     assert captured["kwargs"]["shell"] is False
     assert not any(arg.startswith(("/DIR", "/VERYSILENT", "/FORCECLOSE")) for arg in captured["command"])
     assert store.load()["pending"]["version"] == "1.0.2"

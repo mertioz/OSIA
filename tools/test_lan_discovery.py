@@ -79,7 +79,7 @@ class LanDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             service.properties,
             {
                 b"protocol": b"1",
-                b"product_version": b"1.0.2",
+                b"product_version": b"1.0.3",
                 b"instance": b"0123456789abcdef",
             },
         )

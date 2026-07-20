@@ -600,7 +600,10 @@ def build(
         "mandatory": False,
         "minimumSupportedVersion": "1.0.1",
         "minimumUpdaterVersion": "1.0.1",
-        "releaseNotes": ["Validation du mécanisme de mise à jour automatique."],
+        "releaseNotes": [
+            "Dedicated OSIA update interface.",
+            "Installation choices are now preserved automatically during updates.",
+        ],
         "releaseNotesUrl": None,
         "rollout": {"state": "paused"},
     }

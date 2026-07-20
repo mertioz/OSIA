@@ -272,8 +272,7 @@ def test_installer_ui_keeps_native_accessibility_and_shows_real_state():
     assert "RaiseException(CustomMessage('IntegrationError'))" in script
     assert "MsgBox(CustomMessage('FirewallWarning')" in script
     assert "procedure InitializeUninstallProgressForm" in script
-    # A future update-mode switch must not bypass the shared styled wizard.
-    assert "ShouldSkipPage" not in script
+    assert "function ShouldSkipPage" in script
 
 
 def test_installer_branding_references_generated_assets_that_have_sources():
@@ -369,7 +368,7 @@ def test_build_uses_product_version_and_exact_installer_name():
     build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
     assert "from osia.version import PRODUCT_VERSION, parse_product_version" in build
     assert "SOURCE_VERSION = PRODUCT_VERSION" in build
-    assert 'PRODUCT_VERSION = "1.0.2"' in (ROOT / "osia" / "version.py").read_text("utf-8")
+    assert 'PRODUCT_VERSION = "1.0.3"' in (ROOT / "osia" / "version.py").read_text("utf-8")
     assert 'installer = RELEASE / "OSIA-Setup.exe"' in build
     assert "def _write_bundle_file_manifest" in build
     assert 'CODEX_RUNTIME_VERSION = "0.144.1"' in build
@@ -390,14 +389,14 @@ def test_build_identity_metadata_and_internal_override(monkeypatch, tmp_path):
     baseline = module._resolve_build_identity("internal-preview", "1.0.1")
     assert baseline["version"] == "1.0.1"
     assert baseline["override"] == {
-        "sourceVersion": "1.0.2", "version": "1.0.1", "channel": "internal-preview",
+        "sourceVersion": "1.0.3", "version": "1.0.1", "channel": "internal-preview",
     }
     metadata_path = module._write_app_metadata(baseline)
     embedded = __import__("osia.updater", fromlist=["parse_app_metadata"]).parse_app_metadata(
         metadata_path.read_bytes()
     )
     assert embedded.version == "1.0.1"
-    assert embedded.build_override["sourceVersion"] == "1.0.2"
+    assert embedded.build_override["sourceVersion"] == "1.0.3"
     with pytest.raises(ValueError, match="forbidden"):
         module._resolve_build_identity("stable", "1.0.1")
 
@@ -412,19 +411,122 @@ def test_pe_inno_and_release_manifest_share_resolved_build_version():
     assert '(str(GENERATED / "app_metadata.json"), ".")' in spec
 
 
-def test_inno_update_mode_is_visible_safe_and_in_place():
+def test_wor149_update_detection_is_authoritative_and_strict():
     script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
     assert "#error AppVersion must be supplied" in script
-    assert "{param:OSIAUPDATE|0}" in script
-    assert "function IsDowngrade" in script
-    assert "GetVersionComponents" in script
-    assert "PackVersionComponents" in script
+    assert "function HasExactUpdateSwitch" in script
+    assert "CompareText(ParamStr(Index), '/OSIAUPDATE=1') = 0" in script
+    assert "{param:OSIAUPDATE|0}" not in script
+    assert "function InitializeSetup" in script
+    assert "UpdateModeActive := False" in script
+    assert "UpdateModeActive := True" in script
+    assert "RegKeyExists(HKCU, UninstallKey)" in script
+    assert "{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}_is1" in script
+    assert "InstallLocation" in script
+    assert "DisplayVersion" in script
+    assert "DirExists(ExistingInstallDir)" in script
+    assert "DirExists(AddBackslash(ExistingInstallDir) + '_internal')" in script
+    assert "FileExists(ExistingExe)" in script
+    assert "StrToVersion(RegistryVersion, RegistryPackedVersion)" in script
+    assert "GetVersionComponents(ExistingExe, ExistingMajor, ExistingMinor" in script
+    assert "ExistingBuild <> 0" in script
+    assert "CompareStr(RegistryVersion, ExistingVersionText) <> 0" in script
+    assert "SamePackedVersion(RegistryPackedVersion, ExistingPackedVersion)" in script
+    assert "ComparePackedVersion(PackagePackedVersion, ExistingPackedVersion) <= 0" in script
+    assert "UpdateMissingInstall" in script
+    assert "UpdateInvalidDir" in script
+    assert "UpdateInvalidVersion" in script
+    assert "UpdateNotNewer" in script
+
+
+def test_wor149_update_pages_are_dedicated_and_fresh_pages_remain():
+    script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
+    assert "UpdatePage := CreateCustomPage" in script
+    assert script.count("UpdatePage := CreateCustomPage") == 1
+    skip_page = script[script.index("function ShouldSkipPage"):script.index("function NextButtonClick")]
+    for page in (
+        "wpWelcome", "wpSelectDir", "wpSelectProgramGroup", "wpSelectTasks", "wpReady",
+    ):
+        assert page in skip_page
+    assert "UpdatePage.ID" not in skip_page
+    assert "WizardForm.NextButton.Caption := CustomMessage('UpdateButton')" in script
+    assert "WizardForm.CancelButton.Caption := SetupMessage(msgButtonCancel)" in script
+    assert "WizardForm.Caption := CustomMessage('UpdateHeading')" in script
+    assert "procedure CancelButtonClick" in script
+    assert "if IsUpdateMode then\n    Confirm := False" in script
+    assert "WizardForm.RunList.Visible := False" in script
+    for fresh_page in (
+        "WizardForm.WelcomePage", "WizardForm.SelectDirPage", "WizardForm.SelectTasksPage",
+        "WizardForm.ReadyPage", "WizardForm.InstallingPage", "WizardForm.FinishedPage",
+    ):
+        assert fresh_page in script
+    for fresh_copy in (
+        "WelcomeHeading=Meet OSIA", "StepLocation=STEP 1 OF 3", "StepTasks=STEP 2 OF 3",
+        "StepReady=STEP 3 OF 3", "StepInstalling=INSTALLING", "FinishedHeading=OSIA is ready",
+    ):
+        assert fresh_copy in script
+
+
+def test_wor149_update_copy_progress_and_dark_controls_are_explicit():
+    script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
+    for copy in (
+        "english.UpdateHeading=Update OSIA",
+        "english.UpdateVersions=OSIA %s → OSIA %s",
+        "english.UpdatePreserved=Your settings, memory, and connections will be preserved.",
+        "english.UpdatePhasePreparing=Preparing the update",
+        "english.UpdatePhaseClosing=Closing OSIA components",
+        "english.UpdatePhaseFiles=Updating OSIA files… %d%%",
+        "english.UpdatePhaseIntegration=Restoring Windows integration",
+        "english.UpdatePhaseFinalizing=Finalizing",
+        "english.UpdatePhaseRelaunch=Relaunching OSIA",
+        "english.UpdateFinishedHeading=OSIA has been updated",
+        "french.UpdateHeading=Mise à jour d’OSIA",
+        "french.UpdatePhaseFiles=Mise à jour des fichiers OSIA… %d%%",
+        "french.UpdateFinishedHeading=OSIA a été mise à jour",
+    ):
+        assert copy in script
+    assert "CurInstallProgressChanged" in script
+    assert "Format(CustomMessage('UpdatePhaseFiles'), [Percent])" in script
+    assert "UpdateVersionsLabel.WordWrap := False" in script
+    assert "UpdateVersionsLabel.AutoSize := True" in script
+    for control, color in (
+        ("UpdateVersionsLabel", "OSIA_PRIMARY_TEXT"),
+        ("UpdatePreservedLabel", "OSIA_SECONDARY_TEXT"),
+        ("UpdateUnsignedLabel", "OSIA_WARNING_TEXT"),
+    ):
+        assert f"StyleLabel({control}, TColor({color})" in script
+    update_messages = "\n".join(
+        line for line in script.splitlines() if ".Update" in line and "=" in line
+    )
+    for forbidden in (
+        "Installing OSIA", "Installation d’OSIA", "Ready to install",
+        "Welcome to OSIA", "first-install",
+    ):
+        assert forbidden not in update_messages
+
+
+def test_wor149_update_is_in_place_idempotent_and_rollback_safe():
+    script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
+    assert "UsePreviousAppDir=yes" in script
+    assert "UsePreviousTasks=yes" in script
+    assert "WizardForm.DirEdit.Text := ExistingInstallDir" in script
     assert 'Type: filesandordirs; Name: "{app}\\_internal"; Check: IsUpdateMode' in script
     assert 'Name: "{app}\\*"' not in script
+    assert 'Source: "{#RepoRoot}\\dist\\OSIA\\*"' in script
     assert 'Parameters: "--wake"; Flags: nowait; Check: IsUpdateMode' in script
+    assert script.count('Parameters: "--wake"; Flags: nowait; Check: IsUpdateMode') == 1
     assert "WizardStyle=modern dynamic hidebevels" in script
     assert "WizardForm.ProgressGauge" in script
     assert "and (not IsUpdateMode)" in script
+    assert "if IsUpdateMode then\n      RestorePreviousAutostart" in script
+    assert "PrepareUpdateRollback" in script
+    assert "RenameFile(ExistingInternal, UpdateBackupInternal)" in script
+    assert "DelTree(ExpandConstant('{app}\\_internal'), True, True, True)" in script
+    assert "RenameFile(UpdateBackupInternal, ExpandConstant('{app}\\_internal'))" in script
+    assert "FileCopy(UpdateBackupExe, AppExe, False)" in script
+    assert "ExistingIntegrationStopped" in script
+    assert "IntegrationInstalled" in script
+    assert "FirewallInstalled" in script
     for forbidden in (
         "settings.json", "oauth_tokens.json", "mobile_token.txt", "memory.json",
         "task_state.json", "personality", "conversations",
