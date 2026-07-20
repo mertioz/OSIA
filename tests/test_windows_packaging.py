@@ -209,23 +209,24 @@ def test_installer_contract_preserves_user_data_and_has_real_progress():
 def test_installer_ui_uses_explicit_accessible_osia_palette():
     script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
     for color in (
-        "OSIA_MAIN_BACKGROUND = $00120B0D",
-        "OSIA_ELEVATED_SURFACE = $00211217",
-        "OSIA_SECONDARY_SURFACE = $002F1821",
-        "OSIA_ACCENT = $00F5B5C4",
-        "OSIA_PRIMARY_TEXT = $00FFF6F8",
-        "OSIA_SECONDARY_TEXT = $00E7CED5",
-        "OSIA_HELPER_TEXT = $00C2A4AD",
-        "OSIA_DISABLED_TEXT = $00907981",
-        "OSIA_SUCCESS_TEXT = $00C1E3A7",
-        "OSIA_ERROR_TEXT = $00A7A7F3",
-        "OSIA_WARNING_TEXT = $007DC2F1",
+        "OSIA_MAIN_BACKGROUND = $00150B11",
+        "OSIA_ELEVATED_SURFACE = $001A1222",
+        "OSIA_SECONDARY_SURFACE = $00251A30",
+        "OSIA_ACCENT = $00F1B1D8",
+        "OSIA_PRIMARY_TEXT = $00FFF9FC",
+        "OSIA_SECONDARY_TEXT = $00E8D8E2",
+        "OSIA_HELPER_TEXT = $00BFA9B8",
+        "OSIA_DISABLED_TEXT = $008C7786",
+        "OSIA_SUCCESS_TEXT = $00C8E6B2",
+        "OSIA_ERROR_TEXT = $00B5B4F4",
+        "OSIA_WARNING_TEXT = $0089C9F2",
     ):
         assert color in script
 
-    # WizardBackColor also affects pre-wizard native task dialogs, whose text
-    # follows the Windows theme. Only the main wizard receives the dark skin.
-    assert "WizardBackColor=" not in script
+    # Forced dark styling keeps native dialogs readable while the background
+    # remains consistently branded across the header, pages, and button rail.
+    assert "WizardStyle=modern dark hidebevels includetitlebar" in script
+    assert "WizardBackColor=#110b15" in script
     for control in (
         "WizardForm.WelcomeLabel1",
         "WizardForm.WelcomeLabel2",
@@ -251,10 +252,10 @@ def test_installer_ui_uses_explicit_accessible_osia_palette():
 
 def test_installer_ui_keeps_native_accessibility_and_shows_real_state():
     script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
-    assert "WizardStyle=modern dynamic hidebevels" in script
+    assert "WizardStyle=modern dark hidebevels includetitlebar" in script
     assert "WizardImageFileDynamicDark={#BuildRoot}\\generated\\wizard-large.png" in script
     assert "WizardSmallImageFileDynamicDark={#BuildRoot}\\generated\\wizard-small.png" in script
-    assert "WizardSizePercent=115" in script
+    assert "WizardSizePercent=112" in script
     assert "WizardForm.WizardBitmapImage.Visible := False" in script
     assert "WizardForm.WizardBitmapImage2.Visible := False" in script
     assert "WizardForm.NextButton.Default := True" in script
@@ -262,12 +263,12 @@ def test_installer_ui_keeps_native_accessibility_and_shows_real_state():
     assert "CurInstallProgressChanged" in script
     assert "StageLabel.Caption := Format(CustomMessage('PhaseInstalling')" in script
     assert "StyleLabel(StageLabel, TColor(OSIA_PRIMARY_TEXT)" in script
-    assert "VersionArchitecture=Version %s  ·  Windows x64" in script
-    assert "PreviewState=Internal preview  ·  Unsigned build" in script
+    assert "VersionArchitecture=Version %s  ·  Windows" in script
+    assert "PreviewState=Internal preview  ·  Not signed" in script
     assert "ReadySummaryLabel.Caption" in script
     assert "WizardForm.DiskSpaceLabel.Caption" in script
     assert "FinishedHeading=OSIA is ready" in script
-    assert "FinishedState=SUCCESS" in script
+    assert "FinishedState=Your settings stay in your profile" in script
     assert "Result := CustomMessage('ExistingServiceError')" in script
     assert "RaiseException(CustomMessage('IntegrationError'))" in script
     assert "MsgBox(CustomMessage('FirewallWarning')" in script
@@ -283,13 +284,36 @@ def test_installer_branding_references_generated_assets_that_have_sources():
     for filename in ("osia.ico", "wizard-large.png", "wizard-small.png"):
         assert filename in script
         assert filename in build
+    assert 'Image.new("RGBA", (164, 164), (0, 0, 0, 0))' in build
+    assert 'transparent_logo.save(GENERATED / "wizard-small.png"' in build
+
+
+def test_generated_installer_logo_has_real_transparency(monkeypatch, tmp_path):
+    from PIL import Image
+
+    path = ROOT / "packaging" / "windows" / "build_windows.py"
+    spec = importlib.util.spec_from_file_location("osia_branding_build", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "GENERATED", tmp_path)
+
+    module._generate_branding("1.0.4")
+    with Image.open(tmp_path / "wizard-small.png") as image:
+        alpha = image.convert("RGBA").getchannel("A")
+        assert image.mode == "RGBA"
+        assert alpha.getextrema() == (0, 255)
+        assert all(alpha.getpixel(point) == 0 for point in (
+            (0, 0), (image.width - 1, 0),
+            (0, image.height - 1), (image.width - 1, image.height - 1),
+        ))
 
 
 def test_installer_identity_scope_and_output_name_are_unchanged():
     script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
     assert "AppId={{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}" in script
     assert "PrivilegesRequired=lowest" in script
-    assert "PrivilegesRequiredOverridesAllowed=dialog" in script
+    assert "PrivilegesRequiredOverridesAllowed=commandline" in script
     assert "DefaultDirName={localappdata}\\Programs\\OSIA" in script
     assert "OutputBaseFilename=OSIA-Setup" in script
 
@@ -368,7 +392,7 @@ def test_build_uses_product_version_and_exact_installer_name():
     build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
     assert "from osia.version import PRODUCT_VERSION, parse_product_version" in build
     assert "SOURCE_VERSION = PRODUCT_VERSION" in build
-    assert 'PRODUCT_VERSION = "1.0.3"' in (ROOT / "osia" / "version.py").read_text("utf-8")
+    assert 'PRODUCT_VERSION = "1.0.4"' in (ROOT / "osia" / "version.py").read_text("utf-8")
     assert 'installer = RELEASE / "OSIA-Setup.exe"' in build
     assert "def _write_bundle_file_manifest" in build
     assert 'CODEX_RUNTIME_VERSION = "0.144.1"' in build
@@ -389,14 +413,14 @@ def test_build_identity_metadata_and_internal_override(monkeypatch, tmp_path):
     baseline = module._resolve_build_identity("internal-preview", "1.0.1")
     assert baseline["version"] == "1.0.1"
     assert baseline["override"] == {
-        "sourceVersion": "1.0.3", "version": "1.0.1", "channel": "internal-preview",
+        "sourceVersion": "1.0.4", "version": "1.0.1", "channel": "internal-preview",
     }
     metadata_path = module._write_app_metadata(baseline)
     embedded = __import__("osia.updater", fromlist=["parse_app_metadata"]).parse_app_metadata(
         metadata_path.read_bytes()
     )
     assert embedded.version == "1.0.1"
-    assert embedded.build_override["sourceVersion"] == "1.0.3"
+    assert embedded.build_override["sourceVersion"] == "1.0.4"
     with pytest.raises(ValueError, match="forbidden"):
         module._resolve_build_identity("stable", "1.0.1")
 
@@ -418,6 +442,7 @@ def test_wor149_update_detection_is_authoritative_and_strict():
     assert "CompareText(ParamStr(Index), '/OSIAUPDATE=1') = 0" in script
     assert "{param:OSIAUPDATE|0}" not in script
     assert "function InitializeSetup" in script
+    assert "UpdateModeRequested := HasExactUpdateSwitch" in script
     assert "UpdateModeActive := False" in script
     assert "UpdateModeActive := True" in script
     assert "RegKeyExists(HKCU, UninstallKey)" in script
@@ -461,8 +486,9 @@ def test_wor149_update_pages_are_dedicated_and_fresh_pages_remain():
     ):
         assert fresh_page in script
     for fresh_copy in (
-        "WelcomeHeading=Meet OSIA", "StepLocation=STEP 1 OF 3", "StepTasks=STEP 2 OF 3",
-        "StepReady=STEP 3 OF 3", "StepInstalling=INSTALLING", "FinishedHeading=OSIA is ready",
+        "WelcomeHeading=Your OSIA, on this PC", "StepLocation=LOCATION  ·  1/3",
+        "StepTasks=OPTIONS  ·  2/3", "StepReady=REVIEW  ·  3/3",
+        "StepInstalling=INSTALLATION", "FinishedHeading=OSIA is ready",
     ):
         assert fresh_copy in script
 
@@ -488,7 +514,7 @@ def test_wor149_update_copy_progress_and_dark_controls_are_explicit():
     assert "CurInstallProgressChanged" in script
     assert "Format(CustomMessage('UpdatePhaseFiles'), [Percent])" in script
     assert "UpdateVersionsLabel.WordWrap := False" in script
-    assert "UpdateVersionsLabel.AutoSize := True" in script
+    assert "UpdateVersionsLabel.Alignment := taCenter" in script
     for control, color in (
         ("UpdateVersionsLabel", "OSIA_PRIMARY_TEXT"),
         ("UpdatePreservedLabel", "OSIA_SECONDARY_TEXT"),
@@ -515,15 +541,22 @@ def test_wor149_update_is_in_place_idempotent_and_rollback_safe():
     assert 'Source: "{#RepoRoot}\\dist\\OSIA\\*"' in script
     assert 'Parameters: "--wake"; Flags: nowait; Check: IsUpdateMode' in script
     assert script.count('Parameters: "--wake"; Flags: nowait; Check: IsUpdateMode') == 1
-    assert "WizardStyle=modern dynamic hidebevels" in script
+    assert "WizardStyle=modern dark hidebevels includetitlebar" in script
     assert "WizardForm.ProgressGauge" in script
     assert "and (not IsUpdateMode)" in script
     assert "if IsUpdateMode then\n      RestorePreviousAutostart" in script
     assert "PrepareUpdateRollback" in script
-    assert "RenameFile(ExistingInternal, UpdateBackupInternal)" in script
-    assert "DelTree(ExpandConstant('{app}\\_internal'), True, True, True)" in script
-    assert "RenameFile(UpdateBackupInternal, ExpandConstant('{app}\\_internal'))" in script
-    assert "FileCopy(UpdateBackupExe, AppExe, False)" in script
+    assert "RegisterExtraCloseApplicationsResources" in script
+    assert "RegisterExtraCloseApplicationsResource(" in script
+    assert "False, AddBackslash(ExistingInstallDir) + 'OSIA.exe'" in script
+    assert "RenameFileWithRetry(ExistingInternal, UpdateBackupInternal)" in script
+    assert "'_internal.osia-rollback'" in script
+    assert "'OSIA.exe.osia-rollback'" in script
+    assert "ExpandConstant('{tmp}')" not in script
+    assert "ForceDirectories(BackupRoot)" not in script
+    assert "DelTree(AddBackslash(ExistingInstallDir) + '_internal'" in script
+    assert "RenameFileWithRetry(UpdateBackupInternal" in script
+    assert "FileCopy(UpdateBackupExe, AppExe, False)" not in script
     assert "ExistingIntegrationStopped" in script
     assert "IntegrationInstalled" in script
     assert "FirewallInstalled" in script
@@ -532,6 +565,48 @@ def test_wor149_update_is_in_place_idempotent_and_rollback_safe():
         "task_state.json", "personality", "conversations",
     ):
         assert forbidden not in script
+
+
+def test_wor149_rollback_preflight_is_local_bounded_and_diagnostic():
+    script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
+    prepare = script[script.index("function PrepareUpdateRollback"):script.index("function PrepareToInstall")]
+    install = script[script.index("procedure CurStepChanged"):script.index("procedure InitializeUninstallProgressForm")]
+    deinit = script[script.index("procedure DeinitializeSetup"):]
+
+    for failure in (
+        "invalid_source", "stale_backup", "executable_copy_failed",
+        "payload_rename_failed",
+    ):
+        assert f"UpdateBackupFailure := '{failure}'" in prepare
+    assert "for Attempt := 1 to 20" in script
+    assert "for Attempt := 1 to 40" in script
+    assert "Sleep(250)" in script
+    assert "Log('WOR-149 rollback" in script
+    assert "if not PrepareUpdateRollback then" in install
+    assert "RaiseException(CustomMessage('UpdateBackupError'))" in install
+    assert install.index("PrepareUpdateRollback") < install.index("UpdateDetailCopying")
+    assert "AddBackslash(ExistingInstallDir) + 'OSIA.exe'" in deinit
+    assert "ExpandConstant('{app}\\OSIA.exe')" in deinit
+    assert "if UpdateModeRequested and (not IsUpdateMode) then" in deinit
+    assert deinit.index("if IsUpdateMode then") < deinit.index("ExpandConstant('{app}\\OSIA.exe')")
+
+
+def test_wor149_hotfix_redesign_is_minimal_and_uses_transparent_logo():
+    script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
+    build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
+    assert "WizardSizePercent=112" in script
+    assert "WizardSmallImageBackColor=#110b15" in script
+    assert "WizardForm.MainPanel.Color := TColor(OSIA_MAIN_BACKGROUND)" in script
+    assert "WizardForm.WizardSmallBitmapImage.BackColor := TColor(OSIA_MAIN_BACKGROUND)" in script
+    assert "UpdateLogo.SetBounds((UpdatePage.Surface.ClientWidth" in script
+    assert "UpdatePreservedLabel.Alignment := taCenter" in script
+    assert "UpdateVersionsLabel.AutoSize := False" in script
+    assert "WelcomeMetaLabel.AutoSize := False" in script
+    assert "WizardForm.WelcomeLabel1.Alignment := taCenter" in script
+    assert "WizardForm.FinishedHeadingLabel.Alignment := taCenter" in script
+    assert "WizardForm.NextButton.Font.Name := 'Segoe UI Semibold'" in script
+    assert "transparent_logo = Image.new(\"RGBA\", (164, 164), (0, 0, 0, 0))" in build
+    assert "mark = icon.copy()" in build
 
 
 def test_package_smoke_requires_the_managed_codex_runtime():

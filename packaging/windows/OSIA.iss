@@ -42,7 +42,7 @@ DefaultDirName={localappdata}\Programs\OSIA
 DefaultGroupName=OSIA
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+PrivilegesRequiredOverridesAllowed=commandline
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
@@ -50,12 +50,14 @@ OutputDir={#ReleaseRoot}
 OutputBaseFilename=OSIA-Setup
 SetupIconFile={#BuildRoot}\generated\osia.ico
 UninstallDisplayIcon={app}\OSIA.exe
-WizardStyle=modern dynamic hidebevels
-WizardSizePercent=115
+WizardStyle=modern dark hidebevels includetitlebar
+WizardBackColor=#110b15
+WizardSizePercent=112
 WizardImageFile={#BuildRoot}\generated\wizard-large.png
 WizardSmallImageFile={#BuildRoot}\generated\wizard-small.png
 WizardImageFileDynamicDark={#BuildRoot}\generated\wizard-large.png
 WizardSmallImageFileDynamicDark={#BuildRoot}\generated\wizard-small.png
+WizardSmallImageBackColor=#110b15
 Compression=lzma2/ultra64
 SolidCompression=yes
 LZMAUseSeparateProcess=yes
@@ -87,33 +89,33 @@ english.FirewallTask=Enable secure phone access on private local networks
 english.MobileGroup=Mobile connectivity
 english.LaunchOSIA=Launch OSIA
 english.UninstallOSIA=Uninstall OSIA
-english.BrandEyebrow=OSIA  ·  WINDOWS SETUP
-english.StepLocation=STEP 1 OF 3  ·  LOCATION
-english.StepTasks=STEP 2 OF 3  ·  OPTIONS
-english.StepReady=STEP 3 OF 3  ·  REVIEW
-english.StepInstalling=INSTALLING  ·  REAL-TIME PROGRESS
-english.StepPreparing=PREPARING  ·  SAFETY CHECK
-english.WelcomeHeading=Meet OSIA
-english.WelcomeBody=Your personal AI assistant, ready to run on this PC.
-english.VersionArchitecture=Version %s  ·  Windows x64
-english.PreviewState=Internal preview  ·  Unsigned build
-english.StableState=Stable channel  ·  Signed build
+english.BrandEyebrow=OSIA
+english.StepLocation=LOCATION  ·  1/3
+english.StepTasks=OPTIONS  ·  2/3
+english.StepReady=REVIEW  ·  3/3
+english.StepInstalling=INSTALLATION
+english.StepPreparing=SAFETY CHECK
+english.WelcomeHeading=Your OSIA, on this PC
+english.WelcomeBody=A private workspace for your assistant, ready in a few steps.
+english.VersionArchitecture=Version %s  ·  Windows
+english.PreviewState=Internal preview  ·  Not signed
+english.StableState=Stable release
 english.UpdateState=In-place update  ·  Your data stays in your profile
 english.UpdateHeading=Update OSIA
-english.UpdateDescription=A focused update that preserves your OSIA environment.
+english.UpdateDescription=A secure update, without reconfiguring OSIA.
 english.UpdateVersions=OSIA %s → OSIA %s
 english.UpdatePreserved=Your settings, memory, and connections will be preserved.
-english.UpdateUnsigned=Internal preview · Unsigned installer
+english.UpdateUnsigned=Internal preview  ·  Not signed
 english.UpdateButton=Update
 english.UpdateMissingInstall=OSIA Update could not find an existing OSIA installation for this user.
 english.UpdateInvalidDir=OSIA Update found an invalid existing installation directory. Reinstall OSIA before retrying the update.
 english.UpdateInvalidVersion=OSIA Update could not validate the installed OSIA version.
 english.UpdateNotNewer=OSIA %s cannot update the installed version %s. The target version must be newer.
-english.UpdateBackupError=OSIA Update could not prepare a safe rollback copy. The existing installation was not changed.
-english.UpdateStepConfirm=UPDATE  ·  CONFIRMATION
-english.UpdateStepProgress=UPDATING  ·  REAL-TIME PROGRESS
+english.UpdateBackupError=OSIA Update could not secure the existing application files. Close OSIA and retry. The existing installation was not changed; details are in the Setup log.
+english.UpdateStepConfirm=UPDATE
+english.UpdateStepProgress=UPDATE IN PROGRESS
 english.UpdateProgressHeading=Updating OSIA
-english.UpdateProgressDescription=OSIA is applying the verified update on this PC.
+english.UpdateProgressDescription=Applying the verified OSIA update.
 english.UpdatePhasePreparing=Preparing the update
 english.UpdatePhaseClosing=Closing OSIA components
 english.UpdatePhaseFiles=Updating OSIA files… %d%%
@@ -127,11 +129,11 @@ english.UpdateIntegrationError=OSIA could not restore its background mobile serv
 english.UpdateFinishedHeading=OSIA has been updated
 english.UpdateFinishedVersion=Version %s was installed successfully.
 english.UpdateFinishedPreserved=Your personal data was preserved.
-english.ReadyVersion=OSIA %s  ·  Windows x64
+english.ReadyVersion=OSIA %s  ·  Windows
 english.Destination=Destination: %s
 english.FinishedHeading=OSIA is ready
 english.FinishedBody=Installation completed successfully. Launch OSIA to get started.
-english.FinishedState=SUCCESS  ·  YOUR SETTINGS STAY IN YOUR USER PROFILE
+english.FinishedState=Your settings stay in your profile
 english.ShowDetails=Show details
 english.HideDetails=Hide details
 english.PhasePreparing=Preparing OSIA…
@@ -155,33 +157,33 @@ french.FirewallTask=Autoriser l’accès sécurisé du téléphone sur le résea
 french.MobileGroup=Connexion mobile
 french.LaunchOSIA=Lancer OSIA
 french.UninstallOSIA=Désinstaller OSIA
-french.BrandEyebrow=OSIA  ·  INSTALLATION WINDOWS
-french.StepLocation=ÉTAPE 1 SUR 3  ·  EMPLACEMENT
-french.StepTasks=ÉTAPE 2 SUR 3  ·  OPTIONS
-french.StepReady=ÉTAPE 3 SUR 3  ·  VÉRIFICATION
-french.StepInstalling=INSTALLATION  ·  PROGRESSION RÉELLE
-french.StepPreparing=PRÉPARATION  ·  CONTRÔLE DE SÉCURITÉ
-french.WelcomeHeading=Découvrez OSIA
-french.WelcomeBody=Votre assistant IA personnel, prêt à fonctionner sur ce PC.
-french.VersionArchitecture=Version %s  ·  Windows x64
-french.PreviewState=Aperçu interne  ·  Build non signé
-french.StableState=Canal stable  ·  Build signé
+french.BrandEyebrow=OSIA
+french.StepLocation=EMPLACEMENT  ·  1/3
+french.StepTasks=OPTIONS  ·  2/3
+french.StepReady=VÉRIFICATION  ·  3/3
+french.StepInstalling=INSTALLATION
+french.StepPreparing=CONTRÔLE DE SÉCURITÉ
+french.WelcomeHeading=Votre OSIA, sur ce PC
+french.WelcomeBody=Un espace privé pour votre assistant, prêt en quelques étapes.
+french.VersionArchitecture=Version %s  ·  Windows
+french.PreviewState=Aperçu interne  ·  Non signé
+french.StableState=Version stable
 french.UpdateState=Mise à jour sur place  ·  Vos données restent dans votre profil
 french.UpdateHeading=Mise à jour d’OSIA
-french.UpdateDescription=Une mise à jour ciblée qui préserve votre environnement OSIA.
+french.UpdateDescription=Une mise à jour sûre, sans reconfigurer OSIA.
 french.UpdateVersions=OSIA %s → OSIA %s
 french.UpdatePreserved=Vos réglages, votre mémoire et vos connexions seront conservés.
-french.UpdateUnsigned=Aperçu interne · Installateur non signé
+french.UpdateUnsigned=Aperçu interne  ·  Non signé
 french.UpdateButton=Mettre à jour
 french.UpdateMissingInstall=OSIA Update n’a trouvé aucune installation OSIA existante pour cet utilisateur.
 french.UpdateInvalidDir=OSIA Update a trouvé un dossier d’installation existant invalide. Réinstallez OSIA avant de relancer la mise à jour.
 french.UpdateInvalidVersion=OSIA Update n’a pas pu valider la version OSIA installée.
 french.UpdateNotNewer=OSIA %s ne peut pas mettre à jour la version %s installée. La version cible doit être plus récente.
-french.UpdateBackupError=OSIA Update n’a pas pu préparer une copie de restauration sûre. L’installation existante n’a pas été modifiée.
-french.UpdateStepConfirm=MISE À JOUR  ·  CONFIRMATION
-french.UpdateStepProgress=MISE À JOUR  ·  PROGRESSION RÉELLE
+french.UpdateBackupError=OSIA Update n’a pas pu sécuriser les fichiers existants. Fermez OSIA puis réessayez. L’installation n’a pas été modifiée ; les détails figurent dans le journal d’installation.
+french.UpdateStepConfirm=MISE À JOUR
+french.UpdateStepProgress=MISE À JOUR EN COURS
 french.UpdateProgressHeading=Mise à jour d’OSIA
-french.UpdateProgressDescription=OSIA applique la mise à jour vérifiée sur ce PC.
+french.UpdateProgressDescription=Application de la mise à jour OSIA vérifiée.
 french.UpdatePhasePreparing=Préparation de la mise à jour
 french.UpdatePhaseClosing=Fermeture des composants OSIA
 french.UpdatePhaseFiles=Mise à jour des fichiers OSIA… %d%%
@@ -195,11 +197,11 @@ french.UpdateIntegrationError=OSIA n’a pas pu restaurer son service mobile en 
 french.UpdateFinishedHeading=OSIA a été mise à jour
 french.UpdateFinishedVersion=Version %s installée avec succès.
 french.UpdateFinishedPreserved=Vos données personnelles ont été conservées.
-french.ReadyVersion=OSIA %s  ·  Windows x64
+french.ReadyVersion=OSIA %s  ·  Windows
 french.Destination=Destination : %s
 french.FinishedHeading=OSIA est prêt
 french.FinishedBody=L’installation est terminée. Lancez OSIA pour commencer.
-french.FinishedState=SUCCÈS  ·  VOS RÉGLAGES RESTENT DANS VOTRE PROFIL UTILISATEUR
+french.FinishedState=Vos réglages restent dans votre profil
 french.ShowDetails=Afficher les détails
 french.HideDetails=Masquer les détails
 french.PhasePreparing=Préparation d’OSIA…
@@ -246,17 +248,17 @@ Type: files; Name: "{app}\.osia-no-integration-test"
 
 [Code]
 const
-  OSIA_MAIN_BACKGROUND = $00120B0D;
-  OSIA_ELEVATED_SURFACE = $00211217;
-  OSIA_SECONDARY_SURFACE = $002F1821;
-  OSIA_ACCENT = $00F5B5C4;
-  OSIA_PRIMARY_TEXT = $00FFF6F8;
-  OSIA_SECONDARY_TEXT = $00E7CED5;
-  OSIA_HELPER_TEXT = $00C2A4AD;
-  OSIA_DISABLED_TEXT = $00907981;
-  OSIA_SUCCESS_TEXT = $00C1E3A7;
-  OSIA_ERROR_TEXT = $00A7A7F3;
-  OSIA_WARNING_TEXT = $007DC2F1;
+  OSIA_MAIN_BACKGROUND = $00150B11;
+  OSIA_ELEVATED_SURFACE = $001A1222;
+  OSIA_SECONDARY_SURFACE = $00251A30;
+  OSIA_ACCENT = $00F1B1D8;
+  OSIA_PRIMARY_TEXT = $00FFF9FC;
+  OSIA_SECONDARY_TEXT = $00E8D8E2;
+  OSIA_HELPER_TEXT = $00BFA9B8;
+  OSIA_DISABLED_TEXT = $008C7786;
+  OSIA_SUCCESS_TEXT = $00C8E6B2;
+  OSIA_ERROR_TEXT = $00B5B4F4;
+  OSIA_WARNING_TEXT = $0089C9F2;
 
 var
   StageLabel: TNewStaticText;
@@ -282,12 +284,14 @@ var
   HadPreviousRunValue: Boolean;
   PreviousRunValue: String;
   IntegrationSuppressed: Boolean;
+  UpdateModeRequested: Boolean;
   UpdateModeActive: Boolean;
   ExistingInstallDir: String;
   ExistingVersionText: String;
   UpdateBackupPrepared: Boolean;
   UpdateBackupInternal: String;
   UpdateBackupExe: String;
+  UpdateBackupFailure: String;
 
 function HasExactUpdateSwitch: Boolean;
 var
@@ -313,8 +317,9 @@ var
   ExistingMajor, ExistingMinor, ExistingPatch, ExistingBuild: Word;
 begin
   Result := True;
+  UpdateModeRequested := HasExactUpdateSwitch;
   UpdateModeActive := False;
-  if not HasExactUpdateSwitch then
+  if not UpdateModeRequested then
     exit;
 
   UninstallKey :=
@@ -449,7 +454,7 @@ begin
   WizardForm.Font.Name := 'Segoe UI';
   WizardForm.Font.Size := 9;
   WizardForm.Color := TColor(OSIA_MAIN_BACKGROUND);
-  WizardForm.MainPanel.Color := TColor(OSIA_ELEVATED_SURFACE);
+  WizardForm.MainPanel.Color := TColor(OSIA_MAIN_BACKGROUND);
   WizardForm.InnerPage.Color := TColor(OSIA_MAIN_BACKGROUND);
   StylePage(WizardForm.WelcomePage);
   StylePage(WizardForm.FinishedPage);
@@ -459,35 +464,34 @@ begin
   StylePage(WizardForm.PreparingPage);
   StylePage(WizardForm.InstallingPage);
 
-  { Keep Windows task dialogs and UAC native. The main wizard alone owns the
-    dark OSIA surface, so system dialogs retain their accessible system colors. }
+  { Keep UAC native; Inno's forced dark style provides readable system dialogs
+    while the OSIA wizard uses one consistent branded surface. }
   WizardForm.WizardBitmapImage.Visible := False;
   WizardForm.WizardBitmapImage2.Visible := False;
-  WizardForm.WizardSmallBitmapImage.BackColor := TColor(OSIA_ELEVATED_SURFACE);
+  WizardForm.WizardSmallBitmapImage.BackColor := TColor(OSIA_MAIN_BACKGROUND);
   WizardForm.WizardSmallBitmapImage.SetBounds(
-    WizardForm.MainPanel.ClientWidth - ScaleX(66), ScaleY(8),
-    ScaleX(54), ScaleY(54));
+    ScaleX(22), ScaleY(9), ScaleX(46), ScaleY(46));
   WizardForm.WizardSmallBitmapImage.Stretch := True;
 
   HeaderStepLabel := TNewStaticText.Create(WizardForm);
   HeaderStepLabel.Parent := WizardForm.MainPanel;
-  HeaderStepLabel.SetBounds(ScaleX(20), ScaleY(5),
-    WizardForm.MainPanel.ClientWidth - ScaleX(98), ScaleY(13));
+  HeaderStepLabel.SetBounds(ScaleX(84), ScaleY(7),
+    WizardForm.MainPanel.ClientWidth - ScaleX(108), ScaleY(13));
   HeaderStepLabel.Caption := CustomMessage('BrandEyebrow');
-  StyleLabel(HeaderStepLabel, TColor(OSIA_ACCENT), TColor(OSIA_ELEVATED_SURFACE));
+  StyleLabel(HeaderStepLabel, TColor(OSIA_ACCENT), TColor(OSIA_MAIN_BACKGROUND));
   HeaderStepLabel.Font.Size := 8;
   HeaderStepLabel.Font.Style := [fsBold];
 
-  WizardForm.PageNameLabel.SetBounds(ScaleX(20), ScaleY(19),
-    WizardForm.MainPanel.ClientWidth - ScaleX(100), ScaleY(23));
+  WizardForm.PageNameLabel.SetBounds(ScaleX(84), ScaleY(21),
+    WizardForm.MainPanel.ClientWidth - ScaleX(108), ScaleY(23));
   StyleLabel(WizardForm.PageNameLabel, TColor(OSIA_PRIMARY_TEXT),
-    TColor(OSIA_ELEVATED_SURFACE));
+    TColor(OSIA_MAIN_BACKGROUND));
   WizardForm.PageNameLabel.Font.Size := 14;
   WizardForm.PageNameLabel.Font.Style := [fsBold];
-  WizardForm.PageDescriptionLabel.SetBounds(ScaleX(20), ScaleY(42),
-    WizardForm.MainPanel.ClientWidth - ScaleX(100), ScaleY(16));
+  WizardForm.PageDescriptionLabel.SetBounds(ScaleX(84), ScaleY(44),
+    WizardForm.MainPanel.ClientWidth - ScaleX(108), ScaleY(16));
   StyleLabel(WizardForm.PageDescriptionLabel, TColor(OSIA_SECONDARY_TEXT),
-    TColor(OSIA_ELEVATED_SURFACE));
+    TColor(OSIA_MAIN_BACKGROUND));
 
   ContentLeft := ScaleX(28);
   ContentWidth := WizardForm.WelcomePage.ClientWidth - ContentLeft - ScaleX(28);
@@ -499,7 +503,8 @@ begin
     StylePage(UpdatePage.Surface);
     UpdateLogo := TBitmapImage.Create(WizardForm);
     UpdateLogo.Parent := UpdatePage.Surface;
-    UpdateLogo.SetBounds(ContentLeft, ScaleY(36), ScaleX(74), ScaleY(74));
+    UpdateLogo.SetBounds((UpdatePage.Surface.ClientWidth - ScaleX(82)) div 2,
+      ScaleY(24), ScaleX(82), ScaleY(82));
     UpdateLogo.BackColor := TColor(OSIA_MAIN_BACKGROUND);
     UpdateLogo.PngImage.Assign(WizardForm.WizardSmallBitmapImage.PngImage);
     UpdateLogo.Center := True;
@@ -507,12 +512,13 @@ begin
 
     UpdateVersionsLabel := TNewStaticText.Create(WizardForm);
     UpdateVersionsLabel.Parent := UpdatePage.Surface;
-    UpdateVersionsLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(39),
-      ContentWidth - ScaleX(98), ScaleY(34));
+    UpdateVersionsLabel.AutoSize := False;
+    UpdateVersionsLabel.SetBounds(ContentLeft, ScaleY(126),
+      ContentWidth, ScaleY(34));
     UpdateVersionsLabel.Caption := Format(CustomMessage('UpdateVersions'), [
       ExistingVersionText, ProductVersionText]);
     UpdateVersionsLabel.WordWrap := False;
-    UpdateVersionsLabel.AutoSize := True;
+    UpdateVersionsLabel.Alignment := taCenter;
     StyleLabel(UpdateVersionsLabel, TColor(OSIA_PRIMARY_TEXT),
       TColor(OSIA_MAIN_BACKGROUND));
     UpdateVersionsLabel.Font.Size := 14;
@@ -520,62 +526,70 @@ begin
 
     UpdatePreservedLabel := TNewStaticText.Create(WizardForm);
     UpdatePreservedLabel.Parent := UpdatePage.Surface;
-    UpdatePreservedLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(91),
-      ContentWidth - ScaleX(98), ScaleY(62));
+    UpdatePreservedLabel.AutoSize := False;
+    UpdatePreservedLabel.SetBounds(ContentLeft + ScaleX(18), ScaleY(171),
+      ContentWidth - ScaleX(36), ScaleY(48));
     UpdatePreservedLabel.Caption := CustomMessage('UpdatePreserved');
     UpdatePreservedLabel.WordWrap := True;
+    UpdatePreservedLabel.Alignment := taCenter;
     StyleLabel(UpdatePreservedLabel, TColor(OSIA_SECONDARY_TEXT),
       TColor(OSIA_MAIN_BACKGROUND));
     UpdatePreservedLabel.Font.Size := 10;
 
     UpdateUnsignedLabel := TNewStaticText.Create(WizardForm);
     UpdateUnsignedLabel.Parent := UpdatePage.Surface;
-    UpdateUnsignedLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(169),
-      ContentWidth - ScaleX(98), ScaleY(28));
+    UpdateUnsignedLabel.AutoSize := False;
+    UpdateUnsignedLabel.SetBounds(ContentLeft, ScaleY(232),
+      ContentWidth, ScaleY(24));
     UpdateUnsignedLabel.Caption := CustomMessage('UpdateUnsigned');
     UpdateUnsignedLabel.Visible := ({#InternalBuild} = 1) and ({#SignedBuild} = 0);
     StyleLabel(UpdateUnsignedLabel, TColor(OSIA_WARNING_TEXT),
       TColor(OSIA_MAIN_BACKGROUND));
+    UpdateUnsignedLabel.Alignment := taCenter;
     UpdateUnsignedLabel.Font.Style := [fsBold];
   end;
 
   WelcomeLogo := TBitmapImage.Create(WizardForm);
   WelcomeLogo.Parent := WizardForm.WelcomePage;
-  WelcomeLogo.SetBounds(ContentLeft, ScaleY(34), ScaleX(74), ScaleY(74));
+  WelcomeLogo.SetBounds((WizardForm.WelcomePage.ClientWidth - ScaleX(82)) div 2,
+    ScaleY(22), ScaleX(82), ScaleY(82));
   WelcomeLogo.BackColor := TColor(OSIA_MAIN_BACKGROUND);
   WelcomeLogo.PngImage.Assign(WizardForm.WizardSmallBitmapImage.PngImage);
   WelcomeLogo.Center := True;
   WelcomeLogo.Stretch := True;
 
-  WizardForm.WelcomeLabel1.SetBounds(ContentLeft + ScaleX(98), ScaleY(35),
-    ContentWidth - ScaleX(98), ScaleY(47));
+  WizardForm.WelcomeLabel1.SetBounds(ContentLeft, ScaleY(120),
+    ContentWidth, ScaleY(42));
   WizardForm.WelcomeLabel1.Caption := CustomMessage('WelcomeHeading');
   WizardForm.WelcomeLabel1.WordWrap := True;
+  WizardForm.WelcomeLabel1.Alignment := taCenter;
   StyleLabel(WizardForm.WelcomeLabel1, TColor(OSIA_PRIMARY_TEXT),
     TColor(OSIA_MAIN_BACKGROUND));
   WizardForm.WelcomeLabel1.Font.Size := 18;
   WizardForm.WelcomeLabel1.Font.Style := [fsBold];
-  WizardForm.WelcomeLabel2.SetBounds(ContentLeft + ScaleX(98), ScaleY(88),
-    ContentWidth - ScaleX(98), ScaleY(48));
+  WizardForm.WelcomeLabel2.SetBounds(ContentLeft + ScaleX(24), ScaleY(168),
+    ContentWidth - ScaleX(48), ScaleY(44));
   WizardForm.WelcomeLabel2.Caption := CustomMessage('WelcomeBody');
   WizardForm.WelcomeLabel2.WordWrap := True;
+  WizardForm.WelcomeLabel2.Alignment := taCenter;
   StyleLabel(WizardForm.WelcomeLabel2, TColor(OSIA_SECONDARY_TEXT),
     TColor(OSIA_MAIN_BACKGROUND));
   WizardForm.WelcomeLabel2.Font.Size := 10;
 
   WelcomeMetaLabel := TNewStaticText.Create(WizardForm);
   WelcomeMetaLabel.Parent := WizardForm.WelcomePage;
-  WelcomeMetaLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(147),
-    ContentWidth - ScaleX(98), ScaleY(24));
+  WelcomeMetaLabel.AutoSize := False;
+  WelcomeMetaLabel.SetBounds(ContentLeft, ScaleY(225), ContentWidth, ScaleY(22));
   WelcomeMetaLabel.Caption :=
     Format(CustomMessage('VersionArchitecture'), [ProductVersionText]);
   StyleLabel(WelcomeMetaLabel, TColor(OSIA_HELPER_TEXT),
     TColor(OSIA_MAIN_BACKGROUND));
+  WelcomeMetaLabel.Alignment := taCenter;
 
   WelcomePreviewLabel := TNewStaticText.Create(WizardForm);
   WelcomePreviewLabel.Parent := WizardForm.WelcomePage;
-  WelcomePreviewLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(179),
-    ContentWidth - ScaleX(98), ScaleY(24));
+  WelcomePreviewLabel.AutoSize := False;
+  WelcomePreviewLabel.SetBounds(ContentLeft, ScaleY(255), ContentWidth, ScaleY(22));
   if IsUpdateMode then
     WelcomePreviewLabel.Caption := CustomMessage('UpdateState')
   else if {#InternalBuild} = 1 then
@@ -584,39 +598,44 @@ begin
     WelcomePreviewLabel.Caption := CustomMessage('StableState');
   StyleLabel(WelcomePreviewLabel, TColor(OSIA_WARNING_TEXT),
     TColor(OSIA_MAIN_BACKGROUND));
+  WelcomePreviewLabel.Alignment := taCenter;
   WelcomePreviewLabel.Font.Style := [fsBold];
 
   FinishedLogo := TBitmapImage.Create(WizardForm);
   FinishedLogo.Parent := WizardForm.FinishedPage;
-  FinishedLogo.SetBounds(ContentLeft, ScaleY(34), ScaleX(74), ScaleY(74));
+  FinishedLogo.SetBounds((WizardForm.FinishedPage.ClientWidth - ScaleX(82)) div 2,
+    ScaleY(22), ScaleX(82), ScaleY(82));
   FinishedLogo.BackColor := TColor(OSIA_MAIN_BACKGROUND);
   FinishedLogo.PngImage.Assign(WizardForm.WizardSmallBitmapImage.PngImage);
   FinishedLogo.Center := True;
   FinishedLogo.Stretch := True;
-  WizardForm.FinishedHeadingLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(38),
-    ContentWidth - ScaleX(98), ScaleY(42));
+  WizardForm.FinishedHeadingLabel.SetBounds(ContentLeft, ScaleY(120),
+    ContentWidth, ScaleY(38));
   WizardForm.FinishedHeadingLabel.Caption := CustomMessage('FinishedHeading');
   StyleLabel(WizardForm.FinishedHeadingLabel, TColor(OSIA_PRIMARY_TEXT),
     TColor(OSIA_MAIN_BACKGROUND));
+  WizardForm.FinishedHeadingLabel.Alignment := taCenter;
   WizardForm.FinishedHeadingLabel.Font.Size := 17;
   WizardForm.FinishedHeadingLabel.Font.Style := [fsBold];
-  WizardForm.FinishedLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(88),
-    ContentWidth - ScaleX(98), ScaleY(48));
+  WizardForm.FinishedLabel.SetBounds(ContentLeft + ScaleX(24), ScaleY(168),
+    ContentWidth - ScaleX(48), ScaleY(48));
   WizardForm.FinishedLabel.Caption := CustomMessage('FinishedBody');
   WizardForm.FinishedLabel.WordWrap := True;
+  WizardForm.FinishedLabel.Alignment := taCenter;
   StyleLabel(WizardForm.FinishedLabel, TColor(OSIA_SECONDARY_TEXT),
     TColor(OSIA_MAIN_BACKGROUND));
   FinishedStateLabel := TNewStaticText.Create(WizardForm);
   FinishedStateLabel.Parent := WizardForm.FinishedPage;
-  FinishedStateLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(151),
-    ContentWidth - ScaleX(98), ScaleY(26));
+  FinishedStateLabel.AutoSize := False;
+  FinishedStateLabel.SetBounds(ContentLeft, ScaleY(229), ContentWidth, ScaleY(24));
   FinishedStateLabel.Caption := CustomMessage('FinishedState');
   StyleLabel(FinishedStateLabel, TColor(OSIA_SUCCESS_TEXT),
     TColor(OSIA_MAIN_BACKGROUND));
+  FinishedStateLabel.Alignment := taCenter;
   FinishedStateLabel.Font.Size := 8;
   FinishedStateLabel.Font.Style := [fsBold];
-  WizardForm.RunList.SetBounds(ContentLeft + ScaleX(98), ScaleY(199),
-    ContentWidth - ScaleX(98), ScaleY(58));
+  WizardForm.RunList.SetBounds(ContentLeft + ScaleX(42), ScaleY(267),
+    ContentWidth - ScaleX(84), ScaleY(50));
   StyleDarkList(WizardForm.RunList);
 
   StyleLabel(WizardForm.SelectDirLabel, TColor(OSIA_SECONDARY_TEXT),
@@ -692,6 +711,9 @@ begin
     TColor(OSIA_MAIN_BACKGROUND));
   WizardForm.NextButton.Default := True;
   WizardForm.CancelButton.Cancel := True;
+  WizardForm.NextButton.Font.Name := 'Segoe UI Semibold';
+  WizardForm.CancelButton.Font.Name := 'Segoe UI';
+  WizardForm.BackButton.Font.Name := 'Segoe UI';
 
   HadPreviousRunValue := RegQueryStringValue(
     HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'OSIA', PreviousRunValue);
@@ -720,27 +742,94 @@ begin
     Confirm := False;
 end;
 
+procedure RegisterExtraCloseApplicationsResources;
+begin
+  if IsUpdateMode then
+    RegisterExtraCloseApplicationsResource(
+      False, AddBackslash(ExistingInstallDir) + 'OSIA.exe');
+end;
+
+function CopyFileWithRetry(const Source, Destination: String): Boolean;
+var
+  Attempt: Integer;
+begin
+  Result := False;
+  for Attempt := 1 to 20 do
+  begin
+    if FileExists(Destination) then
+      DeleteFile(Destination);
+    if FileCopy(Source, Destination, True) then
+    begin
+      Result := True;
+      exit;
+    end;
+    if Attempt < 20 then
+      Sleep(250);
+  end;
+end;
+
+function RenameFileWithRetry(const Source, Destination: String): Boolean;
+var
+  Attempt: Integer;
+begin
+  Result := False;
+  for Attempt := 1 to 40 do
+  begin
+    if RenameFile(Source, Destination) then
+    begin
+      Result := True;
+      exit;
+    end;
+    if Attempt < 40 then
+      Sleep(250);
+  end;
+end;
+
 function PrepareUpdateRollback: Boolean;
 var
-  BackupRoot: String;
   ExistingInternal: String;
   ExistingExe: String;
 begin
   Result := False;
+  UpdateBackupFailure := '';
   ExistingInternal := AddBackslash(ExistingInstallDir) + '_internal';
   ExistingExe := AddBackslash(ExistingInstallDir) + 'OSIA.exe';
-  BackupRoot := AddBackslash(ExpandConstant('{tmp}')) + 'osia-update-rollback';
-  UpdateBackupInternal := AddBackslash(BackupRoot) + '_internal';
-  UpdateBackupExe := AddBackslash(BackupRoot) + 'OSIA.exe';
-  if (not ForceDirectories(BackupRoot)) or
-    (not FileCopy(ExistingExe, UpdateBackupExe, True)) then
-    exit;
-  if not RenameFile(ExistingInternal, UpdateBackupInternal) then
+  UpdateBackupInternal := AddBackslash(ExistingInstallDir) +
+    '_internal.osia-rollback';
+  UpdateBackupExe := AddBackslash(ExistingInstallDir) +
+    'OSIA.exe.osia-rollback';
+
+  if (not FileExists(ExistingExe)) or (not DirExists(ExistingInternal)) then
   begin
+    UpdateBackupFailure := 'invalid_source';
+    Log('WOR-149 rollback preflight failed: invalid source installation.');
+    exit;
+  end;
+  if FileExists(UpdateBackupExe) or DirExists(UpdateBackupInternal) then
+  begin
+    UpdateBackupFailure := 'stale_backup';
+    Log('WOR-149 rollback preflight failed: stale local backup exists.');
+    exit;
+  end;
+
+  Log('WOR-149 rollback: copying the launcher beside the installation.');
+  if not CopyFileWithRetry(ExistingExe, UpdateBackupExe) then
+  begin
+    UpdateBackupFailure := 'executable_copy_failed';
+    Log('WOR-149 rollback preflight failed: launcher copy failed.');
+    exit;
+  end;
+
+  Log('WOR-149 rollback: atomically preserving the existing payload in place.');
+  if not RenameFileWithRetry(ExistingInternal, UpdateBackupInternal) then
+  begin
+    UpdateBackupFailure := 'payload_rename_failed';
+    Log('WOR-149 rollback preflight failed: local payload rename failed after retries.');
     DeleteFile(UpdateBackupExe);
     exit;
   end;
   UpdateBackupPrepared := True;
+  Log('WOR-149 rollback: local backup prepared successfully.');
   Result := True;
 end;
 
@@ -757,13 +846,15 @@ begin
     Result := CustomMessage('UpdateInvalidDir');
     exit;
   end;
-  ExistingExe := ExpandConstant('{app}\OSIA.exe');
   if IsUpdateMode then
   begin
+    ExistingExe := AddBackslash(ExistingInstallDir) + 'OSIA.exe';
     StageLabel.Caption := CustomMessage('UpdatePhasePreparing');
     AddDetail(CustomMessage('UpdatePhasePreparing'));
     AddDetail(CustomMessage('UpdatePhaseClosing'));
   end;
+  if not IsUpdateMode then
+    ExistingExe := ExpandConstant('{app}\OSIA.exe');
   if (not IntegrationSuppressed) and FileExists(ExistingExe) then
   begin
     AddDetail(CustomMessage('DetailStopping'));
@@ -773,8 +864,6 @@ begin
     else
       Result := CustomMessage('ExistingServiceError');
   end;
-  if (Result = '') and IsUpdateMode and (not PrepareUpdateRollback) then
-    Result := CustomMessage('UpdateBackupError');
 end;
 
 procedure CurInstallProgressChanged(CurProgress, MaxProgress: Integer);
@@ -866,6 +955,12 @@ begin
   begin
     if IsUpdateMode then
     begin
+      if not PrepareUpdateRollback then
+      begin
+        Log('WOR-149 rollback preparation aborted update: ' +
+          UpdateBackupFailure + '.');
+        RaiseException(CustomMessage('UpdateBackupError'));
+      end;
       StageLabel.Caption := Format(CustomMessage('UpdatePhaseFiles'), [0]);
       AddDetail(CustomMessage('UpdateDetailCopying'));
     end
@@ -950,6 +1045,7 @@ begin
       DelTree(UpdateBackupInternal, True, True, True);
       DeleteFile(UpdateBackupExe);
       UpdateBackupPrepared := False;
+      Log('WOR-149 rollback: obsolete local backup removed after success.');
     end;
   end;
 end;
@@ -980,16 +1076,30 @@ var
 begin
   if InstallSucceeded then
     exit;
-  AppExe := ExpandConstant('{app}\OSIA.exe');
+  { InitializeSetup can reject a requested update before the app path exists. No
+    mutation has happened in that state, so teardown must be a no-op. }
+  if UpdateModeRequested and (not IsUpdateMode) then
+    exit;
+  if IsUpdateMode then
+    AppExe := AddBackslash(ExistingInstallDir) + 'OSIA.exe'
+  else
+    AppExe := ExpandConstant('{app}\OSIA.exe');
   if IntegrationInstalled and FileExists(AppExe) then
     Exec(AppExe, '--osia-remove-integration', '', SW_HIDE,
       ewWaitUntilTerminated, ResultCode);
   if IsUpdateMode and UpdateBackupPrepared then
   begin
-    DelTree(ExpandConstant('{app}\_internal'), True, True, True);
+    Log('WOR-149 rollback: restoring the previous local payload.');
+    DelTree(AddBackslash(ExistingInstallDir) + '_internal', True, True, True);
     DeleteFile(AppExe);
-    RenameFile(UpdateBackupInternal, ExpandConstant('{app}\_internal'));
-    FileCopy(UpdateBackupExe, AppExe, False);
+    if not RenameFileWithRetry(UpdateBackupInternal,
+      AddBackslash(ExistingInstallDir) + '_internal') then
+      Log('WOR-149 rollback restore failed: payload rename failed.')
+    else if not CopyFileWithRetry(UpdateBackupExe, AppExe) then
+      Log('WOR-149 rollback restore failed: launcher copy failed.')
+    else
+      Log('WOR-149 rollback: previous installation restored successfully.');
+    DeleteFile(UpdateBackupExe);
     UpdateBackupPrepared := False;
   end;
   if ExistingIntegrationStopped and FileExists(AppExe) then

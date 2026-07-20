@@ -234,22 +234,32 @@ def _generate_branding(version: str) -> None:
     )
 
     logo = Image.open(ROOT / "assets" / "osia_logo.png").convert("RGBA")
-    for filename, size, logo_size in (
-        ("wizard-large.png", (410, 790), 280),
-        ("wizard-small.png", (164, 164), 120),
-    ):
-        canvas = Image.new("RGBA", size, "#0d0b12")
-        draw = ImageDraw.Draw(canvas)
-        for y in range(size[1]):
-            mix = y / max(1, size[1] - 1)
-            colour = (
-                int(13 + 18 * mix), int(11 + 10 * mix), int(18 + 28 * mix), 255,
-            )
-            draw.line((0, y, size[0], y), fill=colour)
-        mark = logo.copy()
-        mark.thumbnail((logo_size, logo_size), Image.Resampling.LANCZOS)
-        canvas.alpha_composite(mark, ((size[0] - mark.width) // 2, (size[1] - mark.height) // 2))
-        canvas.convert("RGB").save(GENERATED / filename, optimize=True)
+    canvas = Image.new("RGBA", (410, 790), "#110b15")
+    draw = ImageDraw.Draw(canvas)
+    for y in range(canvas.height):
+        mix = y / max(1, canvas.height - 1)
+        colour = (17 + int(9 * mix), 11 + int(6 * mix), 21 + int(15 * mix), 255)
+        draw.line((0, y, canvas.width, y), fill=colour)
+    mark = logo.copy()
+    mark.thumbnail((280, 280), Image.Resampling.LANCZOS)
+    canvas.alpha_composite(
+        mark, ((canvas.width - mark.width) // 2, (canvas.height - mark.height) // 2),
+    )
+    canvas.convert("RGB").save(GENERATED / "wizard-large.png", optimize=True)
+
+    # The small wizard image is reused as the visible logo throughout Setup.
+    # Keep it genuinely transparent so it never renders as a square colour block.
+    mark = icon.copy()
+    mark.thumbnail((132, 132), Image.Resampling.LANCZOS)
+    transparent_logo = Image.new("RGBA", (164, 164), (0, 0, 0, 0))
+    transparent_logo.alpha_composite(
+        mark,
+        (
+            (transparent_logo.width - mark.width) // 2,
+            (transparent_logo.height - mark.height) // 2,
+        ),
+    )
+    transparent_logo.save(GENERATED / "wizard-small.png", optimize=True)
 
     version_parts = list(parse_product_version(version))
     version_parts.extend([0] * (4 - len(version_parts)))
@@ -601,8 +611,8 @@ def build(
         "minimumSupportedVersion": "1.0.1",
         "minimumUpdaterVersion": "1.0.1",
         "releaseNotes": [
-            "Dedicated OSIA update interface.",
-            "Installation choices are now preserved automatically during updates.",
+            "Safer update preparation and rollback handling.",
+            "Redesigned OSIA installer and update interface.",
         ],
         "releaseNotesUrl": None,
         "rollout": {"state": "paused"},
