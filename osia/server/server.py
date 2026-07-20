@@ -112,6 +112,7 @@ from osia.attachments import (
     cleanup_orphan_batches,
 )
 from osia.config import CONFIG_DIR as _CONFIG_DIR, regenerate_mobile_token
+from osia.version import current_product_version
 from osia.legacy_uploads import (
     LegacyUploadError,
     LegacyUploadManager,
@@ -598,7 +599,7 @@ def decode_base64_wav(b64_data: str) -> tuple[np.ndarray, int]:
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
-app = FastAPI(title="OSIA Mobile Server", version="1.0.0")
+app = FastAPI(title="OSIA Mobile Server", version=current_product_version())
 
 
 # Registry of authenticated mobile clients (WOR-10). Holds each connection's

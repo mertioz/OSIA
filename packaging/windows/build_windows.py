@@ -16,8 +16,13 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from osia.version import PRODUCT_VERSION, parse_product_version
+
+
 STAGE = ROOT / "build" / "windows"
 GENERATED = STAGE / "generated"
 MODEL_STAGE = STAGE / "models"
@@ -32,11 +37,10 @@ CODEX_RUNTIME_URL = (
     "https://github.com/openai/codex/releases/download/"
     f"rust-v{CODEX_RUNTIME_VERSION}/{CODEX_RUNTIME_ARCHIVE}"
 )
-_VERSION_SOURCE = (ROOT / "osia" / "lan_discovery.py").read_text("utf-8")
-_VERSION_MATCH = re.search(r'^PRODUCT_VERSION\s*=\s*["\']([^"\']+)["\']', _VERSION_SOURCE, re.M)
-if _VERSION_MATCH is None:
-    raise RuntimeError("osia.lan_discovery.PRODUCT_VERSION was not found")
-VERSION = _VERSION_MATCH.group(1)
+SOURCE_VERSION = PRODUCT_VERSION
+DEFAULT_BUILD_CHANNEL = "internal-preview"
+ALLOWED_BUILD_CHANNELS = {"internal-preview", "stable"}
+UPDATER_SCHEMA_VERSION = 1
 
 MODELS = {
     "kokoro": {
@@ -219,7 +223,7 @@ def _stage_legal() -> list[dict]:
     return dependencies
 
 
-def _generate_branding() -> None:
+def _generate_branding(version: str) -> None:
     from PIL import Image, ImageDraw
 
     GENERATED.mkdir(parents=True, exist_ok=True)
@@ -247,9 +251,7 @@ def _generate_branding() -> None:
         canvas.alpha_composite(mark, ((size[0] - mark.width) // 2, (size[1] - mark.height) // 2))
         canvas.convert("RGB").save(GENERATED / filename, optimize=True)
 
-    version_parts = [int(part) for part in VERSION.split(".")]
-    if len(version_parts) > 4:
-        raise ValueError(f"Windows version has too many components: {VERSION}")
+    version_parts = list(parse_product_version(version))
     version_parts.extend([0] * (4 - len(version_parts)))
     version_tuple = tuple(version_parts)
     version_info = f"""# UTF-8
@@ -259,34 +261,107 @@ VSVersionInfo(
   kids=[StringFileInfo([StringTable('040904B0', [
     StringStruct('CompanyName', 'OSIA'),
     StringStruct('FileDescription', 'OSIA Personal AI Assistant'),
-    StringStruct('FileVersion', '{VERSION}'),
+    StringStruct('FileVersion', '{version}'),
     StringStruct('InternalName', 'OSIA'),
     StringStruct('LegalCopyright', 'Copyright OSIA'),
     StringStruct('OriginalFilename', 'OSIA.exe'),
     StringStruct('ProductName', 'OSIA'),
-    StringStruct('ProductVersion', '{VERSION}')])]),
+    StringStruct('ProductVersion', '{version}')])]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])]
 )
 """
     (GENERATED / "version_info.txt").write_text(version_info, encoding="utf-8")
 
 
+def _build_timestamp() -> str:
+    epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if epoch:
+        try:
+            value = datetime.fromtimestamp(int(epoch), timezone.utc)
+        except (ValueError, OverflowError, OSError) as exc:
+            raise RuntimeError("SOURCE_DATE_EPOCH must be a valid Unix timestamp") from exc
+    else:
+        value = datetime.now(timezone.utc)
+    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _build_commit() -> str | None:
+    configured = os.environ.get("OSIA_BUILD_COMMIT", "").strip().lower()
+    if configured:
+        if re.fullmatch(r"[0-9a-f]{40}", configured) is None:
+            raise RuntimeError("OSIA_BUILD_COMMIT must be a 40-character commit SHA")
+        return configured
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True,
+            text=True, check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    commit = completed.stdout.strip().lower()
+    return commit if re.fullmatch(r"[0-9a-f]{40}", commit) else None
+
+
+def _resolve_build_identity(
+    channel: str = DEFAULT_BUILD_CHANNEL,
+    version_override: str | None = None,
+) -> dict:
+    if channel not in ALLOWED_BUILD_CHANNELS:
+        raise ValueError(f"unsupported update channel: {channel}")
+    version = SOURCE_VERSION
+    override = None
+    if version_override is not None:
+        parse_product_version(version_override)
+        if channel != "internal-preview":
+            raise ValueError("version overrides are forbidden for stable builds")
+        if version_override != "1.0.1":
+            raise ValueError("the only supported internal override is 1.0.1")
+        version = version_override
+        override = {
+            "sourceVersion": SOURCE_VERSION,
+            "version": version,
+            "channel": channel,
+        }
+    return {
+        "version": version,
+        "channel": channel,
+        "timestamp": _build_timestamp(),
+        "commit": _build_commit(),
+        "override": override,
+    }
+
+
+def _write_app_metadata(identity: dict) -> Path:
+    metadata = {
+        "product": "OSIA",
+        "version": identity["version"],
+        "updateChannel": identity["channel"],
+        "platform": "windows",
+        "architecture": "x86_64",
+        "buildTimestamp": identity["timestamp"],
+        "commitSha": identity["commit"],
+        "updaterSchemaVersion": UPDATER_SCHEMA_VERSION,
+        "buildOverride": identity["override"],
+    }
+    GENERATED.mkdir(parents=True, exist_ok=True)
+    path = GENERATED / "app_metadata.json"
+    path.write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+    )
+    return path
+
+
 def _write_manifest(
-    models: list[dict], dependencies: list[dict], codex_runtime: dict,
+    models: list[dict], dependencies: list[dict], codex_runtime: dict, identity: dict,
 ) -> Path:
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True,
-    ).stdout.strip()
     manifest = {
         "product": "OSIA",
-        "version": VERSION,
+        "version": identity["version"],
+        "update_channel": identity["channel"],
         "architecture": "x86_64",
-        "build_utc": datetime.now(timezone.utc).isoformat(),
-        "git_commit": commit,
-        "git_dirty": bool(subprocess.run(
-            ["git", "status", "--porcelain"], cwd=ROOT,
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()),
+        "build_utc": identity["timestamp"],
+        "git_commit": identity["commit"],
+        "build_override": identity["override"],
         "python": sys.version,
         "pyinstaller": importlib.metadata.version("pyinstaller"),
         "pyinstaller_hooks_contrib": importlib.metadata.version("pyinstaller-hooks-contrib"),
@@ -442,13 +517,21 @@ def _secret_scan(root: Path) -> None:
                     tail = data[-overlap:] if overlap > 0 else b""
 
 
-def build(skip_installer: bool = False) -> Path | None:
+def build(
+    skip_installer: bool = False,
+    *,
+    channel: str = DEFAULT_BUILD_CHANNEL,
+    version_override: str | None = None,
+) -> Path | None:
     if sys.platform != "win32":
         raise RuntimeError("the Windows package must be built on Windows")
     if importlib.metadata.version("pyinstaller") != "6.21.0":
         raise RuntimeError("PyInstaller 6.21.0 is required")
     if importlib.metadata.version("pyinstaller-hooks-contrib") != "2026.6":
         raise RuntimeError("pyinstaller-hooks-contrib 2026.6 is required")
+
+    identity = _resolve_build_identity(channel, version_override)
+    version = identity["version"]
 
     _clean_dir(STAGE)
     _clean_dir(DIST)
@@ -458,8 +541,9 @@ def build(skip_installer: bool = False) -> Path | None:
     models = _stage_models()
     codex_runtime = _stage_codex_runtime()
     dependencies = _stage_legal()
-    _generate_branding()
-    _write_manifest(models, dependencies, codex_runtime)
+    _generate_branding(version)
+    _write_app_metadata(identity)
+    _write_manifest(models, dependencies, codex_runtime, identity)
 
     _run([sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm",
           str(ROOT / "packaging" / "windows" / "osia.spec")])
@@ -468,12 +552,20 @@ def build(skip_installer: bool = False) -> Path | None:
     _run([str(DIST / "OSIA.exe"), "--osia-package-smoke"])
     signed_app = _sign(DIST / "OSIA.exe")
     if skip_installer:
+        if channel == "stable" and not signed_app:
+            raise RuntimeError("stable builds require Authenticode signing")
         return None
 
     iscc = _find_iscc()
     _run([
         str(iscc),
-        f"/DAppVersion={VERSION}",
+        f"/DAppVersion={version}",
+        f"/DAppVersionMajor={parse_product_version(version)[0]}",
+        f"/DAppVersionMinor={parse_product_version(version)[1]}",
+        f"/DAppVersionPatch={parse_product_version(version)[2]}",
+        f"/DBuildChannel={channel}",
+        f"/DInternalBuild={1 if channel == 'internal-preview' else 0}",
+        f"/DSignedBuild={1 if signed_app else 0}",
         f"/DRepoRoot={ROOT}",
         f"/DBuildRoot={STAGE}",
         f"/DReleaseRoot={RELEASE}",
@@ -483,18 +575,34 @@ def build(skip_installer: bool = False) -> Path | None:
     if not installer.is_file():
         raise FileNotFoundError(installer)
     signed_installer = _sign(installer)
+    if channel == "stable" and not (signed_app and signed_installer):
+        installer.unlink(missing_ok=True)
+        raise RuntimeError("stable builds require signed application and installer artifacts")
     checksum = _sha256(installer)
     (installer.with_suffix(installer.suffix + ".sha256")).write_text(
         f"{checksum}  {installer.name}\n", encoding="ascii",
     )
     release_manifest = {
-        "artifact": installer.name,
-        "version": VERSION,
+        "schemaVersion": UPDATER_SCHEMA_VERSION,
+        "product": "OSIA",
+        "platform": "windows",
         "architecture": "x86_64",
-        "sha256": checksum,
-        "bytes": installer.stat().st_size,
-        "app_signed": signed_app,
-        "installer_signed": signed_installer,
+        "channel": channel,
+        "version": version,
+        "publishedAt": identity["timestamp"],
+        "installer": {
+            "url": f"https://download.osia.space/windows/{version}/OSIA-Setup.exe",
+            "sizeBytes": installer.stat().st_size,
+            "sha256": checksum,
+            "signed": signed_installer,
+            "signaturePublisher": "OSIA" if signed_installer else None,
+        },
+        "mandatory": False,
+        "minimumSupportedVersion": "1.0.1",
+        "minimumUpdaterVersion": "1.0.1",
+        "releaseNotes": ["Validation du mécanisme de mise à jour automatique."],
+        "releaseNotesUrl": None,
+        "rollout": {"state": "paused"},
     }
     (RELEASE / "release-manifest.json").write_text(
         json.dumps(release_manifest, indent=2) + "\n", encoding="utf-8",
@@ -508,8 +616,15 @@ def build(skip_installer: bool = False) -> Path | None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-installer", action="store_true")
+    parser.add_argument("--channel", choices=sorted(ALLOWED_BUILD_CHANNELS),
+                        default=DEFAULT_BUILD_CHANNEL)
+    parser.add_argument("--version-override")
     args = parser.parse_args()
-    build(skip_installer=args.skip_installer)
+    build(
+        skip_installer=args.skip_installer,
+        channel=args.channel,
+        version_override=args.version_override,
+    )
     return 0
 
 

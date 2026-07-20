@@ -73,6 +73,7 @@ from osia.gui.motion import (
 )
 from osia.gui.streaming import DesktopTextStreamController
 from osia.gui.theme import PALETTES, get_theme_manager, themed_stylesheet
+from osia.gui.update_ui import UpdateBanner, UpdateController, UpdateSettingsSection
 
 # sip lets us detect widgets whose C++ side has already been destroyed
 # (accessing them raises RuntimeError otherwise). It ships with PyQt6 but
@@ -2347,7 +2348,7 @@ class _SettingsPanel(QWidget):
         "claude": "https://docs.anthropic.com/en/docs/build-with-claude/streaming",
     }
 
-    def __init__(self):
+    def __init__(self, update_controller: UpdateController | None = None):
         super().__init__()
 
         self._theme = get_theme_manager()
@@ -2481,6 +2482,10 @@ class _SettingsPanel(QWidget):
         sec_memory    = self._build_memory_section()        # Local Memory
         sec_mcp       = self._build_mcp_section()           # MCP / Connectors (WOR-44)
         sec_legal     = self._build_legal_section()         # Legal versions + links
+        sec_updates   = (
+            UpdateSettingsSection(update_controller)
+            if update_controller is not None else None
+        )
 
         # (nav i18n key, [sections on that page]) — 9 categories, all 17 frames,
         # each frame used exactly once. MCP/Connectors gets its OWN category (not
@@ -2495,6 +2500,7 @@ class _SettingsPanel(QWidget):
             ("settings.cat.mcp",      [sec_mcp]),
             ("settings.cat.mobile",   [sec_mobile, sec_startup]),
             ("settings.cat.advanced", [sec_cron, sec_heartbeat]),
+            *(([("settings.cat.updates", [sec_updates])]) if sec_updates is not None else []),
             ("settings.cat.legal",    [sec_legal]),
         ]
 
@@ -2577,6 +2583,12 @@ class _SettingsPanel(QWidget):
             return
         if key == "settings.cat.memory":
             self._refresh_memory_entries()
+
+    def show_updates(self) -> None:
+        for row, (key, _sections) in enumerate(self._settings_pages):
+            if key == "settings.cat.updates":
+                self._settings_nav.setCurrentRow(row)
+                return
 
     def _guard_settings_wheel(self, combo: QComboBox) -> None:
         """Keep a closed Settings combo from consuming the page wheel."""
@@ -9013,6 +9025,8 @@ class MainPopup(QWidget):
     def __init__(self):
         super().__init__()
 
+        self._update_controller = UpdateController(self)
+
         self._theme = get_theme_manager()
         self._motion = MotionController(
             self,
@@ -9130,6 +9144,9 @@ class MainPopup(QWidget):
         header.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         outer.addLayout(header)
 
+        self._update_banner = UpdateBanner(self)
+        outer.addWidget(self._update_banner)
+
         # Central stack
         # Settings-reopen hit-test fix (APPROACH A — the Qt-recommended lever).
         # Two cooperating measures stop the central stack's tall max-page content
@@ -9163,7 +9180,7 @@ class MainPopup(QWidget):
         self._models = _ModelPanel()
         self._models.model_changed.connect(self._on_model_selected)
 
-        self._settings = _SettingsPanel()
+        self._settings = _SettingsPanel(self._update_controller)
         self._settings.api_keys_saved.connect(self.api_keys_saved.emit)
         self._settings.chatgpt_status_changed.connect(
             self._models.set_account_status
@@ -9187,6 +9204,13 @@ class MainPopup(QWidget):
         self._settings.wake_word_enabled_changed.connect(
             self.wake_word_enabled_changed.emit
         )
+        self._update_controller.state_changed.connect(self._update_banner.apply_state)
+        self._update_banner.view_requested.connect(self._show_update_details)
+        self._update_banner.install_requested.connect(
+            lambda: self._update_controller.install(self)
+        )
+        self._update_banner.dismiss_requested.connect(self._update_controller.dismiss)
+        self._update_banner.apply_state(self._update_controller.state)
 
         self._osia = _OsiaPanel()
 
@@ -9254,6 +9278,10 @@ class MainPopup(QWidget):
         QTimer.singleShot(0, self._request_local_models_refresh)
 
     # ── Window placement ──────────────────────────────────────────────────
+
+    def _show_update_details(self) -> None:
+        self._on_nav_clicked(self.PAGE_SETTINGS)
+        self._settings.show_updates()
 
     def set_anchor(self, widget: QWidget) -> None:
         """Set the widget (the Dynamic Island capsule) the popup opens under.
@@ -9704,6 +9732,16 @@ class MainPopup(QWidget):
             QLabel#themeDot {
                 background: #c4b5f5;
                 border-radius: 4px;
+            }
+            QFrame#updateBanner {
+                background: rgba(196, 181, 245, 0.12);
+                border: 1px solid rgba(196, 181, 245, 0.34);
+                border-radius: 10px;
+            }
+            QLabel#updateBannerText {
+                color: #f8f6ff;
+                font-size: 11px;
+                font-weight: 600;
             }
 
             QScrollArea#chatScroll, QScrollArea#panelScroll,

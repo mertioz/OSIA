@@ -53,6 +53,17 @@ def test_runtime_frozen_paths_support_spaces_and_unicode(monkeypatch, tmp_path):
     assert runtime.application_dir() == executable.parent
 
 
+def test_frozen_product_version_comes_from_embedded_metadata(monkeypatch, tmp_path):
+    from osia.version import current_product_version
+
+    (tmp_path / "app_metadata.json").write_text(
+        '{"version":"1.0.1"}', encoding="utf-8"
+    )
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert current_product_version() == "1.0.1"
+
+
 def test_launcher_normalizes_frozen_execv_duplicate(monkeypatch, tmp_path):
     launcher = _load_launcher()
     executable = tmp_path / "OSIA install" / "OSIA.exe"
@@ -241,6 +252,8 @@ def test_installer_ui_uses_explicit_accessible_osia_palette():
 def test_installer_ui_keeps_native_accessibility_and_shows_real_state():
     script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
     assert "WizardStyle=modern dynamic hidebevels" in script
+    assert "WizardImageFileDynamicDark={#BuildRoot}\\generated\\wizard-large.png" in script
+    assert "WizardSmallImageFileDynamicDark={#BuildRoot}\\generated\\wizard-small.png" in script
     assert "WizardSizePercent=115" in script
     assert "WizardForm.WizardBitmapImage.Visible := False" in script
     assert "WizardForm.WizardBitmapImage2.Visible := False" in script
@@ -317,6 +330,12 @@ def test_inno_script_compiles_with_a_non_installing_minimal_payload(tmp_path):
             str(iscc),
             "/Qp",
             "/DAppVersion=1.0.0",
+            "/DAppVersionMajor=1",
+            "/DAppVersionMinor=0",
+            "/DAppVersionPatch=0",
+            "/DBuildChannel=internal-preview",
+            "/DInternalBuild=1",
+            "/DSignedBuild=0",
             f"/DRepoRoot={source}",
             f"/DBuildRoot={tmp_path / 'build'}",
             f"/DReleaseRoot={output}",
@@ -348,12 +367,69 @@ def test_package_spec_is_allowlist_based_and_excludes_user_config():
 
 def test_build_uses_product_version_and_exact_installer_name():
     build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
-    assert 'ROOT / "osia" / "lan_discovery.py"' in build
+    assert "from osia.version import PRODUCT_VERSION, parse_product_version" in build
+    assert "SOURCE_VERSION = PRODUCT_VERSION" in build
+    assert 'PRODUCT_VERSION = "1.0.2"' in (ROOT / "osia" / "version.py").read_text("utf-8")
     assert 'installer = RELEASE / "OSIA-Setup.exe"' in build
     assert "def _write_bundle_file_manifest" in build
     assert 'CODEX_RUNTIME_VERSION = "0.144.1"' in build
     assert "def _stage_codex_runtime" in build
     assert "CODEX_RUNTIME_SHA256" in build
+
+
+def test_build_identity_metadata_and_internal_override(monkeypatch, tmp_path):
+    path = ROOT / "packaging" / "windows" / "build_windows.py"
+    spec = importlib.util.spec_from_file_location("osia_build_windows", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "GENERATED", tmp_path)
+    monkeypatch.setattr(module, "_build_commit", lambda: "a" * 40)
+    monkeypatch.setattr(module, "_build_timestamp", lambda: "2026-07-20T10:00:00Z")
+
+    baseline = module._resolve_build_identity("internal-preview", "1.0.1")
+    assert baseline["version"] == "1.0.1"
+    assert baseline["override"] == {
+        "sourceVersion": "1.0.2", "version": "1.0.1", "channel": "internal-preview",
+    }
+    metadata_path = module._write_app_metadata(baseline)
+    embedded = __import__("osia.updater", fromlist=["parse_app_metadata"]).parse_app_metadata(
+        metadata_path.read_bytes()
+    )
+    assert embedded.version == "1.0.1"
+    assert embedded.build_override["sourceVersion"] == "1.0.2"
+    with pytest.raises(ValueError, match="forbidden"):
+        module._resolve_build_identity("stable", "1.0.1")
+
+
+def test_pe_inno_and_release_manifest_share_resolved_build_version():
+    build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
+    spec = (ROOT / "packaging" / "windows" / "osia.spec").read_text("utf-8")
+    assert "def _generate_branding(version: str)" in build
+    assert "StringStruct('ProductVersion', '{version}')" in build
+    assert 'f"/DAppVersion={version}"' in build
+    assert '"version": version' in build
+    assert '(str(GENERATED / "app_metadata.json"), ".")' in spec
+
+
+def test_inno_update_mode_is_visible_safe_and_in_place():
+    script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
+    assert "#error AppVersion must be supplied" in script
+    assert "{param:OSIAUPDATE|0}" in script
+    assert "function IsDowngrade" in script
+    assert "GetVersionComponents" in script
+    assert "PackVersionComponents" in script
+    assert 'Type: filesandordirs; Name: "{app}\\_internal"; Check: IsUpdateMode' in script
+    assert 'Name: "{app}\\*"' not in script
+    assert 'Parameters: "--wake"; Flags: nowait; Check: IsUpdateMode' in script
+    assert "WizardStyle=modern dynamic hidebevels" in script
+    assert "WizardForm.ProgressGauge" in script
+    assert "and (not IsUpdateMode)" in script
+    for forbidden in (
+        "settings.json", "oauth_tokens.json", "mobile_token.txt", "memory.json",
+        "task_state.json", "personality", "conversations",
+    ):
+        assert forbidden not in script
 
 
 def test_package_smoke_requires_the_managed_codex_runtime():

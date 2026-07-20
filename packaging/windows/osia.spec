@@ -22,6 +22,7 @@ datas = [
     (str(STAGE / "models"), "models"),
     (str(STAGE / "runtimes"), "runtimes"),
     (str(STAGE / "legal"), "legal"),
+    (str(GENERATED / "app_metadata.json"), "."),
     (str(ROOT / "packaging" / "windows" / "THIRD_PARTY_NOTICES.md"), "."),
 ]
 binaries = []

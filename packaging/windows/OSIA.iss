@@ -1,5 +1,23 @@
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #error AppVersion must be supplied by build_windows.py
+#endif
+#ifndef AppVersionMajor
+  #error AppVersionMajor must be supplied by build_windows.py
+#endif
+#ifndef AppVersionMinor
+  #error AppVersionMinor must be supplied by build_windows.py
+#endif
+#ifndef AppVersionPatch
+  #error AppVersionPatch must be supplied by build_windows.py
+#endif
+#ifndef BuildChannel
+  #error BuildChannel must be supplied by build_windows.py
+#endif
+#ifndef InternalBuild
+  #error InternalBuild must be supplied by build_windows.py
+#endif
+#ifndef SignedBuild
+  #error SignedBuild must be supplied by build_windows.py
 #endif
 #ifndef RepoRoot
   #define RepoRoot "..\.."
@@ -36,6 +54,8 @@ WizardStyle=modern dynamic hidebevels
 WizardSizePercent=115
 WizardImageFile={#BuildRoot}\generated\wizard-large.png
 WizardSmallImageFile={#BuildRoot}\generated\wizard-small.png
+WizardImageFileDynamicDark={#BuildRoot}\generated\wizard-large.png
+WizardSmallImageFileDynamicDark={#BuildRoot}\generated\wizard-small.png
 Compression=lzma2/ultra64
 SolidCompression=yes
 LZMAUseSeparateProcess=yes
@@ -77,6 +97,9 @@ english.WelcomeHeading=Meet OSIA
 english.WelcomeBody=Your personal AI assistant, ready to run on this PC.
 english.VersionArchitecture=Version %s  ·  Windows x64
 english.PreviewState=Internal preview  ·  Unsigned build
+english.StableState=Stable channel  ·  Signed build
+english.UpdateState=In-place update  ·  Your data stays in your profile
+english.UpdateDowngrade=This installer cannot replace a newer OSIA version with %s.
 english.ReadyVersion=OSIA %s  ·  Windows x64
 english.Destination=Destination: %s
 english.FinishedHeading=OSIA is ready
@@ -115,6 +138,9 @@ french.WelcomeHeading=Découvrez OSIA
 french.WelcomeBody=Votre assistant IA personnel, prêt à fonctionner sur ce PC.
 french.VersionArchitecture=Version %s  ·  Windows x64
 french.PreviewState=Aperçu interne  ·  Build non signé
+french.StableState=Canal stable  ·  Build signé
+french.UpdateState=Mise à jour sur place  ·  Vos données restent dans votre profil
+french.UpdateDowngrade=Cet installateur ne peut pas remplacer une version plus récente d’OSIA par la version %s.
 french.ReadyVersion=OSIA %s  ·  Windows x64
 french.Destination=Destination : %s
 french.FinishedHeading=OSIA est prêt
@@ -145,13 +171,17 @@ Name: "firewall"; Description: "{cm:FirewallTask}"; GroupDescription: "{cm:Mobil
 Source: "{#RepoRoot}\dist\OSIA\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#RepoRoot}\windows\configure_lan_firewall.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
 
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\_internal"; Check: IsUpdateMode
+
 [Icons]
 Name: "{group}\OSIA"; Filename: "{app}\OSIA.exe"; WorkingDir: "{app}"; IconFilename: "{app}\OSIA.exe"
 Name: "{group}\{cm:UninstallOSIA}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\OSIA"; Filename: "{app}\OSIA.exe"; WorkingDir: "{app}"; IconFilename: "{app}\OSIA.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\OSIA.exe"; Description: "{cm:LaunchOSIA}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\OSIA.exe"; Description: "{cm:LaunchOSIA}"; Flags: nowait postinstall skipifsilent; Check: not IsUpdateMode
+Filename: "{app}\OSIA.exe"; Parameters: "--wake"; Flags: nowait; Check: IsUpdateMode
 
 [UninstallRun]
 Filename: "{app}\OSIA.exe"; Parameters: "--osia-remove-integration"; Flags: runhidden waituntilterminated; RunOnceId: "OSIAIntegration"; Check: ShouldRemoveIntegration
@@ -197,6 +227,27 @@ var
 function IntegrationMarker: String;
 begin
   Result := ExpandConstant('{app}\.osia-no-integration-test');
+end;
+
+function IsUpdateMode: Boolean;
+begin
+  Result := CompareText(ExpandConstant('{param:OSIAUPDATE|0}'), '1') = 0;
+end;
+
+function IsDowngrade: Boolean;
+var
+  Major, Minor, Revision, Build: Word;
+  InstalledVersion, PackageVersion: Int64;
+begin
+  Result := False;
+  if GetVersionComponents(ExpandConstant('{app}\OSIA.exe'),
+    Major, Minor, Revision, Build) then
+  begin
+    InstalledVersion := PackVersionComponents(Major, Minor, Revision, Build);
+    PackageVersion := PackVersionComponents(
+      {#AppVersionMajor}, {#AppVersionMinor}, {#AppVersionPatch}, 0);
+    Result := PackageVersion < InstalledVersion;
+  end;
 end;
 
 function ShouldRemoveIntegration: Boolean;
@@ -337,7 +388,12 @@ begin
   WelcomePreviewLabel.Parent := WizardForm.WelcomePage;
   WelcomePreviewLabel.SetBounds(ContentLeft + ScaleX(98), ScaleY(179),
     ContentWidth - ScaleX(98), ScaleY(24));
-  WelcomePreviewLabel.Caption := CustomMessage('PreviewState');
+  if IsUpdateMode then
+    WelcomePreviewLabel.Caption := CustomMessage('UpdateState')
+  else if {#InternalBuild} = 1 then
+    WelcomePreviewLabel.Caption := CustomMessage('PreviewState')
+  else
+    WelcomePreviewLabel.Caption := CustomMessage('StableState');
   StyleLabel(WelcomePreviewLabel, TColor(OSIA_WARNING_TEXT),
     TColor(OSIA_MAIN_BACKGROUND));
   WelcomePreviewLabel.Font.Style := [fsBold];
@@ -461,6 +517,11 @@ var
   ExistingExe: String;
 begin
   Result := '';
+  if IsUpdateMode and IsDowngrade then
+  begin
+    Result := Format(CustomMessage('UpdateDowngrade'), ['{#AppVersion}']);
+    exit;
+  end;
   ExistingExe := ExpandConstant('{app}\OSIA.exe');
   if (not IntegrationSuppressed) and FileExists(ExistingExe) then
   begin
@@ -557,7 +618,7 @@ begin
     else
       RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'OSIA');
 
-    if WizardIsTaskSelected('firewall') then
+    if WizardIsTaskSelected('firewall') and (not IsUpdateMode) then
     begin
       StageLabel.Caption := CustomMessage('PhaseFirewall');
       AddDetail(CustomMessage('DetailFirewall'));
@@ -621,4 +682,7 @@ begin
       ewWaitUntilTerminated, ResultCode);
   end;
   RestorePreviousAutostart;
+  if IsUpdateMode and ExistingIntegrationStopped and FileExists(AppExe) then
+    Exec(AppExe, '--wake', '', SW_SHOWNORMAL,
+      ewNoWait, ResultCode);
 end;

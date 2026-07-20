@@ -14,10 +14,10 @@ import tempfile
 import psutil
 
 from osia.config import CONFIG_DIR
+from osia.version import current_product_version
 
 
 SERVICE_TYPE = "_osia._tcp.local."
-PRODUCT_VERSION = "1.0.0"
 _ALIAS_FILE = Path(CONFIG_DIR) / "lan_direct_identity.json"
 _ALIAS_RE = re.compile(r"^[a-f0-9]{16}$")
 
@@ -137,7 +137,7 @@ class LanDiscoveryAdvertiser:
             port=self.port,
             properties={
                 b"protocol": b"1",
-                b"product_version": PRODUCT_VERSION.encode("ascii"),
+                b"product_version": current_product_version().encode("ascii"),
                 b"instance": self.alias.encode("ascii"),
             },
             server=f"osia-{self.alias}.local.",

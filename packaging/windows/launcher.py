@@ -36,6 +36,7 @@ def _package_smoke() -> int:
     from osia.utils.assets import ICON_PATH, LOGO_PATH
 
     required = [
+        ("app metadata", resource_path("app_metadata.json")),
         ("icon", ICON_PATH),
         ("logo", LOGO_PATH),
         ("whisper", bundled_model_path("faster-whisper-small")),
@@ -61,6 +62,11 @@ def _package_smoke() -> int:
         from faster_whisper import WhisperModel
         from playwright._impl._driver import compute_driver_executable
         from osia.chatgpt_account.app_server_client import AppServerClient
+        from osia.updater import load_app_metadata
+
+        metadata = load_app_metadata()
+        if metadata.product != "OSIA" or metadata.platform != "windows":
+            raise RuntimeError("embedded app metadata is invalid")
 
         node, cli = compute_driver_executable()
         if not os.path.isfile(node) or not os.path.isfile(cli):

@@ -46,6 +46,47 @@ DEFAULT_LANG = "en"
 # English entry, then to the key itself. Use ``{name}``-style placeholders
 # and pass them as kwargs to :func:`t`.
 TRANSLATIONS: dict[str, dict[str, str]] = {
+    "settings.cat.updates": {"en": "Updates", "fr": "Mises à jour"},
+    "updates.title": {"en": "Updates", "fr": "Mises à jour"},
+    "updates.banner": {
+        "en": "Update available · {version}",
+        "fr": "Mise à jour disponible · {version}",
+    },
+    "updates.view": {"en": "View", "fr": "Voir"},
+    "updates.install": {"en": "Install", "fr": "Installer"},
+    "updates.later": {"en": "Later", "fr": "Plus tard"},
+    "updates.check": {"en": "Check for updates", "fr": "Rechercher les mises à jour"},
+    "updates.retry": {"en": "Retry", "fr": "Réessayer"},
+    "updates.none": {"en": "None", "fr": "Aucune"},
+    "updates.summary": {
+        "en": "Installed: {installed}\nChannel: {channel}\nAvailable: {available}\nStatus: {status}",
+        "fr": "Installée : {installed}\nCanal : {channel}\nDisponible : {available}\nÉtat : {status}",
+    },
+    "updates.internal_unsigned": {
+        "en": "Internal preview build; the installer is unsigned.",
+        "fr": "Build d’aperçu interne ; l’installateur n’est pas signé.",
+    },
+    "updates.error": {
+        "en": "Last error: {code}",
+        "fr": "Dernière erreur : {code}",
+    },
+    "updates.confirm_title": {"en": "Install OSIA update", "fr": "Installer la mise à jour OSIA"},
+    "updates.confirm_text": {
+        "en": "The verified {version} installer is ready. OSIA will close and the visible installer will open. Continue?",
+        "fr": "L’installateur vérifié {version} est prêt. OSIA va se fermer et l’installateur visible va s’ouvrir. Continuer ?",
+    },
+    "updates.status.disabled": {"en": "Disabled in source mode", "fr": "Désactivée en mode source"},
+    "updates.status.idle": {"en": "Ready", "fr": "Prête"},
+    "updates.status.checking": {"en": "Checking", "fr": "Recherche"},
+    "updates.status.offline": {"en": "Offline", "fr": "Hors ligne"},
+    "updates.status.no_update": {"en": "Up to date", "fr": "À jour"},
+    "updates.status.paused": {"en": "Channel paused", "fr": "Canal en pause"},
+    "updates.status.available": {"en": "Available", "fr": "Disponible"},
+    "updates.status.downloading": {"en": "Downloading", "fr": "Téléchargement"},
+    "updates.status.verifying": {"en": "Verifying", "fr": "Vérification"},
+    "updates.status.ready": {"en": "Verified and ready", "fr": "Vérifiée et prête"},
+    "updates.status.error": {"en": "Retry required", "fr": "Nouvel essai requis"},
+    "updates.status.pending": {"en": "Installer launching", "fr": "Lancement de l’installateur"},
     "settings.cat.legal": {"en": "Legal", "fr": "Légal"},
     "settings.legal": {"en": "Legal and privacy", "fr": "Informations légales"},
     "settings.legal_sub": {

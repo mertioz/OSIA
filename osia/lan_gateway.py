@@ -1069,12 +1069,13 @@ def start_background_gateway() -> bool:
     try:
         host = configured_lan_host()
         cert_file, key_file, fingerprint = ensure_lan_certificate(host)
-        from osia.lan_discovery import PRODUCT_VERSION, load_or_create_instance_alias
+        from osia.lan_discovery import load_or_create_instance_alias
+        from osia.version import current_product_version
 
         alias = load_or_create_instance_alias()
         _set_lan_provisioning({
             "protocol_version": LAN_PROTOCOL_VERSION,
-            "product_version": PRODUCT_VERSION,
+            "product_version": current_product_version(),
             "instance_alias": alias,
             "certificate_sha256": fingerprint,
             "port": LAN_PORT,
