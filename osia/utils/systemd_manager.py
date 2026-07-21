@@ -557,6 +557,48 @@ def _win_coordinated_restart(kind: str) -> bool:
             shutdown.close()
 
 
+def _win_coordinated_stop(kind: str) -> bool:
+    """Stop one registered OSIA task without deleting or relaunching it."""
+
+    task = _TASK_NAME[kind]
+    lifecycle = None
+    shutdown = None
+    tree = _WinServiceTree()
+    try:
+        lifecycle = _WinNamedMutex(_win_lifecycle_mutex_name(kind))
+        if not lifecycle.acquire(_WIN_LIFECYCLE_MUTEX_TIMEOUT):
+            print("[win-service] stop failed category=lifecycle-mutex-timeout")
+            return False
+        try:
+            _win_collect_supervised_tree(kind, tree)
+            shutdown = _WinShutdownSignal(kind)
+        finally:
+            lifecycle.close()
+            lifecycle = None
+
+        stopped, state = _win_try_stop_barrier(
+            task, kind, tree, _WIN_GRACEFUL_STOP_TIMEOUT,
+        )
+        if not stopped:
+            _win_force_stop_owned(task, kind, tree)
+            stopped, state = _win_try_stop_barrier(
+                task, kind, tree, _WIN_FORCED_STOP_TIMEOUT,
+            )
+        if not stopped:
+            details = ",".join(f"{key}={value}" for key, value in state.items())
+            print(f"[win-service] stop failed category=stop-barrier-timeout {details}")
+            return False
+        return True
+    except Exception as exc:
+        print(f"[win-service] stop failed category={type(exc).__name__}")
+        return False
+    finally:
+        if lifecycle is not None:
+            lifecycle.close()
+        if shutdown is not None:
+            shutdown.close()
+
+
 def _win_proc_running(image: str) -> bool:
     """True if a process with executable name ``image`` is running (tasklist)."""
     try:
@@ -1138,6 +1180,32 @@ def disable_service(name: str) -> bool:
             timeout=60.0,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    return result.returncode == 0
+
+
+def stop_service(name: str) -> bool:
+    """Stop the current service session without changing launch-at-login."""
+
+    if _IS_WINDOWS:
+        kind = _UNIT_KIND.get(name)
+        if kind not in ("server", "tunnel"):
+            return False
+        return _win_coordinated_stop(kind)
+    if sys.platform == "darwin":
+        # The desktop does not own a separate system service on macOS.
+        return True
+    try:
+        probe = _run(["systemctl", "is-active", name])
+        state = (probe.stdout or "").strip()
+        if state in {"inactive", "failed", "unknown", "deactivating"}:
+            return True
+        if probe.returncode == 4:  # systemd: unit does not exist
+            return True
+        result = _run(["pkexec", "systemctl", "stop", name], timeout=60.0)
+    except FileNotFoundError:
+        return True
+    except subprocess.TimeoutExpired:
         return False
     return result.returncode == 0
 

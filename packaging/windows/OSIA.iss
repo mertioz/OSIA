@@ -292,6 +292,7 @@ var
   UpdateBackupInternal: String;
   UpdateBackupExe: String;
   UpdateBackupFailure: String;
+  FreshInstallOnboardingEligible: Boolean;
 
 function HasExactUpdateSwitch: Boolean;
 var
@@ -317,13 +318,16 @@ var
   ExistingMajor, ExistingMinor, ExistingPatch, ExistingBuild: Word;
 begin
   Result := True;
+  UninstallKey :=
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}_is1';
+  FreshInstallOnboardingEligible :=
+    (not DirExists(ExpandConstant('{userprofile}\.osia'))) and
+    (not RegKeyExists(HKCU, UninstallKey));
   UpdateModeRequested := HasExactUpdateSwitch;
   UpdateModeActive := False;
   if not UpdateModeRequested then
     exit;
 
-  UninstallKey :=
-    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}_is1';
   if (not RegKeyExists(HKCU, UninstallKey)) or
     (not RegQueryStringValue(HKCU, UninstallKey, 'InstallLocation',
       ExistingInstallDir)) then
@@ -1034,6 +1038,15 @@ begin
     begin
       StageLabel.Caption := CustomMessage('PhaseFinalizing');
       AddDetail(CustomMessage('DetailComplete'));
+    end;
+    if FreshInstallOnboardingEligible and (not IsUpdateMode) and
+      (not IntegrationSuppressed) then
+    begin
+      ForceDirectories(ExpandConstant('{userprofile}\.osia'));
+      if not SaveStringToFile(
+        ExpandConstant('{userprofile}\.osia\onboarding.json'),
+        '{"schemaVersion":1,"status":"pending"}' + #13#10, False) then
+        Log('WOR-151 onboarding marker could not be written.');
     end;
   end;
 

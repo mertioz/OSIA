@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 from osia.runtime import (
     INSTALL_INTEGRATION_MODE,
@@ -62,6 +64,14 @@ def _package_smoke() -> int:
         from faster_whisper import WhisperModel
         from playwright._impl._driver import compute_driver_executable
         from osia.chatgpt_account.app_server_client import AppServerClient
+        from osia.gui.onboarding import OnboardingDialog
+        from osia.onboarding import (
+            claim_automatic_onboarding,
+            create_fresh_install_marker,
+            mark_onboarding_handled,
+            onboarding_state,
+        )
+        from osia.release_notes import release_for_version
         from osia.updater import load_app_metadata
 
         metadata = load_app_metadata()
@@ -78,6 +88,23 @@ def _package_smoke() -> int:
             raise RuntimeError("Qt platform plugin did not initialize")
         if QPixmap(LOGO_PATH).isNull():
             raise RuntimeError("Qt could not load the packaged logo")
+
+        if release_for_version(metadata.version) is None:
+            raise RuntimeError("embedded release notes are unavailable")
+        with tempfile.TemporaryDirectory(prefix="osia-package-smoke-") as temporary:
+            state_path = Path(temporary) / "onboarding.json"
+            if not create_fresh_install_marker(state_path):
+                raise RuntimeError("fresh-install onboarding marker was not created")
+            if not claim_automatic_onboarding(state_path):
+                raise RuntimeError("fresh-install onboarding marker was not claimed")
+            mark_onboarding_handled("completed", state_path)
+            if onboarding_state(state_path).get("outcome") != "completed":
+                raise RuntimeError("onboarding completion did not persist")
+        onboarding = OnboardingDialog(automatic=False)
+        if onboarding.PAGE_COUNT != 4:
+            raise RuntimeError("packaged onboarding journey is incomplete")
+        onboarding.deleteLater()
+        qt_app.processEvents()
 
         if uiautomation.GetRootControl() is None:
             raise RuntimeError("Windows UI Automation did not initialize")

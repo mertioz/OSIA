@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from osia.version import PRODUCT_VERSION, parse_product_version
+from osia.release_notes import manifest_release_notes
 
 
 STAGE = ROOT / "build" / "windows"
@@ -497,7 +498,7 @@ def _local_secret_values() -> tuple[bytes, ...]:
 def _secret_scan(root: Path) -> None:
     forbidden_names = {
         "api_keys.json", "oauth_tokens.json", "mobile_token.txt", "settings.json",
-        "memory.json", "task_state.json", "task_state_mobile.json",
+        "memory.json", "onboarding.json", "task_state.json", "task_state_mobile.json",
         "lan_direct_key.pem", "lan_direct_cert.pem",
     }
     generic_patterns = (b"sk-proj-", b"AIzaSy", b"-----BEGIN PRIVATE KEY-----")
@@ -610,10 +611,7 @@ def build(
         "mandatory": False,
         "minimumSupportedVersion": "1.0.1",
         "minimumUpdaterVersion": "1.0.1",
-        "releaseNotes": [
-            "Safer update preparation and rollback handling.",
-            "Redesigned OSIA installer and update interface.",
-        ],
+        "releaseNotes": manifest_release_notes(version),
         "releaseNotesUrl": None,
         "rollout": {"state": "paused"},
     }

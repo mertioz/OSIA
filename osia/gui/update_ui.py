@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -28,10 +29,16 @@ from osia.updater import (
     fetch_channel_manifest,
     launch_update_installer,
     load_app_metadata,
+    parse_manifest,
     prepare_notification_state,
     reconcile_pending_update,
     safe_error_code,
     updater_enabled,
+)
+from osia.release_notes import (
+    RELEASE_HISTORY,
+    normalize_remote_notes,
+    release_for_version,
 )
 from osia.version import PRODUCT_VERSION
 
@@ -69,6 +76,7 @@ class UpdateController(QObject):
             self.metadata = candidate
             reconcile_pending_update(candidate, self.store)
             self._state = self._new_state("idle")
+            self._restore_cached_manifest()
             self._timer.start(max(1, round(self.scheduler.first_delay() * 1000)))
         else:
             self._state = self._new_state("disabled")
@@ -79,6 +87,7 @@ class UpdateController(QObject):
             "installedVersion": self.metadata.version if self.metadata else PRODUCT_VERSION,
             "channel": self.metadata.channel if self.metadata else "disabled",
             "availableVersion": None,
+            "availablePublishedAt": None,
             "releaseNotes": (),
             "progressReceived": 0,
             "progressTotal": 0,
@@ -86,6 +95,33 @@ class UpdateController(QObject):
             "internalUnsigned": False,
             "bannerVisible": False,
         }
+
+    def _restore_cached_manifest(self) -> None:
+        """Restore a previously validated newer manifest without network I/O."""
+
+        cached = self.store.load().get("cachedManifest")
+        if not isinstance(cached, dict) or self.metadata is None:
+            return
+        try:
+            manifest = parse_manifest(
+                json.dumps(cached, ensure_ascii=False, allow_nan=False),
+                self.metadata,
+            )
+        except Exception:
+            return
+        if manifest.rollout_state != "enabled":
+            return
+        self.manifest = manifest
+        self._state.update(
+            status="available",
+            availableVersion=manifest.version,
+            availablePublishedAt=manifest.published_at,
+            releaseNotes=manifest.release_notes,
+            internalUnsigned=(
+                manifest.channel == "internal-preview"
+                and not manifest.installer.signed
+            ),
+        )
 
     @property
     def state(self) -> dict:
@@ -127,7 +163,8 @@ class UpdateController(QObject):
                 self.manifest = None
                 self.store.update(lastError=None)
                 self._publish(
-                    status="no_update", availableVersion=None, releaseNotes=(),
+                    status="no_update", availableVersion=None,
+                    availablePublishedAt=None, releaseNotes=(),
                     error=None, bannerVisible=False,
                 )
                 return
@@ -143,7 +180,7 @@ class UpdateController(QObject):
             self.manifest = None
             self._publish(
                 status="paused" if manifest is not None else "no_update",
-                availableVersion=None,
+                availableVersion=None, availablePublishedAt=None,
                 releaseNotes=(),
                 bannerVisible=False,
                 error=None,
@@ -156,6 +193,7 @@ class UpdateController(QObject):
         self._publish(
             status="available",
             availableVersion=manifest.version,
+            availablePublishedAt=manifest.published_at,
             releaseNotes=manifest.release_notes,
             internalUnsigned=(manifest.channel == "internal-preview" and not manifest.installer.signed),
             bannerVisible=visible,
@@ -289,22 +327,82 @@ class UpdateBanner(QFrame):
         self.setVisible(bool(state.get("bannerVisible") and self._version))
 
 
+class _ReleaseCard(QFrame):
+    """Compact plain-text release card shared by current/history/remote notes."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("releaseCard")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(11, 9, 11, 9)
+        layout.setSpacing(5)
+        heading = QHBoxLayout()
+        self.version = QLabel()
+        self.version.setObjectName("releaseVersion")
+        self.badge = QLabel()
+        self.badge.setObjectName("releaseBadge")
+        heading.addWidget(self.version)
+        heading.addStretch(1)
+        heading.addWidget(self.badge)
+        self.date = QLabel()
+        self.date.setObjectName("sectionSub")
+        self.notes = QLabel()
+        self.notes.setObjectName("sectionDesc")
+        self.notes.setTextFormat(Qt.TextFormat.PlainText)
+        self.notes.setWordWrap(True)
+        self.notes.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        layout.addLayout(heading)
+        layout.addWidget(self.date)
+        layout.addWidget(self.notes)
+
+    def apply(
+        self,
+        *,
+        version: str,
+        released_on: str | None,
+        notes: tuple[str, ...],
+        badge: str = "",
+    ) -> None:
+        self.version.setText(i18n.t("updates.version", version=version))
+        self.badge.setText(badge)
+        self.badge.setVisible(bool(badge))
+        self.date.setText(
+            i18n.t("updates.release_date", date=released_on)
+            if released_on else i18n.t("updates.date_unavailable")
+        )
+        shown = notes or (i18n.t("updates.notes_unavailable"),)
+        self.notes.setText("\n".join(f"• {note}" for note in shown))
+
+
 class UpdateSettingsSection(QFrame):
     def __init__(self, controller: UpdateController, parent: QWidget | None = None):
         super().__init__(parent)
         self.controller = controller
-        self.setObjectName("sectionCard")
+        self.setObjectName("section")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 13, 14, 13)
-        layout.setSpacing(7)
+        layout.setSpacing(9)
         self.title = QLabel()
         self.title.setObjectName("sectionTitle")
         self.summary = QLabel()
         self.summary.setObjectName("sectionSub")
         self.summary.setWordWrap(True)
-        self.notes = QLabel()
-        self.notes.setObjectName("sectionDesc")
-        self.notes.setWordWrap(True)
+        self.current_card = _ReleaseCard()
+        self.available_card = _ReleaseCard()
+        self.available_card.hide()
+        self.empty_state = QLabel()
+        self.empty_state.setObjectName("sectionDesc")
+        self.empty_state.setWordWrap(True)
+        self.history_button = QPushButton()
+        self.history_button.setObjectName("ghostBtn")
+        self.history_button.setCheckable(True)
+        self.history_button.setAccessibleName(i18n.t("updates.history"))
+        self.history_host = QFrame()
+        self.history_host.setObjectName("historyHost")
+        self.history_layout = QVBoxLayout(self.history_host)
+        self.history_layout.setContentsMargins(0, 0, 0, 0)
+        self.history_layout.setSpacing(7)
+        self.history_host.hide()
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.hide()
@@ -319,9 +417,14 @@ class UpdateSettingsSection(QFrame):
         actions.addStretch(1)
         layout.addWidget(self.title)
         layout.addWidget(self.summary)
-        layout.addWidget(self.notes)
+        layout.addWidget(self.current_card)
+        layout.addWidget(self.available_card)
+        layout.addWidget(self.empty_state)
+        layout.addWidget(self.history_button)
+        layout.addWidget(self.history_host)
         layout.addWidget(self.progress)
         layout.addLayout(actions)
+        self.history_button.toggled.connect(self._on_history_toggled)
         self.check_button.clicked.connect(lambda: controller.check(manual=True))
         self.install_button.clicked.connect(lambda: controller.install(self))
         controller.state_changed.connect(self.apply_state)
@@ -333,25 +436,79 @@ class UpdateSettingsSection(QFrame):
     def _retranslate(self) -> None:
         self.apply_state(self._state)
 
+    def _on_history_toggled(self, visible: bool) -> None:
+        self.history_host.setVisible(visible)
+        self.history_button.setText(
+            i18n.t("updates.hide_history") if visible else i18n.t("updates.history")
+        )
+        self.history_button.setAccessibleName(self.history_button.text())
+
     def apply_state(self, state: dict) -> None:
         self._state = dict(state)
         status = state.get("status", "idle")
         installed = state.get("installedVersion", "—")
-        channel = state.get("channel", "—")
-        available = state.get("availableVersion") or i18n.t("updates.none")
         self.title.setText(i18n.t("updates.title"))
         self.summary.setText(i18n.t(
-            "updates.summary", installed=installed, channel=channel,
-            available=available, status=i18n.t(f"updates.status.{status}"),
+            "updates.installed_summary",
+            version=installed,
+            status=i18n.t(f"updates.status.{status}"),
         ))
-        notes = list(state.get("releaseNotes") or ())
+
+        current = release_for_version(installed)
+        self.current_card.apply(
+            version=installed,
+            released_on=current.released_on if current else None,
+            notes=current.changes(i18n.get_language()) if current else (),
+            badge=i18n.t("updates.current"),
+        )
+
+        available = state.get("availableVersion")
+        notes = list(normalize_remote_notes(state.get("releaseNotes") or ()))
         if state.get("internalUnsigned"):
             notes.insert(0, i18n.t("updates.internal_unsigned"))
-        error = state.get("error")
-        if error:
-            notes.append(i18n.t("updates.error", code=error))
-        self.notes.setText("\n".join(f"• {note}" for note in notes))
-        self.notes.setVisible(bool(notes))
+        self.available_card.setVisible(bool(available))
+        if available:
+            published = state.get("availablePublishedAt")
+            self.available_card.apply(
+                version=str(available),
+                released_on=str(published)[:10] if published else None,
+                notes=tuple(notes),
+                badge=i18n.t("updates.available_badge"),
+            )
+
+        if status == "offline":
+            empty = i18n.t("updates.offline_installed_available")
+        elif state.get("error"):
+            empty = i18n.t("updates.error", code=state["error"])
+        elif not available:
+            empty = i18n.t("updates.no_newer")
+        else:
+            empty = ""
+        self.empty_state.setText(empty)
+        self.empty_state.setVisible(bool(empty))
+
+        while self.history_layout.count():
+            item = self.history_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for entry in RELEASE_HISTORY:
+            card = _ReleaseCard()
+            card.apply(
+                version=entry.version,
+                released_on=entry.released_on,
+                notes=entry.changes(i18n.get_language()),
+                badge=(
+                    i18n.t("updates.current") if entry.version == installed
+                    else i18n.t("updates.internal") if not entry.public else ""
+                ),
+            )
+            self.history_layout.addWidget(card)
+        self.history_button.setText(
+            i18n.t("updates.hide_history")
+            if self.history_button.isChecked() else i18n.t("updates.history")
+        )
+        self.history_button.setAccessibleName(self.history_button.text())
         total = int(state.get("progressTotal") or 0)
         received = int(state.get("progressReceived") or 0)
         self.progress.setVisible(status in {"downloading", "verifying"})

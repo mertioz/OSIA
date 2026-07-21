@@ -62,7 +62,7 @@ from osia.config import (
 from osia.reasoning import get_reasoning_options
 from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
-    restart_service,
+    restart_service, stop_service,
 )
 from osia.utils.assets import LOGO_PATH, autostart_enabled, set_autostart
 from osia import i18n
@@ -2284,6 +2284,8 @@ class _SettingsPanel(QWidget):
     _chatgpt_login_ready = pyqtSignal(dict)
     chatgpt_status_changed = pyqtSignal(dict)
     local_models_refresh_requested = pyqtSignal()
+    getting_started_requested = pyqtSignal()
+    _shutdown_finished = pyqtSignal(bool)
 
     # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
     # last as an info-only row).
@@ -2370,6 +2372,7 @@ class _SettingsPanel(QWidget):
         self._startup_refresh_pending = False
         self._startup_last_probe = datetime.min
         self._startup_status_ready.connect(self._apply_startup_status)
+        self._shutdown_finished.connect(self._on_shutdown_finished)
         self._gmail_rest_status = {
             "status": "disconnected",
             "connected": False,
@@ -2468,6 +2471,7 @@ class _SettingsPanel(QWidget):
         sec_theme     = self._build_theme_section()
         sec_capsule   = self._build_capsule_section()       # Capsule + autostart
         sec_restart   = self._build_restart_section()       # Controlled relaunch
+        sec_guide     = self._build_getting_started_section()
         sec_ai_prov   = self._build_ai_providers_section()  # Section 1
         sec_voice     = self._build_voice_section()         # Section 2 (TTS)
         sec_wake      = self._build_wake_section()           # Wake-word greeting
@@ -2492,7 +2496,7 @@ class _SettingsPanel(QWidget):
         # folded into Advanced) — it is a central, growing capability that
         # warrants top-level discoverability.
         self._settings_pages = [
-            ("settings.cat.general",  [sec_language, sec_theme, sec_capsule, sec_restart]),
+            ("settings.cat.general",  [sec_language, sec_theme, sec_capsule, sec_restart, sec_guide]),
             ("settings.cat.models",   [sec_ai_prov, sec_hierarchy, sec_apikeys]),
             ("settings.cat.voice",    [sec_voice, sec_stt, sec_liveapi]),
             ("settings.cat.wake",     [sec_wake]),
@@ -2584,11 +2588,25 @@ class _SettingsPanel(QWidget):
         if key == "settings.cat.memory":
             self._refresh_memory_entries()
 
-    def show_updates(self) -> None:
+    def show_category(self, category_key: str) -> None:
         for row, (key, _sections) in enumerate(self._settings_pages):
-            if key == "settings.cat.updates":
+            if key == category_key:
                 self._settings_nav.setCurrentRow(row)
+                self._settings_scroll.verticalScrollBar().setValue(0)
                 return
+
+    def show_updates(self) -> None:
+        self.show_category("settings.cat.updates")
+
+    def show_answer_settings(self, *, chatgpt: bool = False) -> None:
+        self.show_category("settings.cat.models")
+        if chatgpt:
+            index = self._ai_provider_combo.findData("chatgpt_account")
+            if index >= 0:
+                self._ai_provider_combo.setCurrentIndex(index)
+
+    def show_mobile_settings(self) -> None:
+        self.show_category("settings.cat.mobile")
 
     def _guard_settings_wheel(self, combo: QComboBox) -> None:
         """Keep a closed Settings combo from consuming the page wheel."""
@@ -2861,12 +2879,19 @@ class _SettingsPanel(QWidget):
         self._restart_btn.setObjectName("primaryBtn")
         self._restart_btn.clicked.connect(self._on_restart_clicked)
         layout.addWidget(self._restart_btn)
+        self._close_osia_btn = QPushButton(i18n.t("settings.close_button"))
+        self._close_osia_btn.setObjectName("destructiveSecondaryBtn")
+        self._close_osia_btn.setAccessibleName(i18n.t("settings.close_button"))
+        self._close_osia_btn.clicked.connect(self._on_close_osia_clicked)
+        layout.addWidget(self._close_osia_btn)
         self._restart_pending = False
+        self._shutdown_pending = False
+        self._power_status_key = ""
         return wrap
 
     def _on_restart_clicked(self) -> None:
         """Confirm once, prepare the coordinator, then quit Qt gracefully."""
-        if self._restart_pending:
+        if self._restart_pending or self._shutdown_pending:
             return
         answer = QMessageBox.question(
             self,
@@ -2880,7 +2905,9 @@ class _SettingsPanel(QWidget):
 
         self._restart_pending = True
         self._restart_btn.setEnabled(False)
-        self._restart_status.setText(i18n.t("settings.restart_pending"))
+        self._close_osia_btn.setEnabled(False)
+        self._power_status_key = "settings.restart_pending"
+        self._restart_status.setText(i18n.t(self._power_status_key))
         self._restart_status.show()
         try:
             from osia.relaunch import prepare_relaunch
@@ -2889,13 +2916,101 @@ class _SettingsPanel(QWidget):
         except Exception:
             self._restart_pending = False
             self._restart_btn.setEnabled(True)
-            self._restart_status.setText(i18n.t("settings.restart_error"))
+            self._close_osia_btn.setEnabled(True)
+            self._power_status_key = "settings.restart_error"
+            self._restart_status.setText(i18n.t(self._power_status_key))
             self._restart_status.show()
             return
 
         app = QApplication.instance()
         if app is not None:
             QTimer.singleShot(0, app.quit)
+
+    def _confirm_close_osia(self) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(i18n.t("settings.close_confirm_title"))
+        box.setText(i18n.t("settings.close_confirm_text"))
+        close_button = box.addButton(
+            i18n.t("settings.close_button"), QMessageBox.ButtonRole.AcceptRole,
+        )
+        cancel_button = box.addButton(
+            i18n.t("settings.close_cancel"), QMessageBox.ButtonRole.RejectRole,
+        )
+        box.setDefaultButton(cancel_button)
+        box.setEscapeButton(cancel_button)
+        box.exec()
+        return box.clickedButton() is close_button
+
+    def _on_close_osia_clicked(self) -> None:
+        """Stop the owned mobile service, then quit Qt without a relaunch."""
+        if self._restart_pending or self._shutdown_pending:
+            return
+        if not self._confirm_close_osia():
+            return
+        self._shutdown_pending = True
+        self._restart_btn.setEnabled(False)
+        self._close_osia_btn.setEnabled(False)
+        self._power_status_key = "settings.close_pending"
+        self._restart_status.setText(i18n.t(self._power_status_key))
+        self._restart_status.show()
+
+        def _stop_owned_server() -> None:
+            try:
+                stopped = bool(stop_service(STARTUP_SERVICES[0]))
+            except Exception:
+                stopped = False
+            self._shutdown_finished.emit(stopped)
+
+        threading.Thread(
+            target=_stop_owned_server,
+            name="osia-session-shutdown",
+            daemon=True,
+        ).start()
+
+    def _on_shutdown_finished(self, stopped: bool) -> None:
+        if not self._shutdown_pending:
+            return
+        if not stopped:
+            self._shutdown_pending = False
+            self._restart_btn.setEnabled(True)
+            self._close_osia_btn.setEnabled(True)
+            self._power_status_key = "settings.close_error"
+            self._restart_status.setText(i18n.t(self._power_status_key))
+            self._restart_status.show()
+            return
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.setProperty("osiaIntentionalShutdown", True)
+            except Exception:
+                pass
+            QTimer.singleShot(0, app.quit)
+
+    def _build_getting_started_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+        self._guide_title = QLabel(i18n.t("settings.getting_started"))
+        self._guide_title.setObjectName("sectionTitle")
+        self._guide_title.setWordWrap(True)
+        self._guide_sub = QLabel(i18n.t("settings.getting_started_sub"))
+        self._guide_sub.setObjectName("sectionSub")
+        self._guide_sub.setWordWrap(True)
+        self._guide_desc = QLabel(i18n.t("settings.getting_started_desc"))
+        self._guide_desc.setObjectName("sectionDesc")
+        self._guide_desc.setWordWrap(True)
+        self._guide_btn = QPushButton(i18n.t("settings.getting_started_button"))
+        self._guide_btn.setObjectName("ghostBtn")
+        self._guide_btn.setAccessibleName(self._guide_btn.text())
+        self._guide_btn.clicked.connect(self.getting_started_requested.emit)
+        layout.addWidget(self._guide_title)
+        layout.addWidget(self._guide_sub)
+        layout.addWidget(self._guide_desc)
+        layout.addWidget(self._guide_btn)
+        return wrap
 
     def _build_startup_section(self) -> QFrame:
         wrap = QFrame()
@@ -7712,9 +7827,15 @@ class _SettingsPanel(QWidget):
         self._restart_sub.setText(i18n.t("settings.restart_sub"))
         self._restart_desc.setText(i18n.t("settings.restart_desc"))
         self._restart_btn.setText(i18n.t("settings.restart_button"))
-        if self._restart_status.isVisible():
-            key = "settings.restart_pending" if self._restart_pending else "settings.restart_error"
-            self._restart_status.setText(i18n.t(key))
+        self._close_osia_btn.setText(i18n.t("settings.close_button"))
+        self._close_osia_btn.setAccessibleName(self._close_osia_btn.text())
+        if self._restart_status.isVisible() and self._power_status_key:
+            self._restart_status.setText(i18n.t(self._power_status_key))
+        self._guide_title.setText(i18n.t("settings.getting_started"))
+        self._guide_sub.setText(i18n.t("settings.getting_started_sub"))
+        self._guide_desc.setText(i18n.t("settings.getting_started_desc"))
+        self._guide_btn.setText(i18n.t("settings.getting_started_button"))
+        self._guide_btn.setAccessibleName(self._guide_btn.text())
 
         self._ai_title.setText(i18n.t("settings.ai_providers"))
         self._ai_sub.setText(i18n.t("settings.ai_providers_sub"))
@@ -9204,6 +9325,9 @@ class MainPopup(QWidget):
         self._settings.wake_word_enabled_changed.connect(
             self.wake_word_enabled_changed.emit
         )
+        self._settings.getting_started_requested.connect(
+            lambda: self.show_onboarding(automatic=False)
+        )
         self._update_controller.state_changed.connect(self._update_banner.apply_state)
         self._update_banner.view_requested.connect(self._show_update_details)
         self._update_banner.install_requested.connect(
@@ -9234,6 +9358,7 @@ class MainPopup(QWidget):
         outer.addWidget(self._stack, 1)
         self._active_conversation_id: str | None = None
         self._busy_conversation_ids: set[str] = set()
+        self._onboarding_dialog = None
 
         # Bottom nav
         nav = QHBoxLayout()
@@ -9280,8 +9405,56 @@ class MainPopup(QWidget):
     # ── Window placement ──────────────────────────────────────────────────
 
     def _show_update_details(self) -> None:
-        self._on_nav_clicked(self.PAGE_SETTINGS)
-        self._settings.show_updates()
+        self.show_settings_category("settings.cat.updates")
+
+    def show_settings_category(
+        self, category_key: str, *, select_chatgpt: bool = False,
+    ) -> None:
+        """Open one Settings category without the active-nav toggle behavior."""
+
+        self._stack.setCurrentIndex(self.PAGE_SETTINGS)
+        button = self._nav_buttons.get(self.PAGE_SETTINGS)
+        if button is not None:
+            button.setChecked(True)
+        self._animate_width(POPUP_W_WIDE)
+        if category_key == "settings.cat.models":
+            self._settings.show_answer_settings(chatgpt=select_chatgpt)
+        elif category_key == "settings.cat.mobile":
+            self._settings.show_mobile_settings()
+        else:
+            self._settings.show_category(category_key)
+        if not self.isVisible():
+            self._show_animated()
+
+    def show_onboarding(self, *, automatic: bool = False, state_path=None) -> None:
+        """Show the native guide; manual reopening never resets configuration."""
+
+        if not _is_deleted(self._onboarding_dialog):
+            try:
+                if self._onboarding_dialog.isVisible():
+                    self._onboarding_dialog.raise_()
+                    self._onboarding_dialog.activateWindow()
+                    return
+            except RuntimeError:
+                pass
+        from osia.gui.onboarding import OnboardingDialog
+
+        dialog = OnboardingDialog(
+            self, automatic=automatic, state_path=state_path,
+        )
+        dialog.answer_settings_requested.connect(
+            lambda chatgpt: self.show_settings_category(
+                "settings.cat.models", select_chatgpt=chatgpt,
+            )
+        )
+        dialog.phone_settings_requested.connect(
+            lambda: self.show_settings_category("settings.cat.mobile")
+        )
+        dialog.finished.connect(dialog.deleteLater)
+        self._onboarding_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def set_anchor(self, widget: QWidget) -> None:
         """Set the widget (the Dynamic Island capsule) the popup opens under.
@@ -10059,6 +10232,32 @@ class MainPopup(QWidget):
             QFrame#section:hover {
                 border: 1px solid rgba(196, 181, 245, 0.32);
             }
+            QDialog#onboardingDialog {
+                background: #0d0b12;
+                color: #e8e6f0;
+            }
+            QStackedWidget#onboardingStack, QFrame#historyHost {
+                background: transparent;
+                border: none;
+            }
+            QFrame#releaseCard {
+                background: #13111a;
+                border: 1px solid rgba(196, 181, 245, 0.16);
+                border-radius: 10px;
+            }
+            QLabel#releaseVersion {
+                color: #e8e6f0;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QLabel#releaseBadge {
+                background: rgba(196, 181, 245, 0.16);
+                border: 1px solid rgba(196, 181, 245, 0.34);
+                border-radius: 8px;
+                color: #c4b5f5;
+                padding: 2px 7px;
+                font-size: 10px;
+            }
             QPushButton#themeChoice {
                 background: rgba(196, 181, 245, 0.04);
                 border: 1px solid rgba(196, 181, 245, 0.12);
@@ -10267,6 +10466,24 @@ class MainPopup(QWidget):
             }
             QPushButton#primaryBtn:hover {
                 background: rgba(196, 181, 245, 0.36);
+            }
+            QPushButton#destructiveSecondaryBtn {
+                background: rgba(220, 80, 80, 0.06);
+                border: 1px solid rgba(220, 80, 80, 0.28);
+                color: #e0a3a3;
+                border-radius: 10px;
+                padding: 8px 16px;
+                font-size: 12px;
+            }
+            QPushButton#destructiveSecondaryBtn:hover,
+            QPushButton#destructiveSecondaryBtn:focus {
+                background: rgba(220, 80, 80, 0.14);
+                border-color: rgba(220, 80, 80, 0.58);
+            }
+            QPushButton#destructiveSecondaryBtn:disabled {
+                background: transparent;
+                border-color: rgba(119, 116, 128, 0.24);
+                color: #777480;
             }
             QPushButton#linkBtn {
                 background: transparent;

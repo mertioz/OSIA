@@ -19,6 +19,9 @@ set "PROJECT_DIR=%~dp0"
 set "VENV_DIR=%PROJECT_DIR%venv"
 set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
 set "OSIA_HOME=%USERPROFILE%\.osia"
+set "OSIA_HAD_STATE=0"
+if exist "%OSIA_HOME%" set "OSIA_HAD_STATE=1"
+if exist "%VENV_PY%" set "OSIA_HAD_STATE=1"
 set "WINDOWS_DIR=%PROJECT_DIR%windows"
 set "CLOUDFLARED=%WINDOWS_DIR%\cloudflared.exe"
 set "CF_URL=https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
@@ -101,6 +104,11 @@ if exist "%FFMPEG_DST%" (
 
 REM --- 5. Config dir (%USERPROFILE%\.osia) + mobile token --------------------
 echo [5/8] Configuration ^(%OSIA_HOME%^)...
+if "%OSIA_HAD_STATE%"=="0" (
+    set "OSIA_ONBOARDING_MARKER=%OSIA_HOME%\onboarding.json"
+    "%VENV_PY%" -c "import os; from pathlib import Path; from osia.onboarding import create_fresh_install_marker; create_fresh_install_marker(Path(os.environ['OSIA_ONBOARDING_MARKER']))"
+    set "OSIA_ONBOARDING_MARKER="
+)
 if not exist "%OSIA_HOME%" mkdir "%OSIA_HOME%"
 REM Migrate any existing repo config\ files without overwriting newer ones.
 for %%F in (api_keys.json settings.json mobile_token.txt) do (

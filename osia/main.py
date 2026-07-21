@@ -700,6 +700,17 @@ def wake_mode():
 
         if not maybe_show_release_legal_gate(popup):
             app.quit()
+            return
+        try:
+            from osia.onboarding import claim_automatic_onboarding
+
+            if claim_automatic_onboarding():
+                popup.show_onboarding(automatic=True)
+        except Exception as e:
+            # A damaged/read-only marker must never block normal startup. Its
+            # absence is treated as an existing installation, so there is no
+            # fallback that could surprise an established user with the guide.
+            print(f"[ONBOARDING] first-install check skipped: {e}")
 
     QTimer.singleShot(0, _run_release_legal_gate)
 

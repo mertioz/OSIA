@@ -58,6 +58,36 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "updates.check": {"en": "Check for updates", "fr": "Rechercher les mises à jour"},
     "updates.retry": {"en": "Retry", "fr": "Réessayer"},
     "updates.none": {"en": "None", "fr": "Aucune"},
+    "updates.installed_summary": {
+        "en": "Installed version: {version} · {status}",
+        "fr": "Version installée : {version} · {status}",
+    },
+    "updates.version": {"en": "OSIA {version}", "fr": "OSIA {version}"},
+    "updates.current": {"en": "Current", "fr": "Actuelle"},
+    "updates.internal": {"en": "Internal", "fr": "Interne"},
+    "updates.available_badge": {"en": "Available", "fr": "Disponible"},
+    "updates.release_date": {
+        "en": "Released {date}",
+        "fr": "Publiée le {date}",
+    },
+    "updates.date_unavailable": {
+        "en": "Release date unavailable",
+        "fr": "Date de publication indisponible",
+    },
+    "updates.notes_unavailable": {
+        "en": "Release notes are unavailable for this version.",
+        "fr": "Les notes de cette version ne sont pas disponibles.",
+    },
+    "updates.no_newer": {
+        "en": "No newer update is available.",
+        "fr": "Aucune mise à jour plus récente n’est disponible.",
+    },
+    "updates.offline_installed_available": {
+        "en": "You are offline. Notes for the installed version remain available.",
+        "fr": "Vous êtes hors ligne. Les notes de la version installée restent disponibles.",
+    },
+    "updates.history": {"en": "Version history", "fr": "Historique des versions"},
+    "updates.hide_history": {"en": "Hide version history", "fr": "Masquer l’historique"},
     "updates.summary": {
         "en": "Installed: {installed}\nChannel: {channel}\nAvailable: {available}\nStatus: {status}",
         "fr": "Installée : {installed}\nCanal : {channel}\nDisponible : {available}\nÉtat : {status}",
@@ -3077,6 +3107,80 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Der Neustart konnte nicht vorbereitet werden. Bitte erneut versuchen.",
         "es": "No se pudo preparar el reinicio. Inténtalo de nuevo.",
     },
+    "settings.close_button": {"en": "Close OSIA", "fr": "Fermer OSIA"},
+    "settings.close_confirm_title": {
+        "en": "Close OSIA?",
+        "fr": "Fermer OSIA ?",
+    },
+    "settings.close_confirm_text": {
+        "en": "OSIA and its mobile connection will stop. Launch-at-login will stay configured.",
+        "fr": "OSIA et sa connexion mobile vont s’arrêter. Le lancement au démarrage restera configuré.",
+    },
+    "settings.close_cancel": {"en": "Cancel", "fr": "Annuler"},
+    "settings.close_pending": {"en": "Closing OSIA…", "fr": "Fermeture d’OSIA…"},
+    "settings.close_error": {
+        "en": "OSIA could not close its mobile connection. Please try again.",
+        "fr": "OSIA n’a pas pu fermer sa connexion mobile. Réessayez.",
+    },
+    "settings.getting_started": {
+        "en": "Getting started",
+        "fr": "Guide de démarrage",
+    },
+    "settings.getting_started_sub": {
+        "en": "Review the short introduction at any time.",
+        "fr": "Revoir la courte introduction à tout moment.",
+    },
+    "settings.getting_started_desc": {
+        "en": "The guide does not change or reset your settings.",
+        "fr": "Le guide ne modifie ni ne réinitialise vos réglages.",
+    },
+    "settings.getting_started_button": {
+        "en": "Show getting started guide",
+        "fr": "Revoir le guide de démarrage",
+    },
+    "onboarding.welcome_title": {"en": "Welcome to OSIA", "fr": "Bienvenue dans OSIA"},
+    "onboarding.welcome_body": {
+        "en": "OSIA helps you from your computer and your phone.",
+        "fr": "OSIA vous aide depuis votre ordinateur et votre téléphone.",
+    },
+    "onboarding.answers_title": {
+        "en": "Choose how OSIA answers",
+        "fr": "Choisissez comment OSIA répond",
+    },
+    "onboarding.answers_body": {
+        "en": "OSIA needs a way to prepare its replies. Choose now or do it later.",
+        "fr": "OSIA a besoin d’un moyen de préparer ses réponses. Choisissez maintenant ou plus tard.",
+    },
+    "onboarding.chatgpt": {
+        "en": "Connect a ChatGPT account",
+        "fr": "Connecter un compte ChatGPT",
+    },
+    "onboarding.other_answer": {
+        "en": "Choose another method",
+        "fr": "Choisir une autre méthode",
+    },
+    "onboarding.phone_title": {
+        "en": "Connect your phone",
+        "fr": "Connectez votre téléphone",
+    },
+    "onboarding.phone_body": {
+        "en": "Open OSIA Mobile, then use the pairing screen to connect your phone and PC. This is optional.",
+        "fr": "Ouvrez OSIA Mobile, puis utilisez l’écran d’association pour relier votre téléphone et votre PC. Cette étape est facultative.",
+    },
+    "onboarding.open_phone": {
+        "en": "Open phone connection",
+        "fr": "Ouvrir la connexion téléphone",
+    },
+    "onboarding.ready_title": {"en": "You’re ready", "fr": "Tout est prêt"},
+    "onboarding.ready_body": {
+        "en": "Type a message or use your voice. You can change your choices later in Settings.",
+        "fr": "Écrivez un message ou utilisez votre voix. Vous pourrez modifier vos choix plus tard dans les réglages.",
+    },
+    "onboarding.back": {"en": "Back", "fr": "Retour"},
+    "onboarding.next": {"en": "Next", "fr": "Suivant"},
+    "onboarding.skip": {"en": "Skip", "fr": "Passer"},
+    "onboarding.start": {"en": "Start using OSIA", "fr": "Commencer"},
+    "onboarding.progress": {"en": "Step {current} of {total}", "fr": "Étape {current} sur {total}"},
     # — Autonomous agent (WOR-45 Phase 4) —
     "autonomous.title": {
         "en": "Autonomous",
