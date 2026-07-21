@@ -3123,64 +3123,62 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "fr": "OSIA n’a pas pu fermer sa connexion mobile. Réessayez.",
     },
     "settings.getting_started": {
-        "en": "Getting started",
-        "fr": "Guide de démarrage",
+        "en": "Complete OSIA guide",
+        "fr": "Guide OSIA complet",
     },
     "settings.getting_started_sub": {
-        "en": "Review the short introduction at any time.",
-        "fr": "Revoir la courte introduction à tout moment.",
+        "en": "Learn the essentials or explore every advanced feature.",
+        "fr": "Apprenez l’essentiel ou explorez chaque fonction avancée.",
     },
     "settings.getting_started_desc": {
         "en": "The guide does not change or reset your settings.",
         "fr": "Le guide ne modifie ni ne réinitialise vos réglages.",
     },
     "settings.getting_started_button": {
-        "en": "Show getting started guide",
-        "fr": "Revoir le guide de démarrage",
+        "en": "Open the OSIA guide",
+        "fr": "Ouvrir le guide OSIA",
     },
-    "onboarding.welcome_title": {"en": "Welcome to OSIA", "fr": "Bienvenue dans OSIA"},
-    "onboarding.welcome_body": {
-        "en": "OSIA helps you from your computer and your phone.",
-        "fr": "OSIA vous aide depuis votre ordinateur et votre téléphone.",
+    "guide.window_title": {"en": "OSIA Guide", "fr": "Guide OSIA"},
+    "guide.title": {"en": "Learn OSIA", "fr": "Découvrir OSIA"},
+    "guide.subtitle": {
+        "en": "A complete guide, available offline at any time",
+        "fr": "Un guide complet, disponible hors ligne à tout moment",
     },
-    "onboarding.answers_title": {
-        "en": "Choose how OSIA answers",
-        "fr": "Choisissez comment OSIA répond",
+    "guide.contents": {"en": "Contents", "fr": "Sommaire"},
+    "guide.home_title": {"en": "Your OSIA learning guide", "fr": "Votre guide d’apprentissage OSIA"},
+    "guide.home_intro": {
+        "en": "Choose a category, then select any lesson from the table of contents. Your position is saved automatically; this guide never changes application settings.",
+        "fr": "Choisissez une catégorie, puis une leçon dans le sommaire. Votre position est enregistrée automatiquement ; ce guide ne modifie jamais les réglages de l’application.",
     },
-    "onboarding.answers_body": {
-        "en": "OSIA needs a way to prepare its replies. Choose now or do it later.",
-        "fr": "OSIA a besoin d’un moyen de préparer ses réponses. Choisissez maintenant ou plus tard.",
+    "guide.home_hint": {
+        "en": "Use Start or Resume below, or choose a chapter directly. Ctrl+Home returns here; Alt+Left and Alt+Right move between lessons.",
+        "fr": "Utilisez Commencer ou Reprendre ci-dessous, ou choisissez directement un chapitre. Ctrl+Début revient ici ; Alt+Gauche et Alt+Droite changent de leçon.",
     },
-    "onboarding.chatgpt": {
-        "en": "Connect a ChatGPT account",
-        "fr": "Connecter un compte ChatGPT",
+    "guide.category_hint": {
+        "en": "Choose a lesson in the table of contents, or use Start / Resume below.",
+        "fr": "Choisissez une leçon dans le sommaire ou utilisez Commencer / Reprendre ci-dessous.",
     },
-    "onboarding.other_answer": {
-        "en": "Choose another method",
-        "fr": "Choisir une autre méthode",
+    "guide.lesson_count": {"en": "{count} lessons", "fr": "{count} leçons"},
+    "guide.category_progress": {
+        "en": "{current} of {total} completed",
+        "fr": "{current} sur {total} terminées",
     },
-    "onboarding.phone_title": {
-        "en": "Connect your phone",
-        "fr": "Connectez votre téléphone",
+    "guide.lesson_progress": {
+        "en": "Lesson {current} of {total}",
+        "fr": "Leçon {current} sur {total}",
     },
-    "onboarding.phone_body": {
-        "en": "Open OSIA Mobile, then use the pairing screen to connect your phone and PC. This is optional.",
-        "fr": "Ouvrez OSIA Mobile, puis utilisez l’écran d’association pour relier votre téléphone et votre PC. Cette étape est facultative.",
+    "guide.remember": {"en": "Remember", "fr": "À retenir"},
+    "guide.image_unavailable": {
+        "en": "Screenshot unavailable.",
+        "fr": "Capture indisponible.",
     },
-    "onboarding.open_phone": {
-        "en": "Open phone connection",
-        "fr": "Ouvrir la connexion téléphone",
-    },
-    "onboarding.ready_title": {"en": "You’re ready", "fr": "Tout est prêt"},
-    "onboarding.ready_body": {
-        "en": "Type a message or use your voice. You can change your choices later in Settings.",
-        "fr": "Écrivez un message ou utilisez votre voix. Vous pourrez modifier vos choix plus tard dans les réglages.",
-    },
-    "onboarding.back": {"en": "Back", "fr": "Retour"},
-    "onboarding.next": {"en": "Next", "fr": "Suivant"},
-    "onboarding.skip": {"en": "Skip", "fr": "Passer"},
-    "onboarding.start": {"en": "Start using OSIA", "fr": "Commencer"},
-    "onboarding.progress": {"en": "Step {current} of {total}", "fr": "Étape {current} sur {total}"},
+    "guide.previous": {"en": "Previous", "fr": "Précédent"},
+    "guide.next": {"en": "Next", "fr": "Suivant"},
+    "guide.skip": {"en": "Skip", "fr": "Passer"},
+    "guide.finish": {"en": "Finish", "fr": "Terminer"},
+    "guide.close": {"en": "Close", "fr": "Fermer"},
+    "guide.start": {"en": "Start", "fr": "Commencer"},
+    "guide.resume": {"en": "Resume", "fr": "Reprendre"},
     # — Autonomous agent (WOR-45 Phase 4) —
     "autonomous.title": {
         "en": "Autonomous",

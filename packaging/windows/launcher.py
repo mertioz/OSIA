@@ -35,7 +35,8 @@ def _package_smoke() -> int:
     """Offline dependency/model probe used by build and install validation."""
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    from osia.utils.assets import ICON_PATH, LOGO_PATH
+    from osia.utils.assets import ICON_PATH, LOGO_PATH, asset_path
+    from osia.guide_content import LESSONS
 
     required = [
         ("app metadata", resource_path("app_metadata.json")),
@@ -45,6 +46,11 @@ def _package_smoke() -> int:
         ("kokoro", bundled_model_path("kokoro")),
         ("codex", resource_path("runtimes", "codex", "bin", "codex.exe")),
     ]
+    required.extend(
+        (f"guide asset {lesson.asset}", asset_path(lesson.asset))
+        for lesson in LESSONS
+        if lesson.asset
+    )
     missing = [label for label, path in required if path is None or not os.path.exists(path)]
     if missing:
         print("ERROR: missing packaged resources: " + ", ".join(missing))
@@ -101,8 +107,8 @@ def _package_smoke() -> int:
             if onboarding_state(state_path).get("outcome") != "completed":
                 raise RuntimeError("onboarding completion did not persist")
         onboarding = OnboardingDialog(automatic=False)
-        if onboarding.PAGE_COUNT != 4:
-            raise RuntimeError("packaged onboarding journey is incomplete")
+        if onboarding.ESSENTIAL_COUNT < 7 or onboarding.ADVANCED_COUNT < 7:
+            raise RuntimeError("packaged OSIA guide is incomplete")
         onboarding.deleteLater()
         qt_app.processEvents()
 

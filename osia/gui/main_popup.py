@@ -9442,14 +9442,6 @@ class MainPopup(QWidget):
         dialog = OnboardingDialog(
             self, automatic=automatic, state_path=state_path,
         )
-        dialog.answer_settings_requested.connect(
-            lambda chatgpt: self.show_settings_category(
-                "settings.cat.models", select_chatgpt=chatgpt,
-            )
-        )
-        dialog.phone_settings_requested.connect(
-            lambda: self.show_settings_category("settings.cat.mobile")
-        )
         dialog.finished.connect(dialog.deleteLater)
         self._onboarding_dialog = dialog
         dialog.show()
