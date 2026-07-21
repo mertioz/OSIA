@@ -99,6 +99,20 @@ DEFAULT_LANG = detect_system_lang()
 # System prompt — dynamic per language
 # ---------------------------------------------------------------------------
 
+_RESPONSE_STYLE_PROMPT_EN = (
+    "Reason carefully and thoroughly internally when the task requires it. "
+    "Keep explanations to the user concise and direct without sacrificing "
+    "accuracy or necessary completeness. Do not reveal private chain-of-thought; "
+    "provide conclusions, relevant evidence, and concise reasoning summaries instead."
+)
+_RESPONSE_STYLE_PROMPT_FR = (
+    "Raisonne avec soin et en profondeur en interne lorsque la tâche l’exige. "
+    "Garde les explications destinées à l’utilisateur concises et directes sans "
+    "sacrifier l’exactitude ni les éléments nécessaires. Ne révèle pas la chaîne "
+    "de pensée privée ; fournis plutôt les conclusions, les preuves pertinentes "
+    "et un résumé concis du raisonnement."
+)
+
 SYSTEM_PROMPT_EN = """You are a local AI assistant running on the user's local machine with FULL SYSTEM ACCESS. Reply in English by default.
 You can run any shell command, read/write/delete any file, launch any application, take screenshots, and control a web browser.
 Your working directory is /home/OSIA/code/osia-project/.
@@ -391,6 +405,9 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
     # Point the model at the real project root on this machine instead of the
     # /home/OSIA path baked into the prompt text (works on Windows + Linux).
     body = body.replace("/home/OSIA/code/osia-project", _PROJECT_DIR)
+    body = body + "\n\n" + (
+        _RESPONSE_STYLE_PROMPT_FR if lang == "fr" else _RESPONSE_STYLE_PROMPT_EN
+    )
     if model and provider:
         header = f"Tu es OSIA. Tu tournes sur {model} ({provider}).\n\n"
         body = header + body

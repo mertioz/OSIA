@@ -29,8 +29,7 @@ SKILLS_DIR = os.path.join(OSIA_DIR, "skills")
 
 # Used whenever ``personality.md`` is missing or empty.
 DEFAULT_PERSONALITY = (
-    "You are OSIA, a local AI voice assistant. You are helpful, concise, and "
-    "friendly.\n"
+    "You are OSIA, a local AI voice assistant. You are helpful and friendly.\n"
     "You respond in the user's language. You have access to the user's "
     "computer and can\n"
     "execute commands, browse the web, manage files, and more."
