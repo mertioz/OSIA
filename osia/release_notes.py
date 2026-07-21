@@ -28,6 +28,25 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="1.0.5",
+        released_on="2026-07-21",
+        public=True,
+        changes_en=(
+            "Explore OSIA with the complete Getting Started and Master OSIA guide.",
+            "Review the changelog and update history offline from Settings.",
+            "Close OSIA directly from the main menu.",
+            "Responses now combine careful reasoning with clearer, more concise explanations.",
+            "Settings navigation and content now scroll independently, with additional stability and distribution improvements.",
+        ),
+        changes_fr=(
+            "Découvrez OSIA avec le guide complet Premiers pas et Maîtriser OSIA.",
+            "Consultez hors ligne le journal des modifications et l’historique des mises à jour depuis les Réglages.",
+            "Fermez OSIA directement depuis le menu principal.",
+            "Les réponses associent désormais un raisonnement attentif à des explications plus claires et concises.",
+            "La navigation et le contenu des Réglages défilent désormais indépendamment, avec des améliorations de stabilité et de distribution.",
+        ),
+    ),
+    ReleaseEntry(
         version="1.0.4",
         released_on="2026-07-20",
         public=True,
