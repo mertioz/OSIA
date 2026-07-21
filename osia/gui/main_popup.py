@@ -36,7 +36,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QScrollArea, QStackedWidget, QListWidget, QFrame,
+    QLineEdit, QScrollArea, QStackedWidget, QListWidget, QAbstractItemView, QFrame,
     QSizePolicy, QFileDialog, QCheckBox, QComboBox,
     QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog, QLayout, QMenu,
     QToolTip, QMessageBox,
@@ -1496,6 +1496,25 @@ class _ModelPanel(QWidget):
 
 # ── Settings panel ──────────────────────────────────────────────────────────
 
+class _SettingsNavigationList(QListWidget):
+    """Category list whose wheel events stay inside the Settings navigation."""
+
+    def __init__(self):
+        super().__init__()
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 (Qt method name)
+        pixel_y = event.pixelDelta().y()
+        if pixel_y:
+            bar = self.verticalScrollBar()
+            bar.setValue(bar.value() - pixel_y)
+        else:
+            super().wheelEvent(event)
+        # QAbstractItemView ignores wheel events at a scroll boundary.  Accept
+        # them here so Qt never propagates them into the sibling detail pane.
+        event.accept()
+
+
 class _SettingsDetailStack(QStackedWidget):
     """Stack used inside the Settings detail scroll area.
 
@@ -2437,7 +2456,7 @@ class _SettingsPanel(QWidget):
         body.setSpacing(10)
 
         # LEFT — category navigation.
-        self._settings_nav = QListWidget()
+        self._settings_nav = _SettingsNavigationList()
         self._settings_nav.setObjectName("settingsNav")
         self._settings_nav.setFixedWidth(110)
         self._settings_nav.setWordWrap(True)
@@ -2553,7 +2572,6 @@ class _SettingsPanel(QWidget):
         for _combo in self.findChildren(QComboBox):
             _cap_combo_width(_combo)
             self._guard_settings_wheel(_combo)
-        self._settings_nav.installEventFilter(self)
 
         # Refresh startup status while visible.
         self._startup_timer = QTimer(self)
@@ -2635,8 +2653,6 @@ class _SettingsPanel(QWidget):
                 # An explicitly opened popup remains a normal Qt item view.
                 if watched.view().isVisible():
                     return False
-                return self._scroll_settings_from_wheel(event)
-            if watched is self._settings_nav:
                 return self._scroll_settings_from_wheel(event)
         return super().eventFilter(watched, event)
 

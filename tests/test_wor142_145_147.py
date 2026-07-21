@@ -149,16 +149,18 @@ def test_open_combo_popup_keeps_normal_item_view_wheel(settings_panel, qt_app):
     assert settings_panel.eventFilter(combo, _wheel(combo)) is True
 
 
-def test_settings_navigation_wheel_reaches_detail_page(settings_panel, qt_app):
+def test_settings_navigation_wheel_stays_out_of_detail_page(settings_panel, qt_app):
     panel = settings_panel
     panel._settings_nav.setCurrentRow(1)
     bar = panel._settings_scroll.verticalScrollBar()
     bar.setValue(0)
     selected = panel._settings_nav.currentRow()
-    QApplication.sendEvent(panel._settings_nav, _wheel(panel._settings_nav))
+    event = _wheel(panel._settings_nav)
+    QApplication.sendEvent(panel._settings_nav, event)
     qt_app.processEvents()
+    assert event.isAccepted()
     assert panel._settings_nav.currentRow() == selected
-    assert bar.value() > 0
+    assert bar.value() == 0
 
 
 @pytest.mark.parametrize("side", ["left", "right"])
