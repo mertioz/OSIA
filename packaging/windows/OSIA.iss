@@ -247,6 +247,8 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -N
 Type: files; Name: "{app}\.osia-no-integration-test"
 
 [Code]
+#include "profile_path.iss"
+
 const
   OSIA_MAIN_BACKGROUND = $00150B11;
   OSIA_ELEVATED_SURFACE = $001A1222;
@@ -293,6 +295,7 @@ var
   UpdateBackupExe: String;
   UpdateBackupFailure: String;
   FreshInstallOnboardingEligible: Boolean;
+  OsiaProfileDirectory: String;
 
 function HasExactUpdateSwitch: Boolean;
 var
@@ -318,10 +321,11 @@ var
   ExistingMajor, ExistingMinor, ExistingPatch, ExistingBuild: Word;
 begin
   Result := True;
+  OsiaProfileDirectory := ResolveOsiaProfileDirectory;
   UninstallKey :=
     'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}_is1';
   FreshInstallOnboardingEligible :=
-    (not DirExists(ExpandConstant('{userprofile}\.osia'))) and
+    (not DirExists(OsiaProfileDirectory)) and
     (not RegKeyExists(HKCU, UninstallKey));
   UpdateModeRequested := HasExactUpdateSwitch;
   UpdateModeActive := False;
@@ -1042,9 +1046,9 @@ begin
     if FreshInstallOnboardingEligible and (not IsUpdateMode) and
       (not IntegrationSuppressed) then
     begin
-      ForceDirectories(ExpandConstant('{userprofile}\.osia'));
+      ForceDirectories(OsiaProfileDirectory);
       if not SaveStringToFile(
-        ExpandConstant('{userprofile}\.osia\onboarding.json'),
+        AddBackslash(OsiaProfileDirectory) + 'onboarding.json',
         '{"schemaVersion":1,"status":"pending"}' + #13#10, False) then
         Log('WOR-151 onboarding marker could not be written.');
     end;

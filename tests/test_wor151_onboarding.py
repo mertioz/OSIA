@@ -206,7 +206,8 @@ def test_installer_marks_only_fresh_non_update_profiles():
     script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
     batch = (ROOT / "install.bat").read_text("utf-8")
     assert "FreshInstallOnboardingEligible" in script
-    assert "not DirExists(ExpandConstant('{userprofile}\\.osia'))" in script
+    assert "OsiaProfileDirectory := ResolveOsiaProfileDirectory" in script
+    assert "not DirExists(OsiaProfileDirectory)" in script
     assert "not RegKeyExists(HKCU, UninstallKey)" in script
     assert "FreshInstallOnboardingEligible and (not IsUpdateMode)" in script
     assert "onboarding.json" in script

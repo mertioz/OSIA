@@ -44,6 +44,20 @@ DEFAULT_BUILD_CHANNEL = "internal-preview"
 ALLOWED_BUILD_CHANNELS = {"internal-preview", "stable"}
 UPDATER_SCHEMA_VERSION = 1
 
+_APPROVED_INNO_RUNTIME_CONSTANTS = frozenset({
+    "app",
+    "autodesktop",
+    "group",
+    "localappdata",
+    "src",
+    "sys",
+    "uninstallexe",
+})
+_APPROVED_INNO_RUNTIME_PREFIXES = ("cm:", "param:")
+_INNO_BRACE_TOKEN_RE = re.compile(r"\{([^{}\r\n]+)\}")
+_INNO_PASCAL_STRING_RE = re.compile(r"'(?:''|[^'])*'")
+_INNO_INCLUDE_RE = re.compile(r'^\s*#include\s+"([^"]+)"', re.IGNORECASE)
+
 MODELS = {
     "kokoro": {
         "repo": "hexgrad/Kokoro-82M",
@@ -73,6 +87,89 @@ MODELS = {
 def _run(args: list[str], **kwargs) -> None:
     print("+", subprocess.list2cmdline(args), flush=True)
     subprocess.run(args, cwd=ROOT, check=True, **kwargs)
+
+
+def _iter_inno_source_lines(
+    script_path: Path,
+    *,
+    in_code: bool = False,
+    seen: set[Path] | None = None,
+):
+    path = script_path.resolve()
+    visited = seen if seen is not None else set()
+    if path in visited:
+        return
+    visited.add(path)
+    code_section = in_code
+    for line_number, line in enumerate(path.read_text("utf-8").splitlines(), 1):
+        section = re.fullmatch(r"\s*\[([^]]+)]\s*", line)
+        if section is not None:
+            code_section = section.group(1).casefold() == "code"
+        include = _INNO_INCLUDE_RE.match(line)
+        if include is not None:
+            include_path = (path.parent / include.group(1)).resolve()
+            yield from _iter_inno_source_lines(
+                include_path, in_code=code_section, seen=visited,
+            )
+        yield path, line_number, line, code_section
+
+
+def _classify_inno_brace_token(body: str, *, escaped: bool) -> str:
+    lowered = body.casefold()
+    if body.startswith("#"):
+        return "compile_time_preprocessor"
+    if escaped or re.fullmatch(r"[A-Za-z%\\][^{}]*", body) is None:
+        return "literal_brace_text"
+    if lowered.startswith("code:"):
+        return "custom_code"
+    if lowered in _APPROVED_INNO_RUNTIME_CONSTANTS or lowered.startswith(
+        _APPROVED_INNO_RUNTIME_PREFIXES
+    ):
+        return "valid_runtime"
+    return "invalid_runtime"
+
+
+def _inno_constant_inventory(
+    script_path: Path | None = None,
+) -> dict[str, tuple[str, ...]]:
+    source = script_path or (ROOT / "packaging" / "windows" / "OSIA.iss")
+    inventory: dict[str, set[str]] = {
+        "compile_time_preprocessor": set(),
+        "valid_runtime": set(),
+        "custom_code": set(),
+        "literal_brace_text": set(),
+        "invalid_runtime": set(),
+    }
+    for _path, _line_number, line, in_code in _iter_inno_source_lines(source):
+        for token in _INNO_BRACE_TOKEN_RE.finditer(line):
+            if token.group(1).startswith("#"):
+                inventory["compile_time_preprocessor"].add(token.group(0))
+        fragments = (
+            (match.group(0)[1:-1], match.start(0) + 1)
+            for match in _INNO_PASCAL_STRING_RE.finditer(line)
+        ) if in_code else ((line, 0),)
+        for fragment, offset in fragments:
+            for token in _INNO_BRACE_TOKEN_RE.finditer(fragment):
+                start = offset + token.start(0)
+                escaped = start > 0 and line[start - 1] == "{"
+                category = _classify_inno_brace_token(
+                    token.group(1), escaped=escaped,
+                )
+                inventory[category].add(token.group(0))
+    return {
+        category: tuple(sorted(tokens, key=str.casefold))
+        for category, tokens in inventory.items()
+    }
+
+
+def _validate_inno_runtime_constants(script_path: Path | None = None) -> dict:
+    inventory = _inno_constant_inventory(script_path)
+    invalid = inventory["invalid_runtime"]
+    if invalid:
+        raise RuntimeError(
+            "unsupported Inno runtime constant(s): " + ", ".join(invalid)
+        )
+    return inventory
 
 
 def _sha256(path: Path) -> str:
@@ -554,6 +651,7 @@ def build(
     if importlib.metadata.version("pyinstaller-hooks-contrib") != "2026.6":
         raise RuntimeError("pyinstaller-hooks-contrib 2026.6 is required")
 
+    _validate_inno_runtime_constants()
     identity = _resolve_build_identity(channel, version_override)
     version = identity["version"]
 

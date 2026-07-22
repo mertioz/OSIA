@@ -29,6 +29,15 @@ def _load_launcher():
     return module
 
 
+def _load_windows_build():
+    path = ROOT / "packaging" / "windows" / "build_windows.py"
+    spec = importlib.util.spec_from_file_location("osia_windows_build", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_external_data_filter_preserves_licenses_and_excludes_generated_cache():
     from osia.windows_release_policy import filter_pyinstaller_data_toc
 
@@ -300,7 +309,102 @@ def test_installer_contract_preserves_user_data_and_has_real_progress():
     assert "Result := not IntegrationSuppressed" in script
     assert "OutputBaseFilename=OSIA-Setup" in script
     assert "{userappdata}\\.osia" not in script.lower()
+    assert "{localappdata}\\.osia" not in script.lower()
     assert "Path.home()" not in script
+
+
+def test_installer_profile_resolver_is_authoritative_and_fails_closed():
+    script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
+    helper = (
+        ROOT / "packaging" / "windows" / "profile_path.iss"
+    ).read_text("utf-8")
+    initialize = script[script.index("function InitializeSetup"):script.index(
+        "function IntegrationMarker"
+    )]
+    install = script[script.index("procedure CurStepChanged"):script.index(
+        "procedure InitializeUninstallProgressForm"
+    )]
+
+    assert '#include "profile_path.iss"' in script
+    assert "{userprofile}" not in (script + helper).casefold()
+    assert "GetEnv('USERPROFILE')" in helper
+    assert "ResolveOsiaProfileDirectory" in initialize
+    assert initialize.index("ResolveOsiaProfileDirectory") < initialize.index(
+        "UpdateModeRequested := HasExactUpdateSwitch"
+    )
+    assert "DirExists(OsiaProfileDirectory)" in initialize
+    assert "ForceDirectories(OsiaProfileDirectory)" in install
+    assert "AddBackslash(OsiaProfileDirectory) + 'onboarding.json'" in install
+    assert helper.count("+ '.osia'") == 1
+    for required_guard in (
+        "Candidate = ''",
+        "PathHasInvalidCharacters(Candidate, True)",
+        "not PathIsRooted(Candidate)",
+        "ExtractFileDrive(Candidate)",
+        "Pos('{', Candidate)",
+        "PathSame(Candidate, SourceDirectory)",
+        "PathStartsWith(Candidate, AddBackslash(SourceDirectory), True)",
+    ):
+        assert required_guard in helper
+    assert "RaiseException('OSIA installer could not resolve the current user profile.')" in helper
+    assert "userappdata" not in helper.casefold()
+    assert "localappdata" not in helper.casefold()
+    assert "C:\\Users\\" not in helper
+
+
+def test_inno_constant_inventory_and_release_gate_are_deterministic(tmp_path):
+    module = _load_windows_build()
+    inventory = module._validate_inno_runtime_constants()
+
+    assert set(inventory["compile_time_preprocessor"]) == {
+        "{#AppVersion}",
+        "{#AppVersionMajor}",
+        "{#AppVersionMinor}",
+        "{#AppVersionPatch}",
+        "{#BuildRoot}",
+        "{#InternalBuild}",
+        "{#ReleaseRoot}",
+        "{#RepoRoot}",
+        "{#SignedBuild}",
+    }
+    assert set(inventory["valid_runtime"]) == {
+        "{app}",
+        "{autodesktop}",
+        "{cm:AutostartGroup}",
+        "{cm:AutostartTask}",
+        "{cm:DesktopTask}",
+        "{cm:FirewallTask}",
+        "{cm:LaunchOSIA}",
+        "{cm:MobileGroup}",
+        "{cm:ShortcutsGroup}",
+        "{cm:UninstallOSIA}",
+        "{group}",
+        "{localappdata}",
+        "{param:NOINTEGRATION|0}",
+        "{src}",
+        "{sys}",
+        "{uninstallexe}",
+    }
+    assert inventory["custom_code"] == ()
+    assert set(inventory["literal_brace_text"]) == {
+        "{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}",
+        '{"schemaVersion":1,"status":"pending"}',
+    }
+    assert inventory["invalid_runtime"] == ()
+
+    invalid = tmp_path / "invalid.iss"
+    invalid.write_text(
+        "[Setup]\nDefaultDirName={userprofile}\\OSIA\n", encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match=r"\{userprofile\}"):
+        module._validate_inno_runtime_constants(invalid)
+    build_source = (
+        ROOT / "packaging" / "windows" / "build_windows.py"
+    ).read_text("utf-8")
+    build_body = build_source[build_source.index("def build("):]
+    assert build_body.index("_validate_inno_runtime_constants()") < build_body.index(
+        "_clean_dir(STAGE)"
+    )
 
 
 def test_installer_ui_uses_explicit_accessible_osia_palette():
@@ -470,6 +574,116 @@ def test_inno_script_compiles_with_a_non_installing_minimal_payload(tmp_path):
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert (output / "OSIA-Setup.exe").is_file()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Inno Setup is Windows-only")
+def test_shared_profile_resolver_runtime_harness_isolated_and_fail_closed(tmp_path):
+    iscc = _find_iscc_for_test()
+    if iscc is None:
+        pytest.skip("Inno Setup 6 is not installed")
+
+    helper = (ROOT / "packaging" / "windows" / "profile_path.iss").resolve()
+    output = tmp_path / "probe-output"
+    install_dir = tmp_path / "must-not-be-created"
+    output.mkdir()
+    harness = tmp_path / "profile-path-harness.iss"
+    harness.write_text(
+        "\n".join((
+            "[Setup]",
+            "AppId={{E9537545-E0B4-4F0E-A760-860FA7CF2ABC}",
+            "AppName=OSIA Profile Resolver Probe",
+            "AppVersion=1.0.0",
+            f"DefaultDirName={install_dir}",
+            "PrivilegesRequired=lowest",
+            "PrivilegesRequiredOverridesAllowed=commandline",
+            "CreateAppDir=no",
+            "Uninstallable=no",
+            f"OutputDir={output}",
+            "OutputBaseFilename=ProfilePathHarness",
+            "[Code]",
+            f'#include "{helper}"',
+            "function InitializeSetup: Boolean;",
+            "var",
+            "  ProfileDirectory: String;",
+            "  ResultFile: String;",
+            "begin",
+            "  Result := False;",
+            "  ProfileDirectory := ResolveOsiaProfileDirectory;",
+            "  ResultFile := ExpandConstant('{param:RESULTFILE|}');",
+            "  if (ResultFile = '') or",
+            "    (not SaveStringToFile(ResultFile, ProfileDirectory, False)) then",
+            "    RaiseException('Profile resolver probe could not record its result.');",
+            "end;",
+            "",
+        )),
+        encoding="utf-8",
+    )
+    compiled = subprocess.run(
+        [str(iscc), "/Qp", str(harness)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=90,
+    )
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    probe = output / "ProfilePathHarness.exe"
+    assert probe.is_file()
+
+    def run_probe(user_profile: str, label: str):
+        result_file = tmp_path / f"{label}.txt"
+        environment = os.environ.copy()
+        environment["USERPROFILE"] = user_profile
+        completed = subprocess.run(
+            [
+                str(probe),
+                "/VERYSILENT",
+                "/SUPPRESSMSGBOXES",
+                "/CURRENTUSER",
+                "/NORESTART",
+                f"/RESULTFILE={result_file}",
+            ],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        return completed, result_file
+
+    normal = tmp_path / "profiles" / "Normal"
+    _completed, normal_result = run_probe(str(normal), "normal")
+    assert Path(normal_result.read_text("utf-8")) == normal / ".osia"
+
+    spaced = tmp_path / "profiles" / "Profile With Spaces"
+    _completed, spaced_result = run_probe(f'"{spaced}\\"', "spaced")
+    resolved_spaced = Path(spaced_result.read_text("utf-8"))
+    assert resolved_spaced == spaced / ".osia"
+    assert resolved_spaced.name == ".osia"
+    assert resolved_spaced.parent == spaced
+
+    for value, label in (
+        ("", "empty"),
+        ("relative-profile", "relative"),
+        ("{unresolved}", "unresolved"),
+        (str(output / "nested-profile"), "inside-installer-directory"),
+    ):
+        completed, result_file = run_probe(value, label)
+        assert completed.returncode != 0
+        assert not result_file.exists()
+
+    assert not install_dir.exists()
+    import winreg
+
+    uninstall_key = (
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+        r"\{E9537545-E0B4-4F0E-A760-860FA7CF2ABC}_is1"
+    )
+    with pytest.raises(FileNotFoundError):
+        winreg.OpenKey(winreg.HKEY_CURRENT_USER, uninstall_key)
 
 
 def test_package_spec_is_allowlist_based_and_excludes_user_config():
