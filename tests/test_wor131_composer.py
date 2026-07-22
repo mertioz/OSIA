@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -54,6 +55,10 @@ class ComposerTests(unittest.TestCase):
         get_theme_manager().set_theme("osia", persist=False)
         self.chat._file_btn.setEnabled(True)
         self.chat.set_busy(False)
+        self.chat._drafts.clear()
+        self.chat._draft_context = None
+        self.chat._pending_attachments = []
+        self.chat._rebuild_attachment_chips()
         self.chat._input.clear()
         self.popup.setGeometry(100, 120, POPUP_W, POPUP_H)
         self.app.processEvents()
@@ -131,29 +136,19 @@ class ComposerTests(unittest.TestCase):
         self.assertEqual(len(sends), 2)
         self.assertEqual([entry[0] for entry in sends], ["click", "enter"])
 
-    def test_file_pick_stays_once_and_does_not_enable_send_or_move_layout(self):
+    def test_file_pick_stages_once_without_emitting_legacy_send_signal(self):
         picks = QSignalSpy(self.popup.pick_file)
-        before = (
-            self.chat._file_btn.geometry(),
-            self.chat._input.geometry(),
-            self.chat._send_btn.geometry(),
-        )
+        source = Path(_TEMP_HOME.name) / "one.txt"
+        source.write_text("synthetic", encoding="utf-8")
         with patch(
-            "osia.gui.main_popup.QFileDialog.getOpenFileName",
-            return_value=(r"C:\temp\one.txt", ""),
+            "osia.gui.main_popup.QFileDialog.getOpenFileNames",
+            return_value=([str(source)], ""),
         ):
             QTest.mouseClick(self.chat._file_btn, Qt.MouseButton.LeftButton)
-        self.assertEqual(len(picks), 1)
-        self.assertEqual(picks[0][0], r"C:\temp\one.txt")
-        self.assertFalse(self.chat._send_btn.isEnabled())
-        self.assertEqual(
-            before,
-            (
-                self.chat._file_btn.geometry(),
-                self.chat._input.geometry(),
-                self.chat._send_btn.geometry(),
-            ),
-        )
+        self.assertEqual(len(picks), 0)
+        self.assertEqual(len(self.chat.pending_attachments()), 1)
+        self.assertTrue(self.chat._send_btn.isEnabled())
+        self.assertTrue(self.chat._attachment_scroll.isVisible())
 
     def test_all_themes_resolve_active_and_disabled_composer_styles(self):
         manager = get_theme_manager()
@@ -194,7 +189,7 @@ class ComposerTests(unittest.TestCase):
         self.chat._file_btn.setEnabled(True)
         self.chat._input.clear()
 
-    def test_popup_and_composer_geometry_match_the_pre_change_contract(self):
+    def test_popup_and_composer_geometry_keep_the_compact_contract(self):
         self.assertEqual((POPUP_W, POPUP_W_WIDE, POPUP_H), (440, 640, 560))
         self.assertEqual(self.popup.geometry().getRect(), (100, 120, 440, 560))
         self.assertEqual(
@@ -207,10 +202,12 @@ class ComposerTests(unittest.TestCase):
             (440, 560, 640, 560),
         )
         input_wrap = self.chat._input.parentWidget()
-        self.assertEqual(input_wrap.geometry().getRect(), (0, 324, 364, 54))
-        self.assertEqual(self.chat._file_btn.geometry().getRect(), (11, 9, 34, 34))
-        self.assertEqual(self.chat._input.geometry().getRect(), (53, 14, 258, 24))
-        self.assertEqual(self.chat._send_btn.geometry().getRect(), (319, 9, 34, 34))
+        self.assertEqual(input_wrap.width(), 364)
+        self.assertEqual(
+            self.chat._file_btn.size(), self.chat._send_btn.size(),
+        )
+        self.assertEqual(self.chat._file_btn.width(), COMPOSER_BUTTON_SIZE)
+        self.assertLess(self.chat._input.width(), input_wrap.width())
 
 
 def tearDownModule():

@@ -84,6 +84,8 @@ def test_embedded_notes_load_offline_and_are_newest_first():
     assert current is not None and current.public
     assert "getting started" in " ".join(current.changes("en")).lower()
     assert "image attachments" in " ".join(current.changes("en")).lower()
+    assert "attach files before sending" in " ".join(current.changes("en")).lower()
+    assert "joignez des fichiers avant l’envoi" in " ".join(current.changes("fr")).lower()
     previous = release_for_version("1.0.4")
     assert previous is not None and previous.public
     assert "roll back" in " ".join(previous.changes("en")).lower()

@@ -353,7 +353,9 @@ def _ensure_mobile_server_windows() -> None:
         print(f"[OSIA] mobile server autostart skipped: {e}")
 
 
-def _persist_agent_delta(conv_id, agent, prev_history_len):
+def _persist_agent_delta(
+    conv_id, agent, prev_history_len, *, user_display_text: str | None = None,
+):
     """Persist messages added to ``agent.messages`` during the most recent
     ``agent.run()`` call. ``prev_history_len`` is the length of the
     non-system message list (``agent.messages[1:]``) before that call.
@@ -365,6 +367,7 @@ def _persist_agent_delta(conv_id, agent, prev_history_len):
         return
     try:
         new_msgs = agent.messages[1:][prev_history_len:]
+        pending_user_display = user_display_text
         for m in new_msgs:
             # WOR-83: internal model-steering frames (anti-loop / hallucination
             # / empty-response guards) carry an _internal marker and must NEVER
@@ -377,6 +380,10 @@ def _persist_agent_delta(conv_id, agent, prev_history_len):
             clean = _sanitize_persisted_history_message(m)
             if clean is None:
                 continue
+            if pending_user_display is not None and clean.get("role") == "user":
+                clean = dict(clean)
+                clean["content"] = pending_user_display
+                pending_user_display = None
             conversations.add_message(
                 conv_id, clean.get("role"), clean.get("content", ""),
             )
@@ -868,6 +875,8 @@ def wake_mode():
         history: list[dict],
         *,
         voice_response: bool,
+        user_display_text: str | None = None,
+        lock_provider: bool = False,
     ) -> None:
         """Run the agent in the current thread, persist + mirror the result.
 
@@ -877,6 +886,10 @@ def wake_mode():
         """
         nonlocal active_conv
         turn_agent = OSIAAgent()
+        if lock_provider:
+            # Attachment capability was preflighted against this selected path;
+            # automatic hierarchy routing must not silently swap it mid-turn.
+            turn_agent._disable_hierarchy_for_turn = True
         tts_session_id = start_streaming_session() if voice_response else None
         settings = load_settings()
         selected_model = settings.get("selected_model")
@@ -923,7 +936,12 @@ def wake_mode():
                     f"({len(reply or '')} chars) — sentences were streamed during the run",
                     flush=True,
                 )
-            _persist_agent_delta(conv_id, turn_agent, prev_history_len)
+            _persist_agent_delta(
+                conv_id,
+                turn_agent,
+                prev_history_len,
+                user_display_text=user_display_text,
+            )
             display = clean_response(reply or "")
             bridge.assistant_stream_final.emit(conv_id, display)
         except Exception as e:
@@ -1028,22 +1046,34 @@ def wake_mode():
 
     # ── Text handler (typed message in popup) ────────────────────────────
 
-    def _send_user_input(user_input, display_text: str) -> None:
+    def _send_user_input(
+        user_input, display_text: str, *, attachment_turn: bool = False,
+    ) -> bool:
         conv = _ensure_active_conversation(display_text)
         conv_id = conv["id"]
+        if attachment_turn:
+            popup.bind_unbound_draft(conv_id)
         if _is_conversation_busy(conv_id):
             popup.show_conversation_busy_notice()
             print("Send fired while this conversation is busy; rejected.")
-            return
+            return False
         tts_stop()
         history = _history_for_conversation(conv_id)
         _set_conversation_busy(conv_id, True)
         bridge.chat_message_for_conversation.emit(conv_id, "user", display_text)
 
         def process():
-            _run_agent(user_input, conv_id, history, voice_response=False)
+            _run_agent(
+                user_input,
+                conv_id,
+                history,
+                voice_response=False,
+                user_display_text=display_text,
+                lock_provider=attachment_turn,
+            )
 
         threading.Thread(target=process, daemon=True).start()
+        return True
 
     def handle_send_text(text: str):
         _send_user_input(text, text)
@@ -1128,6 +1158,8 @@ def wake_mode():
         if active_conv and conv_id == active_conv.get("id"):
             tts_stop()
         ok = conversations.delete_conversation(conv_id)
+        if ok:
+            popup.discard_conversation_draft(conv_id)
         print(f"🗑  Deleted conversation {conv_id}: {'ok' if ok else 'not found'}")
         if active_conv and conv_id == active_conv.get("id"):
             agent.reset()
@@ -1191,19 +1223,28 @@ def wake_mode():
     def handle_remote_models(remote):
         popup.set_remote_models(remote)
 
-    def handle_pick_file(path: str, prompt: str):
-        from osia.attachments import (
-            AttachmentProtocolError,
-            build_local_attachment_input,
+    def handle_submit_draft(prompt: str, attachments) -> None:
+        from osia.desktop_attachments import (
+            DesktopAttachmentError,
+            prepare_desktop_turn,
         )
 
         try:
-            user_input, display_name = build_local_attachment_input(prompt, path)
-        except AttachmentProtocolError as exc:
-            popup.show_notice(f"Attachment rejected: {exc.code}")
+            prepared = prepare_desktop_turn(
+                prompt,
+                list(attachments or ()),
+                provider=agent.provider,
+                model=agent.model,
+            )
+        except DesktopAttachmentError as error:
+            popup.show_attachment_error(error)
             return
-        display_text = f"{prompt.strip()}\n📎 {display_name}".strip()
-        _send_user_input(user_input, display_text)
+        if _send_user_input(
+            prepared.provider_content,
+            prepared.display_text,
+            attachment_turn=True,
+        ):
+            popup.accept_draft_submission(prepared.attachment_ids)
 
     # ── Signal wiring ───────────────────────────────────────────────────
 
@@ -1225,7 +1266,7 @@ def wake_mode():
     stop_popup_hotkey = _start_popup_hotkey_listener(bridge.toggle_popup.emit)
 
     popup.send_text.connect(handle_send_text)
-    popup.pick_file.connect(handle_pick_file)
+    popup.submit_draft.connect(handle_submit_draft)
     popup.new_conversation.connect(handle_new_conversation)
     popup.open_conversation.connect(handle_open_conversation)
     popup.rename_conversation.connect(handle_rename_conversation)

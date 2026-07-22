@@ -1461,6 +1461,60 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Datei anhängen",
         "es": "Adjuntar un archivo",
     },
+    "chat.attachment_file": {"en": "File", "fr": "Fichier"},
+    "chat.attachment_image": {"en": "Image", "fr": "Image"},
+    "chat.attachment_remove": {
+        "en": "Remove {name}",
+        "fr": "Retirer {name}",
+    },
+    "chat.attachment_error_missing": {
+        "en": "{name} no longer exists. Remove it or select it again.",
+        "fr": "{name} n’existe plus. Retirez-le ou sélectionnez-le à nouveau.",
+    },
+    "chat.attachment_error_regular": {
+        "en": "{name} is not a regular file and cannot be attached.",
+        "fr": "{name} n’est pas un fichier ordinaire et ne peut pas être joint.",
+    },
+    "chat.attachment_error_empty": {
+        "en": "{name} is empty and cannot be attached.",
+        "fr": "{name} est vide et ne peut pas être joint.",
+    },
+    "chat.attachment_error_unreadable": {
+        "en": "{name} cannot be read. Check access or remove it.",
+        "fr": "{name} ne peut pas être lu. Vérifiez l’accès ou retirez-le.",
+    },
+    "chat.attachment_error_changed": {
+        "en": "{name} changed after selection. Remove it and attach it again.",
+        "fr": "{name} a changé après sa sélection. Retirez-le puis joignez-le à nouveau.",
+    },
+    "chat.attachment_error_provider": {
+        "en": "The selected provider cannot accept {name}. Keep the draft and choose another provider or remove the file.",
+        "fr": "Le fournisseur sélectionné ne peut pas accepter {name}. Conservez le brouillon et choisissez un autre fournisseur ou retirez le fichier.",
+    },
+    "chat.attachment_error_model": {
+        "en": "The selected model cannot analyze {name}. Keep the draft and choose a compatible model or remove the file.",
+        "fr": "Le modèle sélectionné ne peut pas analyser {name}. Conservez le brouillon et choisissez un modèle compatible ou retirez le fichier.",
+    },
+    "chat.attachment_error_mime": {
+        "en": "The selected provider/model does not accept the format of {name}.",
+        "fr": "Le fournisseur ou modèle sélectionné n’accepte pas le format de {name}.",
+    },
+    "chat.attachment_error_size": {
+        "en": "{name} exceeds the selected provider’s image limit. The draft was kept.",
+        "fr": "{name} dépasse la limite d’image du fournisseur sélectionné. Le brouillon a été conservé.",
+    },
+    "chat.attachment_error_count": {
+        "en": "The selected provider accepts fewer images in one request. Remove one or more images.",
+        "fr": "Le fournisseur sélectionné accepte moins d’images par requête. Retirez une ou plusieurs images.",
+    },
+    "chat.attachment_error_resources": {
+        "en": "The image cannot be prepared safely with the currently available memory.",
+        "fr": "L’image ne peut pas être préparée en sécurité avec la mémoire actuellement disponible.",
+    },
+    "chat.attachment_error_invalid": {
+        "en": "The attachment draft is invalid. Remove the affected file and try again.",
+        "fr": "Le brouillon de pièces jointes est invalide. Retirez le fichier concerné puis réessayez.",
+    },
     "chat.input_placeholder": {
         "en": "Message OSIA…",
         "fr": "Écrire à OSIA…",

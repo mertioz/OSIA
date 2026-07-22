@@ -24,6 +24,7 @@ import re
 import shlex
 import threading
 import webbrowser
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -74,6 +75,12 @@ from osia.gui.motion import (
 from osia.gui.streaming import DesktopTextStreamController
 from osia.gui.theme import PALETTES, get_theme_manager, themed_stylesheet
 from osia.gui.update_ui import UpdateBanner, UpdateController, UpdateSettingsSection
+from osia.desktop_attachments import (
+    DesktopAttachmentError,
+    DraftAttachment,
+    readable_file_size,
+    stage_attachment,
+)
 
 # sip lets us detect widgets whose C++ side has already been destroyed
 # (accessing them raises RuntimeError otherwise). It ships with PyQt6 but
@@ -371,16 +378,128 @@ class _ComposerButton(QPushButton):
         painter.end()
 
 
+class _ComposerInput(QTextEdit):
+    """Compact multiline editor: Enter submits, Shift+Enter inserts a newline."""
+
+    send_requested = pyqtSignal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAcceptRichText(False)
+        self.setTabChangesFocus(True)
+        self.setFixedHeight(42)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def text(self) -> str:
+        """Compatibility accessor for the former QLineEdit composer."""
+
+        return self.toPlainText()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt method name)
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+                self.send_requested.emit()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+
+class _AttachmentChip(QFrame):
+    """Path-free, removable presentation for one pending draft item."""
+
+    remove_requested = pyqtSignal(str)
+
+    def __init__(self, attachment: DraftAttachment) -> None:
+        super().__init__()
+        self._attachment = attachment
+        self._display_name = attachment.display_name
+        self.setObjectName("attachmentChip")
+        self.setProperty("validation", attachment.validation_state)
+        self.setAccessibleName(
+            f"{attachment.display_name}, {readable_file_size(attachment.size_bytes)}"
+        )
+        self.setFixedHeight(34)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(8, 4, 5, 4)
+        row.setSpacing(7)
+
+        kind = QLabel("▣" if attachment.attachment_type == "image" else "▧")
+        kind.setObjectName("attachmentKind")
+        kind.setAccessibleName(
+            i18n.t(
+                "chat.attachment_image"
+                if attachment.attachment_type == "image"
+                else "chat.attachment_file"
+            )
+        )
+
+        self._name = QLabel()
+        self._name.setObjectName("attachmentName")
+        self._name.setTextFormat(Qt.TextFormat.PlainText)
+        self._name.setMinimumWidth(0)
+        self._name.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred,
+        )
+        # A filename is useful context; the private source directory never is.
+        self._name.setToolTip(attachment.display_name)
+
+        size = QLabel(readable_file_size(attachment.size_bytes))
+        size.setObjectName("attachmentSize")
+
+        remove = QPushButton("×")
+        remove.setObjectName("attachmentRemove")
+        remove.setFixedSize(24, 24)
+        remove.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove.setToolTip(
+            i18n.t("chat.attachment_remove", name=attachment.display_name)
+        )
+        remove.setAccessibleName(remove.toolTip())
+        remove.clicked.connect(
+            lambda _checked=False: self.remove_requested.emit(attachment.draft_id)
+        )
+
+        row.addWidget(kind)
+        row.addWidget(self._name, 1)
+        row.addWidget(size)
+        row.addWidget(remove)
+        self._refresh_elision()
+
+    def _refresh_elision(self) -> None:
+        width = max(40, self._name.width())
+        self._name.setText(
+            self._name.fontMetrics().elidedText(
+                self._display_name, Qt.TextElideMode.ElideMiddle, width,
+            )
+        )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt method name)
+        super().resizeEvent(event)
+        self._refresh_elision()
+
+
+@dataclass
+class _ComposerDraft:
+    text: str = ""
+    attachments: list[DraftAttachment] = field(default_factory=list)
+
+
 class _ChatPage(QWidget):
     """Scrollable message list + text input row at the bottom."""
 
     send_text = pyqtSignal(str)
+    submit_draft = pyqtSignal(str, object)
+    # Kept as a compatibility signal. Selecting a file no longer emits it.
     pick_file = pyqtSignal(str, str)
     _BUSY_TEXT = "OSIA is still working in this conversation."
 
     def __init__(self):
         super().__init__()
         self._busy = False
+        self._draft_context: str | None = None
+        self._drafts: dict[str | None, _ComposerDraft] = {}
+        self._pending_attachments: list[DraftAttachment] = []
         self._motion = MotionController(
             self,
             reduced_motion=lambda: (
@@ -447,6 +566,26 @@ class _ChatPage(QWidget):
         self._notice_timer.timeout.connect(self._notice.hide)
         input_layout.addWidget(self._notice)
 
+        self._attachment_scroll = QScrollArea()
+        self._attachment_scroll.setObjectName("attachmentScroll")
+        self._attachment_scroll.setWidgetResizable(True)
+        self._attachment_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._attachment_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._attachment_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._attachment_scroll.setMaximumHeight(76)
+        self._attachment_host = QWidget()
+        self._attachment_host.setObjectName("attachmentHost")
+        self._attachment_layout = QVBoxLayout(self._attachment_host)
+        self._attachment_layout.setContentsMargins(0, 0, 0, 0)
+        self._attachment_layout.setSpacing(4)
+        self._attachment_scroll.setWidget(self._attachment_host)
+        self._attachment_scroll.hide()
+        input_layout.addWidget(self._attachment_scroll)
+
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
@@ -455,17 +594,20 @@ class _ChatPage(QWidget):
         self._file_btn.setObjectName("iconBtn")
         self._file_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._file_btn.setToolTip(i18n.t("chat.attach_file"))
+        self._file_btn.setAccessibleName(i18n.t("chat.attach_file"))
         self._file_btn.clicked.connect(self._on_pick_file)
 
-        self._input = QLineEdit()
+        self._input = _ComposerInput()
         self._input.setObjectName("chatInput")
         self._input.setPlaceholderText(i18n.t("chat.input_placeholder"))
-        self._input.returnPressed.connect(self._on_send)
+        self._input.setAccessibleName(i18n.t("chat.input_placeholder"))
+        self._input.send_requested.connect(self._on_send)
 
         self._send_btn = _ComposerButton("send")
         self._send_btn.setObjectName("sendBtn")
         self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._send_btn.setToolTip(i18n.t("chat.send"))
+        self._send_btn.setAccessibleName(i18n.t("chat.send"))
         self._send_btn.clicked.connect(self._on_send)
         self._input.textChanged.connect(self._sync_send_state)
         self._sync_send_state()
@@ -482,14 +624,135 @@ class _ChatPage(QWidget):
 
     def _retranslate(self) -> None:
         self._file_btn.setToolTip(i18n.t("chat.attach_file"))
+        self._file_btn.setAccessibleName(i18n.t("chat.attach_file"))
         self._input.setPlaceholderText(
             self._BUSY_TEXT if self._busy else i18n.t("chat.input_placeholder")
         )
+        self._input.setAccessibleName(i18n.t("chat.input_placeholder"))
         self._send_btn.setToolTip(i18n.t("chat.send"))
+        self._send_btn.setAccessibleName(i18n.t("chat.send"))
+        self._rebuild_attachment_chips()
         if not _is_deleted(self._empty):
             self._empty.setText(i18n.t("chat.empty"))
 
     # ── Public API ────────────────────────────────────────────────────────
+
+    def pending_attachments(self) -> tuple[DraftAttachment, ...]:
+        return tuple(self._pending_attachments)
+
+    def set_draft_context(self, conversation_id: str | None) -> None:
+        """Save and restore text plus attachments for one conversation."""
+
+        if conversation_id == self._draft_context:
+            return
+        self._save_current_draft()
+        self._draft_context = conversation_id
+        self._load_current_draft()
+
+    def bind_unbound_draft(self, conversation_id: str) -> None:
+        """Move the pre-first-message draft onto its lazily created chat."""
+
+        if not conversation_id or None not in self._drafts:
+            return
+        self._save_current_draft()
+        unbound = self._drafts.pop(None)
+        self._drafts[conversation_id] = unbound
+        self._draft_context = conversation_id
+        self._load_current_draft()
+
+    def discard_draft(self, conversation_id: str | None) -> None:
+        self._drafts.pop(conversation_id, None)
+        if self._draft_context == conversation_id:
+            self._input.clear()
+            self._pending_attachments = []
+            self._rebuild_attachment_chips()
+            self._sync_send_state()
+
+    def accept_draft_submission(self, attachment_ids) -> bool:
+        expected = tuple(item.draft_id for item in self._pending_attachments)
+        if expected != tuple(attachment_ids or ()):
+            return False
+        self._input.clear()
+        self._pending_attachments = []
+        self._drafts.pop(self._draft_context, None)
+        self._rebuild_attachment_chips()
+        self._sync_send_state()
+        self._input.setFocus()
+        return True
+
+    def mark_draft_failure(self, error: DesktopAttachmentError) -> None:
+        affected = error.attachment_id
+        for item in self._pending_attachments:
+            if affected is None or item.draft_id == affected:
+                item.validation_state = "error"
+                item.error_code = error.code
+        self._rebuild_attachment_chips()
+        self.show_notice(self._attachment_error_text(error), duration_ms=7000)
+
+    def show_attachment_error(self, error: DesktopAttachmentError) -> None:
+        self.mark_draft_failure(error)
+
+    def _save_current_draft(self) -> None:
+        text = self._input.toPlainText()
+        if text or self._pending_attachments:
+            self._drafts[self._draft_context] = _ComposerDraft(
+                text=text,
+                attachments=list(self._pending_attachments),
+            )
+        else:
+            self._drafts.pop(self._draft_context, None)
+
+    def _load_current_draft(self) -> None:
+        draft = self._drafts.get(self._draft_context, _ComposerDraft())
+        self._input.blockSignals(True)
+        self._input.setPlainText(draft.text)
+        self._input.blockSignals(False)
+        self._pending_attachments = list(draft.attachments)
+        self._rebuild_attachment_chips()
+        self._sync_send_state()
+
+    def _rebuild_attachment_chips(self) -> None:
+        while self._attachment_layout.count():
+            layout_item = self._attachment_layout.takeAt(0)
+            widget = layout_item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for attachment in self._pending_attachments:
+            chip = _AttachmentChip(attachment)
+            chip.remove_requested.connect(self._remove_attachment)
+            self._attachment_layout.addWidget(chip)
+        self._attachment_scroll.setVisible(bool(self._pending_attachments))
+
+    def _remove_attachment(self, draft_id: str) -> None:
+        self._pending_attachments = [
+            item for item in self._pending_attachments
+            if item.draft_id != draft_id
+        ]
+        self._rebuild_attachment_chips()
+        self._sync_send_state()
+        self._input.setFocus()
+
+    @staticmethod
+    def _attachment_error_text(error: DesktopAttachmentError) -> str:
+        key = {
+            "missing_file": "chat.attachment_error_missing",
+            "not_regular_file": "chat.attachment_error_regular",
+            "empty_file": "chat.attachment_error_empty",
+            "unreadable_file": "chat.attachment_error_unreadable",
+            "changed_file": "chat.attachment_error_changed",
+            "unsupported_provider": "chat.attachment_error_provider",
+            "unsupported_model": "chat.attachment_error_model",
+            "unsupported_mime": "chat.attachment_error_mime",
+            "provider_size_limit": "chat.attachment_error_size",
+            "too_many_images": "chat.attachment_error_count",
+            "resource_limit": "chat.attachment_error_resources",
+        }.get(error.code, "chat.attachment_error_invalid")
+        return i18n.t(
+            key,
+            name=error.display_name or i18n.t("chat.attachment_file"),
+            provider=error.provider or "",
+            model=error.model or "",
+        )
 
     def clear_messages(self) -> None:
         self._stream.clear()
@@ -597,18 +860,20 @@ class _ChatPage(QWidget):
         )
 
     def _sync_send_state(self, _text: str | None = None) -> None:
-        enabled = not self._busy and bool(self._input.text().strip())
+        enabled = not self._busy and bool(
+            self._input.toPlainText().strip() or self._pending_attachments
+        )
         self._send_btn.setEnabled(enabled)
         self._send_btn.setCursor(
             Qt.CursorShape.ArrowCursor
             if not enabled else Qt.CursorShape.PointingHandCursor
         )
 
-    def show_notice(self, text: str) -> None:
+    def show_notice(self, text: str, *, duration_ms: int = 2600) -> None:
         self._notice.setText(text)
         self._notice.show()
         self._motion.fade_in(self._notice, MOTION.state_ms)
-        self._notice_timer.start(2600)
+        self._notice_timer.start(max(0, int(duration_ms)))
 
     @staticmethod
     def _build_empty_label() -> QLabel:
@@ -691,19 +956,46 @@ class _ChatPage(QWidget):
         if self._busy:
             self.show_notice(self._BUSY_TEXT)
             return
-        text = self._input.text().strip()
-        if not text:
+        text = self._input.toPlainText().strip()
+        if not text and not self._pending_attachments:
+            self._sync_send_state()
+            return
+        if self._pending_attachments:
+            for item in self._pending_attachments:
+                item.validation_state = "pending"
+                item.error_code = None
+            self._rebuild_attachment_chips()
+            self.submit_draft.emit(text, list(self._pending_attachments))
             self._sync_send_state()
             return
         self._input.clear()
         self.send_text.emit(text)
 
     def _on_pick_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, i18n.t("chat.attach_file"))
-        if path:
-            prompt = self._input.text().strip()
-            self._input.clear()
-            self.pick_file.emit(path, prompt)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, i18n.t("chat.attach_file")
+        )
+        if not paths:
+            self._input.setFocus()
+            return
+        next_order = 0
+        if self._pending_attachments:
+            next_order = max(
+                item.logical_order for item in self._pending_attachments
+            ) + 1
+        for path in paths:
+            try:
+                attachment = stage_attachment(path, next_order)
+            except DesktopAttachmentError as error:
+                self.show_notice(
+                    self._attachment_error_text(error), duration_ms=7000,
+                )
+                continue
+            self._pending_attachments.append(attachment)
+            next_order += 1
+        self._rebuild_attachment_chips()
+        self._sync_send_state()
+        self._input.setFocus()
 
 
 # ── Conversations panel ────────────────────────────────────────────────────
@@ -9131,6 +9423,7 @@ class MainPopup(QWidget):
     """Floating glass panel anchored just below the Dynamic Island."""
 
     send_text = pyqtSignal(str)
+    submit_draft = pyqtSignal(str, object)
     pick_file = pyqtSignal(str, str)
     new_conversation = pyqtSignal()
     open_conversation = pyqtSignal(str)
@@ -9308,6 +9601,7 @@ class MainPopup(QWidget):
         self._stack.setSizePolicy(_stack_sp)
         self._chat = _ChatPage()
         self._chat.send_text.connect(self.send_text.emit)
+        self._chat.submit_draft.connect(self.submit_draft.emit)
         self._chat.pick_file.connect(self.pick_file.emit)
 
         self._convs = _ConversationsPanel()
@@ -9631,6 +9925,18 @@ class MainPopup(QWidget):
     def set_messages(self, messages: list[dict]) -> None:
         self._chat.set_messages(messages)
 
+    def bind_unbound_draft(self, conversation_id: str) -> None:
+        self._chat.bind_unbound_draft(conversation_id)
+
+    def accept_draft_submission(self, attachment_ids) -> bool:
+        return self._chat.accept_draft_submission(attachment_ids)
+
+    def show_attachment_error(self, error: DesktopAttachmentError) -> None:
+        self._chat.show_attachment_error(error)
+
+    def discard_conversation_draft(self, conversation_id: str | None) -> None:
+        self._chat.discard_draft(conversation_id)
+
     def reset_conversation(self) -> None:
         """Clear the chat view back to its empty state and show the chat page.
 
@@ -9657,6 +9963,8 @@ class MainPopup(QWidget):
         self._chat.cancel_assistant_stream(flush=flush)
 
     def refresh_conversations(self, active_id: str | None) -> None:
+        if active_id != self._active_conversation_id:
+            self._chat.set_draft_context(active_id)
         self._active_conversation_id = active_id
         self._convs.set_active(active_id)
         self._apply_current_busy()
@@ -10009,7 +10317,7 @@ class MainPopup(QWidget):
             QFrame#inputWrap:hover {
                 border: 1px solid rgba(196, 181, 245, 0.26);
             }
-            QLineEdit#chatInput {
+            QTextEdit#chatInput {
                 background: transparent;
                 border: none;
                 color: #e8e6f0;
@@ -10050,7 +10358,7 @@ class MainPopup(QWidget):
             QPushButton#iconBtn:focus, QPushButton#sendBtn:focus {
                 border: 2px solid rgba(196, 181, 245, 0.72);
             }
-            QLineEdit#chatInput:focus {
+            QTextEdit#chatInput:focus {
                 background: rgba(196, 181, 245, 0.06);
                 border-radius: 6px;
             }
@@ -10061,13 +10369,55 @@ class MainPopup(QWidget):
                 border: 1px solid rgba(119, 116, 128, 0.32);
                 color: #777480;
             }
-            QLineEdit#chatInput:disabled {
+            QTextEdit#chatInput:disabled {
                 color: rgba(232, 230, 240, 0.46);
             }
             QLabel#chatNotice {
                 color: rgba(232, 230, 240, 0.72);
                 font-size: 11px;
                 padding: 0 2px 2px 2px;
+            }
+            QScrollArea#attachmentScroll, QWidget#attachmentHost {
+                background: transparent;
+                border: none;
+            }
+            QFrame#attachmentChip {
+                background: rgba(196, 181, 245, 0.07);
+                border: 1px solid rgba(196, 181, 245, 0.20);
+                border-radius: 8px;
+            }
+            QFrame#attachmentChip[validation="error"] {
+                border: 1px solid rgba(220, 100, 100, 0.72);
+                background: rgba(120, 45, 55, 0.16);
+            }
+            QLabel#attachmentKind {
+                color: #c4b5f5;
+                font-size: 8px;
+                font-weight: 700;
+                background: transparent;
+            }
+            QLabel#attachmentName {
+                color: #e8e6f0;
+                font-size: 11px;
+                background: transparent;
+            }
+            QLabel#attachmentSize {
+                color: rgba(232, 230, 240, 0.58);
+                font-size: 9px;
+                background: transparent;
+            }
+            QPushButton#attachmentRemove {
+                color: rgba(232, 230, 240, 0.72);
+                background: transparent;
+                border: none;
+                border-radius: 6px;
+                padding: 0px;
+                font-size: 16px;
+            }
+            QPushButton#attachmentRemove:hover,
+            QPushButton#attachmentRemove:focus {
+                color: #e8e6f0;
+                background: rgba(196, 181, 245, 0.18);
             }
 
             /* Bottom nav (icons are painted by _NavButton) ───────────── */
