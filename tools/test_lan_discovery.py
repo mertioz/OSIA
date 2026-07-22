@@ -10,6 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from osia import lan_discovery, lan_gateway
+from osia.version import PRODUCT_VERSION
 
 
 class _FakeServiceInfo:
@@ -79,7 +80,7 @@ class LanDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             service.properties,
             {
                 b"protocol": b"1",
-                b"product_version": b"1.0.4",
+                b"product_version": PRODUCT_VERSION.encode("ascii"),
                 b"instance": b"0123456789abcdef",
             },
         )
