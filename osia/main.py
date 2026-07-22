@@ -863,7 +863,7 @@ def wake_mode():
     # ── Agent run helpers ────────────────────────────────────────────────
 
     def _run_agent(
-        user_text: str,
+        user_input,
         conv_id: str,
         history: list[dict],
         *,
@@ -911,7 +911,7 @@ def wake_mode():
                     flush=True,
                 )
             reply = turn_agent.run(
-                user_text,
+                user_input,
                 history=history,
                 on_sentence=on_stream_sentence,
                 on_first_token=on_first_token,
@@ -1028,8 +1028,8 @@ def wake_mode():
 
     # ── Text handler (typed message in popup) ────────────────────────────
 
-    def handle_send_text(text: str):
-        conv = _ensure_active_conversation(text)
+    def _send_user_input(user_input, display_text: str) -> None:
+        conv = _ensure_active_conversation(display_text)
         conv_id = conv["id"]
         if _is_conversation_busy(conv_id):
             popup.show_conversation_busy_notice()
@@ -1038,12 +1038,15 @@ def wake_mode():
         tts_stop()
         history = _history_for_conversation(conv_id)
         _set_conversation_busy(conv_id, True)
-        bridge.chat_message_for_conversation.emit(conv_id, "user", text)
+        bridge.chat_message_for_conversation.emit(conv_id, "user", display_text)
 
         def process():
-            _run_agent(text, conv_id, history, voice_response=False)
+            _run_agent(user_input, conv_id, history, voice_response=False)
 
         threading.Thread(target=process, daemon=True).start()
+
+    def handle_send_text(text: str):
+        _send_user_input(text, text)
 
     # ── Popup chat / message wiring ─────────────────────────────────────
 
@@ -1188,10 +1191,19 @@ def wake_mode():
     def handle_remote_models(remote):
         popup.set_remote_models(remote)
 
-    def handle_pick_file(path: str):
-        # Surface the attachment as a user message so the agent can react.
-        msg = f"[File attached: {path}]"
-        handle_send_text(msg)
+    def handle_pick_file(path: str, prompt: str):
+        from osia.attachments import (
+            AttachmentProtocolError,
+            build_local_attachment_input,
+        )
+
+        try:
+            user_input, display_name = build_local_attachment_input(prompt, path)
+        except AttachmentProtocolError as exc:
+            popup.show_notice(f"Attachment rejected: {exc.code}")
+            return
+        display_text = f"{prompt.strip()}\n📎 {display_name}".strip()
+        _send_user_input(user_input, display_text)
 
     # ── Signal wiring ───────────────────────────────────────────────────
 

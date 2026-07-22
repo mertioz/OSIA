@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import queue
 import re
 import threading
@@ -77,8 +78,6 @@ def _text_content(content) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        # Deliberately exclude image/file parts. The account provider never
-        # automatically attaches local screenshots or files.
         parts = []
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
@@ -87,10 +86,36 @@ def _text_content(content) -> str:
     return str(content or "")
 
 
+def _public_content(content):
+    """Return an idempotent, base64-free representation for thread matching."""
+
+    if not isinstance(content, list):
+        return _text_content(content)
+    from osia.image_inputs import decode_image_data_url
+
+    public = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text":
+            public.append({"type": "text", "text": str(item.get("text") or "")})
+        elif item.get("type") == "image_ref":
+            public.append(dict(item))
+        elif item.get("type") == "image_url":
+            decoded = decode_image_data_url(item.get("image_url"))
+            public.append({
+                "type": "image_ref",
+                "mime": decoded.mime,
+                "byte_size": len(decoded.data),
+                "sha256": hashlib.sha256(decoded.data).hexdigest(),
+            })
+    return public
+
+
 def _public_message(message: dict) -> dict:
     return {
         "role": str(message.get("role") or "user"),
-        "content": _text_content(message.get("content")),
+        "content": _public_content(message.get("content")),
     }
 
 
@@ -100,20 +125,53 @@ def _same_messages(left: list[dict], right: list[dict]) -> bool:
     return all(_public_message(a) == _public_message(b) for a, b in zip(left, right))
 
 
-def _turn_input(messages: list[dict]) -> str:
+def _turn_input(messages: list[dict]) -> str | list[dict]:
     if len(messages) == 1 and messages[0].get("role") == "user":
-        return _text_content(messages[0].get("content"))
+        content = messages[0].get("content")
+        if isinstance(content, list) and any(
+            isinstance(item, dict) and item.get("type") == "image_url"
+            for item in content
+        ):
+            return [dict(item) for item in content if isinstance(item, dict)]
+        return _text_content(content)
     blocks = []
     for message in messages:
         role = str(message.get("role") or "user").upper()
         content = _text_content(message.get("content"))
         if content:
             blocks.append(f"[{role}]\n{content}")
-    return (
+    text_turn = (
         "Continue the OSIA conversation below. Role labels are context, not "
         "instructions to quote. Respond to the final USER message.\n\n"
         + "\n\n".join(blocks)
     )
+    if not any(
+        isinstance(message.get("content"), list)
+        and any(
+            isinstance(item, dict) and item.get("type") == "image_url"
+            for item in message["content"]
+        )
+        for message in messages
+    ):
+        return text_turn
+
+    parts: list[dict] = [{"type": "text", "text": (
+        "Continue the OSIA conversation below. Role labels are context, not "
+        "instructions to quote. Respond to the final USER message."
+    )}]
+    for message in messages:
+        role = str(message.get("role") or "user").upper()
+        content = message.get("content")
+        if isinstance(content, list):
+            parts.append({"type": "text", "text": f"[{role}]"})
+            for item in content:
+                if isinstance(item, dict) and item.get("type") in {"text", "image_url"}:
+                    parts.append(dict(item))
+        else:
+            text = _text_content(content)
+            if text:
+                parts.append({"type": "text", "text": f"[{role}]\n{text}"})
+    return parts
 
 
 def _sanitized_system_prompt(system: str, messages: list[dict]) -> str:
@@ -255,14 +313,15 @@ class ChatGPTAccountProvider:
         public = [_public_message(message) for message in messages]
         system = next((m["content"] for m in public if m["role"] == "system"), "")
         system = _sanitized_system_prompt(system, public)
-        non_system = [m for m in public if m["role"] != "system"]
+        public_non_system = [m for m in public if m["role"] != "system"]
+        non_system = [message for message in messages if message.get("role") != "system"]
         with self._lock:
             state = self._threads.get(conversation_id)
             reusable = bool(
                 state
                 and state.generation == self.client.generation
                 and state.model == model
-                and _same_messages(state.expected_messages, non_system)
+                and _same_messages(state.expected_messages, public_non_system)
             )
             delta = non_system[len(state.expected_messages):] if reusable and state else non_system
         if not reusable:
@@ -296,13 +355,18 @@ class ChatGPTAccountProvider:
     ) -> TurnResult:
         try:
             state, delta_messages = self._prepare(conversation_id, model, messages)
-            result = self.client.run_turn(
+            turn_input = _turn_input(delta_messages)
+            run_kwargs = dict(
                 thread_id=state.thread_id,
-                text=_turn_input(delta_messages),
                 model=model,
                 effort=effort,
                 on_delta=on_delta,
             )
+            if isinstance(turn_input, list):
+                run_kwargs["content"] = turn_input
+            else:
+                run_kwargs["text"] = turn_input
+            result = self.client.run_turn(**run_kwargs)
             with self._lock:
                 current = self._threads.get(conversation_id)
                 if current is state:

@@ -3387,21 +3387,11 @@ def _execute_tool_with_retry(tool_name: str, kwargs: dict):
 
 
 def _provider_supports_vision(provider: str, model: str) -> bool:
-    """Return True only for models that accept OpenAI vision-style content
-    arrays (list of ``{"type": "text"|"image_url", ...}`` parts) in message
-    content: Gemini and GPT-4o variants.
+    """Return the central, exact capability result for a PNG screenshot."""
 
-    Every other provider/model (DeepSeek, Groq Llama/Qwen, xAI, Ollama, …)
-    only accepts plain strings as message content — sending a list raises
-    ``400 messages[N].content must be a string`` and cuts the response.
-    """
-    provider_l = (provider or "").lower()
-    model_l = (model or "").lower()
-    if provider_l == "google" or "gemini" in model_l:
-        return True
-    if "gpt-4o" in model_l:
-        return True
-    return False
+    from osia.image_inputs import image_input_decision
+
+    return image_input_decision(provider, model, ("image/png",)).usable
 
 
 # Mandatory instruction prepended to every navigation tool result (navigate,
@@ -4489,6 +4479,10 @@ def _sanitize_persisted_history_message(msg: dict) -> dict | None:
         return None
 
     clean = dict(msg)
+    if isinstance(raw, list):
+        # Native image data is turn-scoped. Persist only the accompanying text:
+        # never carry base64 into conversation storage or resend it next turn.
+        clean["content"] = text
     if role == "assistant" and isinstance(raw, str):
         stripped = strip_raw_tool_tags(raw)
         stripped = strip_bare_tool_json(stripped).strip()
@@ -4846,7 +4840,9 @@ class OSIAAgent:
             for a, b in zip(msgs, msgs[1:])
         )
         if not has_internal and not has_adjacent_dupes:
-            return msgs
+            from osia.image_inputs import adapt_messages_for_provider
+
+            return adapt_messages_for_provider(msgs, self.provider)
 
         wire: list = []
         for m in msgs:
@@ -4864,7 +4860,9 @@ class OSIAAgent:
                     )
                     continue
             wire.append(m)
-        return wire
+        from osia.image_inputs import adapt_messages_for_provider
+
+        return adapt_messages_for_provider(wire, self.provider)
 
     def _reasoning_request_kwargs(self) -> dict:
         """Return provider reasoning kwargs for the current chat attempt."""
@@ -5285,6 +5283,7 @@ class OSIAAgent:
         stops gracefully and returns a summary of what was done.
         """
         scheduled_execution = _SCHEDULED_EXECUTION_CONTEXT.get()
+        user_text = _history_text_for_hygiene(user_input)
         self._chatgpt_conversation_id = current_conversation_id
         if history is not None:
             # Defensively strip anything that looks like a system prompt
@@ -5316,7 +5315,7 @@ class OSIAAgent:
 
         memory_store = getattr(self, "_memory_store", None)
         memory_context = _memory_runtime.build_memory_context(
-            user_input,
+            user_text,
             store=memory_store,
         )
         if memory_context:
@@ -5344,7 +5343,7 @@ class OSIAAgent:
             and not bool(getattr(self, "_disable_hierarchy_for_turn", False))
         )
         if _hierarchy_enabled:
-            _route_category, route_candidates = self._resolve_route(user_input)
+            _route_category, route_candidates = self._resolve_route(user_text)
         else:
             _route_category, route_candidates = (None, [])
         route_idx = 0
@@ -5450,6 +5449,9 @@ class OSIAAgent:
         while True:
             schedule_guard_state["buffered_sentences"] = []
             try:
+                from osia.image_inputs import ensure_image_input_supported
+
+                ensure_image_input_supported(self.provider, self.model, user_input)
                 if on_sentence is not None:
                     # on_first_token only fires the first time a delta arrives
                     # in this round. The server-side flag dedupes across rounds.
@@ -5699,7 +5701,7 @@ class OSIAAgent:
                         tool_name in _SCHEDULED_TASK_TOOL_NAMES
                         and scheduled_execution is None
                         and not _scheduled_tasks.allows_scheduled_task_tool(
-                            user_input,
+                            user_text,
                             tool_name,
                         )
                     ):
@@ -5720,7 +5722,7 @@ class OSIAAgent:
                     if tool_name == "save_memory":
                         token = _memory_runtime.set_save_memory_context(
                             store=memory_store,
-                            user_text=user_input,
+                            user_text=user_text,
                         )
                         try:
                             result, is_error = _execute_tool_with_retry(tool_name, kwargs)
@@ -5773,7 +5775,7 @@ class OSIAAgent:
                         try:
                             from osia.action_policy import guard_tool_call
                             policy_error = guard_tool_call(
-                                user_input, tool_name, kwargs,
+                                user_text, tool_name, kwargs,
                             )
                         except Exception:
                             policy_error = (
@@ -6015,7 +6017,7 @@ class OSIAAgent:
             if (
                 not memory_save_tool_seen
                 and not any_tool_executed
-                and _memory_runtime.looks_like_memory_request(user_input)
+                and _memory_runtime.looks_like_memory_request(user_text)
             ):
                 if not memory_request_retry_used:
                     memory_request_retry_used = True
@@ -6111,7 +6113,7 @@ class OSIAAgent:
                 scheduled_execution is None
                 and not scheduled_task_tool_seen
                 and not any_tool_executed
-                and _scheduled_tasks.looks_like_schedule_request(user_input)
+                and _scheduled_tasks.looks_like_schedule_request(user_text)
             ):
                 if not scheduled_task_request_retry_used:
                     scheduled_task_request_retry_used = True

@@ -2,7 +2,8 @@
 
 The process is deliberately isolated from the normal Codex installation and
 from OSIA's repository/configuration.  Only agent-message text is accepted as
-provider output; every native action item or approval request cancels the turn.
+provider output; turn-scoped local images are input-only, and every native
+action item or approval request cancels the turn.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -1027,7 +1029,7 @@ class AppServerClient:
                 if not isinstance(item, dict) or item.get("hidden"):
                     continue
                 model_id = str(item.get("id") or item.get("model") or "").strip()
-                modalities = item.get("inputModalities") or ["text", "image"]
+                modalities = item.get("inputModalities") or ["text"]
                 if not model_id or "text" not in modalities:
                     continue
                 efforts = []
@@ -1135,12 +1137,20 @@ class AppServerClient:
         self,
         *,
         thread_id: str,
-        text: str,
         model: str,
+        text: str | None = None,
+        content: str | list[dict] | None = None,
         effort: str | None = None,
         on_delta: Callable[[str], None] | None = None,
         timeout: float = 300.0,
     ) -> TurnResult:
+        turn_content = content if content is not None else text
+        if turn_content is None:
+            raise AppServerError(
+                "ERROR: no ChatGPT account turn input was provided.",
+                category="empty_input",
+            )
+        staged_images: list[Path] = []
         attempt = _TurnAttempt(thread_id=thread_id)
         with self._state_lock:
             if thread_id in self._attempts:
@@ -1151,9 +1161,10 @@ class AppServerClient:
                 )
             self._attempts[thread_id] = attempt
         try:
+            app_input, staged_images = self._stage_turn_input(turn_content)
             params = {
                 "threadId": thread_id,
-                "input": [{"type": "text", "text": text}],
+                "input": app_input,
                 "model": model,
                 "approvalPolicy": "never",
                 "cwd": str(self.workspace_dir),
@@ -1237,6 +1248,84 @@ class AppServerClient:
         finally:
             with self._state_lock:
                 self._attempts.pop(thread_id, None)
+            for path in staged_images:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _stage_turn_input(
+        self,
+        content: str | list[dict],
+    ) -> tuple[list[dict], list[Path]]:
+        """Convert verified inline images to native, turn-scoped localImage items."""
+
+        if isinstance(content, str):
+            return [{"type": "text", "text": content}], []
+        if not isinstance(content, list):
+            raise AppServerError(
+                "ERROR: the ChatGPT account turn input is invalid.",
+                category="invalid_input",
+            )
+
+        from osia.attachments import MAX_ATTACHMENT_BYTES
+        from osia.image_inputs import ImageInputError, decode_image_data_url
+
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        staged: list[Path] = []
+        items: list[dict] = []
+        suffixes = {
+            "image/gif": ".gif",
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+        }
+        try:
+            for part in content:
+                if not isinstance(part, dict):
+                    raise AppServerError(
+                        "ERROR: the ChatGPT account image input is invalid.",
+                        category="invalid_input",
+                    )
+                if part.get("type") == "text":
+                    items.append({"type": "text", "text": str(part.get("text") or "")})
+                    continue
+                if part.get("type") != "image_url":
+                    raise AppServerError(
+                        "ERROR: the ChatGPT account input contains an unsupported part.",
+                        category="invalid_input",
+                    )
+                try:
+                    decoded = decode_image_data_url(
+                        part.get("image_url"),
+                        maximum_bytes=MAX_ATTACHMENT_BYTES,
+                    )
+                except ImageInputError as exc:
+                    raise AppServerError(str(exc), category="invalid_image") from exc
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix="vision-",
+                    suffix=suffixes[decoded.mime],
+                    dir=self.temp_dir,
+                    delete=False,
+                ) as handle:
+                    handle.write(decoded.data)
+                    path = Path(handle.name)
+                staged.append(path)
+                items.append({"type": "localImage", "path": str(path)})
+            if not items:
+                raise AppServerError(
+                    "ERROR: the ChatGPT account turn input is empty.",
+                    category="empty_input",
+                )
+            return items, staged
+        except Exception:
+            for path in staged:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
 
     def cancel_turn(self, *, thread_id: str, turn_id: str | None = None) -> None:
         if not turn_id:

@@ -375,7 +375,7 @@ class _ChatPage(QWidget):
     """Scrollable message list + text input row at the bottom."""
 
     send_text = pyqtSignal(str)
-    pick_file = pyqtSignal(str)
+    pick_file = pyqtSignal(str, str)
     _BUSY_TEXT = "OSIA is still working in this conversation."
 
     def __init__(self):
@@ -701,7 +701,9 @@ class _ChatPage(QWidget):
     def _on_pick_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, i18n.t("chat.attach_file"))
         if path:
-            self.pick_file.emit(path)
+            prompt = self._input.text().strip()
+            self._input.clear()
+            self.pick_file.emit(path, prompt)
 
 
 # ── Conversations panel ────────────────────────────────────────────────────
@@ -9129,7 +9131,7 @@ class MainPopup(QWidget):
     """Floating glass panel anchored just below the Dynamic Island."""
 
     send_text = pyqtSignal(str)
-    pick_file = pyqtSignal(str)
+    pick_file = pyqtSignal(str, str)
     new_conversation = pyqtSignal()
     open_conversation = pyqtSignal(str)
     rename_conversation = pyqtSignal(str, str)

@@ -143,19 +143,26 @@ def detect_type(path: Path, display_name: str) -> tuple[str, str]:
             prefix = handle.read(16)
     except OSError as exc:
         raise AttachmentProtocolError("file_read_failed") from exc
-    mime = None
-    if prefix.startswith(b"\x89PNG\r\n\x1a\n"):
-        mime = "image/png"
-    elif prefix.startswith(b"\xff\xd8\xff"):
-        mime = "image/jpeg"
-    elif prefix.startswith((b"GIF87a", b"GIF89a")):
-        mime = "image/gif"
-    elif len(prefix) >= 12 and prefix[:4] == b"RIFF" and prefix[8:12] == b"WEBP":
-        mime = "image/webp"
+    mime = detect_image_mime(prefix)
     if mime is not None:
         return "image", mime
     suffix = Path(display_name).suffix.lower()
     return "file", "application/octet-stream" if suffix not in _IMAGE_MIME else "application/octet-stream"
+
+
+def detect_image_mime(data: bytes) -> str | None:
+    """Return the supported image MIME proved by magic bytes, if any."""
+
+    prefix = data[:16]
+    if prefix.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if prefix.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if prefix.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(prefix) >= 12 and prefix[:4] == b"RIFF" and prefix[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 def _canonical_fingerprint(frame: dict) -> str:
@@ -907,6 +914,63 @@ class AttachmentBatchManager:
             self._tombstones.popitem(last=False)
 
 
+def _build_image_content(prompt: str, images: list[tuple[str, str, bytes]]) -> list[dict]:
+    image_names = ", ".join(name for name, _mime, _data in images)
+    text = (
+        "[Images jointes présentes dans les parties visuelles qui suivent : "
+        f"{image_names}. Si le fournisseur sélectionné ne donne pas accès "
+        "aux parties visuelles, signale explicitement cette incapacité du "
+        "fournisseur ; ne prétends pas qu'aucune image n'a été jointe.]\n\n"
+        f"{prompt.strip()}"
+    ).strip()
+    content: list[dict] = []
+    if text:
+        content.append({"type": "text", "text": text})
+    for _name, mime, data in images:
+        encoded = base64.b64encode(data).decode("ascii")
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{encoded}"},
+        })
+    return content
+
+
+def build_local_attachment_input(
+    prompt: str,
+    path: str | Path,
+) -> tuple[str | list[dict], str]:
+    """Capture one desktop attachment before its selected path can disappear."""
+
+    source = Path(path)
+    display_name = sanitize_display_name(source.name)
+    try:
+        before = source.stat()
+        if not source.is_file() or before.st_size <= 0:
+            raise AttachmentProtocolError("file_read_failed")
+        if before.st_size > MAX_ATTACHMENT_BYTES:
+            raise AttachmentProtocolError("file_too_large")
+        data = source.read_bytes()
+    except AttachmentProtocolError:
+        raise
+    except OSError as exc:
+        raise AttachmentProtocolError("file_read_failed") from exc
+    if len(data) != before.st_size:
+        raise AttachmentProtocolError("file_size_mismatch")
+
+    mime = detect_image_mime(data)
+    if mime is None:
+        text = f"[File attached: {source}]"
+        if prompt.strip():
+            text = f"{text}\n\n{prompt.strip()}"
+        return text, display_name
+
+    image_prompt = prompt.strip() or "Analyze the attached image."
+    return _build_image_content(
+        image_prompt,
+        [(display_name, mime, data)],
+    ), display_name
+
+
 def build_agent_input(
     prompt: str,
     attachments: list[CommittedAttachment],
@@ -931,21 +995,8 @@ def build_agent_input(
         ).strip()
     if not images:
         return text
-    image_names = ", ".join(item.display_name for item in images)
-    text = (
-        "[Images jointes présentes dans les parties visuelles qui suivent : "
-        f"{image_names}. Si le fournisseur sélectionné ne donne pas accès "
-        "aux parties visuelles, signale explicitement cette incapacité du "
-        "fournisseur ; ne prétends pas qu'aucune image n'a été jointe.]\n\n"
-        f"{text}"
-    ).strip()
-    content: list[dict] = []
-    if text:
-        content.append({"type": "text", "text": text})
-    for item in images:
-        encoded = base64.b64encode(item.path.read_bytes()).decode("ascii")
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{item.detected_mime};base64,{encoded}"},
-        })
-    return content
+    captured = [
+        (item.display_name, item.detected_mime, item.path.read_bytes())
+        for item in images
+    ]
+    return _build_image_content(text, captured)
