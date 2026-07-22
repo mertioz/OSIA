@@ -149,6 +149,13 @@ def test_manifest_rejections(path, value, code):
         updater.parse_manifest(json.dumps(raw), metadata())
 
 
+def test_production_parser_rejects_nine_release_notes():
+    raw = manifest_dict()
+    raw["releaseNotes"] = [f"Release note {index}." for index in range(9)]
+    with pytest.raises(updater.ManifestError, match="invalid_release_notes"):
+        updater.parse_manifest(json.dumps(raw), metadata())
+
+
 def test_duplicate_keys_and_non_finite_json_are_rejected():
     with pytest.raises(updater.ManifestError, match="duplicate_key"):
         updater.parse_manifest('{"schemaVersion":1,"schemaVersion":1}', metadata())

@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 
 from osia.version import PRODUCT_VERSION, parse_product_version
 from osia.release_notes import manifest_release_notes
+from osia.windows_release_policy import scan_release_payload
 
 
 STAGE = ROOT / "build" / "windows"
@@ -528,6 +529,18 @@ def _secret_scan(root: Path) -> None:
                     tail = data[-overlap:] if overlap > 0 else b""
 
 
+def _validate_release_payload(root: Path) -> None:
+    files, total_bytes = scan_release_payload(
+        root,
+        forbidden_roots=(Path.home(), ROOT, STAGE, DIST, RELEASE),
+    )
+    print(
+        f"Validated release payload safety: {files:,} files, "
+        f"{total_bytes:,} bytes under {root}",
+        flush=True,
+    )
+
+
 def build(
     skip_installer: bool = False,
     *,
@@ -559,6 +572,7 @@ def build(
     _run([sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm",
           str(ROOT / "packaging" / "windows" / "osia.spec")])
     _write_bundle_file_manifest()
+    _validate_release_payload(DIST)
     _secret_scan(DIST)
     _run([str(DIST / "OSIA.exe"), "--osia-package-smoke"])
     signed_app = _sign(DIST / "OSIA.exe")
@@ -618,6 +632,7 @@ def build(
     (RELEASE / "release-manifest.json").write_text(
         json.dumps(release_manifest, indent=2) + "\n", encoding="utf-8",
     )
+    _validate_release_payload(RELEASE)
     print(f"Built {installer} ({installer.stat().st_size:,} bytes)")
     if not signed_installer:
         print("WARNING: installer is unsigned (set OSIA_SIGN_SHA1 for release signing)")

@@ -10,6 +10,7 @@ from PyInstaller.utils.hooks import (
     collect_submodules,
     copy_metadata,
 )
+from osia.windows_release_policy import filter_pyinstaller_data_toc
 
 ROOT = Path(SPECPATH).parent.parent
 STAGE = ROOT / "build" / "windows"
@@ -93,6 +94,10 @@ a = Analysis(
     noarchive=False,
     optimize=1,
 )
+filtered_datas, excluded_generated_data = filter_pyinstaller_data_toc(a.datas)
+a.datas = filtered_datas
+for destination in excluded_generated_data:
+    print(f"Excluded generated package data: {destination}")
 pyz = PYZ(a.pure)
 
 exe = EXE(

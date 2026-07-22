@@ -29,6 +29,103 @@ def _load_launcher():
     return module
 
 
+def test_external_data_filter_preserves_licenses_and_excludes_generated_cache():
+    from osia.windows_release_policy import filter_pyinstaller_data_toc
+
+    data_entries = [
+        ("av-17.1.0.dist-info/licenses/LICENSE.txt", "license", "DATA"),
+        ("av-17.1.0.dist-info/METADATA", "metadata", "DATA"),
+        ("av-17.1.0.dist-info/licenses/__pycache__/AUTHORS.cpython-312.pyc", "cache", "DATA"),
+        ("package/generated.pyc", "cache", "DATA"),
+        ("package/generated.pyo", "cache", "DATA"),
+        ("package/runtime.pyd", "binary-data", "DATA"),
+    ]
+    pure_modules = [("osia.runtime", "osia/runtime.py", "PYMODULE")]
+
+    filtered, removed = filter_pyinstaller_data_toc(data_entries)
+
+    assert [entry[0] for entry in filtered] == [
+        "av-17.1.0.dist-info/licenses/LICENSE.txt",
+        "av-17.1.0.dist-info/METADATA",
+        "package/runtime.pyd",
+    ]
+    assert removed == (
+        "av-17.1.0.dist-info/licenses/__pycache__/AUTHORS.cpython-312.pyc",
+        "package/generated.pyc",
+        "package/generated.pyo",
+    )
+    assert pure_modules == [("osia.runtime", "osia/runtime.py", "PYMODULE")]
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "package/__pycache__/module.cpython-312.pyc",
+        "package/generated.pyc",
+        "package/generated.pyo",
+    ),
+)
+def test_release_gate_rejects_loose_generated_data(tmp_path, relative):
+    from osia.windows_release_policy import scan_release_payload
+
+    payload = tmp_path / "payload"
+    target = payload / relative
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"generated")
+    with pytest.raises(RuntimeError, match="generated cache (?:file|directory)"):
+        scan_release_payload(payload, forbidden_roots=())
+
+
+def test_release_gate_rejects_empty_pycache_directory(tmp_path):
+    from osia.windows_release_policy import scan_release_payload
+
+    payload = tmp_path / "payload"
+    (payload / "package" / "__pycache__").mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="generated cache directory"):
+        scan_release_payload(payload, forbidden_roots=())
+
+
+def test_release_gate_detects_synthetic_private_windows_path(tmp_path):
+    from osia.windows_release_policy import scan_release_payload
+
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    (payload / "metadata.bin").write_bytes(
+        rb"source=C:\Users\Alice\private-build\module.py"
+    )
+    with pytest.raises(RuntimeError, match="private build path"):
+        scan_release_payload(payload, forbidden_roots=(r"C:\Users\Alice",))
+
+
+def test_release_gate_detects_synthetic_private_unix_path(tmp_path):
+    from osia.windows_release_policy import scan_release_payload
+
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    (payload / "metadata.bin").write_bytes(
+        b"source=/home/alice/private-build/module.py"
+    )
+    with pytest.raises(RuntimeError, match="private build path"):
+        scan_release_payload(payload, forbidden_roots=("/home/alice",))
+
+
+def test_release_gate_accepts_clean_neutral_payload(tmp_path):
+    from osia.windows_release_policy import scan_release_payload
+
+    payload = tmp_path / "payload"
+    license_file = payload / "package.dist-info" / "licenses" / "LICENSE.txt"
+    license_file.parent.mkdir(parents=True)
+    license_file.write_text("Permission is granted.\n", encoding="utf-8")
+    metadata_file = license_file.parents[1] / "METADATA"
+    metadata_file.write_text("Name: package\n", encoding="utf-8")
+
+    files, total_bytes = scan_release_payload(
+        payload, forbidden_roots=(r"C:\Users\Alice", "/home/alice")
+    )
+    assert files == 2
+    assert total_bytes == license_file.stat().st_size + metadata_file.stat().st_size
+
+
 def test_runtime_source_paths_are_cwd_independent(monkeypatch, tmp_path):
     from osia import runtime
 
@@ -386,6 +483,22 @@ def test_package_spec_is_allowlist_based_and_excludes_user_config():
     assert "settings.json" not in spec
     assert "api_keys.json" not in spec
     assert '"uiautomation"' in spec
+    assert "filter_pyinstaller_data_toc(a.datas)" in spec
+    assert spec.index("a = Analysis(") < spec.index("filter_pyinstaller_data_toc(a.datas)")
+    assert spec.index("filter_pyinstaller_data_toc(a.datas)") < spec.index("pyz = PYZ(a.pure)")
+
+
+def test_release_gate_runs_before_smoke_and_after_installer_manifest():
+    build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
+    pyinstaller = build.index('sys.executable, "-m", "PyInstaller"')
+    bundle_manifest = build.index("_write_bundle_file_manifest()", pyinstaller)
+    payload_gate = build.index("_validate_release_payload(DIST)", bundle_manifest)
+    secret_scan = build.index("_secret_scan(DIST)", payload_gate)
+    smoke = build.index('DIST / "OSIA.exe"), "--osia-package-smoke"', secret_scan)
+    final_manifest = build.index('RELEASE / "release-manifest.json"', smoke)
+    final_gate = build.index("_validate_release_payload(RELEASE)", final_manifest)
+    assert pyinstaller < bundle_manifest < payload_gate < secret_scan < smoke
+    assert final_manifest < final_gate
 
 
 def test_build_uses_product_version_and_exact_installer_name():

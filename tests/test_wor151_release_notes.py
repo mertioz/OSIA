@@ -82,13 +82,6 @@ def test_embedded_notes_load_offline_and_are_newest_first():
     assert [entry.version for entry in RELEASE_HISTORY] == ["1.0.5", "1.0.4", "1.0.3"]
     current = release_for_version("1.0.5")
     assert current is not None and current.public
-    assert "getting started" in " ".join(current.changes("en")).lower()
-    assert "advanced guide" in " ".join(current.changes("en")).lower()
-    assert "complete, practical master osia" in " ".join(current.changes("en")).lower()
-    assert "page de guide simplifiée" in " ".join(current.changes("fr")).lower()
-    assert "image attachments" in " ".join(current.changes("en")).lower()
-    assert "attach files before sending" in " ".join(current.changes("en")).lower()
-    assert "joignez des fichiers avant l’envoi" in " ".join(current.changes("fr")).lower()
     previous = release_for_version("1.0.4")
     assert previous is not None and previous.public
     assert "roll back" in " ".join(previous.changes("en")).lower()
@@ -96,6 +89,60 @@ def test_embedded_notes_load_offline_and_are_newest_first():
     assert internal is not None and not internal.public
     assert "superseded" in " ".join(internal.changes("en")).lower()
     assert manifest_release_notes("1.0.5") == list(current.changes_en)
+
+
+def test_105_notes_are_bilingual_bounded_and_keep_release_semantics():
+    current = release_for_version("1.0.5")
+    assert current is not None
+    assert len(current.changes_en) <= 5
+    assert len(current.changes_fr) <= 5
+    assert len(current.changes_en) == len(current.changes_fr) == 5
+
+    english = " ".join(current.changes_en).lower()
+    for subject in (
+        "essential getting started",
+        "master osia",
+        "advanced guide",
+        "attach files before sending",
+        "multiple files",
+        "multimodal providers",
+        "does not support vision",
+        "update history offline",
+        "close osia",
+        "independent scrolling",
+        "careful reasoning",
+        "stability",
+        "update",
+        "windows distribution",
+    ):
+        assert subject in english
+
+    french = " ".join(current.changes_fr).lower()
+    for subject in (
+        "démarrage essentiel",
+        "maîtriser osia",
+        "guide avancé",
+        "joignez des fichiers avant l’envoi",
+        "plusieurs fichiers",
+        "fournisseurs multimodaux",
+        "prend pas en charge la vision",
+        "historique des mises à jour hors ligne",
+        "fermez osia",
+        "défilements indépendants",
+        "raisonnement attentif",
+        "stabilité",
+        "mise à jour",
+        "distribution windows",
+    ):
+        assert subject in french
+
+
+def test_generated_105_manifest_is_accepted_as_an_update_from_104():
+    raw = _manifest(version="1.0.5")
+    raw["releaseNotes"] = manifest_release_notes("1.0.5")
+    parsed = updater.parse_manifest(json.dumps(raw), _metadata("1.0.4"))
+    assert parsed.version == "1.0.5"
+    assert parsed.release_notes == tuple(manifest_release_notes("1.0.5"))
 
 
 def test_manifest_generator_reuses_embedded_source_and_rejects_user_marker():
