@@ -15,6 +15,7 @@ from pathlib import Path
 from osia.config import CONFIG_DIR
 from osia.guide_content import (
     CATEGORY_ADVANCED,
+    CATEGORY_MASTERY,
     GUIDE_CONTENT_SCHEMA_VERSION,
     LESSONS_BY_ID,
 )
@@ -91,21 +92,32 @@ def _progress_from_state(state: dict) -> dict:
     lesson = state.get("currentLesson")
     if not isinstance(lesson, str) or lesson not in LESSONS_BY_ID:
         lesson = ""
-    raw_advanced = state.get("advancedCompleted", [])
-    advanced: list[str] = []
-    if isinstance(raw_advanced, list):
-        for value in raw_advanced:
+    def _completed(raw, category: str) -> list[str]:
+        completed: list[str] = []
+        if not isinstance(raw, list):
+            return completed
+        for value in raw:
             registered = LESSONS_BY_ID.get(value) if isinstance(value, str) else None
             if (
                 registered is not None
-                and registered.category == CATEGORY_ADVANCED
-                and value not in advanced
+                and registered.category == category
+                and value not in completed
             ):
-                advanced.append(value)
+                completed.append(value)
+        return completed
+
+    content_version = state.get("contentSchemaVersion")
+    if not isinstance(content_version, int) or content_version < 3:
+        mastery = _completed(state.get("advancedCompleted", []), CATEGORY_MASTERY)
+        advanced: list[str] = []
+    else:
+        mastery = _completed(state.get("masteryCompleted", []), CATEGORY_MASTERY)
+        advanced = _completed(state.get("advancedCompleted", []), CATEGORY_ADVANCED)
     return {
         "contentSchemaVersion": GUIDE_CONTENT_SCHEMA_VERSION,
         "essentialCompleted": state.get("essentialCompleted") is True,
         "currentLesson": lesson,
+        "masteryCompleted": mastery,
         "advancedCompleted": advanced,
         "skipped": state.get("skipped") is True,
         "finished": state.get("finished") is True,
@@ -132,6 +144,7 @@ def update_guide_progress(
     *,
     current_lesson=_UNSET,
     essential_completed=_UNSET,
+    mastery_completed=_UNSET,
     advanced_completed=_UNSET,
     skipped=_UNSET,
     finished=_UNSET,
@@ -160,6 +173,20 @@ def update_guide_progress(
         )
     if essential_completed is not _UNSET:
         progress["essentialCompleted"] = bool(essential_completed)
+    if mastery_completed is not _UNSET:
+        values: list[str] = []
+        if isinstance(mastery_completed, (list, tuple, set)):
+            for value in mastery_completed:
+                registered = (
+                    LESSONS_BY_ID.get(value) if isinstance(value, str) else None
+                )
+                if (
+                    registered is not None
+                    and registered.category == CATEGORY_MASTERY
+                    and value not in values
+                ):
+                    values.append(value)
+        progress["masteryCompleted"] = values
     if advanced_completed is not _UNSET:
         values: list[str] = []
         if isinstance(advanced_completed, (list, tuple, set)):

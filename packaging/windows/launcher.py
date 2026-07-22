@@ -107,7 +107,11 @@ def _package_smoke() -> int:
             if onboarding_state(state_path).get("outcome") != "completed":
                 raise RuntimeError("onboarding completion did not persist")
         onboarding = OnboardingDialog(automatic=False)
-        if onboarding.ESSENTIAL_COUNT < 7 or onboarding.ADVANCED_COUNT < 7:
+        if (
+            onboarding.ESSENTIAL_COUNT < 7
+            or onboarding.MASTERY_COUNT < 16
+            or onboarding.ADVANCED_COUNT < 38
+        ):
             raise RuntimeError("packaged OSIA guide is incomplete")
         onboarding.deleteLater()
         qt_app.processEvents()

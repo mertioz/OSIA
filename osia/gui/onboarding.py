@@ -27,6 +27,7 @@ from osia.guide_content import (
     CATEGORIES,
     CATEGORY_ADVANCED,
     CATEGORY_ESSENTIAL,
+    CATEGORY_MASTERY,
     LESSONS_BY_ID,
     GuideLesson,
     lessons_for_category,
@@ -37,7 +38,7 @@ from osia.onboarding import (
     mark_onboarding_handled,
     update_guide_progress,
 )
-from osia.utils.assets import LOGO_PATH, asset_path
+from osia.utils.assets import asset_path
 
 
 class _ScaledPixmapLabel(QLabel):
@@ -82,11 +83,12 @@ class _ScaledPixmapLabel(QLabel):
 
 
 class OnboardingDialog(QDialog):
-    """Integrated guide with two categories and resumable offline lessons."""
+    """Integrated guide with three categories and resumable offline lessons."""
 
     handled = pyqtSignal(str)
 
     ESSENTIAL_COUNT = len(lessons_for_category(CATEGORY_ESSENTIAL))
+    MASTERY_COUNT = len(lessons_for_category(CATEGORY_MASTERY))
     ADVANCED_COUNT = len(lessons_for_category(CATEGORY_ADVANCED))
 
     def __init__(
@@ -101,6 +103,9 @@ class OnboardingDialog(QDialog):
         self._state_path = state_path
         self._handled = False
         self._progress_state = guide_progress(state_path)
+        self._mastery_completed = set(
+            self._progress_state.get("masteryCompleted", [])
+        )
         self._advanced_completed = set(
             self._progress_state.get("advancedCompleted", [])
         )
@@ -122,7 +127,6 @@ class OnboardingDialog(QDialog):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(18, 16, 18, 16)
         outer.setSpacing(12)
-        outer.addWidget(self._build_header())
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
@@ -155,39 +159,6 @@ class OnboardingDialog(QDialog):
             self._show_lesson(first.id, persist=True)
         else:
             self.show_home()
-
-    def _build_header(self) -> QWidget:
-        header = QFrame()
-        header.setObjectName("guideHeader")
-        layout = QHBoxLayout(header)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(12)
-
-        self._logo = QLabel()
-        self._logo.setObjectName("guideLogo")
-        self._logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._logo.setFixedSize(52, 52)
-        logo = QPixmap(LOGO_PATH)
-        if not logo.isNull():
-            self._logo.setPixmap(
-                logo.scaled(
-                    46,
-                    46,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            )
-        self._logo.setAccessibleName("OSIA")
-        layout.addWidget(self._logo)
-
-        copy = QVBoxLayout()
-        copy.setSpacing(2)
-        self._guide_title = self._label("guideTitle")
-        self._guide_subtitle = self._label("guideSubtitle")
-        copy.addWidget(self._guide_title)
-        copy.addWidget(self._guide_subtitle)
-        layout.addLayout(copy, 1)
-        return header
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QFrame()
@@ -449,6 +420,7 @@ class OnboardingDialog(QDialog):
             self._progress_state = update_guide_progress(
                 self._state_path,
                 current_lesson=lesson.id,
+                mastery_completed=sorted(self._mastery_completed),
                 advanced_completed=sorted(self._advanced_completed),
             )
         self._sync_navigation()
@@ -551,11 +523,15 @@ class OnboardingDialog(QDialog):
         current = LESSONS_BY_ID.get(self._current_lesson_id or "")
         self._skip.setVisible(self._automatic and not self._handled)
         if current is None:
-            completed = (
-                len(self._advanced_completed)
-                if self._selected_category == CATEGORY_ADVANCED
-                else (len(lessons) if self._progress_state.get("essentialCompleted") else 0)
-            )
+            if self._selected_category == CATEGORY_MASTERY:
+                completed = len(self._mastery_completed)
+            elif self._selected_category == CATEGORY_ADVANCED:
+                completed = len(self._advanced_completed)
+            else:
+                completed = (
+                    len(lessons)
+                    if self._progress_state.get("essentialCompleted") else 0
+                )
             self._progress_text.setText(
                 i18n.t("guide.category_progress", current=completed, total=len(lessons))
             )
@@ -600,7 +576,9 @@ class OnboardingDialog(QDialog):
         lesson = LESSONS_BY_ID.get(self._current_lesson_id or "")
         if lesson is None:
             return
-        if lesson.category == CATEGORY_ADVANCED:
+        if lesson.category == CATEGORY_MASTERY:
+            self._mastery_completed.add(lesson.id)
+        elif lesson.category == CATEGORY_ADVANCED:
             self._advanced_completed.add(lesson.id)
         self._progress_state = update_guide_progress(
             self._state_path,
@@ -609,6 +587,7 @@ class OnboardingDialog(QDialog):
                 self._progress_state.get("essentialCompleted", False)
                 or lesson.id == "essential.ready"
             ),
+            mastery_completed=sorted(self._mastery_completed),
             advanced_completed=sorted(self._advanced_completed),
         )
 
@@ -654,6 +633,7 @@ class OnboardingDialog(QDialog):
                 self._state_path,
                 current_lesson=self._current_lesson_id or self._progress_state.get("currentLesson", ""),
                 essential_completed=self._progress_state.get("essentialCompleted", False),
+                mastery_completed=sorted(self._mastery_completed),
                 advanced_completed=sorted(self._advanced_completed),
                 skipped=(outcome == "skipped" or self._progress_state.get("skipped", False)),
                 finished=(outcome == "completed" or self._progress_state.get("finished", False)),
@@ -668,6 +648,7 @@ class OnboardingDialog(QDialog):
             self._progress_state = update_guide_progress(
                 self._state_path,
                 current_lesson=self._current_lesson_id or self._progress_state.get("currentLesson", ""),
+                mastery_completed=sorted(self._mastery_completed),
                 advanced_completed=sorted(self._advanced_completed),
             )
         except OSError:
@@ -681,6 +662,7 @@ class OnboardingDialog(QDialog):
                 self._progress_state = update_guide_progress(
                     self._state_path,
                     current_lesson=self._current_lesson_id or self._progress_state.get("currentLesson", ""),
+                    mastery_completed=sorted(self._mastery_completed),
                     advanced_completed=sorted(self._advanced_completed),
                 )
             except OSError:
@@ -690,8 +672,6 @@ class OnboardingDialog(QDialog):
 
     def _retranslate(self) -> None:
         self.setWindowTitle(i18n.t("guide.window_title"))
-        self._guide_title.setText(i18n.t("guide.title"))
-        self._guide_subtitle.setText(i18n.t("guide.subtitle"))
         self._contents_title.setText(i18n.t("guide.contents"))
         self._toc.setAccessibleName(i18n.t("guide.contents"))
         for category in CATEGORIES:
@@ -714,13 +694,12 @@ class OnboardingDialog(QDialog):
                 background: #100d18;
                 color: #f4f0ff;
             }
-            QFrame#guideHeader, QFrame#guideFooter, QFrame#guideSidebar {
+            QFrame#guideFooter, QFrame#guideSidebar {
                 background: #191424;
                 border: 1px solid #332744;
                 border-radius: 14px;
             }
-            QLabel#guideTitle { font-size: 20px; font-weight: 700; color: #ffffff; }
-            QLabel#guideSubtitle, QLabel#guideMeta, QLabel#guideProgressText {
+            QLabel#guideMeta, QLabel#guideProgressText {
                 color: #aaa1b8; font-size: 12px;
             }
             QLabel#guideLessonTitle { font-size: 25px; font-weight: 700; color: #ffffff; }

@@ -83,6 +83,9 @@ def test_embedded_notes_load_offline_and_are_newest_first():
     current = release_for_version("1.0.5")
     assert current is not None and current.public
     assert "getting started" in " ".join(current.changes("en")).lower()
+    assert "advanced guide" in " ".join(current.changes("en")).lower()
+    assert "complete, practical master osia" in " ".join(current.changes("en")).lower()
+    assert "page de guide simplifiée" in " ".join(current.changes("fr")).lower()
     assert "image attachments" in " ".join(current.changes("en")).lower()
     assert "attach files before sending" in " ".join(current.changes("en")).lower()
     assert "joignez des fichiers avant l’envoi" in " ".join(current.changes("fr")).lower()
@@ -175,7 +178,7 @@ def test_english_french_copy_and_long_text_stay_bounded(monkeypatch, tmp_path):
         i18n.set_language("fr", persist=False)
         section.apply_state(state)
         assert section.current_card.badge.text() == "Actuelle"
-        assert "premiers pas" in section.current_card.notes.text().lower()
+        assert "démarrage essentiel" in section.current_card.notes.text().lower()
         section.show()
         _QT_APP.processEvents()
         assert section.available_card.notes.wordWrap()

@@ -14,13 +14,14 @@ import pytest
 from PIL import Image
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
+from PyQt6.QtWidgets import QApplication, QFrame, QLabel, QPushButton
 
 from osia import i18n, onboarding
 from osia.guide_content import (
     CATEGORIES,
     CATEGORY_ADVANCED,
     CATEGORY_ESSENTIAL,
+    CATEGORY_MASTERY,
     GUIDE_CONTENT_SCHEMA_VERSION,
     LESSONS,
     LESSONS_BY_ID,
@@ -140,7 +141,8 @@ def test_old_v1_state_gains_progress_without_resetting_or_reopening(tmp_path):
     progress = onboarding.guide_progress(marker)
     assert progress["contentSchemaVersion"] == GUIDE_CONTENT_SCHEMA_VERSION
     assert progress["currentLesson"] == "advanced.voice-tts-stt"
-    assert progress["advancedCompleted"] == ["advanced.pc-mobile-connection"]
+    assert progress["masteryCompleted"] == ["advanced.pc-mobile-connection"]
+    assert progress["advancedCompleted"] == []
     onboarding.update_guide_progress(marker, finished=True)
     state = onboarding.onboarding_state(marker)
     assert state["outcome"] == "completed"
@@ -170,7 +172,34 @@ def test_corrupt_progress_is_bounded_to_registered_lesson_ids(tmp_path):
     )
     progress = onboarding.guide_progress(marker)
     assert progress["currentLesson"] == ""
-    assert progress["advancedCompleted"] == ["advanced.voice-tts-stt"]
+    assert progress["masteryCompleted"] == ["advanced.voice-tts-stt"]
+    assert progress["advancedCompleted"] == []
+
+
+def test_v2_advanced_progress_migrates_to_mastery_only(tmp_path):
+    marker = tmp_path / "onboarding.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "status": "handled",
+                "outcome": "completed",
+                "contentSchemaVersion": 2,
+                "essentialCompleted": True,
+                "currentLesson": "advanced.ai-model-hierarchy",
+                "advancedCompleted": ["advanced.ai-model-hierarchy"],
+                "finished": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    progress = onboarding.guide_progress(marker)
+    assert progress["essentialCompleted"] is True
+    assert progress["currentLesson"] == "advanced.ai-model-hierarchy"
+    assert progress["masteryCompleted"] == ["advanced.ai-model-hierarchy"]
+    assert progress["advancedCompleted"] == []
+    assert progress["finished"] is True
+    assert onboarding.onboarding_state(marker)["outcome"] == "completed"
 
 
 def test_installer_marks_only_fresh_non_update_profiles():
@@ -195,24 +224,54 @@ def test_frozen_smoke_covers_complete_guide_and_assets():
     assert 'mark_onboarding_handled("completed", state_path)' in launcher
     assert "OnboardingDialog(automatic=False)" in launcher
     assert "ESSENTIAL_COUNT < 7" in launcher
-    assert "ADVANCED_COUNT < 7" in launcher
+    assert "MASTERY_COUNT < 16" in launcher
+    assert "ADVANCED_COUNT < 38" in launcher
     assert "guide asset" in launcher
     assert '(str(ROOT / "assets"), "assets")' in spec
 
 
-def test_two_categories_and_all_stable_ids_are_unique():
+def test_three_categories_and_all_stable_ids_are_unique():
     assert [category.id for category in CATEGORIES] == [
         CATEGORY_ESSENTIAL,
+        CATEGORY_MASTERY,
         CATEGORY_ADVANCED,
     ]
     ids = [lesson.id for lesson in LESSONS]
-    assert len(ids) == len(set(ids)) == 16
+    assert len(ids) == len(set(ids)) == 66
     assert set(ids) == set(LESSONS_BY_ID)
     assert len(lessons_for_category(CATEGORY_ESSENTIAL)) == 8
-    assert len(lessons_for_category(CATEGORY_ADVANCED)) == 8
+    assert len(lessons_for_category(CATEGORY_MASTERY)) == 20
+    assert len(lessons_for_category(CATEGORY_ADVANCED)) == 38
     for category in CATEGORIES:
         orders = [lesson.order for lesson in lessons_for_category(category.id)]
         assert orders == list(range(1, len(orders) + 1))
+
+
+def test_decorative_guide_header_is_removed_without_reserved_space(tmp_path):
+    source = (ROOT / "osia" / "gui" / "onboarding.py").read_text("utf-8")
+    assert "def _build_header" not in source
+    assert "outer.addWidget(self._build_header())" not in source
+    assert "guideHeader" not in source
+    assert "guideTitle" not in source
+    assert "guideSubtitle" not in source
+    dialog = OnboardingDialog(state_path=tmp_path / "state.json")
+    assert dialog.findChild(QFrame, "guideHeader") is None
+    body_top = dialog._toc.mapTo(dialog, dialog._toc.rect().topLeft()).y()
+    assert body_top < 170
+    dialog.deleteLater()
+
+
+def test_mastery_and_developer_progress_are_independent(tmp_path):
+    marker = tmp_path / "state.json"
+    progress = onboarding.update_guide_progress(
+        marker,
+        mastery_completed=["advanced.ai-model-hierarchy"],
+        advanced_completed=["advanced.handshake"],
+    )
+    assert progress["masteryCompleted"] == ["advanced.ai-model-hierarchy"]
+    assert progress["advancedCompleted"] == ["advanced.handshake"]
+    restored = onboarding.guide_progress(marker)
+    assert restored == progress
 
 
 def test_essential_content_covers_required_beginner_topics_and_every_menu_page():
@@ -237,8 +296,8 @@ def test_menu_lesson_matches_the_actual_settings_page_registry():
         assert i18n.TRANSLATIONS[key]["en"] == label
 
 
-def test_advanced_content_covers_only_audited_runtime_capabilities():
-    copy = _english_copy(lessons_for_category(CATEGORY_ADVANCED)).lower()
+def test_mastery_content_covers_only_audited_runtime_capabilities():
+    copy = _english_copy(lessons_for_category(CATEGORY_MASTERY)).lower()
     for phrase in (
         "private-lan wss",
         "webrtc/p2p",
@@ -246,10 +305,10 @@ def test_advanced_content_covers_only_audited_runtime_capabilities():
         "tts",
         "stt",
         "provider and api hierarchy",
-        "ai and model hierarchy",
-        "memory and conversations",
-        "personality, skills and automation",
-        "updates and safety",
+        "models and ai hierarchy",
+        "memory and context",
+        "scheduled tasks",
+        "updates",
     ):
         assert phrase in copy
     assert "live api is available" not in copy
@@ -258,9 +317,36 @@ def test_advanced_content_covers_only_audited_runtime_capabilities():
     assert "always prefers chatgpt" not in copy
 
 
+def test_advanced_content_covers_architecture_takeover_and_release():
+    advanced = lessons_for_category(CATEGORY_ADVANCED)
+    subjects = {lesson.subject_id for lesson in advanced}
+    assert len(subjects) == 38
+    for subject in (
+        "repository-topology",
+        "pairing-protocol",
+        "ice-stun-turn",
+        "mcp",
+        "takeover-workflow",
+        "windows-packaging",
+        "android-packaging",
+        "security-model",
+        "glossary",
+    ):
+        assert subject in subjects
+    glossary = next(lesson for lesson in advanced if lesson.subject_id == "glossary")
+    assert set(glossary.glossary_ids) == {
+        "provider", "model", "api", "token", "context", "thinking", "mcp",
+        "dcr", "oauth", "cron", "websocket", "e2e", "lan", "p2p", "webrtc",
+        "sdp", "ice", "stun", "turn", "signaling", "relay", "durable-object",
+        "hibernation", "chunking", "hash", "mime", "abi", "apk", "aab", "r8",
+        "pyinstaller", "inno-setup", "r2", "rollout", "version-name",
+        "version-code",
+    }
+
+
 def test_every_lesson_has_complete_english_and_french_copy():
     for lesson in LESSONS:
-        assert lesson.id.startswith(("essential.", "advanced."))
+        assert lesson.id.startswith(("essential.", "mastery.", "advanced."))
         for value in (
             lesson.title,
             lesson.intro,
@@ -270,7 +356,7 @@ def test_every_lesson_has_complete_english_and_french_copy():
         ):
             assert value.get("en", "").strip()
             assert value.get("fr", "").strip()
-        assert 2 <= len(lesson.paragraphs) <= 5
+        assert 1 <= len(lesson.paragraphs) <= 5
         if lesson.asset:
             assert lesson.caption and lesson.alt_text
             assert lesson.caption.get("en") and lesson.caption.get("fr")
@@ -313,11 +399,11 @@ def test_toc_category_previous_and_next_navigation(tmp_path):
     QTest.mouseClick(dialog._back, Qt.MouseButton.LeftButton)
     assert dialog._current_lesson_id == "essential.what-is-osia"
     QTest.mouseClick(
-        dialog._category_buttons[CATEGORY_ADVANCED], Qt.MouseButton.LeftButton
+        dialog._category_buttons[CATEGORY_MASTERY], Qt.MouseButton.LeftButton
     )
-    assert dialog._selected_category == CATEGORY_ADVANCED
+    assert dialog._selected_category == CATEGORY_MASTERY
     assert dialog._current_lesson_id is None
-    dialog._toc.setCurrentRow(3)
+    dialog._toc.setCurrentRow(4)
     assert dialog._current_lesson_id == "advanced.ai-model-hierarchy"
     dialog.deleteLater()
 
@@ -376,7 +462,7 @@ def test_close_and_manual_reopen_resume_from_saved_lesson(tmp_path):
     reopened = OnboardingDialog(automatic=False, state_path=marker)
     assert reopened._current_lesson_id is None
     QTest.mouseClick(
-        reopened._category_buttons[CATEGORY_ADVANCED], Qt.MouseButton.LeftButton
+        reopened._category_buttons[CATEGORY_MASTERY], Qt.MouseButton.LeftButton
     )
     assert reopened._next.text() == "Resume"
     QTest.mouseClick(reopened._next, Qt.MouseButton.LeftButton)

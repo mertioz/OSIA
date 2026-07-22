@@ -32,7 +32,9 @@ _RELEASES = (
         released_on="2026-07-21",
         public=True,
         changes_en=(
-            "Explore OSIA with the complete Getting Started and Master OSIA guide.",
+            "Explore three guide levels: Getting Started, Master OSIA, and the developer-focused Advanced Guide.",
+            "Learn every major OSIA feature through a complete, practical Master OSIA manual.",
+            "Open the simplified guide page directly at its navigation and useful content.",
             "Review the changelog and update history offline from Settings.",
             "Close OSIA directly from the main menu.",
             "Send image attachments to compatible multimodal providers from PC or mobile.",
@@ -41,7 +43,9 @@ _RELEASES = (
             "Settings navigation and content now scroll independently, with additional stability and distribution improvements.",
         ),
         changes_fr=(
-            "Découvrez OSIA avec le guide complet Premiers pas et Maîtriser OSIA.",
+            "Découvrez trois niveaux : Démarrage essentiel, Maîtriser OSIA et le Guide avancé destiné aux développeurs.",
+            "Retrouvez chaque fonction majeure d’OSIA dans un manuel Maîtriser OSIA complet et pratique.",
+            "Ouvrez la page de guide simplifiée directement sur sa navigation et son contenu utile.",
             "Consultez hors ligne le journal des modifications et l’historique des mises à jour depuis les Réglages.",
             "Fermez OSIA directement depuis le menu principal.",
             "Envoyez des images jointes aux fournisseurs multimodaux compatibles depuis le PC ou le mobile.",
