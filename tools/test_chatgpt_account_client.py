@@ -193,6 +193,7 @@ class AppServerClientTests(unittest.TestCase):
         notification_method=None,
         delta=None,
         language="en",
+        text="test",
     ):
         def handler(process, message):
             if message.get("method") == "turn/start":
@@ -247,7 +248,7 @@ class AppServerClientTests(unittest.TestCase):
             with self.assertRaises(AppServerError) as caught:
                 client.run_turn(
                     thread_id="thread-native",
-                    text="test",
+                    text=text,
                     model="visible",
                     on_delta=deltas.append,
                 )
@@ -739,25 +740,45 @@ class AppServerClientTests(unittest.TestCase):
         self.assertFalse(error.allow_fallback)
         self.assertIn("No action was performed", str(error))
 
-    def test_native_action_refusal_is_localized_in_english_and_french(self):
-        expected = {
-            "en": (
-                "OSIA couldn’t safely translate the action requested by ChatGPT. "
-                "No action was performed. An alternative workflow supported by "
-                "OSIA may be available."
-            ),
-            "fr": (
+    def test_native_action_refusal_uses_user_language_before_ui_locale(self):
+        cases = (
+            (
+                "Continue the OSIA conversation below.\n\n"
+                "[USER]\nHello.\n\n[ASSISTANT]\nHow can I help?\n\n"
+                "[USER]\nCrée un fichier nommé essai sur mon bureau, puis "
+                "ouvre-le pour moi.",
+                "en",
                 "OSIA n’a pas pu traduire en toute sécurité l’action demandée par "
                 "ChatGPT. Aucune action n’a été effectuée. Une méthode alternative "
-                "prise en charge par OSIA peut être disponible."
+                "prise en charge par OSIA peut être disponible.",
             ),
-        }
-        for language, message in expected.items():
-            with self.subTest(language=language):
+            (
+                "Please create a file named sample on my desktop, then open it "
+                "for me.",
+                "fr",
+                "OSIA couldn’t safely translate the action requested by ChatGPT. "
+                "No action was performed. An alternative workflow supported by OSIA "
+                "may be available.",
+            ),
+        )
+        for text, ui_language, message in cases:
+            with self.subTest(text=text, ui_language=ui_language):
                 error, _received, _deltas = self.run_native_failure(
-                    item_type="fileChange", language=language,
+                    item_type="fileChange", language=ui_language, text=text,
                 )
                 self.assertEqual(str(error), message)
+
+    def test_neutral_native_action_refusal_falls_back_to_ui_locale(self):
+        expected = {
+            "en": "No action was performed.",
+            "fr": "Aucune action n’a été effectuée.",
+        }
+        for language, fragment in expected.items():
+            with self.subTest(language=language):
+                error, _received, _deltas = self.run_native_failure(
+                    item_type="fileChange", language=language, text="12345 !!!",
+                )
+                self.assertIn(fragment, str(error))
 
     def test_text_only_account_turn_remains_unchanged(self):
         expected = "Ordinary account response."

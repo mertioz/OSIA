@@ -142,11 +142,49 @@ class RuntimeUnavailableError(AppServerError):
 _NATIVE_ACTION_REFUSAL_KEY = "chatgpt_account.native_action_refused"
 
 
-def _native_action_refusal() -> str:
-    """Return the localized, user-safe refusal for blocked native actions."""
+def _latest_user_text(turn_content: str | list[dict]) -> str:
+    """Return the latest user text from a direct or conversation turn input."""
+    if isinstance(turn_content, list):
+        text = "\n\n".join(
+            str(part.get("text") or "")
+            for part in turn_content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    else:
+        text = str(turn_content or "")
+
+    user_markers = list(re.finditer(r"(?m)^\[USER\][ \t]*$", text))
+    if not user_markers:
+        return text
+    latest = text[user_markers[-1].end():].lstrip("\r\n")
+    next_role = re.search(
+        r"(?m)^\[(?:ASSISTANT|SYSTEM|TOOL|USER)\][ \t]*$",
+        latest,
+    )
+    return latest[:next_role.start()].rstrip() if next_role else latest.rstrip()
+
+
+def _native_action_refusal(turn_content: str | list[dict]) -> str:
+    """Return the user-language refusal for blocked native actions."""
     from osia import i18n
 
-    return i18n.t(_NATIVE_ACTION_REFUSAL_KEY)
+    language = None
+    try:
+        from langdetect import DetectorFactory, detect_langs
+
+        DetectorFactory.seed = 0
+        candidates = detect_langs(_latest_user_text(turn_content))
+        if (
+            candidates
+            and candidates[0].lang in {"en", "fr"}
+            and candidates[0].prob >= 0.90
+        ):
+            language = candidates[0].lang
+    except Exception:
+        pass
+    language = language or i18n.get_language()
+    translations = i18n.TRANSLATIONS.get(_NATIVE_ACTION_REFUSAL_KEY, {})
+    return translations.get(language) or i18n.t(_NATIVE_ACTION_REFUSAL_KEY)
 
 
 @dataclass(frozen=True)
@@ -1223,7 +1261,7 @@ class AppServerClient:
                     raise payload
                 elif kind == "unsafe":
                     raise AppServerError(
-                        _native_action_refusal(),
+                        _native_action_refusal(turn_content),
                         output_started=attempt.output_started,
                         native_action=True,
                         controlled_refusal=True,
@@ -1235,7 +1273,7 @@ class AppServerClient:
                     turn_id = payload.get("turnId") or attempt.turn_id
                     if attempt.native_action:
                         raise AppServerError(
-                            _native_action_refusal(),
+                            _native_action_refusal(turn_content),
                             output_started=attempt.output_started,
                             native_action=True,
                             controlled_refusal=True,
