@@ -499,7 +499,7 @@ def test_generated_installer_logo_has_real_transparency(monkeypatch, tmp_path):
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "GENERATED", tmp_path)
 
-    module._generate_branding("1.0.5")
+    module._generate_branding("1.0.6")
     with Image.open(tmp_path / "wizard-small.png") as image:
         alpha = image.convert("RGBA").getchannel("A")
         assert image.mode == "RGBA"
@@ -719,7 +719,7 @@ def test_build_uses_product_version_and_exact_installer_name():
     build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
     assert "from osia.version import PRODUCT_VERSION, parse_product_version" in build
     assert "SOURCE_VERSION = PRODUCT_VERSION" in build
-    assert 'PRODUCT_VERSION = "1.0.5"' in (ROOT / "osia" / "version.py").read_text("utf-8")
+    assert 'PRODUCT_VERSION = "1.0.6"' in (ROOT / "osia" / "version.py").read_text("utf-8")
     assert 'installer = RELEASE / "OSIA-Setup.exe"' in build
     assert "def _write_bundle_file_manifest" in build
     assert 'CODEX_RUNTIME_VERSION = "0.144.1"' in build
@@ -740,14 +740,14 @@ def test_build_identity_metadata_and_internal_override(monkeypatch, tmp_path):
     baseline = module._resolve_build_identity("internal-preview", "1.0.1")
     assert baseline["version"] == "1.0.1"
     assert baseline["override"] == {
-        "sourceVersion": "1.0.5", "version": "1.0.1", "channel": "internal-preview",
+        "sourceVersion": "1.0.6", "version": "1.0.1", "channel": "internal-preview",
     }
     metadata_path = module._write_app_metadata(baseline)
     embedded = __import__("osia.updater", fromlist=["parse_app_metadata"]).parse_app_metadata(
         metadata_path.read_bytes()
     )
     assert embedded.version == "1.0.1"
-    assert embedded.build_override["sourceVersion"] == "1.0.5"
+    assert embedded.build_override["sourceVersion"] == "1.0.6"
     with pytest.raises(ValueError, match="forbidden"):
         module._resolve_build_identity("stable", "1.0.1")
 

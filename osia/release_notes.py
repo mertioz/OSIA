@@ -28,6 +28,21 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="1.0.6",
+        released_on="2026-07-24",
+        public=False,
+        changes_en=(
+            "ChatGPT Account now refuses unsupported native actions safely in the language of the current request, without executing or retrying them.",
+            "Browser automation now tracks newly opened popups in real time and returns to the opener when they close.",
+            "Long URLs and opaque identifiers now wrap inside conversation bubbles without clipping or changing copied text.",
+        ),
+        changes_fr=(
+            "Compte ChatGPT refuse désormais en toute sécurité les actions natives non prises en charge dans la langue de la demande actuelle, sans les exécuter ni réessayer.",
+            "L’automatisation du navigateur suit désormais les nouvelles fenêtres en temps réel et revient à la fenêtre d’origine lorsqu’elles se ferment.",
+            "Les URL longues et les identifiants opaques passent désormais à la ligne dans les bulles de conversation, sans rognage ni modification du texte copié.",
+        ),
+    ),
+    ReleaseEntry(
         version="1.0.5",
         released_on="2026-07-21",
         public=True,

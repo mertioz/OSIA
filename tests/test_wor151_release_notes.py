@@ -26,7 +26,7 @@ _QT_APP = QApplication.instance() or QApplication([])
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def _metadata(version="1.0.5"):
+def _metadata(version="1.0.6"):
     return updater.parse_app_metadata(json.dumps({
         "product": "OSIA",
         "version": version,
@@ -40,7 +40,7 @@ def _metadata(version="1.0.5"):
     }))
 
 
-def _manifest(version="1.0.6"):
+def _manifest(version="1.0.7"):
     data = b"installer"
     return {
         "schemaVersion": 1,
@@ -79,16 +79,52 @@ def _controller(monkeypatch, tmp_path, *, cached=False):
 
 
 def test_embedded_notes_load_offline_and_are_newest_first():
-    assert [entry.version for entry in RELEASE_HISTORY] == ["1.0.5", "1.0.4", "1.0.3"]
-    current = release_for_version("1.0.5")
-    assert current is not None and current.public
-    previous = release_for_version("1.0.4")
+    assert [entry.version for entry in RELEASE_HISTORY] == [
+        "1.0.6", "1.0.5", "1.0.4", "1.0.3",
+    ]
+    current = release_for_version("1.0.6")
+    assert current is not None and not current.public
+    previous = release_for_version("1.0.5")
     assert previous is not None and previous.public
-    assert "roll back" in " ".join(previous.changes("en")).lower()
+    assert "getting started" in " ".join(previous.changes("en")).lower()
     internal = release_for_version("1.0.3")
     assert internal is not None and not internal.public
     assert "superseded" in " ".join(internal.changes("en")).lower()
-    assert manifest_release_notes("1.0.5") == list(current.changes_en)
+    assert manifest_release_notes("1.0.6") == list(current.changes_en)
+
+
+def test_106_notes_are_bilingual_bounded_and_keep_internal_release_semantics():
+    current = release_for_version("1.0.6")
+    assert current is not None and not current.public
+    assert len(current.changes_en) == len(current.changes_fr) == 3
+
+    english = " ".join(current.changes_en).lower()
+    for subject in (
+        "native actions",
+        "language of the current request",
+        "without executing or retrying",
+        "popups in real time",
+        "returns to the opener",
+        "long urls",
+        "opaque identifiers",
+        "without clipping",
+        "copied text",
+    ):
+        assert subject in english
+
+    french = " ".join(current.changes_fr).lower()
+    for subject in (
+        "actions natives",
+        "langue de la demande actuelle",
+        "sans les exécuter ni réessayer",
+        "fenêtres en temps réel",
+        "fenêtre d’origine",
+        "url longues",
+        "identifiants opaques",
+        "sans rognage",
+        "texte copié",
+    ):
+        assert subject in french
 
 
 def test_105_notes_are_bilingual_bounded_and_keep_release_semantics():
@@ -145,6 +181,14 @@ def test_generated_105_manifest_is_accepted_as_an_update_from_104():
     assert parsed.release_notes == tuple(manifest_release_notes("1.0.5"))
 
 
+def test_generated_106_manifest_is_accepted_as_an_update_from_105():
+    raw = _manifest(version="1.0.6")
+    raw["releaseNotes"] = manifest_release_notes("1.0.6")
+    parsed = updater.parse_manifest(json.dumps(raw), _metadata("1.0.5"))
+    assert parsed.version == "1.0.6"
+    assert parsed.release_notes == tuple(manifest_release_notes("1.0.6"))
+
+
 def test_manifest_generator_reuses_embedded_source_and_rejects_user_marker():
     build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
     assert '"releaseNotes": manifest_release_notes(version)' in build
@@ -160,7 +204,7 @@ def test_cached_remote_notes_restore_without_network(monkeypatch, tmp_path):
         ),
     )
     controller = _controller(monkeypatch, tmp_path, cached=True)
-    assert controller.state["availableVersion"] == "1.0.6"
+    assert controller.state["availableVersion"] == "1.0.7"
     assert controller.state["availablePublishedAt"] == "2026-07-21T10:01:00Z"
     assert controller.state["releaseNotes"] == ("**Clearer** update details.",)
 
@@ -173,7 +217,7 @@ def test_remote_markup_is_normalized_and_rendered_as_plain_text(
     state = controller.state
     state.update(
         status="available",
-        availableVersion="1.0.6",
+        availableVersion="1.0.7",
         availablePublishedAt="2026-07-21T10:01:00Z",
         releaseNotes=("&lt;b&gt;Safe&lt;/b&gt; **details**",),
     )
@@ -214,18 +258,18 @@ def test_english_french_copy_and_long_text_stay_bounded(monkeypatch, tmp_path):
     section.resize(390, 900)
     state = controller.state
     state.update(
-        status="available", availableVersion="1.0.6",
+        status="available", availableVersion="1.0.7",
         releaseNotes=("Long " * 45,),
     )
     try:
         i18n.set_language("en", persist=False)
         section.apply_state(state)
         assert section.current_card.badge.text() == "Current"
-        assert "Getting Started" in section.current_card.notes.text()
+        assert "native actions" in section.current_card.notes.text().lower()
         i18n.set_language("fr", persist=False)
         section.apply_state(state)
         assert section.current_card.badge.text() == "Actuelle"
-        assert "démarrage essentiel" in section.current_card.notes.text().lower()
+        assert "actions natives" in section.current_card.notes.text().lower()
         section.show()
         _QT_APP.processEvents()
         assert section.available_card.notes.wordWrap()
