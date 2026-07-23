@@ -185,6 +185,74 @@ class AppServerClientTests(unittest.TestCase):
         self.addCleanup(client.shutdown)
         return client, factory
 
+    def run_native_failure(
+        self,
+        *,
+        item_type=None,
+        approval_method=None,
+        notification_method=None,
+        delta=None,
+        language="en",
+    ):
+        def handler(process, message):
+            if message.get("method") == "turn/start":
+                process.emit({
+                    "id": message["id"],
+                    "result": {"turn": {"id": "turn-native"}},
+                })
+                if delta:
+                    process.emit({
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": "thread-native",
+                            "turnId": "turn-native",
+                            "delta": delta,
+                        },
+                    })
+                if item_type:
+                    process.emit({
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "thread-native",
+                            "turnId": "turn-native",
+                            "item": {"id": "item-native", "type": item_type},
+                        },
+                    })
+                if approval_method:
+                    process.emit({
+                        "id": 900,
+                        "method": approval_method,
+                        "params": {
+                            "threadId": "thread-native",
+                            "turnId": "turn-native",
+                            "itemId": "item-native",
+                        },
+                    })
+                if notification_method:
+                    process.emit({
+                        "method": notification_method,
+                        "params": {
+                            "threadId": "thread-native",
+                            "turnId": "turn-native",
+                        },
+                    })
+            elif message.get("id") == 900 and "result" in message:
+                pass
+            else:
+                _base_handler(process, message)
+
+        client, factory = self.make_client(handler)
+        deltas = []
+        with patch("osia.i18n.get_language", return_value=language):
+            with self.assertRaises(AppServerError) as caught:
+                client.run_turn(
+                    thread_id="thread-native",
+                    text="test",
+                    model="visible",
+                    on_delta=deltas.append,
+                )
+        return caught.exception, factory.processes[0].received, deltas
+
     def test_initialize_once_and_isolated_process(self):
         client, factory = self.make_client()
         client.health_check()
@@ -587,32 +655,165 @@ class AppServerClientTests(unittest.TestCase):
         self.assertIn("<tool_call>", result.text)
         self.assertEqual(result.text, "".join(deltas))
 
-    def test_native_approval_is_cancelled_and_turn_interrupted_without_fallback(self):
+    def test_command_and_file_items_are_refused_and_interrupted(self):
+        for item_type in ("commandExecution", "fileChange"):
+            with self.subTest(item_type=item_type):
+                error, received, deltas = self.run_native_failure(item_type=item_type)
+                self.assertTrue(error.native_action)
+                self.assertTrue(error.controlled_refusal)
+                self.assertFalse(error.allow_fallback)
+                self.assertFalse(error.output_started)
+                self.assertEqual(deltas, [])
+                self.assertEqual(
+                    str(error),
+                    "OSIA couldn’t safely translate the action requested by ChatGPT. "
+                    "No action was performed. An alternative workflow supported by "
+                    "OSIA may be available.",
+                )
+                interrupt = next(
+                    message for message in received
+                    if message.get("method") == "turn/interrupt"
+                )
+                self.assertEqual(interrupt["params"], {
+                    "threadId": "thread-native", "turnId": "turn-native",
+                })
+                self.assertFalse(any(
+                    message.get("result", {}).get("decision") in {
+                        "accept", "acceptForSession",
+                    }
+                    for message in received
+                    if isinstance(message.get("result"), dict)
+                ))
+
+    def test_command_and_file_approvals_are_cancelled_without_fallback(self):
+        for approval_method in (
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        ):
+            with self.subTest(approval_method=approval_method):
+                error, received, _deltas = self.run_native_failure(
+                    approval_method=approval_method,
+                )
+                approval = next(
+                    message for message in received
+                    if message.get("id") == 900 and "result" in message
+                )
+                self.assertEqual(approval["result"], {"decision": "cancel"})
+                self.assertTrue(error.native_action)
+                self.assertTrue(error.controlled_refusal)
+                self.assertFalse(error.allow_fallback)
+                self.assertEqual(
+                    len([
+                        message for message in received
+                        if message.get("method") == "turn/interrupt"
+                    ]),
+                    1,
+                )
+
+    def test_partial_text_then_native_action_has_one_safe_terminal_failure(self):
+        error, received, deltas = self.run_native_failure(
+            item_type="commandExecution",
+            delta="Partial account text.",
+        )
+        self.assertEqual(deltas, ["Partial account text."])
+        self.assertTrue(error.output_started)
+        self.assertTrue(error.native_action)
+        self.assertTrue(error.controlled_refusal)
+        self.assertFalse(error.allow_fallback)
+        self.assertNotIn(str(error), deltas)
+        self.assertEqual(
+            len([
+                message for message in received
+                if message.get("method") == "turn/interrupt"
+            ]),
+            1,
+        )
+
+    def test_unknown_action_notification_fails_closed_with_safe_refusal(self):
+        error, _received, _deltas = self.run_native_failure(
+            notification_method="plugin/futureNativeAction",
+        )
+        self.assertEqual(error.category, "unknown_action_event")
+        self.assertTrue(error.native_action)
+        self.assertTrue(error.controlled_refusal)
+        self.assertFalse(error.allow_fallback)
+        self.assertIn("No action was performed", str(error))
+
+    def test_native_action_refusal_is_localized_in_english_and_french(self):
+        expected = {
+            "en": (
+                "OSIA couldn’t safely translate the action requested by ChatGPT. "
+                "No action was performed. An alternative workflow supported by "
+                "OSIA may be available."
+            ),
+            "fr": (
+                "OSIA n’a pas pu traduire en toute sécurité l’action demandée par "
+                "ChatGPT. Aucune action n’a été effectuée. Une méthode alternative "
+                "prise en charge par OSIA peut être disponible."
+            ),
+        }
+        for language, message in expected.items():
+            with self.subTest(language=language):
+                error, _received, _deltas = self.run_native_failure(
+                    item_type="fileChange", language=language,
+                )
+                self.assertEqual(str(error), message)
+
+    def test_text_only_account_turn_remains_unchanged(self):
+        expected = "Ordinary account response."
+
         def handler(process, message):
             if message.get("method") == "turn/start":
-                rid = message["id"]
-                process.emit({"id": rid, "result": {"turn": {"id": "turn-2"}}})
-                process.emit({"method": "item/started", "params": {
-                    "threadId": "thread-2", "turnId": "turn-2",
-                    "item": {"id": "item-1", "type": "commandExecution"}}})
-                process.emit({"id": 900, "method": "item/commandExecution/requestApproval",
-                              "params": {"threadId": "thread-2", "turnId": "turn-2",
-                                         "itemId": "item-1"}})
-            elif message.get("id") == 900 and "result" in message:
-                pass
+                process.emit({
+                    "id": message["id"],
+                    "result": {"turn": {"id": "turn-text"}},
+                })
+                process.emit({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-text", "turnId": "turn-text",
+                        "delta": expected,
+                    },
+                })
+                process.emit({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-text",
+                        "turn": {"id": "turn-text", "status": "completed"},
+                    },
+                })
             else:
                 _base_handler(process, message)
 
         client, factory = self.make_client(handler)
-        with self.assertRaises(AppServerError) as caught:
-            client.run_turn(thread_id="thread-2", text="test", model="visible")
-        self.assertTrue(caught.exception.native_action)
-        self.assertFalse(caught.exception.allow_fallback)
-        received = factory.processes[0].received
-        approval = next(m for m in received if m.get("id") == 900 and "result" in m)
-        self.assertEqual(approval["result"], {"decision": "cancel"})
-        interrupt = next(m for m in received if m.get("method") == "turn/interrupt")
-        self.assertEqual(interrupt["params"], {"threadId": "thread-2", "turnId": "turn-2"})
+        deltas = []
+        result = client.run_turn(
+            thread_id="thread-text", text="test", model="visible",
+            on_delta=deltas.append,
+        )
+        self.assertEqual(result.text, expected)
+        self.assertEqual(deltas, [expected])
+        self.assertFalse(any(
+            message.get("method") == "turn/interrupt"
+            for message in factory.processes[0].received
+        ))
+
+    def test_legacy_native_action_message_is_absent_from_user_facing_paths(self):
+        root = Path(__file__).resolve().parents[1]
+        legacy = (
+            "ChatGPT attempted a native "
+            "Codex action; OSIA cancelled the turn."
+        )
+        for relative_path in (
+            "osia/chatgpt_account/app_server_client.py",
+            "osia/chatgpt_account/provider.py",
+            "osia/i18n.py",
+            "osia/main.py",
+            "osia/server/server.py",
+        ):
+            with self.subTest(path=relative_path):
+                source = (root / relative_path).read_text(encoding="utf-8")
+                self.assertNotIn(legacy, source)
 
     def test_unknown_action_item_fails_closed(self):
         def handler(process, message):
@@ -628,6 +829,7 @@ class AppServerClientTests(unittest.TestCase):
         with self.assertRaises(AppServerError) as caught:
             client.run_turn(thread_id="thread-x", text="test", model="visible")
         self.assertTrue(caught.exception.native_action)
+        self.assertTrue(caught.exception.controlled_refusal)
         self.assertFalse(caught.exception.allow_fallback)
 
     def test_all_stable_native_action_categories_fail_closed(self):
@@ -649,6 +851,7 @@ class AppServerClientTests(unittest.TestCase):
                 with self.assertRaises(AppServerError) as caught:
                     client.run_turn(thread_id="thread-a", text="test", model="visible")
                 self.assertTrue(caught.exception.native_action)
+                self.assertTrue(caught.exception.controlled_refusal)
                 self.assertFalse(caught.exception.allow_fallback)
 
 

@@ -115,6 +115,7 @@ class AppServerError(RuntimeError):
         *,
         output_started: bool = False,
         native_action: bool = False,
+        controlled_refusal: bool = False,
         allow_fallback: bool = True,
         category: str = "app_server",
         method: str | None = None,
@@ -123,6 +124,7 @@ class AppServerError(RuntimeError):
         super().__init__(message)
         self.output_started = bool(output_started)
         self.native_action = bool(native_action)
+        self.controlled_refusal = bool(controlled_refusal)
         self.allow_fallback = bool(allow_fallback)
         self.category = category
         self.method = str(method) if method else None
@@ -135,6 +137,16 @@ class AppServerError(RuntimeError):
 
 class RuntimeUnavailableError(AppServerError):
     """The required native Codex runtime is missing or incompatible."""
+
+
+_NATIVE_ACTION_REFUSAL_KEY = "chatgpt_account.native_action_refused"
+
+
+def _native_action_refusal() -> str:
+    """Return the localized, user-safe refusal for blocked native actions."""
+    from osia import i18n
+
+    return i18n.t(_NATIVE_ACTION_REFUSAL_KEY)
 
 
 @dataclass(frozen=True)
@@ -1211,9 +1223,10 @@ class AppServerClient:
                     raise payload
                 elif kind == "unsafe":
                     raise AppServerError(
-                        "ERROR: ChatGPT attempted a native Codex action; OSIA cancelled the turn.",
+                        _native_action_refusal(),
                         output_started=attempt.output_started,
                         native_action=True,
+                        controlled_refusal=True,
                         allow_fallback=False,
                         category=str(payload),
                     )
@@ -1222,9 +1235,10 @@ class AppServerClient:
                     turn_id = payload.get("turnId") or attempt.turn_id
                     if attempt.native_action:
                         raise AppServerError(
-                            "ERROR: ChatGPT attempted a native Codex action; OSIA cancelled the turn.",
+                            _native_action_refusal(),
                             output_started=attempt.output_started,
                             native_action=True,
+                            controlled_refusal=True,
                             allow_fallback=False,
                             category=attempt.unsafe_category or "native_action",
                         )

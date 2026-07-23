@@ -129,6 +129,39 @@ class ProviderAdapterTests(unittest.TestCase):
         self.assertEqual(error.reasoning_level, "high")
         self.assertFalse(error.output_started)
 
+    def test_native_action_refusal_survives_account_provider_normalization(self):
+        from osia import i18n
+
+        client = _ProviderClient()
+        with patch("osia.i18n.get_language", return_value="fr"):
+            refusal = i18n.t("chatgpt_account.native_action_refused")
+
+        def reject(**_kwargs):
+            raise AppServerError(
+                refusal,
+                output_started=True,
+                native_action=True,
+                controlled_refusal=True,
+                allow_fallback=False,
+                category="native_item:fileChange",
+            )
+
+        client.run_turn = reject
+        provider = ChatGPTAccountProvider(client=client)
+        with self.assertRaises(AccountProviderError) as caught:
+            provider.complete(
+                conversation_id="c1",
+                model="account-model",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+        error = caught.exception
+        self.assertEqual(str(error), refusal)
+        self.assertIn("Aucune action n’a été effectuée", str(error))
+        self.assertTrue(error.output_started)
+        self.assertTrue(error.native_action)
+        self.assertTrue(error.controlled_refusal)
+        self.assertFalse(error.allow_fallback)
+
 
 class _FakeCompletions:
     def __init__(self, *, text=None, error=None, calls=None):
@@ -425,6 +458,61 @@ class AgentRoutingEqualityTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIsInstance(error, AccountProviderError)
         self.assertEqual(attempts, ["chatgpt_account"])
+
+    def test_native_action_failure_is_never_replayed_before_output(self):
+        from osia import i18n
+
+        with patch("osia.i18n.get_language", return_value="en"):
+            refusal = i18n.t("chatgpt_account.native_action_refused")
+        native_error = AccountProviderError(AppServerError(
+            refusal,
+            native_action=True,
+            controlled_refusal=True,
+            allow_fallback=False,
+            category="native_item:commandExecution",
+        ))
+        result, error, attempts, _agent, _settings = self._run_route(
+            selected_provider="openai",
+            selected_model="gpt-5.4",
+            hierarchy=[
+                "chatgpt_account:account-model",
+                "deepseek:deepseek-v4-pro",
+            ],
+            outcomes={"chatgpt_account": [native_error]},
+        )
+        self.assertIsNone(result)
+        self.assertIs(error, native_error)
+        self.assertEqual(str(error), refusal)
+        self.assertTrue(error.native_action)
+        self.assertTrue(error.controlled_refusal)
+        self.assertFalse(error.allow_fallback)
+        self.assertEqual(attempts, ["chatgpt_account"])
+
+    def test_openai_and_deepseek_tool_paths_still_reach_osia_dispatcher(self):
+        for provider, model in (
+            ("openai", "gpt-5.4"),
+            ("deepseek", "deepseek-v4-pro"),
+        ):
+            with self.subTest(provider=provider):
+                tool_calls = []
+
+                def fake_tool(value):
+                    tool_calls.append(value)
+                    return "tool ok"
+
+                result, error, attempts, _agent, _settings = self._run_route(
+                    selected_provider=provider,
+                    selected_model=model,
+                    outcomes={provider: [
+                        '<tool_call>{"tool":"account_test_tool","value":"ok"}</tool_call>',
+                        f"{provider} final",
+                    ]},
+                    tool_map={"account_test_tool": fake_tool},
+                )
+                self.assertIsNone(error)
+                self.assertEqual(result, f"{provider} final")
+                self.assertEqual(tool_calls, ["ok"])
+                self.assertEqual(attempts, [provider, provider])
 
     def test_no_provider_replay_after_textual_tool_call(self):
         tool_calls = []

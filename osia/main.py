@@ -391,6 +391,37 @@ def _persist_agent_delta(
         print(f"[OSIA] failed to persist conversation: {e}")
 
 
+def _finalize_controlled_refusal(
+    error,
+    agent,
+    conv_id,
+    prev_history_len,
+    emit_final,
+    *,
+    user_display_text: str | None = None,
+) -> str | None:
+    """Persist and emit one explicitly classified refusal as assistant text."""
+
+    if not (
+        bool(getattr(error, "controlled_refusal", False))
+        and bool(getattr(error, "native_action", False))
+    ):
+        return None
+    text = str(error)
+    agent.messages.append({"role": "assistant", "content": text})
+    _persist_agent_delta(
+        conv_id,
+        agent,
+        prev_history_len,
+        user_display_text=user_display_text,
+    )
+    from osia.agent import clean_response
+
+    display = clean_response(text)
+    emit_final(conv_id, display)
+    return display
+
+
 def _persist_exchange(conv_id, user_text, assistant_text):
     """Persist a stateless single-turn exchange (used by voice_mode,
     which currently calls run_agent() without keeping history).
@@ -945,12 +976,25 @@ def wake_mode():
             display = clean_response(reply or "")
             bridge.assistant_stream_final.emit(conv_id, display)
         except Exception as e:
-            err = f"Error: {e}"
-            bridge.assistant_stream_error.emit(conv_id, err)
-            if voice_response:
-                error_tts_session = start_streaming_session()
-                print(f"[TTS] main.wake_mode: speaking error message: {err[:80]!r}", flush=True)
-                speak_streaming(err, session_id=error_tts_session)
+            refusal = _finalize_controlled_refusal(
+                e,
+                turn_agent,
+                conv_id,
+                prev_history_len,
+                bridge.assistant_stream_final.emit,
+                user_display_text=user_display_text,
+            )
+            if refusal is not None:
+                if voice_response:
+                    refusal_tts_session = start_streaming_session()
+                    speak_streaming(refusal, session_id=refusal_tts_session)
+            else:
+                err = f"Error: {e}"
+                bridge.assistant_stream_error.emit(conv_id, err)
+                if voice_response:
+                    error_tts_session = start_streaming_session()
+                    print(f"[TTS] main.wake_mode: speaking error message: {err[:80]!r}", flush=True)
+                    speak_streaming(err, session_id=error_tts_session)
         finally:
             _set_conversation_busy(conv_id, False)
             bridge.conversations_changed.emit(

@@ -58,6 +58,7 @@ class AccountProviderError(RuntimeError):
         super().__init__(str(error))
         self.output_started = error.output_started
         self.native_action = error.native_action
+        self.controlled_refusal = error.controlled_refusal
         self.allow_fallback = error.allow_fallback
         self.category = error.category
         self.method = error.method

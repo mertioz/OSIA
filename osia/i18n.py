@@ -203,6 +203,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "ERROR: ChatGPT konnte diese Anfrage nicht starten. Bitte erneut versuchen; API-Anbieter bleiben verfügbar.",
         "es": "ERROR: ChatGPT no pudo iniciar esta solicitud. Inténtalo de nuevo; los proveedores de API siguen disponibles.",
     },
+    "chatgpt_account.native_action_refused": {
+        "en": "OSIA couldn’t safely translate the action requested by ChatGPT. No action was performed. An alternative workflow supported by OSIA may be available.",
+        "fr": "OSIA n’a pas pu traduire en toute sécurité l’action demandée par ChatGPT. Aucune action n’a été effectuée. Une méthode alternative prise en charge par OSIA peut être disponible.",
+    },
     "chatgpt_account.connect": {"en": "Connect with ChatGPT", "fr": "Se connecter avec ChatGPT"},
     "chatgpt_account.cancel": {"en": "Cancel", "fr": "Annuler"},
     "chatgpt_account.disconnect": {"en": "Disconnect", "fr": "Déconnecter"},
