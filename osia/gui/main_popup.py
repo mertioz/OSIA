@@ -34,13 +34,14 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap, QIcon,
+    QTextOption,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QStackedWidget, QListWidget, QAbstractItemView, QFrame,
     QSizePolicy, QFileDialog, QCheckBox, QComboBox,
     QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog, QLayout, QMenu,
-    QToolTip, QMessageBox,
+    QToolTip, QMessageBox, QTextBrowser,
 )
 
 from osia import conversations
@@ -285,6 +286,62 @@ def _downloaded_whisper_models() -> set[str]:
 
 # ── Message bubble ──────────────────────────────────────────────────────────
 
+_BUBBLE_MAX_WIDTH = 360
+
+
+class _MessageText(QTextBrowser):
+    """Selectable message text with native anywhere fallback wrapping."""
+
+    metrics_changed = pyqtSignal()
+
+    def __init__(self, text: str):
+        super().__init__()
+        self.setObjectName("msgText")
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.setReadOnly(True)
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.viewport().setAutoFillBackground(False)
+        self.document().setDocumentMargin(0)
+        option = self.document().defaultTextOption()
+        option.setWrapMode(
+            QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
+        )
+        self.document().setDefaultTextOption(option)
+        self.setPlainText(text)
+
+    def changeEvent(self, event) -> None:  # noqa: N802 (Qt method name)
+        super().changeEvent(event)
+        if event.type() in (
+            QEvent.Type.FontChange,
+            QEvent.Type.ApplicationFontChange,
+            QEvent.Type.StyleChange,
+            QEvent.Type.DevicePixelRatioChange,
+        ):
+            self.metrics_changed.emit()
+
+    def fit_to_width(self, maximum_width: int) -> None:
+        """Constrain the document first, then size the viewport to its height."""
+
+        document = self.document()
+        document.setTextWidth(-1)
+        natural_width = max(1, math.ceil(document.idealWidth()))
+        text_width = max(1, min(int(maximum_width), natural_width))
+        document.setTextWidth(text_width)
+        text_height = max(
+            1,
+            math.ceil(document.documentLayout().documentSize().height()),
+        )
+        self.setFixedSize(text_width, text_height)
+
+
 class _Bubble(QFrame):
     """One chat message bubble — user (right, violet) or assistant (left)."""
 
@@ -297,27 +354,56 @@ class _Bubble(QFrame):
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(2)
 
-        label = QLabel(text or "")
-        label.setObjectName("msgText")
-        label.setWordWrap(True)
-        label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
+        self._source_text = text or ""
+        self._available_width = _BUBBLE_MAX_WIDTH
+        label = _MessageText(self._source_text)
+        self._label = label
+        label.metrics_changed.connect(self._layout_text)
         layout.addWidget(label)
 
-        self._label = label
-        self.setMaximumWidth(360)
+        self.setMaximumWidth(_BUBBLE_MAX_WIDTH)
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self._layout_text()
+
+    def set_available_width(self, width: int) -> None:
+        width = max(1, min(_BUBBLE_MAX_WIDTH, int(width)))
+        if width == self._available_width:
+            return
+        self._available_width = width
+        self.setMaximumWidth(width)
+        self._layout_text()
+
+    def _layout_text(self) -> None:
+        margins = self.layout().contentsMargins()
+        text_width = max(
+            1,
+            self._available_width - margins.left() - margins.right(),
+        )
+        self._label.fit_to_width(text_width)
+        self.layout().invalidate()
+        self.updateGeometry()
+        row = self.parentWidget()
+        if row is None or row.layout() is None:
+            return
+        row.layout().invalidate()
+        row.updateGeometry()
+        host = row.parentWidget()
+        if host is not None and host.layout() is not None:
+            host.layout().invalidate()
+            host.layout().activate()
+            row.layout().activate()
+            host.updateGeometry()
 
     def append_text(self, more: str) -> None:
-        self._label.setText(self._label.text() + more)
+        self.set_text(self._source_text + more)
 
     def set_text(self, text: str) -> None:
-        self._label.setText(text)
+        self._source_text = text
+        self._label.setPlainText(text)
+        self._layout_text()
 
     def text(self) -> str:
-        return self._label.text()
-
+        return self._source_text
 
 # ── Chat page ───────────────────────────────────────────────────────────────
 
@@ -545,6 +631,8 @@ class _ChatPage(QWidget):
         self._messages_layout.setSpacing(8)
         self._messages_layout.addStretch(1)
         self._scroll.setWidget(self._messages_host)
+        self._syncing_bubble_geometry = False
+        self._scroll.viewport().installEventFilter(self)
         outer.addWidget(self._scroll, 1)
 
         # Empty-state placeholder, swapped out as soon as a message arrives.
@@ -889,6 +977,7 @@ class _ChatPage(QWidget):
         if not text or not str(text).strip():
             return None
         bubble = _Bubble(role, text)
+        bubble.set_available_width(self._maximum_bubble_width())
         # Insert just before the trailing stretch so the chat grows down.
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
@@ -904,8 +993,51 @@ class _ChatPage(QWidget):
         self._messages_layout.insertWidget(
             self._messages_layout.count() - 1, wrap
         )
+        self._fit_messages_host_to_viewport()
         self._motion.fade_in(wrap, MOTION.appearance_ms)
         return wrap, bubble
+
+    def _maximum_bubble_width(self) -> int:
+        # The viewport already excludes its frame and any visible scrollbar.
+        # The history margins are the only horizontal space between it and a
+        # bubble row. Bubble padding stays inside this returned maximum.
+        margins = self._messages_layout.contentsMargins()
+        usable = (
+            self._scroll.viewport().width()
+            - margins.left()
+            - margins.right()
+        )
+        return max(1, min(_BUBBLE_MAX_WIDTH, usable))
+
+    def _fit_messages_host_to_viewport(self) -> None:
+        self._messages_layout.invalidate()
+        self._messages_layout.activate()
+        viewport_width = self._scroll.viewport().width()
+        if self._messages_host.width() != viewport_width:
+            self._messages_host.resize(
+                viewport_width, self._messages_host.height()
+            )
+        self._messages_host.updateGeometry()
+
+    def _sync_bubble_geometry(self) -> None:
+        if self._syncing_bubble_geometry:
+            return
+        self._syncing_bubble_geometry = True
+        try:
+            maximum = self._maximum_bubble_width()
+            for bubble in self._messages_host.findChildren(_Bubble):
+                bubble.set_available_width(maximum)
+            self._fit_messages_host_to_viewport()
+        finally:
+            self._syncing_bubble_geometry = False
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 (Qt method name)
+        if (
+            watched is self._scroll.viewport()
+            and event.type() == QEvent.Type.Resize
+        ):
+            self._sync_bubble_geometry()
+        return super().eventFilter(watched, event)
 
     def _on_stream_text_changed(self, text: str) -> None:
         if self._stream_bubble is None:
@@ -10302,10 +10434,12 @@ class MainPopup(QWidget):
             QFrame#msgBubble[error="true"] {
                 border: 1px solid rgba(220, 80, 80, 0.55);
             }
-            QLabel#msgText {
+            QLabel#msgText, QTextBrowser#msgText {
                 color: #e8e6f0;
                 font-size: 12px;
                 background: transparent;
+                border: none;
+                padding: 0px;
             }
 
             /* WOR-48: lighter input frame — translucent fill, softer border. */
