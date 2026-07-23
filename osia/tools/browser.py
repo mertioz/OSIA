@@ -27,6 +27,9 @@ neither is available we surface a clear error.
 """
 
 import base64
+import asyncio
+import concurrent.futures
+import inspect
 import os
 import shutil
 import socket
@@ -34,9 +37,10 @@ import subprocess
 import sys
 import threading
 import time
+from enum import Enum
 from pathlib import Path
 
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 # Timeout exceptions that mean "the page is just slow" — never a hard failure.
 # Playwright's TimeoutError is caught alongside the builtin for safety across
@@ -161,21 +165,8 @@ _NON_CDP_BROWSERS = {"firefox", "firefox-esr"}
 
 # ── Module state ───────────────────────────────────────────────────────────
 
-_playwright = None
-_browser = None        # Playwright Browser (CDP-connected Chromium, or BiDi-launched Firefox)
-_context = None        # Playwright BrowserContext
-_page = None           # Active Playwright Page
-# Which protocol the page tools are currently driving:
-#   "cdp"  -> Chromium-based browser connected over the Chrome DevTools Protocol
-#   "bidi" -> Firefox launched through Playwright over WebDriver BiDi
-#   None   -> no browser connected yet (next tool call picks one)
-_active_browser_type = None
-_lock = threading.Lock()
-# Launch-in-flight flags. They prevent the race where two tool calls (e.g.
-# the agent calling open_browser twice in one batch) both see "no browser
-# running" before the first launch finishes, and each spawn a window.
+# Launch-in-flight guard retained by the unchanged CDP process launcher.
 _cdp_launching = False
-_firefox_launching = False
 
 
 # ── CDP lifecycle ──────────────────────────────────────────────────────────
@@ -500,137 +491,611 @@ def _launch_cdp_browser(binary: str | None = None) -> tuple[bool, str]:
         _cdp_launching = False
 
 
-def _ensure_browser():
-    """Ensure the active automated browser is running and return an active
-    Page. Recovers transparently if the previously cached page was closed
-    (e.g. the user closed the tab).
+class _OwnerState(str, Enum):
+    STOPPED = "STOPPED"
+    STARTING = "STARTING"
+    READY = "READY"
+    RECONNECTING = "RECONNECTING"
+    CLOSING = "CLOSING"
+    FAILED = "FAILED"
 
-    Dispatches on ``_active_browser_type``:
-      - "bidi"        -> Firefox launched through Playwright (WebDriver BiDi)
-      - "cdp" / None  -> Chromium browser connected over CDP (the default);
-                         if no CDP-capable browser exists but Firefox does,
-                         falls back to Firefox over BiDi.
 
-    The returned Page exposes the same Playwright API for both backends, so
-    every page tool works regardless of which browser type is active.
-    """
-    global _page
+class _OwnerCallTimeout(TimeoutError):
+    pass
 
-    # Fast path: existing page is still alive.
-    if _page is not None:
+
+_OWNER_START_TIMEOUT_S = 25.0
+_OWNER_CALL_TIMEOUT_S = 45.0
+_OWNER_CANCEL_TIMEOUT_S = 2.0
+_OWNER_SHUTDOWN_TIMEOUT_S = 25.0
+_POPUP_EVENT_WINDOW_MS = 150
+
+
+class _AsyncBrowserOwner:
+    """Own every Playwright object on one continuously running asyncio loop."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._snapshot_lock = threading.Lock()
+        self._state = _OwnerState.STOPPED
+        self._thread = None
+        self._loop = None
+        self._owner_thread_id = None
+        self._owner_native_thread_id = None
+        self._startup_error = None
+        self._closing_requested = False
+        self._close_epoch = 0
+        self._command_lock = None
+        self._active_task = None
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._active_page = None
+        self._active_browser_type = None
+        self._registry = {}
+        self._registry_context = None
+        self._registry_generation = 0
+        self._registry_sequence = 0
+        self._context_handlers = None
+        self._registry_browser = None
+        self._browser_disconnected_handler = None
+        self._page_tombstones = set()
+        self._disconnecting = False
+        self._startup_count = 0
+        self._driver_stop_count = 0
+        self._published = {}
+        self._publish()
+
+    @property
+    def state(self):
+        with self._condition:
+            return self._state
+
+    def _set_state(self, state, error=None):
+        with self._condition:
+            self._state = state
+            self._startup_error = error
+            self._condition.notify_all()
+        self._publish()
+
+    def _assert_owner_thread(self):
+        if threading.get_ident() != self._owner_thread_id:
+            raise RuntimeError("Playwright operation attempted outside browser owner")
+
+    def _publish(self):
+        if (
+            self._owner_thread_id is not None
+            and threading.get_ident() != self._owner_thread_id
+        ):
+            with self._snapshot_lock:
+                current = dict(self._published)
+                current.update(
+                    state=self._state.value,
+                    threadAlive=bool(self._thread and self._thread.is_alive()),
+                )
+                self._published = current
+            return
+        page = self._active_page
         try:
-            _ = _page.url  # raises if the page was closed
-            if not _page.is_closed():
-                return _page
-            _page = None  # fall through to reconnect / re-acquire
+            active_url = page.url if page is not None and not page.is_closed() else None
         except Exception:
-            _page = None  # fall through to reconnect / re-acquire
+            active_url = None
+        with self._snapshot_lock:
+            self._published = {
+                "state": self._state.value,
+                "threadId": self._owner_thread_id,
+                "nativeThreadId": self._owner_native_thread_id,
+                "threadAlive": bool(self._thread and self._thread.is_alive()),
+                "backend": self._active_browser_type,
+                "activeUrl": active_url,
+                "registryCount": len(self._registry),
+                "generation": self._registry_generation,
+                "startupCount": self._startup_count,
+                "driverStopCount": self._driver_stop_count,
+            }
 
-    if _active_browser_type == "bidi":
-        return _ensure_firefox_bidi()
-    if (
-        _active_browser_type is None
-        and not _is_cdp_alive()
-        and _detect_chromium_browser() is None
-        and _detect_firefox() is not None
-    ):
-        # No CDP browser running or installed, but Firefox is available:
-        # drive Firefox over WebDriver BiDi instead of erroring out.
-        return _ensure_firefox_bidi()
-    return _ensure_cdp_browser()
+    def snapshot(self):
+        with self._snapshot_lock:
+            return dict(self._published)
 
+    async def _startup_async(self):
+        self._assert_owner_thread()
+        self._command_lock = asyncio.Lock()
+        self._playwright = await asyncio.wait_for(
+            async_playwright().start(), timeout=_OWNER_START_TIMEOUT_S
+        )
+        self._startup_count += 1
 
-def _ensure_cdp_browser():
-    """Ensure the CDP browser is running, connect Playwright if needed,
-    and return an active Page.
-    """
-    global _playwright, _browser, _context, _page, _active_browser_type
-
-    # Make sure a CDP-enabled browser process is running.
-    if not _is_cdp_alive():
-        ok, msg = _launch_cdp_browser()
-        if not ok:
-            raise RuntimeError(msg)
-
-    # Start Playwright once, connect over CDP every time we lost the browser.
-    if _playwright is None:
-        _playwright = sync_playwright().start()
-    if _browser is None or not getattr(_browser, "is_connected", lambda: False)():
-        _browser = _playwright.chromium.connect_over_cdp(CDP_URL)
-
-    # CDP exposes the existing browser context(s); use the first one.
-    contexts = _browser.contexts
-    _context = contexts[0] if contexts else _browser.new_context()
-
-    # Reuse an existing page if there is one; otherwise open a fresh tab.
-    pages = _context.pages
-    _page = pages[-1] if pages else _context.new_page()
-    _active_browser_type = "cdp"
-    return _page
-
-
-# ── Firefox over WebDriver BiDi ────────────────────────────────────────────
-
-def _is_bidi_alive() -> bool:
-    """Return True if the BiDi-launched Firefox is still running and connected.
-
-    The context check comes first: ``launch_persistent_context()`` may hand
-    back a ``Browser`` whose ``is_connected()`` is unreliable (or ``None``)
-    on some Playwright versions, and treating a live Firefox as dead is what
-    causes duplicate windows.
-    """
-    if _context is not None:
+    def _thread_main(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._owner_thread_id = threading.get_ident()
+        self._owner_native_thread_id = threading.get_native_id()
+        self._loop = loop
         try:
-            _ = _context.pages  # raises once the context is closed
-            return True
+            loop.run_until_complete(self._startup_async())
+        except BaseException as exc:
+            closing = self._closing_requested
+            self._set_state(
+                _OwnerState.CLOSING if closing else _OwnerState.FAILED,
+                None if closing else exc,
+            )
+            try:
+                loop.run_until_complete(self._shutdown_resources())
+            except BaseException:
+                pass
+            loop.close()
+            self._owner_thread_id = None
+            self._owner_native_thread_id = None
+            self._loop = None
+            if closing:
+                self._set_state(_OwnerState.STOPPED)
+            else:
+                self._publish()
+            return
+        if self._closing_requested:
+            self._set_state(_OwnerState.CLOSING)
+            loop.call_soon(loop.stop)
+        else:
+            self._set_state(_OwnerState.READY)
+        try:
+            loop.run_forever()
+        finally:
+            try:
+                loop.run_until_complete(self._shutdown_resources())
+            except BaseException:
+                pass
+            loop.close()
+            self._owner_thread_id = None
+            self._owner_native_thread_id = None
+            self._loop = None
+            final = _OwnerState.STOPPED if self._closing_requested else _OwnerState.FAILED
+            error = None if self._closing_requested else RuntimeError(
+                "browser owner event loop stopped unexpectedly"
+            )
+            self._set_state(final, error)
+
+    def _ensure_started(self):
+        deadline = time.monotonic() + _OWNER_START_TIMEOUT_S
+        with self._condition:
+            close_epoch = self._close_epoch
+            while True:
+                if self._close_epoch != close_epoch:
+                    raise RuntimeError("browser owner closed while the call was waiting")
+                if self._state in (_OwnerState.READY, _OwnerState.RECONNECTING):
+                    return self._loop
+                if self._state in (_OwnerState.STOPPED, _OwnerState.FAILED):
+                    if self._thread is not None and self._thread.is_alive():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise RuntimeError("browser owner did not finish stopping")
+                        self._condition.wait(min(remaining, 0.1))
+                        continue
+                    self._closing_requested = False
+                    self._state = _OwnerState.STARTING
+                    self._startup_error = None
+                    self._thread = threading.Thread(
+                        target=self._thread_main,
+                        name="osia-playwright-owner",
+                        daemon=True,
+                    )
+                    self._thread.start()
+                elif self._state == _OwnerState.CLOSING:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError("browser owner is still closing")
+                    self._condition.wait(min(remaining, 0.1))
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("browser owner startup timed out")
+                self._condition.wait(remaining)
+                if self._state == _OwnerState.FAILED:
+                    raise RuntimeError(
+                        f"browser owner startup failed: {self._startup_error}"
+                    )
+
+    async def _execute(self, operation, args, kwargs, acknowledgement):
+        self._assert_owner_thread()
+        try:
+            async with self._command_lock:
+                if self._state == _OwnerState.CLOSING:
+                    raise RuntimeError("browser owner is closing")
+                self._active_task = asyncio.current_task()
+                handler = getattr(self, f"_op_{operation}")
+                return await handler(*args, **kwargs)
+        finally:
+            if self._active_task is asyncio.current_task():
+                self._active_task = None
+            acknowledgement.set()
+
+    def call(self, operation, *args, timeout=None, **kwargs):
+        if threading.get_ident() == self._owner_thread_id:
+            raise RuntimeError("recursive browser-owner submission is forbidden")
+        loop = self._ensure_started()
+        acknowledgement = threading.Event()
+        future = asyncio.run_coroutine_threadsafe(
+            self._execute(operation, args, kwargs, acknowledgement), loop
+        )
+        outer_timeout = _OWNER_CALL_TIMEOUT_S if timeout is None else timeout
+        try:
+            return future.result(timeout=outer_timeout)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            acknowledgement.wait(_OWNER_CANCEL_TIMEOUT_S)
+            self.close()
+            raise _OwnerCallTimeout(
+                f"browser operation timed out after {outer_timeout:g}s"
+            ) from exc
+
+    def _cancel_active(self):
+        self._assert_owner_thread()
+        task = self._active_task
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _close_on_loop(self):
+        self._assert_owner_thread()
+        async with self._command_lock:
+            await self._shutdown_resources()
+        self._loop.call_soon(self._loop.stop)
+
+    def close(self):
+        if threading.get_ident() == self._owner_thread_id:
+            raise RuntimeError("browser owner cannot synchronously close itself")
+        with self._condition:
+            if self._state == _OwnerState.STOPPED:
+                return
+            if self._state == _OwnerState.FAILED and not (
+                self._thread and self._thread.is_alive()
+            ):
+                self._state = _OwnerState.STOPPED
+                self._condition.notify_all()
+                self._publish()
+                return
+            previous_state = self._state
+            loop = self._loop
+            thread = self._thread
+            self._closing_requested = True
+            self._close_epoch += 1
+            self._state = _OwnerState.CLOSING
+            self._condition.notify_all()
+        self._publish()
+        if (
+            previous_state in (_OwnerState.READY, _OwnerState.RECONNECTING)
+            and loop is not None
+            and not loop.is_closed()
+        ):
+            loop.call_soon_threadsafe(self._cancel_active)
+            future = asyncio.run_coroutine_threadsafe(self._close_on_loop(), loop)
+            try:
+                future.result(timeout=_OWNER_SHUTDOWN_TIMEOUT_S)
+            except (concurrent.futures.CancelledError, concurrent.futures.TimeoutError):
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                loop.call_soon_threadsafe(loop.stop)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=_OWNER_SHUTDOWN_TIMEOUT_S)
+            if thread.is_alive():
+                raise RuntimeError("browser owner thread did not terminate")
+        self._publish()
+
+    @staticmethod
+    def _emitter_off(emitter, event, handler):
+        if emitter is None or handler is None:
+            return
+        try:
+            emitter.off(event, handler)
         except Exception:
             pass
-    if _browser is not None:
+
+    @staticmethod
+    def _page_is_closed(page):
         try:
-            return _browser.is_connected()
+            return page is None or page.is_closed()
         except Exception:
-            return False
-    return False
+            return True
 
+    @staticmethod
+    def _page_opener(page):
+        try:
+            opener = getattr(page, "opener", None)
+            return None if callable(opener) or inspect.isawaitable(opener) else opener
+        except Exception:
+            return None
 
-def _ensure_firefox_bidi():
-    """Ensure the Playwright-launched Firefox (WebDriver BiDi) is running and
-    return an active Page. (Re)launches Firefox if it isn't running or was
-    closed by the user.
+    def _schedule_opener_resolution(self, page, context, generation):
+        candidate = getattr(page, "opener", None)
+        if not callable(candidate):
+            return
 
-    NEVER launches a second instance: if Firefox is already open and
-    controlled (``_active_browser_type == "bidi"`` and the context is alive)
-    the existing window is reused, and if another launch is already in
-    flight (``_firefox_launching``) this call waits for it instead of
-    spawning its own Firefox process.
-    """
-    global _playwright, _browser, _context, _page, _active_browser_type
-    global _firefox_launching
+        async def resolve():
+            try:
+                opener = await candidate()
+            except Exception:
+                return
+            if (
+                context is self._registry_context
+                and generation == self._registry_generation
+                and id(page) in self._registry
+            ):
+                self._registry[id(page)]["opener"] = opener
+                self._publish()
 
-    if _playwright is None:
-        _playwright = sync_playwright().start()
+        asyncio.create_task(resolve())
 
-    # Reuse: Firefox is already open and controlled over BiDi.
-    if _active_browser_type == "bidi" and _is_bidi_alive():
-        pages = _context.pages
-        _page = pages[-1] if pages else _context.new_page()
-        return _page
+    def _most_recent_live_page(self):
+        live = [
+            item for item in self._registry.values()
+            if not self._page_is_closed(item["page"])
+        ]
+        return max(live, key=lambda item: item["order"])["page"] if live else None
 
-    if not _is_bidi_alive():
-        # Another call is already launching Firefox — wait for it to finish
-        # rather than racing it with a second window.
-        if _firefox_launching:
-            deadline = time.time() + 30.0
-            while time.time() < deadline and _firefox_launching:
-                time.sleep(0.2)
-            if _is_bidi_alive():
-                pages = _context.pages
-                _page = pages[-1] if pages else _context.new_page()
-                return _page
-            raise RuntimeError(
-                "another Firefox BiDi launch was in progress but never came online"
+    def _detach_page_handlers(self):
+        for item in tuple(self._registry.values()):
+            for event, handler in item["handlers"].items():
+                self._emitter_off(item["page"], event, handler)
+
+    def _reset_registry(self, detach=True):
+        self._assert_owner_thread()
+        if detach:
+            if self._context_handlers is not None:
+                self._emitter_off(
+                    self._registry_context, "page", self._context_handlers.get("page")
+                )
+                self._emitter_off(
+                    self._registry_context, "close", self._context_handlers.get("close")
+                )
+            self._detach_page_handlers()
+        self._registry.clear()
+        self._page_tombstones.clear()
+        self._active_page = None
+        self._registry_context = None
+        self._context_handlers = None
+        self._registry_generation += 1
+        self._publish()
+
+    def _remove_page(self, page, generation):
+        self._assert_owner_thread()
+        if generation != self._registry_generation:
+            return
+        key = id(page)
+        item = self._registry.pop(key, None)
+        self._page_tombstones.add(key)
+        if item is None:
+            return
+        for event, handler in item["handlers"].items():
+            self._emitter_off(page, event, handler)
+        for other in self._registry.values():
+            if other.get("opener") is page:
+                other["opener"] = None
+        if self._active_page is page:
+            opener = item.get("opener")
+            if (
+                opener is not None
+                and id(opener) in self._registry
+                and not self._page_is_closed(opener)
+            ):
+                self._active_page = opener
+            else:
+                self._active_page = self._most_recent_live_page()
+        self._publish()
+
+    def _register_page(
+        self, page, *, context, generation, opener=None, make_active=False
+    ):
+        self._assert_owner_thread()
+        if page is None or self._page_is_closed(page):
+            return None
+        if (
+            context is not self._registry_context
+            or generation != self._registry_generation
+            or id(page) in self._page_tombstones
+        ):
+            return None
+        key = id(page)
+        item = self._registry.get(key)
+        if item is None:
+            self._registry_sequence += 1
+            handlers = {
+                "popup": lambda popup: self._register_page(
+                    popup,
+                    context=context,
+                    generation=generation,
+                    opener=page,
+                    make_active=True,
+                ),
+                "close": lambda *_args: self._remove_page(page, generation),
+                "crash": lambda *_args: self._remove_page(page, generation),
+                "framenavigated": lambda *_args: self._publish()
+                if generation == self._registry_generation else None,
+            }
+            item = {
+                "page": page,
+                "order": self._registry_sequence,
+                "opener": opener if opener is not None else self._page_opener(page),
+                "handlers": handlers,
+            }
+            self._registry[key] = item
+            if item["opener"] is None:
+                self._schedule_opener_resolution(page, context, generation)
+            for event, handler in handlers.items():
+                try:
+                    page.on(event, handler)
+                except Exception:
+                    pass
+        elif opener is not None:
+            item["opener"] = opener
+        if make_active:
+            self._active_page = page
+        self._publish()
+        return page
+
+    def _handle_context_close(self, context, generation):
+        self._assert_owner_thread()
+        if context is not self._registry_context or generation != self._registry_generation:
+            return
+        self._reset_registry()
+        if self._context is context:
+            self._context = None
+        self._publish()
+
+    def _register_context(self, context):
+        self._assert_owner_thread()
+        if context is self._registry_context:
+            return self._registry_generation
+        self._reset_registry()
+        self._registry_context = context
+        generation = self._registry_generation
+        handlers = {
+            "page": lambda page: self._register_page(
+                page,
+                context=context,
+                generation=generation,
+                opener=self._page_opener(page),
+                make_active=True,
+            ),
+            "close": lambda *_args: self._handle_context_close(context, generation),
+        }
+        self._context_handlers = handlers
+        for event, handler in handlers.items():
+            try:
+                context.on(event, handler)
+            except Exception:
+                pass
+        try:
+            pages = list(context.pages)
+        except Exception:
+            pages = []
+        for page in pages:
+            self._register_page(
+                page,
+                context=context,
+                generation=generation,
+                opener=self._page_opener(page),
+                make_active=False,
             )
+        if self._active_page is None:
+            self._active_page = self._most_recent_live_page()
+        self._publish()
+        return generation
 
+    def _reconcile_pages(self, context):
+        self._assert_owner_thread()
+        generation = self._register_context(context)
+        try:
+            pages = list(context.pages)
+        except Exception:
+            self._handle_context_close(context, generation)
+            return None
+        ids = {id(page) for page in pages}
+        self._page_tombstones.intersection_update(ids)
+        for page in pages:
+            self._register_page(
+                page,
+                context=context,
+                generation=generation,
+                opener=self._page_opener(page),
+                make_active=False,
+            )
+        for key, item in tuple(self._registry.items()):
+            if key not in ids or self._page_is_closed(item["page"]):
+                self._remove_page(item["page"], generation)
+        if (
+            self._active_page is None
+            or id(self._active_page) not in self._registry
+            or self._page_is_closed(self._active_page)
+        ):
+            self._active_page = self._most_recent_live_page()
+        self._publish()
+        return self._active_page
+
+    async def _ensure_context_page(self, context):
+        page = self._reconcile_pages(context)
+        if page is not None:
+            return page
+        page = await context.new_page()
+        generation = self._register_context(context)
+        return self._register_page(
+            page,
+            context=context,
+            generation=generation,
+            opener=None,
+            make_active=True,
+        ) or page
+
+    def _reset_browser_registration(self):
+        self._emitter_off(
+            self._registry_browser,
+            "disconnected",
+            self._browser_disconnected_handler,
+        )
+        self._registry_browser = None
+        self._browser_disconnected_handler = None
+
+    def _handle_browser_disconnected(self, browser):
+        self._assert_owner_thread()
+        if browser is not self._registry_browser:
+            return
+        self._reset_registry()
+        self._reset_browser_registration()
+        if self._browser is browser:
+            self._browser = None
+            self._context = None
+            self._active_browser_type = None
+        if not self._disconnecting and self._state != _OwnerState.CLOSING:
+            self._set_state(_OwnerState.RECONNECTING)
+        self._publish()
+
+    def _register_browser(self, browser):
+        self._assert_owner_thread()
+        if browser is None or browser is self._registry_browser:
+            return
+        self._reset_browser_registration()
+        handler = lambda *_args: self._handle_browser_disconnected(browser)
+        self._registry_browser = browser
+        self._browser_disconnected_handler = handler
+        try:
+            browser.on("disconnected", handler)
+        except Exception:
+            pass
+
+    def _is_bidi_alive(self):
+        if self._context is not None:
+            try:
+                _ = self._context.pages
+                return True
+            except Exception:
+                pass
+        if self._browser is not None:
+            try:
+                return self._browser.is_connected()
+            except Exception:
+                return False
+        return False
+
+    async def _ensure_cdp_browser(self, binary=None):
+        self._assert_owner_thread()
+        if not _is_cdp_alive():
+            ok, message = _launch_cdp_browser(binary)
+            if not ok:
+                raise RuntimeError(message)
+        if self._browser is None or not self._browser.is_connected():
+            self._set_state(_OwnerState.RECONNECTING)
+            self._browser = await self._playwright.chromium.connect_over_cdp(CDP_URL)
+        self._register_browser(self._browser)
+        contexts = self._browser.contexts
+        self._context = contexts[0] if contexts else await self._browser.new_context()
+        self._active_browser_type = "cdp"
+        page = await self._ensure_context_page(self._context)
+        self._set_state(_OwnerState.READY)
+        return page
+
+    async def _ensure_firefox_bidi(self):
+        self._assert_owner_thread()
+        if self._active_browser_type == "bidi" and self._is_bidi_alive():
+            self._register_browser(self._browser)
+            return await self._ensure_context_page(self._context)
         firefox = _detect_firefox()
         if not firefox:
             raise RuntimeError(
@@ -638,96 +1103,587 @@ def _ensure_firefox_bidi():
                 "in /usr/bin, /snap/bin, and $PATH"
             )
         os.makedirs(FIREFOX_PROFILE_DIR, exist_ok=True)
-        # A Firefox from a previous OSIA session may still be holding our
-        # dedicated profile. The Playwright connection that drove it died with
-        # that process, so it is effectively unresponsive — and launching a
-        # second Firefox against the locked profile is what opens a duplicate
-        # window. Kill the stale instance cleanly, then launch fresh (Bug 1).
         stale = _processes_using_profile(FIREFOX_PROFILE_DIR)
         if stale:
             _terminate_processes(stale)
-        _firefox_launching = True
+        self._set_state(_OwnerState.RECONNECTING)
+        self._context = await self._playwright.firefox.launch_persistent_context(
+            FIREFOX_PROFILE_DIR,
+            headless=False,
+            channel="moz-firefox",
+            executable_path=firefox,
+        )
+        self._browser = self._context.browser
+        self._active_browser_type = "bidi"
+        self._register_browser(self._browser)
+        self._register_context(self._context)
+        page = await self._ensure_context_page(self._context)
+        self._set_state(_OwnerState.READY)
+        return page
+
+    async def _ensure_browser(self):
+        self._assert_owner_thread()
+        if self._context is not None:
+            page = self._reconcile_pages(self._context)
+            if page is not None:
+                return page
+        if self._active_browser_type == "bidi":
+            return await self._ensure_firefox_bidi()
+        if (
+            self._active_browser_type is None
+            and not _is_cdp_alive()
+            and _detect_chromium_browser() is None
+            and _detect_firefox() is not None
+        ):
+            return await self._ensure_firefox_bidi()
+        return await self._ensure_cdp_browser()
+
+    async def _disconnect_active_browser(self):
+        self._assert_owner_thread()
+        browser, context = self._browser, self._context
+        self._disconnecting = True
+        self._reset_browser_registration()
+        self._reset_registry()
+        self._browser = None
+        self._context = None
+        self._active_browser_type = None
         try:
-            # launch_persistent_context() is Playwright's supported way to run
-            # Firefox with `--profile <dir>` (passing --profile via args= is
-            # rejected by Playwright), so cookies / logins persist between OSIA
-            # uses. channel="moz-firefox" selects the WebDriver BiDi protocol
-            # against the stock system Firefox resolved by _detect_firefox()
-            # instead of Playwright's bundled (Juggler-patched) build.
-            _context = _playwright.firefox.launch_persistent_context(
-                FIREFOX_PROFILE_DIR,
-                headless=False,
-                channel="moz-firefox",
-                executable_path=firefox,
-            )
-            _browser = _context.browser  # may be None on older Playwright versions
-            _active_browser_type = "bidi"
-        finally:
-            _firefox_launching = False
-
-    # Reuse an existing page if there is one; otherwise open a fresh tab.
-    pages = _context.pages
-    _page = pages[-1] if pages else _context.new_page()
-    return _page
-
-
-def _disconnect_active_browser():
-    """Drop the current Playwright browser connection and reset the
-    automation state. Must be called while holding ``_lock``.
-
-    For a CDP connection this only disconnects — the Chromium browser keeps
-    running. For a BiDi-launched Firefox this quits the browser (OSIA owns
-    that process); its cookies / sessions persist in the OSIA Firefox profile.
-    """
-    global _browser, _context, _page, _active_browser_type
-    try:
-        if _browser is not None:
-            _browser.close()
-        elif _context is not None:
-            _context.close()
-    except Exception:
-        pass
-    _browser = None
-    _context = None
-    _page = None
-    _active_browser_type = None
-
-
-# ── Screenshot helper ──────────────────────────────────────────────────────
-
-def _screenshot_b64(page) -> str | None:
-    """Capture a viewport PNG of ``page`` and return it as a base64 string.
-    Returns ``None`` on failure so callers can degrade gracefully — a
-    missing screenshot must never break a successful navigation tool.
-    """
-    try:
-        png = page.screenshot(type="png", full_page=False)
-        return base64.b64encode(png).decode("ascii")
-    except Exception as e:
-        print(f"[OSIA Browser] screenshot capture failed: {e}")
-        return None
-
-
-def _result(text: str, page) -> dict:
-    """Standard success envelope for navigation tools: text + screenshot
-    so the agent can see the post-action page state.
-    """
-    return {"text": text, "screenshot": _screenshot_b64(page)}
-
-
-def _page_url(page) -> str:
-    """Return the page's current URL.
-
-    On the BiDi backend ``page.url`` goes stale after a history traversal
-    (Firefox doesn't emit the navigation events Playwright uses to track
-    those), so ask the page itself. On CDP this is exactly ``page.url``.
-    """
-    if _active_browser_type == "bidi":
-        try:
-            return page.evaluate("location.href")
+            if browser is not None:
+                await browser.close()
+            elif context is not None:
+                await context.close()
         except Exception:
             pass
-    return page.url
+        finally:
+            self._disconnecting = False
+            self._publish()
+
+    async def _shutdown_resources(self):
+        self._assert_owner_thread()
+        current = asyncio.current_task()
+        active = self._active_task
+        if active is not None and active is not current and not active.done():
+            active.cancel()
+            try:
+                await active
+            except BaseException:
+                pass
+        await self._disconnect_active_browser()
+        playwright, self._playwright = self._playwright, None
+        if playwright is not None:
+            try:
+                await playwright.stop()
+            finally:
+                self._driver_stop_count += 1
+        self._publish()
+
+    async def _screenshot_b64(self, page):
+        try:
+            png = await page.screenshot(type="png", full_page=False)
+            return base64.b64encode(png).decode("ascii")
+        except Exception as exc:
+            print(f"[OSIA Browser] screenshot capture failed: {exc}")
+            return None
+
+    async def _result(self, text, page):
+        return {"text": text, "screenshot": await self._screenshot_b64(page)}
+
+    async def _page_url(self, page):
+        if self._active_browser_type == "bidi":
+            try:
+                return await page.evaluate("location.href")
+            except Exception:
+                pass
+        return page.url
+
+    async def _after_interaction_page(self, fallback):
+        try:
+            await fallback.wait_for_timeout(_POPUP_EVENT_WINDOW_MS)
+        except Exception:
+            await asyncio.sleep(0)
+        if self._context is not None:
+            return self._reconcile_pages(self._context) or fallback
+        return self._active_page or fallback
+
+    async def _bidi_history_step(self, page, delta):
+        before = await page.evaluate("location.href")
+        await page.evaluate("history.back()" if delta < 0 else "history.forward()")
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.2)
+            try:
+                current = await page.evaluate("location.href")
+            except Exception:
+                continue
+            if current != before:
+                return current
+        return None
+
+    async def _op_navigate(self, url):
+        url = _normalize_url(url)
+        try:
+            page = await self._ensure_browser()
+        except Exception as exc:
+            return f"ERROR: the browser did not open — {exc}"
+        try:
+            await page.goto(url, wait_until="commit", timeout=10000)
+        except _TIMEOUT_ERRORS:
+            _raise_browser_window(self._active_browser_type)
+            return await self._result(
+                f"Navigated to: {await self._page_url(page)} (still loading — "
+                "page may still be loading resources)",
+                page,
+            )
+        except Exception as exc:
+            return f"ERROR navigating to {url}: {exc}"
+        note = ""
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=3000)
+        except Exception:
+            note = " (DOM still loading — page may still be loading resources)"
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        _raise_browser_window(self._active_browser_type)
+        return await self._result(
+            f"Navigated to: {await self._page_url(page)}{note}", page
+        )
+
+    async def _op_click(self, selector):
+        try:
+            page = await self._ensure_browser()
+            await page.click(selector, timeout=5000)
+            page = await self._after_interaction_page(page)
+            return await self._result(f"Clicked element: {selector}", page)
+        except Exception as exc:
+            return f"ERROR clicking {selector}: {exc}"
+
+    async def _op_fill(self, selector, value):
+        try:
+            page = await self._ensure_browser()
+            await page.fill(selector, value, timeout=5000)
+            return f"Filled {selector} with: {value}"
+        except Exception as exc:
+            return f"ERROR filling {selector}: {exc}"
+
+    async def _op_read_page(self):
+        try:
+            page = await self._ensure_browser()
+            text = await page.evaluate(
+                "() => document.body ? document.body.innerText : ''"
+            )
+            if not text:
+                text = "(empty page)"
+            if len(text) > 4000:
+                text = text[:4000] + "\n... [TRUNCATED]"
+            return f"Page content:\n{text}"
+        except Exception as exc:
+            return f"ERROR reading page: {exc}"
+
+    async def _op_get_current_url(self):
+        try:
+            page = await self._ensure_browser()
+            return f"Current URL: {await self._page_url(page)}"
+        except Exception as exc:
+            return f"ERROR reading current URL: {exc}"
+
+    async def _op_scroll(self, direction="down", amount=600):
+        direction = (direction or "down").lower()
+        if direction not in ("up", "down"):
+            return f"ERROR scroll: direction must be 'up' or 'down', got {direction!r}"
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            return f"ERROR scroll: amount must be an integer, got {amount!r}"
+        delta = -amount if direction == "up" else amount
+        try:
+            page = await self._ensure_browser()
+            await page.evaluate(f"window.scrollBy(0, {delta})")
+            return f"Scrolled {direction} by {abs(delta)}px"
+        except Exception as exc:
+            return f"ERROR scrolling: {exc}"
+
+    async def _op_go_back(self):
+        try:
+            page = await self._ensure_browser()
+            if self._active_browser_type == "bidi":
+                url = await self._bidi_history_step(page, -1)
+                if url is None:
+                    return await self._result("No previous page in history.", page)
+                return await self._result(f"Went back to: {url}", page)
+            response = await page.go_back(timeout=5000)
+            if response is None:
+                return await self._result("No previous page in history.", page)
+            return await self._result(f"Went back to: {page.url}", page)
+        except Exception as exc:
+            return f"ERROR going back: {exc}"
+
+    async def _op_go_forward(self):
+        try:
+            page = await self._ensure_browser()
+            if self._active_browser_type == "bidi":
+                url = await self._bidi_history_step(page, 1)
+                if url is None:
+                    return await self._result("No forward page in history.", page)
+                return await self._result(f"Went forward to: {url}", page)
+            response = await page.go_forward(timeout=5000)
+            if response is None:
+                return await self._result("No forward page in history.", page)
+            return await self._result(f"Went forward to: {page.url}", page)
+        except Exception as exc:
+            return f"ERROR going forward: {exc}"
+
+    async def _op_open_firefox_bidi(self, url):
+        try:
+            if self._active_browser_type == "cdp":
+                await self._disconnect_active_browser()
+            page = await self._ensure_firefox_bidi()
+        except Exception as exc:
+            print(f"[OSIA Browser] Firefox BiDi launch failed: {exc}")
+            await self._disconnect_active_browser()
+            return None
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        _raise_browser_window(self._active_browser_type)
+        if not url:
+            return await self._result("Opened Firefox (driven over WebDriver BiDi)", page)
+        try:
+            await page.goto(
+                _normalize_url(url), wait_until="domcontentloaded", timeout=20000
+            )
+            return await self._result(
+                f"Opened Firefox (driven over WebDriver BiDi) at {page.url}", page
+            )
+        except Exception as exc:
+            return await self._result(
+                "Opened Firefox (driven over WebDriver BiDi) but navigating "
+                f"to {url!r} failed: {exc}",
+                page,
+            )
+
+    async def _op_open_cdp_browser(self, binary, url):
+        reused = _is_cdp_alive()
+        try:
+            if self._active_browser_type == "bidi":
+                await self._disconnect_active_browser()
+            if not reused:
+                ok, message = _launch_cdp_browser(binary)
+                if not ok:
+                    print(f"[OSIA Browser] CDP launch failed: {message}")
+                    return None
+            page = await self._ensure_cdp_browser(binary)
+        except Exception as exc:
+            print(f"[OSIA Browser] CDP connect failed: {exc}")
+            return None
+        label = _canonical_browser_name(binary)
+        verb = "Reusing existing" if reused else "Opened"
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        _raise_browser_window(self._active_browser_type)
+        if not url:
+            return await self._result(
+                f"{verb} {label} window (CDP on port {CDP_PORT})", page
+            )
+        try:
+            await page.goto(
+                _normalize_url(url), wait_until="domcontentloaded", timeout=20000
+            )
+            return await self._result(
+                f"{verb} {label} window at {await self._page_url(page)}", page
+            )
+        except Exception as exc:
+            return await self._result(
+                f"{verb} {label} window but navigating to {url!r} failed: {exc}",
+                page,
+            )
+
+    async def _op_open_new_tab(self, url):
+        url = _normalize_url(url)
+        try:
+            await self._ensure_browser()
+            page = await self._context.new_page()
+            generation = self._register_context(self._context)
+            self._register_page(
+                page,
+                context=self._context,
+                generation=generation,
+                opener=None,
+                make_active=True,
+            )
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
+            self._active_page = page
+            self._publish()
+            return f"Opened new tab: {page.url}"
+        except Exception as exc:
+            return f"ERROR opening new tab {url}: {exc}"
+
+    async def _resolve_clickable(self, page, target_norm, target_tokens, desktop):
+        best = {"loc": None, "score": 0.0, "label": ""}
+
+        async def consider(locator, primary, minimum):
+            try:
+                count = await locator.count()
+            except Exception:
+                return
+            for index in range(min(count, _DOM_MAX_MATCHES)):
+                candidate = locator.nth(index)
+                try:
+                    if not await candidate.is_visible():
+                        continue
+                except Exception:
+                    continue
+                try:
+                    label = (await candidate.evaluate(_DOM_LABEL_JS) or "").strip()
+                except Exception:
+                    label = ""
+                if not label:
+                    continue
+                score = desktop._label_score(target_norm, target_tokens, label)
+                if primary and score > 0:
+                    score += 0.05
+                if score < minimum:
+                    continue
+                if (
+                    score > best["score"]
+                    or (
+                        score == best["score"]
+                        and best["loc"] is not None
+                        and 0 < len(label) < len(best["label"])
+                    )
+                ):
+                    best.update(loc=candidate, score=score, label=label)
+
+        for role in _DOM_CLICK_ROLES:
+            try:
+                locator = page.get_by_role(role, name=target_norm)
+            except Exception:
+                continue
+            await consider(
+                locator, role in _DOM_PRIMARY_ROLES, desktop._UIA_MIN_SCORE
+            )
+            if best["score"] >= 1.0:
+                break
+        if best["loc"] is None:
+            try:
+                await consider(page.get_by_text(target_norm), False, 1.0)
+            except Exception:
+                pass
+        return best["loc"], best["label"], best["score"]
+
+    async def _op_find_and_click(self, text):
+        if not text:
+            return "ERROR find_and_click: text is required"
+        try:
+            page = await self._ensure_browser()
+        except Exception as exc:
+            return f"ERROR clicking element with text {text!r}: {exc}"
+        locator, label = None, ""
+        try:
+            from osia.tools import desktop_control as desktop
+
+            target_norm = desktop._normalize_label(text)
+            if target_norm:
+                locator, label, _score = await self._resolve_clickable(
+                    page, target_norm, frozenset(target_norm.split()), desktop
+                )
+        except Exception:
+            locator = None
+        try:
+            try:
+                before = await page.screenshot(type="png", full_page=False)
+            except Exception:
+                before = None
+            what = None
+            if locator is not None:
+                try:
+                    await locator.click(timeout=5000)
+                    what = f"{text!r} (matched {label!r})" if label else f"{text!r}"
+                except Exception:
+                    what = None
+            if what is None:
+                await page.get_by_text(text, exact=False).first.click(timeout=5000)
+                what = f"{text!r}"
+            page = await self._after_interaction_page(page)
+            try:
+                after = await page.screenshot(type="png", full_page=False)
+            except Exception:
+                after = None
+            note = ""
+            if before is not None and after is not None and before == after:
+                note = " — but the page did not visibly change; the click may have missed."
+            shot = (
+                base64.b64encode(after).decode("ascii")
+                if after is not None
+                else await self._screenshot_b64(page)
+            )
+            return {
+                "text": f"Clicked element with text: {what}.{note}",
+                "screenshot": shot,
+            }
+        except Exception as exc:
+            return f"ERROR clicking element with text {text!r}: {exc}"
+
+    async def _op_dom_click(self, description):
+        if not description or not str(description).strip():
+            return None
+        description = str(description).strip()
+        try:
+            page = await self._ensure_browser()
+            from osia.tools import desktop_control as desktop
+
+            target_norm = desktop._normalize_label(description)
+            if not target_norm:
+                return None
+            locator, label, _score = await self._resolve_clickable(
+                page, target_norm, frozenset(target_norm.split()), desktop
+            )
+            if locator is None:
+                return None
+            try:
+                await locator.click(timeout=5000)
+            except Exception:
+                return None
+            page = await self._after_interaction_page(page)
+            try:
+                url = await self._page_url(page)
+            except Exception:
+                url = ""
+            where = f" on {url}" if url else ""
+            matched = f" (matched {label!r})" if label else ""
+            return f'Clicked "{description}" via the page DOM{matched}{where}.'
+        except Exception:
+            return None
+
+    async def _op_wait_for_load(self):
+        try:
+            page = await self._ensure_browser()
+        except Exception as exc:
+            return f"ERROR waiting for load: {exc}"
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=8000)
+            return f"Page loaded: {await self._page_url(page)}"
+        except _TIMEOUT_ERRORS:
+            return (
+                f"Page loaded (timeout): {await self._page_url(page)} — "
+                "page may still be loading resources"
+            )
+        except Exception as exc:
+            return f"ERROR waiting for load: {exc}"
+
+    async def _op_get_page_text(self):
+        try:
+            page = await self._ensure_browser()
+            text = await page.evaluate(
+                "() => document.body ? document.body.innerText : ''"
+            )
+            if not text:
+                return "(empty page)"
+            if len(text) > 8000:
+                text = text[:8000] + "\n... [TRUNCATED]"
+            return text
+        except Exception as exc:
+            return f"ERROR reading page: {exc}"
+
+    async def _op_scroll_down(self, amount=None):
+        try:
+            page = await self._ensure_browser()
+            if amount is None:
+                await page.evaluate("window.scrollBy(0, window.innerHeight)")
+                return "Scrolled down one viewport"
+            try:
+                value = int(amount)
+            except (TypeError, ValueError):
+                return f"ERROR scroll_down: amount must be an integer, got {amount!r}"
+            await page.evaluate(f"window.scrollBy(0, {value})")
+            return f"Scrolled down {value}px"
+        except Exception as exc:
+            return f"ERROR scrolling: {exc}"
+
+    async def _op_type_text(self, selector, text):
+        try:
+            page = await self._ensure_browser()
+            await page.click(selector, timeout=5000)
+            await page.keyboard.type(text)
+            return f"Typed into {selector}: {text}"
+        except Exception as exc:
+            return f"ERROR typing into {selector}: {exc}"
+
+    async def _op_press_key(self, key):
+        if not key:
+            return "ERROR press_key: key is required"
+        try:
+            page = await self._ensure_browser()
+            await page.keyboard.press(key)
+            return f"Pressed key: {key}"
+        except Exception as exc:
+            return f"ERROR pressing key {key}: {exc}"
+
+    async def _selector_present(self, page, selector):
+        value = str(selector).strip()
+        if not value:
+            return False
+        try:
+            if await page.query_selector(value) is not None:
+                return True
+        except Exception:
+            pass
+        try:
+            from osia.tools import desktop_control as desktop
+
+            target_norm = desktop._normalize_label(value)
+            if not target_norm:
+                return False
+            locator, _label, score = await self._resolve_clickable(
+                page, target_norm, frozenset(target_norm.split()), desktop
+            )
+            return locator is not None and score > 0
+        except Exception:
+            return False
+
+    async def _op_web_state(self, expect_url=None, expect_text=None, expect_selector=None):
+        if self._context is None or self._active_page is None:
+            return {"available": False, "reason": "no live page"}
+        page = self._reconcile_pages(self._context)
+        if page is None:
+            return {"available": False, "reason": "no live page"}
+        try:
+            url = await self._page_url(page)
+        except Exception:
+            url = None
+        checks = {}
+        if expect_url:
+            checks["url_contains"] = bool(
+                url and str(expect_url).strip().lower() in url.lower()
+            )
+        if expect_text:
+            try:
+                text = await page.evaluate(
+                    "() => document.body ? document.body.innerText : ''"
+                ) or ""
+            except Exception:
+                text = ""
+            checks["text_contains"] = bool(
+                text and str(expect_text).strip().lower() in text.lower()
+            )
+        if expect_selector:
+            checks["selector_found"] = await self._selector_present(
+                page, expect_selector
+            )
+        return {"available": True, "url": url, "checks": checks}
+
+
+_owner = _AsyncBrowserOwner()
+
+
 
 
 # ── OS-window raise (Windows) ──────────────────────────────────────────────
@@ -737,7 +1693,7 @@ def _page_url(page) -> str:
 _RAISE_FOCUS_TIMEOUT_S = 2.0
 
 
-def _raise_browser_window() -> None:
+def _raise_browser_window(browser_type: str | None = None) -> None:
     """Best-effort, Windows-only: bring the automated browser's OS window to the
     foreground after a successful connect/navigate.
 
@@ -763,9 +1719,7 @@ def _raise_browser_window() -> None:
     try:
         from osia.tools import desktop_control as _dc
 
-        profile = (
-            FIREFOX_PROFILE_DIR if _active_browser_type == "bidi" else OSIA_PROFILE_DIR
-        )
+        profile = FIREFOX_PROFILE_DIR if browser_type == "bidi" else OSIA_PROFILE_DIR
         pids, bases = set(), []
         for proc in _processes_using_profile(profile):
             try:
@@ -799,448 +1753,6 @@ def _normalize_url(url: str) -> str:
 
 # ── Existing tools (now backed by the real browser via CDP) ────────────────
 
-def navigate(url: str):
-    """Navigate the real browser to ``url``. Launches Brave/Chromium with
-    ``--remote-debugging-port=9222`` if not already running, then drives
-    the page via CDP. Returns ``{"text": ..., "screenshot": ...}`` on
-    success so the agent can visually verify the page that loaded.
-
-    The navigation waits only until it commits (response received), then
-    gives the DOM a short window (3s) to become ready. A slow page is NOT
-    an error and never blocks the agent: the result is returned right away
-    and the page keeps loading in the background, so there is no need to
-    call ``wait_for_load()`` after navigating.
-    """
-    url = _normalize_url(url)
-    with _lock:
-        try:
-            page = _ensure_browser()
-        except Exception as e:
-            # The browser itself failed to launch/connect — this is NOT a
-            # navigation problem. Start with "ERROR:" and say so plainly so a
-            # fast model never misreads it as success and hallucinates an open
-            # window (Bug 2).
-            return f"ERROR: the browser did not open — {e}"
-        try:
-            page.goto(url, wait_until="commit", timeout=10000)
-        except _TIMEOUT_ERRORS:
-            # Slow server — the navigation keeps going in the browser.
-            # Still a success path, so raise the OS window now: this is often
-            # the FIRST navigate after a launch, and skipping it would leave
-            # the fresh browser in the background — the exact bug being fixed.
-            _raise_browser_window()
-            return _result(
-                f"Navigated to: {_page_url(page)} (still loading — "
-                "page may still be loading resources)",
-                page,
-            )
-        except Exception as e:
-            return f"ERROR navigating to {url}: {e}"
-        # Built-in short wait so the agent never has to wait manually after
-        # navigate: up to 3s for the DOM, then continue regardless.
-        note = ""
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=3000)
-        except Exception:
-            note = " (DOM still loading — page may still be loading resources)"
-        try:
-            page.bring_to_front()
-        except Exception:
-            pass
-        _raise_browser_window()
-        return _result(f"Navigated to: {_page_url(page)}{note}", page)
-
-
-def click(selector: str):
-    """Click an element matching a CSS selector. Returns a screenshot of
-    the post-click state so the agent can confirm the click landed.
-    """
-    with _lock:
-        try:
-            page = _ensure_browser()
-            page.click(selector, timeout=5000)
-            return _result(f"Clicked element: {selector}", page)
-        except Exception as e:
-            return f"ERROR clicking {selector}: {e}"
-
-
-def fill(selector: str, value: str) -> str:
-    """Fill an input element matching a CSS selector with a value."""
-    with _lock:
-        try:
-            page = _ensure_browser()
-            page.fill(selector, value, timeout=5000)
-            return f"Filled {selector} with: {value}"
-        except Exception as e:
-            return f"ERROR filling {selector}: {e}"
-
-
-def read_page() -> str:
-    """Return the visible text content of the current page (truncated to 4000 chars)."""
-    with _lock:
-        try:
-            page = _ensure_browser()
-            text = page.evaluate(
-                "() => document.body ? document.body.innerText : ''"
-            )
-            if not text:
-                text = "(empty page)"
-            if len(text) > 4000:
-                text = text[:4000] + "\n... [TRUNCATED]"
-            return f"Page content:\n{text}"
-        except Exception as e:
-            return f"ERROR reading page: {e}"
-
-
-def get_current_url() -> str:
-    """Return the URL of the active page."""
-    with _lock:
-        try:
-            page = _ensure_browser()
-            return f"Current URL: {_page_url(page)}"
-        except Exception as e:
-            return f"ERROR reading current URL: {e}"
-
-
-def scroll(direction: str = "down", amount: int = 600) -> str:
-    """Scroll the active page. ``direction`` is 'up' or 'down'; ``amount`` is pixels."""
-    direction = (direction or "down").lower()
-    if direction not in ("up", "down"):
-        return f"ERROR scroll: direction must be 'up' or 'down', got {direction!r}"
-    try:
-        amount = int(amount)
-    except (TypeError, ValueError):
-        return f"ERROR scroll: amount must be an integer, got {amount!r}"
-    dy = -amount if direction == "up" else amount
-    with _lock:
-        try:
-            page = _ensure_browser()
-            page.evaluate(f"window.scrollBy(0, {dy})")
-            return f"Scrolled {direction} by {abs(dy)}px"
-        except Exception as e:
-            return f"ERROR scrolling: {e}"
-
-
-def _bidi_history_step(page, delta: int) -> str | None:
-    """History navigation for the BiDi backend.
-
-    Firefox over BiDi performs history traversals but doesn't emit the
-    navigation events Playwright waits for, so ``page.go_back()`` /
-    ``page.go_forward()`` time out. Drive history from page JS instead and
-    poll ``location.href`` until it changes.
-
-    Returns the new URL, or ``None`` if the URL never changed (no history
-    entry in that direction).
-    """
-    before = page.evaluate("location.href")
-    page.evaluate("history.back()" if delta < 0 else "history.forward()")
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
-        time.sleep(0.2)
-        try:
-            current = page.evaluate("location.href")
-        except Exception:
-            continue  # document mid-swap; retry
-        if current != before:
-            return current
-    return None
-
-
-def go_back():
-    """Navigate back in the active page's history. Returns a screenshot
-    of the resulting page state.
-    """
-    with _lock:
-        try:
-            page = _ensure_browser()
-            if _active_browser_type == "bidi":
-                url = _bidi_history_step(page, -1)
-                if url is None:
-                    return _result("No previous page in history.", page)
-                return _result(f"Went back to: {url}", page)
-            response = page.go_back(timeout=5000)
-            if response is None:
-                return _result("No previous page in history.", page)
-            return _result(f"Went back to: {page.url}", page)
-        except Exception as e:
-            return f"ERROR going back: {e}"
-
-
-def go_forward():
-    """Navigate forward in the active page's history. Returns a screenshot
-    of the resulting page state.
-    """
-    with _lock:
-        try:
-            page = _ensure_browser()
-            if _active_browser_type == "bidi":
-                url = _bidi_history_step(page, 1)
-                if url is None:
-                    return _result("No forward page in history.", page)
-                return _result(f"Went forward to: {url}", page)
-            response = page.go_forward(timeout=5000)
-            if response is None:
-                return _result("No forward page in history.", page)
-            return _result(f"Went forward to: {page.url}", page)
-        except Exception as e:
-            return f"ERROR going forward: {e}"
-
-
-def _open_firefox_bidi(url: str | None):
-    """Launch (or reuse) the BiDi-driven Firefox, optionally navigate to
-    ``url``, and make Firefox the active automated browser so every page
-    tool drives it from now on.
-
-    Returns the tool result on success, or ``None`` if the BiDi launch
-    failed (the caller then falls back to a plain application launch).
-    """
-    with _lock:
-        try:
-            # Hand off from CDP if it was active; the Chromium browser keeps
-            # running, we just stop driving it.
-            if _active_browser_type == "cdp":
-                _disconnect_active_browser()
-            page = _ensure_firefox_bidi()
-        except Exception as e:
-            print(f"[OSIA Browser] Firefox BiDi launch failed: {e}")
-            # Reset so the page tools don't keep retrying a broken BiDi setup.
-            _disconnect_active_browser()
-            return None
-
-        # Firefox is up and driven over BiDi. From here on, a navigation
-        # failure is reported but does NOT invalidate the launch — the
-        # window stays open and the page tools keep driving it.
-        try:
-            page.bring_to_front()
-        except Exception:
-            pass
-        _raise_browser_window()
-        if not url:
-            return _result("Opened Firefox (driven over WebDriver BiDi)", page)
-        try:
-            page.goto(_normalize_url(url), wait_until="domcontentloaded", timeout=20000)
-            return _result(
-                f"Opened Firefox (driven over WebDriver BiDi) at {page.url}", page
-            )
-        except Exception as e:
-            return _result(
-                f"Opened Firefox (driven over WebDriver BiDi) but navigating "
-                f"to {url!r} failed: {e}",
-                page,
-            )
-
-
-def _open_cdp_browser(binary: str, url: str | None):
-    """Open (or reuse) a CDP-driven Chromium browser, optionally navigate to
-    ``url``, and make it the active automated browser.
-
-    If a CDP browser is already alive on port ``CDP_PORT`` the existing
-    window is reused — a second window is NEVER opened. Otherwise ``binary``
-    is launched with remote debugging enabled so this window (and not a
-    later duplicate) is the one every page tool drives.
-
-    Returns the tool result on success, or ``None`` if the CDP launch or
-    connection failed (the caller then falls back to a plain application
-    launch).
-    """
-    with _lock:
-        reused = _is_cdp_alive()
-        try:
-            # Hand off from BiDi if Firefox was active: close the OSIA-owned
-            # Firefox (its sessions persist in the profile) so the page tools
-            # drive the Chromium window from now on.
-            if _active_browser_type == "bidi":
-                _disconnect_active_browser()
-            if not reused:
-                ok, msg = _launch_cdp_browser(binary)
-                if not ok:
-                    print(f"[OSIA Browser] CDP launch failed: {msg}")
-                    return None
-            page = _ensure_cdp_browser()
-        except Exception as e:
-            print(f"[OSIA Browser] CDP connect failed: {e}")
-            return None
-
-        label = _canonical_browser_name(binary)
-        verb = "Reusing existing" if reused else "Opened"
-        try:
-            page.bring_to_front()
-        except Exception:
-            pass
-        _raise_browser_window()
-        if not url:
-            return _result(f"{verb} {label} window (CDP on port {CDP_PORT})", page)
-        try:
-            page.goto(_normalize_url(url), wait_until="domcontentloaded", timeout=20000)
-            return _result(f"{verb} {label} window at {_page_url(page)}", page)
-        except Exception as e:
-            return _result(
-                f"{verb} {label} window but navigating to {url!r} failed: {e}",
-                page,
-            )
-
-
-def open_browser(name: str, url: str | None = None):
-    """Open a specific browser by user-facing name (firefox, chrome,
-    chromium, opera, edge, brave), optionally at ``url``.
-
-    Firefox is launched through Playwright over WebDriver BiDi and becomes
-    the active automated browser — all page tools (navigate, click,
-    find_and_click, scroll, …) drive it transparently, exactly as they drive
-    a CDP browser. If the BiDi launch fails, Firefox is opened as a plain
-    application instead.
-
-    Chromium-based browsers (brave, chrome, chromium, opera, edge) are
-    driven over CDP: if a CDP window is already running it is REUSED (never
-    a second window); otherwise the browser is launched with remote
-    debugging enabled so the page tools can drive it. Only if the CDP path
-    fails entirely is the browser opened as a plain application.
-
-    Use this tool when the user asks to open a *specific* browser
-    ("open Firefox", "open Chrome").
-
-    Every browser is launched against a dedicated OSIA profile (see
-    ``_profile_args``), never the user's personal profile.
-    """
-    binary = resolve_browser_name(name)
-    if not binary:
-        known = ", ".join(sorted(_BROWSER_NAME_MAP))
-        return (
-            f"ERROR: browser {name!r} is not installed "
-            f"(known browsers: {known})"
-        )
-
-    bidi_note = ""
-    if _canonical_browser_name(binary) == "firefox":
-        result = _open_firefox_bidi(url)
-        if result is not None:
-            return result
-        # BiDi failed — fall through to the plain application launch below.
-        bidi_note = " (WebDriver BiDi unavailable — page tools cannot drive this window)"
-    else:
-        # CDP-capable browser: reuse the existing CDP window or launch one
-        # with remote debugging enabled. Never opens a duplicate window.
-        result = _open_cdp_browser(binary, url)
-        if result is not None:
-            return result
-        # CDP failed — fall through to the plain application launch below.
-        bidi_note = " (CDP unavailable — page tools cannot drive this window)"
-
-    cmd = [binary, *_profile_args(binary)]
-    if url:
-        cmd.append(_normalize_url(url))
-    try:
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            **_detach_kwargs(),
-        )
-    except Exception as e:
-        return (
-            f"ERROR: the browser did not open — failed to launch "
-            f"{os.path.basename(binary)}: {e}"
-        )
-    suffix = f" at {_normalize_url(url)}" if url else ""
-    return f"Opened {os.path.basename(binary)}{suffix}{bidi_note}"
-
-
-def open_new_tab(url: str) -> str:
-    """Open ``url`` as a new tab in the real browser and make it active."""
-    global _page
-    url = _normalize_url(url)
-    with _lock:
-        try:
-            _ensure_browser()
-            new_page = _context.new_page()
-            new_page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            try:
-                new_page.bring_to_front()
-            except Exception:
-                pass
-            _page = new_page  # subsequent tools act on the new tab
-            return f"Opened new tab: {new_page.url}"
-        except Exception as e:
-            return f"ERROR opening new tab {url}: {e}"
-
-
-# ── New tools ──────────────────────────────────────────────────────────────
-
-def find_and_click(text: str):
-    """Find the best visible element whose label matches ``text`` and click it.
-
-    Prefers a PRECISE ARIA role + accessible-name match (button / link / menu
-    item / …) scored with the WOR-84/WOR-46 fuzzy matcher, so a label like
-    "Suivant" lands on the right control instead of the first stray substring
-    node; falls back to a plain visible-text match, then to the original
-    first-text-match so nothing the old resolver could click is lost. Returns a
-    screenshot so the agent can verify the click, with a soft note when the page
-    did not visibly change (a basic miss check, mirroring the spirit of
-    desktop_click's BEFORE/AFTER diff). Signature and return contract are
-    unchanged (success → {text, screenshot} dict; failure → "ERROR ..." string).
-    """
-    if not text:
-        return "ERROR find_and_click: text is required"
-    with _lock:
-        try:
-            page = _ensure_browser()
-        except Exception as e:
-            return f"ERROR clicking element with text {text!r}: {e}"
-
-        # Precise resolution first (role + accessible name, fuzzy-scored). Any
-        # failure (desktop_control unavailable, no confident match) leaves
-        # ``locator`` None and routes to the original text-first behavior below,
-        # so this is strictly additive — never a regression.
-        locator, label = None, ""
-        try:
-            from osia.tools import desktop_control as _dc
-            target_norm = _dc._normalize_label(text)
-            if target_norm:
-                target_tokens = frozenset(target_norm.split())
-                locator, label, _score = _resolve_clickable(
-                    page, target_norm, target_tokens, _dc)
-        except Exception:
-            locator = None
-
-        try:
-            try:
-                before = page.screenshot(type="png", full_page=False)
-            except Exception:
-                before = None
-            what = None
-            if locator is not None:
-                try:
-                    locator.click(timeout=5000)
-                    what = (f"{text!r} (matched {label!r})"
-                            if label else f"{text!r}")
-                except Exception:
-                    # Role match was found but not actionable (disabled, covered,
-                    # detached mid-animation). Do NOT hard-fail — fall back to the
-                    # original text click, which may resolve a DIFFERENT actionable
-                    # node with the same label. Keeps the role path strictly
-                    # additive (Finding WOR-84/1).
-                    what = None
-            if what is None:
-                # Original behavior preserved: first visible text match.
-                page.get_by_text(text, exact=False).first.click(timeout=5000)
-                what = f"{text!r}"
-            try:
-                after = page.screenshot(type="png", full_page=False)
-            except Exception:
-                after = None
-            # Basic miss check: byte-identical BEFORE/AFTER → warn softly (still a
-            # success, so a legitimate no-visible-change click is never turned
-            # into a false failure).
-            note = ""
-            if before is not None and after is not None and before == after:
-                note = (" — but the page did not visibly change; the click may "
-                        "have missed.")
-            shot = (base64.b64encode(after).decode("ascii")
-                    if after else _screenshot_b64(page))
-            return {"text": f"Clicked element with text: {what}.{note}",
-                    "screenshot": shot}
-        except Exception as e:
-            return f"ERROR clicking element with text {text!r}: {e}"
 
 
 # ── WOR-84: web DOM-first clicking ──────────────────────────────────────────
@@ -1251,8 +1763,9 @@ def find_and_click(text: str):
 # called by ``agent.tool_desktop_click`` BEFORE its vision locate and WOR-46 UIA
 # branch; it returns a success string on a confident DOM resolution, or ``None``
 # on ANY miss so the caller falls through to those native paths unchanged. It
-# reuses the live ``_page`` under ``_lock`` — it never opens a CDP connection,
-# never launches a browser, and never touches the profile-isolation code.
+# submits the work against the live active page on the single async owner loop;
+# it never opens a second CDP connection, launches another browser, or touches
+# the profile-isolation code.
 
 # Interactive ARIA roles a "click" intent can target, most-clickable first.
 _DOM_CLICK_ROLES = (
@@ -1289,75 +1802,18 @@ _DOM_LABEL_JS = (
 )
 
 
-def _resolve_clickable(page, target_norm, target_tokens, _dc):
-    """Best visible clickable element on ``page`` matching the normalised target,
-    scored by accessible name with the WOR-46 fuzzy matcher. Returns
-    ``(locator, label, score)`` or ``(None, "", 0.0)``. Pure resolution — no
-    click, no browser launch. Assumes the caller holds ``_lock``.
-
-    Role matches are accepted at ``_UIA_MIN_SCORE`` (genuine interactive elements
-    with short accessible names). The text fallback is accepted only on an EXACT
-    normalised match, so a large container whose innerText merely CONTAINS the
-    word can never be picked.
-    """
-    best = {"loc": None, "score": 0.0, "label": ""}
-
-    def _consider(locator, primary, min_accept):
-        try:
-            count = locator.count()
-        except Exception:
-            return
-        for i in range(min(count, _DOM_MAX_MATCHES)):
-            nth = locator.nth(i)
-            try:
-                if not nth.is_visible():
-                    continue
-            except Exception:
-                continue
-            try:
-                label = (nth.evaluate(_DOM_LABEL_JS) or "").strip()
-            except Exception:
-                label = ""
-            if not label:
-                continue
-            score = _dc._label_score(target_norm, target_tokens, label)
-            if primary and score > 0:
-                score += 0.05
-            if score < min_accept:
-                continue
-            if (score > best["score"]
-                    or (score == best["score"] and best["loc"] is not None
-                        and 0 < len(label) < len(best["label"]))):
-                best.update(loc=nth, score=score, label=label)
-
-    for role in _DOM_CLICK_ROLES:
-        try:
-            loc = page.get_by_role(role, name=target_norm)
-        except Exception:
-            continue
-        _consider(loc, role in _DOM_PRIMARY_ROLES, _dc._UIA_MIN_SCORE)
-        if best["score"] >= 1.0:
-            break
-
-    if best["loc"] is None:
-        try:
-            _consider(page.get_by_text(target_norm), False, 1.0)
-        except Exception:
-            pass
-
-    return best["loc"], best["label"], best["score"]
 
 
-def _foreground_is_osia_browser() -> bool:
+def _foreground_is_osia_browser(browser_type: str | None = None) -> bool:
     """True only when the OS foreground window belongs to OSIA's OWN automated
     browser — the one holding OSIA's dedicated profile. This is the half of the
-    WOR-84 DOM-first gate that guarantees a DOM click on the live ``_page`` acts
-    on the window the user is actually looking at.
+    WOR-84 DOM-first gate that guarantees a DOM click on the owner's live active
+    page acts on the window the user is actually looking at.
 
     It is NOT enough that the foreground is *a* browser: the user's personal
-    Chrome/Brave/Firefox shares the same process name, and clicking ``_page``
-    (OSIA's possibly-backgrounded automated browser) while the user's own window
-    is in front would click the wrong surface. So we require the foreground
+    Chrome/Brave/Firefox shares the same process name, and clicking OSIA's
+    possibly-backgrounded automated page while the user's own window is in front
+    would click the wrong surface. So we require the foreground
     window's PID to be one of the processes whose command line references OSIA's
     dedicated profile dir (``_processes_using_profile`` — the same identity scan
     the launcher uses), for the profile of the ACTIVE backend (Firefox/BiDi vs
@@ -1381,8 +1837,7 @@ def _foreground_is_osia_browser() -> bool:
     _wid, _title, pid = fw
     if not pid:
         return False
-    profile = (FIREFOX_PROFILE_DIR if _active_browser_type == "bidi"
-               else OSIA_PROFILE_DIR)
+    profile = FIREFOX_PROFILE_DIR if browser_type == "bidi" else OSIA_PROFILE_DIR
     try:
         own_pids = {p.pid for p in _processes_using_profile(profile)}
         return int(pid) in own_pids
@@ -1390,185 +1845,205 @@ def _foreground_is_osia_browser() -> bool:
         return False
 
 
-def _dom_gate_ok() -> bool:
-    """True when a DOM-first click is safe: OSIA is driving a live Playwright
-    page (CDP debugger up, or a BiDi/Firefox session) AND OSIA's OWN browser is
-    the foreground window. Any condition false → the caller uses vision."""
-    if _page is None:
-        return False
-    if not (_is_cdp_alive() or _active_browser_type == "bidi"):
-        return False
-    return _foreground_is_osia_browser()
+
+
+# ── Shutdown ───────────────────────────────────────────────────────────────
+
+
+
+# ── Synchronous public bridge to the dedicated async owner ────────────────
+
+def _owner_error(prefix: str, error: Exception) -> str:
+    return f"ERROR {prefix}: {error}"
+
+
+def navigate(url: str):
+    try:
+        return _owner.call("navigate", url)
+    except Exception as exc:
+        return f"ERROR: the browser did not open — {exc}"
+
+
+def click(selector: str):
+    try:
+        return _owner.call("click", selector)
+    except Exception as exc:
+        return _owner_error(f"clicking {selector}", exc)
+
+
+def fill(selector: str, value: str) -> str:
+    try:
+        return _owner.call("fill", selector, value)
+    except Exception as exc:
+        return _owner_error(f"filling {selector}", exc)
+
+
+def read_page() -> str:
+    try:
+        return _owner.call("read_page")
+    except Exception as exc:
+        return _owner_error("reading page", exc)
+
+
+def get_current_url() -> str:
+    try:
+        return _owner.call("get_current_url")
+    except Exception as exc:
+        return _owner_error("reading current URL", exc)
+
+
+def scroll(direction: str = "down", amount: int = 600) -> str:
+    try:
+        return _owner.call("scroll", direction, amount)
+    except Exception as exc:
+        return _owner_error("scrolling", exc)
+
+
+def go_back():
+    try:
+        return _owner.call("go_back")
+    except Exception as exc:
+        return _owner_error("going back", exc)
+
+
+def go_forward():
+    try:
+        return _owner.call("go_forward")
+    except Exception as exc:
+        return _owner_error("going forward", exc)
+
+
+def open_browser(name: str, url: str | None = None):
+    binary = resolve_browser_name(name)
+    if not binary:
+        known = ", ".join(sorted(_BROWSER_NAME_MAP))
+        return f"ERROR: browser {name!r} is not installed (known browsers: {known})"
+    note = ""
+    try:
+        if _canonical_browser_name(binary) == "firefox":
+            result = _owner.call("open_firefox_bidi", url)
+            note = " (WebDriver BiDi unavailable — page tools cannot drive this window)"
+        else:
+            result = _owner.call("open_cdp_browser", binary, url)
+            note = " (CDP unavailable — page tools cannot drive this window)"
+    except Exception as exc:
+        print(f"[OSIA Browser] automated browser launch failed: {exc}")
+        result = None
+    if result is not None:
+        return result
+    cmd = [binary, *_profile_args(binary)]
+    if url:
+        cmd.append(_normalize_url(url))
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **_detach_kwargs(),
+        )
+    except Exception as exc:
+        return (
+            "ERROR: the browser did not open — failed to launch "
+            f"{os.path.basename(binary)}: {exc}"
+        )
+    suffix = f" at {_normalize_url(url)}" if url else ""
+    return f"Opened {os.path.basename(binary)}{suffix}{note}"
+
+
+def open_new_tab(url: str) -> str:
+    try:
+        return _owner.call("open_new_tab", url)
+    except Exception as exc:
+        return _owner_error(f"opening new tab {_normalize_url(url)}", exc)
+
+
+def find_and_click(text: str):
+    try:
+        return _owner.call("find_and_click", text)
+    except Exception as exc:
+        return _owner_error(f"clicking element with text {text!r}", exc)
 
 
 def dom_click(description: str):
-    """WOR-84 — resolve and click ``description`` through the live page DOM.
-
-    Returns a success string when OSIA's own browser is in front and the target
-    resolves to a confident DOM element (clicked via a real ``locator.click()``).
-    Returns ``None`` on ANY miss — gate not satisfied, no live page, element not
-    found / ambiguous, an inaccessible canvas / cross-origin iframe, or any
-    exception — so ``tool_desktop_click`` falls through to its existing WOR-46
-    UIA and vision paths UNCHANGED. Never raises.
-    """
+    snapshot = _owner.snapshot()
+    if not snapshot.get("activeUrl"):
+        return None
+    if not _foreground_is_osia_browser(snapshot.get("backend")):
+        return None
     try:
-        if not description or not str(description).strip():
-            return None
-        description = str(description).strip()
-        if not _dom_gate_ok():
-            return None
-        from osia.tools import desktop_control as _dc
-        target_norm = _dc._normalize_label(description)
-        if not target_norm:
-            return None
-        target_tokens = frozenset(target_norm.split())
-        with _lock:
-            page = _page
-            if page is None:
-                return None
-            try:
-                if page.is_closed():
-                    return None
-            except Exception:
-                return None
-            locator, label, _score = _resolve_clickable(
-                page, target_norm, target_tokens, _dc)
-            if locator is None:
-                return None
-            try:
-                locator.click(timeout=5000)
-            except Exception:
-                # Found but not actionable (covered, detached, mid-animation):
-                # let the vision path try rather than reporting a hard failure.
-                return None
-            try:
-                url = _page_url(page)
-            except Exception:
-                url = ""
-            where = f" on {url}" if url else ""
-            matched = f" (matched {label!r})" if label else ""
-            return f"Clicked \"{description}\" via the page DOM{matched}{where}."
+        return _owner.call("dom_click", description)
     except Exception:
         return None
 
 
 def wait_for_load() -> str:
-    """Wait for the active page's DOM to be ready (domcontentloaded, max 8s).
-
-    Uses ``domcontentloaded`` rather than ``load``/``networkidle`` so the
-    wait ends as soon as the DOM is usable, without waiting for every image,
-    script, or ad. Never blocks the agent: a timeout is success, not an
-    error — the page simply keeps loading resources in the background.
-
-    Mostly unnecessary now that ``navigate()`` waits for the DOM itself;
-    kept as a tool for pages that re-render after the initial load.
-    """
-    with _lock:
-        try:
-            page = _ensure_browser()
-        except Exception as e:
-            return f"ERROR waiting for load: {e}"
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=8000)
-            return f"Page loaded: {_page_url(page)}"
-        except _TIMEOUT_ERRORS:
-            return (
-                f"Page loaded (timeout): {_page_url(page)} — "
-                "page may still be loading resources"
-            )
-        except Exception as e:
-            return f"ERROR waiting for load: {e}"
+    try:
+        return _owner.call("wait_for_load")
+    except Exception as exc:
+        return _owner_error("waiting for load", exc)
 
 
 def get_page_text() -> str:
-    """Return the full visible text content of the page (truncated to 8000 chars).
-
-    Like ``read_page`` but with a higher cap, intended for full-page reads
-    when the agent really needs to inspect long content.
-    """
-    with _lock:
-        try:
-            page = _ensure_browser()
-            text = page.evaluate(
-                "() => document.body ? document.body.innerText : ''"
-            )
-            if not text:
-                return "(empty page)"
-            if len(text) > 8000:
-                text = text[:8000] + "\n... [TRUNCATED]"
-            return text
-        except Exception as e:
-            return f"ERROR reading page: {e}"
+    try:
+        return _owner.call("get_page_text")
+    except Exception as exc:
+        return _owner_error("reading page", exc)
 
 
 def scroll_down(amount: int | None = None) -> str:
-    """Scroll the active page down by one viewport, or by ``amount`` pixels if given."""
-    with _lock:
-        try:
-            page = _ensure_browser()
-            if amount is None:
-                page.evaluate("window.scrollBy(0, window.innerHeight)")
-                return "Scrolled down one viewport"
-            try:
-                amt = int(amount)
-            except (TypeError, ValueError):
-                return f"ERROR scroll_down: amount must be an integer, got {amount!r}"
-            page.evaluate(f"window.scrollBy(0, {amt})")
-            return f"Scrolled down {amt}px"
-        except Exception as e:
-            return f"ERROR scrolling: {e}"
+    try:
+        return _owner.call("scroll_down", amount)
+    except Exception as exc:
+        return _owner_error("scrolling", exc)
 
 
 def type_text(selector: str, text: str) -> str:
-    """Focus the element matching ``selector`` and type ``text`` character
-    by character via the keyboard. Use this instead of ``fill`` when the
-    target field needs real keystroke events (e.g. search-as-you-type
-    UIs, JS-heavy forms).
-    """
-    with _lock:
-        try:
-            page = _ensure_browser()
-            page.click(selector, timeout=5000)  # focus the field
-            page.keyboard.type(text)
-            return f"Typed into {selector}: {text}"
-        except Exception as e:
-            return f"ERROR typing into {selector}: {e}"
+    try:
+        return _owner.call("type_text", selector, text)
+    except Exception as exc:
+        return _owner_error(f"typing into {selector}", exc)
 
 
 def press_key(key: str) -> str:
-    """Press a single keyboard key on the active page.
-
-    Examples: ``Enter``, ``Escape``, ``Tab``, ``ArrowDown``, ``Backspace``,
-    ``Control+A``. Useful after ``type_text`` to submit a search.
-    """
-    if not key:
-        return "ERROR press_key: key is required"
-    with _lock:
-        try:
-            page = _ensure_browser()
-            page.keyboard.press(key)
-            return f"Pressed key: {key}"
-        except Exception as e:
-            return f"ERROR pressing key {key}: {e}"
+    try:
+        return _owner.call("press_key", key)
+    except Exception as exc:
+        return _owner_error(f"pressing key {key}", exc)
 
 
-# ── Shutdown ───────────────────────────────────────────────────────────────
+def get_web_state(expect_url=None, expect_text=None, expect_selector=None) -> dict:
+    """Read browser state without exposing a Playwright object to the caller."""
+    snapshot = _owner.snapshot()
+    if not snapshot.get("activeUrl"):
+        return {"available": False, "reason": "no live page"}
+    if not _foreground_is_osia_browser(snapshot.get("backend")):
+        return {
+            "available": False,
+            "reason": "OSIA is not driving its own browser in the foreground",
+        }
+    try:
+        return _owner.call(
+            "web_state", expect_url, expect_text, expect_selector
+        )
+    except Exception as exc:
+        return {"available": False, "reason": f"page read failed: {exc}"}
+
+
+def _browser_owner_snapshot() -> dict:
+    """Primitive-only diagnostics used by focused lifecycle tests."""
+    return _owner.snapshot()
+
+
+def _dom_gate_ok() -> bool:
+    snapshot = _owner.snapshot()
+    return bool(
+        snapshot.get("activeUrl")
+        and _foreground_is_osia_browser(snapshot.get("backend"))
+    )
+
 
 def close_browser():
-    """Disconnect Playwright from the automated browser.
-
-    For CDP (Chromium) this just disconnects — the user's real Brave window
-    keeps running. For BiDi (Firefox) the browser process is owned by OSIA,
-    so this quits Firefox; its cookies / sessions persist in the OSIA
-    Firefox profile.
-    """
-    global _playwright
-    with _lock:
-        _disconnect_active_browser()
-        try:
-            if _playwright is not None:
-                _playwright.stop()
-        except Exception:
-            pass
-        finally:
-            _playwright = None
+    try:
+        _owner.close()
+    except Exception as exc:
+        print(f"[OSIA Browser] owner shutdown failed: {exc}")

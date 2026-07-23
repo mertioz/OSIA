@@ -134,65 +134,6 @@ def web_state(expect_url=None, expect_text=None, expect_selector=None) -> dict:
         return {"available": False, "reason": "browser module unavailable"}
 
     try:
-        if not _b._dom_gate_ok():
-            return {"available": False,
-                    "reason": "OSIA is not driving its own browser in the "
-                              "foreground"}
-    except Exception:
-        return {"available": False, "reason": "browser state unavailable"}
-
-    try:
-        with _b._lock:
-            page = _b._page
-            if page is None:
-                return {"available": False, "reason": "no live page"}
-            try:
-                url = _b._page_url(page)
-            except Exception:
-                url = None
-            checks: dict = {}
-            if expect_url:
-                checks["url_contains"] = bool(
-                    url and str(expect_url).strip().lower() in url.lower())
-            if expect_text:
-                try:
-                    text = page.evaluate(
-                        "() => document.body ? document.body.innerText : ''") or ""
-                except Exception:
-                    text = ""
-                checks["text_contains"] = bool(
-                    text and str(expect_text).strip().lower() in text.lower())
-            if expect_selector:
-                checks["selector_found"] = _selector_present(page, expect_selector)
-            return {"available": True, "url": url, "checks": checks}
+        return _b.get_web_state(expect_url, expect_text, expect_selector)
     except Exception as e:
         return {"available": False, "reason": f"page read failed: {e}"}
-
-
-def _selector_present(page, selector) -> bool:
-    """True if ``selector`` matches an element. Tries it as a CSS selector first
-    (exact, deterministic); on an invalid selector or no match, falls back to the
-    WOR-84 accessible-name resolver so a plain visible label also works. Assumes
-    the caller holds ``browser._lock``. Never raises."""
-    sel = str(selector).strip()
-    if not sel:
-        return False
-    # 1) CSS selector — the precise path.
-    try:
-        if page.query_selector(sel) is not None:
-            return True
-    except Exception:
-        pass  # invalid CSS -> treat it as a label below
-    # 2) Visible-label fallback (reuse the DOM-click resolver).
-    try:
-        from osia.tools import browser as _b
-        from osia.tools import desktop_control as _dc
-        target_norm = _dc._normalize_label(sel)
-        if not target_norm:
-            return False
-        target_tokens = frozenset(target_norm.split())
-        loc, _label, score = _b._resolve_clickable(
-            page, target_norm, target_tokens, _dc)
-        return loc is not None and score > 0
-    except Exception:
-        return False
