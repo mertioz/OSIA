@@ -42,6 +42,8 @@ from pathlib import Path
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
+from osia.tools.browser_forms import FORM_MAX_FIELDS_DEFAULT, SemanticFormSession
+
 # Timeout exceptions that mean "the page is just slow" — never a hard failure.
 # Playwright's TimeoutError is caught alongside the builtin for safety across
 # Playwright versions (newer versions subclass the builtin, older don't).
@@ -540,6 +542,7 @@ class _AsyncBrowserOwner:
         self._registry_browser = None
         self._browser_disconnected_handler = None
         self._page_tombstones = set()
+        self._form_session = SemanticFormSession()
         self._disconnecting = False
         self._startup_count = 0
         self._driver_stop_count = 0
@@ -849,6 +852,7 @@ class _AsyncBrowserOwner:
             self._detach_page_handlers()
         self._registry.clear()
         self._page_tombstones.clear()
+        self._form_session.reset()
         self._active_page = None
         self._registry_context = None
         self._context_handlers = None
@@ -862,6 +866,7 @@ class _AsyncBrowserOwner:
         key = id(page)
         item = self._registry.pop(key, None)
         self._page_tombstones.add(key)
+        self._form_session.invalidate_page(page)
         if item is None:
             return
         for event, handler in item["handlers"].items():
@@ -879,6 +884,13 @@ class _AsyncBrowserOwner:
                 self._active_page = opener
             else:
                 self._active_page = self._most_recent_live_page()
+        self._publish()
+
+    def _handle_frame_navigated(self, page, generation):
+        self._assert_owner_thread()
+        if generation != self._registry_generation or id(page) not in self._registry:
+            return
+        self._form_session.invalidate_page(page)
         self._publish()
 
     def _register_page(
@@ -907,8 +919,9 @@ class _AsyncBrowserOwner:
                 ),
                 "close": lambda *_args: self._remove_page(page, generation),
                 "crash": lambda *_args: self._remove_page(page, generation),
-                "framenavigated": lambda *_args: self._publish()
-                if generation == self._registry_generation else None,
+                "framenavigated": lambda *_args: self._handle_frame_navigated(
+                    page, generation
+                ),
             }
             item = {
                 "page": page,
@@ -927,6 +940,8 @@ class _AsyncBrowserOwner:
         elif opener is not None:
             item["opener"] = opener
         if make_active:
+            if self._active_page is not None and self._active_page is not page:
+                self._form_session.invalidate_page(self._active_page)
             self._active_page = page
         self._publish()
         return page
@@ -1680,6 +1695,36 @@ class _AsyncBrowserOwner:
             )
         return {"available": True, "url": url, "checks": checks}
 
+    async def _op_inspect_form_fields(
+        self,
+        include_hidden=False,
+        include_disabled=False,
+        max_fields=FORM_MAX_FIELDS_DEFAULT,
+    ):
+        try:
+            page = await self._ensure_browser()
+        except Exception:
+            return 'ERROR: {"category":"page_unavailable","ok":false}'
+        return await self._form_session.inspect(
+            page=page,
+            context_generation=self._registry_generation,
+            include_hidden=include_hidden,
+            include_disabled=include_disabled,
+            max_fields=max_fields,
+        )
+
+    async def _op_fill_form_field(self, field_ref, value):
+        try:
+            page = await self._ensure_browser()
+        except Exception:
+            return 'ERROR: {"category":"page_unavailable","ok":false}'
+        return await self._form_session.fill(
+            page=page,
+            context_generation=self._registry_generation,
+            field_ref=field_ref,
+            value=value,
+        )
+
 
 _owner = _AsyncBrowserOwner()
 
@@ -2009,6 +2054,34 @@ def press_key(key: str) -> str:
         return _owner.call("press_key", key)
     except Exception as exc:
         return _owner_error(f"pressing key {key}", exc)
+
+
+def inspect_form_fields(
+    include_hidden: bool = False,
+    include_disabled: bool = False,
+    max_fields: int = FORM_MAX_FIELDS_DEFAULT,
+) -> str:
+    """Return bounded semantic metadata for fields on the authoritative page."""
+    try:
+        return _owner.call(
+            "inspect_form_fields",
+            include_hidden,
+            include_disabled,
+            max_fields,
+            timeout=10.0,
+        )
+    except Exception:
+        return 'ERROR: {"category":"inspection_failed","ok":false}'
+
+
+def fill_form_field(field_ref: str, value) -> str:
+    """Fill one opaque field reference and prove the resulting state."""
+    try:
+        return _owner.call(
+            "fill_form_field", field_ref, value, timeout=12.0,
+        )
+    except Exception:
+        return 'ERROR: {"category":"fill_failed","ok":false}'
 
 
 def get_web_state(expect_url=None, expect_text=None, expect_selector=None) -> dict:

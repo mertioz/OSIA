@@ -171,6 +171,8 @@ Browser (drives a REAL visible browser — Chromium/Brave via CDP, or Firefox vi
 - click: Click an element by CSS selector. PRECISE (drives the real DOM) — on a web page PREFER this (or find_and_click) over desktop_click. Usage: {"tool": "click", "selector": "<css_selector>"}
 - find_and_click: Click the element whose visible label matches. Use when you don't know the selector but can see the label. PRECISE (real DOM, accessible-name match) — this is the PREFERRED way to click on a web page; use it instead of desktop_click for buttons/links/menu items inside a tab. Usage: {"tool": "find_and_click", "text": "<visible_text>"}
 - fill: Set the value of an input field in one shot (no keystroke events). Usage: {"tool": "fill", "selector": "<css_selector>", "value": "<text>"}
+- inspect_form_fields: Inspect the authoritative page and same-origin frames for bounded semantic field metadata. Returns opaque field_ref values and never returns current field values. Hidden and disabled fields are omitted unless explicitly requested. Usage: {"tool": "inspect_form_fields", "include_hidden": false, "include_disabled": false, "max_fields": 50}
+- fill_form_field: Fill exactly one field_ref returned by inspect_form_fields and verify the postcondition. Prefer this over selector-based fill for forms. Never repeat or quote the supplied value in logs, status, or the final response. Password/authentication fields and ambiguous/stale references are rejected. Usage: {"tool": "fill_form_field", "field_ref": "<opaque_ref>", "value": "<text_or_boolean>"}
 - type_text: Focus an element and type character-by-character via the keyboard. Use for search boxes / JS-heavy forms. Usage: {"tool": "type_text", "selector": "<css_selector>", "text": "<text>"}
 - press_key: Press a single keyboard key on the active page (Enter, Escape, Tab, ArrowDown, Backspace, "Control+A", …). Usage: {"tool": "press_key", "key": "Enter"}
 - read_page: Visible text of the current page (truncated). Usage: {"tool": "read_page"}
@@ -269,6 +271,8 @@ Navigateur (pilote le VRAI navigateur visible — Chromium/Brave via CDP, ou Fir
 - click : Cliquer sur un élément par sélecteur CSS. PRÉCIS (pilote le vrai DOM) — dans une page web, PRÉFÈRE cet outil (ou find_and_click) à desktop_click. Usage : {"tool": "click", "selector": "<selecteur_css>"}
 - find_and_click : Cliquer sur l'élément dont le libellé visible correspond. À utiliser quand tu ne connais pas le sélecteur mais que tu vois le libellé. PRÉCIS (vrai DOM, correspondance par nom accessible) — c'est la façon PRÉFÉRÉE de cliquer dans une page web ; utilise-le au lieu de desktop_click pour les boutons/liens/éléments de menu d'un onglet. Usage : {"tool": "find_and_click", "text": "<texte_visible>"}
 - fill : Définir la valeur d'un champ en une fois (sans événements clavier). Usage : {"tool": "fill", "selector": "<selecteur_css>", "value": "<texte>"}
+- inspect_form_fields : Inspecter la page autoritaire et ses frames de même origine avec des métadonnées sémantiques bornées. Retourne des field_ref opaques et jamais les valeurs actuelles. Les champs masqués et désactivés sont omis sauf demande explicite. Usage : {"tool": "inspect_form_fields", "include_hidden": false, "include_disabled": false, "max_fields": 50}
+- fill_form_field : Remplir exactement un field_ref renvoyé par inspect_form_fields et vérifier la postcondition. Préférer cet outil à fill par sélecteur pour les formulaires. Ne jamais répéter ni citer la valeur fournie dans les journaux, statuts ou réponse finale. Les champs mot de passe/authentification et les références ambiguës/obsolètes sont refusés. Usage : {"tool": "fill_form_field", "field_ref": "<reference_opaque>", "value": "<texte_ou_booleen>"}
 - type_text : Focaliser un élément et taper caractère par caractère via le clavier. Pour les champs de recherche / formulaires JS. Usage : {"tool": "type_text", "selector": "<selecteur_css>", "text": "<texte>"}
 - press_key : Appuyer sur une touche du clavier sur la page active (Enter, Escape, Tab, ArrowDown, Backspace, « Control+A »…). Usage : {"tool": "press_key", "key": "Enter"}
 - read_page : Texte visible de la page actuelle (tronqué). Usage : {"tool": "read_page"}
@@ -2170,12 +2174,15 @@ def _get_browser_tools():
             navigate, click, fill, read_page,
             get_current_url, scroll, go_back, go_forward, open_new_tab,
             find_and_click, wait_for_load, get_page_text, scroll_down,
-            type_text, press_key, open_browser,
+            type_text, press_key, open_browser, inspect_form_fields,
+            fill_form_field,
         )
         _browser_tools = {
             "navigate": navigate,
             "click": click,
             "fill": fill,
+            "inspect_form_fields": inspect_form_fields,
+            "fill_form_field": fill_form_field,
             "read_page": read_page,
             "get_current_url": get_current_url,
             "scroll": scroll,
@@ -2203,6 +2210,20 @@ def tool_click(selector: str):
 
 def tool_fill(selector: str, value: str) -> str:
     return _get_browser_tools()["fill"](selector, value)
+
+
+def tool_inspect_form_fields(
+    include_hidden: bool = False,
+    include_disabled: bool = False,
+    max_fields: int = 50,
+) -> str:
+    return _get_browser_tools()["inspect_form_fields"](
+        include_hidden, include_disabled, max_fields,
+    )
+
+
+def tool_fill_form_field(field_ref: str, value) -> str:
+    return _get_browser_tools()["fill_form_field"](field_ref, value)
 
 def tool_read_page() -> str:
     return _get_browser_tools()["read_page"]()
@@ -3218,6 +3239,8 @@ TOOL_MAP = {
     "navigate": tool_navigate,
     "click": tool_click,
     "fill": tool_fill,
+    "inspect_form_fields": tool_inspect_form_fields,
+    "fill_form_field": tool_fill_form_field,
     "read_page": tool_read_page,
     "get_current_url": tool_get_current_url,
     "scroll": tool_scroll,
@@ -3261,6 +3284,7 @@ TOOL_MAP = {
 # in prose (code examples, config snippets…) is never executed as a tool.
 KNOWN_TOOL_NAMES = set(TOOL_MAP.keys())
 _DOCUMENT_TOOL_NAMES = frozenset({"read_document", "read_document_artifact"})
+_SEMANTIC_FORM_PRIVATE_TOOL_NAMES = frozenset({"fill_form_field"})
 
 
 # ---------------------------------------------------------------------------
@@ -3390,7 +3414,8 @@ def _execute_tool_once(tool_name: str, kwargs: dict, timeout_s: float | None = N
 
 
 def _execute_tool_with_retry(tool_name: str, kwargs: dict,
-                             *, hard_deadline: float | None = None):
+                             *, hard_deadline: float | None = None,
+                             allow_retry: bool = True):
     """Execute a tool and retry exactly once if the first attempt
     reports an error (or returns empty). Returns ``(result, is_error)``
     where ``is_error`` reflects the *final* attempt — callers use it to
@@ -3436,12 +3461,14 @@ def _execute_tool_with_retry(tool_name: str, kwargs: dict,
         and "timed out after" in _result_text(result).lower()
     )
     no_retry = (
-        long_running
+        not allow_retry
+        or long_running
         or shell_timed_out
         or tool_name == "desktop_click"
         or tool_name.startswith("mcp__")
         or tool_name in _GMAIL_WRITE_TOOL_NAMES
         or tool_name in _DOCUMENT_TOOL_NAMES
+        or tool_name in _SEMANTIC_FORM_PRIVATE_TOOL_NAMES
     )
     if _is_tool_error(result) and not no_retry:
         retry_timeout_s = _bounded_timeout()
@@ -4837,6 +4864,35 @@ def _document_progress_fingerprint(reference: dict | None) -> str | None:
     ).hexdigest()
 
 
+def _semantic_form_progress_fingerprint(tool_name: str, result) -> str | None:
+    """Count only a newly verified changed field state, without its value."""
+
+    if tool_name != "fill_form_field":
+        return None
+    text = _result_text(result)
+    if text.startswith("ERROR:"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict) or not (
+        parsed.get("ok") is True
+        and parsed.get("verified") is True
+        and parsed.get("changed") is True
+    ):
+        return None
+    field_ref = str(parsed.get("field_ref") or "")
+    state_token = str(parsed.get("state_token") or "")
+    if not re.fullmatch(r"fld_[A-Za-z0-9_-]{24}", field_ref):
+        return None
+    if not re.fullmatch(r"[0-9a-f]{32}", state_token):
+        return None
+    return hashlib.sha256(
+        f"semantic_form_field\0{field_ref}\0{state_token}".encode("ascii")
+    ).hexdigest()
+
+
 def _document_extraction_failed(tool_name: str, result) -> bool:
     if tool_name != "read_document":
         return False
@@ -4916,6 +4972,7 @@ class OSIAAgent:
         self._document_scope_id = secrets.token_hex(32)
         self._document_private_run = False
         self._document_turn_start = 1
+        self._semantic_form_values: list[str] = []
 
     def reset(self):
         """Clear conversation history except system prompt."""
@@ -4930,6 +4987,31 @@ class OSIAAgent:
         for message in self.messages[start:]:
             if isinstance(message, dict):
                 message["_document_private"] = True
+
+    def _remember_semantic_form_value(self, value) -> None:
+        """Retain one value only for same-turn output redaction."""
+
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            return
+        bounded = str(value)[:16_000]
+        if not bounded:
+            return
+        if bounded not in self._semantic_form_values:
+            self._semantic_form_values.append(bounded)
+            del self._semantic_form_values[:-64]
+
+    def _redact_semantic_form_values(self, text: str) -> str:
+        redacted = str(text or "")
+        for value in sorted(self._semantic_form_values, key=len, reverse=True):
+            if len(value) < 3 and value.isalnum():
+                redacted = re.sub(
+                    rf"(?<!\w){re.escape(value)}(?!\w)",
+                    "[REDACTED FORM VALUE]",
+                    redacted,
+                )
+            else:
+                redacted = redacted.replace(value, "[REDACTED FORM VALUE]")
+        return redacted
 
     def exported_history(self) -> list:
         """Return self.messages with the system prompt (index 0) removed,
@@ -5652,6 +5734,7 @@ class OSIAAgent:
         self.last_run_document_activity = False
         self.last_run_document_error = None
         self._document_private_run = False
+        self._semantic_form_values = []
 
         def _run_scoped():
             with task_scope():
@@ -5665,11 +5748,14 @@ class OSIAAgent:
                     current_conversation_id=current_conversation_id,
                 )
 
-        if _document_artifacts.has_artifact_access_scope():
-            return _run_scoped()
-        owner_id = current_conversation_id or self._document_scope_id
-        with _document_artifacts.artifact_access_scope(owner_id):
-            return _run_scoped()
+        try:
+            if _document_artifacts.has_artifact_access_scope():
+                return _run_scoped()
+            owner_id = current_conversation_id or self._document_scope_id
+            with _document_artifacts.artifact_access_scope(owner_id):
+                return _run_scoped()
+        finally:
+            self._semantic_form_values = []
 
     def run_scheduled(
         self,
@@ -5863,6 +5949,7 @@ class OSIAAgent:
                 _flag=_stream_emitted,
                 _schedule_state=schedule_guard_state,
             ):
+                _text = self._redact_semantic_form_values(_text)
                 if _schedule_state["ignored_unrelated_tool"]:
                     _schedule_state["buffered_sentences"].append(_text)
                     return None
@@ -6154,12 +6241,18 @@ class OSIAAgent:
                         f"{prose}\n{blocks}".strip() if prose else blocks
                     )
                 self.messages.append({"role": "assistant", "content": assistant_record})
-                if any(
+                document_tool_used = any(
                     tc.get("tool") in _DOCUMENT_TOOL_NAMES
                     for tc in tool_calls if isinstance(tc, dict)
-                ):
+                )
+                semantic_form_private = any(
+                    tc.get("tool") in _SEMANTIC_FORM_PRIVATE_TOOL_NAMES
+                    for tc in tool_calls if isinstance(tc, dict)
+                )
+                if document_tool_used or semantic_form_private:
                     self._document_private_run = True
-                    self.last_run_document_activity = True
+                    if document_tool_used:
+                        self.last_run_document_activity = True
                     self._mark_document_private_history()
 
                 # Anti-loop: don't even start the batch if the turn has
@@ -6245,6 +6338,8 @@ class OSIAAgent:
                         continue
 
                     kwargs = {k: v for k, v in tc.items() if k != "tool"}
+                    if tool_name == "fill_form_field":
+                        self._remember_semantic_form_value(kwargs.get("value"))
                     print(
                         f"[OSIA Agent] tool start: {tool_name} "
                         f"({len(kwargs)} argument field(s))"
@@ -6310,8 +6405,14 @@ class OSIAAgent:
                                 is_error = True
                     else:
                         try:
-                            from osia.action_policy import guard_tool_call
+                            from osia.action_policy import (
+                                guard_tool_call,
+                                is_final_external_tool_call,
+                            )
                             policy_error = guard_tool_call(
+                                user_text, tool_name, kwargs,
+                            )
+                            final_external_call = is_final_external_tool_call(
                                 user_text, tool_name, kwargs,
                             )
                         except Exception:
@@ -6319,6 +6420,7 @@ class OSIAAgent:
                                 "ERROR: action policy check failed; "
                                 "the action was not executed"
                             )
+                            final_external_call = True
                         if policy_error:
                             result, is_error = policy_error, True
                         else:
@@ -6326,6 +6428,7 @@ class OSIAAgent:
                                 tool_name,
                                 kwargs,
                                 hard_deadline=guard.started_at + guard.hard_limit,
+                                allow_retry=not final_external_call,
                             )
                     any_tool_executed = True
                     text_part = _result_text(result)
@@ -6389,6 +6492,11 @@ class OSIAAgent:
                     )
                     if document_progress is not None:
                         guard._record_useful_progress(document_progress)
+                    semantic_form_progress = _semantic_form_progress_fingerprint(
+                        tool_name, result,
+                    )
+                    if semantic_form_progress is not None:
+                        guard._record_useful_progress(semantic_form_progress)
                     if guard.record(
                         tool_name,
                         kwargs,
@@ -6792,6 +6900,7 @@ class OSIAAgent:
                     "error_category": "tool_timeout",
                     "reason_code": "tool_timeout",
                 }
+            content = self._redact_semantic_form_values(content)
             final_message = {"role": "assistant", "content": content}
             if self._document_private_run:
                 final_message["_document_private"] = True

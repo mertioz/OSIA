@@ -77,6 +77,15 @@ _ACCOUNT_SECURITY_RE = re.compile(
 _FINANCIAL_RE = re.compile(
     r"\b(?:buy|purchase|pay|transfer|sign|accept contract|acheter|payer|virer|signer|accepter le contrat)\b"
 )
+_FORM_COMMIT_RE = re.compile(
+    r"(?:\b(?:submit|soumettre)\b|"
+    r"\b(?:apply|postuler)\b.{0,50}\b(?:job|application|candidature|emploi)\b|"
+    r"\b(?:save|enregistrer)\b.{0,80}\b(?:form|application|profile|formulaire|"
+    r"candidature|profil)\b|"
+    r"\b(?:confirm|finalize|confirmer|finaliser)\b.{0,80}\b(?:form|application|"
+    r"order|request|checkout|formulaire|candidature|commande|demande)\b|"
+    r"\b(?:send application|envoyer la candidature)\b)"
+)
 _WEB_RE = re.compile(
     r"\b(?:web|internet|website|site|browser|brave|chrome|firefox|navigate|search|research|page|navigateur|rechercher)\b"
 )
@@ -179,6 +188,13 @@ def classify_action_request(text: str) -> ActionDecision:
             ("browser", "computer_use"),
             content=str(text or "")[:500],
         )
+    if _FORM_COMMIT_RE.search(normalized):
+        return ActionDecision(
+            ActionClass.SENSITIVE,
+            ActionOutcome.CONFIRM,
+            "external_form_commitment",
+            ("browser", "computer_use"),
+        )
 
     communication = bool(_COMMUNICATION_RE.search(normalized))
     send_requested = bool(_SEND_RE.search(normalized))
@@ -245,7 +261,7 @@ _PROMPT_EN = """## Action-risk policy (mandatory)
 Class A — benign local/reversible actions (create or edit a local file, organize files, open an application, prepare content): ALLOWED. Use the available OSIA tools; do not produce a generic safety refusal.
 Class B — read-only web actions (search, open a browser, navigate, read): ALLOWED. Internet access alone does not require confirmation.
 Class C — user-authorized external communication: navigating and drafting are allowed. For a final Send, the recipient and exact harmless content must be clear; never invent either and never send more than requested. The runtime applies the configured confirmation gate to the irreversible Send action. A personal contact is not by itself a reason to refuse.
-Class D — sensitive actions (delete, public post, account/security change, financial/contractual or bulk action): CONFIRM the exact scope before the irreversible step. If scope is unclear, ask for clarification and fail closed.
+Class D — sensitive actions (delete, public post, account/security change, financial/contractual or bulk action, final external form submission/application): CONFIRM the exact scope before the irreversible step. Preparing ordinary fields is allowed, but Submit/Apply/Save/Confirm and a final Enter/Return remain gated. If scope is unclear, ask for clarification and fail closed.
 Class E — harmful/disallowed actions: BLOCK harassment, threats, fraud, impersonation, credential theft, spam, unscoped mass messaging, security bypass, covert action, or action on another person's account.
 
 Keep these outcomes distinct: (1) allowed and executable → use tools; (2) allowed but confirmation/clarification required → ask or use the gate; (3) allowed but a tool/login is unavailable → report that real technical limitation; (4) disallowed → give the specific safety reason. Never replace outcomes 1–3 with a generic refusal. Do not use Enter or another shortcut to bypass a required final-action confirmation."""
@@ -254,7 +270,7 @@ _PROMPT_FR = """## Politique de risque des actions (obligatoire)
 Classe A — actions locales bénignes/réversibles (créer ou modifier un fichier local, organiser des fichiers, ouvrir une application, préparer du contenu) : AUTORISÉES. Utilise les outils OSIA disponibles ; ne réponds pas par un refus générique.
 Classe B — actions web en lecture seule (rechercher, ouvrir un navigateur, naviguer, lire) : AUTORISÉES. L'accès à Internet ne demande pas à lui seul une confirmation.
 Classe C — communication externe autorisée par l'utilisateur : naviguer et préparer un brouillon sont autorisés. Pour l'action finale Envoyer, le destinataire et le contenu exact et inoffensif doivent être clairs ; n'invente jamais l'un ou l'autre et n'envoie jamais plus que demandé. Le runtime applique la confirmation configurée à l'action irréversible. Un contact personnel n'est pas en soi un motif de refus.
-Classe D — actions sensibles (suppression, publication publique, réglage de compte/sécurité, action financière/contractuelle ou en masse) : CONFIRME la portée exacte avant l'étape irréversible. Si la portée est ambiguë, demande une précision et échoue de façon sûre.
+Classe D — actions sensibles (suppression, publication publique, réglage de compte/sécurité, action financière/contractuelle ou en masse, soumission/candidature finale d'un formulaire externe) : CONFIRME la portée exacte avant l'étape irréversible. La préparation des champs ordinaires est autorisée, mais Soumettre/Postuler/Enregistrer/Confirmer et un appui final sur Entrée restent soumis au garde. Si la portée est ambiguë, demande une précision et échoue de façon sûre.
 Classe E — actions nuisibles/interdites : BLOQUE harcèlement, menaces, fraude, usurpation d'identité, vol d'identifiants, spam, envoi de masse non délimité, contournement de sécurité, action dissimulée ou action sur le compte d'un tiers.
 
 Distingue toujours : (1) autorisé et exécutable → utilise les outils ; (2) autorisé mais confirmation/précision requise → demande-la ou utilise le garde ; (3) autorisé mais outil/connexion indisponible → indique la vraie limite technique ; (4) interdit → donne la raison de sûreté précise. Ne remplace jamais les cas 1–3 par un refus générique. N'utilise pas Entrée ou un raccourci pour contourner la confirmation d'une action finale."""
@@ -270,11 +286,13 @@ _READ_ONLY_TOOLS = frozenset({
     "take_screenshot", "get_system_info", "list_running_processes",
     "get_clipboard", "is_running", "is_installed", "has_window",
     "steam_game_state", "web_state", "read_page", "get_page_text",
-    "get_current_url", "list_memories", "list_scheduled_tasks",
+    "get_current_url", "inspect_form_fields", "list_memories", "list_scheduled_tasks",
     "gmail_list_labels", "gmail_list_messages", "gmail_get_message",
 })
 _FINAL_LABEL_RE = re.compile(
-    r"\b(?:send|envoyer|post|publish|share|delete|remove|confirm|buy|purchase|pay|save|publier|partager|supprimer|confirmer|acheter|payer|enregistrer)\b"
+    r"\b(?:send|envoyer|post|publish|share|delete|remove|confirm|buy|purchase|"
+    r"pay|save|submit|apply|finalize|publier|partager|supprimer|confirmer|"
+    r"acheter|payer|enregistrer|soumettre|postuler|finaliser)\b"
 )
 
 
@@ -321,6 +339,8 @@ def _confirmation_summary(
             f"Publish/send to {decision.recipient[:80]}: "
             f"{decision.content[:240]}"
         )
+    if decision.reason == "external_form_commitment":
+        return "Commit the currently prepared external form once"
     if decision.content:
         return f"Perform sensitive action: {decision.content[:240]}"
     label = next((str(value) for value in kwargs.values() if value), tool_name)
@@ -376,3 +396,17 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
     if decision.outcome == ActionOutcome.BLOCK:
         return f"ERROR: action blocked for safety: {decision.reason}"
     return _confirm_irreversible(decision, tool, values)
+
+
+def is_final_external_tool_call(
+    user_request: str,
+    tool_name: str,
+    kwargs: dict,
+) -> bool:
+    """Whether one browser/computer action is a recognized final commitment."""
+
+    return _is_final_external_step(
+        classify_action_request(user_request),
+        str(tool_name or ""),
+        kwargs if isinstance(kwargs, dict) else {},
+    )
