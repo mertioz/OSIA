@@ -43,6 +43,9 @@ for package in (
     "kokoro",
     "mcp",
     "playwright",
+    "pypdfium2",
+    "rapidocr",
+    "onnxruntime",
     "uiautomation",
 ):
     package_datas, package_bins, package_hidden = collect_all(package)

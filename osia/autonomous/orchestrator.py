@@ -36,8 +36,10 @@ Naming note: the *module* :mod:`osia.autonomous.state` is imported as ``state``
 import os
 import re
 import threading
+from contextlib import contextmanager
 from typing import NamedTuple
 
+from osia import document_artifacts
 from osia.autonomous import diagnostics, planner
 # Module-qualified on purpose (like planner.py) so the persistence/mutator layer
 # stays a single black box — and so a test can monkeypatch state.save_task_state.
@@ -48,6 +50,7 @@ from osia.autonomous import state
 DIGEST_MAX_CHARS = 2000       # hard char cap on the whole digest (FIFO-drop oldest)
 DIGEST_MAX_LINES = 6          # K — keep at most this many digest lines
 SUMMARY_MAX_CHARS = 300       # per-task distilled summary cap (cheap string trim)
+ARTIFACT_CONTEXT_MAX_CHARS = 4096
 
 # ── Verifier keyword heuristics (deterministic pre-check, layer 1) ───────────
 # Stems/words that mark a criterion as a *file-existence* claim. Stems (e.g.
@@ -118,9 +121,17 @@ class Orchestrator:
         # success_criterion BEFORE re-executing it (crash-salvage). Consumed on
         # the first task examined, regardless of outcome.
         self._resume_recheck = False
+        self._active_task = None
 
     def _agent_run_failure(self):
         """Read only the agent's allow-listed typed run diagnostic."""
+        if getattr(self.agent, "last_run_document_error", None) == (
+            "document_extraction_failure"
+        ):
+            return (
+                diagnostics.FailureCategory.TASK_EXECUTION_FAILURE,
+                "document_extraction_failure",
+            )
         raw = getattr(self.agent, "last_run_diagnostic", None)
         if not isinstance(raw, dict):
             return None
@@ -166,6 +177,20 @@ class Orchestrator:
             self._emit({"event": "failed", **diagnostic})
             return
         self._state = st
+        artifact_failure = self._artifact_failure(st)
+        if resume and artifact_failure is not None:
+            st["status"] = "failed"
+            diagnostic = self._record_failure(
+                st,
+                diagnostics.AutonomousStage.RESUME,
+                diagnostics.FailureCategory.VERIFICATION_ERROR,
+                reason_code=artifact_failure,
+                resumable=False,
+                checkpoint_present=True,
+            )
+            self._safe_save(st)
+            self._emit({"event": "failed", **diagnostic})
+            return
         self._resume_recheck = bool(resume)
         # We are (re-)entering execution ⇒ the run is in progress. Persist once
         # up front so the on-disk checkpoint matches what we are about to run.
@@ -255,6 +280,7 @@ class Orchestrator:
             return True
 
         task = tasks[t]
+        self._active_task = task
 
         # Defensive: stale cursor parked on an already-done task ⇒ just advance
         # (normal flow never lands here; this absorbs a corrupt/odd resume state).
@@ -308,7 +334,8 @@ class Orchestrator:
         agent_failure = None
         try:
             self.agent.reset()
-            result = self.agent.run(self._compose(task, digest))
+            with self._artifact_scope(st, task):
+                result = self.agent.run(self._compose(task, digest))
             if not isinstance(result, str):
                 result = "" if result is None else str(result)
             agent_failure = self._agent_run_failure()
@@ -485,12 +512,117 @@ class Orchestrator:
 
     # ── Subtask prompt + verification ────────────────────────────────────────
 
+    @contextmanager
+    def _artifact_scope(self, st, task=None):
+        """Expose only this run's retained document capabilities to the agent."""
+
+        if not isinstance(st, dict):
+            yield
+            return
+        references = document_artifacts.normalize_references(
+            st.get("artifacts")
+        )
+        artifact_ids = [ref["artifact_id"] for ref in references]
+
+        def _capture(reference):
+            self._capture_artifact(st, task, reference)
+
+        with document_artifacts.artifact_access_scope(
+            str(st.get("task_id") or ""),
+            artifact_ids,
+            _capture,
+        ):
+            yield
+
+    def _capture_artifact(self, st, task, reference) -> None:
+        """Checkpoint a safe reference immediately after create/read succeeds."""
+
+        clean = document_artifacts.sanitize_reference(reference)
+        if clean is None or not isinstance(st, dict):
+            return
+        existing = document_artifacts.normalize_references(st.get("artifacts"))
+        artifact_id = clean["artifact_id"]
+        changed = all(ref["artifact_id"] != artifact_id for ref in existing)
+        st["artifacts"] = document_artifacts.normalize_references(
+            existing + [clean]
+        )
+        if isinstance(task, dict):
+            ids = [
+                str(value) for value in (task.get("artifact_ids") or [])
+                if str(value).startswith("doc_")
+            ]
+            if artifact_id not in ids:
+                ids.append(artifact_id)
+                changed = True
+            task["artifact_ids"] = ids[:document_artifacts.MAX_ARTIFACT_REFS]
+        if changed:
+            self._safe_save(st)
+
+    @staticmethod
+    def _artifact_context(st, task=None) -> str:
+        """Render bounded non-sensitive metadata for execution and verifier."""
+
+        if not isinstance(st, dict):
+            return ""
+        references = document_artifacts.normalize_references(st.get("artifacts"))
+        lines = []
+        for ref in references:
+            confidence = ref.get("confidence")
+            confidence_text = (
+                "unknown" if confidence is None else f"{float(confidence):.4f}"
+            )
+            lines.append(
+                f"{ref['artifact_id']} type={ref['document_type']} "
+                f"pages={ref['page_count']} "
+                f"methods={','.join(ref['page_methods'])} "
+                f"chars={ref['content_length']} "
+                f"sha256={ref['content_hash']} confidence={confidence_text}"
+            )
+        return "\n".join(lines)[:ARTIFACT_CONTEXT_MAX_CHARS]
+
+    @staticmethod
+    def _artifact_failure(st, task=None) -> str | None:
+        """Validate retained payload availability using stable reason codes."""
+
+        if not isinstance(st, dict):
+            return None
+        raw_references = st.get("artifacts")
+        references = document_artifacts.normalize_references(raw_references)
+        if isinstance(raw_references, list) and raw_references and not references:
+            return "document_artifact_invalid"
+        if not references:
+            return None
+        artifact_ids = [ref["artifact_id"] for ref in references]
+        mapping = {
+            "missing_artifact": "document_artifact_missing",
+            "expired_artifact": "document_artifact_expired",
+            "corrupted_artifact": "document_artifact_corrupted",
+            "unreadable_artifact": "document_artifact_unreadable",
+            "unauthorized_artifact": "document_artifact_unauthorized",
+            "invalid_artifact_id": "document_artifact_invalid",
+        }
+        try:
+            with document_artifacts.artifact_access_scope(
+                str(st.get("task_id") or ""), artifact_ids,
+            ):
+                for artifact_id in artifact_ids:
+                    document_artifacts.get_store().inspect(artifact_id)
+        except document_artifacts.ArtifactStoreError as exc:
+            return mapping.get(exc.category, "document_artifact_corrupted")
+        return None
+
     def _compose(self, task, digest) -> str:
         """Build the isolated subtask prompt: objective + success_criterion +
         the (defensively-truncated) rolling context digest, each clearly
         labelled. The agent is told to do ONLY this step."""
-        objective = (task.get("objective") or "").strip()
-        criterion = (task.get("success_criterion") or "").strip()
+        objective = (
+            task.get("_runtime_objective", task.get("objective")) or ""
+        ).strip()
+        criterion = (
+            task.get(
+                "_runtime_success_criterion", task.get("success_criterion"),
+            ) or ""
+        ).strip()
         digest = digest or ""
         if len(digest) > DIGEST_MAX_CHARS:  # defensive — digest is already capped
             digest = digest[-DIGEST_MAX_CHARS:]
@@ -508,6 +640,14 @@ class Orchestrator:
                 "",
                 "CONTEXT SO FAR (results of previous steps — for reference only):\n"
                 f"{digest}",
+            ]
+        artifact_context = self._artifact_context(self._state, task)
+        if artifact_context:
+            parts += [
+                "",
+                "LOCAL DOCUMENT ARTIFACTS (opaque metadata only; use "
+                "read_document_artifact for bounded local chunks):\n"
+                f"{artifact_context}",
             ]
         parts += ["", "Carry out the step now, then stop."]
         return "\n".join(parts)
@@ -529,7 +669,17 @@ class Orchestrator:
         the judge is told NOT to trust the prior ``evidence`` but to re-check
         (screenshot / read file / re-open). Ambiguity ⇒ NOT_DONE.
         """
-        criterion = (task.get("success_criterion") or "").strip()
+        criterion = (
+            task.get(
+                "_runtime_success_criterion", task.get("success_criterion"),
+            ) or ""
+        ).strip()
+        artifact_failure = self._artifact_failure(self._state, task)
+        if artifact_failure is not None:
+            return _VerificationOutcome(
+                False, diagnostics.FailureCategory.VERIFICATION_ERROR,
+                artifact_failure,
+            )
         if not criterion:
             # No observable criterion ⇒ we can't prove doneness ⇒ fail-closed.
             return _VerificationOutcome(
@@ -635,9 +785,17 @@ class Orchestrator:
             "single word on the first line: DONE or NOT_DONE. Then one short "
             "line explaining why."
         )
+        artifact_context = self._artifact_context(self._state, self._active_task)
+        if artifact_context:
+            prompt += (
+                "\n\nAvailable local document artifacts (opaque metadata; "
+                "read bounded content with read_document_artifact):\n"
+                f"{artifact_context}"
+            )
         try:
             self.agent.reset()
-            reply = self.agent.run(prompt)
+            with self._artifact_scope(self._state, self._active_task):
+                reply = self.agent.run(prompt)
         except Exception:
             return _VerificationOutcome(
                 False, diagnostics.FailureCategory.VERIFICATION_ERROR,
@@ -674,7 +832,13 @@ class Orchestrator:
         """Distil a task result into a short summary line. Cheap string trim to
         ``SUMMARY_MAX_CHARS`` (kept string-based for now per the Phase-3 spec —
         no agent summarisation even for large output)."""
-        text = " ".join((result or "").split())
+        artifact_ids = task.get("artifact_ids") if isinstance(task, dict) else []
+        if artifact_ids:
+            text = "Local document artifact retained: " + self._artifact_context(
+                self._state, task,
+            )
+        else:
+            text = " ".join((result or "").split())
         if len(text) <= SUMMARY_MAX_CHARS:
             return text
         return text[:SUMMARY_MAX_CHARS].rstrip() + "…"
@@ -733,7 +897,7 @@ class Orchestrator:
         planner produced nothing (the caller then fails the run). The replan
         attempt is counted either way so ``max_replans`` is a hard cap."""
         budgets = st.setdefault("budgets", {})
-        objective = st.get("objective", "") or ""
+        objective = st.get("_runtime_objective", st.get("objective", "")) or ""
         digest = st.get("context_digest", "") or ""
 
         cursor = st.get("cursor") or {}
@@ -744,7 +908,9 @@ class Orchestrator:
         if 0 <= p < len(phases):
             tasks = phases[p].get("tasks") or []
             if 0 <= t < len(tasks):
-                failed_obj = tasks[t].get("objective", "") or ""
+                failed_obj = tasks[t].get(
+                    "_runtime_objective", tasks[t].get("objective", ""),
+                ) or ""
                 last_err = tasks[t].get("last_error", "") or ""
 
         remaining = (
@@ -755,11 +921,19 @@ class Orchestrator:
             "objective, taking that failure into account. Do not repeat steps "
             "already completed above."
         )
+        artifact_context = self._artifact_context(st)
+        if artifact_context:
+            remaining += (
+                "\n\nRETAINED LOCAL DOCUMENT ARTIFACTS (opaque metadata only; "
+                "use read_document_artifact if a later execution step needs "
+                f"content):\n{artifact_context}"
+            )
         planning_failures = []
         try:
-            new_phases = planner.plan_objective(
-                remaining, self.agent, failure_cb=planning_failures.append,
-            )
+            with self._artifact_scope(st, self._active_task):
+                new_phases = planner.plan_objective(
+                    remaining, self.agent, failure_cb=planning_failures.append,
+                )
         except Exception:
             new_phases = None
 

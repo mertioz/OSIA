@@ -18,6 +18,7 @@ INSTALL_INTEGRATION_MODE = "--osia-install-integration"
 REMOVE_INTEGRATION_MODE = "--osia-remove-integration"
 PACKAGE_SMOKE_MODE = "--osia-package-smoke"
 RELAUNCH_MODE = "--osia-relaunch"
+DOCUMENT_WORKER_MODE = "--osia-document-worker"
 
 
 def is_frozen() -> bool:

@@ -16,6 +16,19 @@ available in each installed Python distribution into `legal/licenses/`.
 The corresponding upstream model cards remain the authoritative source for
 model limitations, provenance, and license details.
 
+## Local document reading
+
+- **pypdfium2 5.12.1** is distributed under Apache-2.0 and BSD-3-Clause terms
+  and bundles PDFium plus its applicable notices. It performs native PDF text
+  extraction and page rendering without a separately installed executable.
+- **RapidOCR 3.9.2** is distributed under Apache-2.0 and includes the pinned
+  PP-OCR ONNX detection, classification, and recognition models used by OSIA's
+  fully offline OCR path. ONNX Runtime performs local inference.
+
+The generated dependency inventory and copied package notices are authoritative
+for the exact binaries, model files, versions, and transitive licenses shipped
+in a given build.
+
 ## Media codecs
 
 OSIA performs in-process WAV-to-MP3 conversion through PyAV and the FFmpeg

@@ -51,12 +51,14 @@ by calling :func:`save_task_state`. Every disk write is atomic (temp file +
 
 import json
 import os
+import re
 import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 from osia.autonomous import diagnostics
+from osia import document_artifacts
 
 # Imported (never recomputed) so the autonomous harness, the GUI and the mobile
 # server all resolve the SAME config/data dir. CONFIG_DIR is a str → wrap in
@@ -75,6 +77,11 @@ DEFAULT_MAX_REPLANS = 2
 
 # Re-entrant so a future caller can save() while already holding the lock.
 _lock = threading.RLock()
+_DOCUMENT_PATH_RE = re.compile(
+    r"(?i)(?:(?P<quote>[\"'`])(?:[A-Z]:[\\/]|/)[^\"'`\r\n]+?"
+    r"\.(?:pdf|png|jpe?g)(?P=quote)|(?:[A-Z]:[\\/]|/)"
+    r"[^\"'`\r\n]+?\.(?:pdf|png|jpe?g))"
+)
 
 
 # ── Internals ──────────────────────────────────────────────────────────────
@@ -96,8 +103,34 @@ def _write_atomic(path: Path, data: dict) -> None:
     :func:`osia.conversations._write_atomic` byte-for-byte.
     """
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(
+        json.dumps(_checkpoint_projection(data), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     os.replace(tmp, path)
+
+
+def redact_document_paths(value) -> str:
+    """Remove absolute local document paths from persisted/status text."""
+
+    text = str(value or "")
+    return _DOCUMENT_PATH_RE.sub("[local document]", text)
+
+
+def _checkpoint_projection(value):
+    """Drop runtime-only source strings before any Autonomous disk write."""
+
+    if isinstance(value, dict):
+        return {
+            key: _checkpoint_projection(item)
+            for key, item in value.items()
+            if not str(key).startswith("_runtime_")
+        }
+    if isinstance(value, list):
+        return [_checkpoint_projection(item) for item in value]
+    if isinstance(value, str):
+        return redact_document_paths(value)
+    return value
 
 
 def _normalize_task(index: int, task) -> dict:
@@ -111,15 +144,39 @@ def _normalize_task(index: int, task) -> dict:
         task = {"objective": task}
     elif not isinstance(task, dict):
         task = {}
-    return {
+    raw_objective = task.get("objective", "") or ""
+    raw_criterion = task.get("success_criterion", "") or ""
+    normalized = {
         "id": str(task.get("id") or f"t{index}"),
-        "objective": task.get("objective", "") or "",
-        "success_criterion": task.get("success_criterion", "") or "",
+        "objective": redact_document_paths(raw_objective),
+        "success_criterion": redact_document_paths(raw_criterion),
         "status": task.get("status") or "pending",
         "attempts": int(task.get("attempts", 0) or 0),
         "distilled_summary": task.get("distilled_summary", "") or "",
         "last_error": task.get("last_error", None),
+        "artifact_ids": _normalize_artifact_ids(task.get("artifact_ids")),
     }
+    if normalized["objective"] != raw_objective:
+        normalized["_runtime_objective"] = raw_objective
+    if normalized["success_criterion"] != raw_criterion:
+        normalized["_runtime_success_criterion"] = raw_criterion
+    return normalized
+
+
+def _normalize_artifact_ids(values) -> list[str]:
+    """Keep only bounded opaque IDs; no paths or payloads enter checkpoints."""
+
+    clean: list[str] = []
+    for value in values if isinstance(values, list) else ():
+        try:
+            artifact_id = document_artifacts.valid_artifact_id(value)
+        except document_artifacts.ArtifactStoreError:
+            continue
+        if artifact_id not in clean:
+            clean.append(artifact_id)
+        if len(clean) >= document_artifacts.MAX_ARTIFACT_REFS:
+            break
+    return clean
 
 
 def _normalize_phase(phase) -> dict:
@@ -138,7 +195,7 @@ def _normalize_phase(phase) -> dict:
     else:
         name, status, raw_tasks = "", None, []
     return {
-        "name": name,
+        "name": redact_document_paths(name),
         "status": status or "pending",
         "tasks": [_normalize_task(i, t) for i, t in enumerate(raw_tasks)],
     }
@@ -156,10 +213,11 @@ def new_task_state(objective: str, provider: str, model: str, phases) -> dict:
     ``context_digest`` and an empty ``log``.
     """
     now = _now_iso()
-    return {
+    safe_objective = redact_document_paths(objective)
+    result = {
         "schema_version": SCHEMA_VERSION,
         "task_id": uuid.uuid4().hex,
-        "objective": objective or "",
+        "objective": safe_objective,
         "status": "in_progress",
         "created_at": now,
         "updated_at": now,
@@ -172,11 +230,15 @@ def new_task_state(objective: str, provider: str, model: str, phases) -> dict:
             "replan_count": 0,
         },
         "context_digest": "",
+        "artifacts": [],
         "phases": [_normalize_phase(p) for p in (phases or [])],
         "log": [],
         "failure_diagnostic": None,
         "diagnostic_history": [],
     }
+    if safe_objective != (objective or ""):
+        result["_runtime_objective"] = objective or ""
+    return result
 
 
 def new_failed_task_state(provider: str, model: str, diagnostic: dict) -> dict:
@@ -357,6 +419,24 @@ def load_task_state() -> "dict | None":
         ][-diagnostics.MAX_DIAGNOSTIC_HISTORY:]
         loaded["failure_diagnostic"] = current
         loaded["diagnostic_history"] = history
+        loaded["artifacts"] = document_artifacts.normalize_references(
+            loaded.get("artifacts")
+        )
+        known_artifact_ids = {
+            ref["artifact_id"] for ref in loaded["artifacts"]
+        }
+        for phase in loaded.get("phases") or []:
+            if not isinstance(phase, dict):
+                continue
+            for task in phase.get("tasks") or []:
+                if isinstance(task, dict):
+                    task["artifact_ids"] = [
+                        artifact_id
+                        for artifact_id in _normalize_artifact_ids(
+                            task.get("artifact_ids")
+                        )
+                        if artifact_id in known_artifact_ids
+                    ]
         # Old terminal checkpoints predate WOR-173. Preserve compatibility and
         # make their unknown leaf cause explicit instead of inventing one.
         if loaded.get("status") == "failed" and current is None:
@@ -392,6 +472,9 @@ def save_task_state(state: dict) -> None:
         TASK_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         state["updated_at"] = _now_iso()
         _write_atomic(TASK_STATE_FILE, state)
+        if state.get("status") in {"done", "aborted"}:
+            document_artifacts.cleanup_state_artifacts(state)
+            _write_atomic(TASK_STATE_FILE, state)
 
 
 def clear_task_state() -> bool:
@@ -405,7 +488,10 @@ def clear_task_state() -> bool:
         try:
             if not TASK_STATE_FILE.exists():
                 return False
+            existing = load_task_state()
             TASK_STATE_FILE.unlink()
+            if existing is not None:
+                document_artifacts.cleanup_state_artifacts(existing)
             return True
         except OSError:
             return False

@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 from osia.runtime import (
+    DOCUMENT_WORKER_MODE,
     INSTALL_INTEGRATION_MODE,
     PACKAGE_SMOKE_MODE,
     RELAUNCH_MODE,
@@ -79,6 +80,7 @@ def _package_smoke() -> int:
         )
         from osia.release_notes import release_for_version
         from osia.updater import load_app_metadata
+        from osia.document_reader import verify_packaged_dependencies
 
         metadata = load_app_metadata()
         if metadata.product != "OSIA" or metadata.platform != "windows":
@@ -97,6 +99,8 @@ def _package_smoke() -> int:
 
         if release_for_version(metadata.version) is None:
             raise RuntimeError("embedded release notes are unavailable")
+        if not verify_packaged_dependencies():
+            raise RuntimeError("local PDF/OCR dependencies are incomplete")
         with tempfile.TemporaryDirectory(prefix="osia-package-smoke-") as temporary:
             state_path = Path(temporary) / "onboarding.json"
             if not create_fresh_install_marker(state_path):
@@ -172,6 +176,12 @@ def main(args: list[str] | None = None) -> int:
     argv = _normalized_args(args)
     mode = argv[0] if argv else ""
 
+    if mode == DOCUMENT_WORKER_MODE:
+        if len(argv) != 2:
+            return 2
+        from osia.document_reader import worker_main
+
+        return worker_main(argv[1])
     if mode == SERVICE_MODE:
         if len(argv) != 2 or argv[1] != "server":
             return 2

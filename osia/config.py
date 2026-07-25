@@ -48,6 +48,12 @@ def _resolve_config_dir() -> str:
 
 # Config/data dir: <repo>/config in dev/repo mode, else ~/.osia (see above).
 CONFIG_DIR = _resolve_config_dir()
+# Private runtime payloads must never be written into a source checkout, even
+# when CONFIG_DIR intentionally resolves to <repo>/config in development mode.
+# Keep this second, centralized path owner-only and cross-platform.  Modules
+# storing sensitive local payloads import it from here rather than recomputing
+# Path.home() themselves.
+PRIVATE_DATA_DIR = str(Path.home() / ".osia")
 API_KEYS_FILE = os.path.join(CONFIG_DIR, "api_keys.json")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 MOBILE_TOKEN_FILE = os.path.join(CONFIG_DIR, "mobile_token.txt")
