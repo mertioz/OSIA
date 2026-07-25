@@ -28,13 +28,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import qrcode
+
 from PyQt6.QtCore import (
     Qt, QEvent, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
     QRect, QRectF, QPointF, QSize, QFileSystemWatcher, QVariantAnimation,
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap, QIcon,
-    QTextOption,
+    QTextOption, QImage,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -237,6 +239,39 @@ def _mask_token(token: str) -> str:
     if len(token) <= 6:
         return token[:1] + "*" * max(1, len(token) - 1)
     return token[:2] + "*" * (len(token) - 4) + token[-2:]
+
+
+def _pairing_qr_pixmap(token: str, target_size: int = 252) -> QPixmap:
+    """Render *token* as a high-contrast QR pixmap without writing it to disk."""
+    if not token:
+        return QPixmap()
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=1,
+        border=4,
+    )
+    qr.add_data(token, optimize=0)
+    qr.make(fit=True)
+    matrix = qr.get_matrix()
+    module_size = max(1, target_size // len(matrix))
+    image_size = len(matrix) * module_size
+    image = QImage(image_size, image_size, QImage.Format.Format_RGB32)
+    image.fill(QColor("white"))
+    painter = QPainter(image)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("black"))
+    for row, modules in enumerate(matrix):
+        for column, filled in enumerate(modules):
+            if filled:
+                painter.drawRect(
+                    column * module_size,
+                    row * module_size,
+                    module_size,
+                    module_size,
+                )
+    painter.end()
+    return QPixmap.fromImage(image)
 
 
 def _cap_combo_width(combo: QComboBox) -> None:
@@ -2233,6 +2268,68 @@ class _PopoverDialog(QDialog):
                 self.move(geo.center() - self.rect().center())
         self.raise_()
         self.activateWindow()
+
+
+class _PairingQrDialog(_PopoverDialog):
+    """In-memory QR view for exactly one currently active pairing token."""
+
+    def __init__(self, parent, token: str, anchor=None):
+        super().__init__(parent, anchor=anchor)
+        self.setObjectName("pairingQrDialog")
+        self._token = token
+        self._active = True
+
+        title = QLabel(i18n.t("settings.qr_title"))
+        title.setObjectName("dialogTitle")
+        self._card_layout.addWidget(title)
+
+        help_label = QLabel(i18n.t("settings.qr_help"))
+        help_label.setObjectName("sectionDesc")
+        help_label.setWordWrap(True)
+        help_label.setMaximumWidth(300)
+        self._card_layout.addWidget(help_label)
+
+        self._qr_label = QLabel()
+        self._qr_label.setObjectName("pairingQrImage")
+        self._qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._qr_label.setFixedSize(268, 268)
+        self._qr_label.setStyleSheet(
+            "QLabel#pairingQrImage { background: white; border-radius: 10px; "
+            "padding: 8px; color: #1a1a1a; }"
+        )
+        self._qr_label.setPixmap(_pairing_qr_pixmap(token))
+        self._card_layout.addWidget(
+            self._qr_label, alignment=Qt.AlignmentFlag.AlignHCenter
+        )
+
+        close_btn = QPushButton(i18n.t("settings.close"))
+        close_btn.setObjectName("primaryBtn")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(self.accept)
+        self._card_layout.addWidget(
+            close_btn, alignment=Qt.AlignmentFlag.AlignRight
+        )
+
+        self._token_watch = QTimer(self)
+        self._token_watch.setInterval(500)
+        self._token_watch.timeout.connect(self._invalidate_if_rotated)
+        self._token_watch.start()
+
+    def _invalidate_if_rotated(self) -> None:
+        if not self._active or load_mobile_token() == self._token:
+            return
+        self._active = False
+        self._token = ""
+        self._token_watch.stop()
+        self._qr_label.clear()
+        self._qr_label.setText(i18n.t("settings.qr_inactive"))
+        self._qr_label.setWordWrap(True)
+
+    def done(self, result: int) -> None:
+        self._token_watch.stop()
+        self._token = ""
+        self._qr_label.clear()
+        super().done(result)
 
 
 class _MemoryEditDialog(_PopoverDialog):
@@ -7069,6 +7166,10 @@ class _SettingsPanel(QWidget):
         self._mobile_show_btn.setObjectName("ghostBtn")
         self._mobile_show_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._mobile_show_btn.clicked.connect(self._on_show_token)
+        self._mobile_qr_btn = QPushButton(i18n.t("settings.show_qr"))
+        self._mobile_qr_btn.setObjectName("ghostBtn")
+        self._mobile_qr_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mobile_qr_btn.clicked.connect(self._on_show_qr)
         self._mobile_regen_btn = QPushButton(i18n.t("settings.regenerate"))
         self._mobile_regen_btn.setObjectName("ghostBtn")
         self._mobile_regen_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -7084,6 +7185,7 @@ class _SettingsPanel(QWidget):
         token_btn_row = QHBoxLayout()
         token_btn_row.setSpacing(8)
         token_btn_row.addWidget(self._mobile_show_btn)
+        token_btn_row.addWidget(self._mobile_qr_btn)
         token_btn_row.addWidget(self._mobile_regen_btn)
         token_btn_row.addStretch(1)
         l.addLayout(token_btn_row)
@@ -8235,6 +8337,16 @@ class _SettingsPanel(QWidget):
             i18n.t("settings.mobile_token_current"), self._mobile_token
         )
 
+    def _on_show_qr(self) -> None:
+        self._mobile_token = load_mobile_token()
+        self._update_token_mask()
+        if not self._mobile_token:
+            return
+        dialog = _PairingQrDialog(
+            self, self._mobile_token, anchor=self._mobile_qr_btn
+        )
+        dialog.exec()
+
     def _on_regenerate_token(self) -> None:
         self._mobile_token = regenerate_mobile_token()
         self._update_token_mask()
@@ -8398,6 +8510,7 @@ class _SettingsPanel(QWidget):
         self._mobile_desc.setText(i18n.t("settings.mobile_desc"))
         self._mobile_token_label.setText(i18n.t("settings.mobile_token"))
         self._mobile_show_btn.setText(i18n.t("settings.show"))
+        self._mobile_qr_btn.setText(i18n.t("settings.show_qr"))
         self._mobile_regen_btn.setText(i18n.t("settings.regenerate"))
         self._mobile_warn.setText(i18n.t("settings.mobile_token_warning"))
 
