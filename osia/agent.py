@@ -5,8 +5,10 @@ with a manual tool-calling loop that works with any model (llama3, etc.).
 """
 
 import ast
+import hashlib
 import contextvars
 import json
+import math
 import re
 import subprocess
 import sys
@@ -3341,13 +3343,28 @@ def _execute_tool_once(tool_name: str, kwargs: dict, timeout_s: float | None = N
         return f"[ERREUR] '{tool_name}' a échoué: {e}"
 
 
-def _execute_tool_with_retry(tool_name: str, kwargs: dict):
+def _execute_tool_with_retry(tool_name: str, kwargs: dict,
+                             *, hard_deadline: float | None = None):
     """Execute a tool and retry exactly once if the first attempt
     reports an error (or returns empty). Returns ``(result, is_error)``
     where ``is_error`` reflects the *final* attempt — callers use it to
     decide whether to keep dispatching the rest of a tool-call batch.
     """
-    timeout_s = _tool_timeout_seconds(tool_name, kwargs)
+    configured_timeout_s = _tool_timeout_seconds(tool_name, kwargs)
+
+    def _bounded_timeout():
+        if hard_deadline is None:
+            return configured_timeout_s
+        remaining = hard_deadline - time.monotonic()
+        return min(configured_timeout_s, max(0.0, remaining))
+
+    timeout_s = _bounded_timeout()
+    if timeout_s <= 0:
+        return (
+            f"[ERREUR] L'outil '{tool_name}' n'a pas été démarré : "
+            "le plafond total du tour est atteint.",
+            True,
+        )
     result = _execute_tool_once(tool_name, kwargs, timeout_s=timeout_s)
     # Slow install/download/clone commands are NOT auto-retried: an immediate
     # identical retry would just double an already-long wait (WOR-31).
@@ -3380,9 +3397,16 @@ def _execute_tool_with_retry(tool_name: str, kwargs: dict):
         or tool_name in _GMAIL_WRITE_TOOL_NAMES
     )
     if _is_tool_error(result) and not no_retry:
-        preview = _result_text(result).replace("\n", " ")[:120]
-        print(f"[OSIA Agent] ↻ retry tool: {tool_name} (first attempt: {preview!r})")
-        result = _execute_tool_once(tool_name, kwargs, timeout_s=timeout_s)
+        retry_timeout_s = _bounded_timeout()
+        if retry_timeout_s <= 0:
+            return result, _is_tool_error(result)
+        print(
+            f"[OSIA Agent] ↻ retry tool: {tool_name} "
+            f"(first result: {len(_result_text(result))} chars)"
+        )
+        result = _execute_tool_once(
+            tool_name, kwargs, timeout_s=retry_timeout_s,
+        )
     return result, _is_tool_error(result)
 
 
@@ -4165,23 +4189,56 @@ ERROR_STREAK_LIMIT = 8
 STALL_CYCLE_REPEATS = 3
 # Longest cycle length (in tool calls) the stall detector looks for.
 STALL_MAX_CYCLE_LEN = 4
-def _turn_time_limit() -> float:
-    """Wall-clock budget for a single agent turn, in seconds. Defaults to
-    300s (5 min); ``OSIA_TURN_TIME_LIMIT_SECONDS`` overrides it when set to a
-    positive number (env takes precedence)."""
-    raw = os.environ.get("OSIA_TURN_TIME_LIMIT_SECONDS")
+
+DEFAULT_TURN_IDLE_LIMIT_SECONDS = 300.0
+DEFAULT_TURN_HARD_LIMIT_SECONDS = 1800.0
+MAX_TURN_HARD_LIMIT_SECONDS = 86400.0
+RECENT_PROGRESS_FINGERPRINT_LIMIT = 64
+
+
+def _positive_finite_env_seconds(name: str, default: float,
+                                 maximum: float | None = None) -> float:
+    """Read one positive finite seconds override or return ``default``.
+
+    A bounded ``maximum`` is used only for the new hard safety ceiling. The
+    legacy idle override remains otherwise unconstrained for compatibility.
+    """
+    raw = os.environ.get(name)
     if raw and raw.strip():
         try:
-            val = float(raw.strip())
-            if val > 0:
-                return val
-        except ValueError:
-            pass
-    return 300.0
+            value = float(raw.strip())
+        except (TypeError, ValueError, OverflowError):
+            value = default
+        if math.isfinite(value) and value > 0:
+            if maximum is None or value <= maximum:
+                return value
+    return default
 
 
-# Wall-clock budget for a single agent turn (model calls + tool execution).
+def _turn_time_limit() -> float:
+    """Idle/stagnation budget for one turn (legacy override preserved)."""
+    return _positive_finite_env_seconds(
+        "OSIA_TURN_TIME_LIMIT_SECONDS",
+        DEFAULT_TURN_IDLE_LIMIT_SECONDS,
+    )
+
+
+def _turn_hard_time_limit() -> float:
+    """Non-extendable total safety ceiling for one turn."""
+    return _positive_finite_env_seconds(
+        "OSIA_TURN_HARD_LIMIT_SECONDS",
+        DEFAULT_TURN_HARD_LIMIT_SECONDS,
+        maximum=MAX_TURN_HARD_LIMIT_SECONDS,
+    )
+
+
+# Legacy name retained: this is now the idle/stagnation budget.
 TURN_TIME_LIMIT_SECONDS = _turn_time_limit()
+TURN_HARD_LIMIT_SECONDS = _turn_hard_time_limit()
+
+
+class _TurnBudgetStop(RuntimeError):
+    """Internal control signal; never rendered or persisted."""
 
 
 class _AntiLoopGuard:
@@ -4198,7 +4255,9 @@ class _AntiLoopGuard:
     - **stall**: the same sequence of (tool, params) calls (cycle length
       2..``STALL_MAX_CYCLE_LEN``) repeated more than ``STALL_CYCLE_REPEATS``
       times — identical calls each cycle means no progress
-    - **time limit**: the whole turn exceeded ``TURN_TIME_LIMIT_SECONDS``
+    - **stagnation**: no verified useful state change occurred within
+      ``TURN_TIME_LIMIT_SECONDS``
+    - **hard ceiling**: total run time reached ``TURN_HARD_LIMIT_SECONDS``
 
     Every executed tool call must be reported through :meth:`record`. When
     a detector trips, :attr:`stop_reason` (for the user-facing summary) and
@@ -4207,18 +4266,71 @@ class _AntiLoopGuard:
     (see ``OSIAAgent._finish_anti_loop_stop``).
     """
 
-    def __init__(self, lang: str = "fr"):
+    _OBSERVATION_TOOLS = frozenset({
+        "read_file", "list_files", "get_file_info", "search_files",
+        "get_clipboard", "read_page", "get_page_text", "get_current_url",
+        "web_state", "is_running", "is_installed", "has_window",
+        "steam_game_state", "gmail_list_labels", "gmail_list_latest",
+        "gmail_search", "gmail_read_message", "gmail_read_thread",
+        "list_scheduled_tasks",
+    })
+    _VERIFIED_MUTATION_PREFIXES = {
+        "write_file": ("Successfully wrote ",),
+        "delete_file": ("Deleted: ",),
+        "create_directory": ("Created directory: ",),
+        "delete_directory": (
+            "Deleted (empty) directory: ",
+            "Recursively deleted directory: ",
+        ),
+        "rename_file": ("Renamed: ",),
+        "copy_file": ("Copied: ",),
+        "edit_file_lines": ("Replaced lines ",),
+    }
+    _BROWSER_URL_TOOLS = frozenset({
+        "navigate", "get_current_url", "go_back", "go_forward",
+        "open_new_tab", "open_browser", "wait_for_load", "web_state",
+    })
+    _NEVER_PROGRESS_TOOLS = frozenset({
+        "take_screenshot", "scroll", "scroll_down", "desktop_scroll",
+        "fill", "type_text", "press_key", "desktop_type", "desktop_press",
+        "desktop_click", "click", "find_and_click", "bash", "run_command",
+        "kill_process", "set_volume", "set_clipboard", "open_in_editor",
+        "open_uri",
+    })
+
+    def __init__(self, lang: str = "fr", *, clock=None,
+                 idle_limit: float | None = None,
+                 hard_limit: float | None = None):
         self.lang = lang
-        self.started_at = time.monotonic()
-        # Executed calls as (tool_name, canonical-params-JSON) fingerprints.
+        self._clock = clock or time.monotonic
+        self.idle_limit = self._validated_limit(
+            idle_limit, TURN_TIME_LIMIT_SECONDS,
+        )
+        self.hard_limit = self._validated_limit(
+            hard_limit, TURN_HARD_LIMIT_SECONDS,
+        )
+        self.started_at = self._clock()
+        self.last_useful_progress_at = self.started_at
+        # Executed calls as (tool_name, SHA-256) fingerprints. Raw arguments are
+        # never retained in guard state or rendered in summaries.
         self.calls: list[tuple[str, str]] = []
-        # Human-readable log of every executed action: (label, succeeded).
+        # Sanitized action log: tool name only, never arguments/results/paths.
         self.actions: list[tuple[str, bool]] = []
         self.consecutive_errors = 0
-        self.recent_failures: list[str] = []
+        self._recent_progress_fingerprints: list[str] = []
+        self.useful_progress_count = 0
         # Set by the first detector that trips.
         self.stop_reason: str | None = None
         self.model_notice: str | None = None
+        self.stop_category: str | None = None
+
+    @staticmethod
+    def _validated_limit(value, fallback: float) -> float:
+        try:
+            parsed = float(value) if value is not None else float(fallback)
+        except (TypeError, ValueError, OverflowError):
+            return float(fallback)
+        return parsed if math.isfinite(parsed) and parsed > 0 else float(fallback)
 
     @property
     def tripped(self) -> bool:
@@ -4231,41 +4343,173 @@ class _AntiLoopGuard:
         """Record one executed tool call, then run every detector.
         Returns True when a detector tripped (the loop must stop).
         """
-        fingerprint = json.dumps(
+        canonical_args = json.dumps(
             kwargs, sort_keys=True, ensure_ascii=False, default=str,
         )
-        self.calls.append((tool_name, fingerprint))
-
-        args_preview = ", ".join(
-            f"{k}={str(v)[:40]}" for k, v in kwargs.items()
-        )
-        self.actions.append((f"{tool_name}({args_preview})", not is_error))
+        call_fingerprint = hashlib.sha256(
+            canonical_args.encode("utf-8", errors="replace")
+        ).hexdigest()
+        safe_name = self._safe_tool_name(tool_name)
+        self.calls.append((safe_name, call_fingerprint))
+        self.actions.append((safe_name, not is_error))
 
         if is_error:
             self.consecutive_errors += 1
-            failure = result_text.strip().replace("\n", " ")[:160]
-            self.recent_failures.append(f"{tool_name}: {failure}")
-            self.recent_failures = self.recent_failures[-ERROR_STREAK_LIMIT:]
         else:
             self.consecutive_errors = 0
-            self.recent_failures = []
 
-        return (
-            self._check_repetition()
-            or self._check_error_streak()
-            or self._check_stall()
-            or self.check_time()
+        # Repetition/error/cycle protection always wins independently of any
+        # apparently successful result. Only a non-tripping success may advance
+        # the useful-progress clock.
+        if (self._check_repetition()
+                or self._check_error_streak()
+                or self._check_stall()):
+            return True
+        if not is_error:
+            progress_fingerprint = self._useful_progress_fingerprint(
+                safe_name, call_fingerprint, result_text,
+            )
+            if progress_fingerprint is not None:
+                self._record_useful_progress(progress_fingerprint)
+        return self.check_time()
+
+    @staticmethod
+    def _digest(scope: str, value: str) -> str:
+        payload = f"{scope}\0{value}".encode("utf-8", errors="replace")
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _safe_tool_name(value) -> str:
+        name = str(value or "")
+        if re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", name):
+            return name
+        return "unknown_tool"
+
+    @staticmethod
+    def _bounded_text(value, limit: int = 16_000) -> str:
+        return str(value or "")[:limit]
+
+    @staticmethod
+    def _browser_url(text: str) -> str:
+        patterns = (
+            r"(?:Current URL:|Navigated to:|Went back to:|Went forward to:|"
+            r"Opened new tab:|Page loaded(?: \(timeout\))?:)\s*(\S+)",
+            r"\bweb_state:\s*url:\s*(\S+)",
+            r"\b(?:Opened|Reusing existing)\b[^\n]*\bat\s+(https?://\S+)",
         )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).rstrip(".,;)")[:2048]
+        return ""
+
+    def _useful_progress_fingerprint(self, tool_name: str,
+                                     call_fingerprint: str,
+                                     result_text: str) -> str | None:
+        """Return an in-memory evidence fingerprint, conservatively.
+
+        Generic success prose, retries, provider output, scrolling, screenshots
+        requested as observations, and unknown/MCP tools do not qualify.
+        """
+        name = str(tool_name or "")
+        text = self._bounded_text(result_text)
+        if not text.strip() or name.startswith("mcp__"):
+            return None
+        if name in self._NEVER_PROGRESS_TOOLS:
+            return None
+
+        if name in self._BROWSER_URL_TOOLS:
+            url = self._browser_url(text)
+            if url:
+                return self._digest("browser_url", url)
+
+        if name in {"read_page", "get_page_text"}:
+            page_text = re.sub(
+                r"\APage content:\s*", "", text, flags=re.IGNORECASE,
+            )
+            normalized = "\n".join(
+                line.rstrip() for line in page_text.splitlines()
+            )
+            return self._digest("browser_page", normalized)
+
+        if name == "get_file_info":
+            stable_lines = [
+                line for line in text.splitlines()
+                if not line.lstrip().lower().startswith("accessed:")
+            ]
+            return self._digest("filesystem_state", "\n".join(stable_lines))
+
+        if name in self._OBSERVATION_TOOLS:
+            scope = (
+                "filesystem_state" if name in {
+                    "read_file", "list_files", "search_files", "get_file_info",
+                } else f"observation:{name}"
+            )
+            return self._digest(scope, text)
+
+        prefixes = self._VERIFIED_MUTATION_PREFIXES.get(name)
+        if prefixes and text.startswith(prefixes):
+            return self._digest(
+                f"verified_effect:{name}", f"{call_fingerprint}\0{text}",
+            )
+
+        if name == "open_application":
+            low = text.lower()
+            if "unverified" not in low and (
+                    "ready and focused" in low
+                    or "foreground and focused" in low
+                    or "app is running" in low):
+                return self._digest(
+                    "verified_effect:open_application", call_fingerprint,
+                )
+
+        if name in {
+            "save_memory", "create_scheduled_task", "update_scheduled_task",
+            "delete_scheduled_task",
+        }:
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if isinstance(parsed, dict) and parsed.get("ok") is True:
+                safe_shape = {
+                    key: parsed.get(key)
+                    for key in ("id", "task_id", "entry_id", "status", "ok")
+                    if parsed.get(key) not in (None, "")
+                }
+                if len(safe_shape) > 1:
+                    return self._digest(
+                        f"structured_result:{name}",
+                        json.dumps(safe_shape, sort_keys=True, default=str),
+                    )
+
+        return None
+
+    def _record_useful_progress(self, fingerprint: str) -> bool:
+        if fingerprint in self._recent_progress_fingerprints:
+            return False
+        self._recent_progress_fingerprints.append(fingerprint)
+        del self._recent_progress_fingerprints[
+            :-RECENT_PROGRESS_FINGERPRINT_LIMIT
+        ]
+        self.last_useful_progress_at = self._clock()
+        self.useful_progress_count += 1
+        return True
 
     # -- detectors ----------------------------------------------------------
 
-    def _trip(self, detector: str, reason_fr: str, reason_en: str,
+    def _trip(self, detector: str, category: str,
+              reason_fr: str, reason_en: str,
               notice_fr: str, notice_en: str) -> bool:
         """Latch the first tripped detector's reason/notice in the agent's
         language. Always returns True so detectors can ``return self._trip(…)``.
         """
-        tool = self.calls[-1][0] if self.calls else "(none)"
+        tool = (
+            self._safe_tool_name(self.calls[-1][0])
+            if self.calls else "(none)"
+        )
         print(f"[ANTI-LOOP] detector={detector}, tool={tool}, stopping")
+        self.stop_category = category
         if self.lang == "fr":
             self.stop_reason, self.model_notice = reason_fr, notice_fr
         else:
@@ -4279,9 +4523,10 @@ class _AntiLoopGuard:
         tail = self.calls[-REPEAT_CALL_LIMIT:]
         if len(set(tail)) != 1:
             return False
-        tool_name = tail[0][0]
+        tool_name = self._safe_tool_name(tail[0][0])
         return self._trip(
             detector="repetition",
+            category="repeated_identical_call",
             reason_fr=(
                 f"la même action ({tool_name}) a déjà été tentée "
                 f"{REPEAT_CALL_LIMIT} fois de suite sans succès"
@@ -4304,24 +4549,22 @@ class _AntiLoopGuard:
         """ERROR_STREAK_LIMIT consecutive tool calls all returned errors."""
         if self.consecutive_errors < ERROR_STREAK_LIMIT:
             return False
-        failures = "; ".join(self.recent_failures)
         return self._trip(
             detector="error_streak",
+            category="consecutive_tool_errors",
             reason_fr=(
                 f"les {ERROR_STREAK_LIMIT} derniers appels d'outils ont tous "
-                f"échoué ({failures})"
+                "échoué"
             ),
             reason_en=(
-                f"the last {ERROR_STREAK_LIMIT} tool calls all failed "
-                f"({failures})"
+                f"the last {ERROR_STREAK_LIMIT} tool calls all failed"
             ),
             notice_fr=(
                 f"Les {ERROR_STREAK_LIMIT} derniers appels d'outils ont tous "
-                f"échoué : {failures}"
+                "échoué."
             ),
             notice_en=(
-                f"The last {ERROR_STREAK_LIMIT} tool calls all failed: "
-                f"{failures}"
+                f"The last {ERROR_STREAK_LIMIT} tool calls all failed."
             ),
         )
 
@@ -4339,9 +4582,12 @@ class _AntiLoopGuard:
             tail = self.calls[-window:]
             cycle = tail[:period]
             if all(tail[i] == cycle[i % period] for i in range(window)):
-                names = "→".join(name for name, _ in cycle)
+                names = "→".join(
+                    self._safe_tool_name(name) for name, _ in cycle
+                )
                 return self._trip(
                     detector="stall",
+                    category="repeated_cycle",
                     reason_fr=(
                         f"je répétais la même séquence d'actions ({names}) "
                         "sans progresser"
@@ -4364,26 +4610,84 @@ class _AntiLoopGuard:
         return False
 
     def check_time(self) -> bool:
-        """The whole turn exceeded TURN_TIME_LIMIT_SECONDS of wall-clock time.
-        Safe to call at any point in the loop, not just from ``record``.
-        """
+        """Trip on hard total duration or absence of verified useful progress."""
         if self.tripped:
             return True
-        if time.monotonic() - self.started_at <= TURN_TIME_LIMIT_SECONDS:
+        now = self._clock()
+        if now - self.started_at >= self.hard_limit:
+            duration = self._duration_label(self.hard_limit)
+            return self._trip(
+                detector="hard_total_ceiling",
+                category="hard_total_ceiling",
+                reason_fr=(
+                    f"le plafond de sécurité total de {duration} a été atteint"
+                ),
+                reason_en=(
+                    f"the total safety ceiling of {duration} was reached"
+                ),
+                notice_fr=(
+                    "Le plafond total de sécurité de ce tour a été atteint."
+                ),
+                notice_en="This turn reached its total safety ceiling.",
+            )
+        if now - self.last_useful_progress_at < self.idle_limit:
             return False
-        minutes = int(TURN_TIME_LIMIT_SECONDS // 60)
+        duration = self._duration_label(self.idle_limit)
         return self._trip(
-            detector="time_limit",
+            detector="stagnation_timeout",
+            category="stagnation_timeout",
             reason_fr=(
-                f"la limite de temps de {minutes} minutes pour un seul tour "
-                "a été atteinte"
+                f"aucun progrès utile vérifié n'a été observé pendant "
+                f"{duration}"
             ),
             reason_en=(
-                f"the {minutes}-minute time limit for a single turn was reached"
+                f"no verified useful progress was observed for {duration}"
             ),
-            notice_fr=f"Ce tour a dépassé la limite de {minutes} minutes.",
-            notice_en=f"This turn exceeded the {minutes}-minute time limit.",
+            notice_fr=(
+                f"Ce tour n'a produit aucun progrès utile vérifié pendant "
+                f"{duration}."
+            ),
+            notice_en=(
+                f"This turn produced no verified useful progress for {duration}."
+            ),
         )
+
+    def _duration_label(self, seconds: float) -> str:
+        value = float(seconds)
+        if value < 60:
+            amount = f"{value:g}"
+            if self.lang == "fr":
+                unit = "seconde" if value == 1 else "secondes"
+            else:
+                unit = "second" if value == 1 else "seconds"
+        else:
+            minutes = value / 60
+            amount = f"{minutes:g}"
+            if self.lang == "fr":
+                unit = "minute" if minutes == 1 else "minutes"
+            else:
+                unit = "minute" if minutes == 1 else "minutes"
+        return f"{amount} {unit}"
+
+    def remaining_hard_budget(self) -> float:
+        return max(0.0, self.hard_limit - (self._clock() - self.started_at))
+
+    def remaining_idle_budget(self) -> float:
+        return max(
+            0.0,
+            self.idle_limit - (self._clock() - self.last_useful_progress_at),
+        )
+
+    def remaining_provider_budget(self) -> float:
+        return min(self.remaining_hard_budget(), self.remaining_idle_budget())
+
+    def sanitized_diagnostic(self) -> dict:
+        category = self.stop_category or "unknown_failure"
+        return {
+            "stage": "task_execution",
+            "error_category": category,
+            "reason_code": category,
+        }
 
     # -- summaries -----------------------------------------------------------
 
@@ -4513,6 +4817,7 @@ class OSIAAgent:
         self.messages = [{"role": "system", "content": get_system_prompt(self.lang, self.model, self.provider)}]
         self._memory_store = None
         self._chatgpt_conversation_id = None
+        self.last_run_diagnostic: dict | None = None
 
     def reset(self):
         """Clear conversation history except system prompt."""
@@ -4872,7 +5177,38 @@ class OSIAAgent:
         except Exception:
             return {}
 
-    def _stream_deltas(self):
+    def _bounded_provider_timeout(self, guard: _AntiLoopGuard):
+        """Cap one provider round without extending its existing timeouts."""
+        budget = guard.remaining_provider_budget()
+        if budget <= 0:
+            guard.check_time()
+            raise _TurnBudgetStop()
+        current = getattr(self.client, "timeout", None)
+        if all(hasattr(current, name) for name in ("connect", "read", "write", "pool")):
+            try:
+                import httpx
+
+                def _cap(value):
+                    if value is None:
+                        return budget
+                    try:
+                        return min(float(value), budget)
+                    except (TypeError, ValueError, OverflowError):
+                        return budget
+
+                return httpx.Timeout(
+                    connect=_cap(current.connect),
+                    read=_cap(current.read),
+                    write=_cap(current.write),
+                    pool=_cap(current.pool),
+                )
+            except Exception:
+                pass
+        if isinstance(current, (int, float)) and math.isfinite(float(current)):
+            return min(float(current), budget)
+        return budget
+
+    def _stream_deltas(self, guard: _AntiLoopGuard | None = None):
         """Yield text deltas from the OpenAI-compatible chat-completions
         stream, abstracting it so the sentence-splitting loop stays simple.
 
@@ -4884,9 +5220,16 @@ class OSIAAgent:
             "messages": self._wire_messages(),
             "stream": True,
         }
+        if guard is not None:
+            create_kwargs["timeout"] = self._bounded_provider_timeout(guard)
         create_kwargs.update(self._reasoning_request_kwargs())
         stream = self.client.chat.completions.create(**create_kwargs)
         for chunk in stream:
+            if guard is not None and (
+                    guard.remaining_hard_budget() <= 0
+                    or guard.remaining_idle_budget() <= 0):
+                guard.check_time()
+                raise _TurnBudgetStop()
             try:
                 yield chunk.choices[0].delta.content or ""
             except (IndexError, AttributeError):
@@ -4941,7 +5284,8 @@ class OSIAAgent:
             speakable = ""
         return speakable
 
-    def _stream_with_sentences(self, on_sentence, on_first_token=None) -> str:
+    def _stream_with_sentences(self, on_sentence, on_first_token=None,
+                               guard: _AntiLoopGuard | None = None) -> str:
         """Stream a chat completion, emitting each complete sentence to
         ``on_sentence`` as it arrives. Returns the full accumulated content
         so the outer loop can still detect tool calls.
@@ -4971,7 +5315,7 @@ class OSIAAgent:
         tool_call_seen = False
         first_token_fired = False
 
-        for delta in self._stream_deltas():
+        for delta in self._stream_deltas(guard=guard):
             if not delta:
                 continue
             if not first_token_fired:
@@ -5070,52 +5414,42 @@ class OSIAAgent:
 
     def _finish_anti_loop_stop(self, guard: _AntiLoopGuard, on_sentence=None,
                                on_first_token=None) -> str:
-        """Wrap up a turn stopped by the anti-loop guard.
+        """Return one deterministic, sanitized anti-loop summary.
 
-        The stop instruction (detector notice + action log + summary format)
-        has already been appended to ``self.messages``; this makes ONE final
-        model call to produce the user-facing summary. Tool calls in that
-        response are never executed — only stripped. If the call fails or
-        the response is empty once tool markup is removed, falls back to a
-        deterministic summary built from the guard's action log so the user
-        always gets the "J'ai effectué N actions…" report.
+        No additional provider call is started after a detector trips. This
+        keeps the hard ceiling absolute and prevents raw tool results or
+        arguments from being paraphrased into user-visible output.
         """
+        # The deterministic summary does not need the just-produced model/tool
+        # scaffolding. Drop only trailing current-turn internal/tool frames so
+        # raw arguments, results and the anti-loop instruction cannot influence
+        # a later turn if this agent instance is reused without exported history.
+        while self.messages:
+            message = self.messages[-1]
+            text = _history_text_for_hygiene(message.get("content", ""))
+            is_tool_result = (
+                message.get("role") == "user"
+                and text.lstrip().startswith("<tool_result>")
+            )
+            is_tool_call = (
+                message.get("role") == "assistant"
+                and has_tool_markup(text)
+            )
+            if message.get("_internal") or is_tool_result or is_tool_call:
+                self.messages.pop()
+                continue
+            break
         print(
             f"[OSIA Agent] ⛔ anti-loop stop after {len(guard.actions)} "
             f"tool call(s): {guard.stop_reason}"
         )
-        content = ""
-        try:
-            if on_sentence is not None:
-                content = self._stream_with_sentences(
-                    on_sentence, on_first_token=on_first_token,
-                )
-            else:
-                create_kwargs = {
-                    "model": self.model,
-                    "messages": self._wire_messages(),
-                }
-                create_kwargs.update(self._reasoning_request_kwargs())
-                response = self.client.chat.completions.create(**create_kwargs)
-                content = response.choices[0].message.content or ""
-            # Same final-text pipeline as a normal response: strip reasoning
-            # first, then every form of tool markup (nothing gets executed).
-            content = strip_reasoning_blocks(content)
-            content = strip_raw_tool_tags(content)
-            content = strip_bare_tool_json(content).strip()
-        except Exception as e:
-            print(f"[OSIA Agent] ✗ anti-loop summary call failed: {e}")
-            content = ""
-
-        if not content:
-            # Model couldn't produce a usable summary — use the deterministic
-            # one, and speak it too in streaming mode (nothing was emitted).
-            content = guard.fallback_summary()
-            if on_sentence is not None:
-                try:
-                    on_sentence(clean_response(content))
-                except Exception:
-                    pass
+        self.last_run_diagnostic = guard.sanitized_diagnostic()
+        content = guard.fallback_summary()
+        if on_sentence is not None:
+            try:
+                on_sentence(clean_response(content))
+            except Exception:
+                pass
 
         self.messages.append({"role": "assistant", "content": content})
         return content
@@ -5199,6 +5533,7 @@ class OSIAAgent:
         never per tool call, so stickiness is never reset mid-turn.
         """
         from osia.utils.key_chain import task_scope
+        self.last_run_diagnostic = None
         with task_scope():
             return self._run_turn(
                 user_input,
@@ -5279,8 +5614,9 @@ class OSIAAgent:
         (``_AntiLoopGuard``): the agent is never cut off just for making
         many tool calls — only when it repeats the exact same call, hits
         a streak of errors, cycles through the same call sequence with no
-        progress, or exceeds the per-turn time budget. In those cases it
-        stops gracefully and returns a summary of what was done.
+        progress, remains stagnant past the idle budget, or reaches the
+        immutable total safety ceiling. In those cases it stops gracefully
+        and returns a summary of what was done.
         """
         scheduled_execution = _SCHEDULED_EXECUTION_CONTEXT.get()
         user_text = _history_text_for_hygiene(user_input)
@@ -5434,6 +5770,7 @@ class OSIAAgent:
         # below runs for as many rounds as the model needs — it is only
         # stopped when the guard says no progress is being made.
         guard = _AntiLoopGuard(lang=self.lang)
+        unresolved_tool_timeout = False
 
         # The chat path drives its OWN key rotation (the except block below +
         # _activate_next_api_key), so it never reaches with_key_rotation's
@@ -5448,6 +5785,12 @@ class OSIAAgent:
 
         while True:
             schedule_guard_state["buffered_sentences"] = []
+            if guard.check_time():
+                return self._finish_anti_loop_stop(
+                    guard,
+                    on_sentence=on_sentence,
+                    on_first_token=on_first_token,
+                )
             try:
                 from osia.image_inputs import ensure_image_input_supported
 
@@ -5461,11 +5804,13 @@ class OSIAAgent:
                     content = self._stream_with_sentences(
                         _on_sentence_cb,
                         on_first_token=on_first_token,
+                        guard=guard,
                     )
                 else:
                     create_kwargs = {
                         "model": self.model,
                         "messages": self._wire_messages(),
+                        "timeout": self._bounded_provider_timeout(guard),
                     }
                     create_kwargs.update(self._reasoning_request_kwargs())
                     response = self.client.chat.completions.create(**create_kwargs)
@@ -5473,7 +5818,20 @@ class OSIAAgent:
                     # structured tool calls on it (message.tool_calls).
                     message = response.choices[0].message
                     content = message.content or ""
+            except _TurnBudgetStop:
+                guard.check_time()
+                return self._finish_anti_loop_stop(
+                    guard,
+                    on_sentence=None,
+                    on_first_token=on_first_token,
+                )
             except Exception as e:
+                if guard.check_time():
+                    return self._finish_anti_loop_stop(
+                        guard,
+                        on_sentence=None,
+                        on_first_token=on_first_token,
+                    )
                 status = (
                     getattr(e, "status_code", None)
                     or getattr(getattr(e, "response", None), "status_code", None)
@@ -5519,7 +5877,20 @@ class OSIAAgent:
                         and retry_marker not in retry_after_attempted):
                     retry_after_attempted.add(retry_marker)
                     if retry_after:
-                        time.sleep(retry_after)
+                        remaining = guard.remaining_provider_budget()
+                        if remaining <= 0:
+                            guard.check_time()
+                            return self._finish_anti_loop_stop(
+                                guard, on_sentence=None,
+                                on_first_token=on_first_token,
+                            )
+                        delay = min(float(retry_after), remaining)
+                        time.sleep(delay)
+                        if delay < float(retry_after) or guard.check_time():
+                            return self._finish_anti_loop_stop(
+                                guard, on_sentence=None,
+                                on_first_token=on_first_token,
+                            )
                     continue
 
                 # API endpoint fallback (Bloc 5): a connection/timeout failure
@@ -5573,7 +5944,24 @@ class OSIAAgent:
                           f"({self._technical_error_reason(e, status)}), "
                           f"falling back to {self._fmt_route(nxt)}")
                     continue
+                if (status == 408
+                        or isinstance(e, TimeoutError)
+                        or "timeout" in type(e).__name__.lower()):
+                    self.last_run_diagnostic = {
+                        "stage": "task_execution",
+                        "error_category": "provider_timeout",
+                        "reason_code": "provider_timeout",
+                    }
                 raise
+
+            # Provider output, streamed text and chatter are not useful progress.
+            # Re-check both deadlines before parsing or executing anything.
+            if guard.check_time():
+                return self._finish_anti_loop_stop(
+                    guard,
+                    on_sentence=None,
+                    on_first_token=on_first_token,
+                )
 
             # The main chat completion above succeeded on self._api_key. Publish
             # it as this task's active key so the rest of the turn — the vision /
@@ -5670,22 +6058,26 @@ class OSIAAgent:
                 tool_screenshots: list[str] = []
                 for i, tc in enumerate(tool_calls):
                     tool_name = tc.get("tool", "")
+                    if guard.check_time():
+                        break
                     if tool_name not in TOOL_MAP:
+                        safe_tool_name = guard._safe_tool_name(tool_name)
                         print(
-                            f"[OSIA Agent] ✗ unknown tool requested: {tool_name!r} "
+                            "[OSIA Agent] ✗ unknown tool requested: "
+                            f"{safe_tool_name!r} "
                             f"(known tools: {len(TOOL_MAP)})"
                         )
                         tool_results.append(
-                            f"Tool {tool_name} result:\n"
+                            f"Tool {safe_tool_name} result:\n"
                             "⚠️ TOOL FAILED — the action did NOT happen: "
-                            f"[ERREUR] outil inconnu: {tool_name}"
+                            f"[ERREUR] outil inconnu: {safe_tool_name}"
                         )
                         # Unknown-tool requests count toward the anti-loop
                         # detectors too (repetition / error streak).
                         guard.record(
                             tool_name,
                             {k: v for k, v in tc.items() if k != "tool"},
-                            f"[ERREUR] outil inconnu: {tool_name}",
+                            f"[ERREUR] outil inconnu: {safe_tool_name}",
                             True,
                         )
                         # Treat unknown tool as a hard error: stop the batch.
@@ -5714,18 +6106,21 @@ class OSIAAgent:
                         continue
 
                     kwargs = {k: v for k, v in tc.items() if k != "tool"}
-                    kwargs_preview = {
-                        k: (v[:80] + "..." if isinstance(v, str) and len(v) > 80 else v)
-                        for k, v in kwargs.items()
-                    }
-                    print(f"[OSIA Agent] tool start: {tool_name}({kwargs_preview})")
+                    print(
+                        f"[OSIA Agent] tool start: {tool_name} "
+                        f"({len(kwargs)} argument field(s))"
+                    )
                     if tool_name == "save_memory":
                         token = _memory_runtime.set_save_memory_context(
                             store=memory_store,
                             user_text=user_text,
                         )
                         try:
-                            result, is_error = _execute_tool_with_retry(tool_name, kwargs)
+                            result, is_error = _execute_tool_with_retry(
+                                tool_name,
+                                kwargs,
+                                hard_deadline=guard.started_at + guard.hard_limit,
+                            )
                         finally:
                             _memory_runtime.reset_save_memory_context(token)
                         memory_save_tool_seen = True
@@ -5758,6 +6153,9 @@ class OSIAAgent:
                                 result, is_error = _execute_tool_with_retry(
                                     tool_name,
                                     kwargs,
+                                    hard_deadline=(
+                                        guard.started_at + guard.hard_limit
+                                    ),
                                 )
                             finally:
                                 _CURRENT_CONVERSATION_ID.reset(token)
@@ -5786,10 +6184,14 @@ class OSIAAgent:
                             result, is_error = policy_error, True
                         else:
                             result, is_error = _execute_tool_with_retry(
-                                tool_name, kwargs,
+                                tool_name,
+                                kwargs,
+                                hard_deadline=guard.started_at + guard.hard_limit,
                             )
                     any_tool_executed = True
                     text_part = _result_text(result)
+                    if is_error and "timeout" in text_part[:256].lower():
+                        unresolved_tool_timeout = True
                     screenshot = (
                         result.get("screenshot")
                         if isinstance(result, dict) else None
@@ -5828,19 +6230,29 @@ class OSIAAgent:
                         tool_screenshots.append(screenshot)
                     # Anti-loop: record the executed call and run every
                     # detector (repetition, error streak, stall, time).
-                    if guard.record(tool_name, kwargs, text_part, is_error):
+                    progress_before = guard.useful_progress_count
+                    if guard.record(
+                        tool_name,
+                        kwargs,
+                        text_part,
+                        is_error,
+                    ):
                         remaining = tool_calls[i + 1:]
                         if remaining:
                             names = [t.get("tool", "?") for t in remaining]
+                            names = [guard._safe_tool_name(name) for name in names]
                             print(
                                 f"[OSIA Agent] ⏸ anti-loop tripped — skipping "
                                 f"{len(remaining)} follow-up tool call(s): {names}"
                             )
                         break
+                    if guard.useful_progress_count > progress_before:
+                        unresolved_tool_timeout = False
                     if is_error:
                         remaining = tool_calls[i + 1:]
                         if remaining:
                             names = [t.get("tool", "?") for t in remaining]
+                            names = [guard._safe_tool_name(name) for name in names]
                             print(
                                 f"[OSIA Agent] ⏸ skipping {len(remaining)} "
                                 f"follow-up tool call(s) after error: {names}"
@@ -6156,7 +6568,6 @@ class OSIAAgent:
                 print(
                     "[WARN] final response empty after stripping "
                     f"(raw round output was {len(raw_round_output)} chars: "
-                    f"{raw_round_output[:120]!r}, "
                     f"tools_executed={len(guard.actions)}, "
                     f"empty_retry_used={empty_retry_used})"
                 )
@@ -6217,6 +6628,12 @@ class OSIAAgent:
                         on_sentence(sentence)
                     except Exception:
                         pass
+            if unresolved_tool_timeout and self.last_run_diagnostic is None:
+                self.last_run_diagnostic = {
+                    "stage": "task_execution",
+                    "error_category": "tool_timeout",
+                    "reason_code": "tool_timeout",
+                }
             self.messages.append({"role": "assistant", "content": content})
             return content
 

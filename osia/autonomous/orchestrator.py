@@ -79,6 +79,17 @@ class _VerificationOutcome(NamedTuple):
     reason_code: str
 
 
+_AGENT_RUN_FAILURE_CATEGORIES = frozenset({
+    diagnostics.FailureCategory.STAGNATION_TIMEOUT,
+    diagnostics.FailureCategory.HARD_TOTAL_CEILING,
+    diagnostics.FailureCategory.REPEATED_IDENTICAL_CALL,
+    diagnostics.FailureCategory.REPEATED_CYCLE,
+    diagnostics.FailureCategory.CONSECUTIVE_TOOL_ERRORS,
+    diagnostics.FailureCategory.PROVIDER_TIMEOUT,
+    diagnostics.FailureCategory.TOOL_TIMEOUT,
+})
+
+
 class Orchestrator:
     """Background execution engine for one autonomous ``task_state``.
 
@@ -107,6 +118,22 @@ class Orchestrator:
         # success_criterion BEFORE re-executing it (crash-salvage). Consumed on
         # the first task examined, regardless of outcome.
         self._resume_recheck = False
+
+    def _agent_run_failure(self):
+        """Read only the agent's allow-listed typed run diagnostic."""
+        raw = getattr(self.agent, "last_run_diagnostic", None)
+        if not isinstance(raw, dict):
+            return None
+        try:
+            category = diagnostics.FailureCategory(raw.get("error_category"))
+        except (TypeError, ValueError):
+            return None
+        if category not in _AGENT_RUN_FAILURE_CATEGORIES:
+            return None
+        reason_code = str(raw.get("reason_code") or category.value)
+        if reason_code != category.value:
+            reason_code = category.value
+        return category, reason_code
 
     # ── Lifecycle (mirrors CronManager.start/stop) ───────────────────────────
 
@@ -278,23 +305,31 @@ class Orchestrator:
 
         # (D) Run the isolated subtask. run() can raise when fallbacks are
         # exhausted ⇒ treat as an empty result + recorded error (never crash).
+        agent_failure = None
         try:
             self.agent.reset()
             result = self.agent.run(self._compose(task, digest))
             if not isinstance(result, str):
                 result = "" if result is None else str(result)
+            agent_failure = self._agent_run_failure()
         except Exception as exc:
             result = ""
-            is_timeout = (
-                isinstance(exc, TimeoutError)
-                or "timeout" in type(exc).__name__.lower()
-            )
-            category = (
-                diagnostics.FailureCategory.TASK_TIMEOUT
-                if is_timeout
-                else diagnostics.FailureCategory.TASK_EXECUTION_FAILURE
-            )
-            reason_code = "task_timeout" if is_timeout else "task_execution_failure"
+            agent_failure = self._agent_run_failure()
+            if agent_failure is not None:
+                category, reason_code = agent_failure
+            else:
+                is_timeout = (
+                    isinstance(exc, TimeoutError)
+                    or "timeout" in type(exc).__name__.lower()
+                )
+                category = (
+                    diagnostics.FailureCategory.TASK_TIMEOUT
+                    if is_timeout
+                    else diagnostics.FailureCategory.TASK_EXECUTION_FAILURE
+                )
+                reason_code = (
+                    "task_timeout" if is_timeout else "task_execution_failure"
+                )
             state.set_task_status(st, p, t, "in_progress", attempts=attempts,
                                   last_error=reason_code)
             self._record_failure(
@@ -310,7 +345,8 @@ class Orchestrator:
         # ``ERROR:`` is the agent's protected deterministic failure contract.
         # Recording it is observability-only; verification still runs exactly as
         # before, so this does not alter execution, retry or replan behavior.
-        if isinstance(result, str) and result.lstrip().startswith("ERROR:"):
+        if (agent_failure is None and isinstance(result, str)
+                and result.lstrip().startswith("ERROR:")):
             self._record_failure(
                 st,
                 diagnostics.AutonomousStage.TASK_EXECUTION,
@@ -351,11 +387,17 @@ class Orchestrator:
             return True
 
         # (F2) Failure.
-        last_error = verification.reason_code
+        if agent_failure is not None:
+            failure_category, last_error = agent_failure
+            failure_stage = diagnostics.AutonomousStage.TASK_EXECUTION
+        else:
+            failure_category = verification.category
+            last_error = verification.reason_code
+            failure_stage = diagnostics.AutonomousStage.VERIFICATION
         self._record_failure(
             st,
-            diagnostics.AutonomousStage.VERIFICATION,
-            verification.category,
+            failure_stage,
+            failure_category,
             reason_code=last_error,
             attempt=attempts,
             resumable=True,
@@ -374,6 +416,18 @@ class Orchestrator:
                 resumable=True,
                 checkpoint_present=True,
             )
+            if agent_failure is not None:
+                # Keep the typed leaf cause current for PC/mobile while retaining
+                # task_attempts_exhausted in bounded history.
+                diagnostic = self._record_failure(
+                    st,
+                    diagnostics.AutonomousStage.TASK_EXECUTION,
+                    failure_category,
+                    reason_code=last_error,
+                    attempt=attempts,
+                    resumable=True,
+                    checkpoint_present=True,
+                )
             self._append_log(
                 st, "task_failed", ref=task.get("id"),
                 note="task_attempts_exhausted",
@@ -392,6 +446,18 @@ class Orchestrator:
                     diagnostics.AutonomousStage.REPLAN,
                     diagnostics.FailureCategory.REPLANS_EXHAUSTED,
                     reason_code="replans_exhausted",
+                    attempt=attempts,
+                    resumable=False,
+                    checkpoint_present=True,
+                )
+            if agent_failure is not None:
+                # Replan failure/exhaustion remains in history; the terminal
+                # projection keeps the concrete leaf cause that stopped the turn.
+                self._record_failure(
+                    st,
+                    diagnostics.AutonomousStage.TASK_EXECUTION,
+                    failure_category,
+                    reason_code=last_error,
                     attempt=attempts,
                     resumable=False,
                     checkpoint_present=True,

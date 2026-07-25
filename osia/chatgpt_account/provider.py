@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import queue
 import re
 import threading
@@ -200,6 +201,17 @@ def _sanitized_system_prompt(system: str, messages: list[dict]) -> str:
     return cleaned.strip()
 
 
+def _bounded_turn_timeout(value) -> float:
+    """Preserve the account provider's existing 300 s maximum."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 300.0
+    if not math.isfinite(timeout) or timeout <= 0:
+        return 300.0
+    return min(timeout, 300.0)
+
+
 class ChatGPTAccountProvider:
     def __init__(self, client: AppServerClient | None = None):
         self.client = client or AppServerClient()
@@ -353,6 +365,7 @@ class ChatGPTAccountProvider:
         messages: list[dict],
         effort: str | None = None,
         on_delta=None,
+        timeout: float = 300.0,
     ) -> TurnResult:
         try:
             state, delta_messages = self._prepare(conversation_id, model, messages)
@@ -362,6 +375,7 @@ class ChatGPTAccountProvider:
                 model=model,
                 effort=effort,
                 on_delta=on_delta,
+                timeout=_bounded_turn_timeout(timeout),
             )
             if isinstance(turn_input, list):
                 run_kwargs["content"] = turn_input
@@ -406,12 +420,14 @@ class _AccountCompletions:
     def create(self, *, model: str, messages: list[dict], stream: bool = False, **kwargs):
         conversation_id = self._owner.conversation_id or f"ephemeral:{id(self._owner)}"
         effort = kwargs.get("effort")
+        timeout = _bounded_turn_timeout(kwargs.get("timeout", 300.0))
         if not stream:
             result = self._owner.provider.complete(
                 conversation_id=conversation_id,
                 model=model,
                 messages=messages,
                 effort=effort,
+                timeout=timeout,
             )
             message = SimpleNamespace(content=result.text, tool_calls=None)
             return SimpleNamespace(choices=[SimpleNamespace(message=message)])
@@ -426,6 +442,7 @@ class _AccountCompletions:
                     messages=messages,
                     effort=effort,
                     on_delta=lambda delta: events.put(("delta", delta)),
+                    timeout=timeout,
                 )
                 events.put(("done", None))
             except Exception as exc:

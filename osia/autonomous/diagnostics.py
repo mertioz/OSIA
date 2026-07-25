@@ -36,6 +36,13 @@ class FailureCategory(str, Enum):
     INVALID_PLANNING_OUTPUT = "invalid_planning_output"
     TASK_EXECUTION_FAILURE = "task_execution_failure"
     TASK_TIMEOUT = "task_timeout"
+    STAGNATION_TIMEOUT = "stagnation_timeout"
+    HARD_TOTAL_CEILING = "hard_total_ceiling"
+    REPEATED_IDENTICAL_CALL = "repeated_identical_call"
+    REPEATED_CYCLE = "repeated_cycle"
+    CONSECUTIVE_TOOL_ERRORS = "consecutive_tool_errors"
+    PROVIDER_TIMEOUT = "provider_timeout"
+    TOOL_TIMEOUT = "tool_timeout"
     VERIFICATION_ERROR = "verification_error"
     VERIFICATION_NOT_COMPLETED = "verification_not_completed"
     TASK_ATTEMPTS_EXHAUSTED = "task_attempts_exhausted"
@@ -69,6 +76,12 @@ _KNOWN_REASON_CODES = {
     "model_setup_failure",
     "task_execution_failure",
     "task_timeout",
+    "stagnation_timeout",
+    "hard_total_ceiling",
+    "repeated_identical_call",
+    "repeated_cycle",
+    "consecutive_tool_errors",
+    "tool_timeout",
     "task_error_result",
     "missing_success_criterion",
     "file_criterion_satisfied",
