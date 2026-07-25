@@ -36,8 +36,9 @@ Naming note: the *module* :mod:`osia.autonomous.state` is imported as ``state``
 import os
 import re
 import threading
+from typing import NamedTuple
 
-from osia.autonomous import planner
+from osia.autonomous import diagnostics, planner
 # Module-qualified on purpose (like planner.py) so the persistence/mutator layer
 # stays a single black box — and so a test can monkeypatch state.save_task_state.
 from osia.autonomous import state
@@ -70,6 +71,12 @@ _NONFILE_OBSERVABLE_KEYWORDS = (
     "ecran", "confirmation", "message", "says", "contains", "contient",
     "matches", "output", "console", "affich", "montre", "réponse", "reponse",
 )
+
+
+class _VerificationOutcome(NamedTuple):
+    ok: bool
+    category: diagnostics.FailureCategory | None
+    reason_code: str
 
 
 class Orchestrator:
@@ -116,11 +123,27 @@ class Orchestrator:
         # Idempotent: never spawn a second loop over the same Orchestrator.
         if self._thread and self._thread.is_alive():
             return
+        if resume and not state.resume_state_is_valid(st):
+            invalid = st if isinstance(st, dict) else state.new_task_state("", "", "", [])
+            self._state = invalid
+            invalid["status"] = "failed"
+            diagnostic = self._record_failure(
+                invalid,
+                diagnostics.AutonomousStage.RESUME,
+                diagnostics.FailureCategory.INVALID_RESUME_STATE,
+                reason_code="invalid_resume_state",
+                resumable=False,
+                checkpoint_present=isinstance(st, dict),
+            )
+            self._safe_save(invalid)
+            self._emit({"event": "failed", **diagnostic})
+            return
         self._state = st
         self._resume_recheck = bool(resume)
         # We are (re-)entering execution ⇒ the run is in progress. Persist once
         # up front so the on-disk checkpoint matches what we are about to run.
         st["status"] = "in_progress"
+        diagnostics.clear_current(st)
         self._safe_save(st)
         self._stop.clear()
         self._thread = threading.Thread(
@@ -152,15 +175,26 @@ class Orchestrator:
         while not self._stop.is_set():
             try:
                 keep_going = self._step(st)
-            except Exception as exc:  # never let an unexpected error kill silently
-                print(f"[ORCH] loop error: {exc}")
+            except Exception:  # never let an unexpected error kill silently
                 try:
                     st["status"] = "failed"
-                    self._append_log(st, "crashed", note=str(exc))
+                    diagnostic = self._record_failure(
+                        st,
+                        diagnostics.AutonomousStage.ORCHESTRATOR,
+                        diagnostics.FailureCategory.ORCHESTRATOR_FAILURE,
+                        reason_code="orchestrator_failure",
+                        resumable=False,
+                        checkpoint_present=True,
+                    )
+                    self._append_log(st, "crashed", note="orchestrator_failure")
                     self._safe_save(st)
                 except Exception:
-                    pass
-                self._emit({"event": "failed", "reason": f"orchestrator error: {exc}"})
+                    diagnostic = {}
+                self._emit({
+                    "event": "failed",
+                    "reason": "orchestrator_failure",
+                    **diagnostic,
+                })
                 break
             if not keep_going:
                 break
@@ -175,6 +209,7 @@ class Orchestrator:
         # (A) Termination — the cursor has walked past the last phase.
         if p >= len(phases):
             st["status"] = "done"
+            diagnostics.clear_current(st)
             self._append_log(st, "done", note="all phases complete")
             self._safe_save(st)
             self._emit({"event": "done", "status": "done"})
@@ -216,10 +251,21 @@ class Orchestrator:
         if self._resume_recheck:
             self._resume_recheck = False
             if task.get("status") == "in_progress" and int(task.get("attempts", 0) or 0) > 0:
-                ok, reason = self._verify(task, task.get("distilled_summary", "") or "")
-                if ok:
-                    self._salvage(st, p, t, task, reason)
+                verification = self._verify_outcome(
+                    task, task.get("distilled_summary", "") or "",
+                )
+                if verification.ok:
+                    self._salvage(st, p, t, task, verification.reason_code)
                     return True
+                self._record_failure(
+                    st,
+                    diagnostics.AutonomousStage.VERIFICATION,
+                    verification.category,
+                    reason_code=verification.reason_code,
+                    attempt=task.get("attempts", 0),
+                    resumable=True,
+                    checkpoint_present=True,
+                )
             # Not salvageable ⇒ fall through and (re-)execute it normally.
 
         # (C) Begin an attempt — phase in_progress, bump attempts, CHECKPOINT A.
@@ -239,8 +285,41 @@ class Orchestrator:
                 result = "" if result is None else str(result)
         except Exception as exc:
             result = ""
+            is_timeout = (
+                isinstance(exc, TimeoutError)
+                or "timeout" in type(exc).__name__.lower()
+            )
+            category = (
+                diagnostics.FailureCategory.TASK_TIMEOUT
+                if is_timeout
+                else diagnostics.FailureCategory.TASK_EXECUTION_FAILURE
+            )
+            reason_code = "task_timeout" if is_timeout else "task_execution_failure"
             state.set_task_status(st, p, t, "in_progress", attempts=attempts,
-                                  last_error=f"agent.run raised: {exc}")
+                                  last_error=reason_code)
+            self._record_failure(
+                st,
+                diagnostics.AutonomousStage.TASK_EXECUTION,
+                category,
+                reason_code=reason_code,
+                attempt=attempts,
+                resumable=True,
+                checkpoint_present=True,
+            )
+
+        # ``ERROR:`` is the agent's protected deterministic failure contract.
+        # Recording it is observability-only; verification still runs exactly as
+        # before, so this does not alter execution, retry or replan behavior.
+        if isinstance(result, str) and result.lstrip().startswith("ERROR:"):
+            self._record_failure(
+                st,
+                diagnostics.AutonomousStage.TASK_EXECUTION,
+                diagnostics.FailureCategory.TASK_EXECUTION_FAILURE,
+                reason_code="task_error_result",
+                attempt=attempts,
+                resumable=True,
+                checkpoint_present=True,
+            )
 
         # Honour a stop requested DURING the run — persist and exit promptly.
         if self._stop.is_set():
@@ -248,45 +327,88 @@ class Orchestrator:
             return False
 
         # (E) Verify doneness (fail-closed).
-        ok, reason = self._verify(task, result)
+        verification = self._verify_outcome(task, result)
 
-        if ok:
+        if verification.ok:
             # (F1) Success — distil, mark done, grow+cap the digest, CHECKPOINT B.
             summary = self._distil(task, result)
             state.set_task_status(st, p, t, "done",
                                   distilled_summary=summary, last_error=None)
+            diagnostics.clear_current(st)
             st["context_digest"] = self._cap_digest(
                 digest, f"[{task.get('id')}] {summary}")
             if t + 1 >= len(tasks):
                 phase["status"] = "done"
             self._advance(st)
-            self._append_log(st, "task_done", ref=task.get("id"), note=reason)
+            self._append_log(
+                st, "task_done", ref=task.get("id"),
+                note=verification.reason_code,
+            )
             self._safe_save(st)  # CHECKPOINT B
             self._emit({"event": "task_done", "task_id": task.get("id"),
-                        "phase": p, "task": t, "reason": reason})
+                        "phase": p, "task": t,
+                        "reason": verification.reason_code})
             return True
 
         # (F2) Failure.
-        last_error = reason or task.get("last_error") or "success criterion not met"
+        last_error = verification.reason_code
+        self._record_failure(
+            st,
+            diagnostics.AutonomousStage.VERIFICATION,
+            verification.category,
+            reason_code=last_error,
+            attempt=attempts,
+            resumable=True,
+            checkpoint_present=True,
+        )
         if attempts >= max_attempts:
             # Task is out of attempts — fail it and its phase. CHECKPOINT C.
             state.set_task_status(st, p, t, "failed", last_error=last_error)
             phase["status"] = "failed"
-            self._append_log(st, "task_failed", ref=task.get("id"), note=last_error)
+            diagnostic = self._record_failure(
+                st,
+                diagnostics.AutonomousStage.RETRY,
+                diagnostics.FailureCategory.TASK_ATTEMPTS_EXHAUSTED,
+                reason_code="task_attempts_exhausted",
+                attempt=attempts,
+                resumable=True,
+                checkpoint_present=True,
+            )
+            self._append_log(
+                st, "task_failed", ref=task.get("id"),
+                note="task_attempts_exhausted",
+            )
             self._safe_save(st)  # CHECKPOINT C
             self._emit({"event": "task_failed", "task_id": task.get("id"),
-                        "reason": last_error})
+                        "reason": "task_attempts_exhausted", **diagnostic})
 
             # Try to recover by re-planning the remaining work, if budget allows.
-            if replan_count < max_replans and self._replan(st):
-                return True  # loop continues at the freshly-appended phase
+            if replan_count < max_replans:
+                if self._replan(st):
+                    return True  # loop continues at the freshly-appended phase
+            else:
+                self._record_failure(
+                    st,
+                    diagnostics.AutonomousStage.REPLAN,
+                    diagnostics.FailureCategory.REPLANS_EXHAUSTED,
+                    reason_code="replans_exhausted",
+                    attempt=attempts,
+                    resumable=False,
+                    checkpoint_present=True,
+                )
             # Out of attempts AND out of replans (or replanning failed) ⇒ stop.
             st["status"] = "failed"
             self._append_log(st, "failed", ref=task.get("id"),
-                             note="attempts and replans exhausted")
+                             note=(st.get("failure_diagnostic") or {}).get(
+                                 "reason_code", "unknown_failure",
+                             ))
             self._safe_save(st)
+            terminal_reason = (st.get("failure_diagnostic") or {}).get(
+                "reason_code", "unknown_failure",
+            )
             self._emit({"event": "failed", "task_id": task.get("id"),
-                        "reason": last_error})
+                        "reason": terminal_reason,
+                        **diagnostics.projection(st)})
             return False
 
         # Still has attempts left — retry. Cursor UNCHANGED; record the error.
@@ -325,6 +447,11 @@ class Orchestrator:
         return "\n".join(parts)
 
     def _verify(self, task, evidence):
+        """Compatibility wrapper returning the historical ``(ok, reason)`` pair."""
+        outcome = self._verify_outcome(task, evidence)
+        return outcome.ok, outcome.reason_code
+
+    def _verify_outcome(self, task, evidence) -> _VerificationOutcome:
         """Return ``(ok: bool, reason: str)`` — fail-closed, two layers.
 
         Layer 1 (deterministic): a purely objective file-existence criterion
@@ -339,17 +466,23 @@ class Orchestrator:
         criterion = (task.get("success_criterion") or "").strip()
         if not criterion:
             # No observable criterion ⇒ we can't prove doneness ⇒ fail-closed.
-            return False, "no success_criterion to verify against"
+            return _VerificationOutcome(
+                False, diagnostics.FailureCategory.VERIFICATION_ERROR,
+                "missing_success_criterion",
+            )
 
         verdict = self._file_precheck(criterion)
         if verdict is True:
-            return True, "file criterion satisfied on disk"
+            return _VerificationOutcome(True, None, "file_criterion_satisfied")
         if verdict is False:
-            return False, "required file missing or empty on disk"
+            return _VerificationOutcome(
+                False, diagnostics.FailureCategory.VERIFICATION_NOT_COMPLETED,
+                "file_criterion_not_met",
+            )
 
         # Undecided ⇒ LLM judge by direct observation (evidence intentionally
         # NOT fed in: the whole point is to re-check, not to echo a self-report).
-        return self._llm_judge(criterion)
+        return self._llm_judge_outcome(criterion)
 
     def _file_precheck(self, criterion):
         """Tri-state deterministic check: ``True`` (accept) / ``False`` (reject)
@@ -420,6 +553,11 @@ class Orchestrator:
         return out
 
     def _llm_judge(self, criterion):
+        """Compatibility wrapper returning the historical ``(ok, reason)`` pair."""
+        outcome = self._llm_judge_outcome(criterion)
+        return outcome.ok, outcome.reason_code
+
+    def _llm_judge_outcome(self, criterion) -> _VerificationOutcome:
         """Ask the agent to verify ``criterion`` by direct observation and parse
         a robust DONE / NOT_DONE verdict (ambiguous ⇒ NOT_DONE; run error ⇒
         NOT_DONE — fail-closed)."""
@@ -434,9 +572,17 @@ class Orchestrator:
         try:
             self.agent.reset()
             reply = self.agent.run(prompt)
-        except Exception as exc:
-            return False, f"verification run failed: {exc}"
-        return self._parse_verdict(reply)
+        except Exception:
+            return _VerificationOutcome(
+                False, diagnostics.FailureCategory.VERIFICATION_ERROR,
+                "verification_error",
+            )
+        ok, reason_code = self._parse_verdict(reply)
+        return _VerificationOutcome(
+            ok,
+            None if ok else diagnostics.FailureCategory.VERIFICATION_NOT_COMPLETED,
+            reason_code,
+        )
 
     @staticmethod
     def _parse_verdict(reply):
@@ -446,15 +592,15 @@ class Orchestrator:
         treats anything ambiguous/empty as NOT_DONE."""
         text = (reply or "").strip()
         if not text:
-            return False, "empty verification reply → NOT_DONE"
+            return False, "empty_verification_reply"
         up = text.upper()
         # Collapse separators so NOT-DONE / NOT DONE / NOT_DONE all normalise.
         norm = re.sub(r"[\s_\-]+", " ", up)
         if "NOT DONE" in norm or "NOTDONE" in up:
-            return False, Orchestrator._short(text)
+            return False, "verification_not_completed"
         if re.search(r"\bDONE\b", norm):
-            return True, Orchestrator._short(text)
-        return False, "ambiguous verdict → treated as NOT_DONE"
+            return True, "verification_completed"
+        return False, "ambiguous_verification_reply"
 
     # ── Summary / digest helpers (cheap string ops — no agent on the hot path) ─
 
@@ -497,6 +643,7 @@ class Orchestrator:
         summary = (task.get("distilled_summary") or "").strip() \
             or "completed (verified on resume)"
         state.set_task_status(st, p, t, "done", last_error=None)
+        diagnostics.clear_current(st)
         digest = st.get("context_digest", "") or ""
         st["context_digest"] = self._cap_digest(digest, f"[{task.get('id')}] {summary}")
         phases = st.get("phases") or []
@@ -508,7 +655,7 @@ class Orchestrator:
         self._append_log(st, "salvaged", ref=task.get("id"), note=reason)
         self._safe_save(st)
         self._emit({"event": "salvaged", "task_id": task.get("id"),
-                    "reason": "verified satisfied on resume"})
+                    "reason": "verification_completed"})
 
     def _replan(self, st) -> bool:
         """Re-plan the REMAINING work after a task ran out of attempts.
@@ -542,23 +689,47 @@ class Orchestrator:
             "objective, taking that failure into account. Do not repeat steps "
             "already completed above."
         )
+        planning_failures = []
         try:
-            new_phases = planner.plan_objective(remaining, self.agent)
-        except Exception as exc:
+            new_phases = planner.plan_objective(
+                remaining, self.agent, failure_cb=planning_failures.append,
+            )
+        except Exception:
             new_phases = None
-            last_err = f"replan crashed: {exc}"
 
         # Count this replan attempt regardless of outcome (hard cap honoured).
         budgets["replan_count"] = int(budgets.get("replan_count", 0) or 0) + 1
 
         if not new_phases:
-            self._append_log(st, "replan_failed", note="planner returned no plan")
+            if planning_failures:
+                failure = planning_failures[-1]
+                self._record_failure(
+                    st,
+                    diagnostics.AutonomousStage.REPLAN,
+                    failure.error_category,
+                    reason_code=failure.reason,
+                    resumable=True,
+                    checkpoint_present=True,
+                )
+                reason_code = failure.reason
+            else:
+                reason_code = "replan_failure"
+            self._record_failure(
+                st,
+                diagnostics.AutonomousStage.REPLAN,
+                diagnostics.FailureCategory.REPLAN_FAILURE,
+                reason_code=reason_code,
+                resumable=False,
+                checkpoint_present=True,
+            )
+            self._append_log(st, "replan_failed", note=reason_code)
             self._safe_save(st)
             return False
 
         first_new = len(st.get("phases") or [])
         st.setdefault("phases", []).extend(new_phases)
         st["cursor"] = {"phase": first_new, "task": 0}
+        diagnostics.clear_current(st)
         self._append_log(st, "replan", ref=str(first_new),
                          note=f"appended {len(new_phases)} new phase(s)")
         self._safe_save(st)  # single atomic checkpoint
@@ -575,14 +746,22 @@ class Orchestrator:
     def _append_log(st, event, ref=None, note=None):
         state.append_log(st, event, ref=ref, note=note)
 
-    @staticmethod
-    def _safe_save(st):
+    def _safe_save(self, st):
         """Persist a checkpoint; a save failure is logged, never fatal to the
         loop (disk-full / permission error must not crash autonomous mode)."""
         try:
             state.save_task_state(st)
-        except Exception as exc:
-            print(f"[ORCH] checkpoint save failed: {exc}")
+        except Exception:
+            diagnostics.set_checkpoint_present(st, False)
+            diagnostic = diagnostics.make_diagnostic(
+                st,
+                stage=diagnostics.AutonomousStage.PERSISTENCE,
+                category=diagnostics.FailureCategory.CHECKPOINT_FAILURE,
+                reason_code="checkpoint_failure",
+                resumable=False,
+                checkpoint_present=False,
+            )
+            diagnostics.emit_diagnostic_log(diagnostic)
 
     def _emit(self, payload):
         """Fire ``progress_cb`` defensively — a callback error never kills the
@@ -592,5 +771,38 @@ class Orchestrator:
             return
         try:
             cb(dict(payload))
-        except Exception as exc:
-            print(f"[ORCH] progress_cb error: {exc}")
+        except Exception:
+            diagnostic = diagnostics.make_diagnostic(
+                self._state,
+                stage=diagnostics.AutonomousStage.ORCHESTRATOR,
+                category=diagnostics.FailureCategory.ORCHESTRATOR_FAILURE,
+                reason_code="progress_callback_failure",
+                resumable=bool(
+                    isinstance(self._state, dict)
+                    and self._state.get("status") == "in_progress"
+                ),
+                checkpoint_present=isinstance(self._state, dict),
+            )
+            diagnostics.emit_diagnostic_log(diagnostic)
+
+    def _record_failure(self, st, stage, category, *, reason_code,
+                        attempt=None, resumable=False,
+                        checkpoint_present=True) -> dict:
+        """Record one failure using current agent/provider metadata only."""
+        provider, model = diagnostics.actual_provider_model(
+            self.agent,
+            st.get("provider", "") if isinstance(st, dict) else "",
+            st.get("model", "") if isinstance(st, dict) else "",
+        )
+        diagnostic = diagnostics.make_diagnostic(
+            st,
+            stage=stage,
+            category=category or diagnostics.FailureCategory.UNKNOWN_FAILURE,
+            reason_code=reason_code,
+            attempt=attempt,
+            provider=provider,
+            model=model,
+            resumable=resumable,
+            checkpoint_present=checkpoint_present,
+        )
+        return diagnostics.record_diagnostic(st, diagnostic)

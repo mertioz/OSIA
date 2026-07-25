@@ -43,7 +43,7 @@ import json
 import re
 from typing import NamedTuple
 
-from osia.autonomous import state
+from osia.autonomous import diagnostics, state
 from osia.utils.key_chain import error_status, provider_failure_category
 
 # ── Bounded autonomy defaults ────────────────────────────────────────────────
@@ -72,6 +72,11 @@ class PlanFailure(NamedTuple):
     reason: str
     status_code: int | None = None
     provider_category: str = ""
+
+    @property
+    def error_category(self) -> diagnostics.FailureCategory:
+        """Stable WOR-173 category while preserving the legacy ``reason`` API."""
+        return diagnostics.planning_category(self.reason)
 
 
 class _AttemptOutcome(NamedTuple):
@@ -353,13 +358,18 @@ def plan_objective(objective: str, agent, *,
     it receives one sanitized :class:`PlanFailure` for the final failure only.
     """
     if not _nonempty_str(objective):
+        _report_failure(failure_cb, PlanFailure("blank_objective"))
         return None
     objective = objective.strip()
     prompt = _build_planning_prompt(objective, max_phases, max_tasks_per_phase)
 
     # First attempt: fresh context (reset clears history except the system
     # prompt). The agent is the caller's; reset() is part of its public contract.
-    agent.reset()
+    try:
+        agent.reset()
+    except Exception as exc:
+        _report_failure(failure_cb, _provider_failure(exc))
+        return None
     outcome = _attempt(agent, prompt, max_phases, max_tasks_per_phase)
     if outcome.phases is not None:
         return outcome.phases

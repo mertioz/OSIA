@@ -653,8 +653,14 @@ def wake_mode():
     from osia.heartbeat import HeartbeatMonitor
     # WOR-45 Phase 4 — wire the autonomous engine (consumed as black boxes).
     from osia.autonomous.orchestrator import Orchestrator
-    from osia.autonomous import planner
-    from osia.autonomous.state import save_task_state, clear_task_state, count_progress
+    from osia.autonomous import diagnostics as autonomous_diagnostics, planner
+    from osia.autonomous.state import (
+        clear_task_state,
+        count_progress,
+        new_failed_task_state,
+        resume_state_is_valid,
+        save_task_state,
+    )
     perf_mark("wake_mode: heavy imports done")
 
     class Bridge(QObject):
@@ -1509,6 +1515,7 @@ def wake_mode():
             "phase_name": phase_name,
             "objective": st.get("objective", "") or "",
             "status": st.get("status", "") or "",
+            **autonomous_diagnostics.projection(st),
         }
 
     def _on_orch_progress(payload):
@@ -1526,21 +1533,121 @@ def wake_mode():
             if model:
                 try:
                     autonomous_agent.set_model(model)
-                except Exception as e:
-                    print(f"[WOR-45] autonomous set_model({model!r}) failed: {e}")
+                except Exception:
+                    autonomous_diagnostics.emit_diagnostic_log(
+                        autonomous_diagnostics.make_diagnostic(
+                            None,
+                            stage=autonomous_diagnostics.AutonomousStage.PLANNING,
+                            category=(
+                                autonomous_diagnostics.FailureCategory
+                                .PLANNING_PROVIDER_FAILURE
+                            ),
+                            reason_code="model_setup_failure",
+                            provider=provider,
+                            model=model,
+                            resumable=False,
+                            checkpoint_present=False,
+                        )
+                    )
+            actual_provider, actual_model = (
+                autonomous_diagnostics.actual_provider_model(
+                    autonomous_agent, provider, model,
+                )
+            )
+            planning_failures = []
             try:
                 st = planner.create_plan_state(
-                    objective, provider, model, autonomous_agent
+                    objective, actual_provider, actual_model, autonomous_agent,
+                    failure_cb=planning_failures.append,
                 )
-            except Exception as e:
-                print(f"[WOR-45] planning crashed: {e}")
+            except Exception:
                 st = None
             if not st:
-                bridge.autonomous_progress.emit({"event": "plan_failed"})
+                if planning_failures:
+                    failure = planning_failures[-1]
+                    category = failure.error_category
+                    reason_code = failure.reason
+                else:
+                    category = (
+                        autonomous_diagnostics.FailureCategory
+                        .PLANNING_PROVIDER_FAILURE
+                    )
+                    reason_code = "planning_internal_failure"
+                diagnostic = autonomous_diagnostics.make_diagnostic(
+                    None,
+                    stage=autonomous_diagnostics.AutonomousStage.PLANNING,
+                    category=category,
+                    reason_code=reason_code,
+                    provider=actual_provider,
+                    model=actual_model,
+                    resumable=False,
+                    checkpoint_present=True,
+                )
+                failed_state = new_failed_task_state(
+                    actual_provider, actual_model, diagnostic,
+                )
+                try:
+                    save_task_state(failed_state)
+                except Exception:
+                    autonomous_diagnostics.set_checkpoint_present(
+                        failed_state, False,
+                    )
+                autonomous_diagnostics.emit_diagnostic_log(
+                    failed_state.get("failure_diagnostic")
+                )
+                autonomous_state["st"] = failed_state
+                bridge.autonomous_progress.emit(
+                    {"event": "plan_failed", **_orch_snapshot(failed_state)}
+                )
                 return
-            save_task_state(st)
+            try:
+                save_task_state(st)
+            except Exception:
+                st["status"] = "failed"
+                diagnostic = autonomous_diagnostics.make_diagnostic(
+                    st,
+                    stage=autonomous_diagnostics.AutonomousStage.PERSISTENCE,
+                    category=(
+                        autonomous_diagnostics.FailureCategory.CHECKPOINT_FAILURE
+                    ),
+                    reason_code="checkpoint_failure",
+                    provider=actual_provider,
+                    model=actual_model,
+                    resumable=False,
+                    checkpoint_present=False,
+                )
+                autonomous_diagnostics.record_diagnostic(st, diagnostic)
+                autonomous_state["st"] = st
+                bridge.autonomous_progress.emit(
+                    {"event": "failed", **_orch_snapshot(st)}
+                )
+                return
             autonomous_state["st"] = st
-            orchestrator.start(st)
+            try:
+                orchestrator.start(st)
+            except Exception:
+                st["status"] = "failed"
+                diagnostic = autonomous_diagnostics.make_diagnostic(
+                    st,
+                    stage=autonomous_diagnostics.AutonomousStage.ORCHESTRATOR,
+                    category=(
+                        autonomous_diagnostics.FailureCategory.ORCHESTRATOR_FAILURE
+                    ),
+                    reason_code="start_worker_failure",
+                    provider=actual_provider,
+                    model=actual_model,
+                    resumable=False,
+                    checkpoint_present=True,
+                )
+                autonomous_diagnostics.record_diagnostic(st, diagnostic)
+                try:
+                    save_task_state(st)
+                except Exception:
+                    autonomous_diagnostics.set_checkpoint_present(st, False)
+                bridge.autonomous_progress.emit(
+                    {"event": "failed", **_orch_snapshot(st)}
+                )
+                return
             # Flip the panel "Planning…" → "Running…" with the first snapshot, and
             # ONLY now (after start() has spawned the loop) — this is what enables
             # the panel's Interrupt/Abort, so a cancel can never race a start() that
@@ -1554,8 +1661,42 @@ def wake_mode():
         # Pause: stop() joins ≤2s, so run it off the GUI thread. The persisted
         # state stays "in_progress" → the task is resumable on the next launch.
         def _pause():
-            orchestrator.stop()
             st = autonomous_state.get("st")
+            try:
+                orchestrator.stop()
+            except Exception:
+                autonomous_diagnostics.emit_diagnostic_log(
+                    autonomous_diagnostics.make_diagnostic(
+                        st,
+                        stage=autonomous_diagnostics.AutonomousStage.CONTROL,
+                        category=(
+                            autonomous_diagnostics.FailureCategory
+                            .ORCHESTRATOR_FAILURE
+                        ),
+                        reason_code="interrupt_stop_failure",
+                        resumable=resume_state_is_valid(st),
+                        checkpoint_present=True,
+                    )
+                )
+            if isinstance(st, dict):
+                provider_now, model_now = autonomous_diagnostics.actual_provider_model(
+                    autonomous_agent, st.get("provider", ""), st.get("model", ""),
+                )
+                diagnostic = autonomous_diagnostics.make_diagnostic(
+                    st,
+                    stage=autonomous_diagnostics.AutonomousStage.CONTROL,
+                    category=autonomous_diagnostics.FailureCategory.INTERRUPTED,
+                    reason_code="user_interrupted",
+                    provider=provider_now,
+                    model=model_now,
+                    resumable=resume_state_is_valid(st),
+                    checkpoint_present=True,
+                )
+                autonomous_diagnostics.record_diagnostic(st, diagnostic)
+                try:
+                    save_task_state(st)
+                except Exception:
+                    autonomous_diagnostics.set_checkpoint_present(st, False)
             bridge.autonomous_progress.emit(
                 {"event": "interrupted", **_orch_snapshot(st)}
             )
@@ -1573,7 +1714,36 @@ def wake_mode():
             st = autonomous_state.get("st")
             if isinstance(st, dict):
                 st["status"] = "aborted"
-            orchestrator.stop()
+                provider_now, model_now = autonomous_diagnostics.actual_provider_model(
+                    autonomous_agent, st.get("provider", ""), st.get("model", ""),
+                )
+                diagnostic = autonomous_diagnostics.make_diagnostic(
+                    st,
+                    stage=autonomous_diagnostics.AutonomousStage.CONTROL,
+                    category=autonomous_diagnostics.FailureCategory.ABORTED,
+                    reason_code="user_aborted",
+                    provider=provider_now,
+                    model=model_now,
+                    resumable=False,
+                    checkpoint_present=False,
+                )
+                autonomous_diagnostics.record_diagnostic(st, diagnostic)
+            try:
+                orchestrator.stop()
+            except Exception:
+                autonomous_diagnostics.emit_diagnostic_log(
+                    autonomous_diagnostics.make_diagnostic(
+                        st,
+                        stage=autonomous_diagnostics.AutonomousStage.CONTROL,
+                        category=(
+                            autonomous_diagnostics.FailureCategory
+                            .ORCHESTRATOR_FAILURE
+                        ),
+                        reason_code="abort_stop_failure",
+                        resumable=False,
+                        checkpoint_present=False,
+                    )
+                )
             clear_task_state()
             bridge.autonomous_progress.emit({"event": "aborted", **_orch_snapshot(st)})
 
@@ -1645,12 +1815,35 @@ def wake_mode():
     def _offer_resume_if_pending() -> None:
         try:
             from osia.autonomous.state import load_task_state, save_task_state
-        except Exception as e:
-            print(f"[WOR-45] resume check skipped (import failed): {e}")
+        except Exception:
+            print("[WOR-45] resume check skipped (import failed)")
             return
         state = load_task_state()
         if not isinstance(state, dict) or state.get("status") != "in_progress":
             return  # no pending task — normal startup
+        if not resume_state_is_valid(state):
+            state["status"] = "failed"
+            diagnostic = autonomous_diagnostics.make_diagnostic(
+                state,
+                stage=autonomous_diagnostics.AutonomousStage.RESUME,
+                category=(
+                    autonomous_diagnostics.FailureCategory.INVALID_RESUME_STATE
+                ),
+                reason_code="invalid_resume_state",
+                resumable=False,
+                checkpoint_present=True,
+            )
+            autonomous_diagnostics.record_diagnostic(state, diagnostic)
+            try:
+                save_task_state(state)
+            except Exception:
+                autonomous_diagnostics.set_checkpoint_present(state, False)
+            autonomous_state["st"] = state
+            popup.show_autonomous(state)
+            bridge.autonomous_progress.emit(
+                {"event": "failed", **_orch_snapshot(state)}
+            )
+            return
         task_id = state.get("task_id", "?")
         cursor = state.get("cursor") or {}
         phase = cursor.get("phase", 0)
@@ -1671,11 +1864,19 @@ def wake_mode():
         box.exec()
         if box.clickedButton() is abort_btn:
             state["status"] = "aborted"
+            diagnostic = autonomous_diagnostics.make_diagnostic(
+                state,
+                stage=autonomous_diagnostics.AutonomousStage.CONTROL,
+                category=autonomous_diagnostics.FailureCategory.ABORTED,
+                reason_code="user_aborted",
+                resumable=False,
+                checkpoint_present=True,
+            )
+            autonomous_diagnostics.record_diagnostic(state, diagnostic)
             try:
                 save_task_state(state)
-                print(f"[WOR-45] autonomous task {task_id} aborted by user.")
-            except Exception as e:
-                print(f"[WOR-45] could not persist abort: {e}")
+            except Exception:
+                autonomous_diagnostics.set_checkpoint_present(state, False)
         else:
             # Phase 4 — actually resume on the dedicated orchestrator (the
             # background loop is non-blocking; the re-check/salvage happens
@@ -1684,13 +1885,51 @@ def wake_mode():
             if resume_model:
                 try:
                     autonomous_agent.set_model(resume_model)
-                except Exception as e:
-                    print(f"[WOR-45] resume set_model({resume_model!r}) failed: {e}")
+                except Exception:
+                    autonomous_diagnostics.emit_diagnostic_log(
+                        autonomous_diagnostics.make_diagnostic(
+                            state,
+                            stage=autonomous_diagnostics.AutonomousStage.RESUME,
+                            category=(
+                                autonomous_diagnostics.FailureCategory
+                                .PLANNING_PROVIDER_FAILURE
+                            ),
+                            reason_code="model_setup_failure",
+                            resumable=True,
+                            checkpoint_present=True,
+                        )
+                    )
+            provider_now, model_now = autonomous_diagnostics.actual_provider_model(
+                autonomous_agent, state.get("provider", ""), state.get("model", ""),
+            )
+            state["provider"] = provider_now
+            state["model"] = model_now
             autonomous_state["st"] = state
             popup.show_autonomous(state)
-            orchestrator.resume(state)
-            print(f"[WOR-45] resuming task {task_id} at cursor "
-                  f"(phase={phase}, task={task}).")
+            try:
+                orchestrator.resume(state)
+            except Exception:
+                state["status"] = "failed"
+                diagnostic = autonomous_diagnostics.make_diagnostic(
+                    state,
+                    stage=autonomous_diagnostics.AutonomousStage.RESUME,
+                    category=(
+                        autonomous_diagnostics.FailureCategory.ORCHESTRATOR_FAILURE
+                    ),
+                    reason_code="resume_worker_failure",
+                    provider=provider_now,
+                    model=model_now,
+                    resumable=False,
+                    checkpoint_present=True,
+                )
+                autonomous_diagnostics.record_diagnostic(state, diagnostic)
+                try:
+                    save_task_state(state)
+                except Exception:
+                    autonomous_diagnostics.set_checkpoint_present(state, False)
+                bridge.autonomous_progress.emit(
+                    {"event": "failed", **_orch_snapshot(state)}
+                )
 
     QTimer.singleShot(0, _offer_resume_if_pending)
 

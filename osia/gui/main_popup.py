@@ -71,6 +71,7 @@ from osia.utils.systemd_manager import (
 from osia.utils.assets import LOGO_PATH, autostart_enabled, set_autostart
 from osia import i18n
 from osia import timefmt
+from osia.autonomous import diagnostics as autonomous_diagnostics
 from osia.perf import perf_timer
 from osia.gui.motion import (
     MOTION, MotionController, reduced_motion_requested,
@@ -9263,23 +9264,23 @@ class _AutonomousPanel(QWidget):
             return
         event = payload.get("event", "")
         self._render_snapshot(payload)
-        reason = self._short(payload.get("reason"))
+        diagnostic_text = self._diagnostic_text(payload)
 
         if event == "running":
             self._set_running(True)
             self._set_status(i18n.t("autonomous.status_running"))
         elif event == "task_done":
-            self._set_status(i18n.t("autonomous.status_task_done", reason=reason))
+            self._set_status(i18n.t("autonomous.status_task_done"))
         elif event == "salvaged":
             self._set_status(i18n.t("autonomous.status_salvaged"))
         elif event == "task_failed":
-            self._set_status(i18n.t("autonomous.status_task_failed", reason=reason))
+            self._set_status(diagnostic_text)
         elif event == "done":
             self._set_running(False)
             self._set_status(i18n.t("autonomous.status_done"))
         elif event == "failed":
             self._set_running(False)
-            self._set_status(i18n.t("autonomous.status_failed", reason=reason))
+            self._set_status(diagnostic_text)
         elif event == "interrupted":
             self._set_running(False)
             self._set_status(i18n.t("autonomous.status_interrupted"))
@@ -9288,7 +9289,7 @@ class _AutonomousPanel(QWidget):
             self._set_status(i18n.t("autonomous.status_aborted"))
         elif event == "plan_failed":
             self._set_running(False)
-            self._set_status(i18n.t("autonomous.status_plan_failed"))
+            self._set_status(diagnostic_text)
 
     def seed_from_state(self, state: dict) -> None:
         """Seed the display from a persisted ``task_state`` dict — used when the
@@ -9298,10 +9299,18 @@ class _AutonomousPanel(QWidget):
         objective = state.get("objective") or ""
         if objective:
             self._objective_edit.setPlainText(objective)
-        self._render_snapshot(self._snapshot_from_state(state))
-        if (state.get("status") or "") == "in_progress":
+        snapshot = self._snapshot_from_state(state)
+        self._render_snapshot(snapshot)
+        status = state.get("status") or ""
+        if status == "in_progress":
             self._set_running(True)
             self._set_status(i18n.t("autonomous.status_running"))
+        elif status == "failed":
+            self._set_running(False)
+            self._set_status(self._diagnostic_text(snapshot))
+        elif status == "aborted":
+            self._set_running(False)
+            self._set_status(i18n.t("autonomous.status_aborted"))
         else:
             self._set_running(False)
             self._set_status(i18n.t("autonomous.status_idle"))
@@ -9315,7 +9324,10 @@ class _AutonomousPanel(QWidget):
         if objective:
             self._prog_objective.setText(objective)
         phase_name = payload.get("phase_name")
-        if phase_name:
+        if (payload.get("error_category")
+                or payload.get("event") in {"task_failed", "failed", "plan_failed"}):
+            self._prog_phase.setText("")
+        elif phase_name:
             self._prog_phase.setText(i18n.t("autonomous.phase", name=phase_name))
         total = payload.get("total")
         if total is not None:
@@ -9342,7 +9354,32 @@ class _AutonomousPanel(QWidget):
         if 0 <= p < len(phases):
             phase_name = phases[p].get("name", "") or ""
         return {"objective": state.get("objective", "") or "",
-                "phase_name": phase_name, "done": done, "total": total}
+                "phase_name": phase_name, "done": done, "total": total,
+                **autonomous_diagnostics.projection(state)}
+
+    @staticmethod
+    def _diagnostic_text(payload: dict) -> str:
+        """Localized, category-based text; never renders backend free-form text."""
+        category = payload.get("error_category") or "unknown_failure"
+        parts = [i18n.t(autonomous_diagnostics.failure_message_key(category))]
+        attempt = payload.get("attempt")
+        max_attempts = payload.get("max_attempts")
+        if isinstance(attempt, int) and attempt > 0 and isinstance(max_attempts, int):
+            parts.append(i18n.t(
+                "autonomous.diagnostic_attempt",
+                attempt=attempt,
+                max_attempts=max_attempts,
+            ))
+        replan_count = payload.get("replan_count")
+        max_replans = payload.get("max_replans")
+        if (payload.get("stage") == "replan" and isinstance(replan_count, int)
+                and isinstance(max_replans, int)):
+            parts.append(i18n.t(
+                "autonomous.diagnostic_replans",
+                replan_count=replan_count,
+                max_replans=max_replans,
+            ))
+        return " ".join(part for part in parts if part)
 
     def _set_running(self, running: bool, *, planning: bool = False) -> None:
         """Toggle the input/progress controls between idle and busy states.

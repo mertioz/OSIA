@@ -56,6 +56,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+from osia.autonomous import diagnostics
+
 # Imported (never recomputed) so the autonomous harness, the GUI and the mobile
 # server all resolve the SAME config/data dir. CONFIG_DIR is a str → wrap in
 # Path, mirroring osia/server/server.py. See CLAUDE.md "VALEURS CRITIQUES".
@@ -172,7 +174,38 @@ def new_task_state(objective: str, provider: str, model: str, phases) -> dict:
         "context_digest": "",
         "phases": [_normalize_phase(p) for p in (phases or [])],
         "log": [],
+        "failure_diagnostic": None,
+        "diagnostic_history": [],
     }
+
+
+def new_failed_task_state(provider: str, model: str, diagnostic: dict) -> dict:
+    """Build a terminal, objective-free state for a failure before planning.
+
+    Planning and invalid-resume failures have no executable plan to checkpoint.
+    Keeping their state objective-free makes the diagnostic durable without
+    copying a user prompt or other arbitrary content into the failure record.
+    """
+    st = new_task_state("", provider, model, [])
+    st["status"] = "failed"
+    clean = diagnostics.normalize_diagnostic(diagnostic) or {}
+    refreshed = diagnostics.make_diagnostic(
+        st,
+        stage=clean.get("stage"),
+        category=clean.get("error_category"),
+        reason_code=clean.get("reason_code"),
+        attempt=clean.get("attempt"),
+        max_attempts=clean.get("max_attempts"),
+        replan_count=clean.get("replan_count"),
+        max_replans=clean.get("max_replans"),
+        provider=clean.get("provider") or provider,
+        model=clean.get("model") or model,
+        resumable=clean.get("resumable", False),
+        checkpoint_present=clean.get("checkpoint_present", True),
+        transition_at=clean.get("transition_at"),
+    )
+    diagnostics.record_diagnostic(st, refreshed, emit=False)
+    return st
 
 
 # ── Mutators (pure dict manipulation — caller persists via save_task_state) ──
@@ -231,6 +264,37 @@ def append_log(state: dict, event: str, ref=None, note=None) -> dict:
     return state
 
 
+def resume_state_is_valid(st) -> bool:
+    """Whether ``st`` is a structurally safe, resumable checkpoint.
+
+    A cursor exactly one phase past the plan is valid: it represents a crash
+    after the final cursor advance but before the terminal ``done`` checkpoint.
+    """
+    if not isinstance(st, dict) or st.get("status") != "in_progress":
+        return False
+    phases = st.get("phases")
+    cursor = st.get("cursor")
+    if not isinstance(phases, list) or not phases or not isinstance(cursor, dict):
+        return False
+    try:
+        p = int(cursor.get("phase", 0))
+        t = int(cursor.get("task", 0))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if p < 0 or p > len(phases) or t < 0:
+        return False
+    for phase in phases:
+        if not isinstance(phase, dict) or not isinstance(phase.get("tasks"), list):
+            return False
+        if any(not isinstance(task, dict) for task in phase["tasks"]):
+            return False
+    if p == len(phases) and t != 0:
+        return False
+    if p < len(phases) and t > len(phases[p]["tasks"]):
+        return False
+    return True
+
+
 # ── Projections (read-only — pure derived views, never mutate) ───────────────
 
 def count_progress(st: dict) -> "tuple[int, int, str]":
@@ -279,7 +343,36 @@ def load_task_state() -> "dict | None":
     try:
         if not TASK_STATE_FILE.exists():
             return None
-        return json.loads(TASK_STATE_FILE.read_text(encoding="utf-8"))
+        loaded = json.loads(TASK_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            return None
+        current = diagnostics.normalize_diagnostic(
+            loaded.get("failure_diagnostic")
+        )
+        history = [
+            item for item in (
+                diagnostics.normalize_diagnostic(entry)
+                for entry in (loaded.get("diagnostic_history") or [])
+            ) if item is not None
+        ][-diagnostics.MAX_DIAGNOSTIC_HISTORY:]
+        loaded["failure_diagnostic"] = current
+        loaded["diagnostic_history"] = history
+        # Old terminal checkpoints predate WOR-173. Preserve compatibility and
+        # make their unknown leaf cause explicit instead of inventing one.
+        if loaded.get("status") == "failed" and current is None:
+            current = diagnostics.make_diagnostic(
+                loaded,
+                stage=diagnostics.AutonomousStage.ORCHESTRATOR,
+                category=diagnostics.FailureCategory.UNKNOWN_FAILURE,
+                reason_code="legacy_failure",
+                resumable=False,
+                checkpoint_present=True,
+            )
+            loaded["failure_diagnostic"] = current
+            loaded["diagnostic_history"] = (history + [dict(current)])[
+                -diagnostics.MAX_DIAGNOSTIC_HISTORY:
+            ]
+        return loaded
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         # UnicodeDecodeError (a ValueError subclass, NOT an OSError) is raised by
         # read_text() when the file holds non-UTF-8 bytes (binary corruption /

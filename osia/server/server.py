@@ -3369,6 +3369,7 @@ def _server_notify_cron_task(
 # off the chat streaming path, the per-connection conn_agents and the
 # single-writer _OutboundChannel/_writer model.
 import osia.autonomous.state as _astate
+from osia.autonomous import diagnostics as _adiagnostics
 from osia.autonomous import planner as _aplanner
 from osia.autonomous.orchestrator import Orchestrator as _Orchestrator
 
@@ -3432,7 +3433,45 @@ def _autonomous_snapshot(st) -> dict:
         "phase_name": phase_name,
         "objective": st.get("objective", "") or "",
         "status": st.get("status", "") or "",
+        **_adiagnostics.projection(st),
     }
+
+
+def _autonomous_failure_state(*, stage, category, reason_code,
+                              provider="", model="",
+                              emit_log: bool = True) -> dict:
+    """Build an objective-free terminal state carrying one safe diagnostic."""
+    st = _astate.new_task_state("", provider, model, [])
+    st["status"] = "failed"
+    diagnostic = _adiagnostics.make_diagnostic(
+        st,
+        stage=stage,
+        category=category,
+        reason_code=reason_code,
+        provider=provider,
+        model=model,
+        resumable=False,
+        checkpoint_present=False,
+    )
+    _adiagnostics.record_diagnostic(st, diagnostic, emit=emit_log)
+    return st
+
+
+def _establish_autonomous_failure(st: dict, my_gen: int) -> bool:
+    """Persist a failure only while ``my_gen`` still owns the runner slot."""
+    with _autonomous_lock:
+        if (not _autonomous.get("active")
+                or int(_autonomous.get("gen", 0)) != my_gen):
+            return False
+        _autonomous["st"] = st
+        _write_autonomous_lock(st.get("task_id"))
+    _adiagnostics.set_checkpoint_present(st, True)
+    try:
+        _astate.save_task_state(st)
+    except Exception:
+        _adiagnostics.set_checkpoint_present(st, False)
+    _adiagnostics.emit_diagnostic_log(st.get("failure_diagnostic"))
+    return True
 
 
 def _autonomous_frame(payload: dict, st=_AUTO_UNSET) -> dict:
@@ -3504,8 +3543,8 @@ def _write_autonomous_lock(task_id=None) -> None:
             encoding="utf-8",
         )
         os.replace(tmp, _AUTONOMOUS_LOCK_FILE)
-    except OSError as e:
-        print(f"[WOR-45] could not write autonomous lockfile: {e}")
+    except OSError:
+        print("[WOR-45] could not write autonomous lockfile")
 
 
 def _acquire_single_runner(task_id=None):
@@ -3601,8 +3640,8 @@ def _finalize_terminal_release(orch, term_gen: int) -> None:
     try:
         if orch is not None:
             orch.stop()  # joins the finishing loop thread; idempotent
-    except Exception as e:
-        print(f"[WOR-45] terminal orchestrator.stop failed: {e}")
+    except Exception:
+        print("[WOR-45] terminal orchestrator.stop failed")
     _release_single_runner_if_gen(term_gen)
 
 
@@ -3655,8 +3694,8 @@ def _on_autonomous_progress(payload: dict) -> None:
             # never the run OUTCOME — broadcast it unchanged, as before.
             frame = _autonomous_frame(dict(payload), _autonomous.get("st"))
             _broadcast_autonomous(frame)
-    except Exception as e:
-        print(f"[WOR-45] autonomous progress_cb error: {e}")
+    except Exception:
+        print("[WOR-45] autonomous progress callback failed")
 
 
 def _ensure_autonomous_engine():
@@ -3715,7 +3754,14 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
         if _orch_loop_alive():
             print("[WOR-45] autonomous start: orchestrator loop wedged past the "
                   "drain bound — not spawning a second loop; reporting plan_failed")
-            _broadcast_autonomous(_autonomous_frame({"event": "plan_failed"}, None))
+            failed_state = _autonomous_failure_state(
+                stage=_adiagnostics.AutonomousStage.ORCHESTRATOR,
+                category=_adiagnostics.FailureCategory.ORCHESTRATOR_FAILURE,
+                reason_code="orchestrator_unavailable",
+            )
+            _broadcast_autonomous(
+                _autonomous_frame({"event": "plan_failed"}, failed_state)
+            )
             threading.Thread(
                 target=_release_after_orphan_drained,
                 args=(my_gen,),
@@ -3738,39 +3784,57 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
         if model:
             try:
                 agent.set_model(model)
-            except Exception as e:
-                print(f"[WOR-45] autonomous set_model({model!r}) failed: {e}")
+            except Exception:
+                _adiagnostics.emit_diagnostic_log(
+                    _adiagnostics.make_diagnostic(
+                        None,
+                        stage=_adiagnostics.AutonomousStage.PLANNING,
+                        category=(
+                            _adiagnostics.FailureCategory.PLANNING_PROVIDER_FAILURE
+                        ),
+                        reason_code="model_setup_failure",
+                        model=model,
+                        resumable=False,
+                        checkpoint_present=False,
+                    )
+                )
         # Resolve the provider from the model id (osia.models), like the GUI passes.
         try:
             from osia.models import provider_for_model
             provider = provider_for_model(model) if model else ""
         except Exception:
             provider = ""
+        provider, model = _adiagnostics.actual_provider_model(
+            agent, provider, model,
+        )
         planning_failures = []
         try:
             st = _aplanner.create_plan_state(
                 objective, provider, model, agent,
                 failure_cb=planning_failures.append,
             )
-        except Exception as e:
-            print(f"[WOR-45] autonomous planning crashed: {e}")
+        except Exception:
             st = None
         if not st:
             if planning_failures:
                 failure = planning_failures[-1]
-                status = (
-                    f" status={failure.status_code}"
-                    if failure.status_code is not None else ""
+                category = failure.error_category
+                reason_code = failure.reason
+            else:
+                category = _adiagnostics.FailureCategory.PLANNING_PROVIDER_FAILURE
+                reason_code = "planning_internal_failure"
+            failed_state = _autonomous_failure_state(
+                stage=_adiagnostics.AutonomousStage.PLANNING,
+                category=category,
+                reason_code=reason_code,
+                provider=provider,
+                model=model,
+                emit_log=False,
+            )
+            if _establish_autonomous_failure(failed_state, my_gen):
+                _broadcast_autonomous(
+                    _autonomous_frame({"event": "plan_failed"}, failed_state)
                 )
-                category = (
-                    f" provider_category={failure.provider_category}"
-                    if failure.provider_category else ""
-                )
-                print(
-                    f"[WOR-125] autonomous planning failed "
-                    f"reason={failure.reason}{status}{category}"
-                )
-            _broadcast_autonomous(_autonomous_frame({"event": "plan_failed"}, None))
             _release_single_runner_if_gen(my_gen)
             return
 
@@ -3792,19 +3856,37 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
 
         try:
             _astate.save_task_state(st)
-        except Exception as e:
-            print(f"[WOR-45] save_task_state failed: {e}")
+        except Exception:
+            diagnostic = _adiagnostics.make_diagnostic(
+                st,
+                stage=_adiagnostics.AutonomousStage.PERSISTENCE,
+                category=_adiagnostics.FailureCategory.CHECKPOINT_FAILURE,
+                reason_code="checkpoint_failure",
+                provider=provider,
+                model=model,
+                resumable=False,
+                checkpoint_present=False,
+            )
+            _adiagnostics.record_diagnostic(st, diagnostic)
         orch.start(st)
         # Flip "planning" → "running" only AFTER start() spawned the loop. The
         # engine emits events only on task transitions, never on start, so this
         # won't double-fire.
         _broadcast_autonomous(_autonomous_frame({"event": "running"}, st))
-    except Exception as e:
+    except Exception:
         # Any unexpected failure (e.g. OSIAAgent build error, or thread
         # exhaustion in orch.start) must NOT wedge the slot at busy forever:
         # release it (only if still ours) and tell clients the start failed.
-        print(f"[WOR-45] autonomous start worker crashed: {e}")
-        _broadcast_autonomous(_autonomous_frame({"event": "plan_failed"}, None))
+        failed_state = _autonomous_failure_state(
+            stage=_adiagnostics.AutonomousStage.ORCHESTRATOR,
+            category=_adiagnostics.FailureCategory.ORCHESTRATOR_FAILURE,
+            reason_code="start_worker_failure",
+            emit_log=False,
+        )
+        if _establish_autonomous_failure(failed_state, my_gen):
+            _broadcast_autonomous(
+                _autonomous_frame({"event": "plan_failed"}, failed_state)
+            )
         _release_single_runner_if_gen(my_gen)
         # ORPHAN-LOOP RACE (WOR-45): a crash BEFORE the drain reopened the gate
         # (e.g. _ensure_autonomous_engine raised) must not leave it stuck — but
@@ -3975,11 +4057,36 @@ def _autonomous_resume_worker(my_gen: int) -> None:
         except Exception:
             st = None
         if not isinstance(st, dict):
-            # Nothing on disk to resume (no pending run).
-            _broadcast_autonomous(_autonomous_frame({"event": "idle"}, None))
+            failed_state = _autonomous_failure_state(
+                stage=_adiagnostics.AutonomousStage.RESUME,
+                category=_adiagnostics.FailureCategory.INVALID_RESUME_STATE,
+                reason_code="resume_state_unavailable",
+                emit_log=False,
+            )
+            if _establish_autonomous_failure(failed_state, my_gen):
+                _broadcast_autonomous(
+                    _autonomous_frame({"event": "idle"}, failed_state)
+                )
             _release_single_runner_if_gen(my_gen)
             return
         status = st.get("status", "")
+        if status == "in_progress" and not _astate.resume_state_is_valid(st):
+            st["status"] = "failed"
+            diagnostic = _adiagnostics.make_diagnostic(
+                st,
+                stage=_adiagnostics.AutonomousStage.RESUME,
+                category=_adiagnostics.FailureCategory.INVALID_RESUME_STATE,
+                reason_code="invalid_resume_state",
+                resumable=False,
+                checkpoint_present=True,
+            )
+            _adiagnostics.record_diagnostic(st, diagnostic, emit=False)
+            if _establish_autonomous_failure(st, my_gen):
+                _broadcast_autonomous(
+                    _autonomous_frame({"event": "failed"}, st)
+                )
+            _release_single_runner_if_gen(my_gen)
+            return
         if status != "in_progress":
             # Disk shows a TERMINAL outcome — surface it truthfully and start NO
             # loop (the GUI only resumes an in_progress run). When the drained
@@ -3996,8 +4103,24 @@ def _autonomous_resume_worker(my_gen: int) -> None:
         if model:
             try:
                 agent.set_model(model)
-            except Exception as e:
-                print(f"[WOR-45] autonomous resume set_model({model!r}) failed: {e}")
+            except Exception:
+                _adiagnostics.emit_diagnostic_log(
+                    _adiagnostics.make_diagnostic(
+                        st,
+                        stage=_adiagnostics.AutonomousStage.RESUME,
+                        category=(
+                            _adiagnostics.FailureCategory.PLANNING_PROVIDER_FAILURE
+                        ),
+                        reason_code="model_setup_failure",
+                        resumable=True,
+                        checkpoint_present=True,
+                    )
+                )
+        provider_now, model_now = _adiagnostics.actual_provider_model(
+            agent, st.get("provider", ""), st.get("model", ""),
+        )
+        st["provider"] = provider_now
+        st["model"] = model_now
 
         # ── Establish the run atomically — only if our slot is still current ──
         established = False
@@ -4018,12 +4141,20 @@ def _autonomous_resume_worker(my_gen: int) -> None:
         # Flip to "running" only AFTER resume() spawned the loop. The engine emits
         # events only on task transitions, never on resume, so this won't double-fire.
         _broadcast_autonomous(_autonomous_frame({"event": "running"}, st))
-    except Exception as e:
+    except Exception:
         # Any unexpected failure (engine build, orch.resume thread exhaustion)
         # must NOT wedge the slot at busy forever: release it (only if still ours)
         # and tell clients the resume did not take.
-        print(f"[WOR-45] autonomous resume worker crashed: {e}")
-        _broadcast_autonomous(_autonomous_frame({"event": "plan_failed"}, None))
+        failed_state = _autonomous_failure_state(
+            stage=_adiagnostics.AutonomousStage.RESUME,
+            category=_adiagnostics.FailureCategory.ORCHESTRATOR_FAILURE,
+            reason_code="resume_worker_failure",
+            emit_log=False,
+        )
+        if _establish_autonomous_failure(failed_state, my_gen):
+            _broadcast_autonomous(
+                _autonomous_frame({"event": "plan_failed"}, failed_state)
+            )
         _release_single_runner_if_gen(my_gen)
         # ORPHAN-LOOP RACE (WOR-45): a crash BEFORE the drain reopened the gate
         # (engine build / disk load) must not leave it stuck. Reopen only if no
@@ -4054,8 +4185,8 @@ async def _stop_autonomous_on_shutdown() -> None:
     if orch is not None:
         try:
             orch.stop()
-        except Exception as e:
-            print(f"[WOR-45] orchestrator.stop on shutdown failed: {e}")
+        except Exception:
+            print("[WOR-45] orchestrator.stop on shutdown failed")
     _release_single_runner()
     media_tasks = list(_POST_TURN_MEDIA_TASKS)
     for task in media_tasks:
@@ -5059,9 +5190,16 @@ async def websocket_endpoint(ws: WebSocket):
                 objective = (msg.get("objective") or "").strip()
                 model = (msg.get("model") or "").strip()
                 if not objective:
+                    failed_state = _autonomous_failure_state(
+                        stage=_adiagnostics.AutonomousStage.PLANNING,
+                        category=(
+                            _adiagnostics.FailureCategory.INVALID_PLANNING_OUTPUT
+                        ),
+                        reason_code="blank_objective",
+                    )
                     # Malformed request from this client — reject it directly.
                     await out.send_json(
-                        _autonomous_frame({"event": "plan_failed"}, None)
+                        _autonomous_frame({"event": "plan_failed"}, failed_state)
                     )
                     continue
                 # Acquire the single-runner slot BEFORE spending LLM tokens on
@@ -5121,11 +5259,48 @@ async def websocket_endpoint(ws: WebSocket):
                         if orch is not None:
                             try:
                                 orch.stop()
-                            except Exception as e:
-                                print(f"[WOR-45] orchestrator.stop (interrupt) failed: {e}")
+                            except Exception:
+                                _adiagnostics.emit_diagnostic_log(
+                                    _adiagnostics.make_diagnostic(
+                                        _autonomous.get("st"),
+                                        stage=_adiagnostics.AutonomousStage.CONTROL,
+                                        category=(
+                                            _adiagnostics.FailureCategory
+                                            .ORCHESTRATOR_FAILURE
+                                        ),
+                                        reason_code="interrupt_stop_failure",
+                                        resumable=True,
+                                        checkpoint_present=True,
+                                    )
+                                )
+                        st = _autonomous.get("st")
+                        if isinstance(st, dict):
+                            agent = _autonomous.get("agent")
+                            provider_now, model_now = (
+                                _adiagnostics.actual_provider_model(
+                                    agent,
+                                    st.get("provider", ""),
+                                    st.get("model", ""),
+                                )
+                            )
+                            diagnostic = _adiagnostics.make_diagnostic(
+                                st,
+                                stage=_adiagnostics.AutonomousStage.CONTROL,
+                                category=_adiagnostics.FailureCategory.INTERRUPTED,
+                                reason_code="user_interrupted",
+                                provider=provider_now,
+                                model=model_now,
+                                resumable=_astate.resume_state_is_valid(st),
+                                checkpoint_present=True,
+                            )
+                            _adiagnostics.record_diagnostic(st, diagnostic)
+                            try:
+                                _astate.save_task_state(st)
+                            except Exception:
+                                _adiagnostics.set_checkpoint_present(st, False)
                         _broadcast_autonomous(
                             _autonomous_frame({"event": "interrupted"},
-                                              _autonomous.get("st"))
+                                              st)
                         )
                         _release_single_runner()
                     finally:
@@ -5153,16 +5328,43 @@ async def websocket_endpoint(ws: WebSocket):
                     st = _autonomous.get("st")
                     if isinstance(st, dict):
                         st["status"] = "aborted"
+                        agent = _autonomous.get("agent")
+                        provider_now, model_now = _adiagnostics.actual_provider_model(
+                            agent, st.get("provider", ""), st.get("model", ""),
+                        )
+                        diagnostic = _adiagnostics.make_diagnostic(
+                            st,
+                            stage=_adiagnostics.AutonomousStage.CONTROL,
+                            category=_adiagnostics.FailureCategory.ABORTED,
+                            reason_code="user_aborted",
+                            provider=provider_now,
+                            model=model_now,
+                            resumable=False,
+                            checkpoint_present=False,
+                        )
+                        _adiagnostics.record_diagnostic(st, diagnostic)
                     orch = _autonomous.get("orch")
                     if orch is not None:
                         try:
                             orch.stop()
-                        except Exception as e:
-                            print(f"[WOR-45] orchestrator.stop (abort) failed: {e}")
+                        except Exception:
+                            _adiagnostics.emit_diagnostic_log(
+                                _adiagnostics.make_diagnostic(
+                                    st,
+                                    stage=_adiagnostics.AutonomousStage.CONTROL,
+                                    category=(
+                                        _adiagnostics.FailureCategory
+                                        .ORCHESTRATOR_FAILURE
+                                    ),
+                                    reason_code="abort_stop_failure",
+                                    resumable=False,
+                                    checkpoint_present=False,
+                                )
+                            )
                     try:
                         _astate.clear_task_state()
-                    except Exception as e:
-                        print(f"[WOR-45] clear_task_state failed: {e}")
+                    except Exception:
+                        pass
                     _broadcast_autonomous(
                         _autonomous_frame({"event": "aborted"}, st)
                     )
