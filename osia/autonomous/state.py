@@ -26,6 +26,7 @@ Schema (``schema_version == 1``)::
       "updated_at":     "<ISO-8601 local>",
       "provider":       "<provider id>",
       "model":          "<model id>",
+      "language":       "<authoritative turn language>",
       "cursor":         {"phase": <int>, "task": <int>},
       "budgets":        {"max_attempts_per_task": 3,
                          "max_replans": 2, "replan_count": 0},
@@ -58,7 +59,8 @@ from datetime import datetime
 from pathlib import Path
 
 from osia.autonomous import diagnostics
-from osia import document_artifacts
+from osia import document_artifacts, i18n
+from osia.turn_context import normalize_locale
 
 # Imported (never recomputed) so the autonomous harness, the GUI and the mobile
 # server all resolve the SAME config/data dir. CONFIG_DIR is a str → wrap in
@@ -203,7 +205,8 @@ def _normalize_phase(phase) -> dict:
 
 # ── Constructors ───────────────────────────────────────────────────────────
 
-def new_task_state(objective: str, provider: str, model: str, phases) -> dict:
+def new_task_state(objective: str, provider: str, model: str, phases, *,
+                   language: str | None = None) -> dict:
     """Build a fresh ``task_state`` dict (NOT persisted — caller saves).
 
     ``phases`` is a loose list of phase specs (each a name string or a
@@ -223,6 +226,7 @@ def new_task_state(objective: str, provider: str, model: str, phases) -> dict:
         "updated_at": now,
         "provider": provider or "",
         "model": model or "",
+        "language": normalize_locale(language) or i18n.DEFAULT_LANG,
         "cursor": {"phase": 0, "task": 0},
         "budgets": {
             "max_attempts_per_task": DEFAULT_MAX_ATTEMPTS_PER_TASK,
@@ -241,14 +245,15 @@ def new_task_state(objective: str, provider: str, model: str, phases) -> dict:
     return result
 
 
-def new_failed_task_state(provider: str, model: str, diagnostic: dict) -> dict:
+def new_failed_task_state(provider: str, model: str, diagnostic: dict, *,
+                          language: str | None = None) -> dict:
     """Build a terminal, objective-free state for a failure before planning.
 
     Planning and invalid-resume failures have no executable plan to checkpoint.
     Keeping their state objective-free makes the diagnostic durable without
     copying a user prompt or other arbitrary content into the failure record.
     """
-    st = new_task_state("", provider, model, [])
+    st = new_task_state("", provider, model, [], language=language)
     st["status"] = "failed"
     clean = diagnostics.normalize_diagnostic(diagnostic) or {}
     refreshed = diagnostics.make_diagnostic(
@@ -419,6 +424,11 @@ def load_task_state() -> "dict | None":
         ][-diagnostics.MAX_DIAGNOSTIC_HISTORY:]
         loaded["failure_diagnostic"] = current
         loaded["diagnostic_history"] = history
+        # Checkpoints predating WOR-177 get a deterministic compatibility
+        # language exactly once; process LANG never influences resume.
+        loaded["language"] = (
+            normalize_locale(loaded.get("language")) or i18n.DEFAULT_LANG
+        )
         loaded["artifacts"] = document_artifacts.normalize_references(
             loaded.get("artifacts")
         )

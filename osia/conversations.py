@@ -521,6 +521,21 @@ def find_correlated_turn(conv_id: str, request_id: str) -> dict | None:
                 if assistant_message is not None
                 else None
             ),
+            "language": str(
+                (assistant_message or {}).get("_language")
+                or user_message.get("_language")
+                or ""
+            ),
+            "terminal_status": str(
+                (assistant_message or {}).get("_terminal_status") or "done"
+            ),
+            "stage": str((assistant_message or {}).get("_stage") or ""),
+            "error_category": str(
+                (assistant_message or {}).get("_error_category") or ""
+            ),
+            "reason_code": str(
+                (assistant_message or {}).get("_reason_code") or ""
+            ),
         }
 
 

@@ -44,6 +44,13 @@ import re
 from typing import NamedTuple
 
 from osia.autonomous import diagnostics, state
+from osia import i18n
+from osia.turn_context import (
+    fixed_turn_context,
+    language_instruction,
+    normalize_locale,
+    resolve_turn_context,
+)
 from osia.utils.key_chain import error_status, provider_failure_category
 
 # ── Bounded autonomy defaults ────────────────────────────────────────────────
@@ -87,7 +94,8 @@ class _AttemptOutcome(NamedTuple):
 # ── Prompt construction ──────────────────────────────────────────────────────
 
 def _build_planning_prompt(objective: str, max_phases: int,
-                           max_tasks_per_phase: int) -> str:
+                           max_tasks_per_phase: int,
+                           language: str | None = None) -> str:
     """Build the strict planning prompt for ``objective``.
 
     Instructs the model to decompose the objective into a SMALL number of
@@ -96,6 +104,7 @@ def _build_planning_prompt(objective: str, max_phases: int,
     raw JSON in the exact :data:`_SCHEMA_HINT` shape.
     """
     return (
+        language_instruction(language or i18n.DEFAULT_LANG) + "\n\n"
         "You are a planning module. Decompose the OBJECTIVE below into a short, "
         "concrete, executable plan.\n\n"
         f"OBJECTIVE:\n{objective}\n\n"
@@ -298,7 +307,7 @@ def _provider_failure(exc: Exception) -> PlanFailure:
     return PlanFailure(reason, status, category)
 
 
-def _attempt(agent, message, max_phases, max_tasks_per_phase):
+def _attempt(agent, message, max_phases, max_tasks_per_phase, turn_context=None):
     """Run ONE planning message through the agent and parse/validate the reply.
 
     Returns an internal :class:`_AttemptOutcome` that distinguishes provider,
@@ -306,7 +315,15 @@ def _attempt(agent, message, max_phases, max_tasks_per_phase):
     The public API still returns only validated phases or ``None``.
     """
     try:
-        raw = agent.run(message)
+        if turn_context is not None and hasattr(agent, "set_turn_context"):
+            agent.set_turn_context(turn_context)
+            raw = agent.run(
+                message,
+                turn_context=turn_context,
+                canonical_output=False,
+            )
+        else:
+            raw = agent.run(message)
     except Exception as exc:
         return _AttemptOutcome(None, _provider_failure(exc))
 
@@ -340,7 +357,8 @@ def _report_failure(failure_cb, failure: PlanFailure | None) -> None:
 def plan_objective(objective: str, agent, *,
                    max_phases: int = DEFAULT_MAX_PHASES,
                    max_tasks_per_phase: int = DEFAULT_MAX_TASKS_PER_PHASE,
-                   failure_cb=None):
+                   failure_cb=None,
+                   language: str | None = None):
     """Decompose ``objective`` into a validated, normalized ``phases`` list.
 
     ``agent`` is a ready :class:`osia.agent.OSIAAgent` (already model-set by the
@@ -361,7 +379,19 @@ def plan_objective(objective: str, agent, *,
         _report_failure(failure_cb, PlanFailure("blank_objective"))
         return None
     objective = objective.strip()
-    prompt = _build_planning_prompt(objective, max_phases, max_tasks_per_phase)
+    target_language = normalize_locale(language)
+    if target_language is None:
+        target_language = resolve_turn_context(
+            objective,
+            saved_language=i18n.DEFAULT_LANG,
+        ).language
+    turn_context = fixed_turn_context(
+        target_language,
+        source="autonomous_state",
+    )
+    prompt = _build_planning_prompt(
+        objective, max_phases, max_tasks_per_phase, target_language,
+    )
 
     # First attempt: fresh context (reset clears history except the system
     # prompt). The agent is the caller's; reset() is part of its public contract.
@@ -370,7 +400,9 @@ def plan_objective(objective: str, agent, *,
     except Exception as exc:
         _report_failure(failure_cb, _provider_failure(exc))
         return None
-    outcome = _attempt(agent, prompt, max_phases, max_tasks_per_phase)
+    outcome = _attempt(
+        agent, prompt, max_phases, max_tasks_per_phase, turn_context,
+    )
     if outcome.phases is not None:
         return outcome.phases
 
@@ -382,7 +414,11 @@ def plan_objective(objective: str, agent, *,
     # restated exact-schema demand. Exactly one retry; its result (possibly
     # None) is final.
     outcome = _attempt(
-        agent, _CORRECTIVE_PROMPT, max_phases, max_tasks_per_phase,
+        agent,
+        language_instruction(target_language) + "\n\n" + _CORRECTIVE_PROMPT,
+        max_phases,
+        max_tasks_per_phase,
+        turn_context,
     )
     if outcome.phases is not None:
         return outcome.phases
@@ -393,7 +429,8 @@ def plan_objective(objective: str, agent, *,
 def create_plan_state(objective: str, provider: str, model: str, agent, *,
                       max_phases: int = DEFAULT_MAX_PHASES,
                       max_tasks_per_phase: int = DEFAULT_MAX_TASKS_PER_PHASE,
-                      failure_cb=None):
+                      failure_cb=None,
+                      language: str | None = None):
     """Plan ``objective`` and build a fresh (UNSAVED) ``task_state`` dict.
 
     Thin convenience over :func:`plan_objective` +
@@ -402,9 +439,15 @@ def create_plan_state(objective: str, provider: str, model: str, agent, *,
     saves; persisting the returned state (via
     :func:`osia.autonomous.state.save_task_state`) is the caller's decision.
     """
+    target_language = normalize_locale(language) or resolve_turn_context(
+        objective,
+        saved_language=i18n.DEFAULT_LANG,
+    ).language
     phases = plan_objective(objective, agent, max_phases=max_phases,
                             max_tasks_per_phase=max_tasks_per_phase,
-                            failure_cb=failure_cb)
+                            failure_cb=failure_cb, language=target_language)
     if phases is None:
         return None
-    return state.new_task_state(objective, provider, model, phases)
+    return state.new_task_state(
+        objective, provider, model, phases, language=target_language,
+    )

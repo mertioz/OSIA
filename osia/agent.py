@@ -28,6 +28,17 @@ from pathlib import Path
 import psutil
 from openai import OpenAI
 
+from osia import i18n
+from osia.turn_context import (
+    TurnContext,
+    language_instruction,
+    localized_text,
+    log_final,
+    log_round,
+    normalize_locale,
+    resolve_turn_context,
+)
+
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 MODEL = "llama3"
 
@@ -412,8 +423,7 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
     model and provider injected at the start so the agent knows what it's
     running on (and can answer if asked).
     """
-    if lang is None:
-        lang = DEFAULT_LANG
+    lang = normalize_locale(lang) or i18n.get_language()
     body = SYSTEM_PROMPT_FR if lang == "fr" else SYSTEM_PROMPT_EN
     # Point the model at the real project root on this machine instead of the
     # /home/OSIA path baked into the prompt text (works on Windows + Linux).
@@ -447,6 +457,7 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
         body = body + "\n\n" + action_policy_prompt_block(lang)
     except Exception:
         pass
+    body = body + "\n\n" + language_instruction(lang)
     body = body + "\n\n" + _memory_tool_prompt_block(lang)
     body = body + "\n\n" + _scheduled_task_tool_prompt_block(lang)
     body = body + "\n\n" + _gmail_rest_prompt_block(lang)
@@ -677,10 +688,6 @@ def clean_response(text: str) -> str:
     # Step 7: Fix sentence fragments like ". File contents: ..." (leading period)
     text = re.sub(r'^\s*\.\s+', '', text)
     text = re.sub(r'\s+\.\s*$', '.', text)
-
-    # If everything was stripped, return fallback
-    if not text:
-        return "I've completed the task."
 
     return text
 
@@ -4914,6 +4921,8 @@ def _sanitize_persisted_history_message(msg: dict) -> dict | None:
         return None
     if msg.get("_internal"):
         return None
+    if msg.get("_provisional"):
+        return None
     role = msg.get("role")
     if role == "system" or role not in ("user", "assistant"):
         return None
@@ -4949,7 +4958,9 @@ class OSIAAgent:
         self.client = OpenAI(base_url=base_url, api_key="ollama")
         self.model = model
         self.provider = "ollama"
-        self.lang = lang if lang else DEFAULT_LANG
+        self.lang = normalize_locale(lang) or i18n.get_language()
+        self.turn_context: TurnContext | None = None
+        self._has_turn_language = False
         # API endpoint fallback (Bloc 5) state — populated for real by
         # set_model(); seeded here so the attributes always exist.
         self._api_key = "ollama"
@@ -4973,6 +4984,20 @@ class OSIAAgent:
         self._document_private_run = False
         self._document_turn_start = 1
         self._semantic_form_values: list[str] = []
+
+    def set_turn_context(self, context: TurnContext) -> None:
+        """Apply one already-resolved language decision to subsequent model calls."""
+
+        if not isinstance(context, TurnContext):
+            raise TypeError("context must be a TurnContext")
+        self.turn_context = context
+        self.lang = context.language
+        self._has_turn_language = True
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0] = {
+                "role": "system",
+                "content": get_system_prompt(self.lang, self.model, self.provider),
+            }
 
     def reset(self):
         """Clear conversation history except system prompt."""
@@ -5342,7 +5367,18 @@ class OSIAAgent:
         wire: list = []
         for m in msgs:
             if isinstance(m, dict):
+                is_internal = bool(m.get("_internal"))
                 m = {k: v for k, v in m.items() if not str(k).startswith("_")}
+                if (
+                    is_internal
+                    and m.get("role") == "user"
+                    and isinstance(m.get("content"), str)
+                ):
+                    m["content"] = (
+                        language_instruction(self.lang)
+                        + "\n\n"
+                        + m["content"]
+                    )
                 prev = wire[-1] if wire else None
                 if (
                     isinstance(prev, dict)
@@ -5634,10 +5670,14 @@ class OSIAAgent:
             f"tool call(s): {guard.stop_reason}"
         )
         self.last_run_diagnostic = guard.sanitized_diagnostic()
-        content = guard.fallback_summary()
+        content = clean_response(
+            guard.fallback_summary()
+            if self.lang in {"en", "fr"}
+            else localized_text("anti_loop_stop", self.lang)
+        )
         if on_sentence is not None:
             try:
-                on_sentence(clean_response(content))
+                on_sentence(content)
             except Exception:
                 pass
 
@@ -5646,36 +5686,20 @@ class OSIAAgent:
         if self._document_private_run:
             message["_document_private"] = True
         self.messages.append(message)
+        if self.turn_context is not None:
+            log_final(self.turn_context, content)
         return content
 
     def _empty_response_fallback(self, guard: _AntiLoopGuard) -> str:
-        """Deterministic user-facing reply for when the model's final answer
-        is empty once tool/reasoning markup is stripped (even after the
-        empty-response retry). Reports executed actions when there are any,
-        so the user knows what actually happened this turn.
-        """
-        n = len(guard.actions)
-        if n:
-            if self.lang == "fr":
-                return (
-                    f"J'ai exécuté {n} action(s) :\n{guard.action_log()}\n\n"
-                    "Mais je n'ai pas réussi à formuler une réponse finale. "
-                    "Que souhaitez-vous que je fasse ?"
-                )
-            return (
-                f"I executed {n} action(s):\n{guard.action_log()}\n\n"
-                "But I couldn't produce a final response. "
-                "What would you like me to do?"
-            )
-        if self.lang == "fr":
-            return (
-                "Désolé, je n'ai pas réussi à formuler une réponse. "
-                "Pouvez-vous reformuler votre demande ?"
-            )
-        return (
-            "Sorry, I couldn't produce a response. "
-            "Could you rephrase your request?"
-        )
+        """Return a localized, non-assertive fallback for an unusable final."""
+
+        if self.last_run_diagnostic is None:
+            self.last_run_diagnostic = {
+                "stage": "response_generation",
+                "error_category": "empty_completion",
+                "reason_code": "empty_completion",
+            }
+        return localized_text("empty_completion", self.lang)
 
     def _drop_history_screenshots(self) -> None:
         """Reduce past tool-result messages in ``self.messages`` to their
@@ -5712,7 +5736,10 @@ class OSIAAgent:
 
     def run(self, user_input: str, max_tool_rounds: int | None = None, on_sentence=None,
             history: list | None = None, max_tokens: int | None = None,
-            on_first_token=None, current_conversation_id: str | None = None) -> str:
+            on_first_token=None, current_conversation_id: str | None = None,
+            turn_context: TurnContext | None = None,
+            client_locale: str | None = None,
+            canonical_output: bool = True) -> str:
         """Run one user turn under a per-task sticky-key scope, then delegate to
         :meth:`_run_turn` for the actual agent loop.
 
@@ -5736,6 +5763,17 @@ class OSIAAgent:
         self._document_private_run = False
         self._semantic_form_values = []
 
+        if turn_context is None:
+            turn_context = resolve_turn_context(
+                user_input,
+                history=history,
+                client_locale=client_locale,
+                saved_language=i18n.get_language(),
+                previous_language=self.lang if self._has_turn_language else None,
+                reference=current_conversation_id,
+            )
+        self.set_turn_context(turn_context)
+
         def _run_scoped():
             with task_scope():
                 return self._run_turn(
@@ -5746,6 +5784,7 @@ class OSIAAgent:
                     max_tokens=max_tokens,
                     on_first_token=on_first_token,
                     current_conversation_id=current_conversation_id,
+                    canonical_output=canonical_output,
                 )
 
         try:
@@ -5791,7 +5830,8 @@ class OSIAAgent:
 
     def _run_turn(self, user_input: str, max_tool_rounds: int | None = None, on_sentence=None,
                   history: list | None = None, max_tokens: int | None = None,
-                  on_first_token=None, current_conversation_id: str | None = None) -> str:
+                  on_first_token=None, current_conversation_id: str | None = None,
+                  canonical_output: bool = True) -> str:
         """Run the agent loop: send user input, handle tool calls, return final response.
 
         Each round runs the tool pipeline in strict order: ``<think>``
@@ -5801,11 +5841,10 @@ class OSIAAgent:
         BEFORE any tag stripping, and raw tool markup is stripped only from
         the final text once all execution decisions are done.
 
-        If ``on_sentence`` is provided, the API call is streamed and the
-        callback is invoked with each complete sentence (cleaned) as soon
-        as it arrives. Sentences that fall inside a ``<tool_call>`` or
-        ``<think>``/``<thinking>`` block are skipped so tool markup and
-        internal reasoning are never spoken.
+        If ``on_sentence`` is provided, provider deltas are parsed and buffered
+        per round. The callback is invoked exactly once with the cleaned
+        canonical final; prose from rounds that contain tool calls is discarded.
+        Tool markup and internal reasoning are never displayed or spoken.
 
         The returned response (and the assistant messages stored in
         history) has reasoning blocks and raw tool XML tags stripped —
@@ -5845,12 +5884,23 @@ class OSIAAgent:
                     sanitized.append(clean)
             self.messages = [{"role": "system", "content": get_system_prompt(self.lang, self.model, self.provider)}] + sanitized
         else:
+            # Reusing an in-process agent starts from canonical conversational
+            # history only. Prior-turn tool results, correction frames,
+            # document-private data and provisional tool-call prose are never
+            # replayed to a later user turn.
+            canonical_history = []
+            for message in self.messages[1:]:
+                clean = _sanitize_persisted_history_message(message)
+                if clean is not None and not clean.get("_memory_context"):
+                    canonical_history.append(clean)
             self.messages = [
-                m for m in self.messages
-                if not (
-                    isinstance(m, dict)
-                    and (m.get("_memory_context") or m.get("_document_private"))
-                )
+                {
+                    "role": "system",
+                    "content": get_system_prompt(
+                        self.lang, self.model, self.provider,
+                    ),
+                },
+                *canonical_history,
             ]
 
         self._document_turn_start = len(self.messages)
@@ -5931,12 +5981,11 @@ class OSIAAgent:
                 and hasattr(self.client, "set_conversation_id")):
             self.client.set_conversation_id(current_conversation_id)
 
-        # Streaming fallback safety: a mid-stream technical drop must NOT cause
-        # the next model to re-speak sentences already streamed to TTS/mobile.
-        # This tracks whether any sentence was emitted on the current attempt;
-        # the except block only takes the streaming fallback when nothing was
-        # emitted yet (pre-token failures: 429/401/403/connection-open).
+        # Provider deltas are provisional until the entire round has been
+        # parsed. They are deliberately buffered here: a round that later
+        # yields a tool call must never reach display, TTS or persistence.
         _stream_emitted = {"v": False}
+        provisional_sentences: list[str] = []
         schedule_guard_state = {
             "ignored_unrelated_tool": False,
             "failure_retry_used": False,
@@ -5945,16 +5994,15 @@ class OSIAAgent:
         if on_sentence is not None:
             def _on_sentence_cb(
                 _text,
-                _orig=on_sentence,
                 _flag=_stream_emitted,
                 _schedule_state=schedule_guard_state,
             ):
                 _text = self._redact_semantic_form_values(_text)
+                _flag["v"] = True
+                provisional_sentences.append(_text)
                 if _schedule_state["ignored_unrelated_tool"]:
                     _schedule_state["buffered_sentences"].append(_text)
-                    return None
-                _flag["v"] = True
-                return _orig(_text)
+                return None
         else:
             _on_sentence_cb = on_sentence
 
@@ -6000,9 +6048,12 @@ class OSIAAgent:
             record_active_key,
         )
         retry_after_attempted = set()
+        round_number = 0
 
         while True:
+            round_number += 1
             self._mark_document_private_history()
+            provisional_sentences.clear()
             schedule_guard_state["buffered_sentences"] = []
             if guard.check_time():
                 return self._finish_anti_loop_stop(
@@ -6041,14 +6092,14 @@ class OSIAAgent:
                 guard.check_time()
                 return self._finish_anti_loop_stop(
                     guard,
-                    on_sentence=None,
+                    on_sentence=on_sentence,
                     on_first_token=on_first_token,
                 )
             except Exception as e:
                 if guard.check_time():
                     return self._finish_anti_loop_stop(
                         guard,
-                        on_sentence=None,
+                        on_sentence=on_sentence,
                         on_first_token=on_first_token,
                     )
                 status = (
@@ -6069,16 +6120,10 @@ class OSIAAgent:
                 # re-sends a clean conversation to the next model. Non-technical
                 # errors and an exhausted chain re-raise exactly as before.
                 #
-                # Streaming guard: if sentences were ALREADY streamed to
-                # TTS/mobile this attempt (a rare mid-stream drop), re-raise
-                # instead of falling back — re-running the next model would
-                # re-speak the opening of the reply. Pre-token failures
-                # (429/401/403/connection-open) emit nothing, so fallback there
-                # stays fully effective.
+                # Buffered textual deltas are safe to discard and retry. Native
+                # actions and committed account turns are not replay-safe.
                 _already_streamed = (
-                    (on_sentence is not None and _stream_emitted["v"])
-                    or bool(getattr(e, "output_started", False))
-                    or bool(getattr(e, "native_action", False))
+                    bool(getattr(e, "native_action", False))
                     or _account_attempt_committed
                 )
 
@@ -6100,14 +6145,14 @@ class OSIAAgent:
                         if remaining <= 0:
                             guard.check_time()
                             return self._finish_anti_loop_stop(
-                                guard, on_sentence=None,
+                                guard, on_sentence=on_sentence,
                                 on_first_token=on_first_token,
                             )
                         delay = min(float(retry_after), remaining)
                         time.sleep(delay)
                         if delay < float(retry_after) or guard.check_time():
                             return self._finish_anti_loop_stop(
-                                guard, on_sentence=None,
+                                guard, on_sentence=on_sentence,
                                 on_first_token=on_first_token,
                             )
                     continue
@@ -6178,7 +6223,7 @@ class OSIAAgent:
             if guard.check_time():
                 return self._finish_anti_loop_stop(
                     guard,
-                    on_sentence=None,
+                    on_sentence=on_sentence,
                     on_first_token=on_first_token,
                 )
 
@@ -6223,6 +6268,8 @@ class OSIAAgent:
 
             # STEP 3 — execute the parsed tool calls.
             if tool_calls:
+                if self.turn_context is not None:
+                    log_round(self.turn_context, round_number, "tool_call_discarded_prose")
                 # Record the assistant turn. Calls that didn't arrive as
                 # XML blocks (native/bare/python_tag) are serialized as
                 # canonical <tool_call> blocks so the model sees what it
@@ -6230,17 +6277,15 @@ class OSIAAgent:
                 # payload is stripped from the recorded prose so history
                 # never carries the same call twice (display paths strip
                 # these blocks before rendering).
-                assistant_record = content
-                if not has_tool_call(assistant_record):
-                    prose = strip_bare_tool_json(strip_raw_tool_tags(content)).strip()
-                    blocks = "\n".join(
-                        f"<tool_call>\n{json.dumps(tc, ensure_ascii=False)}\n</tool_call>"
-                        for tc in tool_calls
-                    )
-                    assistant_record = (
-                        f"{prose}\n{blocks}".strip() if prose else blocks
-                    )
-                self.messages.append({"role": "assistant", "content": assistant_record})
+                assistant_record = "\n".join(
+                    f"<tool_call>\n{json.dumps(tc, ensure_ascii=False)}\n</tool_call>"
+                    for tc in tool_calls
+                )
+                self.messages.append({
+                    "role": "assistant",
+                    "content": assistant_record,
+                    "_provisional": True,
+                })
                 document_tool_used = any(
                     tc.get("tool") in _DOCUMENT_TOOL_NAMES
                     for tc in tool_calls if isinstance(tc, dict)
@@ -6749,11 +6794,6 @@ class OSIAAgent:
                     continue
                 content = self._empty_response_fallback(guard)
                 schedule_guard_state["buffered_sentences"] = []
-                if on_sentence is not None:
-                    try:
-                        on_sentence(clean_response(content))
-                    except Exception:
-                        pass
 
             if (
                 scheduled_execution is None
@@ -6850,6 +6890,7 @@ class OSIAAgent:
                     self.messages.append({
                         "role": "assistant",
                         "content": raw_round_output if raw_round_output.strip() else "…",
+                        "_provisional": True,
                     })
                     self.messages.append({
                         "role": "user",
@@ -6876,24 +6917,8 @@ class OSIAAgent:
                     continue
                 # Retry also produced nothing usable — deterministic
                 # fallback so the user always gets a reply and TTS always
-                # has text to speak. In streaming mode nothing was emitted
-                # this round, so speak the fallback too.
+                # has one canonical text to speak.
                 content = self._empty_response_fallback(guard)
-                if on_sentence is not None:
-                    try:
-                        on_sentence(clean_response(content))
-                    except Exception:
-                        pass
-
-            if (
-                on_sentence is not None
-                and schedule_guard_state["ignored_unrelated_tool"]
-            ):
-                for sentence in schedule_guard_state["buffered_sentences"]:
-                    try:
-                        on_sentence(sentence)
-                    except Exception:
-                        pass
             if unresolved_tool_timeout and self.last_run_diagnostic is None:
                 self.last_run_diagnostic = {
                     "stage": "task_execution",
@@ -6901,10 +6926,22 @@ class OSIAAgent:
                     "reason_code": "tool_timeout",
                 }
             content = self._redact_semantic_form_values(content)
+            if canonical_output:
+                content = clean_response(content)
+            if not content:
+                content = self._empty_response_fallback(guard)
+            if on_sentence is not None:
+                try:
+                    on_sentence(content)
+                except Exception:
+                    pass
             final_message = {"role": "assistant", "content": content}
             if self._document_private_run:
                 final_message["_document_private"] = True
             self.messages.append(final_message)
+            if self.turn_context is not None:
+                log_round(self.turn_context, round_number, "canonical_final")
+                log_final(self.turn_context, content)
             return content
 
 

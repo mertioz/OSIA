@@ -1055,9 +1055,9 @@ def claims_memory_saved(text: str) -> bool:
 
 
 def memory_not_saved_response(lang: str = "fr") -> str:
-    if lang == "fr":
-        return "Je n'ai rien ajoute a la memoire locale."
-    return "I did not add anything to local memory."
+    from osia.turn_context import localized_text
+
+    return localized_text("memory_not_saved", lang)
 
 
 def save_explicit_memory_if_requested(
@@ -1518,19 +1518,13 @@ def mark_memory_route_used(
 
 
 def memory_save_response(result: MemorySaveResult, lang: str = "fr") -> str:
+    from osia.turn_context import localized_text
+
     if result.saved:
-        return "C’est mémorisé." if lang == "fr" else "It's memorized."
+        return localized_text("memory_saved", lang)
     if result.error_code in {"secret", "validation"}:
-        return (
-            "Je ne peux pas mémoriser cette information."
-            if lang == "fr"
-            else "I can't memorize that information."
-        )
-    return (
-        "La mémorisation a échoué."
-        if lang == "fr"
-        else "Memory save failed."
-    )
+        return localized_text("memory_rejected", lang)
+    return localized_text("memory_failure", lang)
 
 
 def is_about_me_query(user_text: str) -> bool:

@@ -35,6 +35,7 @@ Naming note: the *module* :mod:`osia.autonomous.state` is imported as ``state``
 
 import os
 import re
+import inspect
 import threading
 from contextlib import contextmanager
 from typing import NamedTuple
@@ -44,6 +45,8 @@ from osia.autonomous import diagnostics, planner
 # Module-qualified on purpose (like planner.py) so the persistence/mutator layer
 # stays a single black box — and so a test can monkeypatch state.save_task_state.
 from osia.autonomous import state
+from osia import i18n
+from osia.turn_context import fixed_turn_context, normalize_locale
 
 # ── Tunables (module constants) ──────────────────────────────────────────────
 # Rolling context digest: keep it SMALL so it never balloons the subtask prompt.
@@ -123,6 +126,21 @@ class Orchestrator:
         self._resume_recheck = False
         self._active_task = None
 
+    def _agent_run(self, message: str):
+        """Run one autonomous provider turn under the checkpoint language."""
+
+        st = self._state if isinstance(self._state, dict) else {}
+        language = normalize_locale(st.get("language")) or i18n.DEFAULT_LANG
+        if hasattr(self.agent, "set_turn_context"):
+            context = fixed_turn_context(
+                language,
+                source="autonomous_state",
+                reference=str(st.get("task_id") or "autonomous"),
+            )
+            self.agent.set_turn_context(context)
+            return self.agent.run(message, turn_context=context)
+        return self.agent.run(message)
+
     def _agent_run_failure(self):
         """Read only the agent's allow-listed typed run diagnostic."""
         if getattr(self.agent, "last_run_document_error", None) == (
@@ -177,6 +195,9 @@ class Orchestrator:
             self._emit({"event": "failed", **diagnostic})
             return
         self._state = st
+        st["language"] = (
+            normalize_locale(st.get("language")) or i18n.DEFAULT_LANG
+        )
         artifact_failure = self._artifact_failure(st)
         if resume and artifact_failure is not None:
             st["status"] = "failed"
@@ -335,7 +356,7 @@ class Orchestrator:
         try:
             self.agent.reset()
             with self._artifact_scope(st, task):
-                result = self.agent.run(self._compose(task, digest))
+                result = self._agent_run(self._compose(task, digest))
             if not isinstance(result, str):
                 result = "" if result is None else str(result)
             agent_failure = self._agent_run_failure()
@@ -795,7 +816,7 @@ class Orchestrator:
         try:
             self.agent.reset()
             with self._artifact_scope(self._state, self._active_task):
-                reply = self.agent.run(prompt)
+                reply = self._agent_run(prompt)
         except Exception:
             return _VerificationOutcome(
                 False, diagnostics.FailureCategory.VERIFICATION_ERROR,
@@ -930,9 +951,12 @@ class Orchestrator:
             )
         planning_failures = []
         try:
+            planning_kwargs = {"failure_cb": planning_failures.append}
+            if "language" in inspect.signature(planner.plan_objective).parameters:
+                planning_kwargs["language"] = st.get("language")
             with self._artifact_scope(st, self._active_task):
                 new_phases = planner.plan_objective(
-                    remaining, self.agent, failure_cb=planning_failures.append,
+                    remaining, self.agent, **planning_kwargs,
                 )
         except Exception:
             new_phases = None

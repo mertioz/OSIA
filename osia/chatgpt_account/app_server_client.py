@@ -167,22 +167,12 @@ def _latest_user_text(turn_content: str | list[dict]) -> str:
 def _native_action_refusal(turn_content: str | list[dict]) -> str:
     """Return the user-language refusal for blocked native actions."""
     from osia import i18n
+    from osia.turn_context import resolve_turn_context
 
-    language = None
-    try:
-        from langdetect import DetectorFactory, detect_langs
-
-        DetectorFactory.seed = 0
-        candidates = detect_langs(_latest_user_text(turn_content))
-        if (
-            candidates
-            and candidates[0].lang in {"en", "fr"}
-            and candidates[0].prob >= 0.90
-        ):
-            language = candidates[0].lang
-    except Exception:
-        pass
-    language = language or i18n.get_language()
+    language = resolve_turn_context(
+        _latest_user_text(turn_content),
+        saved_language=i18n.get_language(),
+    ).language
     translations = i18n.TRANSLATIONS.get(_NATIVE_ACTION_REFUSAL_KEY, {})
     return translations.get(language) or i18n.t(_NATIVE_ACTION_REFUSAL_KEY)
 

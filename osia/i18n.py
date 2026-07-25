@@ -206,6 +206,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "chatgpt_account.native_action_refused": {
         "en": "OSIA couldn’t safely translate the action requested by ChatGPT. No action was performed. An alternative workflow supported by OSIA may be available.",
         "fr": "OSIA n’a pas pu traduire en toute sécurité l’action demandée par ChatGPT. Aucune action n’a été effectuée. Une méthode alternative prise en charge par OSIA peut être disponible.",
+        "zh": "OSIA 无法安全转换 ChatGPT 请求的操作。未执行任何操作。OSIA 可能支持其他处理方式。",
+        "ja": "ChatGPT が要求した操作を OSIA が安全に変換できなかったため、操作は実行されませんでした。OSIA が対応する別の方法を利用できる場合があります。",
+        "de": "OSIA konnte die von ChatGPT angeforderte Aktion nicht sicher übertragen. Es wurde keine Aktion ausgeführt. Möglicherweise ist ein anderer von OSIA unterstützter Ablauf verfügbar.",
+        "es": "OSIA no pudo traducir de forma segura la acción solicitada por ChatGPT. No se realizó ninguna acción. Puede que exista un método alternativo compatible con OSIA.",
     },
     "chatgpt_account.connect": {"en": "Connect with ChatGPT", "fr": "Se connecter avec ChatGPT"},
     "chatgpt_account.cancel": {"en": "Cancel", "fr": "Annuler"},

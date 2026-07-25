@@ -50,7 +50,7 @@ Protocol (JSON over WebSocket, port 8765):
                                      "cpu_temp": float|null, "gpu_temp": float|null,
                                      "timestamp": "<ISO>"}              # pushed every heartbeat_interval_seconds while heartbeat_enabled
     {"type": "transcript",           "content": "...", "conversation_id": "..."}
-    {"type": "response_chunk",       "content": "...", "conversation_id": "..."}  # progressively streamed coalesced text deltas
+    {"type": "response_chunk",       "content": "...", "conversation_id": "..."}  # canonical text compatibility chunk; never provisional tool-round prose
     {"type": "response",             "content": "...", "conversation_id": "..."}  # final assembled reply
     {"type": "audio",                "format": "mp3", "data": "<base64>", "source": "response|speak", "conversation_id": "..."}
     {"type": "status",               "content": "thinking|done|error", "conversation_id": "..."}
@@ -103,7 +103,7 @@ import psutil
 import soundfile as sf
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 
-from osia import conversations
+from osia import conversations, i18n
 from osia.attachments import (
     ATTACHMENT_EVENT_TYPES,
     AttachmentBatchManager,
@@ -127,6 +127,13 @@ from osia.memory import (
     MemoryValidationError,
 )
 from osia.server.text_coalescer import AssistantTextCoalescer
+from osia.turn_context import (
+    fixed_turn_context,
+    localized_text,
+    log_final,
+    normalize_locale,
+    resolve_turn_context,
+)
 
 # Windows consoles default to cp1252, which raises UnicodeEncodeError the moment
 # a log line contains a non-ASCII char (e.g. the "▶" in "[OSIA Agent] ▶ tool:")
@@ -1024,6 +1031,9 @@ def _turn_fields(turn_meta: dict | None) -> dict:
         fields["client_request_id"] = req_id
     if turn_id:
         fields["turn_id"] = turn_id
+    language = normalize_locale(turn_meta.get("language"))
+    if language:
+        fields["language"] = language
     return fields
 
 
@@ -1065,6 +1075,9 @@ def _turn_event_frame(
         "sequence": sequence,
         "terminal": bool(terminal),
     }
+    language = normalize_locale(turn_meta.get("language"))
+    if language:
+        frame["language"] = language
     if message_id:
         frame["message_id"] = message_id
     if payload:
@@ -1206,12 +1219,16 @@ async def _send_persisted_turn_for_request(
     terminal_event_id = str(found.get("terminal_event_id") or "")
     terminal_sequence = int(found.get("terminal_sequence") or 0)
     assistant_content = found.get("assistant_content")
+    terminal_status = str(found.get("terminal_status") or "done")
     common = {
         "conversation_id": conv_id,
         "request_id": request_id,
         "client_request_id": request_id,
         "turn_id": turn_id,
     }
+    replay_language = normalize_locale(found.get("language"))
+    if replay_language:
+        common["language"] = replay_language
     if (
         assistant_message_id
         and response_event_id
@@ -1239,9 +1256,14 @@ async def _send_persisted_turn_for_request(
             "event_type": "turn_status",
             "sequence": terminal_sequence,
             "terminal": True,
-            "status": "done",
+            "status": terminal_status,
             "persisted": True,
             "replayed": True,
+            **{
+                key: found[key]
+                for key in ("stage", "error_category", "reason_code")
+                if found.get(key)
+            },
         })
         return True
     await channel.send_json({
@@ -1286,6 +1308,9 @@ def _persist_accepted_user_message(
                 turn_meta.get("client_content_hash") or ""
             ),
         }
+        language = normalize_locale(turn_meta.get("language"))
+        if language:
+            metadata["_language"] = language
         attachment_metadata = turn_meta.get("attachment_metadata")
         if isinstance(attachment_metadata, list) and attachment_metadata:
             metadata["_attachments"] = attachment_metadata
@@ -1351,6 +1376,13 @@ def _persist_completed_assistant_message(
                 "_terminal_event_id": event_id,
                 "_terminal_sequence": sequence,
                 "_terminal": True,
+                "_language": normalize_locale(turn_meta.get("language")) or "",
+                "_terminal_status": str(terminal_frame.get("status") or "done"),
+                "_stage": str(terminal_frame.get("stage") or ""),
+                "_error_category": str(
+                    terminal_frame.get("error_category") or ""
+                ),
+                "_reason_code": str(terminal_frame.get("reason_code") or ""),
             },
         )
     except Exception as exc:
@@ -3433,15 +3465,19 @@ def _autonomous_snapshot(st) -> dict:
         "phase_name": phase_name,
         "objective": st.get("objective", "") or "",
         "status": st.get("status", "") or "",
+        "language": normalize_locale(st.get("language")) or i18n.DEFAULT_LANG,
         **_adiagnostics.projection(st),
     }
 
 
 def _autonomous_failure_state(*, stage, category, reason_code,
                               provider="", model="",
+                              language: str | None = None,
                               emit_log: bool = True) -> dict:
     """Build an objective-free terminal state carrying one safe diagnostic."""
-    st = _astate.new_task_state("", provider, model, [])
+    st = _astate.new_task_state(
+        "", provider, model, [], language=language,
+    )
     st["status"] = "failed"
     diagnostic = _adiagnostics.make_diagnostic(
         st,
@@ -3713,7 +3749,8 @@ def _ensure_autonomous_engine():
         return _autonomous["agent"], _autonomous["orch"]
 
 
-def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
+def _autonomous_start_worker(objective: str, model: str, my_gen: int,
+                             language: str) -> None:
     """Plan + launch OFF the event loop (planning blocks on an LLM run). The
     single-runner slot (generation ``my_gen``) was already acquired by the
     handler. Mirrors main.py's ``handle_autonomous_start``: set_model → resolve
@@ -3741,6 +3778,12 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
     then reopen the gate — exactly as the resume path does."""
     try:
         agent, orch = _ensure_autonomous_engine()
+        autonomous_context = fixed_turn_context(
+            language,
+            source="autonomous_start",
+            reference=f"autonomous-{my_gen}",
+        )
+        agent.set_turn_context(autonomous_context)
 
         # ── DRAIN before spawning (never two loops on the shared agent) ──
         # Wait (GENEROUS bound) until no orchestrator loop remains, so start
@@ -3758,6 +3801,7 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
                 stage=_adiagnostics.AutonomousStage.ORCHESTRATOR,
                 category=_adiagnostics.FailureCategory.ORCHESTRATOR_FAILURE,
                 reason_code="orchestrator_unavailable",
+                language=language,
             )
             _broadcast_autonomous(
                 _autonomous_frame({"event": "plan_failed"}, failed_state)
@@ -3812,6 +3856,7 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
             st = _aplanner.create_plan_state(
                 objective, provider, model, agent,
                 failure_cb=planning_failures.append,
+                language=language,
             )
         except Exception:
             st = None
@@ -3829,6 +3874,7 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
                 reason_code=reason_code,
                 provider=provider,
                 model=model,
+                language=language,
                 emit_log=False,
             )
             if _establish_autonomous_failure(failed_state, my_gen):
@@ -3881,6 +3927,7 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int) -> None:
             stage=_adiagnostics.AutonomousStage.ORCHESTRATOR,
             category=_adiagnostics.FailureCategory.ORCHESTRATOR_FAILURE,
             reason_code="start_worker_failure",
+            language=language,
             emit_log=False,
         )
         if _establish_autonomous_failure(failed_state, my_gen):
@@ -4098,6 +4145,12 @@ def _autonomous_resume_worker(my_gen: int) -> None:
             return
 
         # ── status == in_progress ⇒ resume EXACTLY like the GUI ──
+        resume_context = fixed_turn_context(
+            st.get("language"),
+            source="autonomous_resume",
+            reference=str(st.get("task_id") or "autonomous"),
+        )
+        agent.set_turn_context(resume_context)
         # Honour the model the run was planned with (main.py: set_model(state["model"])).
         model = st.get("model")
         if model:
@@ -5189,6 +5242,12 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "autonomous_start":
                 objective = (msg.get("objective") or "").strip()
                 model = (msg.get("model") or "").strip()
+                autonomous_context = resolve_turn_context(
+                    objective,
+                    client_locale=msg.get("locale"),
+                    saved_language=i18n.get_language(),
+                    reference=_new_turn_id(),
+                )
                 if not objective:
                     failed_state = _autonomous_failure_state(
                         stage=_adiagnostics.AutonomousStage.PLANNING,
@@ -5196,6 +5255,7 @@ async def websocket_endpoint(ws: WebSocket):
                             _adiagnostics.FailureCategory.INVALID_PLANNING_OUTPUT
                         ),
                         reason_code="blank_objective",
+                        language=autonomous_context.language,
                     )
                     # Malformed request from this client — reject it directly.
                     await out.send_json(
@@ -5216,7 +5276,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # Plan + start OFF the event loop (planning blocks on an LLM run).
                 threading.Thread(
                     target=_autonomous_start_worker,
-                    args=(objective, model, _gen),
+                    args=(objective, model, _gen, autonomous_context.language),
                     daemon=True,
                 ).start()
                 continue
@@ -6519,6 +6579,7 @@ async def websocket_endpoint(ws: WebSocket):
                                 await _send_conversation_busy(out, _conv)
                                 continue
                             turn_meta = _new_turn_meta(_conv, client_request_id)
+                            turn_meta["client_locale"] = msg.get("locale")
                             turn_meta["tts_enabled"] = (
                                 msg.get("tts_enabled", True) is not False
                             )
@@ -6722,6 +6783,7 @@ async def websocket_endpoint(ws: WebSocket):
                         )
                         persisted_user_content = user_text
                     turn_meta = _new_turn_meta(_conv, client_request_id)
+                    turn_meta["client_locale"] = msg.get("locale")
                     turn_meta["tts_enabled"] = (
                         msg.get("tts_enabled", True) is not False
                     )
@@ -6842,6 +6904,7 @@ async def websocket_endpoint(ws: WebSocket):
                         continue
                     _pf = list(pending_files)
                     turn_meta = _new_turn_meta(_conv, client_request_id)
+                    turn_meta["client_locale"] = msg.get("locale")
                     turn_meta["tts_enabled"] = (
                         msg.get("tts_enabled", True) is not False
                     )
@@ -7479,8 +7542,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                                  get_agent=None,
                                  turn_meta: dict | None = None) -> tuple[list, str]:
     """Run the agent with the given conversation history, persist the
-    new turn, stream the spoken response sentence-by-sentence, then send
-    the assembled reply + TTS audio.
+    new turn, then send one canonical reply through display and TTS.
 
     Returns ``(updated_history, active_conv_id)``. If no conversation
     was active a new one is created (with a smart keyword title seeded
@@ -7545,6 +7607,17 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         for item in history
         if isinstance(item, dict)
     ]
+    turn_context = resolve_turn_context(
+        text,
+        history=history,
+        client_locale=(turn_meta or {}).get("client_locale"),
+        saved_language=i18n.get_language(),
+        reference=(turn_meta or {}).get("turn_id"),
+    )
+    if isinstance(turn_meta, dict):
+        turn_meta["language"] = turn_context.language
+        turn_meta["language_source"] = turn_context.source
+        turn_meta["turn_ref"] = turn_context.turn_ref
     prev_len = len(history)
     persisted_user_content = (
         turn_meta.get("persisted_user_content", text)
@@ -7577,13 +7650,9 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             )
         )
 
-    # ── Streaming plumbing ────────────────────────────────────────────
-    # The agent runs in a worker thread (so it doesn't block the event
-    # loop). Each completed sentence fires `on_sentence`, which schedules
-    # an asyncio.Queue.put on the event loop. A local sender task drains
-    # the queue and pushes each sentence to the WebSocket as a
-    # `response_chunk` message — the first chunk lands as soon as the
-    # model produces its first sentence.
+    # ── Canonical response plumbing ───────────────────────────────────
+    # Agent callbacks are buffered until agent.run returns successfully.
+    # Only the cleaned canonical return value is then sent to WebSocket/TTS.
     loop = asyncio.get_running_loop()
     chunk_queue: asyncio.Queue = asyncio.Queue()
     pending_puts: list = []
@@ -7595,6 +7664,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # Track everything we've actually streamed to the client so we can
     # detect a missing tail at the end of the run.
     sent_chunks: list[str] = []
+    provisional_chunks: list[str] = []
     tts_session: _ResponseTTSSession | None = None
     tts_enabled = (
         not isinstance(turn_meta, dict)
@@ -7622,13 +7692,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     def on_sentence(sentence: str) -> None:
         if not sentence:
             return
-        try:
-            fut = asyncio.run_coroutine_threadsafe(
-                chunk_queue.put(sentence), loop,
-            )
-            pending_puts.append(fut)
-        except Exception as e:
-            print(f"[OSIA Server] on_sentence dispatch failed: {e}")
+        provisional_chunks.append(sentence)
 
     async def sender() -> None:
         from osia.agent import strip_raw_tool_tags
@@ -7738,6 +7802,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     on_sentence=on_sentence,
                     on_first_token=on_first_token,
                     current_conversation_id=active_conv_id,
+                    turn_context=turn_context,
                 )
             finally:
                 agent._in_use = False
@@ -7770,10 +7835,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     except Exception as e:
         await _cancel_turn_progress_task(progress_task)
         progress_task = None
-        if tts_session is not None:
-            tts_session.cancel()
-        print(f"[OSIA Server] Agent error: {e}")
-        traceback.print_exc()
+        print(f"[OSIA Server] Agent error category={type(e).__name__}")
         # Drain any in-flight puts and shut the sender down cleanly.
         for fut in pending_puts:
             try:
@@ -7783,7 +7845,18 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         await chunk_queue.put(_SENTINEL)
         await sender_task
         if isinstance(turn_meta, dict):
-            error_text = f"Erreur: {e}"
+            provisional_chunks.clear()
+            error_text = localized_text("provider_failure", turn_context.language)
+            chunk_frame = _turn_event_frame(
+                turn_meta,
+                "response_chunk",
+                message_id=str(turn_meta.get("assistant_message_id") or ""),
+                payload={"content": error_text},
+            )
+            await ws.send_json(chunk_frame)
+            if tts_session is not None:
+                tts_session.enqueue(error_text)
+                tts_session.finish_input(error_text)
             response_frame = _turn_event_frame(
                 turn_meta,
                 "response",
@@ -7791,6 +7864,11 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 payload={"content": error_text},
             )
             terminal_frame = _turn_status_frame(turn_meta, "error")
+            terminal_frame.update({
+                "stage": "response_generation",
+                "error_category": "provider_failure",
+                "reason_code": "provider_failure",
+            })
             if accepted_user_persisted and _persist_completed_assistant_message(
                 active_conv_id,
                 error_text,
@@ -7802,11 +7880,18 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 terminal_frame["persisted"] = True
                 await ws.send_json(response_frame)
                 await ws.send_json(terminal_frame)
+                if tts_session is not None:
+                    tts_session.mark_text_final_sent()
+                else:
+                    await _send_response_media_terminal(ws, turn_meta, "done")
+                log_final(turn_context, error_text)
                 return history + [
                     {"role": "user", "content": text},
                     {"role": "assistant", "content": error_text},
                 ], active_conv_id
             await ws.send_json(terminal_frame)
+            if tts_session is not None:
+                tts_session.cancel()
         if accepted_user_persisted:
             return history + [{"role": "user", "content": text}], active_conv_id
         return history, active_conv_id
@@ -7821,6 +7906,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             pass
     await chunk_queue.put(_SENTINEL)
     await sender_task
+    provisional_chunks.clear()
 
     # Strip any raw <tool_call>…</tool_call> blocks (tags AND JSON payload)
     # that survived the agent's own cleaning. This runs BEFORE the tail
@@ -7828,8 +7914,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # must never reach the mobile client or be spoken.
     raw_response_text = response_text or ""
     if response_text:
-        from osia.agent import strip_raw_tool_tags
-        response_text = strip_raw_tool_tags(response_text).strip()
+        from osia.agent import clean_response, strip_raw_tool_tags
+        response_text = clean_response(strip_raw_tool_tags(response_text)).strip()
     print(
         f"[DEBUG] cleaned response ({len(response_text or '')} chars)",
         flush=True,
@@ -7850,9 +7936,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # tail as one last response_chunk so the client never loses the end
     # of a reply.
     if response_text:
-        from osia.agent import clean_response
         sent_concat = _join_sent_chunks(sent_chunks)
-        cleaned_full = clean_response(response_text).strip()
+        cleaned_full = response_text
         if cleaned_full:
             tail = _tail_not_sent(cleaned_full, sent_concat)
             if tail:
@@ -7887,6 +7972,9 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # at index 0 AND defensively filters any system-prompt-looking frame,
     # so the system prompt cannot leak into the conversation history.
     new_history = agent.exported_history()
+    run_diagnostic = getattr(agent, "last_run_diagnostic", None)
+    if not isinstance(run_diagnostic, dict):
+        run_diagnostic = None
 
     # Tool-call counter for debug logging.
     new_msgs = new_history[prev_len:]
@@ -7914,49 +8002,40 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         print(f"[OSIA Server]   last 2 history item count: {len(tail_preview)}")
 
     if not response_text:
-        # Prefer what was actually streamed to the client over a canned
-        # apology — if sentences went out as response_chunks, the final
-        # text and the TTS must match them.
-        streamed = " ".join(sent_chunks).strip()
-        if streamed:
-            print(
-                "[WARN] empty final response — falling back to the "
-                f"{len(sent_chunks)} streamed chunk(s) ({len(streamed)} chars)",
-                flush=True,
-            )
-            response_text = streamed
-        else:
-            print(
-                "[WARN] empty final response and nothing was streamed — "
-                "using the generic fallback message",
-                flush=True,
-            )
-            response_text = "Désolé, je n'ai pas pu traiter votre demande."
-            # Push the fallback as a chunk too so chunk-based clients
-            # render it instead of an empty reply.
-            try:
-                print(
-                    f"[DEBUG] queueing fallback response_chunk for mobile "
-                    f"({len(response_text)} chars)",
-                    flush=True,
+        provisional_chunks.clear()
+        print(
+            "[WARN] empty canonical response — using localized safe fallback",
+            flush=True,
+        )
+        response_text = localized_text(
+            "empty_completion", turn_context.language,
+        )
+        run_diagnostic = {
+            "stage": "response_generation",
+            "error_category": "empty_completion",
+            "reason_code": "empty_completion",
+        }
+        try:
+            if not isinstance(turn_meta, dict):
+                raise ValueError("fallback response has no turn correlation")
+            await ws.send_json(
+                _turn_event_frame(
+                    turn_meta,
+                    "response_chunk",
+                    message_id=str(
+                        turn_meta.get("assistant_message_id") or ""
+                    ),
+                    payload={"content": response_text},
                 )
-                if not isinstance(turn_meta, dict):
-                    raise ValueError("fallback response has no turn correlation")
-                await ws.send_json(
-                    _turn_event_frame(
-                        turn_meta,
-                        "response_chunk",
-                        message_id=str(
-                            turn_meta.get("assistant_message_id") or ""
-                        ),
-                        payload={"content": response_text},
-                    )
-                )
-                sent_chunks.append(response_text)
-                if tts_session is not None:
-                    tts_session.enqueue(response_text)
-            except Exception as e:
-                print(f"[OSIA Server] fallback response_chunk send failed: {e}")
+            )
+            sent_chunks.append(response_text)
+            if tts_session is not None:
+                tts_session.enqueue(response_text)
+        except Exception as e:
+            print(
+                "[OSIA Server] fallback response_chunk send failed "
+                f"category={type(e).__name__}"
+            )
 
     if tts_session is not None:
         tts_session.finish_input(response_text)
@@ -7976,6 +8055,12 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         payload={"content": response_text},
     )
     terminal_frame = _turn_status_frame(turn_meta, "done")
+    if run_diagnostic is not None:
+        terminal_frame.update({
+            key: str(run_diagnostic.get(key) or "")
+            for key in ("stage", "error_category", "reason_code")
+            if run_diagnostic.get(key)
+        })
     if not _persist_completed_assistant_message(
         active_conv_id,
         response_text,
@@ -8007,6 +8092,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # conversation remains unavailable for another turn until that phase emits
     # its correlated terminal event.
     await ws.send_json(terminal_frame)
+    log_final(turn_context, response_text)
     if tts_session is not None:
         tts_session.mark_text_final_sent()
     else:

@@ -646,6 +646,12 @@ def wake_mode():
     )
     from osia.agent import clean_response
     from osia import i18n
+    from osia.turn_context import (
+        fixed_turn_context,
+        localized_text,
+        normalize_locale,
+        resolve_turn_context,
+    )
     from osia import scheduled_tasks
     from osia.config import load_settings, set_setting
     from osia.models import discover_models_async
@@ -995,11 +1001,17 @@ def wake_mode():
                     refusal_tts_session = start_streaming_session()
                     speak_streaming(refusal, session_id=refusal_tts_session)
             else:
-                err = f"Error: {e}"
+                err = localized_text("provider_failure", turn_agent.lang)
+                _persist_agent_delta(
+                    conv_id,
+                    turn_agent,
+                    prev_history_len,
+                    user_display_text=user_display_text,
+                )
+                conversations.add_message(conv_id, "assistant", err)
                 bridge.assistant_stream_error.emit(conv_id, err)
                 if voice_response:
                     error_tts_session = start_streaming_session()
-                    print(f"[TTS] main.wake_mode: speaking error message: {err[:80]!r}", flush=True)
                     speak_streaming(err, session_id=error_tts_session)
         finally:
             _set_conversation_busy(conv_id, False)
@@ -1515,6 +1527,7 @@ def wake_mode():
             "phase_name": phase_name,
             "objective": st.get("objective", "") or "",
             "status": st.get("status", "") or "",
+            "language": normalize_locale(st.get("language")) or i18n.DEFAULT_LANG,
             **autonomous_diagnostics.projection(st),
         }
 
@@ -1530,6 +1543,12 @@ def wake_mode():
         # Plan OFF the GUI thread (create_plan_state blocks on an LLM run), then
         # persist + start the orchestrator. Mirrors the chat worker pattern.
         def _plan_and_run():
+            autonomous_context = resolve_turn_context(
+                objective,
+                saved_language=i18n.get_language(),
+                reference="desktop-autonomous",
+            )
+            autonomous_agent.set_turn_context(autonomous_context)
             if model:
                 try:
                     autonomous_agent.set_model(model)
@@ -1559,6 +1578,7 @@ def wake_mode():
                 st = planner.create_plan_state(
                     objective, actual_provider, actual_model, autonomous_agent,
                     failure_cb=planning_failures.append,
+                    language=autonomous_context.language,
                 )
             except Exception:
                 st = None
@@ -1585,6 +1605,7 @@ def wake_mode():
                 )
                 failed_state = new_failed_task_state(
                     actual_provider, actual_model, diagnostic,
+                    language=autonomous_context.language,
                 )
                 try:
                     save_task_state(failed_state)
@@ -1882,6 +1903,12 @@ def wake_mode():
             # background loop is non-blocking; the re-check/salvage happens
             # inside resume()). Seed the panel and surface it so the user sees it.
             resume_model = state.get("model")
+            resume_context = fixed_turn_context(
+                state.get("language"),
+                source="autonomous_resume",
+                reference=str(state.get("task_id") or "autonomous"),
+            )
+            autonomous_agent.set_turn_context(resume_context)
             if resume_model:
                 try:
                     autonomous_agent.set_model(resume_model)

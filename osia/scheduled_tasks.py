@@ -1151,6 +1151,6 @@ def looks_like_schedule_request(text: str) -> bool:
 
 
 def not_scheduled_response(lang: str = "en") -> str:
-    if lang == "fr":
-        return "Je n'ai pas pu planifier cette tache."
-    return "I could not schedule that task."
+    from osia.turn_context import localized_text
+
+    return localized_text("not_scheduled", lang)

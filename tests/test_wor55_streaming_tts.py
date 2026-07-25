@@ -359,24 +359,21 @@ class ProgressiveTTSTurnIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(*tasks, return_exceptions=True)
         return channel, persisted, result
 
-    async def test_streaming_text_final_persistence_and_mobile_audio_order(self) -> None:
+    async def test_canonical_text_final_persistence_and_mobile_audio_order(self) -> None:
         final = "First sentence. Second sentence. Final unfinished tail"
-        synth_started = threading.Event()
         generation_final = threading.Event()
         synth_calls: list[str] = []
 
         def run(on_sentence, on_first_token):
             on_first_token()
             on_sentence("First sentence.")
-            self.assertTrue(synth_started.wait(timeout=1))
             on_sentence("Second sentence.")
             generation_final.set()
             return final
 
         def synthesize(text: str) -> bytes:
             synth_calls.append(text)
-            synth_started.set()
-            self.assertFalse(generation_final.is_set() and len(synth_calls) == 1)
+            self.assertTrue(generation_final.is_set())
             return text.encode()
 
         channel, persisted, (history, conv_id) = await self._run_turn(
@@ -391,7 +388,7 @@ class ProgressiveTTSTurnIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             synth_calls,
-            ["First sentence.", "Second sentence.", "Final unfinished tail"],
+            [final],
         )
         sequences = [frame["sequence"] for frame in channel.frames if "sequence" in frame]
         self.assertEqual(sequences, sorted(sequences))
@@ -469,7 +466,6 @@ class ProgressiveTTSTurnIntegrationTests(unittest.IsolatedAsyncioTestCase):
         def run(on_sentence, on_first_token):
             on_first_token()
             on_sentence(final)
-            self.assertTrue(synth_started.wait(timeout=1))
             return final
 
         def synthesize(_text: str) -> bytes:
