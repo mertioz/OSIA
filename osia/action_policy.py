@@ -322,6 +322,22 @@ _FINAL_LABEL_RE = re.compile(
 )
 
 
+# Dedicated owner for the stronger local colossal-deletion review.  The desktop
+# GUI registers a provider that receives the sealed private DeletionPlan; the
+# server registers a sanitized, non-approving mobile notifier.  Missing owner is
+# a denial.  Ordinary confirmation plumbing remains unchanged.
+_reinforced_deletion_confirmation_provider = None
+
+
+def set_reinforced_deletion_confirmation_provider(fn) -> None:
+    global _reinforced_deletion_confirmation_provider
+    _reinforced_deletion_confirmation_provider = fn
+
+
+def get_reinforced_deletion_confirmation_provider():
+    return _reinforced_deletion_confirmation_provider
+
+
 def _is_final_external_step(
     decision: ActionDecision,
     tool_name: str,
@@ -437,6 +453,270 @@ def _explicit_central_authority(
         return False
 
 
+def _deletion_preflight(
+    tool_name: str,
+    values: Mapping[str, Any],
+    *,
+    mcp_destructive: bool = False,
+):
+    from osia.deletion_plan import (
+        DeletionPlanError,
+        DeletionPreflightKind,
+        clear_pending_deletion,
+        prepare_deletion_call,
+    )
+
+    clear_pending_execution_permit()
+    clear_pending_deletion()
+    try:
+        result = prepare_deletion_call(
+            tool_name,
+            values,
+            mcp_destructive=mcp_destructive,
+        )
+    except DeletionPlanError as exc:
+        if exc.code == "system_destruction":
+            return True, None, "ERROR: BLOCK_SYSTEM_DESTRUCTION"
+        return True, None, f"ERROR: DELETION_PREFLIGHT_REQUIRED ({exc.code})"
+    if result.kind is DeletionPreflightKind.NOT_DELETION:
+        return False, None, None
+    return True, result.plan, None
+
+
+def _permission_request_for_deletion(
+    tool_name: str,
+    values: Mapping[str, Any],
+    plan,
+    *,
+    confirmation_domain: str,
+    origin_id: str,
+    policy: "PermissionPolicy",
+) -> "PermissionRequest":
+    from osia.deletion_plan import DeletionPlan
+
+    if not isinstance(plan, DeletionPlan):
+        raise ValueError("untrusted_deletion_plan")
+    context = make_execution_context(
+        operation_id=plan.operation_id,
+        store=policy.store,
+    )
+    classification = trusted_deletion_classification(
+        system_destruction=plan.system_destruction,
+        colossal_deletion=plan.colossal_deletion,
+    )
+    return build_permission_request(
+        tool_name,
+        values,
+        confirmation_domain=confirmation_domain,
+        origin_id=origin_id,
+        execution_context=context,
+        deletion_classification=classification,
+        force_sensitive=True,
+        policy=policy,
+    )
+
+
+def _hold_plan_permit(
+    tool_name: str,
+    values: Mapping[str, Any],
+    plan,
+    *,
+    policy_epoch: int,
+    strength: str,
+) -> str | None:
+    try:
+        from osia.deletion_plan import issue_pending_deletion
+
+        binding_values = _deletion_binding_arguments(tool_name, values)
+        issue_pending_deletion(
+            tool_name,
+            binding_values,
+            plan,
+            policy_epoch=policy_epoch,
+            confirmation_strength=strength,
+        )
+        return None
+    except Exception:
+        clear_pending_execution_permit()
+        return "ERROR: deletion execution permit unavailable; nothing was deleted"
+
+
+def _deletion_binding_arguments(
+    tool_name: str,
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(values)
+    if tool_name == "delete_file":
+        return {"path": str(normalized.get("path") or "")}
+    if tool_name == "delete_directory":
+        return {
+            "path": str(normalized.get("path") or ""),
+            "recursive": bool(normalized.get("recursive", False)),
+        }
+    if tool_name in {"bash", "run_command"}:
+        bound = {"command": str(normalized.get("command") or "")}
+        if normalized.get("timeout") is not None:
+            bound["timeout"] = normalized.get("timeout")
+        return bound
+    return normalized
+
+
+def _authorize_colossal_plan(
+    tool_name: str,
+    values: Mapping[str, Any],
+    plan,
+    *,
+    confirmation_domain: str,
+    origin_id: str,
+) -> str:
+    policy = get_default_permission_policy()
+    try:
+        request = _permission_request_for_deletion(
+            tool_name,
+            values,
+            plan,
+            confirmation_domain=confirmation_domain,
+            origin_id=origin_id,
+            policy=policy,
+        )
+        decision = policy.evaluate(request)
+    except Exception:
+        return "ERROR: deletion classification unavailable; nothing was deleted"
+    if decision.decision_type == DecisionType.BLOCK_SYSTEM_DESTRUCTION:
+        return "ERROR: BLOCK_SYSTEM_DESTRUCTION"
+    if decision.decision_type != DecisionType.REQUIRE_COLOSSAL_DELETION_CONFIRMATION:
+        return permission_error_for_decision(decision)
+    provider = get_reinforced_deletion_confirmation_provider()
+    if provider is None:
+        return "ERROR: REQUIRE_COLOSSAL_DELETION_CONFIRMATION"
+    try:
+        approved = provider(plan)
+    except Exception:
+        approved = False
+    if approved is not True:
+        return "ERROR: REQUIRE_COLOSSAL_DELETION_CONFIRMATION"
+    permit = policy.mint_permit(
+        request,
+        decision,
+        reinforced=True,
+        ttl_seconds=max(0.1, plan.expires_at - time.time()),
+    )
+    if permit is None:
+        return "ERROR: reinforced execution permit unavailable; nothing was deleted"
+    hold_execution_permit(permit, request, policy=policy)
+    held = _hold_plan_permit(
+        tool_name,
+        values,
+        plan,
+        policy_epoch=decision.policy_epoch,
+        strength="reinforced",
+    )
+    return held or ""
+
+
+def _universal_deletion_decision(
+    tool_name: str,
+    values: Mapping[str, Any],
+    plan,
+    *,
+    confirmation_domain: str,
+    origin_id: str,
+) -> tuple[bool, str | None]:
+    policy = get_default_permission_policy()
+    try:
+        request = _permission_request_for_deletion(
+            tool_name,
+            values,
+            plan,
+            confirmation_domain=confirmation_domain,
+            origin_id=origin_id,
+            policy=policy,
+        )
+        decision = policy.evaluate(request)
+    except Exception:
+        return True, "ERROR: deletion classification unavailable; nothing was deleted"
+    if decision.decision_type == DecisionType.BLOCK_SYSTEM_DESTRUCTION:
+        return True, "ERROR: BLOCK_SYSTEM_DESTRUCTION"
+    if decision.decision_type == DecisionType.REQUIRE_COLOSSAL_DELETION_CONFIRMATION:
+        result = _authorize_colossal_plan(
+            tool_name,
+            values,
+            plan,
+            confirmation_domain=confirmation_domain,
+            origin_id=origin_id,
+        )
+        return True, result or None
+    return False, None
+
+
+def _finish_ordinary_deletion_authorization(
+    tool_name: str,
+    values: Mapping[str, Any],
+    plan,
+) -> str | None:
+    if plan is None:
+        return None
+    try:
+        epoch = get_default_permission_policy().store.load_state().policy_epoch
+    except Exception:
+        clear_pending_execution_permit()
+        return "ERROR: deletion policy state unavailable; nothing was deleted"
+    return _hold_plan_permit(
+        tool_name,
+        values,
+        plan,
+        policy_epoch=epoch,
+        strength="ordinary",
+    )
+
+
+def _system_mutation_barrier(
+    tool_name: str,
+    values: Mapping[str, Any],
+) -> str | None:
+    try:
+        from osia.system_resources import classify_non_deletion_system_mutation
+
+        evidence = classify_non_deletion_system_mutation(tool_name, values)
+        if evidence is None or not evidence.blocks_destruction:
+            return None
+        policy = get_default_permission_policy()
+        request = build_permission_request(
+            tool_name,
+            values,
+            deletion_classification=trusted_deletion_classification(
+                system_destruction=True,
+            ),
+            force_sensitive=True,
+            policy=policy,
+        )
+        decision = policy.evaluate(request)
+        return permission_error_for_decision(decision)
+    except Exception:
+        # A recognized destructive semantic whose evidence construction failed
+        # cannot be allowed to fall through to dispatch.
+        if tool_name in {"write_file", "edit_file_lines", "rename_file"}:
+            return "ERROR: BLOCK_SYSTEM_DESTRUCTION"
+        if tool_name in {"bash", "run_command"} and re.search(
+            r"(?i)(?:^|\s)(?:truncate|clear-content|move-item|remove-item|"
+            r"format(?:-volume)?|remove-(?:partition|volume)|clear-disk|"
+            r"mkfs|wipefs|sgdisk|fdisk|parted|lvremove|vgremove|pvremove|"
+            r"reg(?:\.exe)?\s+delete)(?:\s|$)|(?<!>)>(?!>)",
+            str(values.get("command") or ""),
+        ):
+            return "ERROR: BLOCK_SYSTEM_DESTRUCTION"
+        return None
+
+
+def system_mutation_barrier(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+) -> str | None:
+    """Public central facade used again at direct native I/O boundaries."""
+
+    return _system_mutation_barrier(str(tool_name or ""), arguments)
+
+
 def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | None:
     """Return an ``ERROR:`` string when a recognized action must not execute.
 
@@ -447,13 +727,50 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
     tool = str(tool_name or "")
     values = kwargs if isinstance(kwargs, dict) else {}
 
+    system_barrier = _system_mutation_barrier(tool, values)
+    if system_barrier is not None:
+        return system_barrier
+
+    # Build trusted deletion evidence before any permission-mode decision.  A
+    # direct deletion or exact shell deletion can proceed only with a complete
+    # plan; non-deletion shell behavior falls through unchanged.
+    deletion_plan = None
+    if tool in {"delete_file", "delete_directory", "bash", "run_command"}:
+        handled, deletion_plan, preflight_error = _deletion_preflight(tool, values)
+        if preflight_error is not None:
+            # Preserve the established confirmation contract for a missing
+            # ordinary target.  No deletion permit is issued, and the native
+            # boundary repeats preflight before any I/O, so the call still
+            # fails closed if the target remains absent.
+            if not preflight_error.endswith("(deletion_root_missing)"):
+                return preflight_error
+            deletion_plan = None
+            handled = True
+        if handled and deletion_plan is not None:
+            final, barrier_error = _universal_deletion_decision(
+                tool,
+                values,
+                deletion_plan,
+                confirmation_domain="action",
+                origin_id="osia",
+            )
+            if final:
+                return barrier_error
+
     if decision.action_class == ActionClass.DISALLOWED and tool not in _READ_ONLY_TOOLS:
         if not _explicit_central_authority(tool, values):
             return f"ERROR: action blocked for safety: {decision.reason}"
-        return None
+        return _finish_ordinary_deletion_authorization(
+            tool, values, deletion_plan,
+        )
 
     if tool in _LOCAL_CONFIRM_TOOLS:
-        return _confirmation_with_permit(decision, tool, values)
+        blocked = _confirmation_with_permit(decision, tool, values)
+        if blocked is not None:
+            return blocked
+        return _finish_ordinary_deletion_authorization(
+            tool, values, deletion_plan,
+        )
 
     # Contract-driven gates complement the semantic final-step detector. Gmail
     # and MCP wrappers retain ownership of their established confirmation flow
@@ -479,7 +796,12 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
     wrapper_owns_confirmation = tool.startswith("gmail_") or tool.startswith("mcp__")
     if requires_contract_confirmation and not wrapper_owns_confirmation:
         if not _is_final_external_step(decision, tool, values):
-            return _confirmation_with_permit(decision, tool, values)
+            blocked = _confirmation_with_permit(decision, tool, values)
+            if blocked is not None:
+                return blocked
+            return _finish_ordinary_deletion_authorization(
+                tool, values, deletion_plan,
+            )
 
     if not _is_final_external_step(decision, tool, values):
         return None
@@ -495,7 +817,10 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
         return "ERROR: the user requested a draft, not the final Send action"
     if decision.outcome == ActionOutcome.BLOCK:
         return f"ERROR: action blocked for safety: {decision.reason}"
-    return _confirmation_with_permit(decision, tool, values)
+    blocked = _confirmation_with_permit(decision, tool, values)
+    if blocked is not None:
+        return blocked
+    return _finish_ordinary_deletion_authorization(tool, values, deletion_plan)
 
 
 def is_final_external_tool_call(
@@ -2003,6 +2328,151 @@ def permission_error_for_decision(decision: PermissionDecision) -> str:
     if decision.decision_type == DecisionType.REQUIRE_COLOSSAL_DELETION_CONFIRMATION:
         return "ERROR: REQUIRE_COLOSSAL_DELETION_CONFIRMATION"
     return f"ERROR: permission denied: {decision.reason_code}"
+
+
+def authorize_mcp_deletion_call(
+    server_id: str,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+) -> str | None:
+    """Authorize one structurally declared MCP deletion without trusting MCP claims."""
+
+    full_name = f"mcp__{server_id}__{tool_name}"
+    handled, plan, preflight_error = _deletion_preflight(
+        full_name,
+        arguments,
+        mcp_destructive=True,
+    )
+    if preflight_error is not None:
+        return preflight_error
+    if not handled or plan is None:
+        return "ERROR: MCP deletion preflight unavailable; the tool was not executed"
+    final, barrier_error = _universal_deletion_decision(
+        full_name,
+        arguments,
+        plan,
+        confirmation_domain="mcp",
+        origin_id=server_id,
+    )
+    if final:
+        return barrier_error
+    try:
+        from osia.mcp_client.registry import confirm_connector_write
+
+        blocked = confirm_connector_write(
+            server_id,
+            tool_name,
+            "Delete one connected item",
+            call_arguments=dict(arguments),
+            policy_tool_name=full_name,
+        )
+    except Exception:
+        blocked = "ERROR: MCP deletion confirmation unavailable"
+    if blocked is not None:
+        return blocked
+    return _finish_ordinary_deletion_authorization(
+        full_name,
+        arguments,
+        plan,
+    )
+
+
+def _current_policy_epoch() -> int:
+    return int(get_default_permission_policy().store.load_state().policy_epoch)
+
+
+def execute_authorized_deletion_call(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    *,
+    directory: bool,
+    recursive: bool,
+) -> str:
+    """Consume the exact plan permit, delete deterministically, and sanitize results."""
+
+    from osia.deletion_plan import (
+        DeletionExecutionOutcome,
+        DeletionPlanError,
+        consume_pending_deletion_for_dispatch,
+        execute_deletion_dispatch,
+        pending_deletion_matches,
+    )
+
+    binding_arguments = _deletion_binding_arguments(tool_name, arguments)
+    if not pending_deletion_matches(tool_name, binding_arguments):
+        return "ERROR: deletion authorization unavailable; nothing was deleted"
+    # Direct focused tests call the tool immediately after guard_tool_call,
+    # while the normal agent dispatcher has already consumed this permit.  If
+    # it is still pending, burn it here before the deletion-specific permit.
+    if pending_execution_permit_matches(tool_name, arguments):
+        if not consume_pending_execution_permit(tool_name, arguments):
+            return "ERROR: execution permit unavailable; nothing was deleted"
+    try:
+        dispatch = consume_pending_deletion_for_dispatch(
+            tool_name,
+            binding_arguments,
+            policy_epoch=_current_policy_epoch(),
+        )
+        result = execute_deletion_dispatch(dispatch)
+    except DeletionPlanError as exc:
+        if exc.code in {
+            "deletion_plan_changed", "deletion_plan_expired",
+            "deletion_permit_expired", "deletion_policy_epoch_changed",
+            "deletion_policy_version_changed", "deletion_permit_inventory_mismatch",
+        }:
+            return "ERROR: DELETION_PLAN_CHANGED_REQUIRES_NEW_CONFIRMATION"
+        return f"ERROR: deletion blocked before I/O ({exc.code})"
+    except Exception:
+        return "ERROR: deletion blocked before I/O (internal_preflight_failure)"
+    if result.outcome is DeletionExecutionOutcome.OUTCOME_UNKNOWN:
+        try:
+            get_default_permission_policy().permit_ledger.mark_outcome_unknown(
+                dispatch.plan.operation_id
+            )
+        except Exception:
+            pass
+    return result.model_text(directory=directory, recursive=recursive)
+
+
+def begin_external_deletion_dispatch(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+):
+    """Revalidate and consume a deletion permit immediately before MCP dispatch."""
+
+    from osia.deletion_plan import (
+        DeletionPlanError,
+        consume_pending_deletion_for_dispatch,
+        pending_deletion_matches,
+    )
+
+    if not pending_deletion_matches(tool_name, arguments):
+        raise DeletionPlanError("deletion_authorization_missing")
+    return consume_pending_deletion_for_dispatch(
+        tool_name,
+        arguments,
+        policy_epoch=_current_policy_epoch(),
+    )
+
+
+def external_deletion_result(dispatch, raw_result: Any) -> str:
+    """Verify the exact local postcondition; MCP response text is never trusted."""
+
+    del raw_result
+    from osia.deletion_plan import (
+        DeletionExecutionOutcome,
+        verify_external_deletion_dispatch,
+    )
+
+    result = verify_external_deletion_dispatch(dispatch)
+    try:
+        if result.outcome is DeletionExecutionOutcome.OUTCOME_UNKNOWN:
+            get_default_permission_policy().permit_ledger.mark_outcome_unknown(
+                dispatch.plan.operation_id
+            )
+    except Exception:
+        pass
+    return result.model_text(directory=False, recursive=False)
 
 
 def register_grant(

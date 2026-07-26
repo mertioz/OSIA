@@ -2413,6 +2413,34 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Decline", "fr": "Refuser", "zh": "拒绝",
         "ja": "拒否", "de": "Ablehnen", "es": "Rechazar",
     },
+    # WOR-193: local-only reinforced colossal-deletion confirmation.
+    "deletion.confirm.title": {
+        "en": "Danger: approve a colossal deletion?",
+        "fr": "Danger : autoriser une suppression colossale ?",
+    },
+    "deletion.confirm.warning": {
+        "en": "This irreversible operation can remove a very large amount of data. Review the complete inventory below. Only an explicit click on Allow can continue.",
+        "fr": "Cette operation irreversible peut supprimer une tres grande quantite de donnees. Verifiez l'inventaire complet ci-dessous. Seul un clic explicite sur Autoriser permet de continuer.",
+    },
+    "deletion.confirm.summary": {
+        "en": "{files} files, {folders} folders, {size}, across {roots} roots.",
+        "fr": "{files} fichiers, {folders} dossiers, {size}, dans {roots} racines.",
+    },
+    "deletion.confirm.recursive": {
+        "en": "Recursive deletion: every listed descendant will be removed.",
+        "fr": "Suppression recursive : chaque descendant affiche sera supprime.",
+    },
+    "deletion.confirm.expires": {
+        "en": "This approval expires shortly. Any inventory change requires a new review.",
+        "fr": "Cette approbation expire rapidement. Toute modification de l'inventaire impose une nouvelle verification.",
+    },
+    "deletion.confirm.name": {"en": "Name", "fr": "Nom"},
+    "deletion.confirm.type": {"en": "Type", "fr": "Type"},
+    "deletion.confirm.size": {"en": "Size", "fr": "Taille"},
+    "deletion.confirm.cancel": {"en": "Cancel", "fr": "Annuler"},
+    "deletion.confirm.allow": {
+        "en": "Allow deletion", "fr": "Autoriser la suppression",
+    },
     # WOR-191 Phase 0: locked, fail-closed compatibility controls in MCP settings.
     "mcp.confirm_writes": {
         "en": "Connector write confirmation required",

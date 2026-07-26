@@ -2951,6 +2951,47 @@ def _ws_confirm_provider(server_id: str, tool_name: str, summary: str) -> bool |
         return False  # any failure -> deny (safe)
 
 
+def _ws_reinforced_deletion_provider(plan) -> bool:
+    """Notify mobile with sanitized PC-review state, but never accept approval."""
+
+    try:
+        from osia.deletion_plan import DeletionPlan
+
+        if not isinstance(plan, DeletionPlan) or not plan.colossal_deletion:
+            return False
+        target = _turn_target.get()
+        if not target:
+            return False
+        channel, loop = target
+        if channel is None or loop is None or not loop.is_running():
+            return False
+        summary = plan.safe_public_summary()
+        if float(summary["expires_at"]) <= time.time():
+            return False
+        frame = {
+            "type": "mcp_confirm_request",
+            "id": str(summary["request_id"]),
+            "server": "osia",
+            "tool": "colossal_deletion",
+            "summary": "Complete review required locally on the PC",
+            "confirmation_kind": "colossal_deletion_pc_only",
+            "can_approve": False,
+            "files_count": int(summary["files_count"]),
+            "folders_count": int(summary["folders_count"]),
+            "total_bytes": int(summary["total_bytes"]),
+            "root_count": int(summary["root_count"]),
+            "safe_reason": "colossal_deletion",
+            "expires_at": float(summary["expires_at"]),
+        }
+        future = asyncio.run_coroutine_threadsafe(channel.send_json(frame), loop)
+        future.result(timeout=2.0)
+    except Exception:
+        pass
+    # Phase 2 mobile is never an authorization owner.  The request id is not
+    # entered in _pending_confirms, so old clients also fail closed.
+    return False
+
+
 @app.on_event("startup")
 async def _reconcile_legacy_uploads_at_startup() -> None:
     """Remove only server-owned legacy orphans from the dedicated directory."""
@@ -2991,6 +3032,12 @@ async def _register_mcp_confirm_provider() -> None:
     try:
         from osia.mcp_client import registry as _mcp_registry
         _mcp_registry.set_confirmation_provider(_ws_confirm_provider)
+        from osia.action_policy import (
+            set_reinforced_deletion_confirmation_provider,
+        )
+        set_reinforced_deletion_confirmation_provider(
+            _ws_reinforced_deletion_provider
+        )
         print("[OSIA Server] MCP write-tool confirmation provider registered (WS).")
     except Exception as e:
         print(f"[OSIA Server] MCP confirm provider not registered: {e}")

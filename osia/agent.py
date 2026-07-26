@@ -802,6 +802,44 @@ def _run_windows_powershell(command: str, timeout_s: float) -> subprocess.Comple
         _cleanup_temp_powershell_script(script_path)
 
 
+def _authorized_shell_deletion(
+    tool_name: str,
+    command: str,
+    timeout=None,
+) -> tuple[bool, str]:
+    """Route exact deletion commands through the sealed DeletionPlan path."""
+
+    try:
+        from osia.action_policy import (
+            execute_authorized_deletion_call,
+            system_mutation_barrier,
+        )
+        from osia.deletion_plan import DeletionPlanError, parse_shell_deletion
+
+        mutation_error = system_mutation_barrier(
+            tool_name,
+            {"command": command, **({"timeout": timeout} if timeout is not None else {})},
+        )
+        if mutation_error is not None:
+            return True, mutation_error
+        spec = parse_shell_deletion(command)
+    except DeletionPlanError as exc:
+        return True, f"ERROR: DELETION_PREFLIGHT_REQUIRED ({exc.code})"
+    except Exception:
+        return True, "ERROR: deletion preflight unavailable; the command was not run"
+    if spec is None:
+        return False, ""
+    arguments = {"command": command}
+    if timeout is not None:
+        arguments["timeout"] = timeout
+    return True, execute_authorized_deletion_call(
+        tool_name,
+        arguments,
+        directory=spec.directory_operation,
+        recursive=spec.recursive,
+    )
+
+
 def tool_bash(command: str, timeout=None) -> str:
     """Execute a bash command and return stdout + stderr (truncated).
 
@@ -814,6 +852,11 @@ def tool_bash(command: str, timeout=None) -> str:
     result reports how long the command actually took, so a slow install is
     waited out instead of failing blindly (WOR-31).
     """
+    handled, deletion_result = _authorized_shell_deletion(
+        "bash", command, timeout,
+    )
+    if handled:
+        return deletion_result
     try:
         timeout_s = _command_timeout_seconds(timeout)
     except ValueError as e:
@@ -969,6 +1012,13 @@ def tool_write_file(path: str, content: str) -> str:
     if not os.path.isabs(path):
         path = os.path.join(_PROJECT_DIR, path)
     try:
+        from osia.action_policy import system_mutation_barrier
+
+        blocked = system_mutation_barrier(
+            "write_file", {"path": path, "content": content},
+        )
+        if blocked is not None:
+            return blocked
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -1500,14 +1550,25 @@ def tool_delete_file(path: str) -> str:
     if not os.path.isabs(path):
         path = os.path.join(_PROJECT_DIR, path)
     try:
-        os.remove(path)
-        return f"Deleted: {path}"
-    except Exception as e:
-        return f"ERROR: deleting {path}: {e}"
+        from osia.action_policy import execute_authorized_deletion_call
+
+        return execute_authorized_deletion_call(
+            "delete_file",
+            {"path": path},
+            directory=False,
+            recursive=False,
+        )
+    except Exception:
+        return "ERROR: deletion dispatch unavailable; nothing was deleted"
 
 
 def tool_run_command(command: str, timeout=None) -> str:
     """Run a bash command and return its output. Alias for bash."""
+    handled, deletion_result = _authorized_shell_deletion(
+        "run_command", command, timeout,
+    )
+    if handled:
+        return deletion_result
     return tool_bash(command, timeout=timeout)
 
 
@@ -1796,17 +1857,16 @@ def tool_delete_directory(path: str, recursive: bool = False) -> str:
     """
     path = _abs(path)
     try:
-        if recursive:
-            shutil.rmtree(path)
-            return f"Recursively deleted directory: {path}"
-        os.rmdir(path)
-        return f"Deleted (empty) directory: {path}"
-    except FileNotFoundError:
-        return f"ERROR: {path} does not exist"
-    except OSError as e:
-        return f"ERROR: deleting {path}: {e} (use recursive=true to remove non-empty dirs)"
-    except Exception as e:
-        return f"ERROR: deleting {path}: {e}"
+        from osia.action_policy import execute_authorized_deletion_call
+
+        return execute_authorized_deletion_call(
+            "delete_directory",
+            {"path": path, "recursive": bool(recursive)},
+            directory=True,
+            recursive=bool(recursive),
+        )
+    except Exception:
+        return "ERROR: deletion dispatch unavailable; nothing was deleted"
 
 
 def tool_rename_file(old_path: str, new_path: str) -> str:
@@ -1814,6 +1874,13 @@ def tool_rename_file(old_path: str, new_path: str) -> str:
     src = _abs(old_path)
     dst = _abs(new_path)
     try:
+        from osia.action_policy import system_mutation_barrier
+
+        blocked = system_mutation_barrier(
+            "rename_file", {"old_path": src, "new_path": dst},
+        )
+        if blocked is not None:
+            return blocked
         os.rename(src, dst)
         return f"Renamed: {src} -> {dst}"
     except Exception as e:
@@ -1950,6 +2017,22 @@ def tool_edit_file_lines(path: str, start_line: int, end_line: int, new_content:
         return f"ERROR: start_line and end_line must be integers"
     if start < 1 or end < start:
         return f"ERROR: invalid range start_line={start}, end_line={end}"
+    try:
+        from osia.action_policy import system_mutation_barrier
+
+        blocked = system_mutation_barrier(
+            "edit_file_lines",
+            {
+                "path": path,
+                "start_line": start,
+                "end_line": end,
+                "new_content": new_content,
+            },
+        )
+        if blocked is not None:
+            return blocked
+    except Exception:
+        return "ERROR: BLOCK_SYSTEM_DESTRUCTION"
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
@@ -3491,13 +3574,37 @@ def _execute_tool_once_record(
         return ToolExecutionRecord(text, True, outcome, 1, True, False, contract)
 
     is_error = _is_tool_error(result)
+    proven_before_effect = False
     if is_error:
-        text = _result_text(result).lower()
+        text = _result_text(result).lower().strip()
         timed_out = "timed out" in text or "timeout" in text
+        deletion_call = tool_name in {"delete_file", "delete_directory"}
+        if tool_name in {"bash", "run_command"}:
+            try:
+                from osia.deletion_plan import parse_shell_deletion
+
+                deletion_call = parse_shell_deletion(
+                    str(kwargs.get("command") or "")
+                ) is not None
+            except Exception:
+                deletion_call = False
+        proven_before_effect = (
+            deletion_call
+            and (
+                text == "error: deletion_plan_changed_requires_new_confirmation"
+                or (
+                    text.startswith("error: deletion blocked before i/o (")
+                    and text.endswith(")")
+                )
+                or text == (
+                    "error: deletion authorization unavailable; nothing was deleted"
+                )
+            )
+        )
         outcome = (
-            ExecutionOutcome.OUTCOME_UNKNOWN
-            if contract.side_effect != SideEffectClass.READ_ONLY
-            else ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
+            ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
+            if proven_before_effect or contract.side_effect == SideEffectClass.READ_ONLY
+            else ExecutionOutcome.OUTCOME_UNKNOWN
         )
     else:
         timed_out = False
@@ -3508,7 +3615,11 @@ def _execute_tool_once_record(
             else ExecutionOutcome.SUCCESS_UNVERIFIED
         )
     return ToolExecutionRecord(
-        result, is_error, outcome, 1, True, timed_out, contract,
+        result, is_error, outcome,
+        0 if proven_before_effect else 1,
+        not proven_before_effect,
+        timed_out,
+        contract,
     )
 
 

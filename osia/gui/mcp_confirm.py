@@ -193,6 +193,21 @@ class MCPConfirmController(QObject):
         # makes concurrent providers safe (the 2nd waits for the 1st to resolve).
         self._gate_lock = threading.Lock()
         self._request.connect(self._show_dialog)
+        # The stronger deletion owner shares the same GUI-thread lifetime but
+        # keeps its private plan and non-truncating view in a dedicated module.
+        self._deletion_controller = None
+        try:
+            from osia.action_policy import (
+                set_reinforced_deletion_confirmation_provider,
+            )
+            from osia.gui.deletion_confirm import DeletionConfirmController
+
+            self._deletion_controller = DeletionConfirmController(parent_window)
+            set_reinforced_deletion_confirmation_provider(
+                self._deletion_controller.confirm
+            )
+        except Exception:
+            self._deletion_controller = None
 
     # ── Provider entry point (CALLED ON THE WORKER THREAD) ───────────────────
     def confirm(self, server_id: str, tool_name: str, summary: str) -> bool:

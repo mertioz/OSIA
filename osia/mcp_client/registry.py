@@ -344,6 +344,7 @@ def _make_wrapper(
     tool_name: str,
     is_write: bool = False,
     input_schema: Optional[dict] = None,
+    is_deletion: bool = False,
 ):
     """Build the SYNC tool callable registered into TOOL_MAP.
 
@@ -368,10 +369,32 @@ def _make_wrapper(
             kwargs = validate_arguments(input_schema or {}, kwargs)
         except Exception:
             return "ERROR: invalid MCP tool arguments; the tool was not executed"
+        deletion_dispatch = None
         if is_write:
+            try:
+                from osia.action_policy import system_mutation_barrier
+
+                system_block = system_mutation_barrier(tool_name, kwargs)
+            except Exception:
+                system_block = "ERROR: BLOCK_SYSTEM_DESTRUCTION"
+            if system_block is not None:
+                return system_block
+        if is_deletion:
+            try:
+                from osia.action_policy import authorize_mcp_deletion_call
+
+                blocked = authorize_mcp_deletion_call(
+                    server_id, tool_name, kwargs,
+                )
+            except Exception:
+                blocked = "ERROR: MCP deletion preflight unavailable"
+            if blocked is not None:
+                return blocked
+        elif is_write:
             blocked = _confirm_gate(server_id, tool_name, kwargs)
             if blocked is not None:
                 return blocked
+        if is_write:
             try:
                 from osia.action_policy import consume_pending_execution_permit
 
@@ -384,9 +407,34 @@ def _make_wrapper(
                 return (
                     f"ERROR: mcp/{server_id}/{tool_name}: execution permit unavailable"
                 )
-        return manager.call_tool(
-            server_id, tool_name, kwargs, timeout=WRAPPER_CALL_TIMEOUT
-        )
+        if is_deletion:
+            try:
+                from osia.action_policy import begin_external_deletion_dispatch
+
+                deletion_dispatch = begin_external_deletion_dispatch(
+                    tool_full_name(server_id, tool_name), kwargs,
+                )
+            except Exception:
+                return (
+                    f"ERROR: mcp/{server_id}/{tool_name}: "
+                    "deletion plan changed or permit unavailable"
+                )
+        try:
+            result = manager.call_tool(
+                server_id, tool_name, kwargs, timeout=WRAPPER_CALL_TIMEOUT
+            )
+        except Exception:
+            if deletion_dispatch is None:
+                return f"ERROR: mcp/{server_id}/{tool_name}: dispatch failed"
+            result = None
+        if deletion_dispatch is not None:
+            try:
+                from osia.action_policy import external_deletion_result
+
+                return external_deletion_result(deletion_dispatch, result)
+            except Exception:
+                return "ERROR: OUTCOME_UNKNOWN"
+        return result
 
     _mcp_tool.__name__ = "tool_" + tool_full_name(server_id, tool_name)
     _mcp_tool.__qualname__ = _mcp_tool.__name__
@@ -484,8 +532,19 @@ def register_server_tools(manager: Any, server_id: str, tools) -> list:
         # Classify ONCE at registration; the result is baked into the wrapper
         # closure (the hot path never re-classifies).
         is_write = classify_tool(name, annotations)
+        is_deletion = bool(
+            annotations.get("destructiveHint") is True
+            or re.search(r"(?:^|_)(?:delete|remove|erase|destroy)(?:_|$)", name, re.IGNORECASE)
+        )
+        if is_deletion:
+            is_write = True
         new_callables[full] = _make_wrapper(
-            manager, server_id, name, is_write, t.get("inputSchema") or {}
+            manager,
+            server_id,
+            name,
+            is_write,
+            t.get("inputSchema") or {},
+            is_deletion,
         )
         new_meta[full] = {
             "server": server_id,
@@ -494,6 +553,7 @@ def register_server_tools(manager: Any, server_id: str, tools) -> list:
             "inputSchema": t.get("inputSchema") or {},
             "annotations": annotations,
             "is_write": is_write,
+            "is_deletion": is_deletion,
         }
 
     with _lock:
