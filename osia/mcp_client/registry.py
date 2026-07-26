@@ -158,6 +158,7 @@ def confirm_sensitive_action(
     summary: str,
     *,
     call_arguments: Optional[dict] = None,
+    policy_tool_name: str = "",
 ) -> Optional[str]:
     """Obtain one exact approval for a known sensitive-action domain.
 
@@ -168,9 +169,55 @@ def confirm_sensitive_action(
     if not isinstance(domain, ConfirmationDomain):
         return "ERROR: confirmation domain unavailable; the action was not executed"
     error_namespace = domain.value
+    normalized = dict(call_arguments) if isinstance(call_arguments, dict) else {}
+    try:
+        from osia.action_policy import (
+            AuthorizationSource,
+            DecisionType,
+            build_permission_request,
+            clear_pending_execution_permit,
+            evaluate_permission,
+            get_default_permission_policy,
+            hold_execution_permit,
+            permission_error_for_decision,
+        )
+
+        clear_pending_execution_permit()
+        policy = get_default_permission_policy()
+        request = build_permission_request(
+            policy_tool_name or tool_name,
+            normalized,
+            confirmation_domain=domain.value,
+            origin_id=origin_id,
+            force_sensitive=True,
+            policy=policy,
+        )
+        permission_decision = evaluate_permission(request, policy=policy)
+    except Exception:
+        return (
+            f"ERROR: {error_namespace}/{origin_id}/{tool_name}: "
+            "confirmation scope unavailable"
+        )
+
+    if permission_decision.decision_type == DecisionType.ALLOW:
+        if permission_decision.authorization_source == AuthorizationSource.NONE:
+            return (
+                f"ERROR: {error_namespace}/{origin_id}/{tool_name}: "
+                "confirmation scope unavailable"
+            )
+        permit = policy.mint_permit(request, permission_decision)
+        if permit is None:
+            return (
+                f"ERROR: {error_namespace}/{origin_id}/{tool_name}: "
+                "confirmation scope unavailable"
+            )
+        hold_execution_permit(permit, request, policy=policy)
+        return None
+    if permission_decision.decision_type != DecisionType.REQUIRE_CONFIRMATION:
+        return permission_error_for_decision(permission_decision)
+
     provider = get_confirmation_provider()
     if provider is not None:
-        normalized = dict(call_arguments) if isinstance(call_arguments, dict) else {}
         try:
             from osia.tool_contracts import CONFIRMATION_LEDGER
 
@@ -191,7 +238,12 @@ def confirm_sensitive_action(
                 if CONFIRMATION_LEDGER.consume(
                     grant.token, tool_name, normalized,
                 ):
-                    return None
+                    permit = policy.mint_permit(
+                        request, permission_decision, confirmed=True,
+                    )
+                    if permit is not None:
+                        hold_execution_permit(permit, request, policy=policy)
+                        return None
                 return (
                     f"ERROR: {error_namespace}/{origin_id}/{tool_name}: "
                     "confirmation scope unavailable"
@@ -214,6 +266,7 @@ def confirm_connector_write(
     *,
     error_namespace: str = "connector",
     call_arguments: Optional[dict] = None,
+    policy_tool_name: str = "",
 ) -> Optional[str]:
     """MCP-specific compatibility wrapper around the shared exact gate.
 
@@ -227,6 +280,7 @@ def confirm_connector_write(
         tool_name,
         summary,
         call_arguments=call_arguments,
+        policy_tool_name=policy_tool_name,
     )
 
 
@@ -241,6 +295,7 @@ def _confirm_gate(server_id: str, tool_name: str, kwargs: dict) -> Optional[str]
         _confirm_summary(server_id, tool_name, kwargs),
         error_namespace="mcp",
         call_arguments=kwargs,
+        policy_tool_name=tool_full_name(server_id, tool_name),
     )
 
 
@@ -317,6 +372,18 @@ def _make_wrapper(
             blocked = _confirm_gate(server_id, tool_name, kwargs)
             if blocked is not None:
                 return blocked
+            try:
+                from osia.action_policy import consume_pending_execution_permit
+
+                permitted = consume_pending_execution_permit(
+                    tool_full_name(server_id, tool_name), kwargs,
+                )
+            except Exception:
+                permitted = False
+            if not permitted:
+                return (
+                    f"ERROR: mcp/{server_id}/{tool_name}: execution permit unavailable"
+                )
         return manager.call_tool(
             server_id, tool_name, kwargs, timeout=WRAPPER_CALL_TIMEOUT
         )

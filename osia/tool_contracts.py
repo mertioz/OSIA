@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import inspect
 import json
 import math
@@ -1036,6 +1037,7 @@ def normalized_call_hash(tool_name: str, arguments: Mapping[str, Any]) -> str:
     payload = json.dumps(
         {"tool": str(tool_name), "arguments": dict(arguments)},
         sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8", errors="replace")
     return hashlib.sha256(payload).hexdigest()
 
@@ -1081,7 +1083,9 @@ class ConfirmationLedger:
         return bool(
             grant is not None
             and grant.expires_at >= self._clock()
-            and grant.call_hash == normalized_call_hash(tool_name, arguments)
+            and hmac.compare_digest(
+                grant.call_hash, normalized_call_hash(tool_name, arguments)
+            )
         )
 
     def _purge_locked(self) -> None:
@@ -1105,7 +1109,9 @@ def confirmed_call_scope(tool_name: str, arguments: Mapping[str, Any]):
 
 
 def current_call_is_confirmed(tool_name: str, arguments: Mapping[str, Any]) -> bool:
-    return _approved_call.get() == normalized_call_hash(tool_name, arguments)
+    return hmac.compare_digest(
+        _approved_call.get(), normalized_call_hash(tool_name, arguments)
+    )
 
 
 def safe_confirmation_summary(

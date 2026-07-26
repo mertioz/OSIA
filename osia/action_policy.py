@@ -9,9 +9,35 @@ reliably before executing a tool call.
 from __future__ import annotations
 
 import re
+import math
+import json
+import secrets
+import threading
+import time
 import unicodedata
-from dataclasses import dataclass
+import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from enum import Enum
+from typing import Any, Mapping, TYPE_CHECKING
+
+from osia.scope_normalization import (
+    NormalizedScope,
+    ScopeNormalizationError,
+    canonical_hash,
+    canonical_serialize,
+    combine_scopes,
+    normalize_exact_call_scope,
+    normalize_file_scope,
+    normalize_gmail_scope,
+    normalize_mcp_scope,
+    normalized_scope_from_protected,
+    sensitive_hash_equal,
+)
+
+if TYPE_CHECKING:
+    from osia.permission_store import PermissionStore
 
 
 class ActionClass(str, Enum):
@@ -363,6 +389,54 @@ def _confirm_irreversible(
         return "ERROR: action confirmation is unavailable; the action was not executed"
 
 
+def _confirmation_with_permit(
+    decision: ActionDecision,
+    tool_name: str,
+    kwargs: dict,
+) -> str | None:
+    blocked = _confirm_irreversible(decision, tool_name, kwargs)
+    if blocked is not None:
+        return blocked
+    try:
+        if ensure_confirmed_execution_permit(tool_name, kwargs):
+            return None
+    except Exception:
+        pass
+    return "ERROR: execution permit unavailable; the action was not executed"
+
+
+def _explicit_central_authority(
+    tool_name: str,
+    kwargs: Mapping[str, Any],
+) -> bool:
+    """Mint a permit only for an exact grant or Full Access decision."""
+
+    try:
+        policy = get_default_permission_policy()
+        request = build_permission_request(
+            tool_name,
+            kwargs,
+            confirmation_domain="action",
+            origin_id="osia",
+            force_sensitive=True,
+            policy=policy,
+        )
+        permission_decision = policy.evaluate(request)
+        if (
+            permission_decision.decision_type != DecisionType.ALLOW
+            or permission_decision.authorization_source
+            not in {AuthorizationSource.GRANT, AuthorizationSource.FULL_ACCESS}
+        ):
+            return False
+        permit = policy.mint_permit(request, permission_decision)
+        if permit is None:
+            return False
+        hold_execution_permit(permit, request, policy=policy)
+        return True
+    except Exception:
+        return False
+
+
 def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | None:
     """Return an ``ERROR:`` string when a recognized action must not execute.
 
@@ -374,10 +448,12 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
     values = kwargs if isinstance(kwargs, dict) else {}
 
     if decision.action_class == ActionClass.DISALLOWED and tool not in _READ_ONLY_TOOLS:
-        return f"ERROR: action blocked for safety: {decision.reason}"
+        if not _explicit_central_authority(tool, values):
+            return f"ERROR: action blocked for safety: {decision.reason}"
+        return None
 
     if tool in _LOCAL_CONFIRM_TOOLS:
-        return _confirm_irreversible(decision, tool, values)
+        return _confirmation_with_permit(decision, tool, values)
 
     # Contract-driven gates complement the semantic final-step detector. Gmail
     # and MCP wrappers retain ownership of their established confirmation flow
@@ -403,7 +479,7 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
     wrapper_owns_confirmation = tool.startswith("gmail_") or tool.startswith("mcp__")
     if requires_contract_confirmation and not wrapper_owns_confirmation:
         if not _is_final_external_step(decision, tool, values):
-            return _confirm_irreversible(decision, tool, values)
+            return _confirmation_with_permit(decision, tool, values)
 
     if not _is_final_external_step(decision, tool, values):
         return None
@@ -419,7 +495,7 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
         return "ERROR: the user requested a draft, not the final Send action"
     if decision.outcome == ActionOutcome.BLOCK:
         return f"ERROR: action blocked for safety: {decision.reason}"
-    return _confirm_irreversible(decision, tool, values)
+    return _confirmation_with_permit(decision, tool, values)
 
 
 def is_final_external_tool_call(
@@ -434,3 +510,1525 @@ def is_final_external_tool_call(
         str(tool_name or ""),
         kwargs if isinstance(kwargs, dict) else {},
     )
+
+
+# ---------------------------------------------------------------------------
+# WOR-192 central typed permission core
+# ---------------------------------------------------------------------------
+
+PERMISSION_SCHEMA_VERSION = 1
+GRANT_SCHEMA_VERSION = 1
+PERMIT_SCHEMA_VERSION = 1
+POLICY_VERSION = "wor192-phase1-v1"
+
+
+class PermissionMode(str, Enum):
+    ASK = "ask"
+    TASK_SCOPED = "task_scoped"
+    FULL_ACCESS = "full_access"
+
+
+class ExecutionType(str, Enum):
+    CHAT = "chat"
+    AUTONOMOUS = "autonomous"
+    SCHEDULED = "scheduled"
+
+
+class DecisionType(str, Enum):
+    ALLOW = "allow"
+    REQUIRE_CONFIRMATION = "require_confirmation"
+    REQUIRE_REINFORCED_CONFIRMATION = "require_reinforced_confirmation"
+    SUSPEND_SCOPE_EXTENSION = "suspend_scope_extension"
+    DENY = "deny"
+    BLOCK_SYSTEM_DESTRUCTION = "block_system_destruction"
+    REQUIRE_COLOSSAL_DELETION_CONFIRMATION = (
+        "require_colossal_deletion_confirmation"
+    )
+
+
+class AuthorizationSource(str, Enum):
+    NONE = "none"
+    CONFIRMATION = "confirmation"
+    GRANT = "grant"
+    FULL_ACCESS = "full_access"
+
+
+class UsePolicy(str, Enum):
+    SINGLE = "single"
+    BOUNDED = "bounded"
+    RECURRING = "recurring"
+
+
+def _validate_constraint_mapping(
+    values: Mapping[str, Any], *, grant: bool,
+) -> dict[str, Any]:
+    if not isinstance(values, Mapping):
+        raise ValueError("invalid_permission_constraints")
+    allowed = (
+        {"allowed", "max_amount_minor", "currency"}
+        if grant else
+        {
+            "allowed", "max_amount_minor", "amount_minor", "currency",
+            "request_currency",
+        }
+    )
+    normalized = dict(values)
+    if set(normalized) - allowed:
+        raise ValueError("unknown_permission_constraint")
+    if "allowed" in normalized and not isinstance(normalized["allowed"], bool):
+        raise ValueError("invalid_allowed_constraint")
+    for name in ("max_amount_minor", "amount_minor"):
+        if name in normalized and (
+            type(normalized[name]) is not int or normalized[name] < 0
+        ):
+            raise ValueError("invalid_amount_constraint")
+    for name in ("currency", "request_currency"):
+        if name in normalized and (
+            not isinstance(normalized[name], str)
+            or not re.fullmatch(r"[A-Za-z]{3}", normalized[name])
+        ):
+            raise ValueError("invalid_currency_constraint")
+    return normalized
+
+
+_OPAQUE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+
+
+def _require_opaque_ref(value: str, *, optional: bool = False) -> str:
+    candidate = str(value or "")
+    if optional and not candidate:
+        return ""
+    if not _OPAQUE_REF_RE.fullmatch(candidate):
+        raise ValueError("invalid_opaque_reference")
+    return candidate
+
+
+@dataclass(frozen=True)
+class ExecutionContext:
+    execution_id: str
+    execution_type: ExecutionType
+    interactive: bool
+    owner_ref: str
+    machine_ref: str
+    operation_id: str
+    policy_epoch: int
+    device_ref: str = ""
+    run_id: str = ""
+    scheduled_task_id: str = ""
+    task_revision: str = ""
+    plan_revision: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.execution_type, ExecutionType):
+            raise ValueError("invalid_execution_type")
+        if not isinstance(self.interactive, bool):
+            raise ValueError("invalid_interactive_state")
+        for field_name in ("execution_id", "owner_ref", "machine_ref", "operation_id"):
+            _require_opaque_ref(getattr(self, field_name))
+        for field_name in (
+            "device_ref", "run_id", "scheduled_task_id", "task_revision",
+            "plan_revision",
+        ):
+            _require_opaque_ref(getattr(self, field_name), optional=True)
+        if type(self.policy_epoch) is not int or self.policy_epoch < 0:
+            raise ValueError("invalid_policy_epoch")
+
+    def public_metadata(self) -> dict[str, Any]:
+        return {
+            "execution_id": self.execution_id,
+            "execution_type": self.execution_type.value,
+            "interactive": self.interactive,
+            "operation_id": self.operation_id,
+            "policy_epoch": self.policy_epoch,
+        }
+
+
+_CLASSIFICATION_SEAL = object()
+
+
+@dataclass(frozen=True, repr=False)
+class TrustedDeletionClassification:
+    system_destruction: bool
+    colossal_deletion: bool
+    _seal: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._seal is not _CLASSIFICATION_SEAL:
+            raise ValueError("untrusted_deletion_classification")
+
+    def __repr__(self) -> str:
+        return (
+            "TrustedDeletionClassification("
+            f"system_destruction={self.system_destruction!r}, "
+            f"colossal_deletion={self.colossal_deletion!r})"
+        )
+
+
+def trusted_deletion_classification(
+    *,
+    system_destruction: bool = False,
+    colossal_deletion: bool = False,
+) -> TrustedDeletionClassification:
+    """Trusted planner boundary; free-form model labels are never accepted."""
+
+    if not isinstance(system_destruction, bool) or not isinstance(
+        colossal_deletion, bool
+    ):
+        raise ValueError("classification_must_be_boolean")
+    return TrustedDeletionClassification(
+        system_destruction=system_destruction,
+        colossal_deletion=colossal_deletion,
+        _seal=_CLASSIFICATION_SEAL,
+    )
+
+
+TRUSTED_CLEAR_CLASSIFICATION = trusted_deletion_classification()
+
+
+@dataclass(frozen=True, repr=False)
+class PermissionRequest:
+    tool_identity: str
+    confirmation_domain: str
+    tool_spec: Any = field(repr=False)
+    effective_contract: Any = field(repr=False)
+    capability: str
+    private_scope: NormalizedScope = field(repr=False)
+    safe_category: str
+    effect_class: str
+    normalized_call_hash: str = field(repr=False)
+    deletion_classification: TrustedDeletionClassification
+    operation_id: str
+    execution_context: ExecutionContext
+    tool_category: str
+    optional_constraints: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    ambiguous_legacy_identity: bool = False
+
+    def __post_init__(self) -> None:
+        from osia.tool_contracts import EffectiveToolContract, ToolSpec
+
+        if not isinstance(self.tool_spec, ToolSpec):
+            raise ValueError("invalid_tool_spec")
+        if not isinstance(self.effective_contract, EffectiveToolContract):
+            raise ValueError("invalid_effective_tool_contract")
+        if self.effective_contract.spec.name != self.tool_spec.name:
+            raise ValueError("tool_contract_mismatch")
+        if self.tool_identity != self.tool_spec.name:
+            raise ValueError("tool_identity_mismatch")
+        if self.capability != self.tool_spec.capability:
+            raise ValueError("capability_mismatch")
+        if self.effect_class != self.effective_contract.side_effect.value:
+            raise ValueError("effect_class_mismatch")
+        if self.safe_category != self.private_scope.safe_category:
+            raise ValueError("safe_category_mismatch")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.normalized_call_hash):
+            raise ValueError("invalid_call_hash")
+        if not isinstance(
+            self.deletion_classification, TrustedDeletionClassification
+        ):
+            raise ValueError("untrusted_deletion_classification")
+        if self.operation_id != self.execution_context.operation_id:
+            raise ValueError("operation_context_mismatch")
+        _require_opaque_ref(self.operation_id)
+        _require_opaque_ref(self.confirmation_domain)
+        _require_opaque_ref(self.tool_category)
+        _validate_constraint_mapping(self.optional_constraints, grant=False)
+        if not isinstance(self.ambiguous_legacy_identity, bool):
+            raise ValueError("invalid_legacy_identity_state")
+
+    @property
+    def system_destruction(self) -> bool:
+        return self.deletion_classification.system_destruction
+
+    @property
+    def colossal_deletion(self) -> bool:
+        return self.deletion_classification.colossal_deletion
+
+    @property
+    def scope_hash(self) -> str:
+        return self.private_scope.scope_hash
+
+    def public_metadata(self) -> dict[str, Any]:
+        return {
+            "tool_identity": self.tool_identity,
+            "confirmation_domain": self.confirmation_domain,
+            "capability": self.capability,
+            "safe_category": self.safe_category,
+            "effect_class": self.effect_class,
+            "operation_id": self.operation_id,
+            "execution_type": self.execution_context.execution_type.value,
+        }
+
+
+@dataclass(frozen=True)
+class PermissionDecision:
+    decision_type: DecisionType
+    reason_code: str
+    authorization_source: AuthorizationSource
+    grant_ref: str
+    policy_epoch: int
+    execution_type: ExecutionType
+    safe_category: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.decision_type, DecisionType):
+            raise ValueError("invalid_decision_type")
+        if not isinstance(self.authorization_source, AuthorizationSource):
+            raise ValueError("invalid_authorization_source")
+        if not isinstance(self.execution_type, ExecutionType):
+            raise ValueError("invalid_execution_type")
+        _require_opaque_ref(self.reason_code)
+        _require_opaque_ref(self.grant_ref, optional=True)
+        if type(self.policy_epoch) is not int or self.policy_epoch < 0:
+            raise ValueError("invalid_policy_epoch")
+
+
+@dataclass(frozen=True, repr=False)
+class Grant:
+    schema_version: int
+    grant_id: str
+    permission_mode: PermissionMode
+    execution_type: ExecutionType
+    owner_ref: str
+    machine_ref: str
+    device_ref: str
+    run_id: str
+    scheduled_task_id: str
+    task_revision: str
+    plan_revision: str
+    tool_category: str
+    effect_class: str
+    capability: str
+    normalized_target_scope: NormalizedScope = field(repr=False)
+    constraints_canonical: str = field(repr=False)
+    issued_at: float
+    expires_at: float | None
+    persistent: bool
+    use_policy: UsePolicy
+    max_uses: int | None
+    use_count: int
+    revocation_epoch: int
+    policy_version: str
+    scope_hash: str = field(repr=False)
+    call_hash: str = field(repr=False)
+    identity_version: str
+    integrity_metadata: str = field(repr=False)
+    last_use_metadata_canonical: str = field(default="{}", repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != GRANT_SCHEMA_VERSION:
+            raise ValueError("unsupported_grant_schema")
+        if not isinstance(self.permission_mode, PermissionMode):
+            raise ValueError("invalid_grant_permission_mode")
+        if self.permission_mode != PermissionMode.TASK_SCOPED:
+            raise ValueError("grant_must_be_task_scoped")
+        if not isinstance(self.execution_type, ExecutionType):
+            raise ValueError("invalid_grant_execution_type")
+        if not isinstance(self.use_policy, UsePolicy):
+            raise ValueError("invalid_use_policy")
+        if not isinstance(self.persistent, bool):
+            raise ValueError("invalid_grant_persistence")
+        for field_name in (
+            "grant_id", "owner_ref", "machine_ref", "tool_category",
+            "effect_class", "identity_version",
+        ):
+            _require_opaque_ref(getattr(self, field_name))
+        if (
+            not isinstance(self.capability, str)
+            or not self.capability
+            or len(self.capability) > 512
+            or any(ord(ch) < 32 for ch in self.capability)
+        ):
+            raise ValueError("invalid_capability")
+        for field_name in (
+            "device_ref", "run_id", "scheduled_task_id", "task_revision",
+            "plan_revision",
+        ):
+            _require_opaque_ref(getattr(self, field_name), optional=True)
+        if (
+            type(self.issued_at) is not float
+            or not math.isfinite(self.issued_at)
+        ):
+            raise ValueError("invalid_grant_issue_time")
+        if self.expires_at is not None and (
+            type(self.expires_at) is not float
+            or not math.isfinite(self.expires_at)
+        ):
+            raise ValueError("invalid_grant_expiration")
+        if self.expires_at is not None and self.expires_at <= self.issued_at:
+            raise ValueError("invalid_grant_expiration")
+        if (
+            type(self.use_count) is not int
+            or type(self.revocation_epoch) is not int
+            or self.use_count < 0
+            or self.revocation_epoch < 0
+        ):
+            raise ValueError("invalid_grant_counter")
+        if self.max_uses is not None and type(self.max_uses) is not int:
+            raise ValueError("invalid_grant_max_uses")
+        if self.use_policy == UsePolicy.SINGLE and self.max_uses != 1:
+            raise ValueError("single_use_requires_one")
+        if self.use_policy == UsePolicy.BOUNDED and (
+            self.max_uses is None or self.max_uses < 1
+        ):
+            raise ValueError("bounded_use_requires_max")
+        if self.use_policy == UsePolicy.RECURRING and self.max_uses is not None:
+            raise ValueError("recurring_use_has_no_max")
+        if self.max_uses is not None and self.use_count > self.max_uses:
+            raise ValueError("grant_use_count_exceeded")
+        if not sensitive_hash_equal(self.scope_hash, self.normalized_target_scope.scope_hash):
+            raise ValueError("grant_scope_hash_mismatch")
+        for value, code in (
+            (self.call_hash, "invalid_grant_call_hash"),
+            (self.integrity_metadata, "invalid_grant_integrity"),
+        ):
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ValueError(code)
+        _validate_constraint_mapping(
+            json_loads_canonical(self.constraints_canonical), grant=True,
+        )
+        canonical_serialize(json_loads_canonical(self.last_use_metadata_canonical))
+
+    @property
+    def constraints(self) -> dict[str, Any]:
+        return json_loads_canonical(self.constraints_canonical)
+
+    @property
+    def exhausted(self) -> bool:
+        return self.max_uses is not None and self.use_count >= self.max_uses
+
+    def _integrity_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "grant_id": self.grant_id,
+            "permission_mode": self.permission_mode.value,
+            "execution_type": self.execution_type.value,
+            "owner_ref": self.owner_ref,
+            "machine_ref": self.machine_ref,
+            "device_ref": self.device_ref,
+            "run_id": self.run_id,
+            "scheduled_task_id": self.scheduled_task_id,
+            "task_revision": self.task_revision,
+            "plan_revision": self.plan_revision,
+            "tool_category": self.tool_category,
+            "effect_class": self.effect_class,
+            "capability": self.capability,
+            "normalized_target_scope": self.normalized_target_scope.protected_payload(),
+            "constraints": self.constraints,
+            "issued_at": self.issued_at,
+            "expires_at": self.expires_at,
+            "persistent": self.persistent,
+            "use_policy": self.use_policy.value,
+            "max_uses": self.max_uses,
+            "use_count": self.use_count,
+            "revocation_epoch": self.revocation_epoch,
+            "policy_version": self.policy_version,
+            "scope_hash": self.scope_hash,
+            "call_hash": self.call_hash,
+            "identity_version": self.identity_version,
+            "last_use_metadata": json_loads_canonical(
+                self.last_use_metadata_canonical
+            ),
+        }
+
+    def integrity_is_valid(self) -> bool:
+        return sensitive_hash_equal(
+            self.integrity_metadata, canonical_hash(self._integrity_payload())
+        )
+
+    def to_protected_dict(self) -> dict[str, Any]:
+        payload = self._integrity_payload()
+        payload["integrity_metadata"] = self.integrity_metadata
+        return payload
+
+    def public_metadata(self) -> dict[str, Any]:
+        return {
+            "grant_ref": self.grant_id,
+            "execution_type": self.execution_type.value,
+            "tool_category": self.tool_category,
+            "effect_class": self.effect_class,
+            "capability": self.capability,
+            "expires_at": self.expires_at,
+            "persistent": self.persistent,
+            "use_policy": self.use_policy.value,
+            "max_uses": self.max_uses,
+            "use_count": self.use_count,
+            "revocation_epoch": self.revocation_epoch,
+            "policy_version": self.policy_version,
+            "safe_category": self.normalized_target_scope.safe_category,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            "Grant("
+            f"grant_id={self.grant_id!r}, execution_type={self.execution_type!r}, "
+            f"tool_category={self.tool_category!r}, capability={self.capability!r}, "
+            f"safe_category={self.normalized_target_scope.safe_category!r}, "
+            f"persistent={self.persistent!r}, use_count={self.use_count!r})"
+        )
+
+    @classmethod
+    def from_protected_dict(cls, payload: Mapping[str, Any]) -> "Grant":
+        try:
+            if not isinstance(payload, Mapping):
+                raise TypeError("grant_not_mapping")
+            text_fields = (
+                "grant_id", "permission_mode", "execution_type", "owner_ref",
+                "machine_ref", "tool_category", "effect_class", "capability",
+                "use_policy", "policy_version", "scope_hash", "call_hash",
+                "identity_version", "integrity_metadata",
+            )
+            optional_text_fields = (
+                "device_ref", "run_id", "scheduled_task_id", "task_revision",
+                "plan_revision",
+            )
+            if not all(isinstance(payload.get(name), str) for name in text_fields):
+                raise TypeError("grant_text_field_invalid")
+            if not all(
+                name not in payload or isinstance(payload[name], str)
+                for name in optional_text_fields
+            ):
+                raise TypeError("grant_optional_text_field_invalid")
+            for name in ("schema_version", "use_count", "revocation_epoch"):
+                if type(payload.get(name)) is not int:
+                    raise TypeError("grant_integer_field_invalid")
+            if payload.get("max_uses") is not None and type(
+                payload.get("max_uses")
+            ) is not int:
+                raise TypeError("grant_max_uses_invalid")
+            if type(payload.get("persistent")) is not bool:
+                raise TypeError("grant_persistent_invalid")
+            for name in ("issued_at", "expires_at"):
+                if payload.get(name) is not None and (
+                    isinstance(payload.get(name), bool)
+                    or not isinstance(payload.get(name), (int, float))
+                ):
+                    raise TypeError("grant_time_field_invalid")
+            if not isinstance(payload.get("constraints", {}), Mapping):
+                raise TypeError("grant_constraints_invalid")
+            if not isinstance(payload.get("last_use_metadata", {}), Mapping):
+                raise TypeError("grant_last_use_invalid")
+            grant = cls(
+                schema_version=int(payload["schema_version"]),
+                grant_id=str(payload["grant_id"]),
+                permission_mode=PermissionMode(payload["permission_mode"]),
+                execution_type=ExecutionType(payload["execution_type"]),
+                owner_ref=str(payload["owner_ref"]),
+                machine_ref=str(payload["machine_ref"]),
+                device_ref=str(payload.get("device_ref", "")),
+                run_id=str(payload.get("run_id", "")),
+                scheduled_task_id=str(payload.get("scheduled_task_id", "")),
+                task_revision=str(payload.get("task_revision", "")),
+                plan_revision=str(payload.get("plan_revision", "")),
+                tool_category=str(payload["tool_category"]),
+                effect_class=str(payload["effect_class"]),
+                capability=str(payload["capability"]),
+                normalized_target_scope=normalized_scope_from_protected(
+                    payload["normalized_target_scope"]
+                ),
+                constraints_canonical=canonical_serialize(payload.get("constraints", {})),
+                issued_at=float(payload["issued_at"]),
+                expires_at=(
+                    None if payload.get("expires_at") is None
+                    else float(payload["expires_at"])
+                ),
+                persistent=bool(payload["persistent"]),
+                use_policy=UsePolicy(payload["use_policy"]),
+                max_uses=(
+                    None if payload.get("max_uses") is None
+                    else int(payload["max_uses"])
+                ),
+                use_count=int(payload["use_count"]),
+                revocation_epoch=int(payload["revocation_epoch"]),
+                policy_version=str(payload["policy_version"]),
+                scope_hash=str(payload["scope_hash"]),
+                call_hash=str(payload["call_hash"]),
+                identity_version=str(payload["identity_version"]),
+                integrity_metadata=str(payload["integrity_metadata"]),
+                last_use_metadata_canonical=canonical_serialize(
+                    payload.get("last_use_metadata", {})
+                ),
+            )
+        except (KeyError, TypeError, ValueError, ScopeNormalizationError) as exc:
+            raise ValueError("corrupt_grant") from exc
+        if not grant.integrity_is_valid():
+            raise ValueError("corrupt_grant")
+        return grant
+
+
+def json_loads_canonical(value: str) -> dict[str, Any]:
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid_canonical_object") from exc
+    if not isinstance(decoded, dict) or canonical_serialize(decoded) != value:
+        raise ValueError("invalid_canonical_object")
+    return decoded
+
+
+def create_grant(
+    request: PermissionRequest,
+    *,
+    use_policy: UsePolicy = UsePolicy.SINGLE,
+    max_uses: int | None = None,
+    expires_at: float | None = None,
+    persistent: bool = False,
+    constraints: Mapping[str, Any] | None = None,
+    issued_at: float | None = None,
+) -> Grant:
+    if not request.private_scope.grantable:
+        raise ValueError("scope_not_grantable")
+    now = time.time() if issued_at is None else float(issued_at)
+    if use_policy == UsePolicy.SINGLE:
+        max_uses = 1
+    elif use_policy == UsePolicy.RECURRING:
+        max_uses = None
+    grant = Grant(
+        schema_version=GRANT_SCHEMA_VERSION,
+        grant_id=uuid.uuid4().hex,
+        permission_mode=PermissionMode.TASK_SCOPED,
+        execution_type=request.execution_context.execution_type,
+        owner_ref=request.execution_context.owner_ref,
+        machine_ref=request.execution_context.machine_ref,
+        device_ref=request.execution_context.device_ref,
+        run_id=request.execution_context.run_id,
+        scheduled_task_id=request.execution_context.scheduled_task_id,
+        task_revision=request.execution_context.task_revision,
+        plan_revision=request.execution_context.plan_revision,
+        tool_category=request.tool_category,
+        effect_class=request.effect_class,
+        capability=request.capability,
+        normalized_target_scope=request.private_scope,
+        constraints_canonical=canonical_serialize(
+            _validate_constraint_mapping(constraints or {}, grant=True)
+        ),
+        issued_at=now,
+        expires_at=None if expires_at is None else float(expires_at),
+        persistent=bool(persistent),
+        use_policy=use_policy,
+        max_uses=max_uses,
+        use_count=0,
+        revocation_epoch=request.execution_context.policy_epoch,
+        policy_version=POLICY_VERSION,
+        scope_hash=request.scope_hash,
+        call_hash=request.normalized_call_hash,
+        identity_version="opaque-v1",
+        integrity_metadata="0" * 64,
+        last_use_metadata_canonical="{}",
+    )
+    return replace(grant, integrity_metadata=canonical_hash(grant._integrity_payload()))
+
+
+@dataclass(frozen=True)
+class PermissionState:
+    permission_schema_version: int = PERMISSION_SCHEMA_VERSION
+    permission_mode: PermissionMode = PermissionMode.ASK
+    policy_epoch: int = 0
+    policy_version: str = POLICY_VERSION
+    grants: tuple[Grant, ...] = ()
+    optional_settings_canonical: str = "{}"
+    migration_marker: str = "wor192-safe-default-v1"
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.permission_schema_version) is not int
+            or self.permission_schema_version != PERMISSION_SCHEMA_VERSION
+        ):
+            raise ValueError("unsupported_permission_schema")
+        if not isinstance(self.permission_mode, PermissionMode):
+            raise ValueError("invalid_permission_mode")
+        if type(self.policy_epoch) is not int or self.policy_epoch < 0:
+            raise ValueError("invalid_policy_epoch")
+        if self.policy_version != POLICY_VERSION:
+            raise ValueError("unsupported_policy_version")
+        if not all(isinstance(grant, Grant) for grant in self.grants):
+            raise ValueError("invalid_grant_collection")
+        json_loads_canonical(self.optional_settings_canonical)
+        _require_opaque_ref(self.migration_marker)
+
+    def to_protected_dict(self) -> dict[str, Any]:
+        return {
+            "permission_schema_version": self.permission_schema_version,
+            "permission_mode": self.permission_mode.value,
+            "policy_epoch": self.policy_epoch,
+            "policy_version": self.policy_version,
+            "grants": [grant.to_protected_dict() for grant in self.grants],
+            "optional_settings": json_loads_canonical(
+                self.optional_settings_canonical
+            ),
+            "migration_marker": self.migration_marker,
+        }
+
+    def public_metadata(self) -> dict[str, Any]:
+        return {
+            "permission_schema_version": self.permission_schema_version,
+            "permission_mode": self.permission_mode.value,
+            "policy_epoch": self.policy_epoch,
+            "policy_version": self.policy_version,
+            "grant_count": len(self.grants),
+            "migration_marker": self.migration_marker,
+        }
+
+    @classmethod
+    def from_protected_dict(cls, payload: Mapping[str, Any]) -> "PermissionState":
+        try:
+            if not isinstance(payload, Mapping):
+                raise TypeError("permission_state_not_mapping")
+            if type(payload.get("permission_schema_version")) is not int:
+                raise TypeError("permission_schema_invalid")
+            if type(payload.get("policy_epoch")) is not int:
+                raise TypeError("permission_epoch_invalid")
+            for name in (
+                "permission_mode", "policy_version", "migration_marker",
+            ):
+                if not isinstance(payload.get(name), str):
+                    raise TypeError("permission_text_field_invalid")
+            if not isinstance(payload.get("grants", []), list):
+                raise TypeError("permission_grants_invalid")
+            if not isinstance(payload.get("optional_settings", {}), Mapping):
+                raise TypeError("permission_settings_invalid")
+            return cls(
+                permission_schema_version=int(payload["permission_schema_version"]),
+                permission_mode=PermissionMode(payload["permission_mode"]),
+                policy_epoch=int(payload["policy_epoch"]),
+                policy_version=str(payload["policy_version"]),
+                grants=tuple(
+                    Grant.from_protected_dict(item)
+                    for item in payload.get("grants", [])
+                ),
+                optional_settings_canonical=canonical_serialize(
+                    payload.get("optional_settings", {})
+                ),
+                migration_marker=str(payload["migration_marker"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("corrupt_permission_state") from exc
+
+
+@dataclass(frozen=True)
+class ExecutionPermit:
+    schema_version: int
+    permit_id: str
+    execution_id: str
+    operation_id: str
+    tool_identity: str
+    normalized_call_hash: str = field(repr=False)
+    scope_hash: str = field(repr=False)
+    confirmation_domain: str
+    authorization_source: AuthorizationSource
+    grant_ref: str
+    policy_epoch: int
+    issued_at: float
+    expires_at: float
+    used: bool
+    required_confirmation_strength: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != PERMIT_SCHEMA_VERSION:
+            raise ValueError("unsupported_permit_schema")
+        for field_name in (
+            "permit_id", "execution_id", "operation_id", "confirmation_domain",
+            "required_confirmation_strength",
+        ):
+            _require_opaque_ref(getattr(self, field_name))
+        _require_opaque_ref(self.grant_ref, optional=True)
+        if not isinstance(self.authorization_source, AuthorizationSource):
+            raise ValueError("invalid_authorization_source")
+        if not isinstance(self.used, bool):
+            raise ValueError("invalid_permit_use_state")
+        if self.authorization_source == AuthorizationSource.NONE:
+            raise ValueError("permit_requires_authority")
+        if (
+            type(self.issued_at) is not float
+            or not math.isfinite(self.issued_at)
+            or type(self.expires_at) is not float
+            or not math.isfinite(self.expires_at)
+            or self.expires_at <= self.issued_at
+        ):
+            raise ValueError("invalid_permit_expiration")
+        if type(self.policy_epoch) is not int or self.policy_epoch < 0:
+            raise ValueError("invalid_policy_epoch")
+
+
+class PermitError(RuntimeError):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+class ExecutionPermitLedger:
+    """Process-local exact permits with atomic, fail-closed consumption."""
+
+    def __init__(self, *, clock=None, maximum: int = 4096):
+        self._clock = clock or time.time
+        self._maximum = max(1, min(int(maximum), 16384))
+        self._lock = threading.Lock()
+        self._permits: dict[str, ExecutionPermit] = {}
+        self._operations: dict[str, str] = {}
+
+    def operation_is_duplicate(self, operation_id: str) -> bool:
+        with self._lock:
+            return self._operations.get(operation_id) in {
+                "pending", "dispatched", "outcome_unknown", "cancelled",
+            }
+
+    def issue(
+        self,
+        request: PermissionRequest,
+        *,
+        authorization_source: AuthorizationSource,
+        grant_ref: str = "",
+        confirmation_strength: str = "ordinary",
+        ttl_seconds: float = 30.0,
+    ) -> ExecutionPermit:
+        ttl = max(0.1, min(float(ttl_seconds), 120.0))
+        now = float(self._clock())
+        with self._lock:
+            self._purge_locked(now)
+            if self._operations.get(request.operation_id) in {
+                "pending", "dispatched", "outcome_unknown", "cancelled",
+            }:
+                raise PermitError("duplicate_operation")
+            permit = ExecutionPermit(
+                schema_version=PERMIT_SCHEMA_VERSION,
+                permit_id=secrets.token_hex(24),
+                execution_id=request.execution_context.execution_id,
+                operation_id=request.operation_id,
+                tool_identity=request.tool_identity,
+                normalized_call_hash=request.normalized_call_hash,
+                scope_hash=request.scope_hash,
+                confirmation_domain=request.confirmation_domain,
+                authorization_source=authorization_source,
+                grant_ref=grant_ref,
+                policy_epoch=request.execution_context.policy_epoch,
+                issued_at=now,
+                expires_at=now + ttl,
+                used=False,
+                required_confirmation_strength=confirmation_strength,
+            )
+            self._permits[permit.permit_id] = permit
+            self._operations[request.operation_id] = "pending"
+            while len(self._permits) > self._maximum:
+                old_id = next(iter(self._permits))
+                old = self._permits.pop(old_id)
+                self._operations[old.operation_id] = "cancelled"
+            return permit
+
+    def consume(
+        self,
+        permit_id: str,
+        request: PermissionRequest,
+        *,
+        current_policy_epoch: int,
+    ) -> ExecutionPermit:
+        now = float(self._clock())
+        with self._lock:
+            permit = self._permits.pop(str(permit_id or ""), None)
+            if permit is None:
+                raise PermitError("permit_missing_or_used")
+            # Removal is deliberately first: every failed validation burns the
+            # permit and cannot authorize a later or altered dispatch.
+            self._operations[permit.operation_id] = "cancelled"
+            if permit.expires_at <= now:
+                raise PermitError("permit_expired")
+            if permit.used:
+                raise PermitError("permit_already_used")
+            if permit.policy_epoch != current_policy_epoch:
+                raise PermitError("permit_epoch_changed")
+            exact = (
+                permit.execution_id == request.execution_context.execution_id
+                and permit.operation_id == request.operation_id
+                and permit.tool_identity == request.tool_identity
+                and permit.confirmation_domain == request.confirmation_domain
+                and sensitive_hash_equal(
+                    permit.normalized_call_hash, request.normalized_call_hash
+                )
+                and sensitive_hash_equal(permit.scope_hash, request.scope_hash)
+            )
+            if not exact:
+                raise PermitError("permit_scope_mismatch")
+            consumed = replace(permit, used=True)
+            self._operations[permit.operation_id] = "dispatched"
+            return consumed
+
+    def invalidate_for_epoch(self, current_epoch: int) -> int:
+        with self._lock:
+            stale = [
+                permit_id for permit_id, permit in self._permits.items()
+                if permit.policy_epoch != current_epoch
+            ]
+            for permit_id in stale:
+                permit = self._permits.pop(permit_id)
+                self._operations[permit.operation_id] = "cancelled"
+            return len(stale)
+
+    def cancel(self, permit_id: str) -> bool:
+        with self._lock:
+            permit = self._permits.pop(str(permit_id or ""), None)
+            if permit is None:
+                return False
+            self._operations[permit.operation_id] = "cancelled"
+            return True
+
+    def mark_outcome_unknown(self, operation_id: str) -> None:
+        with self._lock:
+            if self._operations.get(operation_id) == "dispatched":
+                self._operations[operation_id] = "outcome_unknown"
+
+    def _purge_locked(self, now: float) -> None:
+        for permit_id, permit in tuple(self._permits.items()):
+            if permit.expires_at <= now:
+                self._permits.pop(permit_id, None)
+                self._operations[permit.operation_id] = "cancelled"
+
+
+def _decision(
+    request: PermissionRequest,
+    decision_type: DecisionType,
+    reason_code: str,
+    *,
+    source: AuthorizationSource = AuthorizationSource.NONE,
+    grant_ref: str = "",
+    epoch: int | None = None,
+) -> PermissionDecision:
+    return PermissionDecision(
+        decision_type=decision_type,
+        reason_code=reason_code,
+        authorization_source=source,
+        grant_ref=grant_ref,
+        policy_epoch=(
+            request.execution_context.policy_epoch if epoch is None else epoch
+        ),
+        execution_type=request.execution_context.execution_type,
+        safe_category=request.safe_category,
+    )
+
+
+class PermissionPolicy:
+    """The single deterministic evaluator and permit facade."""
+
+    def __init__(
+        self,
+        store: "PermissionStore",
+        *,
+        permit_ledger: ExecutionPermitLedger | None = None,
+        clock=None,
+    ):
+        self.store = store
+        self.clock = clock or time.time
+        self.permit_ledger = permit_ledger or ExecutionPermitLedger(clock=self.clock)
+        self._mint_lock = threading.Lock()
+        try:
+            self.store.add_epoch_listener(self.permit_ledger.invalidate_for_epoch)
+        except AttributeError:
+            pass
+
+    def evaluate(self, request: PermissionRequest) -> PermissionDecision:
+        from osia.tool_contracts import ConfirmationPolicy, SideEffectClass
+
+        if not isinstance(request, PermissionRequest):
+            raise ValueError("invalid_permission_request")
+
+        # Universal barriers precede every mode, grant and optional constraint.
+        if request.system_destruction:
+            return _decision(
+                request,
+                DecisionType.BLOCK_SYSTEM_DESTRUCTION,
+                "system_destruction_absolute",
+            )
+        if request.colossal_deletion:
+            return _decision(
+                request,
+                DecisionType.REQUIRE_COLOSSAL_DELETION_CONFIRMATION,
+                "colossal_deletion_reinforced_approval",
+            )
+
+        state = self.store.load_state()
+        epoch = state.policy_epoch
+        if request.execution_context.policy_epoch != epoch:
+            return _decision(
+                request, DecisionType.DENY, "policy_epoch_mismatch", epoch=epoch,
+            )
+
+        grant, grant_reason = self.store.find_matching_grant(
+            request, now=self.clock()
+        )
+        if grant is not None:
+            if not _optional_constraints_allow(request, grant.constraints):
+                if state.permission_mode != PermissionMode.FULL_ACCESS:
+                    return _decision(
+                        request, DecisionType.DENY, "optional_constraint_failed",
+                        epoch=epoch,
+                    )
+            else:
+                if self.permit_ledger.operation_is_duplicate(request.operation_id):
+                    return _decision(
+                        request, DecisionType.DENY,
+                        "duplicate_or_ambiguous_operation",
+                        epoch=epoch,
+                    )
+                return _decision(
+                    request, DecisionType.ALLOW, "exact_grant",
+                    source=AuthorizationSource.GRANT,
+                    grant_ref=grant.grant_id,
+                    epoch=epoch,
+                )
+
+        if state.permission_mode == PermissionMode.FULL_ACCESS:
+            if not _optional_constraints_allow(request, {}):
+                return _decision(
+                    request, DecisionType.DENY, "optional_constraint_failed",
+                    epoch=epoch,
+                )
+            if self.permit_ledger.operation_is_duplicate(request.operation_id):
+                return _decision(
+                    request, DecisionType.DENY, "duplicate_or_ambiguous_operation",
+                    epoch=epoch,
+                )
+            return _decision(
+                request, DecisionType.ALLOW, "full_access",
+                source=AuthorizationSource.FULL_ACCESS,
+                epoch=epoch,
+            )
+
+        if self.permit_ledger.operation_is_duplicate(request.operation_id):
+            return _decision(
+                request, DecisionType.DENY, "duplicate_or_ambiguous_operation",
+                epoch=epoch,
+            )
+
+        if request.effective_contract.confirmation == ConfirmationPolicy.DENIED_BY_POLICY:
+            return _decision(
+                request, DecisionType.DENY, "tool_contract_denied", epoch=epoch,
+            )
+
+        sensitive = request.effective_contract.confirmation in {
+            ConfirmationPolicy.CONFIRMATION_REQUIRED,
+            ConfirmationPolicy.FINAL_COMMIT_CONFIRMATION,
+        }
+        if not sensitive or (
+            request.effective_contract.side_effect == SideEffectClass.READ_ONLY
+            and request.effective_contract.confirmation
+            == ConfirmationPolicy.NO_CONFIRMATION
+        ):
+            return _decision(
+                request, DecisionType.ALLOW, "structurally_safe",
+                epoch=epoch,
+            )
+
+        if not request.execution_context.interactive:
+            decision_type = (
+                DecisionType.SUSPEND_SCOPE_EXTENSION
+                if request.execution_context.execution_type
+                in {ExecutionType.AUTONOMOUS, ExecutionType.SCHEDULED}
+                else DecisionType.DENY
+            )
+            reason = grant_reason if grant_reason != "no_grant" else (
+                "scope_extension_required"
+                if decision_type == DecisionType.SUSPEND_SCOPE_EXTENSION
+                else "unattended_sensitive_action"
+            )
+            return _decision(request, decision_type, reason, epoch=epoch)
+
+        return _decision(
+            request, DecisionType.REQUIRE_CONFIRMATION,
+            grant_reason if grant_reason != "no_grant" else "ask_sensitive_action",
+            epoch=epoch,
+        )
+
+    def mint_permit(
+        self,
+        request: PermissionRequest,
+        decision: PermissionDecision,
+        *,
+        confirmed: bool = False,
+        reinforced: bool = False,
+        ttl_seconds: float = 30.0,
+    ) -> ExecutionPermit | None:
+        source = decision.authorization_source
+        strength = "ordinary"
+        if decision.decision_type == DecisionType.BLOCK_SYSTEM_DESTRUCTION:
+            return None
+        if decision.decision_type in {
+            DecisionType.REQUIRE_REINFORCED_CONFIRMATION,
+            DecisionType.REQUIRE_COLOSSAL_DELETION_CONFIRMATION,
+        }:
+            if not reinforced:
+                return None
+            source = AuthorizationSource.CONFIRMATION
+            strength = "reinforced"
+        elif decision.decision_type == DecisionType.REQUIRE_CONFIRMATION:
+            if not confirmed:
+                return None
+            source = AuthorizationSource.CONFIRMATION
+        elif decision.decision_type != DecisionType.ALLOW:
+            return None
+        elif source == AuthorizationSource.NONE:
+            # Structurally safe calls need no authorization permit.
+            return None
+
+        with self._mint_lock:
+            current = self.store.load_state()
+            if current.policy_epoch != decision.policy_epoch:
+                return None
+            if source == AuthorizationSource.GRANT:
+                if not self.store.claim_grant_use(
+                    decision.grant_ref, request, now=self.clock()
+                ):
+                    return None
+            try:
+                return self.permit_ledger.issue(
+                    request,
+                    authorization_source=source,
+                    grant_ref=decision.grant_ref,
+                    confirmation_strength=strength,
+                    ttl_seconds=ttl_seconds,
+                )
+            except PermitError:
+                return None
+
+    def consume_permit(
+        self, permit: ExecutionPermit | str, request: PermissionRequest,
+    ) -> ExecutionPermit:
+        permit_id = permit.permit_id if isinstance(permit, ExecutionPermit) else permit
+        epoch = self.store.load_state().policy_epoch
+        return self.permit_ledger.consume(
+            permit_id, request, current_policy_epoch=epoch,
+        )
+
+    def cancel_permit(self, permit: ExecutionPermit | str) -> bool:
+        permit_id = permit.permit_id if isinstance(permit, ExecutionPermit) else permit
+        return self.permit_ledger.cancel(permit_id)
+
+
+def _optional_constraints_allow(
+    request: PermissionRequest, grant_constraints: Mapping[str, Any],
+) -> bool:
+    grant_values = dict(grant_constraints)
+    request_values = dict(request.optional_constraints)
+    known = {
+        "allowed", "max_amount_minor", "amount_minor", "currency",
+        "request_currency",
+    }
+    if set(grant_values) - known or set(request_values) - known:
+        return False
+    for values in (grant_values, request_values):
+        if "allowed" in values and not isinstance(values["allowed"], bool):
+            return False
+    if grant_values.get("allowed") is False or request_values.get("allowed") is False:
+        return False
+    maximum = grant_values.get(
+        "max_amount_minor", request_values.get("max_amount_minor")
+    )
+    amount = request_values.get("amount_minor")
+    if maximum is not None:
+        if (
+            type(maximum) is not int
+            or type(amount) is not int
+            or maximum < 0
+            or amount < 0
+        ):
+            return False
+        if amount > maximum:
+            return False
+    expected_currency = grant_values.get("currency")
+    actual_currency = request_values.get(
+        "request_currency", request_values.get("currency")
+    )
+    if expected_currency is not None:
+        if (
+            not isinstance(expected_currency, str)
+            or not isinstance(actual_currency, str)
+            or not re.fullmatch(r"[A-Z]{3}", expected_currency.upper())
+            or expected_currency.upper() != actual_currency.upper()
+        ):
+            return False
+    return True
+
+
+_CURRENT_EXECUTION_CONTEXT: ContextVar[ExecutionContext | None] = ContextVar(
+    "osia_permission_execution_context", default=None,
+)
+
+
+@contextmanager
+def execution_context_scope(context: ExecutionContext):
+    if not isinstance(context, ExecutionContext):
+        raise ValueError("invalid_execution_context")
+    token = _CURRENT_EXECUTION_CONTEXT.set(context)
+    try:
+        yield context
+    finally:
+        _CURRENT_EXECUTION_CONTEXT.reset(token)
+
+
+def _hashed_local_ref(label: str, value: str) -> str:
+    return f"{label}:{canonical_hash({'value': str(value or '')})[:32]}"
+
+
+def make_execution_context(
+    *,
+    execution_type: ExecutionType = ExecutionType.CHAT,
+    interactive: bool = True,
+    owner_ref: str | None = None,
+    machine_ref: str | None = None,
+    device_ref: str = "",
+    run_id: str = "",
+    scheduled_task_id: str = "",
+    task_revision: str = "",
+    plan_revision: str = "",
+    policy_epoch: int | None = None,
+    execution_id: str | None = None,
+    operation_id: str | None = None,
+    store: "PermissionStore | None" = None,
+) -> ExecutionContext:
+    import getpass
+    import platform
+
+    active_store = store or get_default_permission_policy().store
+    epoch = active_store.load_state().policy_epoch if policy_epoch is None else policy_epoch
+    return ExecutionContext(
+        execution_id=execution_id or uuid.uuid4().hex,
+        execution_type=execution_type,
+        interactive=bool(interactive),
+        owner_ref=owner_ref or _hashed_local_ref("owner", getpass.getuser()),
+        machine_ref=machine_ref or _hashed_local_ref("machine", platform.node()),
+        device_ref=device_ref,
+        run_id=run_id,
+        scheduled_task_id=scheduled_task_id,
+        task_revision=task_revision,
+        plan_revision=plan_revision,
+        operation_id=operation_id or uuid.uuid4().hex,
+        policy_epoch=int(epoch),
+    )
+
+
+def _request_scope(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    *,
+    call_hash: str,
+    confirmation_domain: str,
+    origin_id: str,
+    schema_hash: str,
+    account_ref: str,
+    tenant_ref: str,
+) -> tuple[NormalizedScope, bool]:
+    import os
+
+    values = dict(arguments)
+    file_fields = [
+        name for name in ("path", "old_path", "new_path", "src", "dst")
+        if isinstance(values.get(name), str) and values.get(name)
+    ]
+    if file_fields:
+        scopes = {
+            name: normalize_file_scope(
+                values[name], base=os.getcwd(),
+                recursive=bool(values.get("recursive", False)),
+            )
+            for name in file_fields
+        }
+        if len(scopes) == 1:
+            return next(iter(scopes.values())), False
+        return combine_scopes(scopes, safe_category="local_paths"), False
+    if confirmation_domain == "gmail" or tool_name.startswith("gmail_"):
+        identity = account_ref or "legacy-default"
+        return normalize_gmail_scope(identity, tool_name), not bool(account_ref)
+    if confirmation_domain == "mcp" or tool_name.startswith("mcp__"):
+        try:
+            return normalize_mcp_scope(
+                origin_id, tool_name,
+                account_ref=account_ref or "legacy-default",
+                schema_hash=schema_hash,
+                tenant_ref=tenant_ref,
+            ), not bool(account_ref)
+        except ScopeNormalizationError:
+            return normalize_exact_call_scope(
+                call_hash, safe_category="connector_operation", grantable=False,
+            ), True
+    if tool_name in {"bash", "run_command"}:
+        # The current tool schema is free-form shell text. Phase 1 permits may
+        # bind that exact call, but grants cannot broaden it into a generic shell.
+        return normalize_exact_call_scope(
+            call_hash, safe_category="local_command", grantable=False,
+        ), False
+    return normalize_exact_call_scope(
+        call_hash, safe_category="tool_operation", grantable=False,
+    ), False
+
+
+def _tool_category(tool_name: str, confirmation_domain: str) -> str:
+    if confirmation_domain == "gmail" or tool_name.startswith("gmail_"):
+        return "gmail"
+    if confirmation_domain == "mcp" or tool_name.startswith("mcp__"):
+        return "mcp"
+    if tool_name in {"bash", "run_command"}:
+        return "shell"
+    if tool_name in {
+        "read_file", "write_file", "delete_file", "delete_directory",
+        "create_directory", "rename_file", "copy_file", "edit_file_lines",
+        "list_files", "get_file_info", "search_files",
+    }:
+        return "filesystem"
+    if tool_name in {
+        "click", "find_and_click", "press_key", "desktop_click",
+        "desktop_press", "fill_form_field", "navigate", "open_browser",
+    }:
+        return "browser"
+    return "native"
+
+
+def build_permission_request(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    *,
+    confirmation_domain: str = "action",
+    origin_id: str = "osia",
+    execution_context: ExecutionContext | None = None,
+    deletion_classification: TrustedDeletionClassification = (
+        TRUSTED_CLEAR_CLASSIFICATION
+    ),
+    optional_constraints: Mapping[str, Any] | None = None,
+    account_ref: str = "",
+    tenant_ref: str = "",
+    connector_schema_hash: str = "",
+    force_sensitive: bool = False,
+    policy: PermissionPolicy | None = None,
+) -> PermissionRequest:
+    from osia.tool_contracts import (
+        ConfirmationPolicy,
+        SideEffectClass,
+        compatibility_tool_spec,
+        effective_contract,
+        get_tool_spec,
+        normalized_call_hash,
+    )
+
+    identity = str(tool_name or "")
+    values = dict(arguments) if isinstance(arguments, Mapping) else {}
+    spec = get_tool_spec(identity)
+    if spec is None:
+        spec = compatibility_tool_spec(identity, lambda **_kwargs: None)
+        if force_sensitive:
+            spec = replace(
+                spec,
+                capability=f"{confirmation_domain}:{identity}",
+                side_effect=SideEffectClass.UNKNOWN_HIGH_RISK,
+                confirmation=ConfirmationPolicy.CONFIRMATION_REQUIRED,
+                dynamic=True,
+                connector_id=origin_id,
+            )
+    contract = effective_contract(spec, values)
+    if force_sensitive and contract.confirmation not in {
+        ConfirmationPolicy.CONFIRMATION_REQUIRED,
+        ConfirmationPolicy.FINAL_COMMIT_CONFIRMATION,
+    }:
+        contract = replace(
+            contract,
+            confirmation=ConfirmationPolicy.CONFIRMATION_REQUIRED,
+        )
+    call_hash = normalized_call_hash(identity, values)
+    schema_hash = connector_schema_hash or canonical_hash(spec.input_schema)
+    if not re.fullmatch(r"[0-9a-f]{64}", schema_hash):
+        raise ValueError("invalid_connector_schema_hash")
+    scope, ambiguous = _request_scope(
+        identity, values, call_hash=call_hash,
+        confirmation_domain=confirmation_domain,
+        origin_id=origin_id,
+        schema_hash=schema_hash,
+        account_ref=account_ref,
+        tenant_ref=tenant_ref,
+    )
+    active_policy = policy or get_default_permission_policy()
+    context = execution_context or _CURRENT_EXECUTION_CONTEXT.get()
+    if context is None:
+        context = make_execution_context(store=active_policy.store)
+    elif context.policy_epoch != active_policy.store.load_state().policy_epoch:
+        # Preserve the supplied stale epoch: the evaluator must reject it.
+        pass
+    return PermissionRequest(
+        tool_identity=identity,
+        confirmation_domain=str(confirmation_domain),
+        tool_spec=spec,
+        effective_contract=contract,
+        capability=spec.capability,
+        private_scope=scope,
+        safe_category=scope.safe_category,
+        effect_class=contract.side_effect.value,
+        normalized_call_hash=call_hash,
+        deletion_classification=deletion_classification,
+        operation_id=context.operation_id,
+        execution_context=context,
+        tool_category=_tool_category(identity, confirmation_domain),
+        optional_constraints=dict(optional_constraints or {}),
+        ambiguous_legacy_identity=ambiguous,
+    )
+
+
+_DEFAULT_POLICY_LOCK = threading.Lock()
+_DEFAULT_POLICY: PermissionPolicy | None = None
+
+
+def get_default_permission_policy() -> PermissionPolicy:
+    global _DEFAULT_POLICY
+    with _DEFAULT_POLICY_LOCK:
+        if _DEFAULT_POLICY is None:
+            from osia.permission_store import PermissionStore
+
+            _DEFAULT_POLICY = PermissionPolicy(PermissionStore())
+        return _DEFAULT_POLICY
+
+
+def set_default_permission_policy(policy: PermissionPolicy | None) -> None:
+    """Test/runtime injection point; ``None`` restores lazy safe defaults."""
+
+    global _DEFAULT_POLICY
+    with _DEFAULT_POLICY_LOCK:
+        _DEFAULT_POLICY = policy
+
+
+def evaluate_permission(
+    request: PermissionRequest, *, policy: PermissionPolicy | None = None,
+) -> PermissionDecision:
+    return (policy or get_default_permission_policy()).evaluate(request)
+
+
+@dataclass(frozen=True, repr=False)
+class _PendingExecutionPermit:
+    permit: ExecutionPermit
+    request: PermissionRequest = field(repr=False)
+    policy: PermissionPolicy = field(repr=False)
+
+
+_PENDING_EXECUTION_PERMIT: ContextVar[_PendingExecutionPermit | None] = ContextVar(
+    "osia_pending_execution_permit", default=None,
+)
+
+
+def clear_pending_execution_permit() -> None:
+    pending = _PENDING_EXECUTION_PERMIT.get()
+    _PENDING_EXECUTION_PERMIT.set(None)
+    if pending is not None:
+        pending.policy.cancel_permit(pending.permit)
+
+
+def hold_execution_permit(
+    permit: ExecutionPermit,
+    request: PermissionRequest,
+    *,
+    policy: PermissionPolicy | None = None,
+) -> None:
+    _PENDING_EXECUTION_PERMIT.set(
+        _PendingExecutionPermit(
+            permit=permit,
+            request=request,
+            policy=policy or get_default_permission_policy(),
+        )
+    )
+
+
+def pending_execution_permit_matches(
+    tool_name: str, arguments: Mapping[str, Any],
+) -> bool:
+    pending = _PENDING_EXECUTION_PERMIT.get()
+    if pending is None:
+        return False
+    try:
+        from osia.tool_contracts import normalized_call_hash
+
+        return (
+            pending.request.tool_identity == str(tool_name or "")
+            and sensitive_hash_equal(
+                pending.request.normalized_call_hash,
+                normalized_call_hash(tool_name, arguments),
+            )
+        )
+    except Exception:
+        return False
+
+
+def ensure_confirmed_execution_permit(
+    tool_name: str, arguments: Mapping[str, Any],
+) -> bool:
+    """Adapt the established ``None == approved`` confirmation contract."""
+
+    if pending_execution_permit_matches(tool_name, arguments):
+        return True
+    policy = get_default_permission_policy()
+    request = build_permission_request(
+        tool_name,
+        arguments,
+        confirmation_domain="action",
+        origin_id="osia",
+        force_sensitive=True,
+        policy=policy,
+    )
+    decision = policy.evaluate(request)
+    permit = policy.mint_permit(
+        request,
+        decision,
+        confirmed=decision.decision_type == DecisionType.REQUIRE_CONFIRMATION,
+    )
+    if permit is None:
+        return False
+    hold_execution_permit(permit, request, policy=policy)
+    return True
+
+
+def consume_pending_execution_permit(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+) -> bool:
+    pending = _PENDING_EXECUTION_PERMIT.get()
+    _PENDING_EXECUTION_PERMIT.set(None)
+    if pending is None:
+        return False
+    try:
+        from osia.tool_contracts import normalized_call_hash
+
+        actual_hash = normalized_call_hash(tool_name, arguments)
+        candidate = replace(
+            pending.request,
+            normalized_call_hash=actual_hash,
+        )
+        pending.policy.consume_permit(pending.permit, candidate)
+        return True
+    except Exception:
+        return False
+
+
+def permission_error_for_decision(decision: PermissionDecision) -> str:
+    if decision.decision_type == DecisionType.BLOCK_SYSTEM_DESTRUCTION:
+        return "ERROR: BLOCK_SYSTEM_DESTRUCTION"
+    if decision.decision_type == DecisionType.REQUIRE_COLOSSAL_DELETION_CONFIRMATION:
+        return "ERROR: REQUIRE_COLOSSAL_DELETION_CONFIRMATION"
+    return f"ERROR: permission denied: {decision.reason_code}"
+
+
+def register_grant(
+    grant: Grant, *, policy: PermissionPolicy | None = None,
+) -> None:
+    (policy or get_default_permission_policy()).store.add_grant(grant)
+
+
+def revoke_grant(
+    grant_id: str, *, policy: PermissionPolicy | None = None,
+):
+    return (policy or get_default_permission_policy()).store.revoke_grant(grant_id)
+
+
+def revoke_all_grants(*, policy: PermissionPolicy | None = None):
+    return (policy or get_default_permission_policy()).store.revoke_all_grants()
+
+
+def revoke_full_access(*, policy: PermissionPolicy | None = None):
+    return (policy or get_default_permission_policy()).store.revoke_full_access()
+
+
+def reset_permissions_to_ask(*, policy: PermissionPolicy | None = None):
+    return (policy or get_default_permission_policy()).store.reset_to_ask()
+
+
+# Descriptive compatibility name for callers that prefer the fully qualified
+# type; ``Grant`` remains the concise canonical schema name.
+PermissionGrant = Grant

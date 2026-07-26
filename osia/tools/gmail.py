@@ -448,6 +448,16 @@ def gmail_create_draft(
                 "subject": draft["subject"],
                 "bodyChars": len(draft["body"]),
             }
+        _consume_gmail_execution_permit(
+            "gmail_create_draft",
+            {
+                "to": list(draft.get("to") or []),
+                "cc": list(draft.get("cc") or []),
+                "bcc": list(draft.get("bcc") or []),
+                "subject": str(draft.get("subject") or ""),
+                "body": str(draft.get("body") or ""),
+            },
+        )
         data = _gmail_post(
             "/drafts",
             json_body={"message": {"raw": draft["raw"]}},
@@ -498,7 +508,14 @@ def gmail_send_draft(
                 "bccPresent": False,
                 "subject": "",
             }
-        draft = _fetch_draft_summary(clean_id, interactive=interactive)
+        try:
+            draft = _fetch_draft_summary(clean_id, interactive=interactive)
+        except Exception:
+            _cancel_gmail_execution_permit()
+            raise
+        _consume_gmail_execution_permit(
+            "gmail_send_draft", {"draft_id": clean_id},
+        )
         data = _gmail_post_no_retry(
             "/drafts/send",
             json_body={"id": clean_id},
@@ -801,6 +818,7 @@ def _gmail_confirmed_message_modify(
                 "messageId": clean_id,
                 "action": action,
             }
+        _consume_gmail_execution_permit(tool_name, {"message_id": clean_id})
         data = _modify_message_labels(
             clean_id,
             add_labels=add_labels,
@@ -845,7 +863,16 @@ def _gmail_confirmed_label_modify(
                 "messageId": clean_id,
                 "label": clean_label,
             }
-        label_info = _resolve_user_label_exact(clean_label, interactive=interactive)
+        try:
+            label_info = _resolve_user_label_exact(
+                clean_label, interactive=interactive,
+            )
+        except Exception:
+            _cancel_gmail_execution_permit()
+            raise
+        _consume_gmail_execution_permit(
+            tool_name, {"message_id": clean_id, "label": clean_label},
+        )
         data = _modify_message_labels(
             clean_id,
             add_labels=(label_info["id"],) if add else (),
@@ -1092,6 +1119,31 @@ def _confirm_gmail_write(
     if "no approver available" in blocked:
         raise GmailRestError(WRITE_CONFIRMATION_REQUIRED_ERROR)
     raise GmailRestError(blocked)
+
+
+def _consume_gmail_execution_permit(
+    tool_name: str,
+    call_arguments: dict,
+) -> None:
+    """Consume the exact permit at the last boundary before Gmail mutation."""
+
+    try:
+        from osia.action_policy import consume_pending_execution_permit
+
+        if consume_pending_execution_permit(tool_name, call_arguments):
+            return
+    except Exception:
+        pass
+    raise GmailRestError("ERROR: Gmail execution permit unavailable")
+
+
+def _cancel_gmail_execution_permit() -> None:
+    try:
+        from osia.action_policy import clear_pending_execution_permit
+
+        clear_pending_execution_permit()
+    except Exception:
+        pass
 
 
 def _draft_confirmation_summary(draft: dict) -> str:

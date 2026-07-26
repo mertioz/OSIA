@@ -3414,6 +3414,10 @@ def _tool_spec_and_contract(tool_name: str, kwargs: dict, user_request: str = ""
     return spec, effective_contract(spec, kwargs, user_request)
 
 
+class _ExecutionPermitUnavailable(RuntimeError):
+    """Internal value-free marker raised before a gated dispatcher starts."""
+
+
 def _execute_tool_once_record(
     tool_name: str,
     kwargs: dict,
@@ -3421,6 +3425,7 @@ def _execute_tool_once_record(
     timeout_s: float,
     contract,
     lang: str = "fr",
+    enforce_execution_permit: bool = False,
 ):
     """Dispatch once and preserve truthful timeout/outcome semantics."""
     from osia.tool_contracts import (
@@ -3434,9 +3439,28 @@ def _execute_tool_once_record(
     try:
         # Preserve the existing key-rotation/context propagation contract.
         ctx = contextvars.copy_context()
-        fut = _TOOL_EXECUTOR.submit(ctx.run, fn, **kwargs)
+
+        def _dispatch():
+            if enforce_execution_permit:
+                from osia.action_policy import consume_pending_execution_permit
+
+                if not consume_pending_execution_permit(tool_name, kwargs):
+                    raise _ExecutionPermitUnavailable()
+            return fn(**kwargs)
+
+        fut = _TOOL_EXECUTOR.submit(ctx.run, _dispatch)
         raw_result = fut.result(timeout=timeout_s)
         result = bounded_model_result(raw_result)
+    except _ExecutionPermitUnavailable:
+        text = (
+            "ERROR: autorisation d'execution indisponible ; l'outil n'a pas ete execute"
+            if str(lang or "").lower().startswith("fr") else
+            "ERROR: execution permit unavailable; the tool was not executed"
+        )
+        return ToolExecutionRecord(
+            text, True, ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+            0, False, False, contract,
+        )
     except FutureTimeoutError:
         # Future.result(timeout=...) does not prove cancellation. The worker may
         # still complete, so no replay or provider fallback may start.
@@ -3496,6 +3520,7 @@ def _execute_tool_with_policy(
     allow_retry: bool = True,
     user_request: str = "",
     lang: str = "fr",
+    enforce_execution_permit: bool = False,
 ):
     """Validate before dispatch and retry only proven-safe read failures."""
     from osia.tool_contracts import (
@@ -3530,6 +3555,13 @@ def _execute_tool_with_policy(
 
     timeout_s = _bounded_timeout()
     if timeout_s <= 0:
+        if enforce_execution_permit:
+            try:
+                from osia.action_policy import clear_pending_execution_permit
+
+                clear_pending_execution_permit()
+            except Exception:
+                pass
         text = (
             "ERROR: outil non démarré ; plafond total du tour atteint"
             if str(lang or "").lower().startswith("fr") else
@@ -3542,6 +3574,7 @@ def _execute_tool_with_policy(
 
     record = _execute_tool_once_record(
         tool_name, kwargs, timeout_s=timeout_s, contract=contract, lang=lang,
+        enforce_execution_permit=enforce_execution_permit,
     )
     retry_allowed = (
         allow_retry
@@ -3560,6 +3593,7 @@ def _execute_tool_with_policy(
     retried = _execute_tool_once_record(
         tool_name, kwargs, timeout_s=retry_timeout_s,
         contract=contract, lang=lang,
+        enforce_execution_permit=enforce_execution_permit,
     )
     return ToolExecutionRecord(
         retried.result, retried.is_error, retried.outcome, 2,
@@ -6549,6 +6583,7 @@ class OSIAAgent:
                     )
                     try:
                         from osia.tool_contracts import (
+                            ConfirmationPolicy,
                             ExecutionOutcome,
                             ProgressEvidencePolicy,
                             ToolExecutionRecord,
@@ -6668,6 +6703,7 @@ class OSIAAgent:
                             from osia.action_policy import (
                                 guard_tool_call,
                                 is_final_external_tool_call,
+                                pending_execution_permit_matches,
                             )
                             policy_error = guard_tool_call(
                                 user_text, tool_name, kwargs,
@@ -6675,12 +6711,16 @@ class OSIAAgent:
                             final_external_call = is_final_external_tool_call(
                                 user_text, tool_name, kwargs,
                             )
+                            explicit_execution_permit = (
+                                pending_execution_permit_matches(tool_name, kwargs)
+                            )
                         except Exception:
                             policy_error = (
                                 "ERROR: action policy check failed; "
                                 "the action was not executed"
                             )
                             final_external_call = True
+                            explicit_execution_permit = False
                         if policy_error:
                             result, is_error = policy_error, True
                             execution_record = ToolExecutionRecord(
@@ -6700,6 +6740,18 @@ class OSIAAgent:
                                 allow_retry=not final_external_call,
                                 user_request=user_text,
                                 lang=self.lang,
+                                enforce_execution_permit=(
+                                    (
+                                        effective.confirmation in {
+                                            ConfirmationPolicy.CONFIRMATION_REQUIRED,
+                                            ConfirmationPolicy.FINAL_COMMIT_CONFIRMATION,
+                                        }
+                                        or final_external_call
+                                        or explicit_execution_permit
+                                    )
+                                    and not tool_name.startswith("gmail_")
+                                    and not tool_name.startswith("mcp__")
+                                ),
                             )
                             result = execution_record.result
                             is_error = execution_record.is_error
