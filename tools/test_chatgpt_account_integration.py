@@ -537,8 +537,12 @@ class AgentRoutingEqualityTests(unittest.TestCase):
             },
             tool_map={"account_test_tool": fake_tool},
         )
-        self.assertIsNone(result)
-        self.assertIsInstance(error, AccountProviderError)
+        self.assertIsNone(error)
+        self.assertIn("did not replay the turn", result)
+        self.assertEqual(
+            _agent.last_run_diagnostic.get("reason_code"),
+            "task_execution_failure",
+        )
         self.assertEqual(tool_calls, ["ok"])
         self.assertEqual(attempts, ["chatgpt_account", "chatgpt_account"])
 

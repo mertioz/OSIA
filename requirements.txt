@@ -56,6 +56,10 @@ zeroconf==0.150.0                 # DNS-SD advertisement for feature-gated LAN t
 # like @modelcontextprotocol/server-filesystem a Node toolchain (npx) must also
 # be present, but that is a runtime/user dependency, not a pip one.
 mcp==1.28.0
+# Direct WOR-178 JSON Schema validation dependency (MIT licensed). The MCP SDK
+# already depends on it transitively; declaring it here makes OSIA's import and
+# supported major-version boundary explicit on Windows, macOS and Linux.
+jsonschema>=4.23.0,<5.0
 
 # ── System / input / utilities ──────────────────────────────────────────────
 psutil>=5.9.0                      # heartbeat metrics + Windows service control

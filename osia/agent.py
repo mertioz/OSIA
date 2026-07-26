@@ -425,6 +425,10 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
     """
     lang = normalize_locale(lang) or i18n.get_language()
     body = SYSTEM_PROMPT_FR if lang == "fr" else SYSTEM_PROMPT_EN
+    # WOR-178: render provider-facing native-tool schemas from the same
+    # authoritative registry used by dispatch validation.
+    from osia.tool_contracts import replace_static_tool_prompt_section
+    body = replace_static_tool_prompt_section(body, lang)
     # Point the model at the real project root on this machine instead of the
     # /home/OSIA path baked into the prompt text (works on Windows + Linux).
     body = body.replace("/home/OSIA/code/osia-project", _PROJECT_DIR)
@@ -458,9 +462,14 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
     except Exception:
         pass
     body = body + "\n\n" + language_instruction(lang)
-    body = body + "\n\n" + _memory_tool_prompt_block(lang)
-    body = body + "\n\n" + _scheduled_task_tool_prompt_block(lang)
-    body = body + "\n\n" + _gmail_rest_prompt_block(lang)
+    from osia.tool_contracts import assert_prompt_tool_examples_compatible
+    for tool_guidance in (
+        _memory_tool_prompt_block(lang),
+        _scheduled_task_tool_prompt_block(lang),
+        _gmail_rest_prompt_block(lang),
+    ):
+        assert_prompt_tool_examples_compatible(tool_guidance)
+        body = body + "\n\n" + tool_guidance
     # WOR-44 Phase 2 — list the tools exposed by connected MCP servers so the
     # model can see and call them like native tools. Built FRESH on every
     # get_system_prompt() call. On the SERVER path run(history=...) rebuilds the
@@ -3286,6 +3295,14 @@ TOOL_MAP = {
     "gmail_remove_label": tool_gmail_remove_label,
 }
 
+# WOR-178: bind every authoritative static specification to the established
+# direct function and fail import on a missing/orphan/duplicate registration.
+# ``TOOL_MAP`` remains the same public mutable dict for compatibility.
+from osia.tool_contracts import bind_static_registry as _bind_static_tool_registry
+
+TOOL_REGISTRY = _bind_static_tool_registry(globals())
+TOOL_REGISTRY.assert_complete(TOOL_MAP)
+
 # Known tool names — bare-JSON candidates (priority 3 of the universal
 # parser) are validated against this set so arbitrary JSON the model shows
 # in prose (code examples, config snippets…) is never executed as a tool.
@@ -3384,51 +3401,126 @@ def _tool_timeout_seconds(tool_name: str, kwargs: dict) -> float:
     return TOOL_TIMEOUT_SECONDS
 
 
-def _execute_tool_once(tool_name: str, kwargs: dict, timeout_s: float | None = None):
-    """Run one tool with a wall-clock timeout (default 30 s; shell commands use
-    the command timeout plus grace — see ``_tool_timeout_seconds``). Returns
-    the result (a string, or a ``{"text", "screenshot"}`` dict for navigation
-    tools), or a clear [ERREUR] line on timeout/exception so the model can read
-    the failure back and report it honestly. Submitting through a
-    ThreadPoolExecutor means the surrounding agent loop can never be wedged by
-    a stuck synchronous tool.
-    """
-    if timeout_s is None:
-        timeout_s = TOOL_TIMEOUT_SECONDS
+def _tool_spec_and_contract(tool_name: str, kwargs: dict, user_request: str = ""):
+    from osia.tool_contracts import (
+        compatibility_tool_spec,
+        effective_contract,
+        get_tool_spec,
+    )
+
+    spec = get_tool_spec(tool_name)
+    if spec is None:
+        spec = compatibility_tool_spec(tool_name, TOOL_MAP[tool_name])
+    return spec, effective_contract(spec, kwargs, user_request)
+
+
+def _execute_tool_once_record(
+    tool_name: str,
+    kwargs: dict,
+    *,
+    timeout_s: float,
+    contract,
+    lang: str = "fr",
+):
+    """Dispatch once and preserve truthful timeout/outcome semantics."""
+    from osia.tool_contracts import (
+        ExecutionOutcome,
+        SideEffectClass,
+        ToolExecutionRecord,
+        bounded_model_result,
+    )
+
     fn = TOOL_MAP[tool_name]
     try:
-        # Run the tool inside a copy of the CURRENT context so the per-task
-        # sticky-key scope (key_chain.task_scope, a ContextVar set on the agent
-        # thread) is visible inside this worker thread — ThreadPoolExecutor does
-        # NOT propagate context on its own. The scope's state is a dict mutated
-        # in place, so a key a tool's vision/TTS/STT call records (e.g. the 2nd
-        # of desktop_click's three vision calls) is seen by the next call and by
-        # the agent thread. Outside any task_scope this copy is inert.
+        # Preserve the existing key-rotation/context propagation contract.
         ctx = contextvars.copy_context()
         fut = _TOOL_EXECUTOR.submit(ctx.run, fn, **kwargs)
-        result = fut.result(timeout=timeout_s)
-        # Preserve dict results (browser tools) so screenshots survive.
-        if isinstance(result, dict):
-            return result
-        return str(result)
+        raw_result = fut.result(timeout=timeout_s)
+        result = bounded_model_result(raw_result)
     except FutureTimeoutError:
-        return (
-            f"[ERREUR] L'outil '{tool_name}' n'a pas répondu après "
-            f"{int(timeout_s)}s (timeout). L'action n'a pas été confirmée."
+        # Future.result(timeout=...) does not prove cancellation. The worker may
+        # still complete, so no replay or provider fallback may start.
+        text = (
+            "ERROR: délai d'exécution dépassé ; résultat incertain. "
+            "L'outil peut encore terminer et ne sera pas relancé."
+            if str(lang or "").lower().startswith("fr") else
+            "ERROR: tool execution timed out; outcome uncertain. "
+            "The tool may still complete and will not be retried."
         )
-    except Exception as e:
-        return f"[ERREUR] '{tool_name}' a échoué: {e}"
+        return ToolExecutionRecord(
+            text, True, ExecutionOutcome.OUTCOME_UNKNOWN, 1, True, True,
+            contract,
+        )
+    except Exception:
+        # Raw exception text may contain arguments, paths, provider payloads or
+        # credentials and therefore never enters feedback or diagnostics.
+        text = (
+            "ERROR: échec interne de l'outil ; détails privés masqués"
+            if str(lang or "").lower().startswith("fr") else
+            "ERROR: internal tool failure; private details were withheld"
+        )
+        outcome = (
+            ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
+            if contract.side_effect == SideEffectClass.READ_ONLY
+            else ExecutionOutcome.OUTCOME_UNKNOWN
+        )
+        return ToolExecutionRecord(text, True, outcome, 1, True, False, contract)
+
+    is_error = _is_tool_error(result)
+    if is_error:
+        text = _result_text(result).lower()
+        timed_out = "timed out" in text or "timeout" in text
+        outcome = (
+            ExecutionOutcome.OUTCOME_UNKNOWN
+            if contract.side_effect != SideEffectClass.READ_ONLY
+            else ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
+        )
+    else:
+        timed_out = False
+        outcome = (
+            ExecutionOutcome.SUCCESS_VERIFIED
+            if contract.side_effect == SideEffectClass.READ_ONLY
+            or contract.spec.verified_success
+            else ExecutionOutcome.SUCCESS_UNVERIFIED
+        )
+    return ToolExecutionRecord(
+        result, is_error, outcome, 1, True, timed_out, contract,
+    )
 
 
-def _execute_tool_with_retry(tool_name: str, kwargs: dict,
-                             *, hard_deadline: float | None = None,
-                             allow_retry: bool = True):
-    """Execute a tool and retry exactly once if the first attempt
-    reports an error (or returns empty). Returns ``(result, is_error)``
-    where ``is_error`` reflects the *final* attempt — callers use it to
-    decide whether to keep dispatching the rest of a tool-call batch.
-    """
-    configured_timeout_s = _tool_timeout_seconds(tool_name, kwargs)
+def _execute_tool_with_policy(
+    tool_name: str,
+    kwargs: dict,
+    *,
+    hard_deadline: float | None = None,
+    allow_retry: bool = True,
+    user_request: str = "",
+    lang: str = "fr",
+):
+    """Validate before dispatch and retry only proven-safe read failures."""
+    from osia.tool_contracts import (
+        ExecutionOutcome,
+        RetryPolicy,
+        ToolExecutionRecord,
+        ToolValidationError,
+        validate_arguments,
+        validation_error_text,
+    )
+
+    spec, contract = _tool_spec_and_contract(tool_name, kwargs, user_request)
+    try:
+        kwargs = validate_arguments(spec.input_schema, kwargs)
+    except ToolValidationError:
+        return ToolExecutionRecord(
+            validation_error_text(lang), True,
+            ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+            0, False, False, contract,
+        )
+
+    configured_timeout_s = min(
+        float(spec.timeout_seconds),
+        _tool_timeout_seconds(tool_name, kwargs),
+    )
 
     def _bounded_timeout():
         if hard_deadline is None:
@@ -3438,57 +3530,73 @@ def _execute_tool_with_retry(tool_name: str, kwargs: dict,
 
     timeout_s = _bounded_timeout()
     if timeout_s <= 0:
-        return (
-            f"[ERREUR] L'outil '{tool_name}' n'a pas été démarré : "
-            "le plafond total du tour est atteint.",
-            True,
+        text = (
+            "ERROR: outil non démarré ; plafond total du tour atteint"
+            if str(lang or "").lower().startswith("fr") else
+            "ERROR: tool not started; the total turn ceiling was reached"
         )
-    result = _execute_tool_once(tool_name, kwargs, timeout_s=timeout_s)
-    # Slow install/download/clone commands are NOT auto-retried: an immediate
-    # identical retry would just double an already-long wait (WOR-31).
-    # Shell timeout results are also not retried: a retry would silently double
-    # the explicit/default command timeout while rerunning the same command.
-    # ``desktop_click`` is also NOT auto-retried: a blind retry doubles the
-    # (already long) wait and can double-click. Fast tools keep the
-    # retry-once-on-error behavior.
-    # MCP tools (``mcp__*``) are also NOT auto-retried (WOR-44 Phase 5,
-    # 5-conf-a): (1) a confirmation DECLINE/BLOCK must be DURABLE — a blind retry
-    # would re-prompt the user and a mis-approved second prompt could execute a
-    # write the agent already presented as declined; (2) MCP write tools are
-    # frequently non-idempotent (send/create/delete), so retrying a call that
-    # errored AFTER its side effect landed would double it. The model still sees
-    # the error result and can deliberately re-issue the call if appropriate.
-    shell_command = tool_name in ("bash", "run_command")
-    long_running = (
-        shell_command
-        and _is_long_running_command(kwargs.get("command", "") or "")
-    )
-    shell_timed_out = (
-        shell_command
-        and "timed out after" in _result_text(result).lower()
-    )
-    no_retry = (
-        not allow_retry
-        or long_running
-        or shell_timed_out
-        or tool_name == "desktop_click"
-        or tool_name.startswith("mcp__")
-        or tool_name in _GMAIL_WRITE_TOOL_NAMES
-        or tool_name in _DOCUMENT_TOOL_NAMES
-        or tool_name in _SEMANTIC_FORM_PRIVATE_TOOL_NAMES
-    )
-    if _is_tool_error(result) and not no_retry:
-        retry_timeout_s = _bounded_timeout()
-        if retry_timeout_s <= 0:
-            return result, _is_tool_error(result)
-        print(
-            f"[OSIA Agent] ↻ retry tool: {tool_name} "
-            f"(first result: {len(_result_text(result))} chars)"
+        return ToolExecutionRecord(
+            text, True, ExecutionOutcome.NOT_STARTED, 0, False, False,
+            contract,
         )
-        result = _execute_tool_once(
-            tool_name, kwargs, timeout_s=retry_timeout_s,
-        )
-    return result, _is_tool_error(result)
+
+    record = _execute_tool_once_record(
+        tool_name, kwargs, timeout_s=timeout_s, contract=contract, lang=lang,
+    )
+    retry_allowed = (
+        allow_retry
+        and contract.retry == RetryPolicy.READ_ONCE_AFTER_CONFIRMED_FAILURE
+        and record.outcome == ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
+    )
+    if not retry_allowed:
+        return record
+    retry_timeout_s = _bounded_timeout()
+    if retry_timeout_s <= 0:
+        return record
+    print(
+        f"[OSIA Agent] retry safe read tool: {tool_name} "
+        f"(first result length={len(_result_text(record.result))})"
+    )
+    retried = _execute_tool_once_record(
+        tool_name, kwargs, timeout_s=retry_timeout_s,
+        contract=contract, lang=lang,
+    )
+    return ToolExecutionRecord(
+        retried.result, retried.is_error, retried.outcome, 2,
+        retried.dispatched, retried.timed_out, retried.contract,
+    )
+
+
+def _execute_tool_once(tool_name: str, kwargs: dict, timeout_s: float | None = None):
+    """Compatibility wrapper returning the historic raw result shape."""
+    from osia.tool_contracts import (
+        ToolValidationError,
+        validate_arguments,
+        validation_error_text,
+    )
+
+    if timeout_s is None:
+        timeout_s = TOOL_TIMEOUT_SECONDS
+    spec, contract = _tool_spec_and_contract(tool_name, kwargs)
+    timeout_s = min(float(timeout_s), float(spec.timeout_seconds))
+    try:
+        kwargs = validate_arguments(spec.input_schema, kwargs)
+    except ToolValidationError:
+        return validation_error_text("fr")
+    return _execute_tool_once_record(
+        tool_name, kwargs, timeout_s=timeout_s, contract=contract,
+    ).result
+
+
+def _execute_tool_with_retry(tool_name: str, kwargs: dict,
+                             *, hard_deadline: float | None = None,
+                             allow_retry: bool = True):
+    """Compatibility wrapper returning ``(result, is_error)``."""
+    record = _execute_tool_with_policy(
+        tool_name, kwargs, hard_deadline=hard_deadline,
+        allow_retry=allow_retry,
+    )
+    return record.result, record.is_error
 
 
 def _provider_supports_vision(provider: str, model: str) -> bool:
@@ -5701,6 +5809,61 @@ class OSIAAgent:
             }
         return localized_text("empty_completion", self.lang)
 
+    def _finish_execution_barrier_stop(
+        self,
+        *,
+        outcome_unknown: bool,
+        timed_out: bool = False,
+        on_sentence=None,
+    ) -> str:
+        """Produce one canonical safe final without replaying a committed turn."""
+        prior_reason = (
+            self.last_run_diagnostic.get("reason_code")
+            if isinstance(self.last_run_diagnostic, dict) else None
+        )
+        reason_code = (
+            "tool_timeout" if timed_out
+            else "provider_timeout" if prior_reason == "provider_timeout"
+            else "task_execution_failure"
+        )
+        self.last_run_diagnostic = {
+            "stage": "task_execution",
+            "error_category": reason_code,
+            "reason_code": reason_code,
+        }
+        if self.lang == "fr":
+            content = (
+                "Le résultat de l'action est incertain : elle a été lancée mais "
+                "peut encore se terminer. Je ne l'ai ni relancée ni rejouée sur "
+                "un autre fournisseur. Vérifiez son effet avant toute nouvelle tentative."
+                if outcome_unknown else
+                "Une action avec effet a déjà été lancée. Le fournisseur a ensuite "
+                "échoué ; je n'ai pas rejoué le tour afin d'éviter de dupliquer l'action."
+            )
+        else:
+            content = (
+                "The action outcome is uncertain: it was dispatched and may still "
+                "complete. I did not retry it or replay it on another provider. "
+                "Check its effect before trying again."
+                if outcome_unknown else
+                "A side-effecting action was already dispatched. The provider then "
+                "failed, and I did not replay the turn to avoid duplicating the action."
+            )
+        content = clean_response(content)
+        if on_sentence is not None:
+            try:
+                on_sentence(content)
+            except Exception:
+                pass
+        self._mark_document_private_history()
+        final_message = {"role": "assistant", "content": content}
+        if self._document_private_run:
+            final_message["_document_private"] = True
+        self.messages.append(final_message)
+        if self.turn_context is not None:
+            log_final(self.turn_context, content)
+        return content
+
     def _drop_history_screenshots(self) -> None:
         """Reduce past tool-result messages in ``self.messages`` to their
         text part, dropping any base64 screenshot/image data.
@@ -6022,6 +6185,12 @@ class OSIAAgent:
         # Once an account response emits an OSIA textual tool call, the attempt
         # is committed. A later tool-result turn must never replay via an API.
         _account_attempt_committed = False
+        # A provider fallback may replay the complete turn. Once a mutating,
+        # dynamic or otherwise ambiguous tool has actually been dispatched,
+        # replay is forbidden for the rest of this turn (WOR-178).
+        tool_execution_barrier_committed = False
+        turn_has_unknown_outcome = False
+        turn_has_tool_timeout = False
         # Empty-response guard: whether the one allowed "your reply was
         # empty after stripping markup" retry has been spent.
         empty_retry_used = False
@@ -6125,6 +6294,7 @@ class OSIAAgent:
                 _already_streamed = (
                     bool(getattr(e, "native_action", False))
                     or _account_attempt_committed
+                    or tool_execution_barrier_committed
                 )
 
                 # Honor one short Retry-After on a transient 429. Quota/billing
@@ -6216,6 +6386,11 @@ class OSIAAgent:
                         "error_category": "provider_timeout",
                         "reason_code": "provider_timeout",
                     }
+                if tool_execution_barrier_committed:
+                    return self._finish_execution_barrier_stop(
+                        outcome_unknown=turn_has_unknown_outcome,
+                        on_sentence=on_sentence,
+                    )
                 raise
 
             # Provider output, streamed text and chatter are not useful progress.
@@ -6366,6 +6541,30 @@ class OSIAAgent:
                             )
                         break
 
+                    # Validate against the authoritative schema before any
+                    # intent/confirmation gate, worker submission or I/O.
+                    kwargs = {k: v for k, v in tc.items() if k != "tool"}
+                    spec, effective = _tool_spec_and_contract(
+                        tool_name, kwargs, user_text,
+                    )
+                    try:
+                        from osia.tool_contracts import (
+                            ExecutionOutcome,
+                            ProgressEvidencePolicy,
+                            ToolExecutionRecord,
+                            ToolValidationError,
+                            validate_arguments,
+                            validation_error_text,
+                        )
+                        kwargs = validate_arguments(spec.input_schema, kwargs)
+                    except ToolValidationError:
+                        validation_text = validation_error_text(self.lang)
+                        tool_results.append(
+                            f"Tool {tool_name} result:\n{validation_text}"
+                        )
+                        guard.record(tool_name, kwargs, "", True)
+                        break
+
                     if (
                         tool_name in _SCHEDULED_TASK_TOOL_NAMES
                         and scheduled_execution is None
@@ -6382,7 +6581,6 @@ class OSIAAgent:
                         )
                         continue
 
-                    kwargs = {k: v for k, v in tc.items() if k != "tool"}
                     if tool_name == "fill_form_field":
                         self._remember_semantic_form_value(kwargs.get("value"))
                     print(
@@ -6395,13 +6593,17 @@ class OSIAAgent:
                             user_text=user_text,
                         )
                         try:
-                            result, is_error = _execute_tool_with_retry(
+                            execution_record = _execute_tool_with_policy(
                                 tool_name,
                                 kwargs,
                                 hard_deadline=guard.started_at + guard.hard_limit,
+                                user_request=user_text,
+                                lang=self.lang,
                             )
                         finally:
                             _memory_runtime.reset_save_memory_context(token)
+                        result = execution_record.result
+                        is_error = execution_record.is_error
                         memory_save_tool_seen = True
                         save_result = _memory_runtime.parse_save_memory_tool_result(result)
                         if save_result is not None:
@@ -6420,6 +6622,15 @@ class OSIAAgent:
                                 ),
                             }, sort_keys=True)
                             is_error = True
+                            execution_record = ToolExecutionRecord(
+                                result,
+                                True,
+                                ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+                                0,
+                                False,
+                                False,
+                                effective,
+                            )
                         else:
                             token = _CURRENT_CONVERSATION_ID.set(
                                 current_conversation_id
@@ -6429,16 +6640,20 @@ class OSIAAgent:
                                 "id": self.model,
                             })
                             try:
-                                result, is_error = _execute_tool_with_retry(
+                                execution_record = _execute_tool_with_policy(
                                     tool_name,
                                     kwargs,
                                     hard_deadline=(
                                         guard.started_at + guard.hard_limit
                                     ),
+                                    user_request=user_text,
+                                    lang=self.lang,
                                 )
                             finally:
                                 _CURRENT_CONVERSATION_ID.reset(token)
                                 _CURRENT_MODEL_METADATA.reset(model_token)
+                            result = execution_record.result
+                            is_error = execution_record.is_error
                         scheduled_task_tool_seen = True
                         scheduled_result = (
                             _scheduled_tasks.parse_scheduled_task_tool_result(result)
@@ -6468,14 +6683,38 @@ class OSIAAgent:
                             final_external_call = True
                         if policy_error:
                             result, is_error = policy_error, True
+                            execution_record = ToolExecutionRecord(
+                                result,
+                                True,
+                                ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+                                0,
+                                False,
+                                False,
+                                effective,
+                            )
                         else:
-                            result, is_error = _execute_tool_with_retry(
+                            execution_record = _execute_tool_with_policy(
                                 tool_name,
                                 kwargs,
                                 hard_deadline=guard.started_at + guard.hard_limit,
                                 allow_retry=not final_external_call,
+                                user_request=user_text,
+                                lang=self.lang,
                             )
-                    any_tool_executed = True
+                            result = execution_record.result
+                            is_error = execution_record.is_error
+                    if execution_record.dispatched:
+                        any_tool_executed = True
+                    if (
+                        execution_record.dispatched
+                        and execution_record.contract.commits_fallback_barrier
+                    ):
+                        tool_execution_barrier_committed = True
+                    if execution_record.outcome == ExecutionOutcome.OUTCOME_UNKNOWN:
+                        tool_execution_barrier_committed = True
+                        turn_has_unknown_outcome = True
+                        if execution_record.timed_out:
+                            turn_has_tool_timeout = True
                     text_part = _result_text(result)
                     document_reference = _document_reference_from_result(
                         tool_name, result,
@@ -6491,7 +6730,11 @@ class OSIAAgent:
                             if ref.get("artifact_id") != artifact_id
                         ]
                         self.last_run_artifacts.append(document_reference)
-                    if is_error and "timeout" in text_part[:256].lower():
+                    if (
+                        execution_record.timed_out
+                        or execution_record.outcome
+                        == ExecutionOutcome.OUTCOME_UNKNOWN
+                    ):
                         unresolved_tool_timeout = True
                     screenshot = (
                         result.get("screenshot")
@@ -6512,7 +6755,15 @@ class OSIAAgent:
                     # happened (WOR-31). The banner is added ONLY to the
                     # model-facing feedback — text_part stays clean for the
                     # anti-loop guard's failure log below.
-                    if is_error:
+                    if execution_record.outcome == ExecutionOutcome.OUTCOME_UNKNOWN:
+                        display_text = (
+                            "⚠️ RÉSULTAT INCERTAIN — ne suppose ni succès ni "
+                            f"échec et ne relance pas automatiquement : {text_part}"
+                            if self.lang == "fr" else
+                            "⚠️ OUTCOME UNCERTAIN — do not assume success or "
+                            f"failure and do not retry automatically: {text_part}"
+                        )
+                    elif is_error:
                         display_text = (
                             "⚠️ TOOL FAILED — the action did NOT happen: "
                             f"{text_part}"
@@ -6532,20 +6783,38 @@ class OSIAAgent:
                     # Anti-loop: record the executed call and run every
                     # detector (repetition, error streak, stall, time).
                     progress_before = guard.useful_progress_count
-                    document_progress = _document_progress_fingerprint(
-                        document_reference,
+                    if (
+                        execution_record.outcome == ExecutionOutcome.SUCCESS_VERIFIED
+                        and execution_record.contract.spec.progress_evidence
+                        == ProgressEvidencePolicy.DOCUMENT_ARTIFACT
+                    ):
+                        document_progress = _document_progress_fingerprint(
+                            document_reference,
+                        )
+                        if document_progress is not None:
+                            guard._record_useful_progress(document_progress)
+                    if (
+                        execution_record.outcome == ExecutionOutcome.SUCCESS_VERIFIED
+                        and execution_record.contract.spec.progress_evidence
+                        == ProgressEvidencePolicy.VERIFIED_FORM_STATE
+                    ):
+                        semantic_form_progress = _semantic_form_progress_fingerprint(
+                            tool_name, result,
+                        )
+                        if semantic_form_progress is not None:
+                            guard._record_useful_progress(semantic_form_progress)
+                    progress_result = (
+                        text_part
+                        if execution_record.outcome
+                        == ExecutionOutcome.SUCCESS_VERIFIED
+                        and execution_record.contract.spec.progress_evidence
+                        != ProgressEvidencePolicy.NONE
+                        else ""
                     )
-                    if document_progress is not None:
-                        guard._record_useful_progress(document_progress)
-                    semantic_form_progress = _semantic_form_progress_fingerprint(
-                        tool_name, result,
-                    )
-                    if semantic_form_progress is not None:
-                        guard._record_useful_progress(semantic_form_progress)
                     if guard.record(
                         tool_name,
                         kwargs,
-                        text_part,
+                        progress_result,
                         is_error,
                     ):
                         remaining = tool_calls[i + 1:]
@@ -6569,6 +6838,16 @@ class OSIAAgent:
                                 f"follow-up tool call(s) after error: {names}"
                             )
                         break
+
+                # A timed-out worker may still be running. Do not ask any
+                # provider to continue the plan: that could dispatch a second
+                # action while the first completes late. Finish canonically.
+                if turn_has_unknown_outcome:
+                    return self._finish_execution_barrier_stop(
+                        outcome_unknown=True,
+                        timed_out=turn_has_tool_timeout,
+                        on_sentence=on_sentence,
+                    )
 
                 # Feed tool results back. When a browser tool returned a
                 # screenshot AND the active model supports vision content,

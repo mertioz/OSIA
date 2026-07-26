@@ -75,88 +75,32 @@ def _valid_server_id(server_id: str) -> bool:
     return _valid_tool_name(server_id) and _SEP not in server_id
 
 
-# ── Write/destructive classification + confirmation gate (WOR-44 Phase 5) ────
-# A write/destructive MCP tool (create/update/delete/send/…) can have real side
-# effects, and MCP tool metadata is third-party text. Before such a tool runs we
-# may require a user confirmation. Classification prefers the server-supplied MCP
-# annotations (readOnlyHint / destructiveHint); when absent it falls back to a
-# name-verb heuristic. The heuristic is WRITE-BIASED: any write verb present wins
-# over a read verb (so e.g. "list_and_delete" is treated as write), and a name
-# matching neither is treated as write — the SAFE default, since a false "write"
-# only costs an extra confirmation while a false "read" would skip the gate on a
-# destructive call.
-# The write list is deliberately BROAD (mutation + execution + destructive
-# verbs): a false "write" only costs an extra confirmation, while a missing write
-# verb is a dangerous false-READ that skips the gate on a destructive call. It
-# covers state-change, lifecycle, sharing/permission, and EXECUTION verbs
-# (run/execute/invoke/trigger/dispatch) — a tool that "runs" something can mutate.
-_WRITE_VERBS = frozenset({
-    # core CRUD / messaging (original set)
-    "create", "update", "delete", "remove", "send", "post", "put", "patch",
-    "write", "merge", "archive", "move", "add", "edit", "insert", "upload",
-    "set", "cancel", "close", "comment", "append",
-    # execution (can mutate — e.g. an SQL "run"/"query" runner)
-    "run", "execute", "exec", "invoke", "trigger", "dispatch", "import",
-    # destructive / lifecycle
-    "purge", "drop", "truncate", "reset", "revoke", "disable", "enable",
-    "kill", "terminate", "destroy", "wipe", "clear", "flush", "prune",
-    "deactivate", "activate", "deploy", "rollback", "restore", "overwrite",
-    "replace", "rename", "duplicate", "clone", "sync", "push", "commit",
-    "revert", "format", "install", "uninstall", "start", "stop", "restart",
-    "reboot", "schedule", "transfer", "publish", "unpublish",
-    # approval / membership / sharing / metadata mutation
-    "approve", "reject", "grant", "assign", "unassign", "charge", "pay",
-    "refund", "share", "unshare", "lock", "unlock", "mute", "unmute", "ban",
-    "unban", "invite", "subscribe", "unsubscribe", "mark", "flag", "pin",
-    "unpin", "tag", "untag", "complete", "reopen", "resolve", "register",
-    "unregister",
-    # additional destructive / lifecycle / infra verbs (red-team residual
-    # closure — a false write here only costs a confirmation, so erring broad).
-    "void", "invalidate", "escalate", "rotate", "decommission", "deprecate",
-    "settle", "dismiss", "quarantine", "scale", "expire", "provision",
-    "acknowledge", "evict", "redeem", "detach", "drain", "suspend", "resume",
-    "pause", "abort", "halt", "regenerate", "rebuild", "reindex", "block",
-    "unblock", "deny", "withdraw", "deposit", "reverse",
-})
-# NOTE: "query" is intentionally NOT a read verb — an SQL/database "query" can
-# INSERT/UPDATE/DELETE/DROP (e.g. d1_database_query), so a query-named tool falls
-# through to the safe default (write) unless its name also carries a read verb.
-_READ_VERBS = frozenset({
-    "get", "list", "search", "read", "fetch", "find", "describe",
-    "view", "export",
-})
+# ── Write/destructive classification + confirmation gate (WOR-44/WOR-178) ───
+# Third-party names and descriptions never lower risk. Only structurally valid,
+# non-conflicting MCP annotations may prove read-only semantics; otherwise the
+# tool is gated as a write/unknown capability.
 
 
 def classify_tool(name: str, annotations: Optional[dict] = None) -> bool:
     """Return ``True`` if a tool is WRITE/destructive (gate it), ``False`` if
     READ-only (run it freely).
 
-    Order of evidence (annotations are authoritative when present):
-      1. ``readOnlyHint is True``                                  -> read.
-      2. ``destructiveHint`` truthy OR ``readOnlyHint is False``   -> write.
-         (``bool(dh)`` coerces a truthy non-bool hint toward write — a dropped
-         destructive signal would be unsafe.)
-      3. Name-verb heuristic, WRITE-biased: any write verb (token OR name
-         prefix) -> write; else any read verb -> read; else -> write (the safe
-         default for an ambiguous name).
+    Only an exact, structurally valid ``readOnlyHint: true`` with no conflicting
+    destructive hint can lower risk. Names and natural-language descriptions
+    are never proof of read-only semantics; everything else is write-biased.
     """
     ann = annotations if isinstance(annotations, dict) else {}
     ro = ann.get("readOnlyHint")
     dh = ann.get("destructiveHint")
-    if ro is True:
+    hints_are_structural = all(
+        key not in ann or isinstance(ann.get(key), bool)
+        for key in ("readOnlyHint", "destructiveHint")
+    )
+    if hints_are_structural and ro is True and dh is not True:
         return False
-    if (dh is not None and bool(dh)) or ro is False:
+    if dh is True or ro is False:
         return True
-    low = str(name or "").lower()
-    tokens = {tok for tok in re.split(r"[^a-z0-9]+", low) if tok}
-    # WRITE wins: an exact write-verb token, or a name starting with one. (Write
-    # is checked BEFORE read so a name pairing both — e.g. "list_and_delete" —
-    # is gated.)
-    if tokens & _WRITE_VERBS or any(low.startswith(v) for v in _WRITE_VERBS):
-        return True
-    if tokens & _READ_VERBS or any(low.startswith(v) for v in _READ_VERBS):
-        return False
-    return True  # ambiguous -> write (safe)
+    return True
 
 
 # Process-wide confirmation provider. A UI (desktop Qt dialog / mobile WS round-
@@ -193,14 +137,10 @@ def _setting_bool(key: str, default: bool) -> bool:
 
 def _confirm_summary(server_id: str, tool_name: str, kwargs: dict) -> str:
     """A short, bounded, human-facing description of a pending write call for the
-    confirmation UI. Best-effort; never raises (and never inlines arg VALUES,
-    which may be large or sensitive — only the arg names)."""
-    try:
-        keys = ", ".join(list(kwargs.keys())[:8]) if isinstance(kwargs, dict) else ""
-    except Exception:
-        keys = ""
-    base = f"{tool_name} on {server_id}"
-    return f"{base} (args: {keys})" if keys else base
+    confirmation UI. It is categorical and never includes argument names or
+    values, server identifiers, payloads or provider descriptions."""
+    del server_id, tool_name, kwargs
+    return "Run one connected write capability"
 
 
 def confirm_connector_write(
@@ -209,6 +149,7 @@ def confirm_connector_write(
     summary: str,
     *,
     error_namespace: str = "connector",
+    call_arguments: Optional[dict] = None,
 ) -> Optional[str]:
     """Shared connector/add-on write safety gate.
 
@@ -220,16 +161,37 @@ def confirm_connector_write(
         return None
     provider = get_confirmation_provider()
     if provider is not None:
+        normalized = dict(call_arguments) if isinstance(call_arguments, dict) else {}
+        try:
+            from osia.tool_contracts import CONFIRMATION_LEDGER
+
+            grant = CONFIRMATION_LEDGER.issue(tool_name, normalized)
+        except Exception:
+            return (
+                f"ERROR: {error_namespace}/{server_id}/{tool_name}: "
+                "confirmation scope unavailable"
+            )
         try:
             decision = provider(server_id, tool_name, str(summary or ""))
         except Exception:
             decision = False  # a provider failure is treated as a decline (safe)
         if decision is not None:
             if bool(decision):
-                return None
+                # Turn the UI decision into one exact, opaque, expiring and
+                # single-use grant. Raw values never leave the hash boundary.
+                if CONFIRMATION_LEDGER.consume(
+                    grant.token, tool_name, normalized,
+                ):
+                    return None
+                return (
+                    f"ERROR: {error_namespace}/{server_id}/{tool_name}: "
+                    "confirmation scope unavailable"
+                )
+            CONFIRMATION_LEDGER.consume(grant.token, tool_name, normalized)
             return (
                 f"ERROR: {error_namespace}/{server_id}/{tool_name}: user declined"
             )
+        CONFIRMATION_LEDGER.consume(grant.token, tool_name, normalized)
     # Unattended: no UI/provider/target present.
     if _setting_bool("mcp_allow_unattended_writes", False):
         return None
@@ -256,6 +218,7 @@ def _confirm_gate(server_id: str, tool_name: str, kwargs: dict) -> Optional[str]
         tool_name,
         _confirm_summary(server_id, tool_name, kwargs),
         error_namespace="mcp",
+        call_arguments=kwargs,
     )
 
 
@@ -318,37 +281,16 @@ def _make_wrapper(
     so their hot path is unchanged. The gate reads its settings LIVE, so toggling
     confirmation takes effect without re-registering tools.
 
-    Defensive arg-unwrap (WOR-100): some models (e.g. DeepSeek) hallucinate an
-    ``{"args": {...}}`` / ``{"arguments": {...}}`` envelope around the real tool
-    arguments. A strict MCP server (e.g. Google's protobuf JSON parser) then
-    rejects the unknown field ``args`` with a 400. We strip exactly that
-    envelope — and only that — before dispatch: when ``kwargs`` is a single key
-    ``args``/``arguments`` whose value is a ``dict`` AND that key is NOT a real
-    property of THIS tool's ``inputSchema``. The schema check means a tool that
-    genuinely declares an ``args``/``arguments`` parameter is never touched; the
-    single-key + dict + not-in-schema gate leaves already-flat calls untouched
-    and makes the transform idempotent. The legitimate property names are
-    computed ONCE at registration; the hot path is just a length check.
+    Arguments are validated exactly as advertised. Invalid envelopes and
+    unknown fields are rejected rather than silently coerced (WOR-178).
     """
-    # Legitimate top-level property names for THIS tool, snapshotted at
-    # registration so the per-call unwrap never re-reads the schema.
-    schema_props: set = set()
-    if isinstance(input_schema, dict):
-        _props = input_schema.get("properties")
-        if isinstance(_props, dict):
-            schema_props = set(_props.keys())
-
     def _mcp_tool(**kwargs) -> str:
-        # Strip a hallucinated single-key args/arguments envelope (see docstring).
-        if len(kwargs) == 1:
-            for _env in ("args", "arguments"):
-                if (
-                    _env in kwargs
-                    and _env not in schema_props
-                    and isinstance(kwargs[_env], dict)
-                ):
-                    kwargs = kwargs[_env]
-                    break
+        try:
+            from osia.tool_contracts import validate_arguments
+
+            kwargs = validate_arguments(input_schema or {}, kwargs)
+        except Exception:
+            return "ERROR: invalid MCP tool arguments; the tool was not executed"
         if is_write:
             blocked = _confirm_gate(server_id, tool_name, kwargs)
             if blocked is not None:
@@ -395,6 +337,12 @@ def _unregister_locked(server_id: str, tool_map, known) -> None:
     TOOL_MAP entries to a disconnected-stub rather than deleting them — see
     ``_make_disconnected_stub`` for why we never pop (TS-1)."""
     names = _by_server.pop(server_id, [])
+    try:
+        from osia.tool_contracts import unregister_dynamic_tools
+
+        unregister_dynamic_tools(names)
+    except Exception:
+        pass
     if known is not None and names:
         try:
             known.difference_update(names)
@@ -424,6 +372,7 @@ def register_server_tools(manager: Any, server_id: str, tools) -> list:
     tool_map, known = _agent_maps()
     new_callables: dict[str, Any] = {}
     new_meta: dict[str, dict] = {}
+    duplicate_names: set[str] = set()
     for t in tools or []:
         try:
             name = (t.get("name") or "").strip()
@@ -434,6 +383,13 @@ def register_server_tools(manager: Any, server_id: str, tools) -> list:
         if not _valid_tool_name(name):
             continue
         full = tool_full_name(server_id, name)
+        if full in duplicate_names:
+            continue
+        if full in new_callables:
+            duplicate_names.add(full)
+            new_callables.pop(full, None)
+            new_meta.pop(full, None)
+            continue
         raw_ann = t.get("annotations")
         annotations = raw_ann if isinstance(raw_ann, dict) else {}
         # Classify ONCE at registration; the result is baked into the wrapper
@@ -454,6 +410,46 @@ def register_server_tools(manager: Any, server_id: str, tools) -> list:
     with _lock:
         # Reconnect hygiene: drop any prior registration for this server.
         _unregister_locked(server_id, tool_map, known)
+        # Register connected MCP contracts only after the previous generation
+        # is removed. Invalid third-party schemas fail closed and are neither
+        # advertised nor executable.
+        valid_callables: dict[str, Any] = {}
+        valid_meta: dict[str, dict] = {}
+        for full, dispatcher in new_callables.items():
+            meta = new_meta[full]
+            annotations = meta.get("annotations") or {}
+            structural_semantics = bool(
+                isinstance(annotations, dict)
+                and all(
+                    key not in annotations
+                    or isinstance(annotations.get(key), bool)
+                    for key in ("readOnlyHint", "destructiveHint")
+                )
+                and (
+                    "readOnlyHint" in annotations
+                    or annotations.get("destructiveHint") is True
+                )
+            )
+            try:
+                from osia.tool_contracts import register_dynamic_tool
+
+                registered_spec = register_dynamic_tool(
+                    name=full,
+                    dispatcher=dispatcher,
+                    capability=meta.get("description") or "Connected MCP capability",
+                    input_schema=meta.get("inputSchema") or {},
+                    connector_id=server_id,
+                    read_only=not bool(meta.get("is_write")),
+                    semantics_known=structural_semantics,
+                )
+            except Exception:
+                continue
+            valid_callables[full] = dispatcher
+            authoritative_meta = dict(meta)
+            authoritative_meta["inputSchema"] = registered_spec.input_schema
+            valid_meta[full] = authoritative_meta
+        new_callables = valid_callables
+        new_meta = valid_meta
         # Record prompt metadata (used regardless of agent availability).
         _tool_meta.update(new_meta)
         _by_server[server_id] = list(new_callables.keys())

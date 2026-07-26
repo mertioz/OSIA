@@ -324,27 +324,21 @@ def _confirmation_summary(
     tool_name: str,
     kwargs: dict,
 ) -> str:
-    if tool_name in {"delete_file", "delete_directory"}:
-        return f"Delete local path: {str(kwargs.get('path') or '')[:240]}"
-    if tool_name == "kill_process":
-        target = kwargs.get("name_or_pid", "")
-        return f"Stop local process: {str(target)[:120]}"
-    if decision.action_class == ActionClass.EXTERNAL_COMMUNICATION:
-        return (
-            f"Send one message to {decision.recipient[:80]}: "
-            f"{decision.content[:240]}"
+    # Confirmation UI is an observability surface: never echo paths, commands,
+    # recipients, bodies, selectors, IDs or arbitrary model arguments into it.
+    del decision, kwargs
+    try:
+        from osia.tool_contracts import (
+            effective_contract,
+            get_tool_spec,
+            safe_confirmation_summary,
         )
-    if decision.reason in {"public_posting", "bulk_messaging"}:
-        return (
-            f"Publish/send to {decision.recipient[:80]}: "
-            f"{decision.content[:240]}"
-        )
-    if decision.reason == "external_form_commitment":
-        return "Commit the currently prepared external form once"
-    if decision.content:
-        return f"Perform sensitive action: {decision.content[:240]}"
-    label = next((str(value) for value in kwargs.values() if value), tool_name)
-    return f"Perform sensitive final action: {label[:240]}"
+
+        spec = get_tool_spec(str(tool_name))
+        contract = effective_contract(spec, {}) if spec is not None else None
+        return safe_confirmation_summary(spec, contract)
+    except Exception:
+        return "Perform one sensitive action"
 
 
 def _confirm_irreversible(
@@ -360,6 +354,7 @@ def _confirm_irreversible(
             str(tool_name),
             _confirmation_summary(decision, str(tool_name), kwargs),
             error_namespace="action",
+            call_arguments=kwargs,
         )
     except Exception:
         return "ERROR: action confirmation is unavailable; the action was not executed"
@@ -380,6 +375,32 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
 
     if tool in _LOCAL_CONFIRM_TOOLS:
         return _confirm_irreversible(decision, tool, values)
+
+    # Contract-driven gates complement the semantic final-step detector. Gmail
+    # and MCP wrappers retain ownership of their established confirmation flow
+    # so one call never creates two prompts.
+    try:
+        from osia.tool_contracts import (
+            ConfirmationPolicy,
+            effective_contract,
+            get_tool_spec,
+        )
+
+        spec = get_tool_spec(tool)
+        contract = effective_contract(spec, values, user_request) if spec else None
+        requires_contract_confirmation = bool(
+            contract is not None
+            and contract.confirmation in {
+                ConfirmationPolicy.CONFIRMATION_REQUIRED,
+                ConfirmationPolicy.FINAL_COMMIT_CONFIRMATION,
+            }
+        )
+    except Exception:
+        return "ERROR: action policy check failed; the action was not executed"
+    wrapper_owns_confirmation = tool.startswith("gmail_") or tool.startswith("mcp__")
+    if requires_contract_confirmation and not wrapper_owns_confirmation:
+        if not _is_final_external_step(decision, tool, values):
+            return _confirm_irreversible(decision, tool, values)
 
     if not _is_final_external_step(decision, tool, values):
         return None

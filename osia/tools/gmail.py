@@ -485,6 +485,7 @@ def gmail_send_draft(
         confirmed = _confirm_gmail_write(
             "gmail_send_draft",
             _send_draft_confirmation_summary({"draftId": clean_id}),
+            {"draft_id": clean_id},
         )
         if not confirmed:
             return {
@@ -790,6 +791,7 @@ def _gmail_confirmed_message_modify(
                 add_labels=add_labels,
                 remove_labels=remove_labels,
             ),
+            {"message_id": clean_id},
         )
         if not confirmed:
             return {
@@ -833,6 +835,7 @@ def _gmail_confirmed_label_modify(
         confirmed = _confirm_gmail_write(
             tool_name,
             _label_modify_confirmation_summary(summary_action, clean_id, clean_label),
+            {"message_id": clean_id, "label": clean_label},
         )
         if not confirmed:
             return {
@@ -1056,16 +1059,32 @@ def _confirm_gmail_draft_creation(draft: dict) -> bool:
     return _confirm_gmail_write(
         "gmail_create_draft",
         _draft_confirmation_summary(draft),
+        {
+            "to": list(draft.get("to") or []),
+            "cc": list(draft.get("cc") or []),
+            "bcc": list(draft.get("bcc") or []),
+            "subject": str(draft.get("subject") or ""),
+            "body": str(draft.get("body") or ""),
+        },
     )
 
 
-def _confirm_gmail_write(tool_name: str, summary: str) -> bool:
+def _confirm_gmail_write(
+    tool_name: str,
+    summary: str,
+    call_arguments: dict | None = None,
+) -> bool:
     """Apply OSIA's shared connector write safety settings to Gmail writes."""
     try:
         from osia.mcp_client.registry import confirm_connector_write
     except Exception as exc:
         raise GmailRestError(WRITE_CONFIRMATION_REQUIRED_ERROR) from exc
-    blocked = confirm_connector_write("gmail", tool_name, summary)
+    blocked = confirm_connector_write(
+        "gmail",
+        tool_name,
+        summary,
+        call_arguments=call_arguments,
+    )
     if blocked is None:
         return True
     if "user declined" in blocked:
@@ -1076,44 +1095,13 @@ def _confirm_gmail_write(tool_name: str, summary: str) -> bool:
 
 
 def _draft_confirmation_summary(draft: dict) -> str:
-    body = str(draft.get("body") or "")
-    preview = re.sub(r"\s+", " ", body).strip()
-    if len(preview) > DRAFT_PREVIEW_CHAR_LIMIT:
-        preview = preview[: DRAFT_PREVIEW_CHAR_LIMIT - 3].rstrip() + "..."
-    parts = [
-        "Create Gmail draft",
-        f"To: {', '.join(draft.get('to') or [])}",
-    ]
-    cc = draft.get("cc") or []
-    bcc = draft.get("bcc") or []
-    if cc:
-        parts.append(f"Cc: {', '.join(cc)}")
-    if bcc:
-        parts.append(f"Bcc: {', '.join(bcc)}")
-    parts.extend([
-        f"Subject: {draft.get('subject') or ''}",
-        f"Body length: {len(body)} characters",
-        f"Preview: {preview}" if preview else "Preview: (empty)",
-    ])
-    return "\n".join(parts)
+    del draft
+    return "Create one Gmail draft"
 
 
 def _send_draft_confirmation_summary(draft: dict) -> str:
-    snippet = _safe_preview(draft.get("snippet"))
-    parts = [
-        "Send Gmail draft",
-        f"Draft id: {draft.get('draftId') or ''}",
-        f"To: {draft.get('to') or '(not available)'}",
-    ]
-    if draft.get("cc"):
-        parts.append(f"Cc: {draft.get('cc')}")
-    if draft.get("bcc"):
-        parts.append("Bcc: present")
-    parts.extend([
-        f"Subject: {draft.get('subject') or '(no subject)'}",
-        f"Snippet: {snippet}" if snippet else "Snippet: (not available)",
-    ])
-    return "\n".join(parts)
+    del draft
+    return "Send one existing Gmail draft"
 
 
 def _message_modify_confirmation_summary(
@@ -1123,15 +1111,8 @@ def _message_modify_confirmation_summary(
     add_labels: tuple[str, ...],
     remove_labels: tuple[str, ...],
 ) -> str:
-    parts = [
-        action,
-        f"Message id: {message_id}",
-    ]
-    if add_labels:
-        parts.append(f"Add labels: {', '.join(add_labels)}")
-    if remove_labels:
-        parts.append(f"Remove labels: {', '.join(remove_labels)}")
-    return "\n".join(parts)
+    del action, message_id, add_labels, remove_labels
+    return "Change one Gmail message"
 
 
 def _label_modify_confirmation_summary(
@@ -1139,12 +1120,8 @@ def _label_modify_confirmation_summary(
     message_id: str,
     label: str,
 ) -> str:
-    return "\n".join([
-        action,
-        f"Message id: {message_id}",
-        f"Label: {label}",
-        "Only an exact existing user label will be used.",
-    ])
+    del action, message_id, label
+    return "Change one Gmail message label"
 
 
 def _safe_preview(value: Any) -> str:
