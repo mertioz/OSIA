@@ -198,14 +198,9 @@ DEFAULT_SETTINGS = {
     # under an ``mcp:<id>`` key (see get_mcp_token/set_mcp_token) — NEVER here,
     # because settings.json is git-tracked. See osia.mcp.MCPManager.
     "mcp_servers": [],
-    # MCP write-tool confirmation gate (WOR-44 Phase 5, 5-conf-a). Both are
-    # NON-secret global toggles. ``mcp_confirm_writes`` (default True): a
-    # write/destructive MCP tool must be confirmed before it runs (read-only MCP
-    # tools and ALL native tools are unaffected; turning this OFF runs writes
-    # unchanged). ``mcp_allow_unattended_writes`` (default False): governs
-    # UNATTENDED runs (cron/autonomous, no confirmation UI registered) — False
-    # hard-denies the write, True lets it run without confirmation. See
-    # osia.mcp.registry (classify_tool / _confirm_gate).
+    # Legacy MCP write-confirmation keys retained only for downgrade/schema
+    # compatibility (WOR-191). Their effective values are immutable: sensitive
+    # writes require an interactive approval and unattended writes fail closed.
     "mcp_confirm_writes": True,
     "mcp_allow_unattended_writes": False,
     "island_shape": "capsule",  # adaptive shape: "capsule", "circle", "docked"
@@ -213,6 +208,18 @@ DEFAULT_SETTINGS = {
     "island_x": None,          # last dragged capsule position; None = top-centre
     "island_y": None,
 }
+
+LEGACY_MCP_CONFIRMATION_SAFE_VALUES = {
+    "mcp_confirm_writes": True,
+    "mcp_allow_unattended_writes": False,
+}
+
+
+def _normalize_legacy_confirmation_settings(settings: dict) -> dict:
+    """Return settings with the two downgrade-compatible keys forced safe."""
+    normalized = dict(settings) if isinstance(settings, dict) else {}
+    normalized.update(LEGACY_MCP_CONFIRMATION_SAFE_VALUES)
+    return normalized
 
 
 def normalize_reasoning_level(value) -> str:
@@ -578,6 +585,7 @@ def load_settings() -> dict:
     """
     base = dict(DEFAULT_SETTINGS)
     base.update(_read_settings_file())
+    base.update(LEGACY_MCP_CONFIRMATION_SAFE_VALUES)
     base["reasoning"] = normalize_reasoning_settings(base.get("reasoning"))
     return base
 
@@ -585,6 +593,7 @@ def load_settings() -> dict:
 def save_settings(settings: dict) -> None:
     global _settings_cache_signature, _settings_cache_data
     _ensure_config_dir()
+    settings = _normalize_legacy_confirmation_settings(settings)
     # Atomic write (temp + fsync + os.replace), mirroring _save_oauth_store: a
     # crash mid-write can never corrupt settings.json, and a concurrent reader in
     # the OTHER process never observes a half-written/torn file — the desktop and
@@ -634,6 +643,31 @@ def save_settings(settings: dict) -> None:
 
 
 _transport_migration_lock = threading.Lock()
+_legacy_confirmation_migration_lock = threading.Lock()
+
+
+def migrate_legacy_confirmation_settings() -> bool:
+    """Persist the fail-closed WOR-191 values without rewriting other keys.
+
+    Missing/corrupt files keep their existing bootstrap/recovery behavior. A
+    valid legacy file is rewritten once only when either compatibility value is
+    missing or unsafe.
+    """
+    with _legacy_confirmation_migration_lock:
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8", errors="strict") as f:
+                raw = json.load(f)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(raw, dict):
+            return False
+        if all(
+            raw.get(key) is safe_value
+            for key, safe_value in LEGACY_MCP_CONFIRMATION_SAFE_VALUES.items()
+        ):
+            return False
+        save_settings(_normalize_legacy_confirmation_settings(raw))
+        return True
 
 
 def migrate_transport_defaults() -> bool:
@@ -678,6 +712,8 @@ def get_setting(key: str, default=None):
 
 def set_setting(key: str, value) -> None:
     settings = load_settings()
+    if key in LEGACY_MCP_CONFIRMATION_SAFE_VALUES:
+        value = LEGACY_MCP_CONFIRMATION_SAFE_VALUES[key]
     if key == "reasoning":
         value = normalize_reasoning_settings(value)
     settings[key] = value
@@ -819,6 +855,11 @@ def ensure_config_files(create_token: bool = True) -> None:
             print("[CONFIG] Activated direct-first transport defaults")
     except Exception as e:
         print(f"[CONFIG] could not migrate transport defaults: {e}")
+    try:
+        if migrate_legacy_confirmation_settings():
+            print("[CONFIG] Normalized legacy MCP confirmation settings")
+    except Exception as e:
+        print(f"[CONFIG] could not normalize MCP confirmation settings: {e}")
     # Mobile pairing token — generate + persist BEFORE the WebSocket server
     # starts so the server reads the same token the GUI displays. load_mobile_token()
     # returns "" for both a missing and an empty/whitespace-only token file.

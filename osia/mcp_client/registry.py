@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import re
 import threading
+from enum import Enum
 from typing import Any, Optional
 
 # Namespacing: mcp__<server_id>__<tool_name>. Matches the convention used for
@@ -113,6 +114,14 @@ def classify_tool(name: str, annotations: Optional[dict] = None) -> bool:
 _confirmation_provider = None
 
 
+class ConfirmationDomain(str, Enum):
+    """Fixed origin of a sensitive call presented to the shared approver."""
+
+    NATIVE = "action"
+    GMAIL = "gmail"
+    MCP = "mcp"
+
+
 def set_confirmation_provider(fn) -> None:
     """Register (or clear, with ``None``) the process-wide confirmation provider.
     Idempotent; last writer wins. Assignment is atomic under the GIL."""
@@ -125,9 +134,8 @@ def get_confirmation_provider():
     return _confirmation_provider
 
 
-def _setting_bool(key: str, default: bool) -> bool:
-    """Read a boolean setting LIVE (so a toggle takes effect without
-    reconnecting). Falls back to ``default`` if config is unavailable."""
+def _non_security_setting_bool(key: str, default: bool) -> bool:
+    """Read a non-authorization boolean setting with a safe fallback."""
     try:
         from osia.config import get_setting
         return bool(get_setting(key, default))
@@ -143,22 +151,23 @@ def _confirm_summary(server_id: str, tool_name: str, kwargs: dict) -> str:
     return "Run one connected write capability"
 
 
-def confirm_connector_write(
-    server_id: str,
+def confirm_sensitive_action(
+    domain: ConfirmationDomain,
+    origin_id: str,
     tool_name: str,
     summary: str,
     *,
-    error_namespace: str = "connector",
     call_arguments: Optional[dict] = None,
 ) -> Optional[str]:
-    """Shared connector/add-on write safety gate.
+    """Obtain one exact approval for a known sensitive-action domain.
 
     Returns ``None`` to ALLOW the call, or an ``ERROR: ...`` string to BLOCK it.
-    ``mcp_confirm_writes`` is intentionally kept as the stored compatibility key:
-    True means ask/require approval, False means auto-approve connector writes.
+    Authorization never depends on the legacy MCP compatibility settings.  A
+    missing provider or a provider without a live target always fails closed.
     """
-    if not _setting_bool("mcp_confirm_writes", True):
-        return None
+    if not isinstance(domain, ConfirmationDomain):
+        return "ERROR: confirmation domain unavailable; the action was not executed"
+    error_namespace = domain.value
     provider = get_confirmation_provider()
     if provider is not None:
         normalized = dict(call_arguments) if isinstance(call_arguments, dict) else {}
@@ -168,11 +177,11 @@ def confirm_connector_write(
             grant = CONFIRMATION_LEDGER.issue(tool_name, normalized)
         except Exception:
             return (
-                f"ERROR: {error_namespace}/{server_id}/{tool_name}: "
+                f"ERROR: {error_namespace}/{origin_id}/{tool_name}: "
                 "confirmation scope unavailable"
             )
         try:
-            decision = provider(server_id, tool_name, str(summary or ""))
+            decision = provider(origin_id, tool_name, str(summary or ""))
         except Exception:
             decision = False  # a provider failure is treated as a decline (safe)
         if decision is not None:
@@ -184,34 +193,47 @@ def confirm_connector_write(
                 ):
                     return None
                 return (
-                    f"ERROR: {error_namespace}/{server_id}/{tool_name}: "
+                    f"ERROR: {error_namespace}/{origin_id}/{tool_name}: "
                     "confirmation scope unavailable"
                 )
             CONFIRMATION_LEDGER.consume(grant.token, tool_name, normalized)
             return (
-                f"ERROR: {error_namespace}/{server_id}/{tool_name}: user declined"
+                f"ERROR: {error_namespace}/{origin_id}/{tool_name}: user declined"
             )
         CONFIRMATION_LEDGER.consume(grant.token, tool_name, normalized)
-    # Unattended: no UI/provider/target present.
-    if _setting_bool("mcp_allow_unattended_writes", False):
-        return None
     return (
-        f"ERROR: {error_namespace}/{server_id}/{tool_name}: write tool blocked "
+        f"ERROR: {error_namespace}/{origin_id}/{tool_name}: sensitive action blocked "
         "(confirmation required, no approver available)"
+    )
+
+
+def confirm_connector_write(
+    server_id: str,
+    tool_name: str,
+    summary: str,
+    *,
+    error_namespace: str = "connector",
+    call_arguments: Optional[dict] = None,
+) -> Optional[str]:
+    """MCP-specific compatibility wrapper around the shared exact gate.
+
+    ``error_namespace`` remains accepted for call compatibility but cannot
+    change the immutable MCP confirmation domain.
+    """
+    del error_namespace
+    return confirm_sensitive_action(
+        ConfirmationDomain.MCP,
+        server_id,
+        tool_name,
+        summary,
+        call_arguments=call_arguments,
     )
 
 
 def _confirm_gate(server_id: str, tool_name: str, kwargs: dict) -> Optional[str]:
     """Decide whether a WRITE tool may run. Returns ``None`` to ALLOW the call,
-    or an ``ERROR: ...`` string to BLOCK it (declined / no approver). Reads the
-    two gate settings LIVE. Never raises.
-
-    Decision table (only ever reached for is_write tools):
-      * mcp_confirm_writes False                -> allow.
-      * confirm True + provider registered      -> ask; approved -> allow,
-        declined/raised -> block ("user declined").
-      * confirm True + NO provider/target       -> mcp_allow_unattended_writes
-        True -> allow, else block ("no approver available").
+    or an ``ERROR: ...`` string to BLOCK it (declined / no approver). Legacy
+    confirmation settings cannot weaken this gate. Never raises.
     """
     return confirm_connector_write(
         server_id,
@@ -742,7 +764,7 @@ def mcp_connectors_prompt_block(lang: str = "en") -> str:
                 lines.append(row)
 
         # ── CATALOG sub-block (suggestable, not already connected) ──────────
-        suggest_on = _setting_bool("mcp_suggest_connectors", True)
+        suggest_on = _non_security_setting_bool("mcp_suggest_connectors", True)
         if suggest_on and catalog:
             names = [
                 m.get("name") for m in catalog

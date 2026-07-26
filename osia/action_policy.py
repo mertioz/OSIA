@@ -347,13 +347,16 @@ def _confirm_irreversible(
     kwargs: dict,
 ) -> str | None:
     try:
-        from osia.mcp_client.registry import confirm_connector_write
+        from osia.mcp_client.registry import (
+            ConfirmationDomain,
+            confirm_sensitive_action,
+        )
 
-        return confirm_connector_write(
+        return confirm_sensitive_action(
+            ConfirmationDomain.NATIVE,
             "osia",
             str(tool_name),
             _confirmation_summary(decision, str(tool_name), kwargs),
-            error_namespace="action",
             call_arguments=kwargs,
         )
     except Exception:

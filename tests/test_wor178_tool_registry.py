@@ -128,7 +128,6 @@ class _Manager:
 def test_dynamic_mcp_schema_is_registered_validated_and_removed(monkeypatch):
     server_id = "wor178_registry"
     manager = _Manager()
-    monkeypatch.setattr(mcp_registry, "_setting_bool", lambda *_args: False)
     tools = [{
         "name": "read_counter",
         "description": "third-party description",

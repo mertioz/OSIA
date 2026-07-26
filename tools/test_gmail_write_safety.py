@@ -62,7 +62,7 @@ class GmailWriteSafetyTests(unittest.TestCase):
 
         return patched(gmail, "_gmail_post", fake_post)
 
-    def test_auto_approve_off_connected_ui_requires_confirmation(self):
+    def test_interactive_gmail_write_requires_confirmation(self):
         prompts: list[tuple[str, str, str]] = []
         api_calls: list = []
 
@@ -84,11 +84,13 @@ class GmailWriteSafetyTests(unittest.TestCase):
         self.assertIsInstance(result, dict)
         self.assertTrue(result["changed"])
 
-    def test_auto_approve_on_connected_ui_skips_confirmation(self):
+    def test_legacy_auto_approve_value_cannot_skip_confirmation(self):
+        prompts: list[tuple[str, str, str]] = []
         api_calls: list = []
 
-        def provider(*_args):
-            raise AssertionError("provider should not be called")
+        def provider(server_id, tool_name, summary):
+            prompts.append((server_id, tool_name, summary))
+            return True
 
         registry.set_confirmation_provider(provider)
         with write_settings(confirm_writes=False, unattended=False), patched(
@@ -98,6 +100,7 @@ class GmailWriteSafetyTests(unittest.TestCase):
                 "user@example.com", "Subject", "Body"
             )
 
+        self.assertEqual(len(prompts), 1)
         self.assertEqual(len(api_calls), 1)
         self.assertIsInstance(result, dict)
         self.assertTrue(result["changed"])
@@ -116,7 +119,7 @@ class GmailWriteSafetyTests(unittest.TestCase):
         self.assertTrue(result.startswith("ERROR:"))
         self.assertEqual(api_calls, [])
 
-    def test_unattended_on_without_provider_allows_intended_execution(self):
+    def test_legacy_unattended_on_without_provider_fails_closed(self):
         api_calls: list = []
 
         with write_settings(confirm_writes=True, unattended=True), patched(
@@ -126,9 +129,9 @@ class GmailWriteSafetyTests(unittest.TestCase):
                 "user@example.com", "Subject", "Body"
             )
 
-        self.assertEqual(len(api_calls), 1)
-        self.assertIsInstance(result, dict)
-        self.assertTrue(result["changed"])
+        self.assertIsInstance(result, str)
+        self.assertTrue(result.startswith("ERROR:"))
+        self.assertEqual(api_calls, [])
 
     def test_unattended_off_without_target_denies_without_api_call(self):
         api_calls: list = []
@@ -145,7 +148,7 @@ class GmailWriteSafetyTests(unittest.TestCase):
         self.assertTrue(result.startswith("ERROR:"))
         self.assertEqual(api_calls, [])
 
-    def test_unattended_on_without_target_allows_intended_execution(self):
+    def test_legacy_unattended_on_without_target_fails_closed(self):
         api_calls: list = []
         registry.set_confirmation_provider(lambda *_args: None)
 
@@ -156,9 +159,9 @@ class GmailWriteSafetyTests(unittest.TestCase):
                 "user@example.com", "Subject", "Body"
             )
 
-        self.assertEqual(len(api_calls), 1)
-        self.assertIsInstance(result, dict)
-        self.assertTrue(result["changed"])
+        self.assertIsInstance(result, str)
+        self.assertTrue(result.startswith("ERROR:"))
+        self.assertEqual(api_calls, [])
 
     def test_user_denial_overrides_unattended_on_without_api_call(self):
         api_calls: list = []
@@ -219,6 +222,7 @@ class GmailWriteSafetyTests(unittest.TestCase):
 
     def test_send_uses_single_no_retry_call(self):
         send_calls: list = []
+        registry.set_confirmation_provider(lambda *_args: True)
 
         def fake_fetch(*_args, **_kwargs):
             return {"draftId": "draft_1", "to": "user@example.com"}
@@ -238,7 +242,7 @@ class GmailWriteSafetyTests(unittest.TestCase):
         self.assertIsInstance(result, str)
         self.assertTrue(result.startswith("ERROR:"))
 
-    def test_server_provider_without_live_target_defers_to_unattended_policy(self):
+    def test_server_provider_without_live_target_reports_no_approver(self):
         from osia.server import server as server_mod
 
         token = server_mod._turn_target.set(None)

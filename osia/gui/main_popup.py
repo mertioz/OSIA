@@ -5455,23 +5455,16 @@ class _SettingsPanel(QWidget):
         l.addWidget(self._mcp_sub)
         l.addWidget(self._mcp_desc)
 
-        # WOR-44 Phase 5 (5-conf) — global "Write safety" gate for WRITE MCP
-        # tools, above the per-connector UI (mirrors the mobile card). Both
-        # toggles persist to settings.json via set_setting; the gate reads them
-        # LIVE (osia.mcp_client.registry._confirm_gate) so a change takes effect
-        # with no reconnect, and the server process picks the new value up via
-        # its settings mtime cache — so flipping a toggle here also governs
-        # mobile-initiated writes. NO backend change: the settings, gate and
-        # server whitelist already exist.
+        # WOR-191 Phase 0: retain the two legacy widgets for layout/downgrade
+        # compatibility, but lock them to the fail-closed values. They no longer
+        # grant auto-approval authority.
         ws_box = QFrame()
         ws_box.setObjectName("providerCard")
         ws = QVBoxLayout(ws_box)
         ws.setContentsMargins(10, 8, 10, 8)
         ws.setSpacing(8)
 
-        # Auto-approve connector writes — user-facing switch. OFF (default)
-        # prompts before connector writes; ON persists mcp_confirm_writes=False
-        # so MCP/native connector writes run without a local prompt.
+        # Connector write confirmation is mandatory in Phase 0.
         cw_row = QHBoxLayout()
         cw_row.setSpacing(6)
         self._mcp_confirm_writes_label = QLabel(i18n.t("mcp.confirm_writes"))
@@ -5479,6 +5472,8 @@ class _SettingsPanel(QWidget):
         self._mcp_confirm_writes_label.setWordWrap(True)
         self._mcp_confirm_writes_toggle = QCheckBox()
         self._mcp_confirm_writes_toggle.setObjectName("smartToggle")
+        self._mcp_confirm_writes_toggle.setChecked(True)
+        self._mcp_confirm_writes_toggle.setEnabled(False)
         self._mcp_confirm_writes_toggle.stateChanged.connect(
             self._on_mcp_confirm_writes_changed)
         cw_row.addWidget(self._mcp_confirm_writes_label)
@@ -5490,9 +5485,8 @@ class _SettingsPanel(QWidget):
         self._mcp_confirm_writes_sub.setWordWrap(True)
         ws.addWidget(self._mcp_confirm_writes_sub)
 
-        # Allow unattended writes — secondary; only consulted on the headless /
-        # no-UI branch of the gate (e.g. scheduled tasks with no device to
-        # confirm). It never bypasses the interactive prompt above.
+        # Unattended connector writes are mandatory-deny until explicit grants
+        # exist in a later WOR-184 phase.
         uw_row = QHBoxLayout()
         uw_row.setSpacing(6)
         self._mcp_unattended_label = QLabel(i18n.t("mcp.unattended_writes"))
@@ -5500,6 +5494,8 @@ class _SettingsPanel(QWidget):
         self._mcp_unattended_label.setWordWrap(True)
         self._mcp_unattended_toggle = QCheckBox()
         self._mcp_unattended_toggle.setObjectName("smartToggle")
+        self._mcp_unattended_toggle.setChecked(False)
+        self._mcp_unattended_toggle.setEnabled(False)
         self._mcp_unattended_toggle.stateChanged.connect(
             self._on_mcp_unattended_changed)
         uw_row.addWidget(self._mcp_unattended_label)
@@ -5569,21 +5565,18 @@ class _SettingsPanel(QWidget):
         return wrap
 
     def _on_mcp_confirm_writes_changed(self, _state) -> None:
-        """Persist the connector write auto-approval switch.
-
-        The stored key is kept for compatibility: mcp_confirm_writes=True means
-        ask first. The UI switch is inverted: checked means auto-approve.
-        """
-        set_setting(
-            "mcp_confirm_writes", not self._mcp_confirm_writes_toggle.isChecked())
+        """Keep the downgrade-compatible confirmation value fail-closed."""
+        self._mcp_confirm_writes_toggle.blockSignals(True)
+        self._mcp_confirm_writes_toggle.setChecked(True)
+        self._mcp_confirm_writes_toggle.blockSignals(False)
+        set_setting("mcp_confirm_writes", True)
 
     def _on_mcp_unattended_changed(self, _state) -> None:
-        """Persist the unattended-writes allowance (WOR-44 Phase 5, 5-conf).
-        Only consulted on the headless / no-UI branch of the gate (e.g.
-        scheduled tasks with no device connected to confirm); it never bypasses
-        the interactive prompt."""
-        set_setting(
-            "mcp_allow_unattended_writes", self._mcp_unattended_toggle.isChecked())
+        """Keep the downgrade-compatible unattended value fail-closed."""
+        self._mcp_unattended_toggle.blockSignals(True)
+        self._mcp_unattended_toggle.setChecked(False)
+        self._mcp_unattended_toggle.blockSignals(False)
+        set_setting("mcp_allow_unattended_writes", False)
 
     def _mcp_connectable(self, entry: dict) -> bool:
         """A server is connectable now iff the manager supports its transport
@@ -8077,19 +8070,13 @@ class _SettingsPanel(QWidget):
         self._render_mcp()
         self._refresh_memory_entries()
 
-        # MCP write-safety toggles (WOR-44 Phase 5, 5-conf) — seed both from
-        # settings. The auto-approve UI is inverted from the compatibility key:
-        # mcp_confirm_writes=True means prompts are required, so the switch is
-        # unchecked by default. allow-unattended remains default OFF.
-        # blockSignals so seeding never re-persists via the stateChanged
-        # handlers.
+        # WOR-191 Phase 0: compatibility widgets are immutable and always show
+        # the authoritative fail-closed values.
         self._mcp_confirm_writes_toggle.blockSignals(True)
-        self._mcp_confirm_writes_toggle.setChecked(
-            not bool(settings.get("mcp_confirm_writes", True)))
+        self._mcp_confirm_writes_toggle.setChecked(True)
         self._mcp_confirm_writes_toggle.blockSignals(False)
         self._mcp_unattended_toggle.blockSignals(True)
-        self._mcp_unattended_toggle.setChecked(
-            bool(settings.get("mcp_allow_unattended_writes", False)))
+        self._mcp_unattended_toggle.setChecked(False)
         self._mcp_unattended_toggle.blockSignals(False)
 
         # Heartbeat (Bloc 5) — master toggle, interval, per-metric checks.

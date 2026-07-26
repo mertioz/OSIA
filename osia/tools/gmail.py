@@ -1051,11 +1051,7 @@ def _require_modify_permission() -> None:
 
 
 def _confirm_gmail_draft_creation(draft: dict) -> bool:
-    """Apply the shared connector write safety gate for Gmail draft creation.
-
-    The stored compatibility key is still named ``mcp_confirm_writes``, but the
-    behavior is now connector-wide: OFF asks, ON auto-approves writes.
-    """
+    """Apply the shared sensitive-action gate for Gmail draft creation."""
     return _confirm_gmail_write(
         "gmail_create_draft",
         _draft_confirmation_summary(draft),
@@ -1074,12 +1070,16 @@ def _confirm_gmail_write(
     summary: str,
     call_arguments: dict | None = None,
 ) -> bool:
-    """Apply OSIA's shared connector write safety settings to Gmail writes."""
+    """Require one exact approval for a Gmail mutation."""
     try:
-        from osia.mcp_client.registry import confirm_connector_write
+        from osia.mcp_client.registry import (
+            ConfirmationDomain,
+            confirm_sensitive_action,
+        )
     except Exception as exc:
         raise GmailRestError(WRITE_CONFIRMATION_REQUIRED_ERROR) from exc
-    blocked = confirm_connector_write(
+    blocked = confirm_sensitive_action(
+        ConfirmationDomain.GMAIL,
         "gmail",
         tool_name,
         summary,

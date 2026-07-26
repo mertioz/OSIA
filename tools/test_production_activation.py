@@ -168,6 +168,8 @@ class TransportMigrationTests(unittest.TestCase):
             "transport_defaults_schema": config.TRANSPORT_DEFAULTS_SCHEMA_VERSION,
             "lan_direct_v1": False,
             "webrtc_direct_v1": False,
+            "mcp_confirm_writes": True,
+            "mcp_allow_unattended_writes": False,
             "custom_non_secret": "preserved",
         }
         self._write(existing)

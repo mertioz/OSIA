@@ -57,11 +57,6 @@ def test_reversible_local_file_lifecycle_is_confirmed_verified_and_cleaned(
     prompts = []
     monkeypatch.setattr(
         mcp_registry,
-        "_setting_bool",
-        lambda key, default: True if key == "mcp_confirm_writes" else False,
-    )
-    monkeypatch.setattr(
-        mcp_registry,
         "_confirmation_provider",
         lambda server, tool, summary: prompts.append((tool, summary)) or True,
     )

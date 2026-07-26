@@ -75,11 +75,6 @@ def test_contract_confirmation_is_safe_and_denial_dispatches_nothing(monkeypatch
     calls = []
     monkeypatch.setattr(
         mcp_registry,
-        "_setting_bool",
-        lambda key, default: True if key == "mcp_confirm_writes" else False,
-    )
-    monkeypatch.setattr(
-        mcp_registry,
         "_confirmation_provider",
         lambda server, tool, summary: prompts.append((server, tool, summary)) or False,
     )
@@ -107,11 +102,6 @@ def test_each_approved_confirmation_is_one_exact_call(monkeypatch):
     prompts = []
     monkeypatch.setattr(
         mcp_registry,
-        "_setting_bool",
-        lambda key, default: True if key == "mcp_confirm_writes" else False,
-    )
-    monkeypatch.setattr(
-        mcp_registry,
         "_confirmation_provider",
         lambda server, tool, summary: prompts.append((tool, summary)) or True,
     )
@@ -134,11 +124,6 @@ def test_confirmation_expiry_is_enforced_across_the_prompt_wait(monkeypatch):
         tool_contracts,
         "CONFIRMATION_LEDGER",
         ConfirmationLedger(ttl_seconds=1.0, clock=lambda: now[0]),
-    )
-    monkeypatch.setattr(
-        mcp_registry,
-        "_setting_bool",
-        lambda key, default: True if key == "mcp_confirm_writes" else False,
     )
 
     def delayed_approval(_server, _tool, _summary):
