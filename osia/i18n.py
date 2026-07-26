@@ -3319,6 +3319,22 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Modell",
         "es": "Modelo",
     },
+    "autonomous.no_models": {
+        "en": "No configured model is currently available.",
+        "fr": "Aucun modèle configuré n’est disponible actuellement.",
+        "zh": "当前没有可用的已配置模型。",
+        "ja": "現在利用できる設定済みモデルはありません。",
+        "de": "Derzeit ist kein konfiguriertes Modell verfügbar.",
+        "es": "No hay ningún modelo configurado disponible actualmente.",
+    },
+    "autonomous.model_fallback": {
+        "en": "The saved Autonomous model was unavailable. A configured model was selected instead.",
+        "fr": "Le modèle autonome enregistré était indisponible. Un modèle configuré a été sélectionné à la place.",
+        "zh": "已保存的自主模型不可用，已改选一个已配置的模型。",
+        "ja": "保存された自律モデルを利用できないため、設定済みモデルを選択しました。",
+        "de": "Das gespeicherte autonome Modell war nicht verfügbar. Stattdessen wurde ein konfiguriertes Modell ausgewählt.",
+        "es": "El modelo autónomo guardado no estaba disponible. Se seleccionó un modelo configurado en su lugar.",
+    },
     "autonomous.start": {
         "en": "Start",
         "fr": "Démarrer",

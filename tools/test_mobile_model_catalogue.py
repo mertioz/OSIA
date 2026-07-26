@@ -45,6 +45,11 @@ class MobileModelCatalogueTests(unittest.TestCase):
     def build(self, keys, models, account=None):
         with (
             patch.object(catalogue, "load_api_keys", return_value=keys),
+            patch.object(
+                catalogue,
+                "has_key",
+                side_effect=lambda provider: bool(str(keys.get(provider) or "").strip()),
+            ),
             patch.object(catalogue, "get_all_models", return_value=models),
             patch.object(catalogue, "invalidate_ollama_models_cache"),
             patch.object(catalogue, "account_snapshot", return_value=account or _account()),

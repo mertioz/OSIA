@@ -75,6 +75,8 @@ _DEFAULT_REASONING_SETTINGS = {
 DEFAULT_SETTINGS = {
     "selected_model": None,
     "selected_model_provider": None,
+    "autonomous_model": None,
+    "autonomous_model_provider": None,
     # Official managed ChatGPT account provider (WOR-113). The capability gate
     # fails closed when Codex is missing/incompatible; this model selection is
     # deliberately separate from the OpenAI API selection above.

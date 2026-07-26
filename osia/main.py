@@ -655,6 +655,10 @@ def wake_mode():
     from osia import scheduled_tasks
     from osia.config import load_settings, set_setting
     from osia.models import discover_models_async
+    from osia.mobile_model_catalogue import (
+        apply_autonomous_agent_model,
+        resolve_current_autonomous_selection,
+    )
     from osia.cron import CronManager
     from osia.heartbeat import HeartbeatMonitor
     # WOR-45 Phase 4 — wire the autonomous engine (consumed as black boxes).
@@ -697,6 +701,7 @@ def wake_mode():
         # progress_cb runs on its daemon thread; it only ever emits this signal
         # (never touches a widget). Carries the event dict + a state snapshot.
         autonomous_progress = pyqtSignal(dict)
+        autonomous_resume_ready = pyqtSignal(dict)
 
     bridge = Bridge()
 
@@ -1319,6 +1324,7 @@ def wake_mode():
     bridge.island_state.connect(handle_island_state)
     bridge.conversation_busy_changed.connect(handle_conversation_busy_changed)
     bridge.autonomous_progress.connect(handle_autonomous_progress)
+    bridge.autonomous_resume_ready.connect(popup.show_autonomous)
     bridge.remote_models_signal.connect(handle_remote_models)
     bridge.conversations_changed.connect(popup.refresh_conversations)
     bridge.new_chat.connect(handle_voice_new_chat)
@@ -1549,10 +1555,26 @@ def wake_mode():
                 reference="desktop-autonomous",
             )
             autonomous_agent.set_turn_context(autonomous_context)
-            if model:
+            resolution = resolve_current_autonomous_selection(
+                provider_id=provider,
+                model_id=model,
+                refresh_account=True,
+            )
+            resolved_provider = resolution.get("provider_id") or ""
+            resolved_model = resolution.get("model_id") or ""
+            if resolution.get("fallback_occurred"):
+                print(
+                    "[WOR-182] Autonomous model fallback: "
+                    f"{resolution.get('reason') or 'unavailable'}"
+                )
+            model_setup_failed = False
+            if resolved_model and resolved_provider:
                 try:
-                    autonomous_agent.set_model(model)
+                    apply_autonomous_agent_model(
+                        autonomous_agent, resolved_provider, resolved_model
+                    )
                 except Exception:
+                    model_setup_failed = True
                     autonomous_diagnostics.emit_diagnostic_log(
                         autonomous_diagnostics.make_diagnostic(
                             None,
@@ -1562,25 +1584,31 @@ def wake_mode():
                                 .PLANNING_PROVIDER_FAILURE
                             ),
                             reason_code="model_setup_failure",
-                            provider=provider,
-                            model=model,
+                            provider=resolved_provider,
+                            model=resolved_model,
                             resumable=False,
                             checkpoint_present=False,
                         )
                     )
-            actual_provider, actual_model = (
-                autonomous_diagnostics.actual_provider_model(
-                    autonomous_agent, provider, model,
+            if resolved_provider and resolved_model and not model_setup_failed:
+                actual_provider, actual_model = (
+                    autonomous_diagnostics.actual_provider_model(
+                        autonomous_agent, resolved_provider, resolved_model,
+                    )
                 )
-            )
+            else:
+                actual_provider, actual_model = "", ""
             planning_failures = []
-            try:
-                st = planner.create_plan_state(
-                    objective, actual_provider, actual_model, autonomous_agent,
-                    failure_cb=planning_failures.append,
-                    language=autonomous_context.language,
-                )
-            except Exception:
+            if resolved_provider and resolved_model and not model_setup_failed:
+                try:
+                    st = planner.create_plan_state(
+                        objective, actual_provider, actual_model, autonomous_agent,
+                        failure_cb=planning_failures.append,
+                        language=autonomous_context.language,
+                    )
+                except Exception:
+                    st = None
+            else:
                 st = None
             if not st:
                 if planning_failures:
@@ -1592,7 +1620,12 @@ def wake_mode():
                         autonomous_diagnostics.FailureCategory
                         .PLANNING_PROVIDER_FAILURE
                     )
-                    reason_code = "planning_internal_failure"
+                    if model_setup_failed:
+                        reason_code = "model_setup_failure"
+                    elif not resolved_provider or not resolved_model:
+                        reason_code = "no_configured_model"
+                    else:
+                        reason_code = "planning_internal_failure"
                 diagnostic = autonomous_diagnostics.make_diagnostic(
                     None,
                     stage=autonomous_diagnostics.AutonomousStage.PLANNING,
@@ -1899,64 +1932,146 @@ def wake_mode():
             except Exception:
                 autonomous_diagnostics.set_checkpoint_present(state, False)
         else:
-            # Phase 4 — actually resume on the dedicated orchestrator (the
-            # background loop is non-blocking; the re-check/salvage happens
-            # inside resume()). Seed the panel and surface it so the user sees it.
-            resume_model = state.get("model")
-            resume_context = fixed_turn_context(
-                state.get("language"),
-                source="autonomous_resume",
-                reference=str(state.get("task_id") or "autonomous"),
-            )
-            autonomous_agent.set_turn_context(resume_context)
-            if resume_model:
-                try:
-                    autonomous_agent.set_model(resume_model)
-                except Exception:
-                    autonomous_diagnostics.emit_diagnostic_log(
-                        autonomous_diagnostics.make_diagnostic(
-                            state,
-                            stage=autonomous_diagnostics.AutonomousStage.RESUME,
-                            category=(
-                                autonomous_diagnostics.FailureCategory
-                                .PLANNING_PROVIDER_FAILURE
-                            ),
-                            reason_code="model_setup_failure",
-                            resumable=True,
-                            checkpoint_present=True,
-                        )
-                    )
-            provider_now, model_now = autonomous_diagnostics.actual_provider_model(
-                autonomous_agent, state.get("provider", ""), state.get("model", ""),
-            )
-            state["provider"] = provider_now
-            state["model"] = model_now
-            autonomous_state["st"] = state
-            popup.show_autonomous(state)
-            try:
-                orchestrator.resume(state)
-            except Exception:
-                state["status"] = "failed"
-                diagnostic = autonomous_diagnostics.make_diagnostic(
-                    state,
-                    stage=autonomous_diagnostics.AutonomousStage.RESUME,
-                    category=(
-                        autonomous_diagnostics.FailureCategory.ORCHESTRATOR_FAILURE
-                    ),
-                    reason_code="resume_worker_failure",
-                    provider=provider_now,
-                    model=model_now,
-                    resumable=False,
-                    checkpoint_present=True,
+            def _resume_pending() -> None:
+                resume_resolution = resolve_current_autonomous_selection(
+                    provider_id=state.get("provider", ""),
+                    model_id=state.get("model", ""),
+                    refresh_account=True,
                 )
-                autonomous_diagnostics.record_diagnostic(state, diagnostic)
+                resume_provider = resume_resolution.get("provider_id") or ""
+                resume_model = resume_resolution.get("model_id") or ""
+                if resume_resolution.get("fallback_occurred"):
+                    print(
+                        "[WOR-182] Autonomous resume model fallback: "
+                        f"{resume_resolution.get('reason') or 'unavailable'}"
+                    )
+                resume_context = fixed_turn_context(
+                    state.get("language"),
+                    source="autonomous_resume",
+                    reference=str(state.get("task_id") or "autonomous"),
+                )
+                autonomous_agent.set_turn_context(resume_context)
+                if not resume_provider or not resume_model:
+                    state["status"] = "failed"
+                    diagnostic = autonomous_diagnostics.make_diagnostic(
+                        state,
+                        stage=autonomous_diagnostics.AutonomousStage.RESUME,
+                        category=(
+                            autonomous_diagnostics.FailureCategory
+                            .PLANNING_PROVIDER_FAILURE
+                        ),
+                        reason_code="no_configured_model",
+                        resumable=False,
+                        checkpoint_present=True,
+                    )
+                    autonomous_diagnostics.record_diagnostic(state, diagnostic)
+                    try:
+                        save_task_state(state)
+                    except Exception:
+                        autonomous_diagnostics.set_checkpoint_present(state, False)
+                    autonomous_state["st"] = state
+                    bridge.autonomous_resume_ready.emit(state)
+                    bridge.autonomous_progress.emit(
+                        {"event": "failed", **_orch_snapshot(state)}
+                    )
+                    return
+                try:
+                    apply_autonomous_agent_model(
+                        autonomous_agent, resume_provider, resume_model
+                    )
+                except Exception:
+                    state["status"] = "failed"
+                    diagnostic = autonomous_diagnostics.make_diagnostic(
+                        state,
+                        stage=autonomous_diagnostics.AutonomousStage.RESUME,
+                        category=(
+                            autonomous_diagnostics.FailureCategory
+                            .PLANNING_PROVIDER_FAILURE
+                        ),
+                        reason_code="model_setup_failure",
+                        provider=resume_provider,
+                        model=resume_model,
+                        resumable=False,
+                        checkpoint_present=True,
+                    )
+                    autonomous_diagnostics.record_diagnostic(state, diagnostic)
+                    try:
+                        save_task_state(state)
+                    except Exception:
+                        autonomous_diagnostics.set_checkpoint_present(state, False)
+                    autonomous_state["st"] = state
+                    bridge.autonomous_resume_ready.emit(state)
+                    bridge.autonomous_progress.emit(
+                        {"event": "failed", **_orch_snapshot(state)}
+                    )
+                    return
+                provider_now, model_now = (
+                    autonomous_diagnostics.actual_provider_model(
+                        autonomous_agent, resume_provider, resume_model,
+                    )
+                )
+                state["provider"] = provider_now
+                state["model"] = model_now
                 try:
                     save_task_state(state)
                 except Exception:
                     autonomous_diagnostics.set_checkpoint_present(state, False)
-                bridge.autonomous_progress.emit(
-                    {"event": "failed", **_orch_snapshot(state)}
-                )
+                autonomous_state["st"] = state
+                bridge.autonomous_resume_ready.emit(state)
+                try:
+                    orchestrator.resume(state)
+                except Exception:
+                    state["status"] = "failed"
+                    diagnostic = autonomous_diagnostics.make_diagnostic(
+                        state,
+                        stage=autonomous_diagnostics.AutonomousStage.RESUME,
+                        category=(
+                            autonomous_diagnostics.FailureCategory
+                            .ORCHESTRATOR_FAILURE
+                        ),
+                        reason_code="resume_worker_failure",
+                        provider=provider_now,
+                        model=model_now,
+                        resumable=False,
+                        checkpoint_present=True,
+                    )
+                    autonomous_diagnostics.record_diagnostic(state, diagnostic)
+                    try:
+                        save_task_state(state)
+                    except Exception:
+                        autonomous_diagnostics.set_checkpoint_present(state, False)
+                    bridge.autonomous_progress.emit(
+                        {"event": "failed", **_orch_snapshot(state)}
+                    )
+
+            def _resume_pending_safe() -> None:
+                try:
+                    _resume_pending()
+                except Exception:
+                    state["status"] = "failed"
+                    diagnostic = autonomous_diagnostics.make_diagnostic(
+                        state,
+                        stage=autonomous_diagnostics.AutonomousStage.RESUME,
+                        category=(
+                            autonomous_diagnostics.FailureCategory
+                            .ORCHESTRATOR_FAILURE
+                        ),
+                        reason_code="resume_worker_failure",
+                        resumable=False,
+                        checkpoint_present=True,
+                    )
+                    autonomous_diagnostics.record_diagnostic(state, diagnostic)
+                    try:
+                        save_task_state(state)
+                    except Exception:
+                        autonomous_diagnostics.set_checkpoint_present(state, False)
+                    autonomous_state["st"] = state
+                    bridge.autonomous_resume_ready.emit(state)
+                    bridge.autonomous_progress.emit(
+                        {"event": "failed", **_orch_snapshot(state)}
+                    )
+
+            threading.Thread(target=_resume_pending_safe, daemon=True).start()
 
     QTimer.singleShot(0, _offer_resume_if_pending)
 

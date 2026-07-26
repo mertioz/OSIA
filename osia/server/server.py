@@ -3753,8 +3753,9 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int,
                              language: str) -> None:
     """Plan + launch OFF the event loop (planning blocks on an LLM run). The
     single-runner slot (generation ``my_gen``) was already acquired by the
-    handler. Mirrors main.py's ``handle_autonomous_start``: set_model → resolve
-    provider → create_plan_state → save → start → emit running.
+    handler. Mirrors main.py's ``handle_autonomous_start``: validate the exact
+    inventory identity → provider-aware set_model → create_plan_state → save →
+    start → emit running.
 
     Two hardening rules around the long planning gap and the held slot:
 
@@ -3817,18 +3818,27 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int,
         # Safe: no loop is alive, so no terminal can fire in between.
         _autonomous["interrupting"] = False
 
-        # Honour the requested model; fall back to the configured one so the run
-        # uses the user's selected model rather than the bare OSIAAgent() default.
-        if not model:
+        from osia.mobile_model_catalogue import (
+            apply_autonomous_agent_model,
+            resolve_current_autonomous_selection,
+        )
+        resolution = resolve_current_autonomous_selection(
+            wire_value=model,
+            refresh_account=True,
+        )
+        provider = resolution.get("provider_id") or ""
+        model = resolution.get("model_id") or ""
+        if resolution.get("fallback_occurred"):
+            print(
+                "[WOR-182] Mobile Autonomous model fallback: "
+                f"{resolution.get('reason') or 'unavailable'}"
+            )
+        model_setup_failed = False
+        if provider and model:
             try:
-                from osia.config import load_settings
-                model = (load_settings().get("selected_model") or "").strip()
+                apply_autonomous_agent_model(agent, provider, model)
             except Exception:
-                model = ""
-        if model:
-            try:
-                agent.set_model(model)
-            except Exception:
+                model_setup_failed = True
                 _adiagnostics.emit_diagnostic_log(
                     _adiagnostics.make_diagnostic(
                         None,
@@ -3837,28 +3847,27 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int,
                             _adiagnostics.FailureCategory.PLANNING_PROVIDER_FAILURE
                         ),
                         reason_code="model_setup_failure",
+                        provider=provider,
                         model=model,
                         resumable=False,
                         checkpoint_present=False,
                     )
                 )
-        # Resolve the provider from the model id (osia.models), like the GUI passes.
-        try:
-            from osia.models import provider_for_model
-            provider = provider_for_model(model) if model else ""
-        except Exception:
-            provider = ""
-        provider, model = _adiagnostics.actual_provider_model(
-            agent, provider, model,
-        )
-        planning_failures = []
-        try:
-            st = _aplanner.create_plan_state(
-                objective, provider, model, agent,
-                failure_cb=planning_failures.append,
-                language=language,
+        if provider and model and not model_setup_failed:
+            provider, model = _adiagnostics.actual_provider_model(
+                agent, provider, model,
             )
-        except Exception:
+        planning_failures = []
+        if provider and model and not model_setup_failed:
+            try:
+                st = _aplanner.create_plan_state(
+                    objective, provider, model, agent,
+                    failure_cb=planning_failures.append,
+                    language=language,
+                )
+            except Exception:
+                st = None
+        else:
             st = None
         if not st:
             if planning_failures:
@@ -3867,7 +3876,12 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int,
                 reason_code = failure.reason
             else:
                 category = _adiagnostics.FailureCategory.PLANNING_PROVIDER_FAILURE
-                reason_code = "planning_internal_failure"
+                if model_setup_failed:
+                    reason_code = "model_setup_failure"
+                elif not provider or not model:
+                    reason_code = "no_configured_model"
+                else:
+                    reason_code = "planning_internal_failure"
             failed_state = _autonomous_failure_state(
                 stage=_adiagnostics.AutonomousStage.PLANNING,
                 category=category,
@@ -4021,8 +4035,9 @@ def _clear_interrupting_after_orphan_drained(timeout: float = 120.0) -> None:
 
 def _autonomous_resume_worker(my_gen: int) -> None:
     """Resume a PAUSED autonomous run OFF the event loop, converging BYTE-FOR-BYTE
-    onto the PROVEN GUI resume flow (``main.py``: ``load_task_state()`` →
-    ``set_model(state["model"])`` → ``orchestrator.resume(state)``): resume ONLY
+    onto the PROVEN GUI resume flow (``main.py``: ``load_task_state()`` → exact
+    provider/model validation → provider-aware ``set_model`` →
+    ``orchestrator.resume(state)``): resume ONLY
     against a dead/idle engine, against the on-disk state. The single-runner slot
     (generation ``my_gen``) was re-acquired by the handler — interrupt freed it.
     There is NO planning step: the plan already lives in the persisted task_state,
@@ -4151,29 +4166,80 @@ def _autonomous_resume_worker(my_gen: int) -> None:
             reference=str(st.get("task_id") or "autonomous"),
         )
         agent.set_turn_context(resume_context)
-        # Honour the model the run was planned with (main.py: set_model(state["model"])).
-        model = st.get("model")
+        from osia.mobile_model_catalogue import (
+            apply_autonomous_agent_model,
+            resolve_current_autonomous_selection,
+        )
+        resolution = resolve_current_autonomous_selection(
+            provider_id=st.get("provider", ""),
+            model_id=st.get("model", ""),
+            refresh_account=True,
+        )
+        provider = resolution.get("provider_id") or ""
+        model = resolution.get("model_id") or ""
+        if resolution.get("fallback_occurred"):
+            print(
+                "[WOR-182] Mobile Autonomous resume model fallback: "
+                f"{resolution.get('reason') or 'unavailable'}"
+            )
+        if not provider or not model:
+            st["status"] = "failed"
+            diagnostic = _adiagnostics.make_diagnostic(
+                st,
+                stage=_adiagnostics.AutonomousStage.RESUME,
+                category=_adiagnostics.FailureCategory.PLANNING_PROVIDER_FAILURE,
+                reason_code="no_configured_model",
+                resumable=False,
+                checkpoint_present=True,
+            )
+            _adiagnostics.record_diagnostic(st, diagnostic)
+            try:
+                _astate.save_task_state(st)
+            except Exception:
+                _adiagnostics.set_checkpoint_present(st, False)
+            if _establish_autonomous_failure(st, my_gen):
+                _broadcast_autonomous(
+                    _autonomous_frame({"event": "failed"}, st)
+                )
+            _release_single_runner_if_gen(my_gen)
+            return
         if model:
             try:
-                agent.set_model(model)
+                apply_autonomous_agent_model(agent, provider, model)
             except Exception:
-                _adiagnostics.emit_diagnostic_log(
-                    _adiagnostics.make_diagnostic(
-                        st,
-                        stage=_adiagnostics.AutonomousStage.RESUME,
-                        category=(
-                            _adiagnostics.FailureCategory.PLANNING_PROVIDER_FAILURE
-                        ),
-                        reason_code="model_setup_failure",
-                        resumable=True,
-                        checkpoint_present=True,
-                    )
+                st["status"] = "failed"
+                diagnostic = _adiagnostics.make_diagnostic(
+                    st,
+                    stage=_adiagnostics.AutonomousStage.RESUME,
+                    category=(
+                        _adiagnostics.FailureCategory.PLANNING_PROVIDER_FAILURE
+                    ),
+                    reason_code="model_setup_failure",
+                    provider=provider,
+                    model=model,
+                    resumable=False,
+                    checkpoint_present=True,
                 )
+                _adiagnostics.record_diagnostic(st, diagnostic)
+                try:
+                    _astate.save_task_state(st)
+                except Exception:
+                    _adiagnostics.set_checkpoint_present(st, False)
+                if _establish_autonomous_failure(st, my_gen):
+                    _broadcast_autonomous(
+                        _autonomous_frame({"event": "failed"}, st)
+                    )
+                _release_single_runner_if_gen(my_gen)
+                return
         provider_now, model_now = _adiagnostics.actual_provider_model(
-            agent, st.get("provider", ""), st.get("model", ""),
+            agent, provider, model,
         )
         st["provider"] = provider_now
         st["model"] = model_now
+        try:
+            _astate.save_task_state(st)
+        except Exception:
+            _adiagnostics.set_checkpoint_present(st, False)
 
         # ── Establish the run atomically — only if our slot is still current ──
         established = False

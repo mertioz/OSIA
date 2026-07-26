@@ -22,6 +22,7 @@ from osia.models import (
     model_has_vision,
 )
 from osia.reasoning import get_reasoning_options, resolve_reasoning_option_id
+from osia.utils.key_chain import has_key
 
 ACCOUNT_PROVIDER_ID = "chatgpt_account"
 PROVIDER_ORDER = (
@@ -192,7 +193,37 @@ def account_snapshot(*, refresh_models: bool = True, include_ephemeral: bool = F
     return snapshot
 
 
-def _provider_entry(provider_id: str, models: list[dict]) -> dict:
+def _mobile_model(entry: dict) -> dict:
+    """Serialize one canonical inventory entry for the mobile protocol."""
+    provider_id = entry["provider_id"]
+    model_id = entry["model_id"]
+    options = [dict(option) for option in entry.get("reasoning_options") or []]
+    try:
+        selected = resolve_reasoning_option_id(provider_id, model_id)
+    except Exception:
+        selected = "auto"
+    if not any(option.get("id") == selected for option in options):
+        selected = "auto"
+    modalities = list(entry.get("input_modalities") or ["text"])
+    return {
+        "id": model_id,
+        "displayName": entry["model_display_name"],
+        "providerId": provider_id,
+        "provider": provider_id,
+        "inputModalities": modalities,
+        "hidden": not bool(entry.get("picker_visible")),
+        "usable": bool(entry.get("available")),
+        "selectable": bool(entry.get("picker_visible") and entry.get("available")),
+        "vision": bool(entry.get("capabilities", {}).get("vision")),
+        "reasoning": {
+            "supported": bool(options),
+            "options": options,
+            "selected": selected,
+        },
+    }
+
+
+def _provider_entry(provider_id: str, entries: list[dict]) -> dict:
     kind = (
         "chatgpt_account" if provider_id == ACCOUNT_PROVIDER_ID
         else "local" if provider_id == "ollama"
@@ -207,8 +238,8 @@ def _provider_entry(provider_id: str, models: list[dict]) -> dict:
         "displayName": name,
         "kind": kind,
         "available": True,
-        "modelCount": len(models),
-        "models": models,
+        "modelCount": len(entries),
+        "models": [_mobile_model(entry) for entry in entries],
     }
 
 
@@ -218,11 +249,319 @@ def cached_remote_models() -> list[dict]:
 
 
 def _api_provider_is_configured(keys: dict, provider_id: str) -> bool:
-    """Mirror the PC Models-page rule using the canonical primary-key store."""
+    """Use the key-chain owner, including fallback-only configuration."""
     if provider_id not in API_PROVIDERS:
         return False
     value = keys.get(provider_id)
-    return bool(str(value).strip()) if value is not None else False
+    if value is not None and bool(str(value).strip()):
+        return True
+    try:
+        return bool(has_key(provider_id))
+    except Exception:
+        return False
+
+
+def configured_api_providers(keys: dict | None = None) -> set[str]:
+    """Return provider ids only; key material never leaves the config owner."""
+    safe_keys = keys if isinstance(keys, dict) else {}
+    return {
+        provider_id for provider_id in API_PROVIDERS
+        if _api_provider_is_configured(safe_keys, provider_id)
+    }
+
+
+def stable_model_key(provider_id: str, model_id: str) -> str:
+    """Stable wire identity for one exact provider/model pair."""
+    return f"{str(provider_id or '').strip().lower()}:{str(model_id or '').strip()}"
+
+
+def _safe_reasoning_options(raw: dict, provider_id: str, model_id: str) -> list[dict]:
+    reasoning = raw.get("reasoning") if isinstance(raw.get("reasoning"), dict) else {}
+    candidates = raw.get("reasoning_options") or reasoning.get("options") or []
+    if not candidates and provider_id == ACCOUNT_PROVIDER_ID:
+        efforts = raw.get("supportedReasoningEfforts") or []
+        if efforts:
+            candidates = [
+                {"id": "auto", "label": "Default", "default": True},
+                *efforts,
+            ]
+    if not candidates and provider_id != ACCOUNT_PROVIDER_ID:
+        try:
+            candidates = get_reasoning_options(provider_id, model_id)
+        except Exception:
+            candidates = []
+    options = []
+    seen = set()
+    for item in candidates if isinstance(candidates, list) else []:
+        if not isinstance(item, dict):
+            continue
+        option_id = str(item.get("id") or "").strip().lower()
+        if not option_id or option_id in seen:
+            continue
+        seen.add(option_id)
+        label = str(item.get("label") or option_id).strip() or option_id
+        option = {
+            "id": option_id,
+            "label": label,
+            "default": bool(item.get("default")),
+        }
+        label_key = str(item.get("label_key") or "").strip()
+        if label_key:
+            option["label_key"] = label_key
+        options.append(option)
+    if (
+        provider_id == ACCOUNT_PROVIDER_ID
+        and len(options) == 1
+        and options[0]["id"] == "auto"
+    ):
+        return []
+    return options
+
+
+def _canonical_entry(raw: dict, provider_id: str, source_type: str) -> dict | None:
+    model_id = str(raw.get("id") or raw.get("model") or "").strip()
+    if not model_id:
+        return None
+    modalities = raw.get("inputModalities") or raw.get("input_modalities") or ["text"]
+    if not isinstance(modalities, list):
+        modalities = ["text"]
+    safe_modalities = [
+        value for value in (str(item).strip().lower() for item in modalities)
+        if value in {"text", "image", "audio"}
+    ]
+    if "text" not in safe_modalities:
+        return None
+    display_name = str(
+        raw.get("displayName") or raw.get("label") or model_id
+    ).strip() or model_id
+    provider_name = (
+        "ChatGPT" if provider_id == ACCOUNT_PROVIDER_ID
+        else str(PROVIDERS.get(provider_id, {}).get("name") or provider_id)
+    )
+    vision = raw.get("vision")
+    if not isinstance(vision, bool):
+        try:
+            vision = bool(model_has_vision(provider_id, model_id))
+        except Exception:
+            vision = False
+    return {
+        "provider_id": provider_id,
+        "provider_display_name": provider_name,
+        "model_id": model_id,
+        "model_display_name": display_name,
+        "source_type": source_type,
+        "configured": True,
+        "available": True,
+        "picker_visible": True,
+        "input_modalities": safe_modalities,
+        "capabilities": {"vision": bool(vision)},
+        "reasoning_options": _safe_reasoning_options(raw, provider_id, model_id),
+        "stable_key": stable_model_key(provider_id, model_id),
+    }
+
+
+def build_model_inventory(
+    raw_models: list,
+    configured_providers: set[str] | list[str] | tuple[str, ...],
+    account_status: dict | None = None,
+) -> list[dict]:
+    """Purely normalize already-available sanitized state into one inventory.
+
+    The caller owns discovery and account probing.  This function performs no
+    network, App Server, local-runtime or secret-store access.
+    """
+    configured = {
+        str(provider_id or "").strip().lower()
+        for provider_id in configured_providers or ()
+    }
+    entries: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def append(raw: dict, provider_id: str, source_type: str) -> None:
+        entry = _canonical_entry(raw, provider_id, source_type)
+        if entry is None:
+            return
+        identity = (entry["provider_id"], entry["model_id"])
+        if identity in seen:
+            return
+        seen.add(identity)
+        entries.append(entry)
+
+    grouped: dict[str, list[dict]] = {}
+    for raw in raw_models if isinstance(raw_models, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        provider_id = str(raw.get("provider") or raw.get("providerId") or "").strip().lower()
+        if provider_id in API_PROVIDERS:
+            if provider_id not in configured:
+                continue
+            grouped.setdefault(provider_id, []).append(raw)
+        elif provider_id == "ollama":
+            grouped.setdefault(provider_id, []).append(raw)
+
+    status = account_status if isinstance(account_status, dict) else {}
+    runtime_available = bool(
+        status.get("runtimeAvailable", status.get("available", False))
+    )
+    account_models = status.get("models") if isinstance(status.get("models"), list) else []
+    account_visible = bool(
+        runtime_available
+        and status.get("available")
+        and status.get("connected")
+        and not status.get("error")
+        and account_models
+    )
+
+    for provider_id in PROVIDER_ORDER:
+        if provider_id == ACCOUNT_PROVIDER_ID:
+            if account_visible:
+                for raw in account_models:
+                    if isinstance(raw, dict) and not raw.get("hidden"):
+                        append(raw, provider_id, "chatgpt_account")
+            continue
+        source_type = "local" if provider_id == "ollama" else "api"
+        for raw in grouped.get(provider_id, []):
+            append(raw, provider_id, source_type)
+    return entries
+
+
+def resolve_autonomous_selection(
+    inventory: list[dict],
+    *,
+    autonomous_provider: str = "",
+    autonomous_model: str = "",
+    main_provider: str = "",
+    main_model: str = "",
+    wire_value: str | None = None,
+) -> dict:
+    """Resolve one deterministic Autonomous selection without provider guessing."""
+    entries = [
+        entry for entry in inventory if isinstance(entry, dict)
+        and entry.get("available") and entry.get("picker_visible")
+    ]
+
+    def result(entry: dict | None, fallback: bool, reason: str) -> dict:
+        return {
+            "entry": entry,
+            "provider_id": str(entry.get("provider_id") or "") if entry else "",
+            "model_id": str(entry.get("model_id") or "") if entry else "",
+            "stable_key": str(entry.get("stable_key") or "") if entry else "",
+            "fallback_occurred": bool(fallback),
+            "reason": reason,
+        }
+
+    def exact(provider_id: str, model_id: str) -> dict | None:
+        wanted = (str(provider_id or "").strip().lower(), str(model_id or "").strip())
+        return next(
+            (entry for entry in entries
+             if (entry.get("provider_id"), entry.get("model_id")) == wanted),
+            None,
+        )
+
+    provider_id = str(autonomous_provider or "").strip().lower()
+    model_id = str(autonomous_model or "").strip()
+    explicit = bool(provider_id or model_id)
+    if wire_value is not None and str(wire_value or "").strip():
+        wire = str(wire_value or "").strip()
+        explicit = bool(wire)
+        stable = next((entry for entry in entries if entry.get("stable_key") == wire), None)
+        if stable is not None:
+            return result(stable, False, "exact_selection")
+        prefix, separator, remainder = wire.partition(":")
+        known_providers = set(PROVIDER_ORDER) | {
+            str(entry.get("provider_id") or "") for entry in entries
+        }
+        if separator and prefix.strip().lower() in known_providers:
+            provider_id = prefix.strip().lower()
+            model_id = remainder.strip()
+        else:
+            provider_id = ""
+            model_id = wire
+
+    stale_reason = ""
+    if provider_id and model_id:
+        selected = exact(provider_id, model_id)
+        if selected is not None:
+            return result(selected, False, "exact_selection")
+        stale_reason = "saved_selection_unavailable"
+    elif model_id:
+        matches = [entry for entry in entries if entry.get("model_id") == model_id]
+        if len(matches) == 1:
+            return result(matches[0], False, "legacy_model_migrated")
+        stale_reason = (
+            "legacy_model_ambiguous" if len(matches) > 1
+            else "legacy_model_unavailable"
+        )
+    elif provider_id:
+        stale_reason = "saved_selection_incomplete"
+    else:
+        main = exact(main_provider, main_model)
+        if main is not None:
+            return result(main, False, "seeded_from_main")
+        if str(main_provider or "").strip() or str(main_model or "").strip():
+            stale_reason = "main_selection_unavailable"
+
+    if entries:
+        return result(
+            entries[0],
+            bool(explicit or stale_reason),
+            stale_reason or "first_available",
+        )
+    return result(None, bool(explicit or stale_reason), "no_models_available")
+
+
+def persist_autonomous_selection(resolution: dict) -> None:
+    """Persist only the dedicated Autonomous pair from a safe resolution."""
+    provider_id = str(resolution.get("provider_id") or "").strip().lower()
+    model_id = str(resolution.get("model_id") or "").strip()
+    if not provider_id or not model_id:
+        return
+    settings = load_settings()
+    if settings.get("autonomous_model_provider") != provider_id:
+        set_setting("autonomous_model_provider", provider_id)
+    if settings.get("autonomous_model") != model_id:
+        set_setting("autonomous_model", model_id)
+
+
+def apply_autonomous_agent_model(agent, provider_id: str, model_id: str) -> None:
+    """Apply one already-resolved exact identity through the provider-aware API."""
+    provider = str(provider_id or "").strip().lower()
+    model = str(model_id or "").strip()
+    if not provider or not model:
+        raise ValueError("an exact provider/model identity is required")
+    agent.set_model(model, provider=provider)
+
+
+def resolve_current_autonomous_selection(
+    *,
+    provider_id: str = "",
+    model_id: str = "",
+    wire_value: str | None = None,
+    refresh_account: bool = True,
+) -> dict:
+    """Validate immediately against current configured state off the UI thread."""
+    catalogue = build_catalogue(
+        refresh_local=False,
+        refresh_account=refresh_account,
+    )
+    settings = load_settings()
+    use_saved_pair = not provider_id and not model_id and wire_value is None
+    resolution = resolve_autonomous_selection(
+        catalogue.get("inventory") or [],
+        autonomous_provider=(
+            settings.get("autonomous_model_provider") or ""
+            if use_saved_pair else provider_id
+        ),
+        autonomous_model=(
+            settings.get("autonomous_model") or ""
+            if use_saved_pair else model_id
+        ),
+        main_provider=settings.get("selected_model_provider") or "",
+        main_model=settings.get("selected_model") or "",
+        wire_value=wire_value,
+    )
+    persist_autonomous_selection(resolution)
+    return resolution
 
 
 def build_catalogue(*, refresh_local: bool = True, refresh_account: bool = True) -> dict:
@@ -231,30 +570,15 @@ def build_catalogue(*, refresh_local: bool = True, refresh_account: bool = True)
         invalidate_ollama_models_cache()
     keys = load_api_keys()
     raw_models = get_all_models(api_keys=keys, remote_models=cached_remote_models())
-    grouped: dict[str, list[dict]] = {}
-    seen = set()
-    for raw in raw_models:
-        if not isinstance(raw, dict):
-            continue
-        provider_id = str(raw.get("provider") or "").strip().lower()
-        if provider_id in API_PROVIDERS and not _api_provider_is_configured(
-            keys, provider_id
-        ):
-            continue
-        if provider_id not in API_PROVIDERS and provider_id != "ollama":
-            continue
-        model = _safe_model(raw, provider_id)
-        if model is None:
-            continue
-        key = (provider_id, model["id"])
-        if key in seen:
-            continue
-        seen.add(key)
-        grouped.setdefault(provider_id, []).append(model)
-
     account = account_snapshot(refresh_models=refresh_account)
-    if account["available"] and account["models"]:
-        grouped[ACCOUNT_PROVIDER_ID] = list(account["models"])
+    inventory = build_model_inventory(
+        raw_models,
+        configured_api_providers(keys),
+        account,
+    )
+    grouped: dict[str, list[dict]] = {}
+    for entry in inventory:
+        grouped.setdefault(entry["provider_id"], []).append(entry)
 
     providers = [
         _provider_entry(provider_id, grouped[provider_id])
@@ -270,6 +594,7 @@ def build_catalogue(*, refresh_local: bool = True, refresh_account: bool = True)
         "current": str(settings.get("selected_model") or ""),
         "currentProvider": str(settings.get("selected_model_provider") or ""),
         "account": account,
+        "inventory": inventory,
     }
 
 

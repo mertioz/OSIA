@@ -64,6 +64,11 @@ from osia.config import (
     get_reasoning_settings, set_reasoning_settings,
 )
 from osia.reasoning import get_reasoning_options
+from osia.mobile_model_catalogue import (
+    build_model_inventory,
+    configured_api_providers,
+    resolve_autonomous_selection,
+)
 from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
     restart_service, stop_service,
@@ -1699,6 +1704,7 @@ class _ModelPanel(QWidget):
         self._current_provider: str | None = None
         self._remote: list = []
         self._account_status: dict | None = None
+        self._inventory: list[dict] = []
         self._view: str | None = None   # None = provider grid, else provider key
 
         outer = QVBoxLayout(self)
@@ -1763,7 +1769,11 @@ class _ModelPanel(QWidget):
 
     def set_remote_models(self, remote: list) -> None:
         self._remote = remote or []
-        self.refresh()
+        self.set_inventory(build_model_inventory(
+            list(get_all_models(remote_models=self._remote)),
+            configured_api_providers(load_api_keys()),
+            self._account_status,
+        ))
 
     def set_current(self, model_id: str | None, provider: str | None = None) -> None:
         self._current_model = model_id
@@ -1772,6 +1782,17 @@ class _ModelPanel(QWidget):
 
     def set_account_status(self, status: dict) -> None:
         self._account_status = dict(status or {})
+        self.set_inventory(build_model_inventory(
+            list(get_all_models(remote_models=self._remote)),
+            configured_api_providers(load_api_keys()),
+            self._account_status,
+        ))
+
+    def set_inventory(self, inventory: list[dict]) -> None:
+        """Consume the MainPopup-owned normalized cached inventory."""
+        self._inventory = [
+            dict(entry) for entry in inventory if isinstance(entry, dict)
+        ]
         self.refresh()
 
     def showEvent(self, event):
@@ -1790,50 +1811,23 @@ class _ModelPanel(QWidget):
         super().hideEvent(event)
 
     def _account_models(self) -> list[dict]:
-        status = self._account_status or {}
-        if not status.get("connected") or not status.get("available"):
-            return []
-        models = []
-        for item in status.get("models") or []:
-            if not isinstance(item, dict) or item.get("hidden"):
-                continue
-            model_id = str(item.get("id") or item.get("model") or "").strip()
-            modalities = item.get("inputModalities") or ["text", "image"]
-            if not model_id or "text" not in modalities:
-                continue
-            options = [{
-                "id": "auto", "label": "Default",
-                "label_key": "reasoning.default", "default": True,
-            }]
-            for effort in item.get("supportedReasoningEfforts") or []:
-                effort_id = str(
-                    effort.get("id") if isinstance(effort, dict) else ""
-                ).strip().lower()
-                if effort_id and effort_id != "auto":
-                    options.append({
-                        "id": effort_id,
-                        "label": "Extra high" if effort_id == "xhigh"
-                        else effort_id.title(),
-                        "label_key": f"reasoning.{effort_id}",
-                        "default": False,
-                    })
-            models.append({
-                "id": model_id,
-                "provider": "chatgpt_account",
-                "label": str(item.get("displayName") or model_id),
-                "reasoning_options": options if len(options) > 1 else [],
-            })
-        return models
+        return [
+            self._row_model(entry) for entry in self._inventory
+            if entry.get("provider_id") == "chatgpt_account"
+        ]
+
+    @staticmethod
+    def _row_model(entry: dict) -> dict:
+        return {
+            "id": entry.get("model_id") or "",
+            "provider": entry.get("provider_id") or "",
+            "label": entry.get("model_display_name") or entry.get("model_id") or "?",
+            "reasoning_options": list(entry.get("reasoning_options") or []),
+        }
 
     def _account_is_visible(self, models: list[dict] | None = None) -> bool:
-        status = self._account_status or {}
         usable_models = self._account_models() if models is None else models
-        return bool(
-            status.get("connected")
-            and status.get("available")
-            and not status.get("error")
-            and usable_models
-        )
+        return bool(usable_models)
 
     # ── Navigation ─────────────────────────────────────────────────────────
 
@@ -1852,7 +1846,9 @@ class _ModelPanel(QWidget):
             if w is not None:
                 w.hide()
                 w.deleteLater()
-        if self._view == "chatgpt_account" and not self._account_is_visible():
+        if self._view and not any(
+            entry.get("provider_id") == self._view for entry in self._inventory
+        ):
             self._view = None
         if self._view is None:
             self._build_grid()
@@ -1866,24 +1862,14 @@ class _ModelPanel(QWidget):
         self._title.setText(i18n.t("models.title"))
         self._sub.setText(i18n.t("models.choose_provider_sub"))
 
-        account_models = self._account_models()
-        models = list(get_all_models(remote_models=self._remote))
-        models.extend(account_models)
         counts: dict[str, int] = {}
-        for m in models:
-            counts[m["provider"]] = counts.get(m["provider"], 0) + 1
-
-        # Only show providers that are actually usable: local (Ollama) or
-        # with a saved API key. Unconfigured providers stay reachable from
-        # the Settings panel, where their key can be added.
-        keys = load_api_keys()
+        for entry in self._inventory:
+            provider_id = str(entry.get("provider_id") or "")
+            if provider_id:
+                counts[provider_id] = counts.get(provider_id, 0) + 1
         configured = [
             p for p in self.PROVIDER_ORDER
-            if (
-                self._account_is_visible(account_models)
-                if p == "chatgpt_account"
-                else bool(counts.get(p)) and (p == "ollama" or keys.get(p))
-            )
+            if counts.get(p)
         ]
 
         grid_host = QWidget()
@@ -1912,10 +1898,10 @@ class _ModelPanel(QWidget):
         )
         self._sub.setText(i18n.t("models.pick_model_sub"))
 
-        all_models = list(get_all_models(remote_models=self._remote))
-        if provider == "chatgpt_account":
-            all_models += self._account_models()
-        models = [m for m in all_models if m["provider"] == provider]
+        models = [
+            self._row_model(entry) for entry in self._inventory
+            if entry.get("provider_id") == provider
+        ]
         models.sort(key=lambda m: m.get("label", ""))
 
         if not models:
@@ -9046,6 +9032,7 @@ class _AutonomousPanel(QWidget):
 
     # objective, provider, model
     start_requested = pyqtSignal(str, str, str)
+    selection_changed = pyqtSignal(str, str)
     interrupt_requested = pyqtSignal()
     abort_requested = pyqtSignal()
 
@@ -9053,6 +9040,8 @@ class _AutonomousPanel(QWidget):
         super().__init__()
         self._running = False
         self._planning = False
+        self._inventory: list[dict] = []
+        self._fallback_reason = ""
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 12, 14, 12)
@@ -9116,8 +9105,8 @@ class _AutonomousPanel(QWidget):
         )
         l.addWidget(self._objective_edit)
 
-        # Model picker — every known model (label shown, id stored as data); the
-        # provider is derived from the id on Start via provider_for_model().
+        # Model picker — canonical provider/model labels with the exact pair in
+        # item data, so duplicate model ids remain distinct.
         self._model_label = QLabel(i18n.t("autonomous.model"))
         self._model_label.setObjectName("sectionSub")
         l.addWidget(self._model_label)
@@ -9125,7 +9114,14 @@ class _AutonomousPanel(QWidget):
         self._model_combo.setObjectName("voiceCombo")
         _cap_combo_width(self._model_combo)
         self._populate_models()
+        self._model_combo.currentIndexChanged.connect(self._on_model_changed)
         l.addWidget(self._model_combo)
+
+        self._model_notice = QLabel("")
+        self._model_notice.setObjectName("sectionSub")
+        self._model_notice.setWordWrap(True)
+        self._model_notice.hide()
+        l.addWidget(self._model_notice)
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
@@ -9138,39 +9134,79 @@ class _AutonomousPanel(QWidget):
         l.addLayout(btn_row)
         return wrap
 
-    def _populate_models(self) -> None:
-        """Fill the model combo with the **configured** models only — providers
-        with a saved API key, plus keyless/local Ollama — using the SAME filter
-        as the chat model pickers (``_ModelPanel._build_grid`` /
-        ``_SettingsPanel._hier_model_choices``). Listing an unconfigured provider
-        would let the user launch a task that fails immediately. Defaults the
-        selection to the user's chat model when present; when nothing is
-        configured the combo stays empty and Start is guarded."""
+    def set_inventory(self, inventory: list[dict], resolution: dict) -> None:
+        self._inventory = [
+            dict(entry) for entry in inventory if isinstance(entry, dict)
+        ]
+        self._fallback_reason = str(resolution.get("reason") or "")
+        self._populate_models(resolution)
+
+    def _populate_models(self, resolution: dict | None = None) -> None:
+        """Render the MainPopup-owned cached canonical inventory only."""
+        selected = resolution or {}
+        wanted = (
+            str(selected.get("provider_id") or ""),
+            str(selected.get("model_id") or ""),
+        )
+        self._model_combo.blockSignals(True)
         self._model_combo.clear()
-        try:
-            models = get_all_models()
-        except Exception:
-            models = []
-        try:
-            keys = load_api_keys()
-        except Exception:
-            keys = {}
-        for m in models:
-            # Same rule as the rest of OSIA: only providers with a saved key are
-            # usable; Ollama is local/keyless so it always qualifies.
-            provider = m.get("provider")
-            if provider != "ollama" and not keys.get(provider):
+        selected_index = -1
+        for entry in self._inventory:
+            provider_id = str(entry.get("provider_id") or "")
+            model_id = str(entry.get("model_id") or "")
+            if not provider_id or not model_id:
                 continue
-            label = m.get("label") or m.get("id") or "?"
-            self._model_combo.addItem(label, m.get("id"))
-        try:
-            current = (load_settings() or {}).get("selected_model")
-        except Exception:
-            current = None
-        if current:
-            idx = self._model_combo.findData(current)
-            if idx >= 0:
-                self._model_combo.setCurrentIndex(idx)
+            provider_label = str(
+                entry.get("provider_display_name") or provider_id
+            )
+            model_label = str(entry.get("model_display_name") or model_id)
+            index = self._model_combo.count()
+            self._model_combo.addItem(
+                f"{provider_label} — {model_label}",
+                (provider_id, model_id),
+            )
+            if (provider_id, model_id) == wanted:
+                selected_index = index
+        if selected_index >= 0:
+            self._model_combo.setCurrentIndex(selected_index)
+        self._model_combo.blockSignals(False)
+        self._update_model_notice(bool(selected.get("fallback_occurred")))
+        if hasattr(self, "_start_btn"):
+            self._start_btn.setEnabled(
+                not self._running and self._model_combo.count() > 0
+            )
+        self._model_combo.setEnabled(
+            not self._running and self._model_combo.count() > 0
+        )
+
+    def _update_model_notice(self, fallback_occurred: bool | None = None) -> None:
+        if not hasattr(self, "_model_notice"):
+            return
+        if self._model_combo.count() == 0:
+            self._model_notice.setText(i18n.t("autonomous.no_models"))
+            self._model_notice.show()
+        elif fallback_occurred or self._fallback_reason in {
+            "saved_selection_unavailable", "legacy_model_ambiguous",
+            "legacy_model_unavailable", "saved_selection_incomplete",
+            "main_selection_unavailable",
+        }:
+            self._model_notice.setText(i18n.t("autonomous.model_fallback"))
+            self._model_notice.show()
+        else:
+            self._model_notice.clear()
+            self._model_notice.hide()
+
+    def _on_model_changed(self, _index: int) -> None:
+        identity = self._model_combo.currentData()
+        if (
+            isinstance(identity, (tuple, list))
+            and len(identity) == 2
+            and identity[0]
+            and identity[1]
+        ):
+            self._fallback_reason = ""
+            self._update_model_notice(False)
+            self.selection_changed.emit(str(identity[0]), str(identity[1]))
 
     # ── Progress section ────────────────────────────────────────────────────
 
@@ -9230,13 +9266,13 @@ class _AutonomousPanel(QWidget):
         objective = self._objective_edit.toPlainText().strip()
         if not objective:
             return
-        model = self._model_combo.currentData() or ""
-        if not model:
-            # Nothing configured to run with — the combo lists only configured
-            # providers, so an empty selection means no API key is set anywhere.
-            # Don't launch a task that would fail immediately.
+        identity = self._model_combo.currentData()
+        if not isinstance(identity, (tuple, list)) or len(identity) != 2:
             return
-        provider = provider_for_model_cached(model) if model else ""
+        provider = str(identity[0] or "").strip().lower()
+        model = str(identity[1] or "").strip()
+        if not provider or not model:
+            return
         self._prog_objective.setText(objective)
         # Lock the panel immediately (planning runs off the GUI thread); the host
         # flips us to "running" or re-opens us via a progress event.
@@ -9392,7 +9428,9 @@ class _AutonomousPanel(QWidget):
         the "running" event closes that window."""
         self._running = running
         self._planning = bool(running and planning)
-        self._start_btn.setEnabled(not running)
+        self._start_btn.setEnabled(
+            not running and self._model_combo.count() > 0
+        )
         if running:
             self._start_btn.setText(
                 i18n.t("autonomous.planning") if planning
@@ -9401,7 +9439,9 @@ class _AutonomousPanel(QWidget):
         else:
             self._start_btn.setText(i18n.t("autonomous.start"))
         self._objective_edit.setReadOnly(running)
-        self._model_combo.setEnabled(not running)
+        self._model_combo.setEnabled(
+            not running and self._model_combo.count() > 0
+        )
         controllable = running and not planning
         self._interrupt_btn.setEnabled(controllable)
         self._abort_btn.setEnabled(controllable)
@@ -9432,6 +9472,7 @@ class _AutonomousPanel(QWidget):
         self._abort_btn.setText(i18n.t("autonomous.abort"))
         if not self._running:
             self._start_btn.setText(i18n.t("autonomous.start"))
+        self._update_model_notice()
         # The live status/phase/counter text reflects the last snapshot and
         # re-renders (translated) on the next progress event.
 
@@ -9892,16 +9933,17 @@ class MainPopup(QWidget):
         self._convs.rename_conversation.connect(self.rename_conversation.emit)
         self._convs.delete_conversation.connect(self.delete_conversation.emit)
 
+        self._model_remote_models: list[dict] = []
+        self._model_account_status: dict = {}
+        self._model_inventory: list[dict] = []
+
         self._models = _ModelPanel()
         self._models.model_changed.connect(self._on_model_selected)
 
         self._settings = _SettingsPanel(self._update_controller)
-        self._settings.api_keys_saved.connect(self.api_keys_saved.emit)
+        self._settings.api_keys_saved.connect(self._on_api_keys_saved)
         self._settings.chatgpt_status_changed.connect(
-            self._models.set_account_status
-        )
-        self._settings.chatgpt_status_changed.connect(
-            self.chatgpt_status_changed.emit
+            self._on_chatgpt_status_changed
         )
         self._models.account_refresh_requested.connect(
             self._settings._probe_chatgpt_account
@@ -9933,6 +9975,9 @@ class MainPopup(QWidget):
         self._osia = _OsiaPanel()
 
         self._autonomous = _AutonomousPanel()
+        self._autonomous.selection_changed.connect(
+            self._on_autonomous_model_selected
+        )
         self._autonomous.start_requested.connect(
             self.autonomous_start_requested.emit
         )
@@ -9942,6 +9987,7 @@ class MainPopup(QWidget):
         self._autonomous.abort_requested.connect(
             self.autonomous_abort_requested.emit
         )
+        self._refresh_model_inventory()
 
         self._stack.addWidget(self._chat)
         self._stack.addWidget(self._convs)
@@ -10271,8 +10317,73 @@ class MainPopup(QWidget):
         self._models.set_current(model_id, provider)
 
     def set_remote_models(self, remote: list) -> None:
-        self._models.set_remote_models(remote)
+        self._model_remote_models = [
+            dict(item) for item in remote or [] if isinstance(item, dict)
+        ]
         self._settings.set_remote_models(remote)
+        self._refresh_model_inventory()
+
+    def _on_api_keys_saved(self, keys: dict) -> None:
+        self._refresh_model_inventory(keys)
+        self.api_keys_saved.emit(dict(keys or {}))
+
+    def _on_chatgpt_status_changed(self, status: dict) -> None:
+        self._model_account_status = dict(status or {})
+        # Kept for the focused account-panel contract tests and selection side
+        # effect; rendering itself consumes only the canonical inventory below.
+        self._models._account_status = dict(status or {})
+        self._refresh_model_inventory()
+        self.chatgpt_status_changed.emit(dict(status or {}))
+
+    def _refresh_model_inventory(self, keys: dict | None = None) -> None:
+        """Rebuild one non-blocking cached inventory and distribute it."""
+        try:
+            raw_models = list(get_all_models(
+                remote_models=self._model_remote_models
+            ))
+        except Exception:
+            raw_models = []
+        try:
+            key_snapshot = dict(keys) if isinstance(keys, dict) else load_api_keys()
+            configured = configured_api_providers(key_snapshot)
+        except Exception:
+            configured = set()
+        self._model_inventory = build_model_inventory(
+            raw_models,
+            configured,
+            self._model_account_status,
+        )
+        settings = load_settings() or {}
+        resolution = resolve_autonomous_selection(
+            self._model_inventory,
+            autonomous_provider=settings.get("autonomous_model_provider") or "",
+            autonomous_model=settings.get("autonomous_model") or "",
+            main_provider=settings.get("selected_model_provider") or "",
+            main_model=settings.get("selected_model") or "",
+        )
+        account_status_pending = not bool(self._model_account_status)
+        # Until the first account snapshot arrives, a missing entry may still be
+        # a valid account model (including a legacy bare id). Render the safe
+        # fallback, but do not destroy the saved identity before that probe.
+        defer_account_fallback = bool(
+            account_status_pending and resolution.get("fallback_occurred")
+        )
+        if resolution.get("entry") and not defer_account_fallback:
+            provider_id = resolution["provider_id"]
+            model_id = resolution["model_id"]
+            if settings.get("autonomous_model_provider") != provider_id:
+                set_setting("autonomous_model_provider", provider_id)
+            if settings.get("autonomous_model") != model_id:
+                set_setting("autonomous_model", model_id)
+        self._models.set_inventory(self._model_inventory)
+        self._autonomous.set_inventory(self._model_inventory, resolution)
+
+    def _on_autonomous_model_selected(self, provider: str, model: str) -> None:
+        settings = load_settings() or {}
+        if settings.get("autonomous_model_provider") != provider:
+            set_setting("autonomous_model_provider", provider)
+        if settings.get("autonomous_model") != model:
+            set_setting("autonomous_model", model)
 
     def _request_local_models_refresh(self) -> None:
         refresh_ollama_models_async(self._publish_local_models)
@@ -10281,9 +10392,8 @@ class MainPopup(QWidget):
         self._ollama_models_ready.emit(list(models))
 
     def _apply_local_models(self, _models: list) -> None:
-        self._models.refresh()
         self._settings._apply_local_models_snapshot()
-        self._autonomous._populate_models()
+        self._refresh_model_inventory()
 
     # ── Autonomous agent (WOR-45 Phase 4) ─────────────────────────────────
 
@@ -10296,6 +10406,8 @@ class MainPopup(QWidget):
         if btn is not None:
             btn.setChecked(True)
         self._animate_width(POPUP_W)   # autonomous page uses the COMPACT width
+        self._settings._probe_chatgpt_account()
+        self._request_local_models_refresh()
         self._autonomous.seed_from_state(state)
         if not self.isVisible():
             self._show_animated()
@@ -10337,6 +10449,9 @@ class MainPopup(QWidget):
                 self._convs.refresh()
             elif page_idx == self.PAGE_OSIA:
                 self._osia.refresh()
+            elif page_idx == self.PAGE_AUTONOMOUS:
+                self._settings._probe_chatgpt_account()
+                self._request_local_models_refresh()
 
     def _on_new_conv(self) -> None:
         self.new_conversation.emit()

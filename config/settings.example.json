@@ -1,6 +1,8 @@
 {
   "selected_model": null,
   "selected_model_provider": null,
+  "autonomous_model": null,
+  "autonomous_model_provider": null,
   "chatgpt_account_feature_enabled": true,
   "chatgpt_account_model": null,
   "tts_provider": "local",
