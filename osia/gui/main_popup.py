@@ -8736,7 +8736,9 @@ class _OsiaPanel(QWidget):
         host = QWidget()
         host.setObjectName("panelHost")
         v = QVBoxLayout(host)
-        v.setContentsMargins(0, 0, 6, 0)
+        # Keep the final authorization/control row fully reachable at the
+        # compact 440x560 popup height after long wrapped plan/scope details.
+        v.setContentsMargins(0, 0, 6, 56)
         v.setSpacing(14)
         v.addWidget(self._build_personality_section())
         v.addWidget(self._build_skills_section())
@@ -9020,6 +9022,9 @@ class _AutonomousPanel(QWidget):
     # objective, provider, model
     start_requested = pyqtSignal(str, str, str)
     selection_changed = pyqtSignal(str, str)
+    authorize_requested = pyqtSignal()
+    scope_extension_response = pyqtSignal(str)
+    revoke_requested = pyqtSignal()
     interrupt_requested = pyqtSignal()
     abort_requested = pyqtSignal()
 
@@ -9227,6 +9232,55 @@ class _AutonomousPanel(QWidget):
         self._prog_status.setWordWrap(True)
         l.addWidget(self._prog_status)
 
+        self._plan_review = QLabel("")
+        self._plan_review.setObjectName("sectionSub")
+        self._plan_review.setWordWrap(True)
+        self._plan_review.hide()
+        l.addWidget(self._plan_review)
+
+        self._capability_review = QLabel("")
+        self._capability_review.setObjectName("sectionSub")
+        self._capability_review.setWordWrap(True)
+        self._capability_review.hide()
+        l.addWidget(self._capability_review)
+
+        self._authorization_state = QLabel("")
+        self._authorization_state.setObjectName("sectionSub")
+        self._authorization_state.setWordWrap(True)
+        self._authorization_state.hide()
+        l.addWidget(self._authorization_state)
+
+        self._scope_frame = QFrame()
+        self._scope_frame.setObjectName("section")
+        scope_layout = QVBoxLayout(self._scope_frame)
+        scope_layout.setContentsMargins(10, 10, 10, 10)
+        scope_layout.setSpacing(8)
+        self._scope_title = QLabel(i18n.t("autonomous.scope_extension_title"))
+        self._scope_title.setObjectName("sectionTitle")
+        self._scope_detail = QLabel("")
+        self._scope_detail.setObjectName("sectionSub")
+        self._scope_detail.setWordWrap(True)
+        scope_layout.addWidget(self._scope_title)
+        scope_layout.addWidget(self._scope_detail)
+        scope_buttons = QHBoxLayout()
+        self._scope_approve_btn = QPushButton(
+            i18n.t("autonomous.approve_exact")
+        )
+        self._scope_approve_btn.setObjectName("saveBtn")
+        self._scope_approve_btn.clicked.connect(
+            lambda: self.scope_extension_response.emit("approve_exact")
+        )
+        self._scope_deny_btn = QPushButton(i18n.t("autonomous.deny"))
+        self._scope_deny_btn.setObjectName("ghostBtn")
+        self._scope_deny_btn.clicked.connect(
+            lambda: self.scope_extension_response.emit("deny")
+        )
+        scope_buttons.addWidget(self._scope_approve_btn)
+        scope_buttons.addWidget(self._scope_deny_btn)
+        scope_layout.addLayout(scope_buttons)
+        self._scope_frame.hide()
+        l.addWidget(self._scope_frame)
+
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
         self._interrupt_btn = QPushButton(i18n.t("autonomous.interrupt"))
@@ -9239,6 +9293,20 @@ class _AutonomousPanel(QWidget):
         self._abort_btn.setObjectName("ghostBtn")
         self._abort_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._abort_btn.clicked.connect(self._on_abort)
+        self._authorize_btn = QPushButton(
+            i18n.t("autonomous.authorize_and_start")
+        )
+        self._authorize_btn.setObjectName("saveBtn")
+        self._authorize_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._authorize_btn.clicked.connect(self.authorize_requested.emit)
+        self._authorize_btn.hide()
+        self._revoke_btn = QPushButton(i18n.t("autonomous.revoke"))
+        self._revoke_btn.setObjectName("ghostBtn")
+        self._revoke_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._revoke_btn.clicked.connect(self.revoke_requested.emit)
+        self._revoke_btn.hide()
+        btn_row.addWidget(self._authorize_btn)
+        btn_row.addWidget(self._revoke_btn)
         btn_row.addWidget(self._interrupt_btn)
         btn_row.addWidget(self._abort_btn)
         btn_row.addStretch()
@@ -9289,9 +9357,61 @@ class _AutonomousPanel(QWidget):
         self._render_snapshot(payload)
         diagnostic_text = self._diagnostic_text(payload)
 
-        if event == "running":
+        if event in {"autonomous_plan_ready", "authorization_pending"}:
             self._set_running(True)
+            self._interrupt_btn.setEnabled(False)
+            self._abort_btn.setEnabled(True)
+            self._authorize_btn.show()
+            self._authorize_btn.setEnabled(True)
+            self._revoke_btn.hide()
+            self._scope_frame.hide()
+            self._set_status(i18n.t("autonomous.status_authorization_pending"))
+        elif event == "running":
+            self._set_running(True)
+            self._authorize_btn.hide()
+            self._revoke_btn.show()
+            self._scope_frame.hide()
             self._set_status(i18n.t("autonomous.status_running"))
+        elif event in {
+            "autonomous_scope_extension_request", "suspended_scope_extension",
+            "scope_extension_denied",
+        }:
+            self._set_running(True)
+            self._interrupt_btn.setEnabled(False)
+            self._abort_btn.setEnabled(True)
+            self._authorize_btn.hide()
+            self._revoke_btn.show()
+            self._scope_frame.show()
+            pending = payload.get("pending_scope_extension") or {}
+            barrier = str(pending.get("universal_barrier") or "")
+            responded = pending.get("responded") is True
+            self._scope_approve_btn.setEnabled(
+                pending.get("can_approve_pc", True) is True
+                and not bool(barrier)
+                and not responded
+            )
+            self._scope_deny_btn.setEnabled(not responded)
+            self._set_status(i18n.t("autonomous.status_scope_extension"))
+        elif event in {
+            "autonomous_authorization_revoked", "suspended_authorization_revoked",
+        }:
+            self._set_running(True)
+            self._interrupt_btn.setEnabled(False)
+            self._abort_btn.setEnabled(True)
+            self._authorize_btn.hide()
+            self._revoke_btn.hide()
+            self._scope_frame.hide()
+            self._set_status(i18n.t("autonomous.status_revoked"))
+        elif event in {"autonomous_outcome_unknown", "blocked_outcome_unknown"}:
+            self._set_running(True)
+            self._interrupt_btn.setEnabled(False)
+            self._abort_btn.setEnabled(True)
+            self._authorize_btn.hide()
+            self._revoke_btn.hide()
+            self._scope_frame.hide()
+            self._set_status(i18n.t("autonomous.status_outcome_unknown"))
+        elif event == "authorization_error":
+            self._set_status(i18n.t("autonomous.status_authorization_error"))
         elif event == "task_done":
             self._set_status(i18n.t("autonomous.status_task_done"))
         elif event == "salvaged":
@@ -9300,15 +9420,24 @@ class _AutonomousPanel(QWidget):
             self._set_status(diagnostic_text)
         elif event == "done":
             self._set_running(False)
+            self._authorize_btn.hide()
+            self._revoke_btn.hide()
+            self._scope_frame.hide()
             self._set_status(i18n.t("autonomous.status_done"))
         elif event == "failed":
             self._set_running(False)
+            self._authorize_btn.hide()
+            self._revoke_btn.hide()
+            self._scope_frame.hide()
             self._set_status(diagnostic_text)
         elif event == "interrupted":
             self._set_running(False)
             self._set_status(i18n.t("autonomous.status_interrupted"))
         elif event == "aborted":
             self._set_running(False)
+            self._authorize_btn.hide()
+            self._revoke_btn.hide()
+            self._scope_frame.hide()
             self._set_status(i18n.t("autonomous.status_aborted"))
         elif event == "plan_failed":
             self._set_running(False)
@@ -9324,6 +9453,21 @@ class _AutonomousPanel(QWidget):
             self._objective_edit.setPlainText(objective)
         snapshot = self._snapshot_from_state(state)
         self._render_snapshot(snapshot)
+        run_state = state.get("run_state") or ""
+        event = {
+            "authorization_pending": "autonomous_plan_ready",
+            "ready": "authorization_pending",
+            "running": "running",
+            "suspended_scope_extension": "suspended_scope_extension",
+            "suspended_authorization_revoked": "suspended_authorization_revoked",
+            "blocked_outcome_unknown": "blocked_outcome_unknown",
+            "completed": "done",
+            "failed": "failed",
+            "cancelled": "aborted",
+        }.get(run_state)
+        if event:
+            self.apply_progress({"event": event, **snapshot})
+            return
         status = state.get("status") or ""
         if status == "in_progress":
             self._set_running(True)
@@ -9358,6 +9502,90 @@ class _AutonomousPanel(QWidget):
             self._prog_counter.setText(
                 i18n.t("autonomous.tasks", done=done, total=total)
             )
+        plan_summary = payload.get("plan_summary")
+        if isinstance(plan_summary, list):
+            plan_lines = []
+            for phase in plan_summary:
+                if not isinstance(phase, dict):
+                    continue
+                name = self._short(str(phase.get("name") or ""), 100)
+                if name:
+                    plan_lines.append(name)
+                for task in phase.get("tasks") or []:
+                    plan_lines.append(f"  • {self._short(str(task), 140)}")
+            self._plan_review.setText(
+                i18n.t("autonomous.plan_review") + "\n" + "\n".join(plan_lines)
+            )
+            self._plan_review.setVisible(bool(plan_lines))
+        capabilities = payload.get("capability_summary")
+        if isinstance(capabilities, list):
+            private = payload.get("private_scope_details") or {}
+            capability_lines = []
+            for item in capabilities:
+                if not isinstance(item, dict):
+                    continue
+                label = self._short(str(item.get("label") or ""), 100)
+                effect = self._short(str(item.get("effect_class") or ""), 60)
+                precision = self._short(
+                    str(item.get("target_precision") or "unknown"), 40,
+                )
+                detail = self._short(
+                    str(private.get(item.get("capability_id")) or ""), 160,
+                )
+                suffix = f" — {detail}" if detail else ""
+                bounds = []
+                uses = item.get("expected_use_count")
+                ttl = item.get("grant_ttl_seconds")
+                if type(uses) is int and uses > 0:
+                    bounds.append(f"{uses}×")
+                if type(ttl) is int and ttl > 0:
+                    bounds.append(f"{max(1, ttl // 60)} min")
+                bounds_text = f" · {' · '.join(bounds)}" if bounds else ""
+                capability_lines.append(
+                    f"• {label} · {effect} · {precision}{bounds_text}{suffix}"
+                )
+            self._capability_review.setText(
+                i18n.t("autonomous.capability_review")
+                + "\n" + "\n".join(capability_lines)
+            )
+            self._capability_review.setVisible(bool(capability_lines))
+        source = payload.get("authorization_source")
+        if source:
+            grant_count = len(payload.get("grant_refs") or [])
+            self._authorization_state.setText(i18n.t(
+                "autonomous.authorization_state",
+                source=str(source),
+                count=grant_count,
+            ))
+            self._authorization_state.show()
+        pending = payload.get("pending_scope_extension")
+        if isinstance(pending, dict):
+            local_note = (
+                i18n.t("autonomous.local_pc_review")
+                if pending.get("local_pc_review_required") else ""
+            )
+            detail_text = i18n.t(
+                "autonomous.scope_extension_detail",
+                category=str(pending.get("safe_category") or ""),
+                effect=str(pending.get("effect_class") or ""),
+                uses=int(pending.get("requested_use_count", 1) or 1),
+                local=local_note,
+            )
+            private_detail = self._short(
+                str(pending.get("private_scope_detail") or ""), 320,
+            )
+            try:
+                ttl_minutes = max(1, int(
+                    (float(pending.get("expires_at"))
+                     - float(pending.get("issued_at"))) / 60
+                ))
+            except (TypeError, ValueError, OverflowError):
+                ttl_minutes = 0
+            if ttl_minutes:
+                detail_text += f" · {ttl_minutes} min"
+            if private_detail:
+                detail_text += "\n" + private_detail
+            self._scope_detail.setText(detail_text)
 
     @staticmethod
     def _snapshot_from_state(state: dict) -> dict:
@@ -9376,9 +9604,32 @@ class _AutonomousPanel(QWidget):
         phase_name = ""
         if 0 <= p < len(phases):
             phase_name = phases[p].get("name", "") or ""
-        return {"objective": state.get("objective", "") or "",
-                "phase_name": phase_name, "done": done, "total": total,
-                **autonomous_diagnostics.projection(state)}
+        return {
+            "objective": state.get("objective", "") or "",
+            "phase_name": phase_name,
+            "done": done,
+            "total": total,
+            "run_state": state.get("run_state", ""),
+            "authorization_source": state.get("authorization_source", "none"),
+            "grant_refs": list(state.get("grant_refs") or []),
+            "capability_summary": list(state.get("capability_summary") or []),
+            "pending_scope_extension": state.get("pending_scope_extension"),
+            "private_scope_details": dict(
+                state.get("_runtime_pc_capability_details") or {}
+            ),
+            "plan_summary": [
+                {
+                    "name": str(phase.get("name") or ""),
+                    "tasks": [
+                        str(task.get("objective") or "")
+                        for task in phase.get("tasks") or []
+                        if isinstance(task, dict)
+                    ],
+                }
+                for phase in phases if isinstance(phase, dict)
+            ],
+            **autonomous_diagnostics.projection(state),
+        }
 
     @staticmethod
     def _diagnostic_text(payload: dict) -> str:
@@ -9455,6 +9706,11 @@ class _AutonomousPanel(QWidget):
         )
         self._model_label.setText(i18n.t("autonomous.model"))
         self._progress_title.setText(i18n.t("autonomous.progress_title"))
+        self._scope_title.setText(i18n.t("autonomous.scope_extension_title"))
+        self._authorize_btn.setText(i18n.t("autonomous.authorize_and_start"))
+        self._revoke_btn.setText(i18n.t("autonomous.revoke"))
+        self._scope_approve_btn.setText(i18n.t("autonomous.approve_exact"))
+        self._scope_deny_btn.setText(i18n.t("autonomous.deny"))
         self._interrupt_btn.setText(i18n.t("autonomous.interrupt"))
         self._abort_btn.setText(i18n.t("autonomous.abort"))
         if not self._running:
@@ -9752,6 +10008,9 @@ class MainPopup(QWidget):
     # to the dedicated Orchestrator: start (objective, provider, model), pause
     # (resumable next launch) and discard.
     autonomous_start_requested = pyqtSignal(str, str, str)
+    autonomous_authorize_requested = pyqtSignal()
+    autonomous_scope_extension_response = pyqtSignal(str)
+    autonomous_revoke_requested = pyqtSignal()
     autonomous_interrupt_requested = pyqtSignal()
     autonomous_abort_requested = pyqtSignal()
     _ollama_models_ready = pyqtSignal(list)
@@ -9967,6 +10226,15 @@ class MainPopup(QWidget):
         )
         self._autonomous.start_requested.connect(
             self.autonomous_start_requested.emit
+        )
+        self._autonomous.authorize_requested.connect(
+            self.autonomous_authorize_requested.emit
+        )
+        self._autonomous.scope_extension_response.connect(
+            self.autonomous_scope_extension_response.emit
+        )
+        self._autonomous.revoke_requested.connect(
+            self.autonomous_revoke_requested.emit
         )
         self._autonomous.interrupt_requested.connect(
             self.autonomous_interrupt_requested.emit

@@ -476,6 +476,8 @@ class MobileServerAutonomousRuntimeTests(unittest.TestCase):
             "model": "shared",
             "phases": [],
             "cursor": {"phase": 0, "task": 0},
+            "run_state": "authorization_pending",
+            "authorization_status": "pending",
         }
         original = dict(server._autonomous)
         server._autonomous.update({
@@ -505,14 +507,16 @@ class MobileServerAutonomousRuntimeTests(unittest.TestCase):
                 patch.object(server, "_broadcast_autonomous"),
             ):
                 server._autonomous_start_worker(
-                    "Harmless objective", "deepseek:shared", 182, "en"
+                    "Harmless objective", "deepseek:shared", 182, "en",
+                    "mobile_test",
                 )
         finally:
             server._autonomous.clear()
             server._autonomous.update(original)
         self.assertEqual(agent.calls, [("deepseek", "shared")])
         self.assertEqual(create_plan.call_args.args[1:3], ("deepseek", "shared"))
-        self.assertEqual(orchestrator.started, [state])
+        self.assertEqual(orchestrator.started, [])
+        self.assertEqual(create_plan.call_args.kwargs["origin_ref"], "mobile_test")
 
     def test_mobile_resume_worker_uses_task_state_exact_pair(self):
         from osia.server import server
@@ -547,6 +551,11 @@ class MobileServerAutonomousRuntimeTests(unittest.TestCase):
                 patch.object(server._astate, "resume_state_is_valid", return_value=True),
                 patch.object(server._astate, "save_task_state"),
                 patch.object(
+                    server._aauthorization,
+                    "revalidate_loaded_authorization",
+                    side_effect=lambda st, **_kwargs: st,
+                ),
+                patch.object(
                     catalogue,
                     "resolve_current_autonomous_selection",
                     return_value=self._resolution("openai", "shared"),
@@ -554,7 +563,7 @@ class MobileServerAutonomousRuntimeTests(unittest.TestCase):
                 patch.object(server, "_write_autonomous_lock"),
                 patch.object(server, "_broadcast_autonomous"),
             ):
-                server._autonomous_resume_worker(183)
+                server._autonomous_resume_worker(183, "mobile_test")
         finally:
             server._autonomous.clear()
             server._autonomous.update(original)

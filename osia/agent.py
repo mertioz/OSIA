@@ -6733,7 +6733,38 @@ class OSIAAgent:
                         f"[OSIA Agent] tool start: {tool_name} "
                         f"({len(kwargs)} argument field(s))"
                     )
-                    if tool_name == "save_memory":
+                    autonomous_policy_error = None
+                    autonomous_execution_permit = False
+                    if tool_name == "save_memory" or tool_name in _SCHEDULED_TASK_TOOL_NAMES:
+                        try:
+                            from osia.action_policy import (
+                                autonomous_permission_gate,
+                                pending_execution_permit_matches,
+                            )
+
+                            autonomous_policy_error = autonomous_permission_gate(
+                                tool_name, kwargs,
+                            )
+                            autonomous_execution_permit = (
+                                pending_execution_permit_matches(tool_name, kwargs)
+                            )
+                        except Exception:
+                            autonomous_policy_error = (
+                                "ERROR: autonomous authorization unavailable; "
+                                "the action was not executed"
+                            )
+                    if autonomous_policy_error:
+                        result, is_error = autonomous_policy_error, True
+                        execution_record = ToolExecutionRecord(
+                            result,
+                            True,
+                            ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+                            0,
+                            False,
+                            False,
+                            effective,
+                        )
+                    elif tool_name == "save_memory":
                         token = _memory_runtime.set_save_memory_context(
                             store=memory_store,
                             user_text=user_text,
@@ -6745,6 +6776,7 @@ class OSIAAgent:
                                 hard_deadline=guard.started_at + guard.hard_limit,
                                 user_request=user_text,
                                 lang=self.lang,
+                                enforce_execution_permit=autonomous_execution_permit,
                             )
                         finally:
                             _memory_runtime.reset_save_memory_context(token)
@@ -6789,12 +6821,13 @@ class OSIAAgent:
                                 execution_record = _execute_tool_with_policy(
                                     tool_name,
                                     kwargs,
-                                    hard_deadline=(
-                                        guard.started_at + guard.hard_limit
-                                    ),
-                                    user_request=user_text,
-                                    lang=self.lang,
-                                )
+                                     hard_deadline=(
+                                         guard.started_at + guard.hard_limit
+                                     ),
+                                     user_request=user_text,
+                                     lang=self.lang,
+                                     enforce_execution_permit=autonomous_execution_permit,
+                                 )
                             finally:
                                 _CURRENT_CONVERSATION_ID.reset(token)
                                 _CURRENT_MODEL_METADATA.reset(model_token)
@@ -6866,6 +6899,15 @@ class OSIAAgent:
                             )
                             result = execution_record.result
                             is_error = execution_record.is_error
+                    try:
+                        from osia.autonomous.authorization import record_tool_execution
+
+                        record_tool_execution(tool_name, kwargs, execution_record)
+                    except Exception:
+                        # The authorization coordinator is additive outside an
+                        # Autonomous runtime.  In Autonomous, facade decisions
+                        # already fail closed before this outcome hook.
+                        pass
                     if execution_record.dispatched:
                         any_tool_executed = True
                     if (
@@ -7001,6 +7043,30 @@ class OSIAAgent:
                                 f"follow-up tool call(s) after error: {names}"
                             )
                         break
+
+                try:
+                    from osia.autonomous.authorization import current_runtime
+
+                    autonomous_runtime = current_runtime()
+                    autonomous_run_state = (
+                        autonomous_runtime.task_state.get("run_state")
+                        if autonomous_runtime is not None else ""
+                    )
+                except Exception:
+                    autonomous_run_state = ""
+                if autonomous_run_state in {
+                    "suspended_scope_extension",
+                    "suspended_authorization_revoked",
+                }:
+                    # Do not give the provider another turn after a typed
+                    # zero-dispatch suspension; the orchestrator owns resume.
+                    return "ERROR: autonomous authorization suspended before dispatch"
+                if autonomous_run_state == "blocked_outcome_unknown":
+                    return self._finish_execution_barrier_stop(
+                        outcome_unknown=True,
+                        timed_out=turn_has_tool_timeout,
+                        on_sentence=on_sentence,
+                    )
 
                 # A timed-out worker may still be running. Do not ask any
                 # provider to continue the plan: that could dispatch a second

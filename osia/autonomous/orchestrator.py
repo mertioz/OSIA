@@ -41,7 +41,7 @@ from contextlib import contextmanager
 from typing import NamedTuple
 
 from osia import document_artifacts
-from osia.autonomous import diagnostics, planner
+from osia.autonomous import authorization, diagnostics, planner
 # Module-qualified on purpose (like planner.py) so the persistence/mutator layer
 # stays a single black box — and so a test can monkeypatch state.save_task_state.
 from osia.autonomous import state
@@ -114,7 +114,7 @@ class Orchestrator:
         thread-safe GUI bridge on top. Any exception it raises is swallowed.
     """
 
-    def __init__(self, agent, progress_cb=None):
+    def __init__(self, agent, progress_cb=None, *, origin_ref="desktop"):
         self.agent = agent
         self._progress_cb = progress_cb
         self._state = None
@@ -125,21 +125,47 @@ class Orchestrator:
         # the first task examined, regardless of outcome.
         self._resume_recheck = False
         self._active_task = None
+        self._origin_ref = str(origin_ref or "desktop")
 
     def _agent_run(self, message: str):
         """Run one autonomous provider turn under the checkpoint language."""
 
         st = self._state if isinstance(self._state, dict) else {}
         language = normalize_locale(st.get("language")) or i18n.DEFAULT_LANG
-        if hasattr(self.agent, "set_turn_context"):
-            context = fixed_turn_context(
-                language,
-                source="autonomous_state",
-                reference=str(st.get("task_id") or "autonomous"),
-            )
-            self.agent.set_turn_context(context)
-            return self.agent.run(message, turn_context=context)
-        return self.agent.run(message)
+        from osia.action_policy import (
+            ExecutionType,
+            execution_context_scope,
+            get_default_permission_policy,
+            make_execution_context,
+        )
+
+        context = fixed_turn_context(
+            language,
+            source="autonomous_state",
+            reference=str(st.get("run_id") or st.get("task_id") or "autonomous"),
+        )
+        policy = get_default_permission_policy()
+        permission_state = policy.store.load_state()
+        execution_context = make_execution_context(
+            execution_type=ExecutionType.AUTONOMOUS,
+            interactive=False,
+            run_id=str(st.get("run_id") or ""),
+            plan_revision=str(st.get("plan_revision") or 0),
+            task_revision=str(st.get("authorization_revision") or 0),
+            policy_epoch=permission_state.policy_epoch,
+            store=policy.store,
+        )
+        origin_ref = str(st.get("authorization_origin_ref") or self._origin_ref)
+        with authorization.run_authorization_scope(
+            st,
+            save=state.save_task_state,
+            emit=self._emit,
+            origin_ref=origin_ref,
+        ), execution_context_scope(execution_context):
+            if hasattr(self.agent, "set_turn_context"):
+                self.agent.set_turn_context(context)
+                return self.agent.run(message, turn_context=context)
+            return self.agent.run(message)
 
     def _agent_run_failure(self):
         """Read only the agent's allow-listed typed run diagnostic."""
@@ -179,10 +205,44 @@ class Orchestrator:
         # Idempotent: never spawn a second loop over the same Orchestrator.
         if self._thread and self._thread.is_alive():
             return
+        if not isinstance(st, dict) or not state.execution_state_is_valid(st):
+            invalid = st if isinstance(st, dict) else state.new_task_state("", "", "", [])
+            self._state = invalid
+            invalid["status"] = "failed"
+            invalid["run_state"] = "failed"
+            diagnostic = self._record_failure(
+                invalid,
+                diagnostics.AutonomousStage.RESUME if resume else diagnostics.AutonomousStage.ORCHESTRATOR,
+                diagnostics.FailureCategory.INVALID_RESUME_STATE,
+                reason_code="invalid_authorization_state",
+                resumable=False,
+                checkpoint_present=isinstance(st, dict),
+            )
+            self._safe_save(invalid)
+            self._emit({"event": "failed", **diagnostic})
+            return
+        if resume and st.get("run_state") == "running":
+            # A persisted running checkpoint means the process stopped between
+            # checkpoints.  Resume re-enters through the same ready gate; every
+            # dispatch still revalidates the protected epoch/grant.
+            st["run_state"] = "ready"
+        if st.get("run_state") != "ready":
+            self._state = st
+            self._safe_save(st)
+            self._emit({
+                "event": (
+                    "authorization_pending"
+                    if st.get("run_state") == "authorization_pending"
+                    else st.get("run_state")
+                ),
+                **authorization.pc_projection(st),
+            })
+            return
         if resume and not state.resume_state_is_valid(st):
             invalid = st if isinstance(st, dict) else state.new_task_state("", "", "", [])
             self._state = invalid
             invalid["status"] = "failed"
+            invalid["run_state"] = "failed"
             diagnostic = self._record_failure(
                 invalid,
                 diagnostics.AutonomousStage.RESUME,
@@ -216,6 +276,7 @@ class Orchestrator:
         # We are (re-)entering execution ⇒ the run is in progress. Persist once
         # up front so the on-disk checkpoint matches what we are about to run.
         st["status"] = "in_progress"
+        st["run_state"] = "running"
         diagnostics.clear_current(st)
         self._safe_save(st)
         self._stop.clear()
@@ -282,6 +343,7 @@ class Orchestrator:
         # (A) Termination — the cursor has walked past the last phase.
         if p >= len(phases):
             st["status"] = "done"
+            st["run_state"] = "completed"
             diagnostics.clear_current(st)
             self._append_log(st, "done", note="all phases complete")
             self._safe_save(st)
@@ -390,6 +452,32 @@ class Orchestrator:
                 checkpoint_present=True,
             )
 
+        barrier = st.get("run_state")
+        if barrier in {
+            "suspended_scope_extension",
+            "suspended_authorization_revoked",
+            "blocked_outcome_unknown",
+        }:
+            if barrier != "blocked_outcome_unknown":
+                # Authorization failed before dispatch and is not a task retry.
+                attempts = max(0, attempts - 1)
+                state.set_task_status(
+                    st, p, t, "in_progress", attempts=attempts,
+                    last_error=(
+                        "scope_extension_required"
+                        if barrier == "suspended_scope_extension"
+                        else "authorization_revoked"
+                    ),
+                )
+            else:
+                state.set_task_status(
+                    st, p, t, "in_progress", attempts=attempts,
+                    last_error="outcome_unknown",
+                )
+            self._safe_save(st)
+            self._emit({"event": barrier, **authorization.pc_projection(st)})
+            return False
+
         # ``ERROR:`` is the agent's protected deterministic failure contract.
         # Recording it is observability-only; verification still runs exactly as
         # before, so this does not alter execution, retry or replan behavior.
@@ -487,7 +575,10 @@ class Orchestrator:
             # Try to recover by re-planning the remaining work, if budget allows.
             if replan_count < max_replans:
                 if self._replan(st):
-                    return True  # loop continues at the freshly-appended phase
+                    # Replanning always creates a new plan revision and review
+                    # request unless protected Full Access is already active.
+                    # In that isolated mode the new tail may continue directly.
+                    return st.get("run_state") == "ready"
             else:
                 self._record_failure(
                     st,
@@ -512,6 +603,7 @@ class Orchestrator:
                 )
             # Out of attempts AND out of replans (or replanning failed) ⇒ stop.
             st["status"] = "failed"
+            st["run_state"] = "failed"
             self._append_log(st, "failed", ref=task.get("id"),
                              note=(st.get("failure_diagnostic") or {}).get(
                                  "reason_code", "unknown_failure",
@@ -956,7 +1048,11 @@ class Orchestrator:
                 planning_kwargs["language"] = st.get("language")
             with self._artifact_scope(st, self._active_task):
                 new_phases = planner.plan_objective(
-                    remaining, self.agent, **planning_kwargs,
+                    remaining,
+                    self.agent,
+                    run_id=str(st.get("run_id") or ""),
+                    plan_revision=int(st.get("plan_revision", 0)) + 1,
+                    **planning_kwargs,
                 )
         except Exception:
             new_phases = None
@@ -993,10 +1089,21 @@ class Orchestrator:
         first_new = len(st.get("phases") or [])
         st.setdefault("phases", []).extend(new_phases)
         st["cursor"] = {"phase": first_new, "task": 0}
+        authorization.prepare_replan(
+            st,
+            origin_ref=str(st.get("authorization_origin_ref") or self._origin_ref),
+        )
         diagnostics.clear_current(st)
         self._append_log(st, "replan", ref=str(first_new),
                          note=f"appended {len(new_phases)} new phase(s)")
         self._safe_save(st)  # single atomic checkpoint
+        self._emit({
+            "event": (
+                "running" if st.get("run_state") == "ready"
+                else "autonomous_plan_ready"
+            ),
+            **authorization.pc_projection(st),
+        })
         return True
 
     # ── Thin black-box wrappers over the state/persistence layer ──────────────

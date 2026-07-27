@@ -51,6 +51,10 @@ def _one_task_state(*, attempts=0, max_attempts=3, max_replans=2):
         "max_attempts_per_task": max_attempts,
         "max_replans": max_replans,
     })
+    # Authorization is orthogonal to this diagnostic-focused test module.
+    st["run_state"] = "ready"
+    st["authorization_status"] = "authorized"
+    st["authorization_source"] = "task_scoped"
     return st
 
 
@@ -191,6 +195,9 @@ def test_invalid_resume_and_success_clear_only_current_diagnostic(monkeypatch):
 
     events = []
     invalid = state.new_task_state("", "fake_provider", "fake-model", [])
+    invalid["run_state"] = "ready"
+    invalid["authorization_status"] = "authorized"
+    invalid["cursor"] = {"phase": 0, "task": 1}
     Orchestrator(ScriptedAgent([]), progress_cb=events.append).resume(invalid)
     assert invalid["status"] == "failed"
     assert invalid["failure_diagnostic"]["error_category"] == "invalid_resume_state"

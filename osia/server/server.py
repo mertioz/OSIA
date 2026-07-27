@@ -3448,6 +3448,7 @@ def _server_notify_cron_task(
 # off the chat streaming path, the per-connection conn_agents and the
 # single-writer _OutboundChannel/_writer model.
 import osia.autonomous.state as _astate
+from osia.autonomous import authorization as _aauthorization
 from osia.autonomous import diagnostics as _adiagnostics
 from osia.autonomous import planner as _aplanner
 from osia.autonomous.orchestrator import Orchestrator as _Orchestrator
@@ -3488,6 +3489,7 @@ _autonomous: dict = {
                       # neither broadcast as the run outcome (R1) nor allowed to
                       # stop()/release a newer run (R2) — see
                       # _on_autonomous_progress and _autonomous_resume_worker.
+    "origin_ref": "",
 }
 # Guards `_autonomous` lifecycle mutations + the lockfile across the event-loop
 # thread and the orchestrator/worker daemon threads. Non-reentrant — the helpers
@@ -3505,14 +3507,30 @@ def _autonomous_snapshot(st) -> dict:
     main.py's ``_orch_snapshot`` but emits the mobile WS field names."""
     if not isinstance(st, dict):
         return {}
-    done, total, phase_name = _astate.count_progress(st)
+    done, total, _phase_name = _astate.count_progress(st)
     return {
         "tasks_done": done,
         "tasks_total": total,
-        "phase_name": phase_name,
-        "objective": st.get("objective", "") or "",
+        # Free-form objective/plan text may repeat a private basename, message
+        # body or secret even after path/URL redaction. Mobile needs the plan
+        # structure and safe capability summaries, not model-authored strings.
+        "phase_name": "",
+        "objective": "",
         "status": st.get("status", "") or "",
         "language": normalize_locale(st.get("language")) or i18n.DEFAULT_LANG,
+        "plan_summary": [
+            {
+                "name": f"Phase {phase_index + 1}",
+                "tasks": [
+                    f"Task {phase_index + 1}.{task_index + 1}"
+                    for task_index, task in enumerate(phase.get("tasks") or [])
+                    if isinstance(task, dict)
+                ],
+            }
+            for phase_index, phase in enumerate(st.get("phases") or [])
+            if isinstance(phase, dict)
+        ],
+        **_aauthorization.mobile_projection(st),
         **_adiagnostics.projection(st),
     }
 
@@ -3526,6 +3544,8 @@ def _autonomous_failure_state(*, stage, category, reason_code,
         "", provider, model, [], language=language,
     )
     st["status"] = "failed"
+    st["run_state"] = "failed"
+    st["authorization_status"] = "corrupt"
     diagnostic = _adiagnostics.make_diagnostic(
         st,
         stage=stage,
@@ -3797,7 +3817,8 @@ def _ensure_autonomous_engine():
 
 
 def _autonomous_start_worker(objective: str, model: str, my_gen: int,
-                             language: str) -> None:
+                             language: str,
+                             origin_ref: str = "mobile_legacy") -> None:
     """Plan + launch OFF the event loop (planning blocks on an LLM run). The
     single-runner slot (generation ``my_gen``) was already acquired by the
     handler. Mirrors main.py's ``handle_autonomous_start``: validate the exact
@@ -3911,6 +3932,7 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int,
                     objective, provider, model, agent,
                     failure_cb=planning_failures.append,
                     language=language,
+                    origin_ref=origin_ref,
                 )
             except Exception:
                 st = None
@@ -3975,6 +3997,12 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int,
                 checkpoint_present=False,
             )
             _adiagnostics.record_diagnostic(st, diagnostic)
+        if st.get("run_state") != "ready":
+            _broadcast_autonomous(_autonomous_frame({
+                "type": "autonomous_plan_ready",
+                "event": "authorization_pending",
+            }, st))
+            return
         orch.start(st)
         # Flip "planning" → "running" only AFTER start() spawned the loop. The
         # engine emits events only on task transitions, never on start, so this
@@ -4080,7 +4108,9 @@ def _clear_interrupting_after_orphan_drained(timeout: float = 120.0) -> None:
         _autonomous["interrupting"] = False
 
 
-def _autonomous_resume_worker(my_gen: int) -> None:
+def _autonomous_resume_worker(
+    my_gen: int, origin_ref: str = "mobile_legacy",
+) -> None:
     """Resume a PAUSED autonomous run OFF the event loop, converging BYTE-FOR-BYTE
     onto the PROVEN GUI resume flow (``main.py``: ``load_task_state()`` → exact
     provider/model validation → provider-aware ``set_model`` →
@@ -4177,6 +4207,38 @@ def _autonomous_resume_worker(my_gen: int) -> None:
                     _autonomous_frame({"event": "idle"}, failed_state)
                 )
             _release_single_runner_if_gen(my_gen)
+            return
+        _aauthorization.revalidate_loaded_authorization(
+            st, origin_ref=origin_ref,
+        )
+        _astate.save_task_state(st)
+        if st.get("run_state") in {
+            "authorization_pending",
+            "suspended_scope_extension",
+            "suspended_authorization_revoked",
+            "blocked_outcome_unknown",
+        }:
+            established = False
+            with _autonomous_lock:
+                if (
+                    _autonomous.get("active")
+                    and int(_autonomous.get("gen", 0)) == my_gen
+                ):
+                    _autonomous["st"] = st
+                    _write_autonomous_lock(st.get("task_id"))
+                    established = True
+            if established:
+                pending_review = st.get("run_state") == "authorization_pending"
+                _broadcast_autonomous(_autonomous_frame({
+                    "type": (
+                        "autonomous_plan_ready" if pending_review
+                        else "autonomous_authorization_state"
+                    ),
+                    "event": (
+                        "authorization_pending" if pending_review
+                        else st.get("run_state")
+                    ),
+                }, st))
             return
         status = st.get("status", "")
         if status == "in_progress" and not _astate.resume_state_is_valid(st):
@@ -4330,6 +4392,189 @@ def _autonomous_resume_worker(my_gen: int) -> None:
             _autonomous["interrupting"] = False
 
 
+def _autonomous_pc_snapshot(st: dict | None) -> dict:
+    """Local-PC projection for reviewing the server-owned mobile run."""
+
+    if not isinstance(st, dict):
+        return {}
+    checkpoint = _astate._checkpoint_projection(st)
+    pc = _aauthorization.pc_projection(st)
+    checkpoint.update(pc)
+    checkpoint["_runtime_pc_capability_details"] = dict(
+        pc.get("private_scope_details") or {}
+    )
+    checkpoint["_server_mobile_run"] = True
+    return checkpoint
+
+
+def _current_autonomous_state() -> dict | None:
+    """Return the in-memory run, recovering its persisted checkpoint if needed."""
+
+    st = _autonomous.get("st")
+    if isinstance(st, dict):
+        return st
+    try:
+        loaded = _astate.load_task_state()
+    except Exception:
+        loaded = None
+    if not isinstance(loaded, dict):
+        return None
+    _aauthorization.restore_planned_runtime_descriptors(loaded)
+    # A relay reconnect can recreate the canonical mobile checkpoint before the
+    # local PC endpoint observes the process-owned in-memory reference. Publish
+    # that same dict atomically; never replace a run established meanwhile.
+    with _autonomous_lock:
+        current = _autonomous.get("st")
+        if isinstance(current, dict):
+            return current
+        _autonomous["st"] = loaded
+        return loaded
+
+
+def _internal_autonomous_origin(st: dict) -> str:
+    request = st.get("authorization_request") or st.get(
+        "pending_scope_extension"
+    )
+    if not isinstance(request, dict):
+        return ""
+    # The loopback-only endpoint is the authenticated PC authority. Atomically
+    # transfer this still-pending request away from its mobile observer before
+    # validating the local decision; any stale mobile response then fails its
+    # origin binding.
+    request["origin_ref"] = "desktop"
+    return "desktop"
+
+
+@app.get("/internal/autonomous_authorization_state")
+async def internal_autonomous_authorization_state(request: Request):
+    """Expose the canonical mobile run only to the local PC review panel."""
+
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    return {
+        "ok": True,
+        "state": _autonomous_pc_snapshot(_current_autonomous_state()),
+    }
+
+
+@app.post("/internal/autonomous_authorization_action")
+async def internal_autonomous_authorization_action(request: Request):
+    """Apply one explicit local-PC decision to the canonical mobile run."""
+
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    action = str(body.get("action") or "") if isinstance(body, dict) else ""
+    if action not in {
+        "authorize", "scope_approve", "scope_deny", "revoke", "cancel",
+    }:
+        return {"ok": False, "error": "invalid_action"}
+    st = _current_autonomous_state()
+    if not isinstance(st, dict):
+        return {"ok": False, "error": "run_missing"}
+    try:
+        if action == "authorize":
+            origin_ref = _internal_autonomous_origin(st)
+            response = _aauthorization.response_for_current_request(
+                st, action="approve", origin_ref=origin_ref,
+            )
+            _aauthorization.authorize_and_start(
+                st, response, origin_ref=origin_ref,
+            )
+            _astate.save_task_state(st)
+            _agent, orch = _ensure_autonomous_engine()
+            orch.start(st)
+            event = "running"
+        elif action in {"scope_approve", "scope_deny"}:
+            origin_ref = _internal_autonomous_origin(st)
+            response_action = (
+                "approve_exact" if action == "scope_approve" else "deny"
+            )
+            response = _aauthorization.response_for_current_request(
+                st, action=response_action, origin_ref=origin_ref,
+            )
+            _aauthorization.approve_scope_extension(
+                st, response, origin_ref=origin_ref,
+            )
+            _astate.save_task_state(st)
+            if action == "scope_approve":
+                _agent, orch = _ensure_autonomous_engine()
+                orch.resume(st)
+                event = "running"
+            else:
+                event = "scope_extension_denied"
+        elif action == "revoke":
+            _aauthorization.revoke_run_authorization(
+                st, save=_astate.save_task_state,
+            )
+            orch = _autonomous.get("orch")
+            if orch is not None:
+                await asyncio.to_thread(orch.stop)
+            _astate.save_task_state(st)
+            event = "suspended_authorization_revoked"
+        else:
+            run_state = str(st.get("run_state") or "")
+            origin_ref = _internal_autonomous_origin(st)
+            pending_request = (
+                st.get("authorization_request")
+                if run_state == "authorization_pending"
+                else st.get("pending_scope_extension")
+            )
+            already_responded = bool(
+                isinstance(pending_request, dict)
+                and pending_request.get("responded") is True
+            )
+            if run_state == "authorization_pending" and not already_responded:
+                response = _aauthorization.response_for_current_request(
+                    st, action="cancel", origin_ref=origin_ref,
+                )
+                _aauthorization.authorize_and_start(
+                    st, response, origin_ref=origin_ref,
+                )
+            elif run_state == "suspended_scope_extension" and not already_responded:
+                response = _aauthorization.response_for_current_request(
+                    st, action="cancel", origin_ref=origin_ref,
+                )
+                _aauthorization.approve_scope_extension(
+                    st, response, origin_ref=origin_ref,
+                )
+            _aauthorization.revoke_run_authorization(
+                st, save=_astate.save_task_state,
+            )
+            st["status"] = "aborted"
+            st["run_state"] = "cancelled"
+            orch = _autonomous.get("orch")
+            if orch is not None:
+                await asyncio.to_thread(orch.stop)
+            _astate.clear_task_state()
+            _release_single_runner()
+            event = "aborted"
+    except _aauthorization.AuthorizationError as exc:
+        return {
+            "ok": False,
+            "error": exc.code,
+            "state": _autonomous_pc_snapshot(st),
+        }
+    except Exception:
+        return {
+            "ok": False,
+            "error": "authorization_internal_failure",
+            "state": _autonomous_pc_snapshot(st),
+        }
+    frame = _autonomous_frame({"event": event}, st)
+    _broadcast_autonomous(frame)
+    return {
+        "ok": True,
+        "event": event,
+        "state": _autonomous_pc_snapshot(st),
+    }
+
+
 @app.on_event("shutdown")
 async def _stop_autonomous_on_shutdown() -> None:
     """Server cleanup: stop the autonomous loop (safe if never started) and
@@ -4367,6 +4612,7 @@ async def _stop_autonomous_on_shutdown() -> None:
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     authenticated = False
+    authorization_origin_ref = "mobile_" + secrets.token_hex(16)
     # Single-writer funnel + its drain task. From here on, the receive loop,
     # streaming tasks and the heartbeat NEVER call ``ws.send_*`` directly —
     # they enqueue on ``out`` and ``writer_task`` does the real sends (so two
@@ -4914,6 +5160,13 @@ async def websocket_endpoint(ws: WebSocket):
                     # funnel and the historically delicate auth handshake stays
                     # byte-for-byte as before.
                     await ws.send_json({"type": "status", "content": "done"})
+                    await ws.send_json({
+                        "type": "autonomous_authorization_context",
+                        "protocol_version": (
+                            _aauthorization.AUTHORIZATION_PROTOCOL_VERSION
+                        ),
+                        "origin_ref": authorization_origin_ref,
+                    })
                     print("[WS] auth OK, sending: status/done")
                     try:
                         items = conversations.list_conversations()
@@ -5386,12 +5639,202 @@ async def websocket_endpoint(ws: WebSocket):
                 # Capture THIS event loop so the orchestrator's daemon thread can
                 # hop progress frames back onto each connection's writer.
                 _autonomous["loop"] = asyncio.get_running_loop()
+                _autonomous["origin_ref"] = authorization_origin_ref
                 # Plan + start OFF the event loop (planning blocks on an LLM run).
                 threading.Thread(
                     target=_autonomous_start_worker,
-                    args=(objective, model, _gen, autonomous_context.language),
+                    args=(
+                        objective, model, _gen, autonomous_context.language,
+                        authorization_origin_ref,
+                    ),
                     daemon=True,
                 ).start()
+                continue
+
+            if msg_type == "autonomous_authorization_response":
+                st = _autonomous.get("st")
+                if not isinstance(st, dict):
+                    await out.send_json({
+                        "type": "autonomous_authorization_state",
+                        "event": "rejected", "reason_code": "run_missing",
+                    })
+                    continue
+                response = {
+                    key: msg.get(key) for key in (
+                        "protocol_version", "request_id", "run_id",
+                        "plan_revision", "authorization_revision",
+                        "expected_policy_epoch", "origin_ref", "action",
+                    )
+                }
+                selected = msg.get("selected_capability_ids")
+                if not isinstance(selected, list) or any(
+                    not isinstance(item, str) for item in selected
+                ):
+                    selected = None
+                try:
+                    _aauthorization.authorize_and_start(
+                        st,
+                        response,
+                        selected_capability_ids=selected,
+                        origin_ref=authorization_origin_ref,
+                    )
+                    _astate.save_task_state(st)
+                    action = str(response.get("action") or "")
+                    if action == "approve" and st.get("run_state") == "ready":
+                        orch = _autonomous.get("orch")
+                        if orch is None:
+                            _ensure_autonomous_engine()
+                            orch = _autonomous.get("orch")
+                        orch.start(st)
+                        event = "running"
+                    elif action == "cancel":
+                        _aauthorization.revoke_run_authorization(st)
+                        st["status"] = "aborted"
+                        st["run_state"] = "cancelled"
+                        _astate.clear_task_state()
+                        _release_single_runner()
+                        event = "aborted"
+                    else:
+                        event = "authorization_denied"
+                except _aauthorization.AuthorizationError as exc:
+                    await out.send_json({
+                        "type": "autonomous_authorization_state",
+                        "event": "rejected", "reason_code": exc.code,
+                        **_autonomous_snapshot(st),
+                    })
+                    continue
+                except Exception:
+                    await out.send_json({
+                        "type": "autonomous_authorization_state",
+                        "event": "rejected",
+                        "reason_code": "authorization_internal_failure",
+                        **_autonomous_snapshot(st),
+                    })
+                    continue
+                _broadcast_autonomous(_autonomous_frame({
+                    "type": "autonomous_authorization_state",
+                    "event": event,
+                }, st))
+                continue
+
+            if msg_type == "autonomous_scope_extension_response":
+                st = _autonomous.get("st")
+                if not isinstance(st, dict):
+                    await out.send_json({
+                        "type": "autonomous_authorization_state",
+                        "event": "rejected", "reason_code": "run_missing",
+                    })
+                    continue
+                response = {
+                    key: msg.get(key) for key in (
+                        "protocol_version", "request_id", "run_id",
+                        "plan_revision", "authorization_revision",
+                        "expected_policy_epoch", "origin_ref", "action",
+                    )
+                }
+                try:
+                    _aauthorization.approve_scope_extension(
+                        st, response, origin_ref=authorization_origin_ref,
+                    )
+                    _astate.save_task_state(st)
+                    action = str(response.get("action") or "")
+                    if action == "approve_exact":
+                        orch = _autonomous.get("orch")
+                        if orch is None:
+                            _ensure_autonomous_engine()
+                            orch = _autonomous.get("orch")
+                        orch.resume(st)
+                        event = "running"
+                    elif action == "cancel":
+                        _aauthorization.revoke_run_authorization(st)
+                        st["status"] = "aborted"
+                        st["run_state"] = "cancelled"
+                        _astate.clear_task_state()
+                        _release_single_runner()
+                        event = "aborted"
+                    else:
+                        event = "scope_extension_denied"
+                except _aauthorization.AuthorizationError as exc:
+                    await out.send_json({
+                        "type": "autonomous_authorization_state",
+                        "event": "rejected", "reason_code": exc.code,
+                        **_autonomous_snapshot(st),
+                    })
+                    continue
+                except Exception:
+                    await out.send_json({
+                        "type": "autonomous_authorization_state",
+                        "event": "rejected",
+                        "reason_code": "scope_extension_internal_failure",
+                        **_autonomous_snapshot(st),
+                    })
+                    continue
+                _broadcast_autonomous(_autonomous_frame({
+                    "type": "autonomous_authorization_state",
+                    "event": event,
+                }, st))
+                continue
+
+            if msg_type == "autonomous_authorization_revoke":
+                st = _autonomous.get("st")
+                try:
+                    if not isinstance(st, dict):
+                        raise _aauthorization.AuthorizationError("run_missing")
+                    if msg.get("protocol_version") != (
+                        _aauthorization.AUTHORIZATION_PROTOCOL_VERSION
+                    ):
+                        raise _aauthorization.AuthorizationError(
+                            "wrong_protocol_version"
+                        )
+                    if msg.get("origin_ref") != authorization_origin_ref:
+                        raise _aauthorization.AuthorizationError("wrong_origin")
+                    if msg.get("run_id") != st.get("run_id"):
+                        raise _aauthorization.AuthorizationError("wrong_run_id")
+                    if msg.get("plan_revision") != st.get("plan_revision"):
+                        raise _aauthorization.AuthorizationError(
+                            "wrong_plan_revision"
+                        )
+                    if msg.get("authorization_revision") != st.get(
+                        "authorization_revision"
+                    ):
+                        raise _aauthorization.AuthorizationError(
+                            "wrong_authorization_revision"
+                        )
+                    from osia.action_policy import get_default_permission_policy
+
+                    current_epoch = (
+                        get_default_permission_policy().store.load_state().policy_epoch
+                    )
+                    if (
+                        msg.get("expected_policy_epoch") != current_epoch
+                        or st.get("policy_epoch") != current_epoch
+                    ):
+                        raise _aauthorization.AuthorizationError("wrong_policy_epoch")
+                    if st.get("run_state") in {"completed", "failed", "cancelled"}:
+                        raise _aauthorization.AuthorizationError("run_terminal")
+                    _aauthorization.revoke_run_authorization(st)
+                    orch = _autonomous.get("orch")
+                    if orch is not None:
+                        await asyncio.to_thread(orch.stop)
+                    _astate.save_task_state(st)
+                except _aauthorization.AuthorizationError as exc:
+                    await out.send_json({
+                        "type": "autonomous_authorization_state",
+                        "event": "rejected", "reason_code": exc.code,
+                        **_autonomous_snapshot(st),
+                    })
+                    continue
+                except Exception:
+                    await out.send_json({
+                        "type": "autonomous_authorization_state",
+                        "event": "rejected", "reason_code": "revocation_failure",
+                        **_autonomous_snapshot(st),
+                    })
+                    continue
+                _broadcast_autonomous(_autonomous_frame({
+                    "type": "autonomous_authorization_revoked",
+                    "event": "suspended_authorization_revoked",
+                }, st))
                 continue
 
             if msg_type == "autonomous_resume":
@@ -5407,11 +5850,12 @@ async def websocket_endpoint(ws: WebSocket):
                 # Capture THIS event loop so the orchestrator's daemon thread can
                 # hop progress frames back onto each connection's writer.
                 _autonomous["loop"] = asyncio.get_running_loop()
+                _autonomous["origin_ref"] = authorization_origin_ref
                 # Resume OFF the event loop (resume() spawns the loop thread and
                 # joins ≤2 s on its first checkpoint save — never block the loop).
                 threading.Thread(
                     target=_autonomous_resume_worker,
-                    args=(_gen,),
+                    args=(_gen, authorization_origin_ref),
                     daemon=True,
                 ).start()
                 continue
@@ -5501,6 +5945,15 @@ async def websocket_endpoint(ws: WebSocket):
                     st = _autonomous.get("st")
                     if isinstance(st, dict):
                         st["status"] = "aborted"
+                        st["run_state"] = "cancelled"
+                        try:
+                            _aauthorization.revoke_run_authorization(
+                                st, save=_astate.save_task_state,
+                            )
+                            st["status"] = "aborted"
+                            st["run_state"] = "cancelled"
+                        except Exception:
+                            pass
                         agent = _autonomous.get("agent")
                         provider_now, model_now = _adiagnostics.actual_provider_model(
                             agent, st.get("provider", ""), st.get("model", ""),
@@ -5558,7 +6011,13 @@ async def websocket_endpoint(ws: WebSocket):
                         st = None
                 if isinstance(st, dict):
                     status = st.get("status", "")
-                    if status == "in_progress":
+                    run_state = st.get("run_state", "")
+                    if run_state in {
+                        "authorization_pending", "suspended_scope_extension",
+                        "suspended_authorization_revoked", "blocked_outcome_unknown",
+                    }:
+                        ev = run_state
+                    elif status == "in_progress":
                         # A LIVE run keeps active=True; interrupt cleared it (the
                         # run is PAUSED but state stays in_progress ⇒ resumable),
                         # and a fresh process recovering st from disk has no
@@ -5573,7 +6032,20 @@ async def websocket_endpoint(ws: WebSocket):
                             "failed": "failed",
                             "aborted": "aborted",
                         }.get(status, "running")
-                    await out.send_json(_autonomous_frame({"event": ev}, st))
+                    frame_type = (
+                        "autonomous_plan_ready"
+                        if ev == "authorization_pending"
+                        else "autonomous_authorization_state"
+                        if ev in {
+                            "suspended_scope_extension",
+                            "suspended_authorization_revoked",
+                            "blocked_outcome_unknown",
+                        }
+                        else "autonomous_progress"
+                    )
+                    await out.send_json(_autonomous_frame({
+                        "type": frame_type, "event": ev,
+                    }, st))
                 else:
                     await out.send_json(_autonomous_frame({"event": "idle"}, None))
                 continue

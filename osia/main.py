@@ -113,6 +113,50 @@ _SERVER_MCP_OAUTH_CANCEL_URL = "http://127.0.0.1:8765/internal/mcp_oauth_cancel"
 # next Connect re-runs DCR + a fresh login, then rebroadcasts the reset.
 _SERVER_MCP_OAUTH_SWITCH_URL = "http://127.0.0.1:8765/internal/mcp_oauth_switch"
 _SERVER_CRON_NOTIFICATION_URL = "http://127.0.0.1:8765/internal/cron_notification"
+_SERVER_AUTONOMOUS_PC_STATE_URL = (
+    "http://127.0.0.1:8765/internal/autonomous_authorization_state"
+)
+_SERVER_AUTONOMOUS_PC_ACTION_URL = (
+    "http://127.0.0.1:8765/internal/autonomous_authorization_action"
+)
+
+
+def _load_server_autonomous_pc_state() -> dict | None:
+    """Fetch the server-owned mobile run for local PC review only."""
+
+    import json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            _SERVER_AUTONOMOUS_PC_STATE_URL, timeout=0.75,
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    state = payload.get("state") if isinstance(payload, dict) else None
+    return state if payload.get("ok") is True and isinstance(state, dict) else None
+
+
+def _send_server_autonomous_pc_action(action: str) -> dict | None:
+    """Send one explicit PC-panel action to the canonical server run."""
+
+    import json
+    import urllib.request
+
+    payload = json.dumps({"action": str(action or "")}).encode("utf-8")
+    try:
+        request = urllib.request.Request(
+            _SERVER_AUTONOMOUS_PC_ACTION_URL,
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=5.0) as response:
+            decoded = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    return decoded if isinstance(decoded, dict) else None
 
 
 def _notify_mobile_new_chat() -> None:
@@ -663,7 +707,11 @@ def wake_mode():
     from osia.heartbeat import HeartbeatMonitor
     # WOR-45 Phase 4 — wire the autonomous engine (consumed as black boxes).
     from osia.autonomous.orchestrator import Orchestrator
-    from osia.autonomous import diagnostics as autonomous_diagnostics, planner
+    from osia.autonomous import (
+        authorization as autonomous_authorization,
+        diagnostics as autonomous_diagnostics,
+        planner,
+    )
     from osia.autonomous.state import (
         clear_task_state,
         count_progress,
@@ -1518,7 +1566,27 @@ def wake_mode():
     # Mutable holder for the live task_state dict so the progress closure (run on
     # the orchestrator's daemon thread) and the abort/interrupt workers can read
     # the same reference the orchestrator mutates in place.
-    autonomous_state = {"st": None}
+    autonomous_state = {"st": None, "mobile_snapshot_key": ""}
+
+    def _is_server_mobile_state(st) -> bool:
+        return isinstance(st, dict) and st.get("_server_mobile_run") is True
+
+    def _apply_server_mobile_action(action: str) -> bool:
+        result = _send_server_autonomous_pc_action(action)
+        if not isinstance(result, dict):
+            return False
+        st = result.get("state")
+        if not isinstance(st, dict):
+            return False
+        autonomous_state["st"] = st
+        bridge.autonomous_progress.emit({
+            "event": result.get("event") or (
+                "authorization_error" if result.get("ok") is not True else ""
+            ),
+            "reason_code": result.get("error") or "",
+            **st,
+        })
+        return result.get("ok") is True
 
     def _orch_snapshot(st) -> dict:
         """Plain-dict snapshot (done/total tasks + current phase name) computed
@@ -1534,6 +1602,19 @@ def wake_mode():
             "objective": st.get("objective", "") or "",
             "status": st.get("status", "") or "",
             "language": normalize_locale(st.get("language")) or i18n.DEFAULT_LANG,
+            "plan_summary": [
+                {
+                    "name": str(phase.get("name") or ""),
+                    "tasks": [
+                        str(task.get("objective") or "")
+                        for task in phase.get("tasks") or []
+                        if isinstance(task, dict)
+                    ],
+                }
+                for phase in st.get("phases") or []
+                if isinstance(phase, dict)
+            ],
+            **autonomous_authorization.pc_projection(st),
             **autonomous_diagnostics.projection(st),
         }
 
@@ -1605,6 +1686,7 @@ def wake_mode():
                         objective, actual_provider, actual_model, autonomous_agent,
                         failure_cb=planning_failures.append,
                         language=autonomous_context.language,
+                        origin_ref="desktop",
                     )
                 except Exception:
                     st = None
@@ -1677,6 +1759,12 @@ def wake_mode():
                 )
                 return
             autonomous_state["st"] = st
+            if st.get("run_state") != "ready":
+                bridge.autonomous_progress.emit({
+                    "event": "autonomous_plan_ready",
+                    **_orch_snapshot(st),
+                })
+                return
             try:
                 orchestrator.start(st)
             except Exception:
@@ -1710,6 +1798,148 @@ def wake_mode():
             bridge.autonomous_progress.emit({"event": "running", **_orch_snapshot(st)})
 
         threading.Thread(target=_plan_and_run, daemon=True).start()
+
+    def _ensure_autonomous_agent_for_state(st: dict) -> bool:
+        provider = str(st.get("provider_id") or st.get("provider") or "")
+        model = str(st.get("model_id") or st.get("model") or "")
+        if not provider or not model:
+            return False
+        try:
+            apply_autonomous_agent_model(autonomous_agent, provider, model)
+        except Exception:
+            return False
+        actual_provider, actual_model = autonomous_diagnostics.actual_provider_model(
+            autonomous_agent, provider, model,
+        )
+        return actual_provider == provider and actual_model == model
+
+    def handle_autonomous_authorize():
+        def _authorize():
+            st = autonomous_state.get("st")
+            if not isinstance(st, dict):
+                return
+            if _is_server_mobile_state(st):
+                if not _apply_server_mobile_action("authorize"):
+                    bridge.autonomous_progress.emit({
+                        "event": "authorization_error",
+                        "reason_code": "server_authorization_failure",
+                        **st,
+                    })
+                return
+            try:
+                if not _ensure_autonomous_agent_for_state(st):
+                    raise autonomous_authorization.AuthorizationError(
+                        "model_identity_unavailable"
+                    )
+                response = autonomous_authorization.response_for_current_request(
+                    st, action="approve", origin_ref="desktop",
+                )
+                autonomous_authorization.authorize_and_start(
+                    st, response, origin_ref="desktop",
+                )
+                save_task_state(st)
+                orchestrator.start(st)
+            except autonomous_authorization.AuthorizationError as exc:
+                bridge.autonomous_progress.emit({
+                    "event": "authorization_error",
+                    "reason_code": exc.code,
+                    **_orch_snapshot(st),
+                })
+                return
+            except Exception:
+                bridge.autonomous_progress.emit({
+                    "event": "authorization_error",
+                    "reason_code": "authorization_start_failure",
+                    **_orch_snapshot(st),
+                })
+                return
+            bridge.autonomous_progress.emit({"event": "running", **_orch_snapshot(st)})
+
+        threading.Thread(target=_authorize, daemon=True).start()
+
+    def handle_autonomous_scope_extension(action: str):
+        def _respond():
+            st = autonomous_state.get("st")
+            if not isinstance(st, dict):
+                return
+            if _is_server_mobile_state(st):
+                mapped = {
+                    "approve_exact": "scope_approve",
+                    "deny": "scope_deny",
+                    "cancel": "cancel",
+                }.get(action)
+                if not mapped or not _apply_server_mobile_action(mapped):
+                    bridge.autonomous_progress.emit({
+                        "event": "authorization_error",
+                        "reason_code": "server_scope_extension_failure",
+                        **st,
+                    })
+                return
+            try:
+                if action == "approve_exact" and not _ensure_autonomous_agent_for_state(st):
+                    raise autonomous_authorization.AuthorizationError(
+                        "model_identity_unavailable"
+                    )
+                response = autonomous_authorization.response_for_current_request(
+                    st, action=action, origin_ref="desktop",
+                )
+                autonomous_authorization.approve_scope_extension(
+                    st, response, origin_ref="desktop",
+                )
+                save_task_state(st)
+                if action == "approve_exact":
+                    orchestrator.resume(st)
+                    event = "running"
+                else:
+                    event = "scope_extension_denied"
+            except autonomous_authorization.AuthorizationError as exc:
+                bridge.autonomous_progress.emit({
+                    "event": "authorization_error",
+                    "reason_code": exc.code,
+                    **_orch_snapshot(st),
+                })
+                return
+            except Exception:
+                bridge.autonomous_progress.emit({
+                    "event": "authorization_error",
+                    "reason_code": "scope_extension_failure",
+                    **_orch_snapshot(st),
+                })
+                return
+            bridge.autonomous_progress.emit({"event": event, **_orch_snapshot(st)})
+
+        threading.Thread(target=_respond, daemon=True).start()
+
+    def handle_autonomous_revoke():
+        def _revoke():
+            st = autonomous_state.get("st")
+            if not isinstance(st, dict):
+                return
+            if _is_server_mobile_state(st):
+                if not _apply_server_mobile_action("revoke"):
+                    bridge.autonomous_progress.emit({
+                        "event": "authorization_error",
+                        "reason_code": "server_revocation_failure",
+                        **st,
+                    })
+                return
+            try:
+                autonomous_authorization.revoke_run_authorization(st)
+                orchestrator.stop()
+                save_task_state(st)
+            except Exception:
+                bridge.autonomous_progress.emit({
+                    "event": "authorization_error",
+                    "reason_code": "revocation_failure",
+                    **_orch_snapshot(st),
+                })
+                return
+            bridge.autonomous_progress.emit({
+                "event": "autonomous_authorization_revoked",
+                **_orch_snapshot(st),
+            })
+
+        threading.Thread(target=_revoke, daemon=True).start()
 
     def handle_autonomous_interrupt():
         # Pause: stop() joins ≤2s, so run it off the GUI thread. The persisted
@@ -1766,8 +1996,23 @@ def wake_mode():
         # re-create it as "aborted", still not resumable).
         def _abort():
             st = autonomous_state.get("st")
+            if _is_server_mobile_state(st):
+                if not _apply_server_mobile_action("cancel"):
+                    bridge.autonomous_progress.emit({
+                        "event": "authorization_error",
+                        "reason_code": "server_cancel_failure",
+                        **st,
+                    })
+                return
             if isinstance(st, dict):
                 st["status"] = "aborted"
+                st["run_state"] = "cancelled"
+                try:
+                    autonomous_authorization.revoke_run_authorization(st)
+                    st["status"] = "aborted"
+                    st["run_state"] = "cancelled"
+                except Exception:
+                    pass
                 provider_now, model_now = autonomous_diagnostics.actual_provider_model(
                     autonomous_agent, st.get("provider", ""), st.get("model", ""),
                 )
@@ -1803,9 +2048,63 @@ def wake_mode():
 
         threading.Thread(target=_abort, daemon=True).start()
 
+    def _poll_server_mobile_authorization() -> bool:
+        """Mirror the canonical server run into the local PC panel."""
+
+        st = _load_server_autonomous_pc_state()
+        if not isinstance(st, dict) or not st.get("run_id"):
+            return False
+        current = autonomous_state.get("st")
+        same_mobile_run = (
+            _is_server_mobile_state(current)
+            and current.get("run_id") == st.get("run_id")
+        )
+        run_state = str(st.get("run_state") or "")
+        if run_state in {"completed", "failed", "cancelled"} and not same_mobile_run:
+            return False
+        key = "|".join((
+            str(st.get("run_id") or ""),
+            str(st.get("updated_at") or ""),
+            run_state,
+            str(st.get("plan_revision") or ""),
+            str(st.get("authorization_revision") or ""),
+            str((st.get("pending_scope_extension") or {}).get("request_id") or ""),
+            str((st.get("pending_scope_extension") or {}).get("responded") or ""),
+        ))
+        if key == autonomous_state.get("mobile_snapshot_key"):
+            return True
+        autonomous_state["mobile_snapshot_key"] = key
+        autonomous_state["st"] = st
+        event = {
+            "authorization_pending": "autonomous_plan_ready",
+            "ready": "running",
+            "running": "running",
+            "suspended_scope_extension": "suspended_scope_extension",
+            "suspended_authorization_revoked": "suspended_authorization_revoked",
+            "blocked_outcome_unknown": "blocked_outcome_unknown",
+            "completed": "done",
+            "failed": "failed",
+            "cancelled": "aborted",
+        }.get(run_state, run_state)
+        if not same_mobile_run:
+            popup.show_autonomous(st)
+        else:
+            popup.update_autonomous_progress({"event": event, **st})
+        return True
+
     popup.autonomous_start_requested.connect(handle_autonomous_start)
+    popup.autonomous_authorize_requested.connect(handle_autonomous_authorize)
+    popup.autonomous_scope_extension_response.connect(
+        handle_autonomous_scope_extension
+    )
+    popup.autonomous_revoke_requested.connect(handle_autonomous_revoke)
     popup.autonomous_interrupt_requested.connect(handle_autonomous_interrupt)
     popup.autonomous_abort_requested.connect(handle_autonomous_abort)
+
+    mobile_authorization_timer = QTimer()
+    mobile_authorization_timer.setInterval(1000)
+    mobile_authorization_timer.timeout.connect(_poll_server_mobile_authorization)
+    mobile_authorization_timer.start()
 
     # Honour the saved "Enable wake word" preference at launch: when off, the
     # detector exists but isn't started (OSIA stays reachable via the capsule /
@@ -1867,6 +2166,8 @@ def wake_mode():
     # QTimer.singleShot(0, ...) so it NEVER blocks GUI startup (the modal prompt
     # only appears after app.exec() has started the event loop).
     def _offer_resume_if_pending() -> None:
+        if _poll_server_mobile_authorization():
+            return
         try:
             from osia.autonomous.state import load_task_state, save_task_state
         except Exception:
@@ -1875,6 +2176,32 @@ def wake_mode():
         state = load_task_state()
         if not isinstance(state, dict) or state.get("status") != "in_progress":
             return  # no pending task — normal startup
+        try:
+            autonomous_authorization.revalidate_loaded_authorization(
+                state, origin_ref="desktop",
+            )
+            save_task_state(state)
+        except Exception:
+            state["run_state"] = "authorization_pending"
+            state["authorization_status"] = "corrupt"
+            state["grant_refs"] = []
+        if state.get("run_state") in {
+            "authorization_pending",
+            "suspended_scope_extension",
+            "suspended_authorization_revoked",
+            "blocked_outcome_unknown",
+        }:
+            autonomous_state["st"] = state
+            popup.show_autonomous(state)
+            bridge.autonomous_progress.emit({
+                "event": (
+                    "autonomous_plan_ready"
+                    if state.get("run_state") == "authorization_pending"
+                    else state.get("run_state")
+                ),
+                **_orch_snapshot(state),
+            })
+            return
         if not resume_state_is_valid(state):
             state["status"] = "failed"
             diagnostic = autonomous_diagnostics.make_diagnostic(

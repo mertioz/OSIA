@@ -79,7 +79,7 @@ def isolated(tmp_path, monkeypatch):
 
 
 def _workflow_state():
-    return state.new_task_state("document workflow", "test", "test-model", [
+    st = state.new_task_state("document workflow", "test", "test-model", [
         {
             "name": "documents",
             "tasks": [
@@ -96,6 +96,11 @@ def _workflow_state():
             ],
         },
     ])
+    # Authorization is covered separately; these tests isolate artifact flow.
+    st["run_state"] = "ready"
+    st["authorization_status"] = "authorized"
+    st["authorization_source"] = "task_scoped"
+    return st
 
 
 def test_task_to_task_verifier_tail_propagation_and_terminal_cleanup(isolated):
@@ -207,7 +212,7 @@ def test_retry_and_replan_retain_reference_without_payload_in_prompt(
     monkeypatch.setattr(
         planner,
         "plan_objective",
-        lambda objective, agent, failure_cb=None: (
+        lambda objective, agent, failure_cb=None, **_kwargs: (
             captured.append(objective)
             or [{"name": "replacement", "status": "pending", "tasks": []}]
         ),

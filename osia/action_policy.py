@@ -410,6 +410,15 @@ def _confirmation_with_permit(
     tool_name: str,
     kwargs: dict,
 ) -> str | None:
+    context = _CURRENT_EXECUTION_CONTEXT.get()
+    if (
+        context is not None
+        and context.execution_type == ExecutionType.AUTONOMOUS
+        and pending_execution_permit_matches(tool_name, kwargs)
+    ):
+        # A fresh exact grant/Full-Access permit already passed the central
+        # facade for this call.  Do not open a second ordinary dialog.
+        return None
     blocked = _confirm_irreversible(decision, tool_name, kwargs)
     if blocked is not None:
         return blocked
@@ -717,6 +726,61 @@ def system_mutation_barrier(
     return _system_mutation_barrier(str(tool_name or ""), arguments)
 
 
+def autonomous_permission_gate(
+    tool_name: str,
+    values: Mapping[str, Any],
+    *,
+    deletion_plan=None,
+) -> str | None:
+    """Evaluate every native Autonomous call through the central facade."""
+
+    context = _CURRENT_EXECUTION_CONTEXT.get()
+    if context is None or context.execution_type != ExecutionType.AUTONOMOUS:
+        return None
+    if tool_name.startswith("gmail_") or tool_name.startswith("mcp__"):
+        # Their wrappers own the same facade and consume permits at the actual
+        # remote dispatch boundary.
+        return None
+    if pending_execution_permit_matches(tool_name, values):
+        return None
+    policy = get_default_permission_policy()
+    try:
+        classification = TRUSTED_CLEAR_CLASSIFICATION
+        if deletion_plan is not None:
+            classification = trusted_deletion_classification(
+                system_destruction=bool(deletion_plan.system_destruction),
+                colossal_deletion=bool(deletion_plan.colossal_deletion),
+            )
+        request = build_permission_request(
+            tool_name,
+            values,
+            confirmation_domain="action",
+            origin_id="osia",
+            deletion_classification=classification,
+            policy=policy,
+        )
+        permission_decision = policy.evaluate(request)
+        if permission_decision.decision_type != DecisionType.ALLOW:
+            return permission_error_for_decision(permission_decision)
+        if permission_decision.authorization_source == AuthorizationSource.NONE:
+            return None
+        permit = policy.mint_permit(request, permission_decision)
+        if permit is None:
+            return "ERROR: execution permit unavailable; the action was not executed"
+        hold_execution_permit(permit, request, policy=policy)
+        return None
+    except Exception:
+        try:
+            from osia.autonomous.authorization import (
+                suspend_authorization_unavailable,
+            )
+
+            suspend_authorization_unavailable("authorization_unavailable")
+        except Exception:
+            pass
+        return "ERROR: autonomous authorization unavailable; the action was not executed"
+
+
 def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | None:
     """Return an ``ERROR:`` string when a recognized action must not execute.
 
@@ -756,6 +820,12 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
             )
             if final:
                 return barrier_error
+
+    autonomous_error = autonomous_permission_gate(
+        tool, values, deletion_plan=deletion_plan,
+    )
+    if autonomous_error is not None:
+        return autonomous_error
 
     if decision.action_class == ActionClass.DISALLOWED and tool not in _READ_ONLY_TOOLS:
         if not _explicit_central_authority(tool, values):
@@ -890,7 +960,7 @@ def _validate_constraint_mapping(
     if not isinstance(values, Mapping):
         raise ValueError("invalid_permission_constraints")
     allowed = (
-        {"allowed", "max_amount_minor", "currency"}
+        {"allowed", "max_amount_minor", "currency", "scope_only"}
         if grant else
         {
             "allowed", "max_amount_minor", "amount_minor", "currency",
@@ -902,6 +972,10 @@ def _validate_constraint_mapping(
         raise ValueError("unknown_permission_constraint")
     if "allowed" in normalized and not isinstance(normalized["allowed"], bool):
         raise ValueError("invalid_allowed_constraint")
+    if "scope_only" in normalized and not isinstance(
+        normalized["scope_only"], bool
+    ):
+        raise ValueError("invalid_scope_only_constraint")
     for name in ("max_amount_minor", "amount_minor"):
         if name in normalized and (
             type(normalized[name]) is not int or normalized[name] < 0
@@ -1715,7 +1789,7 @@ def _decision(
     grant_ref: str = "",
     epoch: int | None = None,
 ) -> PermissionDecision:
-    return PermissionDecision(
+    decision = PermissionDecision(
         decision_type=decision_type,
         reason_code=reason_code,
         authorization_source=source,
@@ -1726,6 +1800,15 @@ def _decision(
         execution_type=request.execution_context.execution_type,
         safe_category=request.safe_category,
     )
+    try:
+        from osia.autonomous.authorization import observe_permission_decision
+
+        observe_permission_decision(request, decision)
+    except Exception:
+        # Authorization observability can only narrow execution.  A checkpoint
+        # failure must not broaden this deterministic decision.
+        pass
+    return decision
 
 
 class PermissionPolicy:
@@ -1766,6 +1849,22 @@ class PermissionPolicy:
                 DecisionType.REQUIRE_COLOSSAL_DELETION_CONFIRMATION,
                 "colossal_deletion_reinforced_approval",
             )
+
+        try:
+            from osia.autonomous.authorization import request_block_reason
+
+            durable_block = request_block_reason(request)
+        except Exception:
+            # A broken Autonomous binding must fail closed, but this optional
+            # coordinator must never deny ordinary interactive chat.
+            durable_block = (
+                "authorization_state_unavailable"
+                if request.execution_context.execution_type
+                == ExecutionType.AUTONOMOUS
+                else None
+            )
+        if durable_block:
+            return _decision(request, DecisionType.DENY, durable_block)
 
         state = self.store.load_state()
         epoch = state.policy_epoch
@@ -1830,6 +1929,11 @@ class PermissionPolicy:
             ConfirmationPolicy.CONFIRMATION_REQUIRED,
             ConfirmationPolicy.FINAL_COMMIT_CONFIRMATION,
         }
+        if (
+            request.execution_context.execution_type == ExecutionType.AUTONOMOUS
+            and request.effective_contract.side_effect != SideEffectClass.READ_ONLY
+        ):
+            sensitive = True
         if not sensitive or (
             request.effective_contract.side_effect == SideEffectClass.READ_ONLY
             and request.effective_contract.confirmation
@@ -1932,12 +2036,14 @@ def _optional_constraints_allow(
     request_values = dict(request.optional_constraints)
     known = {
         "allowed", "max_amount_minor", "amount_minor", "currency",
-        "request_currency",
+        "request_currency", "scope_only",
     }
     if set(grant_values) - known or set(request_values) - known:
         return False
     for values in (grant_values, request_values):
         if "allowed" in values and not isinstance(values["allowed"], bool):
+            return False
+        if "scope_only" in values and not isinstance(values["scope_only"], bool):
             return False
     if grant_values.get("allowed") is False or request_values.get("allowed") is False:
         return False
@@ -2077,6 +2183,13 @@ def _request_scope(
         return normalize_exact_call_scope(
             call_hash, safe_category="local_command", grantable=False,
         ), False
+    if tool_name == "set_volume":
+        # A bounded volume level is a non-private, reversible local setting.
+        # Keep the extension bound to this exact normalized call so mobile
+        # approval cannot broaden into another setting or argument value.
+        return normalize_exact_call_scope(
+            call_hash, safe_category="safe_local_setting", grantable=True,
+        ), False
     return normalize_exact_call_scope(
         call_hash, safe_category="tool_operation", grantable=False,
     ), False
@@ -2170,6 +2283,14 @@ def build_permission_request(
         context = make_execution_context(store=active_policy.store)
     elif context.policy_epoch != active_policy.store.load_state().policy_epoch:
         # Preserve the supplied stale epoch: the evaluator must reject it.
+        pass
+    try:
+        from osia.autonomous.authorization import bind_request_execution_context
+
+        context = bind_request_execution_context(context, identity, call_hash)
+    except Exception:
+        # A malformed Autonomous binding fails closed at evaluation through the
+        # stale/missing run fields; ordinary chat remains unchanged.
         pass
     return PermissionRequest(
         tool_identity=identity,
@@ -2316,7 +2437,13 @@ def consume_pending_execution_permit(
             pending.request,
             normalized_call_hash=actual_hash,
         )
-        pending.policy.consume_permit(pending.permit, candidate)
+        consumed = pending.policy.consume_permit(pending.permit, candidate)
+        try:
+            from osia.autonomous.authorization import on_permit_consumed
+
+            on_permit_consumed(candidate, consumed)
+        except Exception:
+            pass
         return True
     except Exception:
         return False
@@ -2327,6 +2454,8 @@ def permission_error_for_decision(decision: PermissionDecision) -> str:
         return "ERROR: BLOCK_SYSTEM_DESTRUCTION"
     if decision.decision_type == DecisionType.REQUIRE_COLOSSAL_DELETION_CONFIRMATION:
         return "ERROR: REQUIRE_COLOSSAL_DELETION_CONFIRMATION"
+    if decision.decision_type == DecisionType.SUSPEND_SCOPE_EXTENSION:
+        return f"ERROR: SUSPEND_SCOPE_EXTENSION: {decision.reason_code}"
     return f"ERROR: permission denied: {decision.reason_code}"
 
 

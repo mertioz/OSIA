@@ -15,7 +15,7 @@ in-repo ``<repo>/config`` in dev/repo mode, else ``~/.osia`` on every OS — the
 exact same dir the GUI and the mobile server use. ``CONFIG_DIR`` is a ``str``,
 so we wrap it in ``Path`` here, mirroring ``osia/server/server.py``.
 
-Schema (``schema_version == 1``)::
+Schema (``schema_version == 2``)::
 
     {
       "schema_version": 1,
@@ -70,7 +70,33 @@ from osia.config import CONFIG_DIR as _CONFIG_DIR
 # ── Storage layout ─────────────────────────────────────────────────────────
 
 TASK_STATE_FILE = Path(_CONFIG_DIR) / "task_state.json"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# ``status`` remains the legacy engine lifecycle field so existing callers keep
+# their public contract.  ``run_state`` is the finer WOR-194 state machine used
+# for authorization and protocol decisions.
+RUN_STATES = frozenset({
+    "planning",
+    "authorization_pending",
+    "ready",
+    "running",
+    "suspended_scope_extension",
+    "suspended_authorization_revoked",
+    "blocked_outcome_unknown",
+    "completed",
+    "failed",
+    "cancelled",
+})
+AUTHORIZATION_STATUSES = frozenset({
+    "pending", "authorized", "scope_extension_required", "revoked",
+    "outcome_unknown", "not_required_full_access", "corrupt",
+})
+OPERATION_STATUSES = frozenset({
+    "prepared", "authorized", "dispatched", "success_verified",
+    "success_unverified", "cancelled_proven", "partial_effect_verified",
+    "outcome_unknown", "suspended_scope_extension",
+    "blocked_authorization", "failed_before_dispatch",
+})
 
 # Default budgets — bounded autonomy: at most N attempts per task and N replans
 # overall (the planner/orchestrator in later phases enforce these).
@@ -206,7 +232,8 @@ def _normalize_phase(phase) -> dict:
 # ── Constructors ───────────────────────────────────────────────────────────
 
 def new_task_state(objective: str, provider: str, model: str, phases, *,
-                   language: str | None = None) -> dict:
+                   language: str | None = None,
+                   run_id: str | None = None) -> dict:
     """Build a fresh ``task_state`` dict (NOT persisted — caller saves).
 
     ``phases`` is a loose list of phase specs (each a name string or a
@@ -220,12 +247,33 @@ def new_task_state(objective: str, provider: str, model: str, phases, *,
     result = {
         "schema_version": SCHEMA_VERSION,
         "task_id": uuid.uuid4().hex,
+        "run_id": str(run_id or uuid.uuid4().hex),
         "objective": safe_objective,
         "status": "in_progress",
         "created_at": now,
         "updated_at": now,
         "provider": provider or "",
         "model": model or "",
+        "provider_id": provider or "",
+        "model_id": model or "",
+        "plan_revision": 1,
+        "authorization_revision": 0,
+        "policy_epoch": 0,
+        "run_state": "planning",
+        "authorization_status": "pending",
+        "authorization_source": "none",
+        "grant_refs": [],
+        "capability_summary": [],
+        "authorization_request": None,
+        "pending_scope_extension": None,
+        "handled_authorization_requests": [],
+        "revocation": {
+            "revoked": False,
+            "revoked_at": None,
+            "reason_code": "",
+        },
+        "operation_records": [],
+        "ambiguity_barriers": [],
         "language": normalize_locale(language) or i18n.DEFAULT_LANG,
         "cursor": {"phase": 0, "task": 0},
         "budgets": {
@@ -245,6 +293,132 @@ def new_task_state(objective: str, provider: str, model: str, phases, *,
     return result
 
 
+def initialize_authorization_pending(
+    st: dict,
+    capability_summary,
+    *,
+    policy_epoch: int,
+    request: dict | None,
+) -> dict:
+    """Finish planning without granting authority or starting execution."""
+
+    if not isinstance(st, dict):
+        raise ValueError("invalid_autonomous_state")
+    st["schema_version"] = SCHEMA_VERSION
+    st["run_state"] = "authorization_pending"
+    st["authorization_status"] = "pending"
+    st["authorization_source"] = "none"
+    st["policy_epoch"] = max(0, int(policy_epoch))
+    st["grant_refs"] = []
+    st["capability_summary"] = [
+        dict(item) for item in (capability_summary or [])
+        if isinstance(item, dict)
+    ]
+    st["authorization_request"] = dict(request) if isinstance(request, dict) else None
+    st["pending_scope_extension"] = None
+    return st
+
+
+def operation_record(st: dict, operation_id: str) -> dict | None:
+    """Return one durable operation record by opaque id."""
+
+    for record in st.get("operation_records") or []:
+        if isinstance(record, dict) and record.get("operation_id") == operation_id:
+            return record
+    return None
+
+
+def equivalent_operation_record(
+    st: dict,
+    *,
+    tool_identity: str,
+    normalized_call_hash: str,
+    private_scope_hash: str,
+    statuses=None,
+) -> dict | None:
+    """Find a durable equivalent operation without relying on plan revision."""
+
+    allowed = set(statuses or OPERATION_STATUSES)
+    for record in st.get("operation_records") or []:
+        if not isinstance(record, dict) or record.get("status") not in allowed:
+            continue
+        if (
+            record.get("tool_identity") == tool_identity
+            and record.get("normalized_call_hash") == normalized_call_hash
+            and record.get("private_scope_hash") == private_scope_hash
+        ):
+            return record
+    return None
+
+
+def upsert_operation_record(st: dict, record: dict) -> dict:
+    """Insert/update one value-free operation record in the checkpoint."""
+
+    if not isinstance(record, dict):
+        raise ValueError("invalid_operation_record")
+    operation_id = str(record.get("operation_id") or "")
+    status = str(record.get("status") or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", operation_id):
+        raise ValueError("invalid_operation_id")
+    if status not in OPERATION_STATUSES:
+        raise ValueError("invalid_operation_status")
+    records = st.setdefault("operation_records", [])
+    existing = operation_record(st, operation_id)
+    if existing is None:
+        records.append(dict(record))
+    else:
+        existing.update(record)
+    # A bounded history is sufficient for one bounded plan and avoids an
+    # externally-corrupted state growing without limit.
+    if len(records) > 512:
+        del records[:-512]
+    return operation_record(st, operation_id) or dict(record)
+
+
+def equivalent_ambiguity_barrier(
+    st: dict,
+    *,
+    tool_identity: str,
+    normalized_call_hash: str,
+    private_scope_hash: str,
+) -> dict | None:
+    """Find a durable no-replay barrier for an equivalent private operation."""
+
+    for barrier in st.get("ambiguity_barriers") or []:
+        if not isinstance(barrier, dict):
+            continue
+        if (
+            barrier.get("tool_identity") == tool_identity
+            and barrier.get("normalized_call_hash") == normalized_call_hash
+            and barrier.get("private_scope_hash") == private_scope_hash
+        ):
+            return barrier
+    return None
+
+
+def add_ambiguity_barrier(st: dict, record: dict) -> dict:
+    """Persist one OUTCOME_UNKNOWN equivalence barrier idempotently."""
+
+    existing = equivalent_ambiguity_barrier(
+        st,
+        tool_identity=str(record.get("tool_identity") or ""),
+        normalized_call_hash=str(record.get("normalized_call_hash") or ""),
+        private_scope_hash=str(record.get("private_scope_hash") or ""),
+    )
+    if existing is not None:
+        return existing
+    barrier = {
+        "operation_id": str(record.get("operation_id") or ""),
+        "tool_identity": str(record.get("tool_identity") or ""),
+        "normalized_call_hash": str(record.get("normalized_call_hash") or ""),
+        "private_scope_hash": str(record.get("private_scope_hash") or ""),
+        "reason_code": "outcome_unknown",
+        "created_at": _now_iso(),
+    }
+    st.setdefault("ambiguity_barriers", []).append(barrier)
+    return barrier
+
+
 def new_failed_task_state(provider: str, model: str, diagnostic: dict, *,
                           language: str | None = None) -> dict:
     """Build a terminal, objective-free state for a failure before planning.
@@ -255,6 +429,8 @@ def new_failed_task_state(provider: str, model: str, diagnostic: dict, *,
     """
     st = new_task_state("", provider, model, [], language=language)
     st["status"] = "failed"
+    st["run_state"] = "failed"
+    st["authorization_status"] = "corrupt"
     clean = diagnostics.normalize_diagnostic(diagnostic) or {}
     refreshed = diagnostics.make_diagnostic(
         st,
@@ -339,6 +515,15 @@ def resume_state_is_valid(st) -> bool:
     """
     if not isinstance(st, dict) or st.get("status") != "in_progress":
         return False
+    if st.get("schema_version") != SCHEMA_VERSION:
+        return False
+    if st.get("run_state") not in {
+        "ready", "running", "suspended_scope_extension",
+        "suspended_authorization_revoked", "blocked_outcome_unknown",
+    }:
+        return False
+    if st.get("authorization_status") not in AUTHORIZATION_STATUSES:
+        return False
     phases = st.get("phases")
     cursor = st.get("cursor")
     if not isinstance(phases, list) or not phases or not isinstance(cursor, dict):
@@ -360,6 +545,123 @@ def resume_state_is_valid(st) -> bool:
     if p < len(phases) and t > len(phases[p]["tasks"]):
         return False
     return True
+
+
+def execution_state_is_valid(st) -> bool:
+    """Whether authorization fields are structurally safe for dispatch."""
+
+    if not isinstance(st, dict) or st.get("schema_version") != SCHEMA_VERSION:
+        return False
+    if st.get("run_state") not in RUN_STATES:
+        return False
+    if st.get("authorization_status") not in AUTHORIZATION_STATUSES:
+        return False
+    if not isinstance(st.get("run_id"), str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", st.get("run_id", "")
+    ):
+        return False
+    for name in ("plan_revision", "authorization_revision", "policy_epoch"):
+        if type(st.get(name)) is not int or st[name] < 0:
+            return False
+    refs = st.get("grant_refs")
+    if not isinstance(refs, list) or any(
+        not isinstance(ref, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", ref)
+        for ref in refs
+    ):
+        return False
+    if not isinstance(st.get("operation_records"), list):
+        return False
+    for record in st["operation_records"]:
+        if not isinstance(record, dict) or record.get("status") not in OPERATION_STATUSES:
+            return False
+        if not isinstance(record.get("operation_id"), str):
+            return False
+    return True
+
+
+def _migrate_loaded_state(loaded: dict) -> dict:
+    """Migrate old checkpoints without ever creating authority."""
+
+    version = loaded.get("schema_version", 1)
+    if type(version) is not int or version > SCHEMA_VERSION or version < 1:
+        # Unknown formats remain inspectable but can never execute or be
+        # converted into authority by a later authorization response.
+        loaded["schema_version"] = SCHEMA_VERSION
+        loaded["status"] = "failed"
+        loaded["run_state"] = "failed"
+        loaded["authorization_status"] = "corrupt"
+        loaded["authorization_source"] = "none"
+        loaded["grant_refs"] = []
+        loaded["authorization_request"] = None
+        loaded["pending_scope_extension"] = None
+        loaded["operation_records"] = []
+        loaded["ambiguity_barriers"] = []
+        return loaded
+
+    if version < SCHEMA_VERSION:
+        loaded["schema_version"] = SCHEMA_VERSION
+        loaded["run_id"] = str(
+            loaded.get("run_id") or loaded.get("task_id") or uuid.uuid4().hex
+        )
+        loaded["provider_id"] = str(loaded.get("provider") or "")
+        loaded["model_id"] = str(loaded.get("model") or "")
+        loaded["plan_revision"] = 1
+        loaded["authorization_revision"] = 0
+        loaded["policy_epoch"] = 0
+        loaded["grant_refs"] = []
+        loaded["capability_summary"] = []
+        loaded["authorization_request"] = None
+        loaded["pending_scope_extension"] = None
+        loaded["handled_authorization_requests"] = []
+        loaded["revocation"] = {
+            "revoked": False, "revoked_at": None, "reason_code": "",
+        }
+        loaded["operation_records"] = []
+        loaded["ambiguity_barriers"] = []
+        legacy_status = loaded.get("status")
+        loaded["run_state"] = {
+            "done": "completed",
+            "failed": "failed",
+            "aborted": "cancelled",
+        }.get(legacy_status, "authorization_pending")
+        loaded["authorization_status"] = (
+            "pending" if legacy_status == "in_progress" else "corrupt"
+        )
+        loaded["authorization_source"] = "none"
+        if legacy_status == "in_progress":
+            append_log(
+                loaded, "authorization_migration",
+                note="legacy_active_run_requires_authorization",
+            )
+        return loaded
+
+    defaults = {
+        "run_id": str(loaded.get("task_id") or uuid.uuid4().hex),
+        "provider_id": str(loaded.get("provider") or ""),
+        "model_id": str(loaded.get("model") or ""),
+        "plan_revision": 1,
+        "authorization_revision": 0,
+        "policy_epoch": 0,
+        "run_state": "authorization_pending",
+        "authorization_status": "corrupt",
+        "authorization_source": "none",
+        "grant_refs": [],
+        "capability_summary": [],
+        "authorization_request": None,
+        "pending_scope_extension": None,
+        "handled_authorization_requests": [],
+        "revocation": {"revoked": False, "revoked_at": None, "reason_code": ""},
+        "operation_records": [],
+        "ambiguity_barriers": [],
+    }
+    for key, value in defaults.items():
+        loaded.setdefault(key, value)
+    if not execution_state_is_valid(loaded):
+        loaded["run_state"] = "authorization_pending"
+        loaded["authorization_status"] = "corrupt"
+        loaded["grant_refs"] = []
+    return loaded
 
 
 # ── Projections (read-only — pure derived views, never mutate) ───────────────
@@ -413,6 +715,7 @@ def load_task_state() -> "dict | None":
         loaded = json.loads(TASK_STATE_FILE.read_text(encoding="utf-8"))
         if not isinstance(loaded, dict):
             return None
+        loaded = _migrate_loaded_state(loaded)
         current = diagnostics.normalize_diagnostic(
             loaded.get("failure_diagnostic")
         )
@@ -482,7 +785,9 @@ def save_task_state(state: dict) -> None:
         TASK_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         state["updated_at"] = _now_iso()
         _write_atomic(TASK_STATE_FILE, state)
-        if state.get("status") in {"done", "aborted"}:
+        if state.get("status") in {"done", "aborted"} or state.get(
+            "run_state"
+        ) in {"completed", "cancelled"}:
             document_artifacts.cleanup_state_artifacts(state)
             _write_atomic(TASK_STATE_FILE, state)
 

@@ -263,7 +263,22 @@ def _match_grant(
         return "wrong_run"
     if grant.scheduled_task_id != context.scheduled_task_id:
         return "wrong_scheduled_task"
-    if grant.task_revision != context.task_revision:
+    if grant.execution_type.value == "autonomous":
+        try:
+            issued_revision = int(grant.task_revision)
+            current_revision = int(context.task_revision)
+        except (TypeError, ValueError, OverflowError):
+            # Preserve legacy opaque revision matching.  WOR-194-generated
+            # Autonomous revisions are numeric; pre-existing callers may still
+            # use stable opaque labels and retain exact semantics.
+            if grant.task_revision != context.task_revision:
+                return "wrong_task_revision"
+        # Autonomous authorization revisions are cumulative: a scope approved
+        # in revision 1 remains part of revision 2 after an exact extension.
+        else:
+            if issued_revision < 1 or issued_revision > current_revision:
+                return "wrong_task_revision"
+    elif grant.task_revision != context.task_revision:
         return "wrong_task_revision"
     if grant.plan_revision != context.plan_revision:
         return "wrong_plan_revision"
@@ -275,7 +290,10 @@ def _match_grant(
         return "wrong_effect_class"
     if not sensitive_hash_equal(grant.scope_hash, request.scope_hash):
         return "changed_scope"
-    if not sensitive_hash_equal(grant.call_hash, request.normalized_call_hash):
+    if (
+        not grant.constraints.get("scope_only", False)
+        and not sensitive_hash_equal(grant.call_hash, request.normalized_call_hash)
+    ):
         return "changed_arguments"
     if grant.expires_at is not None and grant.expires_at <= now:
         return "expired_grant"
@@ -536,6 +554,40 @@ class PermissionStore:
         )
         return state.grants + session
 
+    def autonomous_grant_refs_available(
+        self,
+        grant_refs,
+        *,
+        run_id: str,
+        plan_revision: int,
+        now: float,
+    ) -> bool:
+        """Validate checkpoint refs without exposing protected grant content."""
+
+        refs = tuple(str(ref or "") for ref in (grant_refs or ()))
+        if not refs:
+            return True
+        with self._lock:
+            permission_state = self.load_state()
+            by_id = {
+                grant.grant_id: grant
+                for grant in self._all_grants_locked(permission_state)
+            }
+            for grant_ref in refs:
+                grant = by_id.get(grant_ref)
+                if (
+                    grant is None
+                    or not grant.integrity_is_valid()
+                    or grant.execution_type.value != "autonomous"
+                    or grant.run_id != str(run_id or "")
+                    or grant.plan_revision != str(int(plan_revision))
+                    or grant.revocation_epoch != permission_state.policy_epoch
+                    or (grant.expires_at is not None and grant.expires_at <= now)
+                    or grant.exhausted
+                ):
+                    return False
+            return True
+
     def find_matching_grant(
         self,
         request: PermissionRequest,
@@ -699,6 +751,46 @@ class PermissionStore:
             )
         self._notify_epoch(epoch)
         return RevocationResult(True, epoch, "all_grants")
+
+    def revoke_run_grants(self, run_id: str) -> RevocationResult:
+        """Revoke only grants bound to one exact Autonomous run."""
+
+        run_ref = str(run_id or "")
+        if not run_ref:
+            raise ValueError("invalid_run_id")
+        with self._lock, self._cross_process_mutation_lock():
+            state = self.load_state()
+            persistent = tuple(
+                grant for grant in state.grants if grant.run_id != run_ref
+            )
+            session = {
+                key: grant for key, grant in self._session_grants.items()
+                if grant.run_id != run_ref
+            }
+            changed = (
+                len(persistent) != len(state.grants)
+                or len(session) != len(self._session_grants)
+            )
+            if not changed:
+                return RevocationResult(
+                    False, state.policy_epoch, "autonomous_run", run_ref,
+                )
+            _new_state, epoch = self._advance_epoch_locked(
+                state,
+                keep_persistent=persistent,
+                keep_session=session,
+                mode=(
+                    PermissionMode.ASK
+                    if (
+                        state.permission_mode == PermissionMode.TASK_SCOPED
+                        and not persistent
+                        and not session
+                    )
+                    else state.permission_mode
+                ),
+            )
+        self._notify_epoch(epoch)
+        return RevocationResult(True, epoch, "autonomous_run", run_ref)
 
     def revoke_full_access(self) -> RevocationResult:
         with self._lock, self._cross_process_mutation_lock():

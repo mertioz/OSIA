@@ -166,7 +166,11 @@ def two_phase_plan():
              "attempts": 0, "distilled_summary": "", "last_error": None},
         ]},
     ]
-    return state.new_task_state("overall goal", "anthropic", "claude-opus-4-8", phases)
+    return _authorized_test_state(
+        state.new_task_state(
+            "overall goal", "anthropic", "claude-opus-4-8", phases,
+        )
+    )
 
 
 def one_task_plan(criterion="the work is visibly complete"):
@@ -177,7 +181,19 @@ def one_task_plan(criterion="the work is visibly complete"):
              "attempts": 0, "distilled_summary": "", "last_error": None},
         ]},
     ]
-    return state.new_task_state("overall goal", "anthropic", "claude-opus-4-8", phases)
+    return _authorized_test_state(
+        state.new_task_state(
+            "overall goal", "anthropic", "claude-opus-4-8", phases,
+        )
+    )
+
+
+def _authorized_test_state(st):
+    """Model a completed review; authorization itself has focused tests."""
+    st["run_state"] = "ready"
+    st["authorization_status"] = "authorized"
+    st["authorization_source"] = "task_scoped"
+    return st
 
 
 # ── Tests ────────────────────────────────────────────────────────────────────
@@ -225,6 +241,11 @@ def test_fail_then_replan_success():
     with SaveCounter() as saves:
         orch.start(st)
         run_to_completion(orch, "replan")
+        check("replan stops for fresh authorization review",
+              st["run_state"] == "authorization_pending")
+        _authorized_test_state(st)
+        orch.start(st)
+        run_to_completion(orch, "authorized replan")
     check("overall status done (objective met via replan)", st["status"] == "done")
     a = st["phases"][0]["tasks"][0]
     check("failed task capped at max_attempts (2)", a["attempts"] == 2)
@@ -254,6 +275,11 @@ def test_exhaust_replans_failed():
     with SaveCounter() as saves:
         orch.start(st)
         run_to_completion(orch, "exhaust")
+        check("replan stops for fresh authorization review",
+              st["run_state"] == "authorization_pending")
+        _authorized_test_state(st)
+        orch.start(st)
+        run_to_completion(orch, "authorized exhaust")
     check("overall status failed", st["status"] == "failed")
     check("replan_count capped at max_replans (1)",
           st["budgets"]["replan_count"] == 1)

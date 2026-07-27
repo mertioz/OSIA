@@ -41,6 +41,8 @@ Design notes
 
 import json
 import re
+import uuid
+from contextlib import nullcontext
 from typing import NamedTuple
 
 from osia.autonomous import diagnostics, state
@@ -307,7 +309,10 @@ def _provider_failure(exc: Exception) -> PlanFailure:
     return PlanFailure(reason, status, category)
 
 
-def _attempt(agent, message, max_phases, max_tasks_per_phase, turn_context=None):
+def _attempt(
+    agent, message, max_phases, max_tasks_per_phase, turn_context=None,
+    permission_context=None,
+):
     """Run ONE planning message through the agent and parse/validate the reply.
 
     Returns an internal :class:`_AttemptOutcome` that distinguishes provider,
@@ -315,15 +320,22 @@ def _attempt(agent, message, max_phases, max_tasks_per_phase, turn_context=None)
     The public API still returns only validated phases or ``None``.
     """
     try:
-        if turn_context is not None and hasattr(agent, "set_turn_context"):
-            agent.set_turn_context(turn_context)
-            raw = agent.run(
-                message,
-                turn_context=turn_context,
-                canonical_output=False,
-            )
+        if permission_context is not None:
+            from osia.action_policy import execution_context_scope
+
+            permission_scope = execution_context_scope(permission_context)
         else:
-            raw = agent.run(message)
+            permission_scope = nullcontext()
+        with permission_scope:
+            if turn_context is not None and hasattr(agent, "set_turn_context"):
+                agent.set_turn_context(turn_context)
+                raw = agent.run(
+                    message,
+                    turn_context=turn_context,
+                    canonical_output=False,
+                )
+            else:
+                raw = agent.run(message)
     except Exception as exc:
         return _AttemptOutcome(None, _provider_failure(exc))
 
@@ -358,7 +370,9 @@ def plan_objective(objective: str, agent, *,
                    max_phases: int = DEFAULT_MAX_PHASES,
                    max_tasks_per_phase: int = DEFAULT_MAX_TASKS_PER_PHASE,
                    failure_cb=None,
-                   language: str | None = None):
+                   language: str | None = None,
+                   run_id: str | None = None,
+                   plan_revision: int = 1):
     """Decompose ``objective`` into a validated, normalized ``phases`` list.
 
     ``agent`` is a ready :class:`osia.agent.OSIAAgent` (already model-set by the
@@ -389,6 +403,15 @@ def plan_objective(objective: str, agent, *,
         target_language,
         source="autonomous_state",
     )
+    from osia.action_policy import ExecutionType, make_execution_context
+
+    permission_context = make_execution_context(
+        execution_type=ExecutionType.AUTONOMOUS,
+        interactive=False,
+        run_id=str(run_id or uuid.uuid4().hex),
+        plan_revision=str(max(1, int(plan_revision))),
+        task_revision="0",
+    )
     prompt = _build_planning_prompt(
         objective, max_phases, max_tasks_per_phase, target_language,
     )
@@ -402,6 +425,7 @@ def plan_objective(objective: str, agent, *,
         return None
     outcome = _attempt(
         agent, prompt, max_phases, max_tasks_per_phase, turn_context,
+        permission_context,
     )
     if outcome.phases is not None:
         return outcome.phases
@@ -419,6 +443,7 @@ def plan_objective(objective: str, agent, *,
         max_phases,
         max_tasks_per_phase,
         turn_context,
+        permission_context,
     )
     if outcome.phases is not None:
         return outcome.phases
@@ -430,7 +455,10 @@ def create_plan_state(objective: str, provider: str, model: str, agent, *,
                       max_phases: int = DEFAULT_MAX_PHASES,
                       max_tasks_per_phase: int = DEFAULT_MAX_TASKS_PER_PHASE,
                       failure_cb=None,
-                      language: str | None = None):
+                      language: str | None = None,
+                      run_id: str | None = None,
+                      origin_ref: str = "desktop",
+                      permission_policy=None):
     """Plan ``objective`` and build a fresh (UNSAVED) ``task_state`` dict.
 
     Thin convenience over :func:`plan_objective` +
@@ -443,11 +471,19 @@ def create_plan_state(objective: str, provider: str, model: str, agent, *,
         objective,
         saved_language=i18n.DEFAULT_LANG,
     ).language
+    stable_run_id = str(run_id or uuid.uuid4().hex)
     phases = plan_objective(objective, agent, max_phases=max_phases,
                             max_tasks_per_phase=max_tasks_per_phase,
-                            failure_cb=failure_cb, language=target_language)
+                            failure_cb=failure_cb, language=target_language,
+                            run_id=stable_run_id, plan_revision=1)
     if phases is None:
         return None
-    return state.new_task_state(
+    planned = state.new_task_state(
         objective, provider, model, phases, language=target_language,
+        run_id=stable_run_id,
+    )
+    from osia.autonomous import authorization
+
+    return authorization.prepare_planned_state(
+        planned, origin_ref=origin_ref, policy=permission_policy,
     )
