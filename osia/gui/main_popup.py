@@ -2814,6 +2814,7 @@ class _SettingsPanel(QWidget):
     chatgpt_status_changed = pyqtSignal(dict)
     local_models_refresh_requested = pyqtSignal()
     getting_started_requested = pyqtSignal()
+    permissions_changed = pyqtSignal(dict)
     _shutdown_finished = pyqtSignal(bool)
 
     # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
@@ -3001,6 +3002,7 @@ class _SettingsPanel(QWidget):
         sec_capsule   = self._build_capsule_section()       # Capsule + autostart
         sec_restart   = self._build_restart_section()       # Controlled relaunch
         sec_guide     = self._build_getting_started_section()
+        sec_permissions = self._build_permissions_section()
         sec_ai_prov   = self._build_ai_providers_section()  # Section 1
         sec_voice     = self._build_voice_section()         # Section 2 (TTS)
         sec_wake      = self._build_wake_section()           # Wake-word greeting
@@ -3026,6 +3028,7 @@ class _SettingsPanel(QWidget):
         # warrants top-level discoverability.
         self._settings_pages = [
             ("settings.cat.general",  [sec_language, sec_theme, sec_capsule, sec_restart, sec_guide]),
+            ("settings.cat.permissions", [sec_permissions]),
             ("settings.cat.models",   [sec_ai_prov, sec_hierarchy, sec_apikeys]),
             ("settings.cat.voice",    [sec_voice, sec_stt, sec_liveapi]),
             ("settings.cat.wake",     [sec_wake]),
@@ -3537,6 +3540,38 @@ class _SettingsPanel(QWidget):
         layout.addWidget(self._guide_desc)
         layout.addWidget(self._guide_btn)
         return wrap
+
+    def _build_permissions_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+        self._permissions_title = QLabel(i18n.t("permissions.settings_title"))
+        self._permissions_title.setObjectName("sectionTitle")
+        self._permissions_title.setWordWrap(True)
+        self._permissions_sub = QLabel(i18n.t("permissions.settings_sub"))
+        self._permissions_sub.setObjectName("sectionSub")
+        self._permissions_sub.setWordWrap(True)
+        self._permissions_desc = QLabel(i18n.t("permissions.settings_desc"))
+        self._permissions_desc.setObjectName("sectionDesc")
+        self._permissions_desc.setWordWrap(True)
+        from osia.gui.permissions_center import PermissionsPage
+
+        self._permissions_page = PermissionsPage(self)
+        self._permissions_page.state_changed.connect(self._on_permissions_changed)
+        layout.addWidget(self._permissions_title)
+        layout.addWidget(self._permissions_sub)
+        layout.addWidget(self._permissions_desc)
+        layout.addWidget(self._permissions_page)
+        return wrap
+
+    def _refresh_permissions_summary(self, *_args) -> None:
+        self._permissions_page.refresh()
+
+    def _on_permissions_changed(self, snapshot: dict) -> None:
+        self._refresh_permissions_summary()
+        self.permissions_changed.emit(snapshot)
 
     def _build_startup_section(self) -> QFrame:
         wrap = QFrame()
@@ -8478,6 +8513,11 @@ class _SettingsPanel(QWidget):
         self._guide_desc.setText(i18n.t("settings.getting_started_desc"))
         self._guide_btn.setText(i18n.t("settings.getting_started_button"))
         self._guide_btn.setAccessibleName(self._guide_btn.text())
+        self._permissions_title.setText(i18n.t("permissions.settings_title"))
+        self._permissions_sub.setText(i18n.t("permissions.settings_sub"))
+        self._permissions_desc.setText(i18n.t("permissions.settings_desc"))
+        self._permissions_page.retranslate()
+        self._refresh_permissions_summary()
 
         self._ai_title.setText(i18n.t("settings.ai_providers"))
         self._ai_sub.setText(i18n.t("settings.ai_providers_sub"))
@@ -8769,6 +8809,7 @@ class _SettingsPanel(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._refresh_permissions_summary()
         self._schedule_state_refresh_if_stale()
         # Lazy, asynchronous account discovery: constructing OSIA never starts
         # Codex, and opening Settings remains responsive when it is unavailable.
@@ -10128,6 +10169,7 @@ class MainPopup(QWidget):
     autonomous_interrupt_requested = pyqtSignal()
     autonomous_abort_requested = pyqtSignal()
     _ollama_models_ready = pyqtSignal(list)
+    _permission_epoch_changed = pyqtSignal(int)
 
     # Index of the chat page in the QStackedWidget.
     PAGE_CHAT = 0
@@ -10254,8 +10296,15 @@ class MainPopup(QWidget):
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.clicked.connect(self._hide_animated)
 
+        self._full_access_indicator = QLabel()
+        self._full_access_indicator.setObjectName("fullAccessIndicator")
+        self._full_access_indicator.hide()
+
         header.addWidget(logo)
         header.addStretch()
+        header.addWidget(
+            self._full_access_indicator, 0, Qt.AlignmentFlag.AlignVCenter,
+        )
         header.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         outer.addLayout(header)
 
@@ -10324,6 +10373,25 @@ class MainPopup(QWidget):
         self._settings.getting_started_requested.connect(
             lambda: self.show_onboarding(automatic=False)
         )
+        self._settings.permissions_changed.connect(
+            self._refresh_full_access_indicator
+        )
+        self._permission_epoch_changed.connect(
+            self._on_permission_epoch_changed
+        )
+        try:
+            from osia.action_policy import get_default_permission_policy
+
+            self._permission_epoch_listener = self._permission_epoch_changed.emit
+            permission_store = get_default_permission_policy().store
+            permission_store.add_epoch_listener(self._permission_epoch_listener)
+            self.destroyed.connect(
+                lambda: permission_store.remove_epoch_listener(
+                    self._permission_epoch_listener
+                )
+            )
+        except Exception:
+            self._permission_epoch_listener = None
         self._update_controller.state_changed.connect(self._update_banner.apply_state)
         self._update_banner.view_requested.connect(self._show_update_details)
         self._update_banner.install_requested.connect(
@@ -10408,6 +10476,7 @@ class MainPopup(QWidget):
 
         self._theme.theme_changed.connect(self._on_theme_changed)
         self._apply_style()
+        self._refresh_full_access_indicator()
         self._stack.setCurrentIndex(self.PAGE_CHAT)
         QTimer.singleShot(0, self._request_local_models_refresh)
 
@@ -10415,6 +10484,27 @@ class MainPopup(QWidget):
 
     def _show_update_details(self) -> None:
         self.show_settings_category("settings.cat.updates")
+
+    def _refresh_full_access_indicator(self, *_args) -> None:
+        try:
+            from osia.action_policy import permission_center_snapshot
+
+            snapshot = permission_center_snapshot()
+            if snapshot["full_access_enabled"]:
+                self._full_access_indicator.setText(
+                    i18n.t("permissions.full_with_limits")
+                    if snapshot["full_access_with_limits"]
+                    else "FULL ACCESS"
+                )
+                self._full_access_indicator.show()
+            else:
+                self._full_access_indicator.hide()
+        except Exception:
+            self._full_access_indicator.hide()
+
+    def _on_permission_epoch_changed(self, _epoch: int) -> None:
+        self._refresh_full_access_indicator()
+        self._settings._refresh_permissions_summary()
 
     def show_settings_category(
         self, category_key: str, *, select_chatgpt: bool = False,
@@ -10563,6 +10653,7 @@ class MainPopup(QWidget):
     def _show_animated(self) -> None:
         self._window_opacity_anim.stop()
         self._hiding = False
+        self._refresh_full_access_indicator()
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.anchor_below_island()
         if reduced_motion_requested(self):
@@ -10989,6 +11080,15 @@ class MainPopup(QWidget):
             QLabel#themeDot {
                 background: #c4b5f5;
                 border-radius: 4px;
+            }
+            QLabel#fullAccessIndicator {
+                background: rgba(196, 181, 245, 0.18);
+                border: 1px solid rgba(196, 181, 245, 0.45);
+                color: #c4b5f5;
+                border-radius: 5px;
+                padding: 4px 7px;
+                font-size: 10px;
+                font-weight: 700;
             }
             QFrame#updateBanner {
                 background: rgba(196, 181, 245, 0.12);
@@ -11418,6 +11518,34 @@ class MainPopup(QWidget):
                 font-size: 11px;
                 color: #8a8798;
                 line-height: 1.35;
+            }
+            QTableWidget#permissionsTable {
+                background: rgba(19, 17, 26, 0.62);
+                alternate-background-color: rgba(196, 181, 245, 0.04);
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                border-radius: 10px;
+                color: #e8e6f0;
+                gridline-color: rgba(196, 181, 245, 0.10);
+                selection-background-color: rgba(196, 181, 245, 0.22);
+            }
+            QTableWidget#permissionsTable QHeaderView::section,
+            QTableWidget#permissionsTable QTableCornerButton::section {
+                background: rgba(196, 181, 245, 0.10);
+                border: none;
+                border-right: 1px solid rgba(196, 181, 245, 0.10);
+                border-bottom: 1px solid rgba(196, 181, 245, 0.12);
+                color: #e8e6f0;
+                padding: 5px;
+            }
+            QSpinBox#permissionsAmount {
+                background: #13111a;
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                border-radius: 10px;
+                color: #e8e6f0;
+                padding: 6px 10px;
+            }
+            QSpinBox#permissionsAmount:focus {
+                border: 1px solid rgba(196, 181, 245, 0.55);
             }
             QLabel#fieldLabel {
                 font-size: 12px;

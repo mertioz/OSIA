@@ -10,16 +10,20 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
+import secrets
 import stat
 import sys
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from osia.action_policy import (
+    AUTOMATIC_PERMISSION_CATEGORIES,
     POLICY_VERSION,
     Grant,
     PermissionMode,
@@ -27,10 +31,249 @@ from osia.action_policy import (
     PermissionState,
 )
 from osia.scope_normalization import (
+    ScopeNormalizationError,
+    WebScopeKind,
     canonical_hash,
     canonical_serialize,
+    normalize_web_scope,
     sensitive_hash_equal,
 )
+
+
+_JOURNAL_SCHEMA_VERSION = 1
+_JOURNAL_MAX_EVENTS = 200
+_JOURNAL_EVENT_CODES = {
+    "full_access_enabled", "full_access_disabled", "activation_failed",
+    "grant_created", "grant_expired", "grant_revoked",
+    "policy_epoch_changed", "optional_constraint_changed",
+    "universal_barrier_blocked", "authorization_required",
+    "delegated_authority_revoked",
+    "automatic_permission_changed",
+}
+_LOCAL_AUTH_METHODS = {
+    "windows_hello", "unavailable", "deterministic_test", "legacy_local_api",
+}
+_SAFE_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SAFE_EXECUTION_TYPES = {"", "chat", "autonomous", "scheduled"}
+_SAFE_AUTHORIZATION_SOURCES = {
+    "", "none", "confirmation", "grant", "full_access",
+}
+_SAFE_CATEGORIES = {
+    "unknown", "local_path", "local_paths", "directory_tree",
+    "local_command", "safe_local_setting", "tool_operation",
+    "connector_operation", "web_origin", "web_url", "purchase",
+}
+_SAFE_TOOL_CATEGORIES = {
+    "unknown", "gmail", "mcp", "shell", "filesystem", "browser", "native",
+}
+_SAFE_JOURNAL_RESULTS = {
+    "unknown", "enabled", "disabled", "updated", "created",
+    "mode_changed", "full_access_enabled", "full_access_disabled",
+    "constraint_changed", "one_grant", "all_grants", "grant_revoked",
+    "grants_revoked", "permits_invalidated", "autonomous_run",
+    "scheduled_task", "all_authority", "authority_revoked",
+    "system_destruction", "colossal_deletion_review",
+    "optional_constraint_failed", "acknowledgement_required",
+    "second_confirmation_required", "secure_storage_unavailable",
+    "store_corrupt", "protected_store_write_failed", "reauth_denied",
+    "reauth_cancelled", "reauth_error", "ask_sensitive_action",
+    "scope_extension_required", "unattended_sensitive_action",
+    "duplicate_outcome_unknown", "duplicate_success_verified",
+    "authorization_revoked", "outcome_unknown_blocked",
+    "authorization_pending", "authorization_required",
+    "authorization_expired", "authorization_edited",
+    "blocked_outcome_unknown", "expired_grant", "revoked_grant",
+    "corrupt_grant", "exhausted_grant", "changed_arguments",
+    "changed_scope", "wrong_effect_class", "wrong_capability",
+    "wrong_tool_category", "wrong_plan_revision", "wrong_task_revision",
+    "wrong_scheduled_task", "wrong_run", "wrong_device", "wrong_machine",
+    "wrong_owner", "wrong_execution_type", "wrong_policy_version",
+    "ambiguous_legacy_identity", "confirmation_required",
+    "automatic_permissions_changed",
+}
+
+
+def _default_full_access_settings() -> dict[str, Any]:
+    return {
+        "activation": {
+            "activated_at": None,
+            "local_auth_method": "",
+        },
+        "constraints": {
+            "payment": {
+                "enabled": False,
+                "max_amount_minor": 0,
+                "currency": "EUR",
+            },
+            "destinations": {
+                "enabled": False,
+                "origins": [],
+                "connectors": [],
+            },
+        },
+    }
+
+
+def _settings_copy(state: PermissionState) -> dict[str, Any]:
+    settings = state.optional_settings
+    return json.loads(canonical_serialize(settings))
+
+
+def _full_access_settings_for_update(state: PermissionState) -> dict[str, Any]:
+    settings = _settings_copy(state)
+    current = settings.get("full_access")
+    defaults = _default_full_access_settings()
+    if current is None:
+        settings["full_access"] = defaults
+        current = settings["full_access"]
+    elif not isinstance(current, dict):
+        raise PermissionStoreCorrupt("corrupt_permission_settings")
+    activation = current.setdefault("activation", defaults["activation"])
+    constraints = current.setdefault("constraints", defaults["constraints"])
+    if not isinstance(activation, dict) or not isinstance(constraints, dict):
+        raise PermissionStoreCorrupt("corrupt_permission_settings")
+    for name, value in defaults["activation"].items():
+        activation.setdefault(name, value)
+    for name, value in defaults["constraints"].items():
+        constraints.setdefault(name, value)
+    automatic = settings.get("automatic_categories")
+    if automatic is None:
+        enabled = state.permission_mode == PermissionMode.FULL_ACCESS
+        settings["automatic_categories"] = {
+            category: enabled for category in AUTOMATIC_PERMISSION_CATEGORIES
+        }
+    elif not isinstance(automatic, dict):
+        raise PermissionStoreCorrupt("corrupt_permission_settings")
+    return settings
+
+
+def _validate_permission_settings(settings: Mapping[str, Any]) -> None:
+    if not isinstance(settings, Mapping):
+        raise ValueError("permission_settings_not_mapping")
+    automatic = settings.get("automatic_categories")
+    if automatic is not None and (
+        not isinstance(automatic, Mapping)
+        or set(automatic) != set(AUTOMATIC_PERMISSION_CATEGORIES)
+        or any(not isinstance(value, bool) for value in automatic.values())
+    ):
+        raise ValueError("invalid_automatic_permission_categories")
+    full_access = settings.get("full_access")
+    if full_access is not None:
+        if not isinstance(full_access, Mapping):
+            raise ValueError("invalid_full_access_settings")
+        activation = full_access.get("activation", {})
+        constraints = full_access.get("constraints", {})
+        if not isinstance(activation, Mapping) or not isinstance(constraints, Mapping):
+            raise ValueError("invalid_full_access_settings")
+        activated_at = activation.get("activated_at")
+        if activated_at is not None and not isinstance(activated_at, (int, float)):
+            raise ValueError("invalid_activation_time")
+        method = activation.get("local_auth_method", "")
+        if method and method not in _LOCAL_AUTH_METHODS:
+            raise ValueError("invalid_local_auth_method")
+        payment = constraints.get("payment", {})
+        destinations = constraints.get("destinations", {})
+        if not isinstance(payment, Mapping) or not isinstance(destinations, Mapping):
+            raise ValueError("invalid_full_access_constraints")
+        if not isinstance(payment.get("enabled", False), bool):
+            raise ValueError("invalid_payment_constraint")
+        maximum = payment.get("max_amount_minor", 0)
+        currency = payment.get("currency", "EUR")
+        if type(maximum) is not int or maximum < 0:
+            raise ValueError("invalid_payment_constraint")
+        if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
+            raise ValueError("invalid_payment_constraint")
+        if not isinstance(destinations.get("enabled", False), bool):
+            raise ValueError("invalid_destination_constraint")
+        origins = destinations.get("origins", [])
+        connectors = destinations.get("connectors", [])
+        if not isinstance(origins, list) or not all(isinstance(x, str) for x in origins):
+            raise ValueError("invalid_destination_constraint")
+        if not isinstance(connectors, list) or not all(
+            isinstance(x, str) and _SAFE_CODE_RE.fullmatch(x) for x in connectors
+        ):
+            raise ValueError("invalid_destination_constraint")
+        for origin in origins:
+            normalized = normalize_web_scope(origin, kind=WebScopeKind.EXACT_ORIGIN)
+            canonical = json.loads(normalized.private_canonical)["identity"]
+            if canonical != origin:
+                raise ValueError("invalid_destination_constraint")
+    journal = settings.get("journal")
+    if journal is not None:
+        if (
+            not isinstance(journal, Mapping)
+            or journal.get("schema_version") != _JOURNAL_SCHEMA_VERSION
+            or not isinstance(journal.get("events"), list)
+            or len(journal["events"]) > _JOURNAL_MAX_EVENTS
+        ):
+            raise ValueError("invalid_permission_journal")
+        for event in journal["events"]:
+            if not isinstance(event, Mapping) or set(event) != {
+                "timestamp", "event_code", "execution_type", "safe_category",
+                "authorization_source", "result",
+            }:
+                raise ValueError("invalid_permission_journal_event")
+            if not isinstance(event["timestamp"], (int, float)):
+                raise ValueError("invalid_permission_journal_event")
+            if event["event_code"] not in _JOURNAL_EVENT_CODES:
+                raise ValueError("invalid_permission_journal_event")
+            for key in (
+                "execution_type", "safe_category", "authorization_source", "result",
+            ):
+                value = event[key]
+                if value and (
+                    not isinstance(value, str) or not _SAFE_CODE_RE.fullmatch(value)
+                ):
+                    raise ValueError("invalid_permission_journal_event")
+
+
+def _safe_code(value: Any, fallback: str = "") -> str:
+    candidate = str(value or "")
+    return candidate if _SAFE_CODE_RE.fullmatch(candidate) else fallback
+
+
+def _safe_choice(value: Any, allowed: set[str], fallback: str = "") -> str:
+    candidate = str(value or "")
+    return candidate if candidate in allowed else fallback
+
+
+def _append_event(
+    settings: dict[str, Any],
+    event_code: str,
+    *,
+    execution_type: str = "",
+    safe_category: str = "",
+    authorization_source: str = "",
+    result: str = "",
+    timestamp: float | None = None,
+) -> None:
+    if event_code not in _JOURNAL_EVENT_CODES:
+        raise ValueError("invalid_journal_event_code")
+    journal = settings.setdefault("journal", {
+        "schema_version": _JOURNAL_SCHEMA_VERSION,
+        "events": [],
+    })
+    if (
+        not isinstance(journal, dict)
+        or journal.get("schema_version") != _JOURNAL_SCHEMA_VERSION
+        or not isinstance(journal.get("events"), list)
+    ):
+        raise PermissionStoreCorrupt("corrupt_permission_journal")
+    event = {
+        "timestamp": float(time.time() if timestamp is None else timestamp),
+        "event_code": event_code,
+        "execution_type": _safe_choice(
+            execution_type, _SAFE_EXECUTION_TYPES,
+        ),
+        "safe_category": _safe_choice(
+            safe_category, _SAFE_CATEGORIES, "unknown",
+        ),
+        "authorization_source": _safe_choice(
+            authorization_source, _SAFE_AUTHORIZATION_SOURCES,
+        ),
+        "result": _safe_choice(result, _SAFE_JOURNAL_RESULTS, "unknown"),
+    }
+    journal["events"] = (journal["events"] + [event])[-_JOURNAL_MAX_EVENTS:]
 
 
 class PermissionStoreError(RuntimeError):
@@ -328,6 +571,8 @@ class PermissionStore:
         self._last_good_state: PermissionState | None = None
         self._epoch_listeners: set[Callable[[int], Any]] = set()
         self._corrupt = False
+        self._center_grant_tokens: dict[str, str] = {}
+        self._center_group_tokens: dict[str, tuple[str, str]] = {}
 
     @contextmanager
     def _cross_process_mutation_lock(self):
@@ -371,6 +616,10 @@ class PermissionStore:
             with self._lock:
                 self._epoch_listeners.add(listener)
 
+    def remove_epoch_listener(self, listener: Callable[[int], Any]) -> None:
+        with self._lock:
+            self._epoch_listeners.discard(listener)
+
     def _notify_epoch(self, epoch: int) -> None:
         with self._lock:
             listeners = tuple(self._epoch_listeners)
@@ -399,6 +648,7 @@ class PermissionStore:
             if not sensitive_hash_equal(expected, canonical_hash(payload)):
                 raise ValueError("payload_integrity_mismatch")
             state = PermissionState.from_protected_dict(payload)
+            _validate_permission_settings(state.optional_settings)
         except Exception as exc:
             raise PermissionStoreCorrupt("corrupt_permission_state") from exc
         return state
@@ -491,6 +741,8 @@ class PermissionStore:
             return True
 
     def set_permission_mode(self, mode: PermissionMode) -> PermissionState:
+        """Compatibility mutator; the PC UI uses :meth:`activate_full_access`."""
+
         if not isinstance(mode, PermissionMode):
             raise ValueError("invalid_permission_mode")
         if mode != PermissionMode.ASK and not self.secure_available:
@@ -502,12 +754,43 @@ class PermissionStore:
             if state.permission_mode == mode:
                 return state
             epoch = state.policy_epoch + 1
+            settings = _full_access_settings_for_update(state)
+            activation = settings["full_access"]["activation"]
+            if mode == PermissionMode.FULL_ACCESS:
+                settings["automatic_categories"] = {
+                    category: True
+                    for category in AUTOMATIC_PERMISSION_CATEGORIES
+                }
+                activation.update({
+                    "activated_at": float(time.time()),
+                    "local_auth_method": "legacy_local_api",
+                })
+                _append_event(
+                    settings, "full_access_enabled",
+                    authorization_source="full_access", result="enabled",
+                )
+            elif state.permission_mode == PermissionMode.FULL_ACCESS:
+                settings["automatic_categories"] = {
+                    category: False
+                    for category in AUTOMATIC_PERMISSION_CATEGORIES
+                }
+                _append_event(
+                    settings, "full_access_disabled",
+                    authorization_source="full_access", result="disabled",
+                )
+            _append_event(
+                settings, "policy_epoch_changed", result="mode_changed",
+            )
             rebased = tuple(
                 _new_integrity(replace(grant, revocation_epoch=epoch))
                 for grant in state.grants
             )
             new_state = replace(
-                state, permission_mode=mode, policy_epoch=epoch, grants=rebased,
+                state,
+                permission_mode=mode,
+                policy_epoch=epoch,
+                grants=rebased,
+                optional_settings_canonical=canonical_serialize(settings),
             )
             self._session_grants = {
                 grant_id: _new_integrity(replace(grant, revocation_epoch=epoch))
@@ -540,11 +823,33 @@ class PermissionStore:
                     if state.permission_mode == PermissionMode.ASK
                     else state.permission_mode
                 )
+                settings = _settings_copy(state)
+                _append_event(
+                    settings, "grant_created",
+                    execution_type=grant.execution_type.value,
+                    safe_category=grant.normalized_target_scope.safe_category,
+                    authorization_source="grant", result="created",
+                )
                 self._write_state_locked(replace(
-                    state, permission_mode=mode, grants=grants,
+                    state,
+                    permission_mode=mode,
+                    grants=grants,
+                    optional_settings_canonical=canonical_serialize(settings),
                 ))
             else:
                 self._session_grants[grant.grant_id] = grant
+                if self.secure_available:
+                    settings = _settings_copy(state)
+                    _append_event(
+                        settings, "grant_created",
+                        execution_type=grant.execution_type.value,
+                        safe_category=grant.normalized_target_scope.safe_category,
+                        authorization_source="grant", result="created",
+                    )
+                    self._write_state_locked(replace(
+                        state,
+                        optional_settings_canonical=canonical_serialize(settings),
+                    ))
 
     def _all_grants_locked(self, state: PermissionState) -> tuple[Grant, ...]:
         persistent_ids = {grant.grant_id for grant in state.grants}
@@ -720,6 +1025,7 @@ class PermissionStore:
         keep_persistent: tuple[Grant, ...],
         keep_session: Mapping[str, Grant],
         mode: PermissionMode | None = None,
+        optional_settings: Mapping[str, Any] | None = None,
     ) -> tuple[PermissionState, int]:
         epoch = state.policy_epoch + 1
         persistent = tuple(
@@ -735,6 +1041,11 @@ class PermissionStore:
             permission_mode=mode or state.permission_mode,
             policy_epoch=epoch,
             grants=persistent,
+            optional_settings_canonical=(
+                state.optional_settings_canonical
+                if optional_settings is None
+                else canonical_serialize(optional_settings)
+            ),
         )
         if self.secure_available:
             self._write_state_locked(new_state)
@@ -742,6 +1053,400 @@ class PermissionStore:
             self._volatile_epoch = epoch
             new_state = self._fail_closed_state(epoch)
         return new_state, epoch
+
+    def activate_full_access(
+        self,
+        *,
+        activation_proof,
+        activated_at: float | None = None,
+    ) -> PermissionState:
+        """Persist permanent Full Access after the PC-only activation ceremony."""
+
+        from osia.local_reauth import consume_full_access_activation_proof
+
+        method = consume_full_access_activation_proof(activation_proof)
+        if not self.secure_available:
+            raise PersistentPermissionUnavailable("secure_storage_required")
+        with self._lock, self._cross_process_mutation_lock():
+            state = self.load_state()
+            if self._corrupt:
+                raise PermissionStoreCorrupt("corrupt_store_requires_explicit_reset")
+            if state.permission_mode == PermissionMode.FULL_ACCESS:
+                return state
+            settings = _full_access_settings_for_update(state)
+            settings["automatic_categories"] = {
+                category: True
+                for category in AUTOMATIC_PERMISSION_CATEGORIES
+            }
+            settings["full_access"]["activation"] = {
+                "activated_at": float(
+                    time.time() if activated_at is None else activated_at
+                ),
+                "local_auth_method": method,
+            }
+            _append_event(
+                settings, "full_access_enabled",
+                authorization_source="full_access", result="enabled",
+            )
+            _append_event(
+                settings, "policy_epoch_changed", result="full_access_enabled",
+            )
+            new_state, epoch = self._advance_epoch_locked(
+                state,
+                keep_persistent=state.grants,
+                keep_session=dict(self._session_grants),
+                mode=PermissionMode.FULL_ACCESS,
+                optional_settings=settings,
+            )
+        self._notify_epoch(epoch)
+        return new_state
+
+    def update_automatic_permissions(
+        self,
+        updates: Mapping[str, bool],
+        *,
+        force_ask: bool = False,
+    ) -> PermissionState:
+        """Persist category switches and invalidate every loaded permit."""
+
+        if (
+            not isinstance(updates, Mapping)
+            or not updates
+            or set(updates) - set(AUTOMATIC_PERMISSION_CATEGORIES)
+            or any(not isinstance(value, bool) for value in updates.values())
+        ):
+            raise ValueError("invalid_automatic_permission_update")
+        if not self.secure_available:
+            raise PersistentPermissionUnavailable("secure_storage_required")
+        with self._lock, self._cross_process_mutation_lock():
+            state = self.load_state()
+            if self._corrupt:
+                raise PermissionStoreCorrupt("corrupt_store_requires_explicit_reset")
+            settings = _full_access_settings_for_update(state)
+            current = dict(settings["automatic_categories"])
+            updated = dict(current)
+            updated.update(updates)
+            next_mode = state.permission_mode
+            if force_ask or (
+                state.permission_mode == PermissionMode.FULL_ACCESS
+                and not all(updated.values())
+            ):
+                next_mode = PermissionMode.ASK
+            if updated == current and next_mode == state.permission_mode:
+                return state
+            settings["automatic_categories"] = updated
+            if (
+                state.permission_mode == PermissionMode.FULL_ACCESS
+                and next_mode != PermissionMode.FULL_ACCESS
+            ):
+                _append_event(
+                    settings, "full_access_disabled",
+                    authorization_source="full_access", result="disabled",
+                )
+            _append_event(
+                settings, "automatic_permission_changed",
+                result="automatic_permissions_changed",
+            )
+            _append_event(
+                settings, "policy_epoch_changed", result="mode_changed",
+            )
+            new_state, epoch = self._advance_epoch_locked(
+                state,
+                keep_persistent=state.grants,
+                keep_session=dict(self._session_grants),
+                mode=next_mode,
+                optional_settings=settings,
+            )
+        self._notify_epoch(epoch)
+        return new_state
+
+    def apply_default_access(self) -> PermissionState:
+        return self.update_automatic_permissions(
+            {
+                category: False
+                for category in AUTOMATIC_PERMISSION_CATEGORIES
+            },
+            force_ask=True,
+        )
+
+    def update_full_access_constraints(
+        self,
+        *,
+        payment_enabled: bool,
+        max_amount_minor: int,
+        currency: str,
+        destinations_enabled: bool,
+        origins: list[str] | tuple[str, ...] | None,
+        connectors: list[str] | tuple[str, ...] | None,
+    ) -> PermissionState:
+        """Replace exact optional limits and invalidate every loaded permit."""
+
+        if not isinstance(payment_enabled, bool) or not isinstance(
+            destinations_enabled, bool
+        ):
+            raise ValueError("invalid_constraint_toggle")
+        if type(max_amount_minor) is not int or max_amount_minor < 0:
+            raise ValueError("invalid_payment_maximum")
+        currency_code = str(currency or "").upper()
+        if not re.fullmatch(r"[A-Z]{3}", currency_code):
+            raise ValueError("invalid_payment_currency")
+        normalized_origins: list[str] | None = None
+        if origins is not None:
+            normalized_origins = []
+            for value in origins:
+                try:
+                    scope = normalize_web_scope(
+                        str(value or "").strip(), kind=WebScopeKind.EXACT_ORIGIN,
+                    )
+                    normalized_origins.append(
+                        json.loads(scope.private_canonical)["identity"]
+                    )
+                except (
+                    KeyError, TypeError, ValueError, ScopeNormalizationError,
+                ) as exc:
+                    raise ValueError("invalid_destination_origin") from exc
+        normalized_connectors: list[str] | None = None
+        if connectors is not None:
+            normalized_connectors = []
+            for value in connectors:
+                candidate = str(value or "").strip()
+                if not _SAFE_CODE_RE.fullmatch(candidate):
+                    raise ValueError("invalid_connector_allowlist")
+                normalized_connectors.append(candidate)
+        if not self.secure_available:
+            raise PersistentPermissionUnavailable("secure_storage_required")
+        with self._lock, self._cross_process_mutation_lock():
+            state = self.load_state()
+            if self._corrupt:
+                raise PermissionStoreCorrupt("corrupt_store_requires_explicit_reset")
+            settings = _full_access_settings_for_update(state)
+            current_destinations = settings["full_access"]["constraints"][
+                "destinations"
+            ]
+            next_constraints = {
+                "payment": {
+                    "enabled": payment_enabled,
+                    "max_amount_minor": max_amount_minor,
+                    "currency": currency_code,
+                },
+                "destinations": {
+                    "enabled": destinations_enabled,
+                    "origins": (
+                        list(current_destinations.get("origins", []))
+                        if normalized_origins is None
+                        else sorted(set(normalized_origins))
+                    ),
+                    "connectors": (
+                        list(current_destinations.get("connectors", []))
+                        if normalized_connectors is None
+                        else sorted(set(normalized_connectors))
+                    ),
+                },
+            }
+            if settings["full_access"].get("constraints") == next_constraints:
+                return state
+            settings["full_access"]["constraints"] = next_constraints
+            _append_event(
+                settings, "optional_constraint_changed", result="updated",
+            )
+            _append_event(
+                settings, "policy_epoch_changed", result="constraint_changed",
+            )
+            new_state, epoch = self._advance_epoch_locked(
+                state,
+                keep_persistent=state.grants,
+                keep_session=dict(self._session_grants),
+                optional_settings=settings,
+            )
+        self._notify_epoch(epoch)
+        return new_state
+
+    def append_journal_event(
+        self,
+        event_code: str,
+        *,
+        execution_type: str = "",
+        safe_category: str = "",
+        authorization_source: str = "",
+        result: str = "",
+        timestamp: float | None = None,
+    ) -> bool:
+        """Append one value-free event; never falls back to plaintext."""
+
+        if event_code not in _JOURNAL_EVENT_CODES or not self.secure_available:
+            return False
+        with self._lock, self._cross_process_mutation_lock():
+            state = self.load_state()
+            if self._corrupt:
+                return False
+            settings = _settings_copy(state)
+            _append_event(
+                settings,
+                event_code,
+                execution_type=execution_type,
+                safe_category=safe_category,
+                authorization_source=authorization_source,
+                result=result,
+                timestamp=timestamp,
+            )
+            self._write_state_locked(replace(
+                state,
+                optional_settings_canonical=canonical_serialize(settings),
+            ))
+        return True
+
+    def clear_journal(self) -> bool:
+        """Clear audit history without changing mode, grants or policy epoch."""
+
+        if not self.secure_available:
+            return False
+        with self._lock, self._cross_process_mutation_lock():
+            state = self.load_state()
+            if self._corrupt:
+                return False
+            settings = _settings_copy(state)
+            journal = settings.get("journal")
+            if not isinstance(journal, Mapping) or not journal.get("events"):
+                return False
+            settings["journal"] = {
+                "schema_version": _JOURNAL_SCHEMA_VERSION,
+                "events": [],
+            }
+            self._write_state_locked(replace(
+                state,
+                optional_settings_canonical=canonical_serialize(settings),
+            ))
+        return True
+
+    def permission_center_snapshot(self, *, now: float | None = None) -> dict[str, Any]:
+        """Return a value-free desktop projection and ephemeral row handles."""
+
+        current_time = float(time.time() if now is None else now)
+        with self._lock:
+            state = self.load_state()
+            try:
+                settings = _full_access_settings_for_update(state)
+                _validate_permission_settings(settings)
+            except Exception:
+                settings = {
+                    "full_access": _default_full_access_settings(),
+                    "automatic_categories": {
+                        category: False
+                        for category in AUTOMATIC_PERMISSION_CATEGORIES
+                    },
+                }
+            full = settings["full_access"]
+            automatic = settings["automatic_categories"]
+            constraints = full["constraints"]
+            activation = full["activation"]
+            grants = self._all_grants_locked(state)
+            self._center_grant_tokens = {}
+            self._center_group_tokens = {}
+            summaries = []
+            group_tokens: dict[tuple[str, str], str] = {}
+            for grant in grants:
+                row_token = "row:" + secrets.token_urlsafe(18)
+                self._center_grant_tokens[row_token] = grant.grant_id
+                group_token = ""
+                group_key: tuple[str, str] | None = None
+                if grant.execution_type.value == "autonomous" and grant.run_id:
+                    group_key = ("autonomous", grant.run_id)
+                elif (
+                    grant.execution_type.value == "scheduled"
+                    and grant.scheduled_task_id
+                ):
+                    group_key = ("scheduled", grant.scheduled_task_id)
+                if group_key is not None:
+                    group_token = group_tokens.get(group_key, "")
+                    if not group_token:
+                        group_token = "group:" + secrets.token_urlsafe(18)
+                        group_tokens[group_key] = group_token
+                        self._center_group_tokens[group_token] = group_key
+                remaining = (
+                    None if grant.max_uses is None
+                    else max(0, grant.max_uses - grant.use_count)
+                )
+                summaries.append({
+                    "row_token": row_token,
+                    "group_token": group_token,
+                    "execution_type": grant.execution_type.value,
+                    "safe_category": _safe_choice(
+                        grant.normalized_target_scope.safe_category,
+                        _SAFE_CATEGORIES,
+                        "unknown",
+                    ),
+                    "tool_category": _safe_choice(
+                        grant.tool_category, _SAFE_TOOL_CATEGORIES, "unknown",
+                    ),
+                    "expires_at": grant.expires_at,
+                    "remaining_seconds": (
+                        None if grant.expires_at is None
+                        else max(0.0, grant.expires_at - current_time)
+                    ),
+                    "remaining_uses": remaining,
+                    "use_policy": grant.use_policy.value,
+                    "persistent": grant.persistent,
+                    "expired": bool(
+                        grant.expires_at is not None
+                        and grant.expires_at <= current_time
+                    ),
+                })
+            journal = settings.get("journal", {})
+            events = journal.get("events", []) if isinstance(journal, Mapping) else []
+            payment_enabled = constraints["payment"]["enabled"]
+            destinations_enabled = constraints["destinations"]["enabled"]
+            mode = state.permission_mode.value
+            return {
+                "permission_mode": mode,
+                "full_access_enabled": mode == PermissionMode.FULL_ACCESS.value,
+                "full_access_with_limits": bool(
+                    mode == PermissionMode.FULL_ACCESS.value
+                    and (payment_enabled or destinations_enabled)
+                ),
+                "secure_storage_available": self.secure_available,
+                "secure_storage_backend": self.availability.backend,
+                "store_corrupt": self.corrupt,
+                "activation_available": self.secure_available and not self.corrupt,
+                "automatic_categories": dict(automatic),
+                "policy_epoch": state.policy_epoch,
+                "activated_at": activation.get("activated_at"),
+                "local_auth_method": _safe_code(
+                    activation.get("local_auth_method", ""), "unknown",
+                ),
+                "constraints": {
+                    "payment": dict(constraints["payment"]),
+                    "destinations": {
+                        "enabled": destinations_enabled,
+                        "origin_count": len(constraints["destinations"]["origins"]),
+                        "connector_count": len(
+                            constraints["destinations"]["connectors"]
+                        ),
+                    },
+                },
+                "grants": summaries,
+                "journal": [dict(event) for event in events],
+                "journal_schema_version": _JOURNAL_SCHEMA_VERSION,
+                "journal_capacity": _JOURNAL_MAX_EVENTS,
+            }
+
+    def revoke_center_grant(self, row_token: str) -> RevocationResult:
+        with self._lock:
+            grant_ref = self._center_grant_tokens.get(str(row_token or ""), "")
+        if not grant_ref:
+            state = self.load_state()
+            return RevocationResult(False, state.policy_epoch, "one_grant")
+        return self.revoke_grant(grant_ref)
+
+    def revoke_center_group(self, group_token: str) -> RevocationResult:
+        with self._lock:
+            group = self._center_group_tokens.get(str(group_token or ""))
+        if not group:
+            state = self.load_state()
+            return RevocationResult(False, state.policy_epoch, "task_group")
+        execution_type, authority_ref = group
+        if execution_type == "autonomous":
+            return self.revoke_run_grants(authority_ref)
+        return self.revoke_scheduled_task_grants(authority_ref)
 
     def revoke_grant(self, grant_id: str) -> RevocationResult:
         grant_ref = str(grant_id or "")
@@ -762,6 +1467,12 @@ class PermissionStore:
                 return RevocationResult(
                     False, state.policy_epoch, "one_grant", grant_ref,
                 )
+            settings = _settings_copy(state) if self.secure_available else None
+            if settings is not None:
+                _append_event(settings, "grant_revoked", result="one_grant")
+                _append_event(
+                    settings, "policy_epoch_changed", result="grant_revoked",
+                )
             _new_state, epoch = self._advance_epoch_locked(
                 state,
                 keep_persistent=persistent,
@@ -775,6 +1486,7 @@ class PermissionStore:
                     )
                     else state.permission_mode
                 ),
+                optional_settings=settings,
             )
         self._notify_epoch(epoch)
         return RevocationResult(True, epoch, "one_grant", grant_ref)
@@ -785,6 +1497,12 @@ class PermissionStore:
             changed = bool(state.grants or self._session_grants)
             if not changed:
                 return RevocationResult(False, state.policy_epoch, "all_grants")
+            settings = _settings_copy(state) if self.secure_available else None
+            if settings is not None:
+                _append_event(settings, "grant_revoked", result="all_grants")
+                _append_event(
+                    settings, "policy_epoch_changed", result="grants_revoked",
+                )
             _new_state, epoch = self._advance_epoch_locked(
                 state,
                 keep_persistent=(),
@@ -794,6 +1512,7 @@ class PermissionStore:
                     if state.permission_mode == PermissionMode.TASK_SCOPED
                     else state.permission_mode
                 ),
+                optional_settings=settings,
             )
         self._notify_epoch(epoch)
         return RevocationResult(True, epoch, "all_grants")
@@ -803,10 +1522,16 @@ class PermissionStore:
 
         with self._lock, self._cross_process_mutation_lock():
             state = self.load_state()
+            settings = _settings_copy(state) if self.secure_available else None
+            if settings is not None:
+                _append_event(
+                    settings, "policy_epoch_changed", result="permits_invalidated",
+                )
             _new_state, epoch = self._advance_epoch_locked(
                 state,
                 keep_persistent=state.grants,
                 keep_session=self._session_grants,
+                optional_settings=settings,
             )
         self._notify_epoch(epoch)
         return epoch
@@ -834,6 +1559,12 @@ class PermissionStore:
                 return RevocationResult(
                     False, state.policy_epoch, "autonomous_run", run_ref,
                 )
+            settings = _settings_copy(state) if self.secure_available else None
+            if settings is not None:
+                _append_event(settings, "grant_revoked", result="autonomous_run")
+                _append_event(
+                    settings, "policy_epoch_changed", result="grants_revoked",
+                )
             _new_state, epoch = self._advance_epoch_locked(
                 state,
                 keep_persistent=persistent,
@@ -847,15 +1578,74 @@ class PermissionStore:
                     )
                     else state.permission_mode
                 ),
+                optional_settings=settings,
             )
         self._notify_epoch(epoch)
         return RevocationResult(True, epoch, "autonomous_run", run_ref)
+
+    def revoke_scheduled_task_grants(self, task_id: str) -> RevocationResult:
+        task_ref = str(task_id or "")
+        if not task_ref:
+            raise ValueError("invalid_scheduled_task_id")
+        with self._lock, self._cross_process_mutation_lock():
+            state = self.load_state()
+            persistent = tuple(
+                grant for grant in state.grants
+                if grant.scheduled_task_id != task_ref
+            )
+            session = {
+                key: grant for key, grant in self._session_grants.items()
+                if grant.scheduled_task_id != task_ref
+            }
+            changed = (
+                len(persistent) != len(state.grants)
+                or len(session) != len(self._session_grants)
+            )
+            if not changed:
+                return RevocationResult(
+                    False, state.policy_epoch, "scheduled_task", task_ref,
+                )
+            settings = _settings_copy(state) if self.secure_available else None
+            if settings is not None:
+                _append_event(settings, "grant_revoked", result="scheduled_task")
+                _append_event(
+                    settings, "policy_epoch_changed", result="grants_revoked",
+                )
+            _new_state, epoch = self._advance_epoch_locked(
+                state,
+                keep_persistent=persistent,
+                keep_session=session,
+                mode=(
+                    PermissionMode.ASK
+                    if (
+                        state.permission_mode == PermissionMode.TASK_SCOPED
+                        and not persistent
+                        and not session
+                    )
+                    else state.permission_mode
+                ),
+                optional_settings=settings,
+            )
+        self._notify_epoch(epoch)
+        return RevocationResult(True, epoch, "scheduled_task", task_ref)
 
     def revoke_full_access(self) -> RevocationResult:
         with self._lock, self._cross_process_mutation_lock():
             state = self.load_state()
             if state.permission_mode != PermissionMode.FULL_ACCESS:
                 return RevocationResult(False, state.policy_epoch, "full_access")
+            settings = _full_access_settings_for_update(state)
+            settings["automatic_categories"] = {
+                category: False
+                for category in AUTOMATIC_PERMISSION_CATEGORIES
+            }
+            _append_event(
+                settings, "full_access_disabled",
+                authorization_source="full_access", result="disabled",
+            )
+            _append_event(
+                settings, "policy_epoch_changed", result="full_access_disabled",
+            )
             _new_state, epoch = self._advance_epoch_locked(
                 state,
                 keep_persistent=state.grants,
@@ -865,9 +1655,53 @@ class PermissionStore:
                     if state.grants or self._session_grants
                     else PermissionMode.ASK
                 ),
+                optional_settings=settings,
             )
         self._notify_epoch(epoch)
         return RevocationResult(True, epoch, "full_access")
+
+    def revoke_all_delegated_authority(self) -> RevocationResult:
+        """Atomically revoke Full Access, every grant and every loaded permit."""
+
+        with self._lock, self._cross_process_mutation_lock():
+            state = self.load_state()
+            settings = _full_access_settings_for_update(state)
+            changed = bool(
+                state.permission_mode == PermissionMode.FULL_ACCESS
+                or state.grants
+                or self._session_grants
+                or any(settings["automatic_categories"].values())
+            )
+            if not changed:
+                return RevocationResult(
+                    False, state.policy_epoch, "delegated_authority",
+                )
+            settings["automatic_categories"] = {
+                category: False
+                for category in AUTOMATIC_PERMISSION_CATEGORIES
+            }
+            if state.permission_mode == PermissionMode.FULL_ACCESS:
+                _append_event(
+                    settings, "full_access_disabled",
+                    authorization_source="full_access", result="disabled",
+                )
+            if state.grants or self._session_grants:
+                _append_event(settings, "grant_revoked", result="all_grants")
+            _append_event(
+                settings, "delegated_authority_revoked", result="all_authority",
+            )
+            _append_event(
+                settings, "policy_epoch_changed", result="authority_revoked",
+            )
+            _new_state, epoch = self._advance_epoch_locked(
+                state,
+                keep_persistent=(),
+                keep_session={},
+                mode=PermissionMode.ASK,
+                optional_settings=settings,
+            )
+        self._notify_epoch(epoch)
+        return RevocationResult(True, epoch, "delegated_authority")
 
     def reset_to_ask(self) -> RevocationResult:
         """Explicit recovery/reset; replaces even corrupt protected state."""

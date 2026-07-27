@@ -25,6 +25,7 @@ from typing import Any, Mapping, TYPE_CHECKING
 from osia.scope_normalization import (
     NormalizedScope,
     ScopeNormalizationError,
+    WebScopeKind,
     canonical_hash,
     canonical_serialize,
     combine_scopes,
@@ -32,6 +33,7 @@ from osia.scope_normalization import (
     normalize_file_scope,
     normalize_gmail_scope,
     normalize_mcp_scope,
+    normalize_web_scope,
     normalized_scope_from_protected,
     sensitive_hash_equal,
 )
@@ -1022,6 +1024,19 @@ class AuthorizationSource(str, Enum):
     FULL_ACCESS = "full_access"
 
 
+AUTOMATIC_PERMISSION_CATEGORIES = (
+    "files_modify",
+    "files_delete",
+    "commands",
+    "browser_account",
+    "connectors",
+    "send_publish_submit",
+    "purchases_payments",
+    "autonomous_actions",
+    "scheduled_actions",
+)
+
+
 class UsePolicy(str, Enum):
     SINGLE = "single"
     BOUNDED = "bounded"
@@ -1038,7 +1053,7 @@ def _validate_constraint_mapping(
         if grant else
         {
             "allowed", "max_amount_minor", "amount_minor", "currency",
-            "request_currency",
+            "request_currency", "destination_origin", "connector_id",
         }
     )
     normalized = dict(values)
@@ -1061,6 +1076,25 @@ def _validate_constraint_mapping(
             or not re.fullmatch(r"[A-Za-z]{3}", normalized[name])
         ):
             raise ValueError("invalid_currency_constraint")
+    if "destination_origin" in normalized:
+        origin = normalized["destination_origin"]
+        if not isinstance(origin, str):
+            raise ValueError("invalid_destination_origin")
+        try:
+            canonical = json.loads(normalize_web_scope(
+                origin, kind=WebScopeKind.EXACT_ORIGIN,
+            ).private_canonical)["identity"]
+        except (KeyError, TypeError, ValueError, ScopeNormalizationError) as exc:
+            raise ValueError("invalid_destination_origin") from exc
+        if canonical != origin:
+            raise ValueError("noncanonical_destination_origin")
+    if "connector_id" in normalized:
+        connector_id = normalized["connector_id"]
+        if (
+            not isinstance(connector_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", connector_id)
+        ):
+            raise ValueError("invalid_connector_constraint")
     return normalized
 
 
@@ -1230,6 +1264,61 @@ class PermissionRequest:
             "operation_id": self.operation_id,
             "execution_type": self.execution_context.execution_type.value,
         }
+
+
+def automatic_permission_category(request: PermissionRequest) -> str | None:
+    """Map one request from authoritative execution and tool metadata only."""
+
+    from osia.tool_contracts import SideEffectClass
+
+    if not isinstance(request, PermissionRequest):
+        raise ValueError("invalid_permission_request")
+    if request.execution_context.execution_type == ExecutionType.SCHEDULED:
+        return "scheduled_actions"
+    if request.execution_context.execution_type == ExecutionType.AUTONOMOUS:
+        return "autonomous_actions"
+    if request.safe_category == "purchase" or any(
+        name in request.optional_constraints
+        for name in ("amount_minor", "request_currency")
+    ):
+        return "purchases_payments"
+    if request.tool_identity in {"delete_file", "delete_directory"}:
+        return "files_delete"
+    if request.tool_category == "shell":
+        return "commands"
+    if request.effect_class == SideEffectClass.IRREVERSIBLE_EXTERNAL.value:
+        return "send_publish_submit"
+    if (
+        request.tool_category in {"gmail", "mcp"}
+        and request.effect_class != SideEffectClass.READ_ONLY.value
+    ):
+        return "connectors"
+    if (
+        request.tool_category == "browser"
+        and request.effect_class != SideEffectClass.READ_ONLY.value
+    ):
+        return "browser_account"
+    if (
+        request.tool_category == "filesystem"
+        and request.effect_class != SideEffectClass.READ_ONLY.value
+    ):
+        return "files_modify"
+    return None
+
+
+def _automatic_permission_enabled(
+    state: PermissionState, request: PermissionRequest,
+) -> bool:
+    category = automatic_permission_category(request)
+    if category is None:
+        return False
+    try:
+        matrix = state.optional_settings.get("automatic_categories")
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if matrix is None:
+        return state.permission_mode == PermissionMode.FULL_ACCESS
+    return isinstance(matrix, Mapping) and matrix.get(category) is True
 
 
 @dataclass(frozen=True)
@@ -1618,6 +1707,13 @@ class PermissionState:
         json_loads_canonical(self.optional_settings_canonical)
         _require_opaque_ref(self.migration_marker)
 
+    @property
+    def optional_settings(self) -> dict[str, Any]:
+        value = json_loads_canonical(self.optional_settings_canonical)
+        if not isinstance(value, dict):
+            raise ValueError("invalid_permission_settings")
+        return value
+
     def to_protected_dict(self) -> dict[str, Any]:
         return {
             "permission_schema_version": self.permission_schema_version,
@@ -1904,6 +2000,25 @@ class PermissionPolicy:
         except AttributeError:
             pass
 
+    def _journal(
+        self,
+        request: PermissionRequest,
+        event_code: str,
+        result: str,
+        *,
+        authorization_source: AuthorizationSource = AuthorizationSource.NONE,
+    ) -> None:
+        try:
+            self.store.append_journal_event(
+                event_code,
+                execution_type=request.execution_context.execution_type.value,
+                safe_category=request.safe_category,
+                authorization_source=authorization_source.value,
+                result=result,
+            )
+        except Exception:
+            pass
+
     def evaluate(self, request: PermissionRequest) -> PermissionDecision:
         from osia.tool_contracts import ConfirmationPolicy, SideEffectClass
 
@@ -1912,12 +2027,18 @@ class PermissionPolicy:
 
         # Universal barriers precede every mode, grant and optional constraint.
         if request.system_destruction:
+            self._journal(
+                request, "universal_barrier_blocked", "system_destruction",
+            )
             return _decision(
                 request,
                 DecisionType.BLOCK_SYSTEM_DESTRUCTION,
                 "system_destruction_absolute",
             )
         if request.colossal_deletion:
+            self._journal(
+                request, "authorization_required", "colossal_deletion_review",
+            )
             return _decision(
                 request,
                 DecisionType.REQUIRE_COLOSSAL_DELETION_CONFIRMATION,
@@ -1938,6 +2059,7 @@ class PermissionPolicy:
                 else None
             )
         if durable_block:
+            self._journal(request, "authorization_required", durable_block)
             return _decision(request, DecisionType.DENY, durable_block)
 
         if request.execution_context.execution_type == ExecutionType.SCHEDULED:
@@ -1960,6 +2082,9 @@ class PermissionPolicy:
                     )
                 except Exception:
                     pass
+                self._journal(
+                    request, "authorization_required", scheduled_block,
+                )
                 return _decision(request, DecisionType.DENY, scheduled_block)
 
         state = self.store.load_state()
@@ -1969,12 +2094,26 @@ class PermissionPolicy:
                 request, DecisionType.DENY, "policy_epoch_mismatch", epoch=epoch,
             )
 
+        automatic_authority = _automatic_permission_enabled(state, request)
+        if (
+            automatic_authority
+            and not _full_access_constraints_allow(request, state)
+        ):
+            self._journal(
+                request, "authorization_required", "optional_constraint_failed",
+                authorization_source=AuthorizationSource.FULL_ACCESS,
+            )
+            return _decision(
+                request, DecisionType.DENY, "optional_constraint_failed",
+                epoch=epoch,
+            )
+
         grant, grant_reason = self.store.find_matching_grant(
             request, now=self.clock()
         )
         if grant is not None:
             if not _optional_constraints_allow(request, grant.constraints):
-                if state.permission_mode != PermissionMode.FULL_ACCESS:
+                if not automatic_authority:
                     return _decision(
                         request, DecisionType.DENY, "optional_constraint_failed",
                         epoch=epoch,
@@ -1993,8 +2132,14 @@ class PermissionPolicy:
                     epoch=epoch,
                 )
 
-        if state.permission_mode == PermissionMode.FULL_ACCESS:
-            if not _optional_constraints_allow(request, {}):
+        if automatic_authority:
+            if (
+                not _optional_constraints_allow(request, {})
+            ):
+                self._journal(
+                    request, "authorization_required", "optional_constraint_failed",
+                    authorization_source=AuthorizationSource.FULL_ACCESS,
+                )
                 return _decision(
                     request, DecisionType.DENY, "optional_constraint_failed",
                     epoch=epoch,
@@ -2005,7 +2150,10 @@ class PermissionPolicy:
                     epoch=epoch,
                 )
             return _decision(
-                request, DecisionType.ALLOW, "full_access",
+                request, DecisionType.ALLOW, (
+                    "full_access" if state.permission_mode == PermissionMode.FULL_ACCESS
+                    else "automatic_category"
+                ),
                 source=AuthorizationSource.FULL_ACCESS,
                 epoch=epoch,
             )
@@ -2053,8 +2201,12 @@ class PermissionPolicy:
                 if decision_type == DecisionType.SUSPEND_SCOPE_EXTENSION
                 else "unattended_sensitive_action"
             )
+            self._journal(request, "authorization_required", reason)
             return _decision(request, decision_type, reason, epoch=epoch)
 
+        self._journal(request, "authorization_required", (
+            grant_reason if grant_reason != "no_grant" else "ask_sensitive_action"
+        ))
         return _decision(
             request, DecisionType.REQUIRE_CONFIRMATION,
             grant_reason if grant_reason != "no_grant" else "ask_sensitive_action",
@@ -2133,7 +2285,7 @@ def _optional_constraints_allow(
     request_values = dict(request.optional_constraints)
     known = {
         "allowed", "max_amount_minor", "amount_minor", "currency",
-        "request_currency", "scope_only",
+        "request_currency", "scope_only", "destination_origin", "connector_id",
     }
     if set(grant_values) - known or set(request_values) - known:
         return False
@@ -2171,6 +2323,119 @@ def _optional_constraints_allow(
         ):
             return False
     return True
+
+
+def _request_payment_values(
+    request: PermissionRequest,
+) -> tuple[int | None, str | None, bool]:
+    values = dict(request.optional_constraints)
+    amount = values.get("amount_minor")
+    currency = values.get("request_currency", values.get("currency"))
+    is_payment = request.safe_category == "purchase" or (
+        "amount_minor" in values or "request_currency" in values
+    )
+    if request.private_scope.kind == "purchase":
+        is_payment = True
+        try:
+            private = json.loads(request.private_scope.private_canonical)
+            amount = private.get("amount_minor", amount)
+            currency = private.get("currency", currency)
+        except (TypeError, ValueError):
+            return None, None, True
+    return (
+        amount if type(amount) is int and amount >= 0 else None,
+        currency.upper() if isinstance(currency, str) else None,
+        is_payment,
+    )
+
+
+def _request_external_destination(
+    request: PermissionRequest,
+) -> tuple[str, str, bool]:
+    """Return exact normalized origin/connector plus whether limits apply."""
+
+    values = dict(request.optional_constraints)
+    origin = values.get("destination_origin", "")
+    connector = values.get("connector_id", "")
+    capability = str(request.capability or "").lower()
+    matching = (
+        request.safe_category == "purchase"
+        or (
+            request.tool_category in {"gmail", "mcp", "browser"}
+            and request.effect_class != "read_only"
+        )
+        or any(
+            token in capability
+            for token in ("send", "publish", "submit", "purchase", "payment")
+        )
+    )
+    if origin:
+        matching = True
+    try:
+        private = json.loads(request.private_scope.private_canonical)
+    except (TypeError, ValueError):
+        private = {}
+    if request.private_scope.kind == "web":
+        origin = private.get("identity", origin)
+        matching = True
+    elif request.private_scope.kind == "purchase":
+        origin = private.get("merchant", origin)
+    elif request.private_scope.kind == "connector":
+        connector = private.get("connector_id", connector)
+    return str(origin or ""), str(connector or ""), matching
+
+
+def _full_access_constraints_allow(
+    request: PermissionRequest, state: PermissionState,
+) -> bool:
+    """Apply only explicitly enabled protected Full Access restrictions."""
+
+    try:
+        full_access = state.optional_settings.get("full_access", {})
+        if not isinstance(full_access, Mapping):
+            return False
+        constraints = full_access.get("constraints", {})
+        if not isinstance(constraints, Mapping):
+            return False
+
+        payment = constraints.get("payment", {})
+        if not isinstance(payment, Mapping):
+            return False
+        if payment.get("enabled") is True:
+            amount, currency, matching = _request_payment_values(request)
+            if matching:
+                maximum = payment.get("max_amount_minor")
+                expected_currency = payment.get("currency")
+                if (
+                    type(maximum) is not int
+                    or maximum < 0
+                    or amount is None
+                    or amount > maximum
+                    or not isinstance(expected_currency, str)
+                    or not re.fullmatch(r"[A-Z]{3}", expected_currency)
+                    or currency is None
+                    or currency != expected_currency
+                ):
+                    return False
+
+        destinations = constraints.get("destinations", {})
+        if not isinstance(destinations, Mapping):
+            return False
+        if destinations.get("enabled") is True:
+            origin, connector, matching = _request_external_destination(request)
+            if matching:
+                origins = destinations.get("origins", [])
+                connectors = destinations.get("connectors", [])
+                if not isinstance(origins, list) or not isinstance(connectors, list):
+                    return False
+                if origin:
+                    return origin in origins
+                if connector:
+                    return connector in connectors
+                return False
+        return True
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 _CURRENT_EXECUTION_CONTEXT: ContextVar[ExecutionContext | None] = ContextVar(
@@ -2307,10 +2572,58 @@ def _tool_category(tool_name: str, confirmation_domain: str) -> str:
         return "filesystem"
     if tool_name in {
         "click", "find_and_click", "press_key", "desktop_click",
-        "desktop_press", "fill_form_field", "navigate", "open_browser",
+        "desktop_press", "desktop_type", "fill", "fill_form_field",
+        "navigate", "open_browser", "type_text",
     }:
         return "browser"
     return "native"
+
+
+def _derived_request_constraints(
+    arguments: Mapping[str, Any],
+    scope: NormalizedScope,
+    supplied: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Add only exact values already supported by deterministic normalizers."""
+
+    constraints = dict(supplied or {})
+    amount = arguments.get("amount_minor")
+    currency = arguments.get("currency")
+    if "amount_minor" not in constraints and type(amount) is int and amount >= 0:
+        constraints["amount_minor"] = amount
+    if (
+        "request_currency" not in constraints
+        and isinstance(currency, str)
+        and re.fullmatch(r"[A-Za-z]{3}", currency)
+    ):
+        constraints["request_currency"] = currency.upper()
+
+    if "destination_origin" not in constraints:
+        for field_name in (
+            "merchant_origin", "destination_url", "target_url", "origin", "url",
+        ):
+            candidate = arguments.get(field_name)
+            if not isinstance(candidate, str) or not candidate:
+                continue
+            try:
+                web_scope = normalize_web_scope(
+                    candidate, kind=WebScopeKind.EXACT_ORIGIN,
+                )
+                constraints["destination_origin"] = json.loads(
+                    web_scope.private_canonical
+                )["identity"]
+            except (KeyError, TypeError, ValueError, ScopeNormalizationError):
+                pass
+            break
+
+    if "connector_id" not in constraints and scope.kind == "connector":
+        try:
+            connector_id = json.loads(scope.private_canonical)["connector_id"]
+            if isinstance(connector_id, str):
+                constraints["connector_id"] = connector_id
+        except (KeyError, TypeError, ValueError):
+            pass
+    return _validate_constraint_mapping(constraints, grant=False)
 
 
 def build_permission_request(
@@ -2411,7 +2724,9 @@ def build_permission_request(
         operation_id=context.operation_id,
         execution_context=context,
         tool_category=_tool_category(identity, confirmation_domain),
-        optional_constraints=dict(optional_constraints or {}),
+        optional_constraints=_derived_request_constraints(
+            values, scope, optional_constraints,
+        ),
         ambiguous_legacy_identity=ambiguous,
     )
 
@@ -2727,6 +3042,84 @@ def revoke_all_grants(*, policy: PermissionPolicy | None = None):
 
 def revoke_full_access(*, policy: PermissionPolicy | None = None):
     return (policy or get_default_permission_policy()).store.revoke_full_access()
+
+
+def activate_full_access(
+    *,
+    activation_proof,
+    policy: PermissionPolicy | None = None,
+):
+    return (policy or get_default_permission_policy()).store.activate_full_access(
+        activation_proof=activation_proof,
+    )
+
+
+def update_full_access_constraints(
+    *, policy: PermissionPolicy | None = None, **constraints,
+):
+    return (
+        policy or get_default_permission_policy()
+    ).store.update_full_access_constraints(**constraints)
+
+
+def update_automatic_permission(
+    category: str,
+    enabled: bool,
+    *,
+    policy: PermissionPolicy | None = None,
+):
+    return (
+        policy or get_default_permission_policy()
+    ).store.update_automatic_permissions({category: enabled})
+
+
+def apply_default_access(*, policy: PermissionPolicy | None = None):
+    return (
+        policy or get_default_permission_policy()
+    ).store.apply_default_access()
+
+
+def permission_center_snapshot(*, policy: PermissionPolicy | None = None):
+    return (
+        policy or get_default_permission_policy()
+    ).store.permission_center_snapshot()
+
+
+def revoke_permission_center_grant(
+    row_token: str, *, policy: PermissionPolicy | None = None,
+):
+    return (
+        policy or get_default_permission_policy()
+    ).store.revoke_center_grant(row_token)
+
+
+def revoke_permission_center_group(
+    group_token: str, *, policy: PermissionPolicy | None = None,
+):
+    return (
+        policy or get_default_permission_policy()
+    ).store.revoke_center_group(group_token)
+
+
+def revoke_all_delegated_authority(*, policy: PermissionPolicy | None = None):
+    return (
+        policy or get_default_permission_policy()
+    ).store.revoke_all_delegated_authority()
+
+
+def clear_permission_journal(*, policy: PermissionPolicy | None = None) -> bool:
+    return (policy or get_default_permission_policy()).store.clear_journal()
+
+
+def record_permission_journal_event(
+    event_code: str,
+    *,
+    policy: PermissionPolicy | None = None,
+    **safe_fields,
+) -> bool:
+    return (
+        policy or get_default_permission_policy()
+    ).store.append_journal_event(event_code, **safe_fields)
 
 
 def reset_permissions_to_ask(*, policy: PermissionPolicy | None = None):
