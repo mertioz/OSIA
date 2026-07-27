@@ -1314,6 +1314,40 @@ def revoke_run_authorization(
     return result.public_metadata()
 
 
+def apply_external_permission_revocation(
+    st: dict,
+    *,
+    policy_epoch: int,
+    grant_ref: str | None = None,
+    revoke_all: bool = False,
+    save=state.save_task_state,
+) -> dict:
+    """Refresh a loaded run after the protected store revoked its authority."""
+
+    if not isinstance(st, dict) or type(policy_epoch) is not int or policy_epoch < 0:
+        raise ValueError("invalid_external_permission_revocation")
+    target = str(grant_ref or "")
+    refs = [str(item) for item in (st.get("grant_refs") or []) if str(item)]
+    st["grant_refs"] = [] if revoke_all else [item for item in refs if item != target]
+    st["policy_epoch"] = policy_epoch
+    st["pending_scope_extension"] = None
+    st["authorization_request"] = None
+    _clear_private_run(str(st.get("run_id") or ""))
+    st["revocation"] = {
+        "revoked": True,
+        "revoked_at": _now_iso(),
+        "reason_code": "run_authorization_revoked",
+    }
+    if st.get("run_state") not in {
+        "completed", "failed", "cancelled", "blocked_outcome_unknown",
+    }:
+        st["run_state"] = "suspended_authorization_revoked"
+        st["authorization_status"] = "revoked"
+    state.append_log(st, "authorization_revoked", ref=target or st.get("run_id"))
+    _safe_call(save, st)
+    return st
+
+
 def prepare_replan(st: dict, *, origin_ref: str = "desktop", policy=None) -> dict:
     """Increment plan revision and require a fresh review for the new plan tail."""
 
@@ -1512,7 +1546,8 @@ def mobile_safe_text(value: Any, *, limit: int = 240) -> str:
 
 __all__ = [
     "AUTHORIZATION_PROTOCOL_VERSION", "AuthorizationError",
-    "approve_scope_extension", "authorize_and_start",
+    "apply_external_permission_revocation", "approve_scope_extension",
+    "authorize_and_start",
     "bind_request_execution_context", "current_runtime",
     "derive_capability_proposal", "restore_planned_runtime_descriptors",
     "inject_proposal_requests",

@@ -2246,6 +2246,70 @@ def revoke_scheduled_task_authorization(task_id: str) -> dict[str, Any]:
         return _result_error(exc.code, exc.message)
 
 
+def refresh_after_permission_epoch(
+    policy_epoch: int,
+    *,
+    revoked_task_id: str | None = None,
+    revoke_all: bool = False,
+    full_access_disabled: bool = False,
+) -> None:
+    """Refresh persisted task state after an external protected-store revoke."""
+
+    if type(policy_epoch) is not int or policy_epoch < 0:
+        raise ValueError("invalid_policy_epoch")
+    target = str(revoked_task_id or "")
+    changed = False
+    with _JOBS_LOCK:
+        jobs = _load_jobs()
+        for job in jobs:
+            task_id = str(job.get("id") or "")
+            if not task_id:
+                continue
+            refs = [str(item) for item in (job.get("grant_refs") or []) if str(item)]
+            status = str(job.get("authorization_status") or "")
+            revoke_job = bool(
+                (target and task_id == target)
+                or (
+                    revoke_all
+                    and (refs or status in {AUTHORIZED, RUNNING})
+                )
+                or (
+                    full_access_disabled
+                    and not refs
+                    and status in {AUTHORIZED, RUNNING}
+                )
+            )
+            _forget_pending_for_task(task_id)
+            if revoke_job:
+                job["grant_refs"] = []
+                job["policy_epoch"] = policy_epoch
+                job["authorization_revision"] = (
+                    max(0, int(job.get("authorization_revision", 0))) + 1
+                )
+                if status != BLOCKED_OUTCOME_UNKNOWN:
+                    job["authorization_status"] = AUTHORIZATION_REVOKED
+                job["enabled"] = False
+                job["authorization_expires_at"] = None
+                job["authorization_bounds"] = None
+                job["updated_at"] = _iso()
+                job.pop("authorization_request", None)
+                changed = True
+                continue
+            if job.get("policy_epoch") != policy_epoch:
+                job["policy_epoch"] = policy_epoch
+                changed = True
+            if isinstance(job.get("authorization_request"), dict):
+                job.pop("authorization_request", None)
+                if status not in {BLOCKED_OUTCOME_UNKNOWN, DISABLED}:
+                    job["authorization_status"] = AUTHORIZATION_REQUIRED
+                    job["enabled"] = False
+                changed = True
+        if changed:
+            _save_jobs(jobs)
+    if changed:
+        _notify_changed()
+
+
 def _validate_control_envelope(
     envelope: dict[str, Any], *, authenticated_origin: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:

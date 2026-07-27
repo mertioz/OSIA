@@ -91,6 +91,7 @@ import contextvars
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -332,6 +333,9 @@ def load_or_create_token() -> str:
 
 
 MOBILE_TOKEN = load_or_create_token()
+_PERMISSION_SERVER_ID = hashlib.sha256(
+    ("osia-permission-server-v1\0" + MOBILE_TOKEN).encode("utf-8")
+).hexdigest()
 
 
 def _log_active_model() -> None:
@@ -624,6 +628,365 @@ app = FastAPI(title="OSIA Mobile Server", version=current_product_version())
 # disconnect.
 _WS_CLIENTS: set["_OutboundChannel"] = set()
 _MOBILE_CATALOGUE_BROADCAST_LOCK: asyncio.Lock | None = None
+
+_PERMISSION_REQUEST_CACHE_MAX = 512
+_PERMISSION_REQUEST_RETENTION_SECONDS = 600.0
+_PERMISSION_REQUESTS: "OrderedDict[str, dict]" = OrderedDict()
+_PERMISSION_REQUESTS_LOCK = threading.Lock()
+_PERMISSION_SESSIONS: set["_PermissionMobileSession"] = set()
+_PERMISSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_PERMISSION_REVOCATION_OPERATIONS = {
+    "revoke_temporary_permission",
+    "revoke_autonomous_run",
+    "revoke_scheduled_task",
+    "revoke_all_delegated_authority",
+    "disable_full_access",
+}
+_PERMISSION_REQUEST_FIELDS = {
+    "type", "schema_version", "request_id", "device_id", "session_id",
+    "expected_policy_epoch", "expected_snapshot_sequence", "operation",
+    "target_id", "expires_at",
+}
+
+
+def _permission_safe_id(value) -> str:
+    candidate = str(value or "")
+    return candidate if _PERMISSION_ID_RE.fullmatch(candidate) else ""
+
+
+def _purge_permission_requests(now: float) -> None:
+    with _PERMISSION_REQUESTS_LOCK:
+        expired = [
+            request_id
+            for request_id, record in _PERMISSION_REQUESTS.items()
+            if float(record.get("retain_until", 0.0)) <= now
+        ]
+        for request_id in expired:
+            _PERMISSION_REQUESTS.pop(request_id, None)
+        while len(_PERMISSION_REQUESTS) > _PERMISSION_REQUEST_CACHE_MAX:
+            _PERMISSION_REQUESTS.popitem(last=False)
+
+
+def _permission_request_statuses(
+    request_ids: tuple[str, ...], *, device_id: str,
+) -> tuple[dict, ...]:
+    now = time.time()
+    _purge_permission_requests(now)
+    statuses = []
+    with _PERMISSION_REQUESTS_LOCK:
+        for request_id in request_ids:
+            record = _PERMISSION_REQUESTS.get(request_id)
+            status = "unknown"
+            if record is not None and record.get("device_id") == device_id:
+                status = str(record.get("status") or "unknown")
+            statuses.append({"request_id": request_id, "status": status})
+    return tuple(statuses)
+
+
+async def _refresh_revoked_permission_contexts(result) -> None:
+    """Refresh loaded run/task state without changing dispatched outcomes."""
+
+    operation = str(getattr(result, "operation", "") or "")
+    epoch = int(getattr(result, "policy_epoch", 0) or 0)
+    execution_type = str(getattr(result, "execution_type", "") or "")
+    authority_ref = str(getattr(result, "authority_ref", "") or "")
+    revoke_all = operation == "revoke_all_delegated_authority"
+    revoke_run = operation == "revoke_autonomous_run" or (
+        operation == "revoke_temporary_permission"
+        and execution_type == "autonomous"
+    )
+    st = _autonomous.get("st")
+    if isinstance(st, dict):
+        same_run = revoke_all or (
+            revoke_run and str(st.get("run_id") or "") == authority_ref
+        )
+        disable_full = operation == "disable_full_access"
+        if same_run or disable_full:
+            orch = _autonomous.get("orch")
+            if orch is not None:
+                try:
+                    await asyncio.to_thread(orch.stop)
+                except Exception:
+                    pass
+            if same_run:
+                _aauthorization.apply_external_permission_revocation(
+                    st,
+                    policy_epoch=epoch,
+                    grant_ref=str(getattr(result, "grant_ref", "") or ""),
+                    revoke_all=(
+                        operation in {
+                            "revoke_autonomous_run",
+                            "revoke_all_delegated_authority",
+                        }
+                    ),
+                )
+            else:
+                _aauthorization.revalidate_loaded_authorization(
+                    st, origin_ref="mobile_revocation",
+                )
+                _astate.save_task_state(st)
+
+    try:
+        from osia import scheduled_tasks
+
+        scheduled_tasks.refresh_after_permission_epoch(
+            epoch,
+            revoked_task_id=(
+                authority_ref
+                if operation == "revoke_scheduled_task" or (
+                    operation == "revoke_temporary_permission"
+                    and execution_type == "scheduled"
+                )
+                else None
+            ),
+            revoke_all=revoke_all,
+            full_access_disabled=(operation == "disable_full_access"),
+        )
+    except Exception:
+        pass
+
+
+class _PermissionMobileSession:
+    """One authenticated connection's monotonic permission snapshot stream."""
+
+    def __init__(self, out: "_OutboundChannel", loop, store) -> None:
+        self.out = out
+        self.loop = loop
+        self.store = store
+        self.server_id = _PERMISSION_SERVER_ID
+        self.session_id = "permission-session:" + secrets.token_urlsafe(24)
+        self.device_id = ""
+        self.sequence = 0
+        self.active = False
+        self._suppress_epoch_snapshot = False
+        self._epoch_listener = self._on_epoch
+
+    def activate(self) -> None:
+        if self.active:
+            return
+        self.active = True
+        _PERMISSION_SESSIONS.add(self)
+        self.store.add_epoch_listener(self._epoch_listener)
+
+    def close(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        _PERMISSION_SESSIONS.discard(self)
+        self.store.remove_epoch_listener(self._epoch_listener)
+
+    def bind_device(self, value) -> bool:
+        device_id = _permission_safe_id(value)
+        if not device_id:
+            return False
+        if self.device_id and self.device_id != device_id:
+            return False
+        self.device_id = device_id
+        return True
+
+    def _on_epoch(self, _epoch: int) -> None:
+        if (
+            not self.active
+            or not self.device_id
+            or self._suppress_epoch_snapshot
+        ):
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self.send_snapshot(), self.loop)
+        except Exception:
+            pass
+
+    async def send_snapshot(
+        self, pending_request_ids: tuple[str, ...] = (),
+    ) -> dict | None:
+        if not self.active or not self.device_id:
+            return None
+        safe_ids = tuple(dict.fromkeys(
+            request_id
+            for request_id in (
+                _permission_safe_id(item) for item in pending_request_ids[:64]
+            )
+            if request_id
+        ))
+        pending = _permission_request_statuses(
+            safe_ids, device_id=self.device_id,
+        )
+        self.sequence += 1
+        frame = self.store.mobile_permission_snapshot(
+            server_id=self.server_id,
+            session_id=self.session_id,
+            sequence=self.sequence,
+            pending_requests=pending,
+        )
+        await self.out.send_json(frame)
+        return frame
+
+    async def _send_ack(
+        self,
+        *,
+        request_id: str,
+        base_epoch: int,
+        base_sequence: int,
+        status: str,
+        reason: str,
+        policy_epoch: int | None = None,
+    ) -> dict:
+        if policy_epoch is None:
+            policy_epoch = self.store.load_state().policy_epoch
+        frame = {
+            "type": "permission_revocation_ack",
+            "schema_version": 1,
+            "request_id": request_id,
+            "server_id": self.server_id,
+            "session_id": self.session_id,
+            "base_policy_epoch": base_epoch,
+            "base_snapshot_sequence": base_sequence,
+            "status": status,
+            "reason": reason,
+            "policy_epoch": int(policy_epoch),
+        }
+        await self.out.send_json(frame)
+        return frame
+
+    async def handle_revocation(self, message: dict) -> dict:
+        request_id = _permission_safe_id(message.get("request_id"))
+        base_epoch = message.get("expected_policy_epoch")
+        base_sequence = message.get("expected_snapshot_sequence")
+        safe_base_epoch = base_epoch if type(base_epoch) is int else -1
+        safe_base_sequence = base_sequence if type(base_sequence) is int else -1
+
+        async def reject(reason: str) -> dict:
+            return await self._send_ack(
+                request_id=request_id,
+                base_epoch=safe_base_epoch,
+                base_sequence=safe_base_sequence,
+                status="rejected",
+                reason=reason,
+            )
+
+        if set(message) != _PERMISSION_REQUEST_FIELDS:
+            return await reject("malformed_request")
+        if message.get("type") != "permission_revocation_request":
+            return await reject("malformed_request")
+        if message.get("schema_version") != 1:
+            return await reject("unsupported_schema")
+        if not request_id:
+            return await reject("malformed_request")
+        if not self.bind_device(message.get("device_id")):
+            return await reject("wrong_device")
+        if message.get("session_id") != self.session_id:
+            return await reject("wrong_session")
+        operation = str(message.get("operation") or "")
+        if operation not in _PERMISSION_REVOCATION_OPERATIONS:
+            return await reject("unsupported_operation")
+        target_id = str(message.get("target_id") or "")
+        if target_id and not _permission_safe_id(target_id):
+            return await reject("malformed_request")
+        expires_at = message.get("expires_at")
+        if (
+            isinstance(expires_at, bool)
+            or not isinstance(expires_at, (int, float))
+            or not math.isfinite(float(expires_at))
+            or float(expires_at) <= time.time()
+            or float(expires_at) > time.time() + 120.0
+        ):
+            return await reject("expired_request")
+        if safe_base_sequence != self.sequence:
+            return await reject("stale_snapshot")
+        state = self.store.load_state()
+        if safe_base_epoch != state.policy_epoch:
+            return await reject("stale_epoch")
+
+        _purge_permission_requests(time.time())
+        with _PERMISSION_REQUESTS_LOCK:
+            duplicate = _PERMISSION_REQUESTS.get(request_id)
+        if duplicate is not None:
+            same = (
+                duplicate.get("device_id") == self.device_id
+                and duplicate.get("operation") == operation
+                and duplicate.get("target_id") == target_id
+            )
+            if same and duplicate.get("status") in {"applied", "idempotent"}:
+                ack = await self._send_ack(
+                    request_id=request_id,
+                    base_epoch=safe_base_epoch,
+                    base_sequence=safe_base_sequence,
+                    status="idempotent",
+                    reason="already_applied",
+                    policy_epoch=int(duplicate.get("policy_epoch", state.policy_epoch)),
+                )
+                await self.send_snapshot((request_id,))
+                return ack
+            return await reject("duplicate_request")
+
+        record = {
+            "device_id": self.device_id,
+            "operation": operation,
+            "target_id": target_id,
+            "status": "pending",
+            "reason": "pending",
+            "policy_epoch": state.policy_epoch,
+            "retain_until": time.time() + _PERMISSION_REQUEST_RETENTION_SECONDS,
+        }
+        with _PERMISSION_REQUESTS_LOCK:
+            _PERMISSION_REQUESTS[request_id] = record
+            _PERMISSION_REQUESTS.move_to_end(request_id)
+
+        try:
+            self._suppress_epoch_snapshot = True
+            result = self.store.revoke_mobile_authority(
+                operation=operation,
+                target_id=target_id,
+                expected_policy_epoch=safe_base_epoch,
+            )
+        except Exception as exc:
+            from osia.permission_store import (
+                PermissionStoreCorrupt,
+                PermissionStoreError,
+                PersistentPermissionUnavailable,
+            )
+
+            if isinstance(exc, PersistentPermissionUnavailable):
+                reason = "changes_unavailable"
+            elif isinstance(exc, PermissionStoreCorrupt):
+                reason = "changes_unavailable"
+            elif isinstance(exc, PermissionStoreError):
+                reason = {
+                    "stale_policy_epoch": "stale_epoch",
+                    "unknown_mobile_target": "unknown_target",
+                    "unsupported_mobile_revocation": "unsupported_operation",
+                }.get(exc.code, "rejected")
+            else:
+                reason = "internal_failure"
+            with _PERMISSION_REQUESTS_LOCK:
+                record.update({
+                    "status": "rejected",
+                    "reason": reason,
+                    "policy_epoch": self.store.load_state().policy_epoch,
+                })
+            return await reject(reason)
+        finally:
+            self._suppress_epoch_snapshot = False
+
+        await _refresh_revoked_permission_contexts(result)
+        status = "applied" if result.changed else "idempotent"
+        reason = "applied" if result.changed else "already_revoked"
+        with _PERMISSION_REQUESTS_LOCK:
+            record.update({
+                "status": status,
+                "reason": reason,
+                "policy_epoch": result.policy_epoch,
+            })
+        ack = await self._send_ack(
+            request_id=request_id,
+            base_epoch=safe_base_epoch,
+            base_sequence=safe_base_sequence,
+            status=status,
+            reason=reason,
+            policy_epoch=result.policy_epoch,
+        )
+        await self.send_snapshot((request_id,))
+        return ack
 
 _CRON_NOTIFICATION_MAX = 30
 _CRON_NOTIFICATIONS: "deque[dict]" = deque(maxlen=_CRON_NOTIFICATION_MAX)
@@ -4660,6 +5023,13 @@ async def websocket_endpoint(ws: WebSocket):
     # its own context, so a confirm never reaches the wrong device.
     _turn_target.set((out, asyncio.get_running_loop()))
     loop = asyncio.get_running_loop()
+    from osia.action_policy import get_default_permission_policy
+
+    permission_session = _PermissionMobileSession(
+        out,
+        loop,
+        get_default_permission_policy().store,
+    )
     unsubscribe_scheduled_tasks = None
     unsubscribe_api_key_changes = None
     unsubscribe_account_changes = None
@@ -5168,6 +5538,8 @@ async def websocket_endpoint(ws: WebSocket):
                 print(f"[WS] auth attempt received (matches={matched})")
                 if matched:
                     authenticated = True
+                    permission_session.bind_device(msg.get("device_id"))
+                    permission_session.activate()
                     session_history = []
                     active_conv_id = None
                     # Track this client so server-initiated frames (e.g. a
@@ -5252,6 +5624,23 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "status", "content": "error"})
                 await ws.close(code=4001, reason="Not authenticated")
                 return
+
+            if msg_type == "get_permission_snapshot":
+                if msg.get("schema_version") != 1:
+                    continue
+                if not permission_session.bind_device(msg.get("device_id")):
+                    continue
+                pending_ids = msg.get("pending_request_ids", [])
+                if not isinstance(pending_ids, list) or any(
+                    not isinstance(item, str) for item in pending_ids
+                ):
+                    pending_ids = []
+                await permission_session.send_snapshot(tuple(pending_ids[:64]))
+                continue
+
+            if msg_type == "permission_revocation_request":
+                await permission_session.handle_revocation(msg)
+                continue
 
             # --- Conversation management ---
             if msg_type == "list_conversations":
@@ -7663,6 +8052,7 @@ async def websocket_endpoint(ws: WebSocket):
         except Exception:
             pass
     finally:
+        permission_session.close()
         legacy_uploads.cleanup(pending_files)
         attachment_batches.cleanup_disconnected()
         attachment_cleanup_task.cancel()

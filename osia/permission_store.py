@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import re
 import secrets
@@ -42,6 +43,17 @@ from osia.scope_normalization import (
 
 _JOURNAL_SCHEMA_VERSION = 1
 _JOURNAL_MAX_EVENTS = 200
+MOBILE_PERMISSION_SCHEMA_VERSION = 1
+_MOBILE_PERMISSION_OPERATIONS = {
+    "revoke_temporary_permission",
+    "revoke_autonomous_run",
+    "revoke_scheduled_task",
+    "revoke_all_delegated_authority",
+    "disable_full_access",
+}
+_MOBILE_PENDING_STATUSES = {
+    "pending", "applied", "idempotent", "rejected", "unknown",
+}
 _JOURNAL_EVENT_CODES = {
     "full_access_enabled", "full_access_disabled", "activation_failed",
     "grant_created", "grant_expired", "grant_revoked",
@@ -235,6 +247,34 @@ def _safe_code(value: Any, fallback: str = "") -> str:
 def _safe_choice(value: Any, allowed: set[str], fallback: str = "") -> str:
     candidate = str(value or "")
     return candidate if candidate in allowed else fallback
+
+
+def _mobile_action_label(grant: Grant) -> str:
+    """Return a fixed safe label code without projecting private scope data."""
+
+    category = _safe_choice(
+        grant.normalized_target_scope.safe_category,
+        _SAFE_CATEGORIES,
+        "unknown",
+    )
+    tool_category = _safe_choice(
+        grant.tool_category, _SAFE_TOOL_CATEGORIES, "unknown",
+    )
+    if category in {"local_path", "local_paths", "directory_tree"}:
+        return "files_and_folders"
+    if category == "local_command" or tool_category == "shell":
+        return "commands"
+    if category == "safe_local_setting":
+        return "device_settings"
+    if category == "connector_operation" or tool_category in {"gmail", "mcp"}:
+        return "connected_services"
+    if category in {"web_origin", "web_url"} or tool_category == "browser":
+        return "web_actions"
+    if category == "purchase":
+        return "payments"
+    if tool_category == "filesystem":
+        return "files_and_folders"
+    return "sensitive_action"
 
 
 def _append_event(
@@ -472,6 +512,18 @@ class RevocationResult:
         }
 
 
+@dataclass(frozen=True)
+class MobileRevocationResult:
+    """Internal result; raw refs in this object are never projected to mobile."""
+
+    changed: bool
+    policy_epoch: int
+    operation: str
+    execution_type: str = ""
+    grant_ref: str = ""
+    authority_ref: str = ""
+
+
 def _new_integrity(grant: Grant) -> Grant:
     staged = replace(grant, integrity_metadata="0" * 64)
     return replace(
@@ -573,6 +625,10 @@ class PermissionStore:
         self._corrupt = False
         self._center_grant_tokens: dict[str, str] = {}
         self._center_group_tokens: dict[str, tuple[str, str]] = {}
+        self._mobile_permission_targets: dict[
+            str, tuple[str, str, str]
+        ] = {}
+        self._mobile_permission_token_by_grant: dict[str, str] = {}
 
     @contextmanager
     def _cross_process_mutation_lock(self):
@@ -1318,6 +1374,335 @@ class PermissionStore:
             ))
         return True
 
+    def _mobile_token_for_grant_locked(self, grant: Grant) -> str:
+        token = self._mobile_permission_token_by_grant.get(grant.grant_id, "")
+        if not token:
+            token = "permission:" + secrets.token_urlsafe(24)
+            self._mobile_permission_token_by_grant[grant.grant_id] = token
+        authority_ref = ""
+        if grant.execution_type.value == "autonomous":
+            authority_ref = grant.run_id
+        elif grant.execution_type.value == "scheduled":
+            authority_ref = grant.scheduled_task_id
+        self._mobile_permission_targets[token] = (
+            grant.grant_id,
+            grant.execution_type.value,
+            authority_ref,
+        )
+        return token
+
+    def mobile_permission_snapshot(
+        self,
+        *,
+        server_id: str,
+        session_id: str,
+        sequence: int,
+        pending_requests: tuple[Mapping[str, Any], ...] = (),
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Build the strict, value-free canonical mobile projection (WOR-197)."""
+
+        safe_server_id = _safe_code(server_id)
+        safe_session_id = _safe_code(session_id)
+        if not safe_server_id or not safe_session_id:
+            raise ValueError("invalid_mobile_snapshot_identity")
+        if type(sequence) is not int or sequence < 1:
+            raise ValueError("invalid_mobile_snapshot_sequence")
+        current_time = float(time.time() if now is None else now)
+        if not math.isfinite(current_time) or current_time < 0.0:
+            raise ValueError("invalid_mobile_snapshot_time")
+
+        with self._lock:
+            state = self.load_state()
+            try:
+                settings = _full_access_settings_for_update(state)
+                _validate_permission_settings(settings)
+            except Exception:
+                settings = {
+                    "full_access": _default_full_access_settings(),
+                    "automatic_categories": {
+                        category: False
+                        for category in AUTOMATIC_PERMISSION_CATEGORIES
+                    },
+                }
+            automatic = {
+                category: bool(settings["automatic_categories"].get(category, False))
+                for category in AUTOMATIC_PERMISSION_CATEGORIES
+            }
+            full_access_active = (
+                state.permission_mode == PermissionMode.FULL_ACCESS
+            )
+            preset = (
+                "full_access"
+                if full_access_active
+                else "default_access" if not any(automatic.values()) else "mixed"
+            )
+            temporary_permissions: list[dict[str, Any]] = []
+            for grant in self._all_grants_locked(state):
+                if grant.exhausted or (
+                    grant.expires_at is not None
+                    and grant.expires_at <= current_time
+                ):
+                    continue
+                remaining_uses = (
+                    None if grant.max_uses is None
+                    else max(0, grant.max_uses - grant.use_count)
+                )
+                temporary_permissions.append({
+                    "action_label": _mobile_action_label(grant),
+                    "context": grant.execution_type.value,
+                    "expires_at": grant.expires_at,
+                    "remaining_uses": remaining_uses,
+                    "mobile_item_id": self._mobile_token_for_grant_locked(grant),
+                    "revocable": bool(self.secure_available and not self.corrupt),
+                })
+
+            journal = settings.get("journal", {})
+            raw_events = (
+                journal.get("events", []) if isinstance(journal, Mapping) else []
+            )
+            history = [
+                {
+                    "timestamp": float(event["timestamp"]),
+                    "event": _safe_choice(
+                        event.get("event_code"), _JOURNAL_EVENT_CODES,
+                        "authorization_required",
+                    ),
+                    "context": _safe_choice(
+                        event.get("execution_type"), _SAFE_EXECUTION_TYPES,
+                    ),
+                }
+                for event in raw_events[-30:]
+                if isinstance(event, Mapping)
+            ]
+            safe_pending = []
+            for item in pending_requests:
+                if not isinstance(item, Mapping):
+                    continue
+                request_id = _safe_code(item.get("request_id"))
+                status = _safe_choice(
+                    item.get("status"), _MOBILE_PENDING_STATUSES,
+                )
+                if request_id and status:
+                    safe_pending.append({
+                        "request_id": request_id,
+                        "status": status,
+                    })
+
+            return {
+                "type": "permission_snapshot",
+                "schema_version": MOBILE_PERMISSION_SCHEMA_VERSION,
+                "snapshot_id": "snapshot:" + secrets.token_urlsafe(18),
+                "server_id": safe_server_id,
+                "session_id": safe_session_id,
+                "policy_epoch": state.policy_epoch,
+                "sequence": sequence,
+                "generated_at": current_time,
+                "preset": preset,
+                "categories": automatic,
+                "full_access_active": full_access_active,
+                "protected_store": (
+                    "available"
+                    if self.secure_available and not self.corrupt
+                    else "unavailable"
+                ),
+                "temporary_permissions": temporary_permissions,
+                "history": history,
+                "pending_requests": safe_pending,
+            }
+
+    def revoke_mobile_authority(
+        self,
+        *,
+        operation: str,
+        target_id: str = "",
+        expected_policy_epoch: int,
+    ) -> MobileRevocationResult:
+        """Atomically apply one epoch-bound mobile revocation in the PC store."""
+
+        operation_code = str(operation or "")
+        if operation_code not in _MOBILE_PERMISSION_OPERATIONS:
+            raise PermissionStoreError("unsupported_mobile_revocation")
+        if type(expected_policy_epoch) is not int or expected_policy_epoch < 0:
+            raise PermissionStoreError("stale_policy_epoch")
+        target_token = str(target_id or "")
+        targeted = operation_code in {
+            "revoke_temporary_permission",
+            "revoke_autonomous_run",
+            "revoke_scheduled_task",
+        }
+        if targeted != bool(target_token):
+            raise PermissionStoreError("unknown_mobile_target")
+        if not self.secure_available:
+            raise PersistentPermissionUnavailable("secure_storage_required")
+
+        execution_type = ""
+        grant_ref = ""
+        authority_ref = ""
+        with self._lock, self._cross_process_mutation_lock():
+            state = self.load_state()
+            if self._corrupt:
+                raise PermissionStoreCorrupt("corrupt_store_requires_explicit_reset")
+            if state.policy_epoch != expected_policy_epoch:
+                raise PermissionStoreError("stale_policy_epoch")
+
+            if targeted:
+                target = self._mobile_permission_targets.get(target_token)
+                if target is None:
+                    raise PermissionStoreError("unknown_mobile_target")
+                grant_ref, execution_type, authority_ref = target
+                if (
+                    operation_code == "revoke_autonomous_run"
+                    and (execution_type != "autonomous" or not authority_ref)
+                ) or (
+                    operation_code == "revoke_scheduled_task"
+                    and (execution_type != "scheduled" or not authority_ref)
+                ):
+                    raise PermissionStoreError("unknown_mobile_target")
+
+            persistent = state.grants
+            session = dict(self._session_grants)
+            next_mode = state.permission_mode
+            settings = _full_access_settings_for_update(state)
+            changed = False
+            event_result = ""
+
+            if operation_code == "revoke_temporary_permission":
+                persistent = tuple(
+                    grant for grant in state.grants
+                    if grant.grant_id != grant_ref
+                )
+                session = {
+                    key: grant for key, grant in self._session_grants.items()
+                    if key != grant_ref
+                }
+                changed = (
+                    len(persistent) != len(state.grants)
+                    or len(session) != len(self._session_grants)
+                )
+                event_result = "one_grant"
+            elif operation_code == "revoke_autonomous_run":
+                persistent = tuple(
+                    grant for grant in state.grants
+                    if grant.run_id != authority_ref
+                )
+                session = {
+                    key: grant for key, grant in self._session_grants.items()
+                    if grant.run_id != authority_ref
+                }
+                changed = (
+                    len(persistent) != len(state.grants)
+                    or len(session) != len(self._session_grants)
+                )
+                event_result = "autonomous_run"
+            elif operation_code == "revoke_scheduled_task":
+                persistent = tuple(
+                    grant for grant in state.grants
+                    if grant.scheduled_task_id != authority_ref
+                )
+                session = {
+                    key: grant for key, grant in self._session_grants.items()
+                    if grant.scheduled_task_id != authority_ref
+                }
+                changed = (
+                    len(persistent) != len(state.grants)
+                    or len(session) != len(self._session_grants)
+                )
+                event_result = "scheduled_task"
+            elif operation_code == "disable_full_access":
+                changed = state.permission_mode == PermissionMode.FULL_ACCESS
+                if changed:
+                    settings["automatic_categories"] = {
+                        category: False
+                        for category in AUTOMATIC_PERMISSION_CATEGORIES
+                    }
+                    next_mode = (
+                        PermissionMode.TASK_SCOPED
+                        if persistent or session else PermissionMode.ASK
+                    )
+                    _append_event(
+                        settings,
+                        "full_access_disabled",
+                        authorization_source="full_access",
+                        result="disabled",
+                    )
+            else:
+                changed = bool(
+                    state.permission_mode != PermissionMode.ASK
+                    or state.grants
+                    or self._session_grants
+                    or any(settings["automatic_categories"].values())
+                )
+                if changed:
+                    if state.permission_mode == PermissionMode.FULL_ACCESS:
+                        _append_event(
+                            settings,
+                            "full_access_disabled",
+                            authorization_source="full_access",
+                            result="disabled",
+                        )
+                    if state.grants or self._session_grants:
+                        _append_event(
+                            settings, "grant_revoked", result="all_grants",
+                        )
+                    settings["automatic_categories"] = {
+                        category: False
+                        for category in AUTOMATIC_PERMISSION_CATEGORIES
+                    }
+                    persistent = ()
+                    session = {}
+                    next_mode = PermissionMode.ASK
+                    _append_event(
+                        settings,
+                        "delegated_authority_revoked",
+                        result="all_authority",
+                    )
+
+            if not changed:
+                return MobileRevocationResult(
+                    False,
+                    state.policy_epoch,
+                    operation_code,
+                    execution_type,
+                    grant_ref,
+                    authority_ref,
+                )
+            if event_result:
+                _append_event(settings, "grant_revoked", result=event_result)
+            _append_event(
+                settings,
+                "policy_epoch_changed",
+                result=(
+                    "full_access_disabled"
+                    if operation_code == "disable_full_access"
+                    else "authority_revoked"
+                    if operation_code == "revoke_all_delegated_authority"
+                    else "grants_revoked"
+                ),
+            )
+            if (
+                next_mode == PermissionMode.TASK_SCOPED
+                and not persistent
+                and not session
+            ):
+                next_mode = PermissionMode.ASK
+            _new_state, epoch = self._advance_epoch_locked(
+                state,
+                keep_persistent=persistent,
+                keep_session=session,
+                mode=next_mode,
+                optional_settings=settings,
+            )
+        self._notify_epoch(epoch)
+        return MobileRevocationResult(
+            True,
+            epoch,
+            operation_code,
+            execution_type,
+            grant_ref,
+            authority_ref,
+        )
+
     def permission_center_snapshot(self, *, now: float | None = None) -> dict[str, Any]:
         """Return a value-free desktop projection and ephemeral row handles."""
 
@@ -1738,6 +2123,7 @@ class PermissionStore:
 __all__ = [
     "BackendAvailability", "PermissionStore", "PermissionStoreCorrupt",
     "PermissionStoreError", "PersistentPermissionUnavailable",
+    "MOBILE_PERMISSION_SCHEMA_VERSION", "MobileRevocationResult",
     "RevocationResult", "SecureStorageBackend",
     "UnavailableSecureStorageBackend", "WindowsDPAPISecureStorageBackend",
     "default_secure_storage_backend",
