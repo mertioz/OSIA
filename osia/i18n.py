@@ -972,6 +972,43 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "WÃ¤hlen Sie ein gÃ¼ltiges Modell.",
         "es": "Elige un modelo vÃ¡lido.",
     },
+    "cron.authorization_line": {
+        "en": "Authorization: {status} · revision {revision} · {summary} · expires {expiration}",
+        "fr": "Autorisation : {status} · révision {revision} · {summary} · expire {expiration}",
+        "zh": "授权：{status} · 修订 {revision} · {summary} · 到期 {expiration}",
+        "ja": "承認: {status} · リビジョン {revision} · {summary} · 期限 {expiration}",
+        "de": "Autorisierung: {status} · Revision {revision} · {summary} · Ablauf {expiration}",
+        "es": "Autorización: {status} · revisión {revision} · {summary} · vence {expiration}",
+    },
+    "cron.no_expiration": {
+        "en": "not applicable", "fr": "sans objet", "zh": "不适用",
+        "ja": "該当なし", "de": "nicht zutreffend", "es": "no aplicable",
+    },
+    "cron.authorize": {
+        "en": "Authorize", "fr": "Autoriser", "zh": "授权",
+        "ja": "承認", "de": "Autorisieren", "es": "Autorizar",
+    },
+    "cron.reauthorize": {
+        "en": "Reauthorize", "fr": "Réautoriser", "zh": "重新授权",
+        "ja": "再承認", "de": "Erneut autorisieren", "es": "Reautorizar",
+    },
+    "cron.revoke_authorization": {
+        "en": "Revoke authorization", "fr": "Révoquer l’autorisation",
+        "zh": "撤销授权", "ja": "承認を取り消す",
+        "de": "Autorisierung widerrufen", "es": "Revocar autorización",
+    },
+    "cron.disable": {
+        "en": "Disable task", "fr": "Désactiver la tâche", "zh": "停用任务",
+        "ja": "タスクを無効化", "de": "Aufgabe deaktivieren",
+        "es": "Desactivar tarea",
+    },
+    "cron.authorization_required": {
+        "en": "Authorization is required before this task can run.",
+        "fr": "Une autorisation est requise avant l’exécution de cette tâche.",
+        "zh": "此任务运行前需要授权。", "ja": "このタスクの実行前に承認が必要です。",
+        "de": "Vor der Ausführung ist eine Autorisierung erforderlich.",
+        "es": "Se requiere autorización antes de ejecutar esta tarea.",
+    },
     "cron.every_minutes": {
         "en": "Every … minutes",
         "fr": "Toutes les … minutes",

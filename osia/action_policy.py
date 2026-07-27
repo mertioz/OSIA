@@ -781,6 +781,74 @@ def autonomous_permission_gate(
         return "ERROR: autonomous authorization unavailable; the action was not executed"
 
 
+def scheduled_permission_gate(
+    tool_name: str,
+    values: Mapping[str, Any],
+    *,
+    deletion_plan=None,
+) -> str | None:
+    """Evaluate every native Scheduled call through the central facade."""
+
+    context = _CURRENT_EXECUTION_CONTEXT.get()
+    if context is None or context.execution_type != ExecutionType.SCHEDULED:
+        return None
+    if tool_name.startswith("gmail_") or tool_name.startswith("mcp__"):
+        # Their wrappers evaluate the same policy at the remote dispatch edge.
+        return None
+    if pending_execution_permit_matches(tool_name, values):
+        return None
+    policy = get_default_permission_policy()
+    try:
+        classification = TRUSTED_CLEAR_CLASSIFICATION
+        if deletion_plan is not None:
+            classification = trusted_deletion_classification(
+                system_destruction=bool(deletion_plan.system_destruction),
+                colossal_deletion=bool(deletion_plan.colossal_deletion),
+            )
+        request = build_permission_request(
+            tool_name,
+            values,
+            confirmation_domain="action",
+            origin_id="osia",
+            deletion_classification=classification,
+            policy=policy,
+        )
+        from osia import scheduled_tasks
+
+        blocked = scheduled_tasks.validate_scheduled_permission_request(request)
+        if blocked:
+            scheduled_tasks.mark_scheduled_authorization_failure(
+                context.scheduled_task_id, blocked,
+            )
+            return f"ERROR: scheduled authorization blocked: {blocked}"
+        permission_decision = policy.evaluate(request)
+        if permission_decision.decision_type != DecisionType.ALLOW:
+            scheduled_tasks.mark_scheduled_authorization_failure(
+                context.scheduled_task_id, permission_decision.reason_code,
+            )
+            return permission_error_for_decision(permission_decision)
+        if permission_decision.authorization_source == AuthorizationSource.NONE:
+            return None
+        permit = policy.mint_permit(request, permission_decision)
+        if permit is None:
+            scheduled_tasks.mark_scheduled_authorization_failure(
+                context.scheduled_task_id, "execution_permit_unavailable",
+            )
+            return "ERROR: execution permit unavailable; the action was not executed"
+        hold_execution_permit(permit, request, policy=policy)
+        return None
+    except Exception:
+        try:
+            from osia import scheduled_tasks
+
+            scheduled_tasks.mark_scheduled_authorization_failure(
+                context.scheduled_task_id, "authorization_unavailable",
+            )
+        except Exception:
+            pass
+        return "ERROR: scheduled authorization unavailable; the action was not executed"
+
+
 def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | None:
     """Return an ``ERROR:`` string when a recognized action must not execute.
 
@@ -826,6 +894,12 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
     )
     if autonomous_error is not None:
         return autonomous_error
+
+    scheduled_error = scheduled_permission_gate(
+        tool, values, deletion_plan=deletion_plan,
+    )
+    if scheduled_error is not None:
+        return scheduled_error
 
     if decision.action_class == ActionClass.DISALLOWED and tool not in _READ_ONLY_TOOLS:
         if not _explicit_central_authority(tool, values):
@@ -1866,6 +1940,28 @@ class PermissionPolicy:
         if durable_block:
             return _decision(request, DecisionType.DENY, durable_block)
 
+        if request.execution_context.execution_type == ExecutionType.SCHEDULED:
+            try:
+                from osia import scheduled_tasks
+
+                scheduled_block = (
+                    scheduled_tasks.validate_scheduled_permission_request(request)
+                    if scheduled_tasks.is_bound_scheduled_context(
+                        request.execution_context
+                    ) else None
+                )
+            except Exception:
+                scheduled_block = "authorization_state_unavailable"
+            if scheduled_block:
+                try:
+                    scheduled_tasks.mark_scheduled_authorization_failure(
+                        request.execution_context.scheduled_task_id,
+                        scheduled_block,
+                    )
+                except Exception:
+                    pass
+                return _decision(request, DecisionType.DENY, scheduled_block)
+
         state = self.store.load_state()
         epoch = state.policy_epoch
         if request.execution_context.policy_epoch != epoch:
@@ -1930,7 +2026,8 @@ class PermissionPolicy:
             ConfirmationPolicy.FINAL_COMMIT_CONFIRMATION,
         }
         if (
-            request.execution_context.execution_type == ExecutionType.AUTONOMOUS
+            request.execution_context.execution_type
+            in {ExecutionType.AUTONOMOUS, ExecutionType.SCHEDULED}
             and request.effective_contract.side_effect != SideEffectClass.READ_ONLY
         ):
             sensitive = True
@@ -2292,6 +2389,14 @@ def build_permission_request(
         # A malformed Autonomous binding fails closed at evaluation through the
         # stale/missing run fields; ordinary chat remains unchanged.
         pass
+    if context.execution_type == ExecutionType.SCHEDULED:
+        from osia.scheduled_tasks import (
+            bind_request_execution_context,
+            is_bound_scheduled_context,
+        )
+
+        if is_bound_scheduled_context(context):
+            context = bind_request_execution_context(context, identity, call_hash)
     return PermissionRequest(
         tool_identity=identity,
         confirmation_domain=str(confirmation_domain),

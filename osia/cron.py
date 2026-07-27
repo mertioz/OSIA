@@ -128,10 +128,17 @@ def parse_schedule(spec: str) -> dict | None:
 
 def _job_signature(job: dict) -> tuple:
     """Stable identity for a job slot, used to detect in-place edits."""
+    model = job.get("model") if isinstance(job.get("model"), dict) else {}
     return (
         str(job.get("task", "")),
         str(job.get("schedule", "")),
         str(job.get("next_run_at", "")),
+        str(job.get("timezone", "")),
+        str(model.get("provider", "")),
+        str(model.get("id", "")),
+        int(job.get("task_revision", 0) or 0),
+        str(job.get("definition_hash", "")),
+        int(job.get("authorization_revision", 0) or 0),
     )
 
 
@@ -165,6 +172,7 @@ def _scheduled_execution_context(
     scheduled_for: datetime,
     signature: tuple | None,
     original_request_id: str | None = None,
+    authorization: dict | None = None,
 ) -> dict:
     """Return stable, body-free provenance for one scheduled occurrence."""
 
@@ -191,6 +199,16 @@ def _scheduled_execution_context(
             "recurring": kind != "once",
         },
     }
+    if isinstance(authorization, dict):
+        context.update({
+            "task_revision": int(authorization.get("task_revision", 0) or 0),
+            "definition_hash": str(authorization.get("definition_hash") or ""),
+            "authorization_revision": int(
+                authorization.get("authorization_revision", 0) or 0
+            ),
+            "policy_epoch": int(authorization.get("policy_epoch", 0) or 0),
+            "execution_mode": str(authorization.get("execution_mode") or "agent"),
+        })
     if original_request_id:
         context["original_request_id"] = str(original_request_id)
     return context
@@ -368,7 +386,12 @@ class CronManager:
             self._wake.clear()
 
     def _check_jobs(self, now: datetime) -> None:
-        jobs = get_setting("cron_jobs", []) or []
+        try:
+            from osia.scheduled_tasks import scheduler_jobs_snapshot
+
+            jobs = scheduler_jobs_snapshot()
+        except Exception:
+            jobs = get_setting("cron_jobs", []) or []
         if not isinstance(jobs, list):
             return
 
@@ -403,13 +426,12 @@ class CronManager:
                     job_index=idx, signature=sig, task_id=job.get("id"),
                     title=job.get("title"), model=job.get("model"),
                     original_request_id=job.get("original_request_id"))
-                # A one-shot job runs exactly once: as soon as it actually
-                # launches, flag it in-memory (so it never re-fires this
-                # session even if the persist below fails) and disable it on
-                # disk so it stays off across restarts.
+                # A one-shot job runs exactly once. Flag it in-memory as soon
+                # as it launches; persistent disable/revocation happens in the
+                # worker's terminal path so it cannot invalidate the authority
+                # that the already-launched occurrence still needs.
                 if launched and spec["kind"] == "once":
                     st["once_fired"] = True
-                    self._disable_once_job(idx, sig, job.get("id"))
 
         # Drop state for slots that no longer exist (jobs were removed).
         for stale in [i for i in self._state if i not in seen_indices]:
@@ -510,6 +532,40 @@ class CronManager:
         task = (task or "").strip()
         if not task:
             return False
+        try:
+            from osia.scheduled_tasks import preflight_scheduled_task
+
+            preflight = preflight_scheduled_task(str(task_id or ""))
+        except Exception:
+            preflight = {
+                "ok": False,
+                "authorization_status": "authorization_required",
+                "message": "authorization preflight unavailable",
+            }
+        if not preflight.get("ok"):
+            blocked_status = str(
+                preflight.get("authorization_status") or "authorization_required"
+            )
+            self._update_job_status(
+                job_index, signature, task_id,
+                last_status="blocked_authorization",
+                last_error=blocked_status,
+                authorization_status=blocked_status,
+            )
+            print(f"[CRON] authorization blocked before dispatch: {blocked_status}")
+            return False
+        current_job = preflight.get("job")
+        if isinstance(current_job, dict):
+            task = str(current_job.get("task") or "").strip()
+            schedule = str(current_job.get("schedule") or schedule)
+            conversation_id = current_job.get("conversation_id") or None
+            title = current_job.get("title") or title
+            model = current_job.get("model") if isinstance(
+                current_job.get("model"), dict
+            ) else model
+            original_request_id = (
+                current_job.get("original_request_id") or original_request_id
+            )
         # If another scheduled task is still running, leave this job's timing
         # state UNTOUCHED so it stays "due" and retries on the next tick. We must
         # NOT mark it done here: a daily "at HH:MM" run blocked at its fire time
@@ -530,7 +586,22 @@ class CronManager:
             scheduled_for=scheduled_for,
             signature=signature,
             original_request_id=original_request_id,
+            authorization=current_job if isinstance(current_job, dict) else None,
         )
+        try:
+            from osia.scheduled_tasks import mark_scheduled_task_running
+
+            if not mark_scheduled_task_running(execution_context):
+                self._busy.clear()
+                self._update_job_status(
+                    job_index, signature, task_id,
+                    last_status="blocked_authorization",
+                    last_error="authorization_stale",
+                )
+                return False
+        except Exception:
+            self._busy.clear()
+            return False
         st["last_run"] = now
         st["last_date"] = now.date()
         st["anchor_date"] = now.date()
@@ -578,11 +649,40 @@ class CronManager:
                 last_error = str(e)[:240]
                 print(f"[CRON] task failed: {e}")
             finally:
+                try:
+                    from osia.scheduled_tasks import (
+                        mark_scheduled_task_finished,
+                        record_scheduled_occurrence,
+                        scheduled_execution_block_state,
+                    )
+
+                    blocked = scheduled_execution_block_state(execution_context)
+                    occurrence_outcome = (
+                        "outcome_unknown" if blocked == "blocked_outcome_unknown"
+                        else "blocked_authorization" if blocked
+                        else "success_verified" if job_status.startswith("completed")
+                        else "failed_before_dispatch"
+                    )
+                    record_scheduled_occurrence(
+                        execution_context,
+                        outcome=occurrence_outcome,
+                    )
+                    mark_scheduled_task_finished(execution_context)
+                except Exception:
+                    pass
                 self._update_job_status(
                     job_index, signature, task_id,
                     last_status=job_status,
                     last_error=last_error,
                 )
+                try:
+                    spec = parse_schedule(schedule)
+                    if spec and spec.get("kind") == "once" and task_id:
+                        from osia.scheduled_tasks import disable_scheduled_task
+
+                        disable_scheduled_task(str(task_id))
+                except Exception as e:
+                    print(f"[CRON] could not disable completed one-shot: {e}")
                 self._notify_completion(
                     task_id=task_id,
                     title=title or task[:80],

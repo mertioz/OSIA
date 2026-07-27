@@ -42,6 +42,10 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "autonomous_abort"}                                       # WOR-45 P5: discard the autonomous run — marks state aborted then deletes the checkpoint
     {"type": "get_autonomous_status"}                                  # WOR-45 P5: request the current autonomous snapshot (or {event:"idle"}); a paused run reports {event:"interrupted"}; lets a phone reconnecting mid-run render progress
     {"type": "autonomous_resume"}                                      # WOR-45: resume a PAUSED (interrupted) autonomous run from its cursor (re-acquires the single-runner lock; refused with {event:"busy"} if another run holds it, {event:"idle"} if nothing is resumable)
+    {"type": "scheduled_task_authorization_request", "task_id": "..."}
+    {"type": "scheduled_task_authorization_response", "request_id": "...", "task_id": "...", "task_revision": int, "definition_hash": "...", "authorization_revision": int, "policy_epoch": int, "expiration": number, "origin_ref": "...", "action": "approve|deny"}
+    {"type": "scheduled_task_authorization_revoke", ...bound task fields...}
+    {"type": "scheduled_task_disable", ...bound task fields...}
   Server → Client:
     {"type": "api_keys",             "keys": {provider: key, ...}}     # actual stored keys, one entry per models.API_PROVIDERS ("" if unset)
     {"type": "heartbeat_config",     "config": {"enabled": bool, "interval_seconds": int}}
@@ -77,6 +81,7 @@ Protocol (JSON over WebSocket, port 8765):
                                      "tasks_done": int, "tasks_total": int, "phase_name": "...", "objective": "...", "status": "..."}
                                      # WOR-45 P5: autonomous-run progress. Broadcast to ALL clients on every engine/synthesized transition (the run is machine-global);
                                      # the host synthesizes running/interrupted/aborted/plan_failed/busy/idle and enriches every frame with the live task_state snapshot.
+    {"type": "scheduled_task_authorization_context|scheduled_task_authorization_request|scheduled_task_authorization_state", ...sanitized revision-bound fields...}
 """
 
 import asyncio
@@ -87,6 +92,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -824,8 +830,6 @@ async def _broadcast_conversations(exclude: "_OutboundChannel | None" = None) ->
 
 # ── MCP / Connectors server-side plumbing (WOR-44 Phase 4) ──────────────────
 def _cron_notification_frame(payload: dict) -> dict:
-    from osia.notifications import safe_task_title
-
     raw_status = str(payload.get("status") or "").strip().lower()
     status = "failed" if raw_status in {"failed", "error"} else "completed"
     created_at = str(payload.get("created_at") or "").strip()
@@ -836,6 +840,9 @@ def _cron_notification_frame(payload: dict) -> dict:
     note_id = str(payload.get("id") or "").strip()
     if not note_id:
         note_id = f"cron_note_{secrets.token_urlsafe(12).rstrip('=')}"
+    safe_category = str(payload.get("safe_category") or "scheduled_task").strip()
+    if not re.fullmatch(r"[a-z0-9_.:-]{1,64}", safe_category):
+        safe_category = "scheduled_task"
     correlation_digest = hashlib.sha256(note_id.encode("utf-8")).hexdigest()[:32]
     return {
         "type": "cron_notification",
@@ -849,8 +856,9 @@ def _cron_notification_frame(payload: dict) -> dict:
         "sequence": 1,
         "terminal": True,
         "task_id": task_id,
-        "title": safe_task_title(payload.get("title")),
+        "title": "Scheduled task",
         "status": status,
+        "safe_category": safe_category,
         "conversation_id": conversation_id,
         "created_at": created_at,
     }
@@ -1976,6 +1984,14 @@ def _build_config_snapshot() -> dict:
     from osia.config import load_settings, load_api_keys, get_setting
     from osia import personality
     cfg = load_settings()
+    try:
+        from osia import scheduled_tasks
+
+        cfg["cron_jobs"] = scheduled_tasks.sanitized_mobile_jobs(
+            cfg.get("cron_jobs")
+        )
+    except Exception:
+        cfg["cron_jobs"] = []
     cfg["reasoning"] = _normalize_mobile_reasoning_setting(cfg.get("reasoning"))
     cfg["mcp_servers"] = _sanitize_mobile_mcp_servers(cfg.get("mcp_servers"))
     cfg["gmail_rest"] = _gmail_rest_config_snapshot()
@@ -3374,7 +3390,11 @@ def _server_run_cron_task(
                     current_conversation_id=conversation_id,
                 )
             display = clean_response(reply or "")
-            conversations.add_message(conversation_id, "user", task_text)
+            conversations.add_message(
+                conversation_id,
+                "user",
+                "Scheduled task" if scheduled_execution is not None else task_text,
+            )
             conversations.add_message(conversation_id, "assistant", display)
             try:
                 loop = _SERVER_CRON_LOOP
@@ -3398,6 +3418,14 @@ def _server_run_cron_task(
                 "conversation_stale": True,
                 "message": "linked conversation not found; ran unlinked",
             }
+        if scheduled_execution is not None:
+            from osia import scheduled_tasks
+
+            blocked = scheduled_tasks.scheduled_execution_block_state(
+                scheduled_execution
+            )
+            if blocked:
+                return {"status": "failed", "message": blocked}
         return {"status": "completed"}
     except Exception as e:
         print(f"[OSIA Server CRON] task error: {e}")
@@ -3414,18 +3442,18 @@ def _server_notify_cron_task(
     status: str,
     conversation_id: str | None,
 ) -> None:
-    from osia.notifications import notify, safe_task_title
+    from osia.notifications import notify
 
-    safe_title = safe_task_title(title)
     if status == "failed":
-        body = f"Tâche planifiée échouée: {safe_title}"
+        body = "Tâche planifiée échouée"
     else:
-        body = f"Tâche planifiée terminée: {safe_title}"
+        body = "Tâche planifiée terminée"
     notify("OSIA", body)
     frame = _cron_notification_frame({
         "task_id": task_id,
-        "title": safe_title,
+        "title": "Scheduled task",
         "status": status,
+        "safe_category": "scheduled_task",
         "conversation_id": conversation_id,
     })
     _remember_cron_notification(frame)
@@ -5167,6 +5195,11 @@ async def websocket_endpoint(ws: WebSocket):
                         ),
                         "origin_ref": authorization_origin_ref,
                     })
+                    await ws.send_json({
+                        "type": "scheduled_task_authorization_context",
+                        "protocol_version": 1,
+                        "origin_ref": authorization_origin_ref,
+                    })
                     print("[WS] auth OK, sending: status/done")
                     try:
                         items = conversations.list_conversations()
@@ -5649,6 +5682,84 @@ async def websocket_endpoint(ws: WebSocket):
                     ),
                     daemon=True,
                 ).start()
+                continue
+
+            if msg_type == "scheduled_task_authorization_request":
+                from osia import scheduled_tasks
+
+                result = scheduled_tasks.begin_scheduled_task_authorization(
+                    str(msg.get("task_id") or ""),
+                    origin_ref=authorization_origin_ref,
+                    mobile=True,
+                    ttl_seconds=msg.get("ttl_seconds", 30 * 24 * 60 * 60),
+                    max_executions=msg.get("max_executions"),
+                )
+                if result.get("ok") and isinstance(result.get("request"), dict):
+                    await out.send_json(result["request"])
+                else:
+                    await out.send_json({
+                        "type": "scheduled_task_authorization_state",
+                        "task_id": str(msg.get("task_id") or ""),
+                        "ok": bool(result.get("ok")),
+                        "code": str(result.get("code") or ""),
+                        "authorization_status": (
+                            "pc_local_review_required"
+                            if result.get("code") == "pc_local_review_required"
+                            else "authorization_required"
+                        ),
+                    })
+                continue
+
+            if msg_type == "scheduled_task_authorization_response":
+                from osia import scheduled_tasks
+
+                response = {
+                    key: msg.get(key) for key in (
+                        "protocol_version", "request_id", "task_id",
+                        "task_revision", "definition_hash",
+                        "authorization_revision", "policy_epoch", "expiration",
+                        "origin_ref", "action",
+                    )
+                }
+                result = scheduled_tasks.respond_scheduled_task_authorization(
+                    response,
+                    authenticated_origin=authorization_origin_ref,
+                )
+                await out.send_json({
+                    "type": "scheduled_task_authorization_state",
+                    "task_id": str(msg.get("task_id") or ""),
+                    **result,
+                })
+                continue
+
+            if msg_type in {
+                "scheduled_task_authorization_revoke",
+                "scheduled_task_disable",
+            }:
+                from osia import scheduled_tasks
+
+                envelope = {
+                    key: msg.get(key) for key in (
+                        "protocol_version", "task_id", "task_revision",
+                        "definition_hash", "authorization_revision",
+                        "policy_epoch", "expiration", "origin_ref",
+                    )
+                }
+                if msg_type == "scheduled_task_authorization_revoke":
+                    result = scheduled_tasks.revoke_scheduled_task_authorization_bound(
+                        envelope,
+                        authenticated_origin=authorization_origin_ref,
+                    )
+                else:
+                    result = scheduled_tasks.disable_scheduled_task_bound(
+                        envelope,
+                        authenticated_origin=authorization_origin_ref,
+                    )
+                await out.send_json({
+                    "type": "scheduled_task_authorization_state",
+                    "task_id": str(msg.get("task_id") or ""),
+                    **result,
+                })
                 continue
 
             if msg_type == "autonomous_authorization_response":

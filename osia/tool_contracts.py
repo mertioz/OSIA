@@ -564,7 +564,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               real=RealValidationRequirement.USER_VISIBLE),
         _spec("set_volume", "Set local output volume",
               _object({"level": _integer(0, 100)}, required=("level",)), RL, I, NC,
-              real=RealValidationRequirement.USER_VISIBLE),
+              real=RealValidationRequirement.USER_VISIBLE, verified=True),
         _spec("get_clipboard", "Read bounded clipboard text", _object(), R, I, NC,
               progress=state, real=RealValidationRequirement.USER_VISIBLE,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),

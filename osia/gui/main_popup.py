@@ -4496,6 +4496,61 @@ class _SettingsPanel(QWidget):
         model_row.addWidget(model_label)
         model_row.addWidget(model_combo, 1)
         v.addLayout(model_row)
+
+        auth_status = str(job.get("authorization_status") or "authorization_required")
+        revision = int(job.get("task_revision", 0) or 0)
+        summary = ", ".join(
+            str(item) for item in (job.get("capability_summary") or [])
+        ) or "dynamic_scope_requires_review"
+        bounds = job.get("authorization_bounds")
+        if isinstance(bounds, dict) and bounds.get("mode"):
+            bounds_text = str(bounds["mode"])
+            if bounds.get("max_executions") is not None:
+                bounds_text += f" ({int(bounds['max_executions'])} max)"
+            summary = f"{summary}; {bounds_text}"
+        expires = job.get("authorization_expires_at")
+        expiration_text = i18n.t("cron.no_expiration")
+        if expires is not None:
+            try:
+                expiration_text = datetime.fromtimestamp(
+                    float(expires)
+                ).astimezone().isoformat(timespec="minutes")
+            except (TypeError, ValueError, OverflowError, OSError):
+                expiration_text = str(expires)
+        auth_text = i18n.t(
+            "cron.authorization_line",
+            status=auth_status,
+            revision=revision,
+            summary=summary,
+            expiration=expiration_text,
+        )
+        auth_label = QLabel(auth_text)
+        auth_label.setObjectName("providerSub")
+        auth_label.setWordWrap(True)
+        v.addWidget(auth_label)
+
+        auth_buttons = QHBoxLayout()
+        authorize = QPushButton(
+            i18n.t(
+                "cron.reauthorize" if auth_status == "authorized"
+                else "cron.authorize"
+            )
+        )
+        authorize.setObjectName("ghostBtn")
+        authorize.clicked.connect(
+            lambda _=False, i=index: self._on_cron_authorize(i)
+        )
+        revoke = QPushButton(i18n.t("cron.revoke_authorization"))
+        revoke.setObjectName("ghostBtn")
+        revoke.clicked.connect(lambda _=False, i=index: self._on_cron_revoke(i))
+        disable = QPushButton(i18n.t("cron.disable"))
+        disable.setObjectName("ghostBtn")
+        disable.clicked.connect(lambda _=False, i=index: self._on_cron_disable(i))
+        auth_buttons.addWidget(authorize)
+        auth_buttons.addWidget(revoke)
+        auth_buttons.addWidget(disable)
+        auth_buttons.addStretch()
+        v.addLayout(auth_buttons)
         return row
 
     def _cron_model_choices(self) -> list[tuple[str, dict]]:
@@ -4785,6 +4840,65 @@ class _SettingsPanel(QWidget):
             self._cron_jobs.pop(index)
             self._persist_cron()
             self._render_cron()
+
+    def _reload_cron_authorization_state(self) -> None:
+        from osia import scheduled_tasks
+
+        result = scheduled_tasks.list_scheduled_tasks()
+        if result.get("ok"):
+            self._cron_jobs = result.get("tasks", [])
+        self._render_cron()
+
+    def _on_cron_authorize(self, index: int) -> None:
+        if not (0 <= index < len(self._cron_jobs)):
+            return
+        from osia import scheduled_tasks
+
+        job = self._cron_jobs[index]
+        detail = (
+            f"{job.get('task', '')}\n\n"
+            f"{', '.join(job.get('capability_summary') or [])}"
+        )
+        answer = QMessageBox.question(
+            self,
+            i18n.t("cron.authorize"),
+            detail,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        result = scheduled_tasks.authorize_scheduled_task(
+            str(job.get("id") or ""),
+            origin_ref="desktop",
+        )
+        if not result.get("ok"):
+            self._set_cron_error(
+                str(result.get("message") or i18n.t("cron.authorization_required"))
+            )
+        else:
+            self._set_cron_error(None)
+        self._reload_cron_authorization_state()
+
+    def _on_cron_revoke(self, index: int) -> None:
+        if not (0 <= index < len(self._cron_jobs)):
+            return
+        from osia import scheduled_tasks
+
+        scheduled_tasks.revoke_scheduled_task_authorization(
+            str(self._cron_jobs[index].get("id") or "")
+        )
+        self._reload_cron_authorization_state()
+
+    def _on_cron_disable(self, index: int) -> None:
+        if not (0 <= index < len(self._cron_jobs)):
+            return
+        from osia import scheduled_tasks
+
+        scheduled_tasks.disable_scheduled_task(
+            str(self._cron_jobs[index].get("id") or "")
+        )
+        self._reload_cron_authorization_state()
 
     def _cron_pill_text(self, conv_id) -> str:
         """Short pill label for a cron row's linked conversation: the

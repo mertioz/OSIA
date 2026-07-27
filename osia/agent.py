@@ -2157,22 +2157,128 @@ def tool_kill_process(name_or_pid) -> str:
     return " | ".join(parts)
 
 
+def _set_windows_volume_percent(pct: int) -> int:
+    """Set and read back the Windows Core Audio endpoint volume."""
+
+    from ctypes import POINTER, c_float, c_int, c_void_p, cast
+    from ctypes.wintypes import DWORD, UINT
+
+    from comtypes import (
+        CLSCTX_ALL, COMMETHOD, GUID, HRESULT, IUnknown,
+        CoCreateInstance, CoInitialize, CoUninitialize,
+    )
+
+    class _IAudioEndpointVolume(IUnknown):
+        _iid_ = GUID("{5CDF2C82-841E-4546-9722-0CF74078229A}")
+        _methods_ = [
+            COMMETHOD([], HRESULT, "RegisterControlChangeNotify",
+                      (["in"], c_void_p, "pNotify")),
+            COMMETHOD([], HRESULT, "UnregisterControlChangeNotify",
+                      (["in"], c_void_p, "pNotify")),
+            COMMETHOD([], HRESULT, "GetChannelCount",
+                      (["out"], POINTER(UINT), "pnChannelCount")),
+            COMMETHOD([], HRESULT, "SetMasterVolumeLevel",
+                      (["in"], c_float, "fLevelDB"),
+                      (["in"], c_void_p, "pguidEventContext")),
+            COMMETHOD([], HRESULT, "SetMasterVolumeLevelScalar",
+                      (["in"], c_float, "fLevel"),
+                      (["in"], c_void_p, "pguidEventContext")),
+            COMMETHOD([], HRESULT, "GetMasterVolumeLevel",
+                      (["out"], POINTER(c_float), "pfLevelDB")),
+            COMMETHOD([], HRESULT, "GetMasterVolumeLevelScalar",
+                      (["out"], POINTER(c_float), "pfLevel")),
+        ]
+
+    class _IMMDevice(IUnknown):
+        _iid_ = GUID("{D666063F-1587-4E43-81F1-B948E807363F}")
+        _methods_ = [
+            COMMETHOD([], HRESULT, "Activate",
+                      (["in"], POINTER(GUID), "iid"),
+                      (["in"], DWORD, "dwClsCtx"),
+                      (["in"], c_void_p, "pActivationParams"),
+                      (["out", "retval"], POINTER(c_void_p), "ppInterface")),
+        ]
+
+    class _IMMDeviceEnumerator(IUnknown):
+        _iid_ = GUID("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+        _methods_ = [
+            COMMETHOD([], HRESULT, "EnumAudioEndpoints",
+                      (["in"], c_int, "dataFlow"),
+                      (["in"], DWORD, "dwStateMask"),
+                      (["out", "retval"], POINTER(c_void_p), "ppDevices")),
+            COMMETHOD([], HRESULT, "GetDefaultAudioEndpoint",
+                      (["in"], c_int, "dataFlow"),
+                      (["in"], c_int, "role"),
+                      (["out", "retval"], POINTER(POINTER(_IMMDevice)),
+                       "ppEndpoint")),
+        ]
+
+    CoInitialize()
+    try:
+        enumerator = CoCreateInstance(
+            GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}"),
+            interface=_IMMDeviceEnumerator,
+            clsctx=CLSCTX_ALL,
+        )
+        device = enumerator.GetDefaultAudioEndpoint(0, 1)
+        raw_endpoint = device.Activate(
+            _IAudioEndpointVolume._iid_, CLSCTX_ALL, None,
+        )
+        endpoint = cast(raw_endpoint, POINTER(_IAudioEndpointVolume))
+        endpoint.SetMasterVolumeLevelScalar(pct / 100.0, None)
+        return round(endpoint.GetMasterVolumeLevelScalar() * 100)
+    finally:
+        CoUninitialize()
+
+
 def tool_set_volume(level) -> str:
-    """Set system volume to ``level`` percent (0-100) on the default sink
-    via pactl (works on PulseAudio and PipeWire).
-    """
+    """Set and verify system output volume from 0 to 100 percent."""
     try:
         pct = int(level)
     except (TypeError, ValueError):
         return f"ERROR: level must be an integer 0-100, got {level!r}"
     pct = max(0, min(100, pct))
     try:
+        if sys.platform == "win32":
+            actual = _set_windows_volume_percent(pct)
+            if abs(actual - pct) > 1:
+                return "ERROR: setting volume: verification failed"
+            return f"Volume set to {pct}%"
+        if sys.platform == "darwin":
+            result = subprocess.run(
+                [
+                    "osascript", "-e",
+                    f"set volume output volume {pct}\n"
+                    "output volume of (get volume settings)",
+                ],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                return (
+                    "ERROR: setting volume: "
+                    f"{result.stderr.strip() or 'osascript failed'}"
+                )
+            actual = int(result.stdout.strip().splitlines()[-1])
+            if abs(actual - pct) > 1:
+                return "ERROR: setting volume: verification failed"
+            return f"Volume set to {pct}%"
         result = subprocess.run(
             ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{pct}%"],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
             return f"ERROR: setting volume: {result.stderr.strip() or 'pactl failed'}"
+        verified = subprocess.run(
+            ["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
+            capture_output=True, text=True, timeout=5,
+        )
+        levels = [int(value) for value in re.findall(r"(\d+)%", verified.stdout)]
+        if (
+            verified.returncode != 0
+            or not levels
+            or any(abs(value - pct) > 1 for value in levels)
+        ):
+            return "ERROR: setting volume: verification failed"
         return f"Volume set to {pct}%"
     except FileNotFoundError:
         return "ERROR: pactl is not installed"
@@ -6123,9 +6229,48 @@ class OSIAAgent:
             raise ValueError("scheduled execution source must be scheduled_task")
         if not context.get("task_id") or not context.get("occurrence_id"):
             raise ValueError("scheduled execution correlation is incomplete")
+        from osia.action_policy import (
+            ExecutionType,
+            execution_context_scope,
+            get_default_permission_policy,
+            make_execution_context,
+        )
+        from osia import scheduled_tasks as _scheduled_authorization
+
+        has_authorization_binding = all(
+            key in context for key in (
+                "task_revision", "definition_hash", "authorization_revision",
+            )
+        )
+        if has_authorization_binding:
+            policy_context = (
+                _scheduled_authorization.execution_context_for_scheduled_occurrence(
+                    context
+                )
+            )
+        else:
+            # Compatibility for direct read-only synthetic callers.  Any actual
+            # tool call still fails closed because no stored task can match this
+            # deliberately incomplete Scheduled binding.
+            policy = get_default_permission_policy()
+            policy_context = make_execution_context(
+                execution_type=ExecutionType.SCHEDULED,
+                interactive=False,
+                scheduled_task_id=str(context["task_id"]),
+                task_revision="legacy",
+                plan_revision="legacy",
+                execution_id=str(context["occurrence_id"]),
+                operation_id=(
+                    "schedlegacy:" + hashlib.sha256(
+                        str(context["occurrence_id"]).encode("utf-8")
+                    ).hexdigest()[:40]
+                ),
+                store=policy.store,
+            )
         token = _SCHEDULED_EXECUTION_CONTEXT.set(context)
         try:
-            return self.run(user_input, **run_kwargs)
+            with execution_context_scope(policy_context):
+                return self.run(user_input, **run_kwargs)
         finally:
             self.messages = [
                 message for message in self.messages
@@ -6740,16 +6885,27 @@ class OSIAAgent:
                             from osia.action_policy import (
                                 autonomous_permission_gate,
                                 pending_execution_permit_matches,
+                                scheduled_permission_gate,
                             )
 
                             autonomous_policy_error = autonomous_permission_gate(
                                 tool_name, kwargs,
                             )
+                            if (
+                                autonomous_policy_error is None
+                                and tool_name == "save_memory"
+                            ):
+                                autonomous_policy_error = scheduled_permission_gate(
+                                    tool_name, kwargs,
+                                )
                             autonomous_execution_permit = (
                                 pending_execution_permit_matches(tool_name, kwargs)
                             )
                         except Exception:
                             autonomous_policy_error = (
+                                "ERROR: scheduled authorization unavailable; "
+                                "the action was not executed"
+                                if scheduled_execution is not None else
                                 "ERROR: autonomous authorization unavailable; "
                                 "the action was not executed"
                             )
@@ -6908,6 +7064,17 @@ class OSIAAgent:
                         # Autonomous runtime.  In Autonomous, facade decisions
                         # already fail closed before this outcome hook.
                         pass
+                    try:
+                        _scheduled_tasks.record_scheduled_tool_execution(
+                            scheduled_execution,
+                            tool_name,
+                            kwargs,
+                            execution_record,
+                        )
+                    except Exception:
+                        # The Scheduled facade already fails closed before any
+                        # gated dispatch; outcome persistence cannot broaden it.
+                        pass
                     if execution_record.dispatched:
                         any_tool_executed = True
                     if (
@@ -7054,6 +7221,23 @@ class OSIAAgent:
                     )
                 except Exception:
                     autonomous_run_state = ""
+                scheduled_block_state = (
+                    _scheduled_tasks.scheduled_execution_block_state(
+                        scheduled_execution
+                    )
+                    if (
+                        isinstance(scheduled_execution, dict)
+                        and scheduled_execution.get("definition_hash")
+                        and scheduled_execution.get("task_revision") is not None
+                        and scheduled_execution.get("authorization_revision")
+                        is not None
+                    ) else ""
+                )
+                if scheduled_block_state:
+                    return (
+                        "ERROR: scheduled authorization suspended before dispatch: "
+                        f"{scheduled_block_state}"
+                    )
                 if autonomous_run_state in {
                     "suspended_scope_extension",
                     "suspended_authorization_revoked",

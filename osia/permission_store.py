@@ -588,6 +588,52 @@ class PermissionStore:
                     return False
             return True
 
+    def scheduled_grant_refs_status(
+        self,
+        grant_refs,
+        *,
+        task_id: str,
+        task_revision: int,
+        authorization_binding: str,
+        now: float,
+    ) -> str:
+        """Validate opaque Scheduled Task refs without exposing grant content."""
+
+        refs = tuple(str(ref or "") for ref in (grant_refs or ()))
+        if not refs:
+            return "missing_grant"
+        with self._lock:
+            permission_state = self.load_state()
+            by_id = {
+                grant.grant_id: grant
+                for grant in self._all_grants_locked(permission_state)
+            }
+            for grant_ref in refs:
+                grant = by_id.get(grant_ref)
+                if grant is None:
+                    return "missing_grant"
+                if not grant.integrity_is_valid():
+                    return "corrupt_grant"
+                if grant.policy_version != POLICY_VERSION:
+                    return "wrong_policy_version"
+                if grant.execution_type.value != "scheduled":
+                    return "wrong_execution_type"
+                if grant.run_id:
+                    return "wrong_run"
+                if grant.scheduled_task_id != str(task_id or ""):
+                    return "wrong_scheduled_task"
+                if grant.task_revision != str(int(task_revision)):
+                    return "wrong_task_revision"
+                if grant.plan_revision != str(authorization_binding or ""):
+                    return "wrong_authorization_binding"
+                if grant.revocation_epoch != permission_state.policy_epoch:
+                    return "revoked_grant"
+                if grant.expires_at is not None and grant.expires_at <= float(now):
+                    return "expired_grant"
+                if grant.exhausted:
+                    return "exhausted_grant"
+            return "valid"
+
     def find_matching_grant(
         self,
         request: PermissionRequest,
@@ -751,6 +797,19 @@ class PermissionStore:
             )
         self._notify_epoch(epoch)
         return RevocationResult(True, epoch, "all_grants")
+
+    def invalidate_active_permits(self) -> int:
+        """Advance the protected epoch while preserving current grant scopes."""
+
+        with self._lock, self._cross_process_mutation_lock():
+            state = self.load_state()
+            _new_state, epoch = self._advance_epoch_locked(
+                state,
+                keep_persistent=state.grants,
+                keep_session=self._session_grants,
+            )
+        self._notify_epoch(epoch)
+        return epoch
 
     def revoke_run_grants(self, run_id: str) -> RevocationResult:
         """Revoke only grants bound to one exact Autonomous run."""

@@ -60,6 +60,8 @@ def in_memory_cron_runtime(initial=None):
     store = {"cron_jobs": copy.deepcopy(initial or [])}
     orig_get = cron_module.get_setting
     orig_set = cron_module.set_setting
+    orig_scheduled_get = scheduled_tasks.config.get_setting
+    orig_scheduled_set = scheduled_tasks.config.set_setting
 
     def fake_get(key, default=None):
         return copy.deepcopy(store.get(key, default))
@@ -69,11 +71,15 @@ def in_memory_cron_runtime(initial=None):
 
     cron_module.get_setting = fake_get
     cron_module.set_setting = fake_set
+    scheduled_tasks.config.get_setting = fake_get
+    scheduled_tasks.config.set_setting = fake_set
     try:
         yield store
     finally:
         cron_module.get_setting = orig_get
         cron_module.set_setting = orig_set
+        scheduled_tasks.config.get_setting = orig_scheduled_get
+        scheduled_tasks.config.set_setting = orig_scheduled_set
 
 
 def check(label, condition):
@@ -477,7 +483,7 @@ def test_cron_notification_callback_and_status():
     job = {
         "id": "cron_test_notification",
         "title": "Notify me",
-        "task": "Do notification",
+        "task": "Return notification",
         "schedule": "every 1 minutes",
         "enabled": True,
     }
@@ -488,12 +494,12 @@ def test_cron_notification_callback_and_status():
             notify_task=lambda **payload: notifications.append(payload),
         )
         launched = manager._fire(
-            "Do notification",
+            "Return notification",
             "every 1 minutes",
             {},
             datetime(2026, 7, 6, 12, 0),
             job_index=0,
-            signature=("Do notification", "every 1 minutes"),
+            signature=("Return notification", "every 1 minutes"),
             task_id="cron_test_notification",
             title="Notify me",
         )
@@ -512,7 +518,7 @@ def test_cron_daily_next_run_prevents_poll_miss():
     job = {
         "id": "cron_test_daily",
         "title": "Daily exact",
-        "task": "Do exact",
+        "task": "Return exact",
         "schedule": "at 15:06",
         "enabled": True,
         "created_at": created_at.isoformat(timespec="minutes"),
@@ -534,7 +540,7 @@ def test_cron_passes_model_and_legacy_without_model_runs():
     with_model = {
         "id": "cron_test_model",
         "title": "With model",
-        "task": "Do model",
+        "task": "Return model",
         "schedule": "once:2026-07-06T12:00",
         "enabled": True,
         "next_run_at": "2026-07-06T12:00",
@@ -552,7 +558,7 @@ def test_cron_passes_model_and_legacy_without_model_runs():
     legacy = {
         "id": "cron_test_legacy",
         "title": "Legacy",
-        "task": "Do legacy",
+        "task": "Return legacy",
         "schedule": "once:2026-07-06T12:00",
         "enabled": True,
         "next_run_at": "2026-07-06T12:00",
