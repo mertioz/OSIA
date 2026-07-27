@@ -321,6 +321,40 @@ def test_category_switching_preserves_independent_scroll_ownership(
     assert (left.value(), right.value(), panel._settings_nav.currentRow()) == before
 
 
+def test_every_category_resets_only_right_detail_without_recreation(settings_panel):
+    panel = settings_panel
+    nav = panel._settings_nav
+    left = _make_nav_scrollable(panel)
+    right = panel._settings_scroll.verticalScrollBar()
+    window = panel.window()
+    geometry = window.geometry()
+    stack_identity = id(panel._settings_stack)
+    page_identities = tuple(
+        id(panel._settings_stack.widget(index))
+        for index in range(panel._settings_stack.count())
+    )
+
+    for row, (category_key, _sections) in enumerate(panel._settings_pages):
+        nav.setCurrentRow((row + 1) % nav.count())
+        left.setValue(left.maximum() // 2)
+        left_before = left.value()
+        right.setValue(right.maximum())
+
+        panel.show_category(category_key)
+        QApplication.processEvents()
+
+        assert right.value() == 0
+        assert left.value() == left_before
+        assert nav.currentRow() == row
+        assert panel._settings_stack.currentIndex() == row
+        assert id(panel._settings_stack) == stack_identity
+        assert tuple(
+            id(panel._settings_stack.widget(index))
+            for index in range(panel._settings_stack.count())
+        ) == page_identities
+        assert window.geometry() == geometry
+
+
 def test_keyboard_navigation_and_focus_keep_native_pane_ownership(
     settings_panel, qt_app,
 ):
@@ -333,15 +367,19 @@ def test_keyboard_navigation_and_focus_keep_native_pane_ownership(
     assert panel._settings_scroll.focusPolicy() == Qt.FocusPolicy.StrongFocus
 
     nav.setCurrentRow(0)
+    left.setValue(left.maximum())
+    navigation_scroll = left.value()
     nav.setFocus()
     QTest.keyClick(nav, Qt.Key.Key_Down)
     qt_app.processEvents()
     assert nav.currentRow() == 1
+    assert left.value() == navigation_scroll
     assert right.value() == 0
 
     QTest.keyClick(nav, Qt.Key.Key_PageDown)
     qt_app.processEvents()
     assert nav.currentRow() > 1
+    assert left.value() == navigation_scroll
     assert right.value() == 0
 
     _show_category(panel, "settings.cat.general")

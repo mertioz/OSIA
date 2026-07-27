@@ -1962,6 +1962,10 @@ class _SettingsNavigationList(QListWidget):
         # them here so Qt never propagates them into the sibling detail pane.
         event.accept()
 
+    def scrollTo(self, index, hint=None) -> None:  # noqa: N802 (Qt method name)
+        """Keep category selection from moving the independently scrolled list."""
+        del index, hint
+
 
 class _SettingsDetailStack(QStackedWidget):
     """Stack used inside the Settings detail scroll area.
@@ -3109,6 +3113,8 @@ class _SettingsPanel(QWidget):
         if row < 0:
             return
         self._settings_stack.setCurrentIndex(row)
+        # WOR-198: reset only the independently owned right detail pane.
+        self._settings_scroll.verticalScrollBar().setValue(0)
         page = self._settings_stack.currentWidget()
         if page is not None:
             self._motion.fade_in(page, MOTION.page_ms)
@@ -5604,60 +5610,6 @@ class _SettingsPanel(QWidget):
         l.addWidget(self._mcp_sub)
         l.addWidget(self._mcp_desc)
 
-        # WOR-191 Phase 0: retain the two legacy widgets for layout/downgrade
-        # compatibility, but lock them to the fail-closed values. They no longer
-        # grant auto-approval authority.
-        ws_box = QFrame()
-        ws_box.setObjectName("providerCard")
-        ws = QVBoxLayout(ws_box)
-        ws.setContentsMargins(10, 8, 10, 8)
-        ws.setSpacing(8)
-
-        # Connector write confirmation is mandatory in Phase 0.
-        cw_row = QHBoxLayout()
-        cw_row.setSpacing(6)
-        self._mcp_confirm_writes_label = QLabel(i18n.t("mcp.confirm_writes"))
-        self._mcp_confirm_writes_label.setObjectName("providerName")
-        self._mcp_confirm_writes_label.setWordWrap(True)
-        self._mcp_confirm_writes_toggle = QCheckBox()
-        self._mcp_confirm_writes_toggle.setObjectName("smartToggle")
-        self._mcp_confirm_writes_toggle.setChecked(True)
-        self._mcp_confirm_writes_toggle.setEnabled(False)
-        self._mcp_confirm_writes_toggle.stateChanged.connect(
-            self._on_mcp_confirm_writes_changed)
-        cw_row.addWidget(self._mcp_confirm_writes_label)
-        cw_row.addStretch()
-        cw_row.addWidget(self._mcp_confirm_writes_toggle)
-        ws.addLayout(cw_row)
-        self._mcp_confirm_writes_sub = QLabel(i18n.t("mcp.confirm_writes_sub"))
-        self._mcp_confirm_writes_sub.setObjectName("sectionSub")
-        self._mcp_confirm_writes_sub.setWordWrap(True)
-        ws.addWidget(self._mcp_confirm_writes_sub)
-
-        # Unattended connector writes are mandatory-deny until explicit grants
-        # exist in a later WOR-184 phase.
-        uw_row = QHBoxLayout()
-        uw_row.setSpacing(6)
-        self._mcp_unattended_label = QLabel(i18n.t("mcp.unattended_writes"))
-        self._mcp_unattended_label.setObjectName("providerName")
-        self._mcp_unattended_label.setWordWrap(True)
-        self._mcp_unattended_toggle = QCheckBox()
-        self._mcp_unattended_toggle.setObjectName("smartToggle")
-        self._mcp_unattended_toggle.setChecked(False)
-        self._mcp_unattended_toggle.setEnabled(False)
-        self._mcp_unattended_toggle.stateChanged.connect(
-            self._on_mcp_unattended_changed)
-        uw_row.addWidget(self._mcp_unattended_label)
-        uw_row.addStretch()
-        uw_row.addWidget(self._mcp_unattended_toggle)
-        ws.addLayout(uw_row)
-        self._mcp_unattended_sub = QLabel(i18n.t("mcp.unattended_writes_sub"))
-        self._mcp_unattended_sub.setObjectName("sectionSub")
-        self._mcp_unattended_sub.setWordWrap(True)
-        ws.addWidget(self._mcp_unattended_sub)
-
-        l.addWidget(ws_box)
-
         # WOR-44 P3 (refine) — connector DROPDOWN instead of a long stacked card
         # list (mirrors the AI/voice provider selectors): a label + combo row,
         # then ONE panel below for the selected connector only. Keeping a single
@@ -5712,20 +5664,6 @@ class _SettingsPanel(QWidget):
         self._mcp_add_btn.clicked.connect(self._on_mcp_add_custom)
         l.addWidget(self._mcp_add_btn, 0, Qt.AlignmentFlag.AlignLeft)
         return wrap
-
-    def _on_mcp_confirm_writes_changed(self, _state) -> None:
-        """Keep the downgrade-compatible confirmation value fail-closed."""
-        self._mcp_confirm_writes_toggle.blockSignals(True)
-        self._mcp_confirm_writes_toggle.setChecked(True)
-        self._mcp_confirm_writes_toggle.blockSignals(False)
-        set_setting("mcp_confirm_writes", True)
-
-    def _on_mcp_unattended_changed(self, _state) -> None:
-        """Keep the downgrade-compatible unattended value fail-closed."""
-        self._mcp_unattended_toggle.blockSignals(True)
-        self._mcp_unattended_toggle.setChecked(False)
-        self._mcp_unattended_toggle.blockSignals(False)
-        set_setting("mcp_allow_unattended_writes", False)
 
     def _mcp_connectable(self, entry: dict) -> bool:
         """A server is connectable now iff the manager supports its transport
@@ -8219,15 +8157,6 @@ class _SettingsPanel(QWidget):
         self._render_mcp()
         self._refresh_memory_entries()
 
-        # WOR-191 Phase 0: compatibility widgets are immutable and always show
-        # the authoritative fail-closed values.
-        self._mcp_confirm_writes_toggle.blockSignals(True)
-        self._mcp_confirm_writes_toggle.setChecked(True)
-        self._mcp_confirm_writes_toggle.blockSignals(False)
-        self._mcp_unattended_toggle.blockSignals(True)
-        self._mcp_unattended_toggle.setChecked(False)
-        self._mcp_unattended_toggle.blockSignals(False)
-
         # Heartbeat (Bloc 5) — master toggle, interval, per-metric checks.
         self._hb_enabled_toggle.blockSignals(True)
         self._hb_enabled_toggle.setChecked(
@@ -8683,10 +8612,6 @@ class _SettingsPanel(QWidget):
         self._mcp_title.setText(i18n.t("settings.mcp"))
         self._mcp_sub.setText(i18n.t("settings.mcp_sub"))
         self._mcp_desc.setText(i18n.t("settings.mcp_desc"))
-        self._mcp_confirm_writes_label.setText(i18n.t("mcp.confirm_writes"))
-        self._mcp_confirm_writes_sub.setText(i18n.t("mcp.confirm_writes_sub"))
-        self._mcp_unattended_label.setText(i18n.t("mcp.unattended_writes"))
-        self._mcp_unattended_sub.setText(i18n.t("mcp.unattended_writes_sub"))
         self._mcp_select_label.setText(i18n.t("mcp.select_label"))
         self._mcp_add_btn.setText("＋ " + i18n.t("mcp.add_custom"))
         self._render_mcp()

@@ -40,7 +40,7 @@ _ACTIVATION_PROOF_LOCK = threading.Lock()
 @dataclass(frozen=True)
 class FullAccessActivationProof:
     method: str
-    reauth_status: ReauthStatus
+    ceremony_confirmed: bool
     issued_at: float
     _nonce: str = field(repr=False)
     _seal: object = field(repr=False, compare=False)
@@ -50,19 +50,14 @@ class FullAccessActivationProof:
             raise ValueError("untrusted_activation_proof")
 
 
-def issue_full_access_activation_proof(
-    result: ReauthResult,
-) -> FullAccessActivationProof:
-    if not isinstance(result, ReauthResult) or not result.allows_activation:
-        raise ValueError("reauth_does_not_authorize_activation")
-    if result.method not in {"windows_hello", "deterministic_test"}:
-        raise ValueError("invalid_activation_method")
+def issue_full_access_activation_proof() -> FullAccessActivationProof:
+    """Seal one explicit Settings ceremony for single-use store activation."""
     nonce = secrets.token_urlsafe(32)
     with _ACTIVATION_PROOF_LOCK:
         _ACTIVATION_PROOFS.add(nonce)
     return FullAccessActivationProof(
-        method=result.method,
-        reauth_status=result.status,
+        method="settings_ceremony",
+        ceremony_confirmed=True,
         issued_at=time.time(),
         _nonce=nonce,
         _seal=_ACTIVATION_SEAL,
@@ -76,8 +71,11 @@ def consume_full_access_activation_proof(
         raise ValueError("activation_proof_required")
     if proof._seal is not _ACTIVATION_SEAL:
         raise ValueError("untrusted_activation_proof")
-    if proof.reauth_status is not ReauthStatus.SUCCESS:
-        raise ValueError("invalid_activation_proof_status")
+    if (
+        proof.method != "settings_ceremony"
+        or proof.ceremony_confirmed is not True
+    ):
+        raise ValueError("invalid_activation_proof_ceremony")
     if time.time() - proof.issued_at > 120.0:
         with _ACTIVATION_PROOF_LOCK:
             _ACTIVATION_PROOFS.discard(proof._nonce)

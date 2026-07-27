@@ -8,7 +8,8 @@ import time
 
 import pytest
 
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import (
     QAbstractButton,
     QApplication,
@@ -25,11 +26,6 @@ from osia.gui.main_popup import _SettingsPanel
 from osia.gui.permissions_center import (
     FullAccessActivationService,
     PermissionsPage,
-)
-from osia.local_reauth import (
-    ReauthResult,
-    ReauthStatus,
-    WindowsHelloReauthProvider,
 )
 from osia.permission_store import (
     BackendAvailability,
@@ -55,40 +51,6 @@ class _ProtectedBackend(SecureStorageBackend):
         return protected[3:][::-1]
 
 
-class _SuccessReauth:
-    def reauthenticate(self, prompt: str):
-        assert prompt
-        return ReauthResult(ReauthStatus.SUCCESS, "deterministic_test")
-
-
-class _OutcomeReauth:
-    def __init__(self, status: ReauthStatus, reason_code: str = ""):
-        self.status = status
-        self.reason_code = reason_code or status.value
-
-    def reauthenticate(self, prompt: str):
-        assert prompt
-        method = (
-            "unavailable"
-            if self.status is ReauthStatus.UNAVAILABLE
-            else "deterministic_test"
-        )
-        return ReauthResult(self.status, method, self.reason_code)
-
-
-class _RecordingWindowsHello(WindowsHelloReauthProvider):
-    def __init__(self):
-        self.window_handle = None
-
-    def reauthenticate(
-        self, prompt: str, *, window_handle=None, cancellation_event=None,
-    ):
-        assert prompt
-        assert cancellation_event is None or not cancellation_event.is_set()
-        self.window_handle = window_handle
-        return ReauthResult(ReauthStatus.SUCCESS, "windows_hello")
-
-
 def _policy(tmp_path):
     return PermissionPolicy(PermissionStore(
         tmp_path / "permissions.dat", backend=_ProtectedBackend(),
@@ -98,7 +60,7 @@ def _policy(tmp_path):
 def _page(tmp_path, provider=None):
     return PermissionsPage(
         policy=_policy(tmp_path),
-        reauth_provider=provider or _SuccessReauth(),
+        reauth_provider=provider,
     )
 
 
@@ -165,6 +127,34 @@ def test_permissions_content_is_in_existing_settings_stack(monkeypatch, tmp_path
     panel.deleteLater()
 
 
+def test_mcp_section_has_no_duplicate_permission_controls(
+    monkeypatch, tmp_path,
+):
+    policy = _policy(tmp_path)
+    monkeypatch.setattr(action_policy, "get_default_permission_policy", lambda: policy)
+    panel = _SettingsPanel()
+    panel.show()
+    panel.show_category("settings.cat.mcp")
+    _QT_APP.processEvents()
+    rendered = _visible_text(panel)
+    assert "Connector write confirmation required" not in rendered
+    assert "Unattended connector writes blocked" not in rendered
+    for name in (
+        "_mcp_confirm_writes_toggle", "_mcp_confirm_writes_label",
+        "_mcp_unattended_toggle", "_mcp_unattended_label",
+    ):
+        assert not hasattr(panel, name)
+
+    panel.show_category("settings.cat.permissions")
+    _QT_APP.processEvents()
+    assert (
+        panel._permissions_page._switches["connectors"].text()
+        == "Automatically use Gmail, MCP and connectors"
+    )
+    panel.hide()
+    panel.deleteLater()
+
+
 def test_default_preset_turns_every_switch_off_and_sets_ask(tmp_path):
     page = _page(tmp_path)
     page._switches["files_delete"].setChecked(True)
@@ -188,6 +178,15 @@ def test_full_preset_changes_nothing_until_complete_inline_ceremony(tmp_path):
     page._ack.setChecked(True)
     assert page._confirm_activation.isEnabled() is True
     assert not any(page._snapshot["automatic_categories"].values())
+    page._confirm_activation.setFocus()
+    QTest.keyClick(page._confirm_activation, Qt.Key.Key_Return)
+    _QT_APP.processEvents()
+    assert page._snapshot["permission_mode"] == "ask"
+    assert page._activation_in_progress is False
+    page._cancel_activation.click()
+    assert page._snapshot["permission_mode"] == "ask"
+    page._full_preset.click()
+    page._ack.setChecked(True)
     page._confirm_activation.click()
     _wait_until(lambda: not page._activation_in_progress)
     assert page._snapshot["permission_mode"] == "full_access"
@@ -201,71 +200,52 @@ def test_full_preset_changes_nothing_until_complete_inline_ceremony(tmp_path):
     page.deleteLater()
 
 
-@pytest.mark.parametrize(
-    ("status", "reason_code"),
-    [
-        (ReauthStatus.DENIED, "verification_denied"),
-        (ReauthStatus.CANCELLED, "user_cancelled"),
-        (ReauthStatus.UNAVAILABLE, "not_configured"),
-        (ReauthStatus.ERROR, "reauth_timeout"),
-        (ReauthStatus.ERROR, "reauth_backend_error"),
-    ],
-)
-def test_failed_auth_outcomes_keep_ui_open_and_restore_controls(
-    tmp_path, status, reason_code,
-):
-    page = _page(tmp_path, _OutcomeReauth(status, reason_code))
-    page.show()
-    page._full_preset.click()
-    page._ack.setChecked(True)
-    page._confirm_activation.click()
-    assert page._activation_in_progress is True
-    assert page._confirm_activation.isEnabled() is False
-    _wait_until(lambda: not page._activation_in_progress)
-    assert page.isVisible()
-    assert page._confirm_activation.isEnabled() is True
-    assert page._default_preset.isEnabled() is True
-    assert page._snapshot["permission_mode"] == "ask"
-    assert not any(page._snapshot["automatic_categories"].values())
-    page.hide()
-    page.deleteLater()
-
-
-def test_provider_exception_keeps_ui_usable_and_writes_no_full_access(tmp_path):
-    class _RaisingReauth:
-        def reauthenticate(self, _prompt: str):
-            raise OSError("synthetic_native_failure")
-
-    page = _page(tmp_path, _RaisingReauth())
-    page.show()
-    page._full_preset.click()
-    page._ack.setChecked(True)
-    page._confirm_activation.click()
-    _wait_until(lambda: not page._activation_in_progress)
-    assert page.isVisible()
-    assert page._confirm_activation.isEnabled() is True
-    assert page._snapshot["permission_mode"] == "ask"
-    assert not any(page._snapshot["automatic_categories"].values())
-    page.hide()
-    page.deleteLater()
-
-
-def test_duplicate_activation_is_rejected_while_qt_stays_responsive(tmp_path):
-    entered = threading.Event()
-    release = threading.Event()
-
-    class _BlockingReauth:
+def test_ui_activation_never_invokes_local_reauthentication(tmp_path):
+    class _ForbiddenReauth:
         calls = 0
 
-        def reauthenticate(self, prompt: str):
-            assert prompt
+        def reauthenticate(self, *_args, **_kwargs):
             self.calls += 1
-            entered.set()
-            assert release.wait(2.0)
-            return ReauthResult(ReauthStatus.SUCCESS, "deterministic_test")
+            raise AssertionError("local reauthentication must not run")
 
-    provider = _BlockingReauth()
+    provider = _ForbiddenReauth()
     page = _page(tmp_path, provider)
+    page.show()
+    page._full_preset.click()
+    page._ack.setChecked(True)
+    page._confirm_activation.click()
+    _wait_until(lambda: not page._activation_in_progress)
+    assert page.isVisible()
+    assert page._default_preset.isEnabled() is True
+    assert page._full_preset.isEnabled() is True
+    assert page._snapshot["permission_mode"] == "full_access"
+    assert all(page._snapshot["automatic_categories"].values())
+    assert provider.calls == 0
+    rendered = _visible_text(page).lower()
+    for forbidden in ("windows hello", "pin", "password", "fingerprint", "face"):
+        assert forbidden not in rendered
+    page.hide()
+    page.deleteLater()
+
+
+def test_duplicate_activation_is_rejected_while_qt_stays_responsive(
+    monkeypatch, tmp_path,
+):
+    entered = threading.Event()
+    release = threading.Event()
+    original_activate = action_policy.activate_full_access
+    calls = []
+
+    def blocking_activate(*, activation_proof, policy):
+        calls.append(activation_proof)
+        entered.set()
+        assert release.wait(2.0)
+        return original_activate(
+            activation_proof=activation_proof, policy=policy,
+        )
+
+    monkeypatch.setattr(action_policy, "activate_full_access", blocking_activate)
+    page = _page(tmp_path)
     page.show()
     page._full_preset.click()
     page._ack.setChecked(True)
@@ -276,7 +256,7 @@ def test_duplicate_activation_is_rejected_while_qt_stays_responsive(tmp_path):
     QTimer.singleShot(0, heartbeat.set)
     _QT_APP.processEvents()
     assert heartbeat.is_set()
-    assert provider.calls == 1
+    assert len(calls) == 1
     release.set()
     _wait_until(lambda: not page._activation_in_progress)
     assert page._snapshot["permission_mode"] == "full_access"
@@ -392,7 +372,7 @@ def test_temporary_permission_row_is_friendly_private_and_revocable(tmp_path):
     policy.store.add_grant(action_policy.create_grant(
         request, persistent=True,
     ))
-    page = PermissionsPage(policy=policy, reauth_provider=_SuccessReauth())
+    page = PermissionsPage(policy=policy)
     page._advanced_toggle.setChecked(True)
     page.show()
     _QT_APP.processEvents()
@@ -414,13 +394,14 @@ def test_temporary_permission_row_is_friendly_private_and_revocable(tmp_path):
     page.deleteLater()
 
 
-def test_activation_service_passes_window_handle_to_windows_hello(tmp_path):
+def test_activation_service_requires_no_window_handle_or_pc_code(tmp_path):
     policy = _policy(tmp_path)
-    provider = _RecordingWindowsHello()
-    outcome = FullAccessActivationService(
-        policy=policy, reauth_provider=provider,
-    ).activate(
-        acknowledged=True, second_confirmed=True, window_handle=12345,
+    outcome = FullAccessActivationService(policy=policy).activate(
+        acknowledged=True, second_confirmed=True,
     )
     assert outcome.activated is True
-    assert provider.window_handle == 12345
+    assert all(
+        policy.store.permission_center_snapshot()[
+            "automatic_categories"
+        ].values()
+    )

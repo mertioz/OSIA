@@ -64,6 +64,7 @@ _JOURNAL_EVENT_CODES = {
 }
 _LOCAL_AUTH_METHODS = {
     "windows_hello", "unavailable", "deterministic_test", "legacy_local_api",
+    "settings_ceremony",
 }
 _SAFE_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_EXECUTION_TYPES = {"", "chat", "autonomous", "scheduled"}

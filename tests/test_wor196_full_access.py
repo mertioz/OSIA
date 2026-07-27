@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import threading
 import time
 
 import pytest
 
+from osia import action_policy as action_policy_module
 from osia.action_policy import (
     AUTOMATIC_PERMISSION_CATEGORIES,
     AuthorizationSource,
@@ -52,30 +54,15 @@ class _SyntheticProtectedBackend(SecureStorageBackend):
         return bytes(value ^ 0xA5 for value in protected[4:])
 
 
-class _FixedReauth:
-    def __init__(self, status: ReauthStatus, reason_code: str = ""):
-        self.status = status
-        self.reason_code = reason_code or status.value
-
-    def reauthenticate(self, prompt: str) -> ReauthResult:
-        assert prompt
-        method = (
-            "unavailable" if self.status is ReauthStatus.UNAVAILABLE
-            else "deterministic_test"
-        )
-        return ReauthResult(self.status, method, self.reason_code)
-
-
 def _policy(tmp_path: Path, name: str = "permissions.dat"):
     store = PermissionStore(tmp_path / name, backend=_SyntheticProtectedBackend())
     return PermissionPolicy(store)
 
 
 def _enable(policy: PermissionPolicy):
-    outcome = FullAccessActivationService(
-        policy=policy,
-        reauth_provider=_FixedReauth(ReauthStatus.SUCCESS),
-    ).activate(acknowledged=True, second_confirmed=True)
+    outcome = FullAccessActivationService(policy=policy).activate(
+        acknowledged=True, second_confirmed=True,
+    )
     assert outcome.activated is True
     return policy.store.load_state()
 
@@ -151,9 +138,7 @@ def test_unavailable_or_corrupt_store_is_ask_and_activation_unavailable(tmp_path
 
 def test_acknowledgement_and_second_confirmation_are_both_required(tmp_path):
     policy = _policy(tmp_path)
-    service = FullAccessActivationService(
-        policy=policy, reauth_provider=_FixedReauth(ReauthStatus.SUCCESS),
-    )
+    service = FullAccessActivationService(policy=policy)
     assert service.activate(
         acknowledged=False, second_confirmed=True,
     ).reason_code == "acknowledgement_required"
@@ -167,37 +152,40 @@ def test_store_rejects_unsealed_or_replayed_activation(tmp_path):
     policy = _policy(tmp_path)
     with pytest.raises(ValueError, match="activation_proof_required"):
         policy.store.activate_full_access(activation_proof="windows_hello")
-    proof = issue_full_access_activation_proof(
-        ReauthResult(ReauthStatus.SUCCESS, "deterministic_test")
-    )
+    proof = issue_full_access_activation_proof()
+    assert proof.method == "settings_ceremony"
     policy.store.activate_full_access(activation_proof=proof)
     policy.store.revoke_full_access()
     with pytest.raises(ValueError, match="activation_proof_used"):
         policy.store.activate_full_access(activation_proof=proof)
 
+    expired = replace(
+        issue_full_access_activation_proof(), issued_at=time.time() - 121.0,
+    )
+    with pytest.raises(ValueError, match="activation_proof_expired"):
+        policy.store.activate_full_access(activation_proof=expired)
 
-@pytest.mark.parametrize(
-    ("status", "reason_code", "activated"),
-    [
-        (ReauthStatus.SUCCESS, "success", True),
-        (ReauthStatus.UNAVAILABLE, "unavailable", False),
-        (ReauthStatus.DENIED, "denied", False),
-        (ReauthStatus.CANCELLED, "cancelled", False),
-        (ReauthStatus.ERROR, "reauth_timeout", False),
-        (ReauthStatus.ERROR, "error", False),
-    ],
-)
-def test_local_reauth_typed_outcomes(
-    tmp_path, status, reason_code, activated,
-):
-    policy = _policy(tmp_path, f"{status.value}-{reason_code}.dat")
+
+def test_full_access_activation_never_invokes_local_reauthentication(tmp_path):
+    class _ForbiddenReauth:
+        calls = 0
+
+        def reauthenticate(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("local reauthentication must not run")
+
+    provider = _ForbiddenReauth()
+    policy = _policy(tmp_path)
     outcome = FullAccessActivationService(
-        policy=policy, reauth_provider=_FixedReauth(status, reason_code),
-    ).activate(acknowledged=True, second_confirmed=True)
-    assert outcome.activated is activated
-    assert (
-        policy.store.load_state().permission_mode is PermissionMode.FULL_ACCESS
-    ) is activated
+        policy=policy, reauth_provider=provider,
+    ).activate(
+        acknowledged=True, second_confirmed=True, window_handle=12345,
+    )
+    assert outcome.activated is True
+    assert provider.calls == 0
+    snapshot = policy.store.permission_center_snapshot()
+    assert snapshot["permission_mode"] == "full_access"
+    assert snapshot["local_auth_method"] == "settings_ceremony"
 
 
 def test_native_exception_becomes_typed_error_without_state_write(
@@ -234,16 +222,6 @@ def test_native_exception_becomes_typed_error_without_state_write(
     assert result == ReauthResult(
         ReauthStatus.ERROR, "windows_hello", "reauth_backend_error",
     )
-    outcome = FullAccessActivationService(
-        policy=policy,
-        reauth_provider=_FixedReauth(
-            ReauthStatus.ERROR, "reauth_backend_error",
-        ),
-    ).activate(acknowledged=True, second_confirmed=True)
-    assert outcome.activated is False
-    assert policy.store.load_state().permission_mode is PermissionMode.ASK
-
-
 @pytest.mark.parametrize(
     ("verification", "expected_status", "expected_reason"),
     [
@@ -291,25 +269,28 @@ def test_windows_hello_native_results_are_typed(
     assert result.reason_code == expected_reason
 
 
-def test_concurrent_activation_is_rejected_and_state_waits_for_success(tmp_path):
+def test_concurrent_activation_is_rejected_and_state_waits_for_success(
+    monkeypatch, tmp_path,
+):
     entered = threading.Event()
     release = threading.Event()
 
-    class _BlockingReauth:
-        calls = 0
-
-        def reauthenticate(self, prompt: str):
-            assert prompt
-            self.calls += 1
-            entered.set()
-            assert release.wait(2.0)
-            return ReauthResult(ReauthStatus.SUCCESS, "deterministic_test")
-
     policy = _policy(tmp_path)
-    provider = _BlockingReauth()
-    service = FullAccessActivationService(
-        policy=policy, reauth_provider=provider,
+    original_activate = action_policy_module.activate_full_access
+    calls = []
+
+    def blocking_activate(*, activation_proof, policy):
+        calls.append(activation_proof)
+        entered.set()
+        assert release.wait(2.0)
+        return original_activate(
+            activation_proof=activation_proof, policy=policy,
+        )
+
+    monkeypatch.setattr(
+        action_policy_module, "activate_full_access", blocking_activate,
     )
+    service = FullAccessActivationService(policy=policy)
     first_outcome: list = []
     worker = threading.Thread(
         target=lambda: first_outcome.append(service.activate(
@@ -322,7 +303,7 @@ def test_concurrent_activation_is_rejected_and_state_waits_for_success(tmp_path)
     duplicate = service.activate(acknowledged=True, second_confirmed=True)
     assert duplicate.activated is False
     assert duplicate.reason_code == "activation_in_progress"
-    assert provider.calls == 1
+    assert len(calls) == 1
     release.set()
     worker.join(2.0)
     assert not worker.is_alive()
@@ -712,3 +693,33 @@ def test_existing_ask_and_task_scoped_behavior_is_unchanged(tmp_path):
     # Exact operation identity remains bound and an altered replay cannot broaden.
     assert policy.store.load_state().permission_mode is PermissionMode.TASK_SCOPED
     assert policy.evaluate(current).authorization_source is AuthorizationSource.GRANT
+
+
+@pytest.mark.parametrize(
+    "execution_type", [ExecutionType.AUTONOMOUS, ExecutionType.SCHEDULED],
+)
+def test_exact_background_grants_work_with_global_switches_off(
+    tmp_path, execution_type,
+):
+    policy = _policy(tmp_path)
+    original = _request(
+        policy,
+        execution_type=execution_type,
+        operation=f"exact:{execution_type.value}",
+    )
+    policy.store.add_grant(create_grant(
+        original, use_policy=UsePolicy.RECURRING, persistent=True,
+    ))
+    assert not any(
+        policy.store.permission_center_snapshot()[
+            "automatic_categories"
+        ].values()
+    )
+    current = _request(
+        policy,
+        execution_type=execution_type,
+        operation=f"exact:{execution_type.value}",
+    )
+    decision = policy.evaluate(current)
+    assert decision.decision_type is DecisionType.ALLOW
+    assert decision.authorization_source is AuthorizationSource.GRANT

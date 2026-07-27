@@ -7,7 +7,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -27,14 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 from osia import action_policy, i18n
-from osia.local_reauth import (
-    LocalReauthProvider,
-    ReauthResult,
-    ReauthStatus,
-    WindowsHelloReauthProvider,
-    default_local_reauth_provider,
-    issue_full_access_activation_proof,
-)
+from osia.local_reauth import issue_full_access_activation_proof
 
 
 _SWITCH_KEYS = {
@@ -89,38 +82,38 @@ _HISTORY_EVENT_KEYS = {
 class ActivationOutcome:
     activated: bool
     reason_code: str
-    reauth: ReauthResult | None = None
 
 
 class FullAccessActivationService:
-    """Non-Qt activation coordinator with a deterministic reauth test seam."""
+    """Non-Qt coordinator for the explicit Full Access ceremony."""
 
     def __init__(
         self,
         *,
         policy: action_policy.PermissionPolicy | None = None,
-        reauth_provider: LocalReauthProvider | None = None,
+        reauth_provider: Any | None = None,
     ) -> None:
         self.policy = policy or action_policy.get_default_permission_policy()
-        self.reauth_provider = (
-            reauth_provider or default_local_reauth_provider()
-        )
+        # Compatibility-only constructor seam. Full Access is deliberately
+        # disconnected from every local reauthentication provider.
+        del reauth_provider
         self._activation_lock = threading.Lock()
 
-    def _failed(self, reason: str, reauth: ReauthResult | None = None):
+    def _failed(self, reason: str):
         action_policy.record_permission_journal_event(
             "activation_failed",
             policy=self.policy,
             authorization_source="full_access",
             result=reason,
         )
-        return ActivationOutcome(False, reason, reauth)
+        return ActivationOutcome(False, reason)
 
     def activate(
         self, *, acknowledged: bool, second_confirmed: bool,
         window_handle: int | None = None,
         cancellation_event: threading.Event | None = None,
     ) -> ActivationOutcome:
+        del window_handle, cancellation_event
         try:
             acquired = self._activation_lock.acquire(blocking=False)
         except Exception:
@@ -138,40 +131,15 @@ class FullAccessActivationService:
                 return self._failed("acknowledgement_required")
             if not second_confirmed:
                 return self._failed("second_confirmation_required")
-            prompt = i18n.t("permissions.reauth_prompt")
             try:
-                if isinstance(self.reauth_provider, WindowsHelloReauthProvider):
-                    reauth = self.reauth_provider.reauthenticate(
-                        prompt,
-                        window_handle=window_handle,
-                        cancellation_event=cancellation_event,
-                    )
-                else:
-                    reauth = self.reauth_provider.reauthenticate(prompt)
-            except Exception:
-                reauth = ReauthResult(
-                    ReauthStatus.ERROR, "windows_hello", "reauth_backend_error",
-                )
-            if not isinstance(reauth, ReauthResult):
-                reauth = ReauthResult(
-                    ReauthStatus.ERROR, "windows_hello", "invalid_reauth_result",
-                )
-            if reauth.status is not ReauthStatus.SUCCESS:
-                reason = (
-                    "reauth_timeout"
-                    if reauth.reason_code == "reauth_timeout"
-                    else f"reauth_{reauth.status.value}"
-                )
-                return self._failed(reason, reauth)
-            try:
-                activation_proof = issue_full_access_activation_proof(reauth)
+                activation_proof = issue_full_access_activation_proof()
                 action_policy.activate_full_access(
                     activation_proof=activation_proof,
                     policy=self.policy,
                 )
             except Exception:
-                return self._failed("protected_store_write_failed", reauth)
-            return ActivationOutcome(True, "full_access_enabled", reauth)
+                return self._failed("protected_store_write_failed")
+            return ActivationOutcome(True, "full_access_enabled")
         finally:
             self._activation_lock.release()
 
@@ -187,7 +155,7 @@ class PermissionsPage(QWidget):
         parent=None,
         *,
         policy: action_policy.PermissionPolicy | None = None,
-        reauth_provider: LocalReauthProvider | None = None,
+        reauth_provider: Any | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("permissionsPage")
@@ -285,6 +253,7 @@ class PermissionsPage(QWidget):
         self._confirm_activation.setObjectName("primaryBtn")
         self._confirm_activation.setAutoDefault(False)
         self._confirm_activation.setDefault(False)
+        self._confirm_activation.installEventFilter(self)
         self._confirm_activation.clicked.connect(self._confirm_full_access)
         actions.addWidget(self._cancel_activation)
         actions.addWidget(self._confirm_activation)
@@ -516,48 +485,38 @@ class PermissionsPage(QWidget):
             and self._ack.isChecked()
         )
 
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            watched is self._confirm_activation
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+        ):
+            return True
+        return super().eventFilter(watched, event)
+
     def _confirm_full_access(self) -> None:
         if not self._ack.isChecked() or self._activation_in_progress:
-            return
-        try:
-            window_handle = int(self.window().winId())
-        except Exception:
-            self._finish_full_access_activation(ActivationOutcome(
-                False,
-                "reauth_error",
-                ReauthResult(
-                    ReauthStatus.ERROR, "windows_hello", "invalid_window_handle",
-                ),
-            ))
             return
         self._activation_cancel_event.clear()
         self._activation_in_progress = True
         self._set_activation_controls()
-        self._refresh_status_text("reauth_in_progress")
+        self._refresh_status_text("activation_in_progress")
         worker = threading.Thread(
             target=self._run_full_access_activation,
-            args=(window_handle,),
             daemon=True,
         )
         self._activation_thread = worker
         worker.start()
 
-    def _run_full_access_activation(self, window_handle: int) -> None:
+    def _run_full_access_activation(self) -> None:
         try:
             outcome = self.activation_service.activate(
                 acknowledged=True,
                 second_confirmed=True,
-                window_handle=window_handle,
                 cancellation_event=self._activation_cancel_event,
             )
         except Exception:
-            outcome = ActivationOutcome(
-                False,
-                "reauth_error",
-                ReauthResult(
-                    ReauthStatus.ERROR, "windows_hello", "reauth_backend_error",
-                ),
-            )
+            outcome = ActivationOutcome(False, "protected_store_write_failed")
         try:
             self._activation_completed.emit(outcome)
         except RuntimeError:
@@ -681,19 +640,13 @@ class PermissionsPage(QWidget):
         if error_reason:
             key = {
                 "invalid_constraints": "permissions.invalid_constraints",
-                "reauth_in_progress": "permissions.reauth_in_progress",
-                "reauth_denied": "permissions.reauth_denied",
-                "reauth_cancelled": "permissions.reauth_cancelled",
-                "reauth_unavailable": "permissions.reauth_unavailable",
-                "reauth_timeout": "permissions.reauth_timeout",
-                "reauth_error": "permissions.reauth_error",
-                "activation_in_progress": "permissions.reauth_in_progress",
+                "activation_in_progress": "permissions.activation_in_progress",
             }.get(error_reason, "permissions.change_failed")
             self._status.setText(i18n.t(key))
         elif not self._snapshot.get("activation_available"):
             self._status.setText(i18n.t("permissions.unavailable_simple"))
         elif self._activation_in_progress:
-            self._status.setText(i18n.t("permissions.reauth_in_progress"))
+            self._status.setText(i18n.t("permissions.activation_in_progress"))
         else:
             self._status.setText(i18n.t("permissions.saved"))
 
