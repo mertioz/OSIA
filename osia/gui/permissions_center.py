@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as _datetime
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,8 +17,8 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QPushButton,
+    QDoubleSpinBox,
     QSizePolicy,
-    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -48,6 +49,41 @@ _SWITCH_KEYS = {
     "scheduled_actions": "permissions.switch.scheduled_actions",
 }
 
+_TEMPORARY_ACTION_KEYS = {
+    "local_path": "permissions.allowed.files",
+    "local_paths": "permissions.allowed.files",
+    "directory_tree": "permissions.allowed.files",
+    "local_command": "permissions.allowed.commands",
+    "safe_local_setting": "permissions.allowed.settings",
+    "tool_operation": "permissions.allowed.action",
+    "connector_operation": "permissions.allowed.service",
+    "web_origin": "permissions.allowed.website",
+    "web_url": "permissions.allowed.website",
+    "purchase": "permissions.allowed.payment",
+    "unknown": "permissions.allowed.action",
+}
+
+_EXECUTION_KEYS = {
+    "chat": "permissions.where.chat",
+    "autonomous": "permissions.where.autonomous",
+    "scheduled": "permissions.where.scheduled",
+}
+
+_HISTORY_EVENT_KEYS = {
+    "full_access_enabled": "permissions.history.full_enabled",
+    "full_access_disabled": "permissions.history.full_disabled",
+    "activation_failed": "permissions.history.full_failed",
+    "grant_created": "permissions.history.temporary_granted",
+    "grant_expired": "permissions.history.temporary_expired",
+    "grant_revoked": "permissions.history.revoked",
+    "delegated_authority_revoked": "permissions.history.revoked",
+    "universal_barrier_blocked": "permissions.history.blocked",
+    "authorization_required": "permissions.history.approval_required",
+    "optional_constraint_changed": "permissions.history.limits_updated",
+    "automatic_permission_changed": "permissions.history.settings_updated",
+    "policy_epoch_changed": "permissions.history.settings_updated",
+}
+
 
 @dataclass(frozen=True)
 class ActivationOutcome:
@@ -69,6 +105,7 @@ class FullAccessActivationService:
         self.reauth_provider = (
             reauth_provider or default_local_reauth_provider()
         )
+        self._activation_lock = threading.Lock()
 
     def _failed(self, reason: str, reauth: ReauthResult | None = None):
         action_policy.record_permission_journal_event(
@@ -82,43 +119,68 @@ class FullAccessActivationService:
     def activate(
         self, *, acknowledged: bool, second_confirmed: bool,
         window_handle: int | None = None,
+        cancellation_event: threading.Event | None = None,
     ) -> ActivationOutcome:
-        snapshot = action_policy.permission_center_snapshot(policy=self.policy)
-        if not snapshot["activation_available"]:
-            return self._failed(
-                "store_corrupt" if snapshot["store_corrupt"]
-                else "secure_storage_unavailable"
-            )
-        if not acknowledged:
-            return self._failed("acknowledgement_required")
-        if not second_confirmed:
-            return self._failed("second_confirmation_required")
-        prompt = i18n.t("permissions.reauth_prompt")
-        if isinstance(self.reauth_provider, WindowsHelloReauthProvider):
-            reauth = self.reauth_provider.reauthenticate(
-                prompt, window_handle=window_handle,
-            )
-        else:
-            reauth = self.reauth_provider.reauthenticate(prompt)
-        if reauth.status not in {
-            ReauthStatus.SUCCESS, ReauthStatus.UNAVAILABLE,
-        }:
-            return self._failed(f"reauth_{reauth.status.value}", reauth)
         try:
-            activation_proof = issue_full_access_activation_proof(reauth)
-            action_policy.activate_full_access(
-                activation_proof=activation_proof,
-                policy=self.policy,
-            )
+            acquired = self._activation_lock.acquire(blocking=False)
         except Exception:
-            return self._failed("protected_store_write_failed", reauth)
-        return ActivationOutcome(True, "full_access_enabled", reauth)
+            acquired = False
+        if not acquired:
+            return ActivationOutcome(False, "activation_in_progress")
+        try:
+            snapshot = action_policy.permission_center_snapshot(policy=self.policy)
+            if not snapshot["activation_available"]:
+                return self._failed(
+                    "store_corrupt" if snapshot["store_corrupt"]
+                    else "secure_storage_unavailable"
+                )
+            if not acknowledged:
+                return self._failed("acknowledgement_required")
+            if not second_confirmed:
+                return self._failed("second_confirmation_required")
+            prompt = i18n.t("permissions.reauth_prompt")
+            try:
+                if isinstance(self.reauth_provider, WindowsHelloReauthProvider):
+                    reauth = self.reauth_provider.reauthenticate(
+                        prompt,
+                        window_handle=window_handle,
+                        cancellation_event=cancellation_event,
+                    )
+                else:
+                    reauth = self.reauth_provider.reauthenticate(prompt)
+            except Exception:
+                reauth = ReauthResult(
+                    ReauthStatus.ERROR, "windows_hello", "reauth_backend_error",
+                )
+            if not isinstance(reauth, ReauthResult):
+                reauth = ReauthResult(
+                    ReauthStatus.ERROR, "windows_hello", "invalid_reauth_result",
+                )
+            if reauth.status is not ReauthStatus.SUCCESS:
+                reason = (
+                    "reauth_timeout"
+                    if reauth.reason_code == "reauth_timeout"
+                    else f"reauth_{reauth.status.value}"
+                )
+                return self._failed(reason, reauth)
+            try:
+                activation_proof = issue_full_access_activation_proof(reauth)
+                action_policy.activate_full_access(
+                    activation_proof=activation_proof,
+                    policy=self.policy,
+                )
+            except Exception:
+                return self._failed("protected_store_write_failed", reauth)
+            return ActivationOutcome(True, "full_access_enabled", reauth)
+        finally:
+            self._activation_lock.release()
 
 
 class PermissionsPage(QWidget):
     """Permissions controls embedded in the existing Settings stack."""
 
     state_changed = pyqtSignal(dict)
+    _activation_completed = pyqtSignal(object)
 
     def __init__(
         self,
@@ -136,8 +198,10 @@ class PermissionsPage(QWidget):
         self._snapshot: dict[str, Any] = {}
         self._refreshing = False
         self._destinations_dirty = False
-        self._grant_row_tokens: list[str] = []
-        self._grant_group_tokens: list[str] = []
+        self._activation_in_progress = False
+        self._activation_cancel_event = threading.Event()
+        self._activation_thread: threading.Thread | None = None
+        self._activation_completed.connect(self._finish_full_access_activation)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -179,6 +243,7 @@ class PermissionsPage(QWidget):
         root.addWidget(self._advanced)
 
         i18n.add_listener(self.retranslate)
+        self.destroyed.connect(lambda *_: self._activation_cancel_event.set())
         self.destroyed.connect(lambda: i18n.remove_listener(self.retranslate))
         self.retranslate()
         self.refresh()
@@ -235,17 +300,48 @@ class PermissionsPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
+        temporary = QFrame()
+        temporary.setObjectName("providerCard")
+        temporary_layout = QVBoxLayout(temporary)
+        temporary_layout.setContentsMargins(12, 10, 12, 10)
+        temporary_layout.setSpacing(8)
+        self._temporary_title = QLabel()
+        self._temporary_title.setObjectName("sectionTitle")
+        self._temporary_empty = QLabel()
+        self._temporary_empty.setObjectName("sectionSub")
+        self._temporary_empty.setWordWrap(True)
+        self._grants = QTableWidget(0, 4)
+        self._grants.setObjectName("permissionsTable")
+        self._grants.setMaximumHeight(170)
+        self._grants.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection
+        )
+        self._grants.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._grants.verticalHeader().setVisible(False)
+        grant_header = self._grants.horizontalHeader()
+        grant_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in (1, 2, 3):
+            grant_header.setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents,
+            )
+        temporary_layout.addWidget(self._temporary_title)
+        temporary_layout.addWidget(self._temporary_empty)
+        temporary_layout.addWidget(self._grants)
+        layout.addWidget(temporary)
+
         limits = QFrame()
         limits.setObjectName("providerCard")
         limits_layout = QVBoxLayout(limits)
         limits_layout.setContentsMargins(12, 10, 12, 10)
+        limits_layout.setSpacing(8)
         self._limits_title = QLabel()
         self._limits_title.setObjectName("sectionTitle")
         self._payment_enabled = QCheckBox()
         payment_row = QHBoxLayout()
-        self._payment_max = QSpinBox()
+        self._payment_max = QDoubleSpinBox()
         self._payment_max.setObjectName("permissionsAmount")
-        self._payment_max.setRange(0, 2_000_000_000)
+        self._payment_max.setDecimals(2)
+        self._payment_max.setRange(0, 20_000_000.00)
         self._currency = QComboBox()
         self._currency.setObjectName("voiceCombo")
         self._currency.setEditable(True)
@@ -253,6 +349,11 @@ class PermissionsPage(QWidget):
         payment_row.addWidget(self._payment_enabled)
         payment_row.addWidget(self._payment_max)
         payment_row.addWidget(self._currency)
+        self._payment_state = QLabel()
+        self._payment_state.setObjectName("sectionSub")
+        self._payment_example = QLabel()
+        self._payment_example.setObjectName("sectionSub")
+        self._payment_example.setWordWrap(True)
         self._destinations_enabled = QCheckBox()
         self._destinations = QTextEdit()
         self._destinations.setObjectName("mdEditor")
@@ -263,70 +364,51 @@ class PermissionsPage(QWidget):
         self._destinations_summary = QLabel()
         self._destinations_summary.setObjectName("sectionSub")
         self._destinations_summary.setWordWrap(True)
-        self._limits_note = QLabel()
-        self._limits_note.setObjectName("sectionSub")
-        self._limits_note.setWordWrap(True)
+        self._destinations_example = QLabel()
+        self._destinations_example.setObjectName("sectionSub")
+        self._destinations_example.setWordWrap(True)
         self._apply_limits = QPushButton()
         self._apply_limits.setObjectName("ghostBtn")
         self._apply_limits.clicked.connect(self._apply_constraints)
+        self._payment_enabled.toggled.connect(self._sync_limit_controls)
+        self._destinations_enabled.toggled.connect(self._sync_limit_controls)
         limits_layout.addWidget(self._limits_title)
         limits_layout.addLayout(payment_row)
+        limits_layout.addWidget(self._payment_state)
+        limits_layout.addWidget(self._payment_example)
         limits_layout.addWidget(self._destinations_enabled)
         limits_layout.addWidget(self._destinations_summary)
         limits_layout.addWidget(self._destinations)
-        limits_layout.addWidget(self._limits_note)
+        limits_layout.addWidget(self._destinations_example)
         limits_layout.addWidget(self._apply_limits)
         layout.addWidget(limits)
-
-        grants = QFrame()
-        grants.setObjectName("providerCard")
-        grants_layout = QVBoxLayout(grants)
-        grants_layout.setContentsMargins(12, 10, 12, 10)
-        self._grants_title = QLabel()
-        self._grants_title.setObjectName("sectionTitle")
-        self._grants = QTableWidget(0, 4)
-        self._grants.setObjectName("permissionsTable")
-        self._grants.setMaximumHeight(150)
-        self._grants.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        self._grants.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._grants.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._grants.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-        grant_actions = QHBoxLayout()
-        self._revoke_one = QPushButton()
-        self._revoke_group = QPushButton()
-        self._revoke_all = QPushButton()
-        for button in (self._revoke_one, self._revoke_group, self._revoke_all):
-            button.setObjectName("ghostBtn")
-            grant_actions.addWidget(button)
-        self._revoke_one.clicked.connect(self._revoke_selected)
-        self._revoke_group.clicked.connect(self._revoke_selected_group)
-        self._revoke_all.clicked.connect(self._revoke_everything)
-        grants_layout.addWidget(self._grants_title)
-        grants_layout.addWidget(self._grants)
-        grants_layout.addLayout(grant_actions)
-        layout.addWidget(grants)
 
         journal = QFrame()
         journal.setObjectName("providerCard")
         journal_layout = QVBoxLayout(journal)
         journal_layout.setContentsMargins(12, 10, 12, 10)
+        journal_layout.setSpacing(8)
         self._journal_title = QLabel()
         self._journal_title.setObjectName("sectionTitle")
-        self._journal = QTableWidget(0, 4)
+        self._journal_empty = QLabel()
+        self._journal_empty.setObjectName("sectionSub")
+        self._journal_empty.setWordWrap(True)
+        self._journal = QTableWidget(0, 2)
         self._journal.setObjectName("permissionsTable")
         self._journal.setMaximumHeight(150)
         self._journal.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._journal.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
+        self._journal.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._journal.verticalHeader().setVisible(False)
+        journal_header = self._journal.horizontalHeader()
+        journal_header.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents,
         )
+        journal_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._clear_journal = QPushButton()
         self._clear_journal.setObjectName("ghostBtn")
         self._clear_journal.clicked.connect(self._clear_permission_journal)
         journal_layout.addWidget(self._journal_title)
+        journal_layout.addWidget(self._journal_empty)
         journal_layout.addWidget(self._journal)
         journal_layout.addWidget(self._clear_journal)
         layout.addWidget(journal)
@@ -341,39 +423,71 @@ class PermissionsPage(QWidget):
         self._confirm_activation.setText(i18n.t("permissions.enable_confirm"))
         for category, toggle in self._switches.items():
             toggle.setText(i18n.t(_SWITCH_KEYS[category]))
-        self._advanced_toggle.setText(i18n.t("permissions.advanced"))
-        self._limits_title.setText(i18n.t("permissions.constraints"))
+        self._advanced_toggle.setText(i18n.t("permissions.more_controls"))
+        self._temporary_title.setText(i18n.t("permissions.temporary_title"))
+        self._temporary_empty.setText(i18n.t("permissions.temporary_empty"))
+        self._grants.setHorizontalHeaderLabels([
+            i18n.t("permissions.allowed_action"),
+            i18n.t("permissions.applies_to"),
+            i18n.t("permissions.expires_or_uses"),
+            i18n.t("permissions.action"),
+        ])
+        self._limits_title.setText(i18n.t("permissions.limits_title"))
         self._payment_enabled.setText(i18n.t("permissions.payment_limit"))
-        self._payment_max.setSuffix(" " + i18n.t("permissions.minor_units"))
+        self._payment_example.setText(i18n.t("permissions.payment_example"))
         self._destinations_enabled.setText(
-            i18n.t("permissions.destination_limit")
+            i18n.t("permissions.website_limit")
         )
         self._destinations.setPlaceholderText(
             i18n.t("permissions.destination_placeholder")
         )
-        self._limits_note.setText(i18n.t("permissions.constraints_note"))
-        self._apply_limits.setText(i18n.t("permissions.apply_constraints"))
-        self._grants_title.setText(i18n.t("permissions.grants"))
-        self._grants.setHorizontalHeaderLabels([
-            i18n.t("permissions.execution"), i18n.t("permissions.category"),
-            i18n.t("permissions.expiration"), i18n.t("permissions.uses"),
-        ])
-        self._revoke_one.setText(i18n.t("permissions.revoke_one"))
-        self._revoke_group.setText(i18n.t("permissions.revoke_group"))
-        self._revoke_all.setText(i18n.t("permissions.revoke_all"))
-        self._journal_title.setText(i18n.t("permissions.journal"))
+        self._destinations_example.setText(
+            i18n.t("permissions.website_example")
+        )
+        self._apply_limits.setText(i18n.t("permissions.save_limits"))
+        self._journal_title.setText(i18n.t("permissions.history_title"))
+        self._journal_empty.setText(i18n.t("permissions.history_empty"))
         self._journal.setHorizontalHeaderLabels([
-            i18n.t("permissions.time"), i18n.t("permissions.event"),
-            i18n.t("permissions.category"), i18n.t("permissions.result"),
+            i18n.t("permissions.when"), i18n.t("permissions.what_happened"),
         ])
-        self._clear_journal.setText(i18n.t("permissions.clear_journal"))
+        self._clear_journal.setText(i18n.t("permissions.clear_history"))
+        self._sync_limit_controls()
         if self._snapshot:
-            self._refresh_status_text()
+            self.refresh()
 
     def _toggle_advanced(self, expanded: bool) -> None:
         self._advanced.setVisible(expanded)
 
+    def _sync_limit_controls(self) -> None:
+        payment_enabled = self._payment_enabled.isChecked()
+        self._payment_max.setEnabled(payment_enabled)
+        self._currency.setEnabled(payment_enabled)
+        self._payment_state.setText(i18n.t(
+            "permissions.limit_enabled"
+            if payment_enabled else "permissions.no_additional_limit"
+        ))
+
+        destinations_enabled = self._destinations_enabled.isChecked()
+        self._destinations.setEnabled(destinations_enabled)
+        if not destinations_enabled:
+            self._destinations_summary.setText(
+                i18n.t("permissions.no_additional_limit")
+            )
+        elif self._snapshot:
+            destinations = self._snapshot["constraints"]["destinations"]
+            self._destinations_summary.setText(i18n.t(
+                "permissions.allowed_summary",
+                websites=destinations["origin_count"],
+                services=destinations["connector_count"],
+            ))
+        else:
+            self._destinations_summary.setText(
+                i18n.t("permissions.limit_enabled")
+            )
+
     def _show_full_access_ceremony(self) -> None:
+        if self._activation_in_progress:
+            return
         if (
             self._snapshot.get("permission_mode") == "full_access"
             and all(self._snapshot.get("automatic_categories", {}).values())
@@ -389,30 +503,86 @@ class PermissionsPage(QWidget):
         self._update_confirmation_button()
 
     def _cancel_ceremony(self) -> None:
+        if self._activation_in_progress:
+            return
         self._ack.setChecked(False)
         self._ceremony.hide()
         self.refresh()
 
     def _update_confirmation_button(self) -> None:
         self._confirm_activation.setEnabled(
-            bool(self._snapshot.get("activation_available"))
+            not self._activation_in_progress
+            and bool(self._snapshot.get("activation_available"))
             and self._ack.isChecked()
         )
 
     def _confirm_full_access(self) -> None:
-        if not self._ack.isChecked():
+        if not self._ack.isChecked() or self._activation_in_progress:
             return
-        outcome = self.activation_service.activate(
-            acknowledged=True,
-            second_confirmed=True,
-            window_handle=int(self.window().winId()),
+        try:
+            window_handle = int(self.window().winId())
+        except Exception:
+            self._finish_full_access_activation(ActivationOutcome(
+                False,
+                "reauth_error",
+                ReauthResult(
+                    ReauthStatus.ERROR, "windows_hello", "invalid_window_handle",
+                ),
+            ))
+            return
+        self._activation_cancel_event.clear()
+        self._activation_in_progress = True
+        self._set_activation_controls()
+        self._refresh_status_text("reauth_in_progress")
+        worker = threading.Thread(
+            target=self._run_full_access_activation,
+            args=(window_handle,),
+            daemon=True,
         )
+        self._activation_thread = worker
+        worker.start()
+
+    def _run_full_access_activation(self, window_handle: int) -> None:
+        try:
+            outcome = self.activation_service.activate(
+                acknowledged=True,
+                second_confirmed=True,
+                window_handle=window_handle,
+                cancellation_event=self._activation_cancel_event,
+            )
+        except Exception:
+            outcome = ActivationOutcome(
+                False,
+                "reauth_error",
+                ReauthResult(
+                    ReauthStatus.ERROR, "windows_hello", "reauth_backend_error",
+                ),
+            )
+        try:
+            self._activation_completed.emit(outcome)
+        except RuntimeError:
+            self._activation_cancel_event.set()
+
+    def _finish_full_access_activation(self, outcome: ActivationOutcome) -> None:
+        self._activation_in_progress = False
+        self._activation_thread = None
         if outcome.activated:
             self._ceremony.hide()
             self._ack.setChecked(False)
         self.refresh(emit=True, error_reason=(
             "" if outcome.activated else outcome.reason_code
         ))
+
+    def _set_activation_controls(self) -> None:
+        available = bool(self._snapshot.get("activation_available"))
+        enabled = available and not self._activation_in_progress
+        self._default_preset.setEnabled(enabled)
+        self._full_preset.setEnabled(enabled)
+        self._cancel_activation.setEnabled(not self._activation_in_progress)
+        self._advanced.setEnabled(not self._activation_in_progress)
+        for toggle in self._switches.values():
+            toggle.setEnabled(enabled)
+        self._update_confirmation_button()
 
     def _apply_default(self) -> None:
         try:
@@ -450,13 +620,17 @@ class PermissionsPage(QWidget):
                     continue
                 if value.lower().startswith(("http://", "https://")):
                     origins.append(value)
+                elif "." in value and not any(
+                    character.isspace() for character in value
+                ):
+                    origins.append("https://" + value)
                 else:
                     connectors.append(value)
         try:
             action_policy.update_full_access_constraints(
                 policy=self.policy,
                 payment_enabled=self._payment_enabled.isChecked(),
-                max_amount_minor=self._payment_max.value(),
+                max_amount_minor=int(round(self._payment_max.value() * 100)),
                 currency=self._currency.currentText().strip().upper(),
                 destinations_enabled=self._destinations_enabled.isChecked(),
                 origins=origins,
@@ -467,30 +641,10 @@ class PermissionsPage(QWidget):
             return
         self.refresh(emit=True)
 
-    def _selected_row(self) -> int:
-        ranges = self._grants.selectedRanges()
-        return ranges[0].topRow() if ranges else -1
-
-    def _revoke_selected(self) -> None:
-        row = self._selected_row()
-        if 0 <= row < len(self._grant_row_tokens):
-            action_policy.revoke_permission_center_grant(
-                self._grant_row_tokens[row], policy=self.policy,
-            )
-            self.refresh(emit=True)
-
-    def _revoke_selected_group(self) -> None:
-        row = self._selected_row()
-        if 0 <= row < len(self._grant_group_tokens):
-            token = self._grant_group_tokens[row]
-            if token:
-                action_policy.revoke_permission_center_group(
-                    token, policy=self.policy,
-                )
-                self.refresh(emit=True)
-
-    def _revoke_everything(self) -> None:
-        action_policy.revoke_all_delegated_authority(policy=self.policy)
+    def _revoke_grant(self, row_token: str) -> None:
+        action_policy.revoke_permission_center_grant(
+            row_token, policy=self.policy,
+        )
         self.refresh(emit=True)
 
     def _clear_permission_journal(self) -> None:
@@ -500,19 +654,46 @@ class PermissionsPage(QWidget):
     @staticmethod
     def _format_timestamp(value: Any) -> str:
         if not isinstance(value, (int, float)):
-            return i18n.t("permissions.never")
+            return ""
         return _datetime.datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+
+    @classmethod
+    def _temporary_duration_text(cls, grant: dict[str, Any]) -> str:
+        if grant["expired"]:
+            return i18n.t("permissions.expired")
+        pieces: list[str] = []
+        expiration = cls._format_timestamp(grant["expires_at"])
+        if expiration:
+            pieces.append(i18n.t("permissions.expires_at", time=expiration))
+        remaining = grant["remaining_uses"]
+        if remaining is not None:
+            pieces.append(i18n.t("permissions.uses_left", count=remaining))
+        return " · ".join(pieces) or i18n.t("permissions.until_revoked")
+
+    @staticmethod
+    def _history_text(event_code: str) -> str:
+        key = _HISTORY_EVENT_KEYS.get(
+            event_code, "permissions.history.settings_updated",
+        )
+        return i18n.t(key)
 
     def _refresh_status_text(self, error_reason: str = "") -> None:
         if error_reason:
-            key = (
-                "permissions.invalid_constraints"
-                if error_reason == "invalid_constraints"
-                else "permissions.change_failed"
-            )
+            key = {
+                "invalid_constraints": "permissions.invalid_constraints",
+                "reauth_in_progress": "permissions.reauth_in_progress",
+                "reauth_denied": "permissions.reauth_denied",
+                "reauth_cancelled": "permissions.reauth_cancelled",
+                "reauth_unavailable": "permissions.reauth_unavailable",
+                "reauth_timeout": "permissions.reauth_timeout",
+                "reauth_error": "permissions.reauth_error",
+                "activation_in_progress": "permissions.reauth_in_progress",
+            }.get(error_reason, "permissions.change_failed")
             self._status.setText(i18n.t(key))
         elif not self._snapshot.get("activation_available"):
             self._status.setText(i18n.t("permissions.unavailable_simple"))
+        elif self._activation_in_progress:
+            self._status.setText(i18n.t("permissions.reauth_in_progress"))
         else:
             self._status.setText(i18n.t("permissions.saved"))
 
@@ -522,17 +703,14 @@ class PermissionsPage(QWidget):
         snapshot = action_policy.permission_center_snapshot(policy=self.policy)
         self._snapshot = snapshot
         matrix = snapshot["automatic_categories"]
-        available = bool(snapshot["activation_available"])
         self._refreshing = True
         try:
             for category, toggle in self._switches.items():
                 toggle.setChecked(bool(matrix.get(category, False)))
-                toggle.setEnabled(available)
             all_off = not any(matrix.values())
             all_on = bool(matrix) and all(matrix.values())
             self._default_preset.setChecked(all_off)
             self._full_preset.setChecked(all_on)
-            self._full_preset.setEnabled(available)
         finally:
             self._refreshing = False
 
@@ -540,52 +718,61 @@ class PermissionsPage(QWidget):
         payment = constraints["payment"]
         destinations = constraints["destinations"]
         self._payment_enabled.setChecked(payment["enabled"])
-        self._payment_max.setValue(payment["max_amount_minor"])
+        self._payment_max.setValue(payment["max_amount_minor"] / 100)
         index = self._currency.findText(payment["currency"])
         if index >= 0:
             self._currency.setCurrentIndex(index)
         else:
             self._currency.setEditText(payment["currency"])
         self._destinations_enabled.setChecked(destinations["enabled"])
-        self._destinations_summary.setText(i18n.t(
-            "permissions.destination_summary",
-            origins=destinations["origin_count"],
-            connectors=destinations["connector_count"],
-        ))
         self._destinations.blockSignals(True)
         self._destinations.clear()
         self._destinations.blockSignals(False)
         self._destinations_dirty = False
 
         grants = snapshot["grants"]
-        self._grant_row_tokens = [item["row_token"] for item in grants]
-        self._grant_group_tokens = [item["group_token"] for item in grants]
+        self._grants.clearContents()
         self._grants.setRowCount(len(grants))
         for row, grant in enumerate(grants):
-            expiration = (
-                i18n.t("permissions.expired") if grant["expired"]
-                else self._format_timestamp(grant["expires_at"])
+            action_key = _TEMPORARY_ACTION_KEYS.get(
+                grant["safe_category"], "permissions.allowed.action",
             )
-            uses = (
-                i18n.t("permissions.unlimited")
-                if grant["remaining_uses"] is None
-                else str(grant["remaining_uses"])
+            where_key = _EXECUTION_KEYS.get(
+                grant["execution_type"], "permissions.where.chat",
             )
             for column, value in enumerate((
-                grant["execution_type"], grant["safe_category"],
-                expiration, uses,
+                i18n.t(action_key),
+                i18n.t(where_key),
+                self._temporary_duration_text(grant),
             )):
                 self._grants.setItem(row, column, QTableWidgetItem(str(value)))
+            revoke = QPushButton(i18n.t("permissions.revoke"))
+            revoke.setObjectName("ghostBtn")
+            revoke.clicked.connect(
+                lambda _checked=False, token=grant["row_token"]: (
+                    self._revoke_grant(token)
+                )
+            )
+            self._grants.setCellWidget(row, 3, revoke)
+        has_grants = bool(grants)
+        self._temporary_empty.setVisible(not has_grants)
+        self._grants.setVisible(has_grants)
 
         events = snapshot["journal"]
+        self._journal.clearContents()
         self._journal.setRowCount(len(events))
         for row, event in enumerate(events):
             for column, value in enumerate((
                 self._format_timestamp(event["timestamp"]),
-                event["event_code"], event["safe_category"], event["result"],
+                self._history_text(event["event_code"]),
             )):
                 self._journal.setItem(row, column, QTableWidgetItem(str(value)))
-        self._update_confirmation_button()
+        has_events = bool(events)
+        self._journal_empty.setVisible(not has_events)
+        self._journal.setVisible(has_events)
+        self._clear_journal.setEnabled(has_events)
+        self._sync_limit_controls()
+        self._set_activation_controls()
         self._refresh_status_text(error_reason)
         if emit:
             self.state_changed.emit(snapshot)

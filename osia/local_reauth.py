@@ -29,7 +29,7 @@ class ReauthResult:
 
     @property
     def allows_activation(self) -> bool:
-        return self.status in {ReauthStatus.SUCCESS, ReauthStatus.UNAVAILABLE}
+        return self.status is ReauthStatus.SUCCESS
 
 
 _ACTIVATION_SEAL = object()
@@ -55,7 +55,7 @@ def issue_full_access_activation_proof(
 ) -> FullAccessActivationProof:
     if not isinstance(result, ReauthResult) or not result.allows_activation:
         raise ValueError("reauth_does_not_authorize_activation")
-    if result.method not in {"windows_hello", "unavailable", "deterministic_test"}:
+    if result.method not in {"windows_hello", "deterministic_test"}:
         raise ValueError("invalid_activation_method")
     nonce = secrets.token_urlsafe(32)
     with _ACTIVATION_PROOF_LOCK:
@@ -76,7 +76,7 @@ def consume_full_access_activation_proof(
         raise ValueError("activation_proof_required")
     if proof._seal is not _ACTIVATION_SEAL:
         raise ValueError("untrusted_activation_proof")
-    if proof.reauth_status not in {ReauthStatus.SUCCESS, ReauthStatus.UNAVAILABLE}:
+    if proof.reauth_status is not ReauthStatus.SUCCESS:
         raise ValueError("invalid_activation_proof_status")
     if time.time() - proof.issued_at > 120.0:
         with _ACTIVATION_PROOF_LOCK:
@@ -154,7 +154,11 @@ def _release_com_pointer(pointer) -> None:
 
 
 def _verify_windows_hello_for_window(
-    window_handle: int, prompt: str, timeout: float = 120.0,
+    window_handle: int,
+    prompt: str,
+    timeout: float = 120.0,
+    *,
+    cancellation_event: threading.Event | None = None,
 ) -> str:
     """Call the desktop UserConsentVerifier interop API for an HWND."""
     from ctypes import wintypes
@@ -230,6 +234,7 @@ def _verify_windows_hello_for_window(
         get_status = _com_method(
             async_info, 7, ctypes.c_long, ctypes.POINTER(ctypes.c_int32),
         )
+        cancel = _com_method(async_info, 9, ctypes.c_long)
         deadline = time.monotonic() + timeout
         status = ctypes.c_int32()
         while True:
@@ -237,9 +242,23 @@ def _verify_windows_hello_for_window(
                 return "InteropStatusFailed"
             if status.value != 0:  # AsyncStatus.Started
                 break
+            if cancellation_event is not None and cancellation_event.is_set():
+                if cancel(async_info) < 0:
+                    return "InteropCancelFailed"
+                cancel_deadline = time.monotonic() + 5.0
+                while status.value == 0 and time.monotonic() < cancel_deadline:
+                    time.sleep(0.01)
+                    if get_status(async_info, ctypes.byref(status)) < 0:
+                        return "InteropStatusFailed"
+                return "Canceled"
             if time.monotonic() >= deadline:
-                cancel = _com_method(async_info, 9, ctypes.c_long)
-                cancel(async_info)
+                if cancel(async_info) < 0:
+                    return "InteropCancelFailed"
+                cancel_deadline = time.monotonic() + 5.0
+                while status.value == 0 and time.monotonic() < cancel_deadline:
+                    time.sleep(0.01)
+                    if get_status(async_info, ctypes.byref(status)) < 0:
+                        return "InteropStatusFailed"
                 return "TimedOut"
             time.sleep(0.05)
         if status.value == 2:
@@ -254,6 +273,12 @@ def _verify_windows_hello_for_window(
             return "InteropResultFailed"
         return _USER_CONSENT_RESULTS.get(result.value, "Unknown")
     finally:
+        if async_info:
+            try:
+                close = _com_method(async_info, 10, ctypes.c_long)
+                close(async_info)
+            except Exception:
+                pass
         _release_com_pointer(async_info)
         _release_com_pointer(operation)
         _release_com_pointer(factory)
@@ -268,10 +293,15 @@ class WindowsHelloReauthProvider:
 
     _UNAVAILABLE = {
         "DeviceNotPresent", "NotConfiguredForUser", "DisabledByPolicy",
+        "DeviceBusy",
     }
 
     def reauthenticate(
-        self, prompt: str, *, window_handle: int | None = None,
+        self,
+        prompt: str,
+        *,
+        window_handle: int | None = None,
+        cancellation_event: threading.Event | None = None,
     ) -> ReauthResult:
         if sys.platform != "win32":
             return ReauthResult(
@@ -286,32 +316,35 @@ class WindowsHelloReauthProvider:
             return ReauthResult(
                 ReauthStatus.ERROR, "windows_hello", "window_handle_required",
             )
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        user32.IsWindow.argtypes = [ctypes.c_void_p]
-        user32.IsWindow.restype = ctypes.c_bool
-        if not user32.IsWindow(ctypes.c_void_p(window_handle)):
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.IsWindow.argtypes = [ctypes.c_void_p]
+            user32.IsWindow.restype = ctypes.c_bool
+            valid_window = user32.IsWindow(ctypes.c_void_p(window_handle))
+        except Exception:
+            return ReauthResult(
+                ReauthStatus.ERROR, "windows_hello", "reauth_backend_error",
+            )
+        if not valid_window:
             return ReauthResult(
                 ReauthStatus.ERROR, "windows_hello", "invalid_window_handle",
             )
 
-        result: list[str] = []
-
-        def verify() -> None:
-            try:
-                result.append(_verify_windows_hello_for_window(
-                    window_handle, str(prompt or "Confirm local access"), 115.0,
-                ))
-            except Exception:
-                result.append("InteropBackendError")
-
-        worker = threading.Thread(target=verify, daemon=True)
-        worker.start()
-        worker.join(120.0)
-        if worker.is_alive() or not result or result[0] == "TimedOut":
+        try:
+            verification = _verify_windows_hello_for_window(
+                window_handle,
+                str(prompt or "Confirm local access"),
+                115.0,
+                cancellation_event=cancellation_event,
+            )
+        except Exception:
+            return ReauthResult(
+                ReauthStatus.ERROR, "windows_hello", "reauth_backend_error",
+            )
+        if verification == "TimedOut":
             return ReauthResult(
                 ReauthStatus.ERROR, "windows_hello", "reauth_timeout",
             )
-        verification = result[0]
         if verification == "Verified":
             return ReauthResult(ReauthStatus.SUCCESS, "windows_hello")
         if verification == "Canceled":

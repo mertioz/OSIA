@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 import time
 
 import pytest
@@ -52,8 +53,9 @@ class _SyntheticProtectedBackend(SecureStorageBackend):
 
 
 class _FixedReauth:
-    def __init__(self, status: ReauthStatus):
+    def __init__(self, status: ReauthStatus, reason_code: str = ""):
         self.status = status
+        self.reason_code = reason_code or status.value
 
     def reauthenticate(self, prompt: str) -> ReauthResult:
         assert prompt
@@ -61,7 +63,7 @@ class _FixedReauth:
             "unavailable" if self.status is ReauthStatus.UNAVAILABLE
             else "deterministic_test"
         )
-        return ReauthResult(self.status, method, self.status.value)
+        return ReauthResult(self.status, method, self.reason_code)
 
 
 def _policy(tmp_path: Path, name: str = "permissions.dat"):
@@ -175,24 +177,161 @@ def test_store_rejects_unsealed_or_replayed_activation(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("status", "activated"),
+    ("status", "reason_code", "activated"),
     [
-        (ReauthStatus.SUCCESS, True),
-        (ReauthStatus.UNAVAILABLE, True),
-        (ReauthStatus.DENIED, False),
-        (ReauthStatus.CANCELLED, False),
-        (ReauthStatus.ERROR, False),
+        (ReauthStatus.SUCCESS, "success", True),
+        (ReauthStatus.UNAVAILABLE, "unavailable", False),
+        (ReauthStatus.DENIED, "denied", False),
+        (ReauthStatus.CANCELLED, "cancelled", False),
+        (ReauthStatus.ERROR, "reauth_timeout", False),
+        (ReauthStatus.ERROR, "error", False),
     ],
 )
-def test_local_reauth_typed_outcomes(tmp_path, status, activated):
-    policy = _policy(tmp_path, f"{status.value}.dat")
+def test_local_reauth_typed_outcomes(
+    tmp_path, status, reason_code, activated,
+):
+    policy = _policy(tmp_path, f"{status.value}-{reason_code}.dat")
     outcome = FullAccessActivationService(
-        policy=policy, reauth_provider=_FixedReauth(status),
+        policy=policy, reauth_provider=_FixedReauth(status, reason_code),
     ).activate(acknowledged=True, second_confirmed=True)
     assert outcome.activated is activated
     assert (
         policy.store.load_state().permission_mode is PermissionMode.FULL_ACCESS
     ) is activated
+
+
+def test_native_exception_becomes_typed_error_without_state_write(
+    monkeypatch, tmp_path,
+):
+    version = type("Version", (), {"build": 26100})()
+    monkeypatch.setattr("osia.local_reauth.sys.platform", "win32")
+    monkeypatch.setattr(
+        "osia.local_reauth.sys.getwindowsversion", lambda: version,
+        raising=False,
+    )
+
+    class _IsWindow:
+        def __call__(self, _window_handle):
+            return True
+
+    class _User32:
+        IsWindow = _IsWindow()
+
+    monkeypatch.setattr(
+        "osia.local_reauth.ctypes.WinDLL",
+        lambda *_args, **_kwargs: _User32(),
+    )
+    monkeypatch.setattr(
+        "osia.local_reauth._verify_windows_hello_for_window",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("synthetic_native_failure")
+        ),
+    )
+    policy = _policy(tmp_path)
+    result = WindowsHelloReauthProvider().reauthenticate(
+        "Confirm", window_handle=12345,
+    )
+    assert result == ReauthResult(
+        ReauthStatus.ERROR, "windows_hello", "reauth_backend_error",
+    )
+    outcome = FullAccessActivationService(
+        policy=policy,
+        reauth_provider=_FixedReauth(
+            ReauthStatus.ERROR, "reauth_backend_error",
+        ),
+    ).activate(acknowledged=True, second_confirmed=True)
+    assert outcome.activated is False
+    assert policy.store.load_state().permission_mode is PermissionMode.ASK
+
+
+@pytest.mark.parametrize(
+    ("verification", "expected_status", "expected_reason"),
+    [
+        ("Verified", ReauthStatus.SUCCESS, ""),
+        ("RetriesExhausted", ReauthStatus.DENIED, "verification_denied"),
+        ("Canceled", ReauthStatus.CANCELLED, "user_cancelled"),
+        (
+            "DeviceNotPresent",
+            ReauthStatus.UNAVAILABLE,
+            "windows_hello_devicenotpresent",
+        ),
+        ("TimedOut", ReauthStatus.ERROR, "reauth_timeout"),
+        ("InteropOperationFailed", ReauthStatus.ERROR, "reauth_backend_error"),
+    ],
+)
+def test_windows_hello_native_results_are_typed(
+    monkeypatch, verification, expected_status, expected_reason,
+):
+    version = type("Version", (), {"build": 26100})()
+    monkeypatch.setattr("osia.local_reauth.sys.platform", "win32")
+    monkeypatch.setattr(
+        "osia.local_reauth.sys.getwindowsversion", lambda: version,
+        raising=False,
+    )
+
+    class _IsWindow:
+        def __call__(self, _window_handle):
+            return True
+
+    class _User32:
+        IsWindow = _IsWindow()
+
+    monkeypatch.setattr(
+        "osia.local_reauth.ctypes.WinDLL",
+        lambda *_args, **_kwargs: _User32(),
+    )
+    monkeypatch.setattr(
+        "osia.local_reauth._verify_windows_hello_for_window",
+        lambda *_args, **_kwargs: verification,
+    )
+    result = WindowsHelloReauthProvider().reauthenticate(
+        "Confirm", window_handle=12345,
+    )
+    assert result.status is expected_status
+    assert result.reason_code == expected_reason
+
+
+def test_concurrent_activation_is_rejected_and_state_waits_for_success(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _BlockingReauth:
+        calls = 0
+
+        def reauthenticate(self, prompt: str):
+            assert prompt
+            self.calls += 1
+            entered.set()
+            assert release.wait(2.0)
+            return ReauthResult(ReauthStatus.SUCCESS, "deterministic_test")
+
+    policy = _policy(tmp_path)
+    provider = _BlockingReauth()
+    service = FullAccessActivationService(
+        policy=policy, reauth_provider=provider,
+    )
+    first_outcome: list = []
+    worker = threading.Thread(
+        target=lambda: first_outcome.append(service.activate(
+            acknowledged=True, second_confirmed=True,
+        )),
+    )
+    worker.start()
+    assert entered.wait(1.0)
+    assert policy.store.load_state().permission_mode is PermissionMode.ASK
+    duplicate = service.activate(acknowledged=True, second_confirmed=True)
+    assert duplicate.activated is False
+    assert duplicate.reason_code == "activation_in_progress"
+    assert provider.calls == 1
+    release.set()
+    worker.join(2.0)
+    assert not worker.is_alive()
+    assert first_outcome[0].activated is True
+    assert all(
+        policy.store.permission_center_snapshot()[
+            "automatic_categories"
+        ].values()
+    )
 
 
 def test_full_access_persists_and_activation_revocation_advance_epoch(tmp_path):
