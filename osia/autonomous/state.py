@@ -51,6 +51,7 @@ by calling :func:`save_task_state`. Every disk write is atomic (temp file +
 """
 
 import json
+import math
 import os
 import re
 import threading
@@ -61,6 +62,11 @@ from pathlib import Path
 from osia.autonomous import diagnostics
 from osia import document_artifacts, i18n
 from osia.turn_context import normalize_locale
+from osia.tools.browser_state import (
+    BrowserReferenceError,
+    BrowserStateRef,
+    safe_url_display,
+)
 
 # Imported (never recomputed) so the autonomous harness, the GUI and the mobile
 # server all resolve the SAME config/data dir. CONFIG_DIR is a str → wrap in
@@ -86,6 +92,8 @@ RUN_STATES = frozenset({
     "completed",
     "failed",
     "cancelled",
+    "suspended_browser_intervention",
+    "suspended_browser_state",
 })
 AUTHORIZATION_STATUSES = frozenset({
     "pending", "authorized", "scope_extension_required", "revoked",
@@ -96,6 +104,11 @@ OPERATION_STATUSES = frozenset({
     "success_unverified", "cancelled_proven", "partial_effect_verified",
     "outcome_unknown", "suspended_scope_extension",
     "blocked_authorization", "failed_before_dispatch",
+})
+BROWSER_SUSPENSION_REASONS = frozenset({
+    "manual_login_required", "captcha_required", "two_factor_required",
+    "permission_required", "browser_state_stale",
+    "download_attention_required", "unsupported_browser_behavior",
 })
 
 # Default budgets — bounded autonomy: at most N attempts per task and N replans
@@ -109,6 +122,19 @@ _DOCUMENT_PATH_RE = re.compile(
     r"(?i)(?:(?P<quote>[\"'`])(?:[A-Z]:[\\/]|/)[^\"'`\r\n]+?"
     r"\.(?:pdf|png|jpe?g)(?P=quote)|(?:[A-Z]:[\\/]|/)"
     r"[^\"'`\r\n]+?\.(?:pdf|png|jpe?g))"
+)
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?:[A-Z]:[\\/])[^\s\"'`<>]+"
+)
+_UNIX_ABSOLUTE_PATH_RE = re.compile(
+    r"(?m)(?:(?<=^)|(?<=\s)|(?<=[\"'`]))/(?!/)[^\s\"'`<>]+"
+)
+_WEB_URL_RE = re.compile(r"(?i)https?://[^\s\"'`<>]+")
+_ENUMERATED_REQUIREMENT_RE = re.compile(
+    r"(?m)^\s*(?P<number>\d{1,4})[.)]\s+(?P<text>\S.*)$"
+)
+_HANDOFF_REF_RE = re.compile(
+    r"^(?:el|field)_[A-Za-z0-9_-]{16,64}$"
 )
 
 
@@ -145,23 +171,400 @@ def redact_document_paths(value) -> str:
     return _DOCUMENT_PATH_RE.sub("[local document]", text)
 
 
-def _checkpoint_projection(value):
+def _absolute_path_matches(value: str) -> list[str]:
+    text = str(value or "")
+    return [
+        *(match.group(0) for match in _WINDOWS_ABSOLUTE_PATH_RE.finditer(text)),
+        *(match.group(0) for match in _UNIX_ABSOLUTE_PATH_RE.finditer(text)),
+    ]
+
+
+def _private_path_basenames(value: str) -> tuple[str, ...]:
+    names = []
+    for raw in _absolute_path_matches(value):
+        name = re.split(r"[\\/]", raw.rstrip(".,;:!?)]}"))[-1]
+        if name and name not in names:
+            names.append(name)
+    return tuple(names[:64])
+
+
+def sanitize_autonomous_text(value, *, private_filenames=()) -> str:
+    """Remove private paths and URL query/fragment data from checkpoints."""
+
+    text = str(value or "")
+
+    def _safe_url(match):
+        raw = match.group(0)
+        trailing = ""
+        while raw and raw[-1] in ".,;:!?)]:":
+            trailing = raw[-1] + trailing
+            raw = raw[:-1]
+        return safe_url_display(raw) + trailing
+
+    text = _WEB_URL_RE.sub(_safe_url, text)
+    text = _WINDOWS_ABSOLUTE_PATH_RE.sub("[private local path]", text)
+    text = _UNIX_ABSOLUTE_PATH_RE.sub("[private local path]", text)
+    text = redact_document_paths(text)
+    for name in sorted(
+        {str(item) for item in private_filenames if str(item)},
+        key=len,
+        reverse=True,
+    ):
+        text = re.sub(re.escape(name), "[private file]", text, flags=re.IGNORECASE)
+    return text
+
+
+def extract_enumerated_requirements(value: str) -> list[dict]:
+    """Extract explicit numbered requirements without merging adjacent items."""
+
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    matches = list(_ENUMERATED_REQUIREMENT_RE.finditer(text))
+    if len(matches) < 2:
+        return []
+    requirements = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[match.start("text"):end].strip()
+        requirements.append({
+            "requirement_id": f"req_{index + 1:03d}",
+            "source_number": int(match.group("number")),
+            "text": body,
+        })
+    return requirements
+
+
+def _checkpoint_projection(value, *, private_filenames=()):
     """Drop runtime-only source strings before any Autonomous disk write."""
 
     if isinstance(value, dict):
+        filenames = tuple(private_filenames)
+        if not filenames:
+            filenames = _private_path_basenames(
+                value.get("_runtime_objective", "")
+            )
         return {
-            key: _checkpoint_projection(item)
+            key: _checkpoint_projection(
+                item, private_filenames=filenames,
+            )
             for key, item in value.items()
             if not str(key).startswith("_runtime_")
         }
     if isinstance(value, list):
-        return [_checkpoint_projection(item) for item in value]
+        return [
+            _checkpoint_projection(item, private_filenames=private_filenames)
+            for item in value
+        ]
     if isinstance(value, str):
-        return redact_document_paths(value)
+        return sanitize_autonomous_text(
+            value, private_filenames=private_filenames,
+        )
     return value
 
 
-def _normalize_task(index: int, task) -> dict:
+def _safe_browser_state_ref(value) -> dict | None:
+    try:
+        return BrowserStateRef.parse(value).to_dict()
+    except BrowserReferenceError:
+        return None
+
+
+def _safe_nonnegative_number(value, *, integer=False):
+    try:
+        number = int(value) if integer else float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if isinstance(number, float) and not math.isfinite(number):
+        return 0
+    return max(0, number)
+
+
+def _safe_action_receipt(value) -> dict | None:
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        return None
+    dispatch = str(value.get("dispatch_state") or "")
+    outcome = str(value.get("outcome") or "")
+    if dispatch not in {
+        "not_dispatched", "dispatched", "effect_confirmed", "effect_unknown",
+    } or outcome not in {
+        "confirmed_failure_before_effect", "confirmed_success", "outcome_unknown",
+    }:
+        return None
+    evidence = []
+    for item in (value.get("evidence") or [])[:16]:
+        if not isinstance(item, dict):
+            continue
+        clean = {}
+        for key, raw in list(item.items())[:12]:
+            name = re.sub(r"[^a-z0-9_]", "", str(key).lower())[:48]
+            if not name:
+                continue
+            if isinstance(raw, str):
+                clean[name] = raw[:512]
+            elif raw is None or isinstance(raw, (bool, int, float)):
+                clean[name] = raw
+        if clean:
+            evidence.append(clean)
+    return {
+        "schema_version": 1,
+        "operation_id": str(value.get("operation_id") or "")[:96],
+        "tool_call_id": str(value.get("tool_call_id") or "")[:96],
+        "before_state": _safe_browser_state_ref(value.get("before_state")),
+        "after_state": _safe_browser_state_ref(value.get("after_state")),
+        "dispatch_state": dispatch,
+        "outcome": outcome,
+        "evidence": evidence,
+        "started_at": _safe_nonnegative_number(value.get("started_at")),
+        "completed_at": _safe_nonnegative_number(value.get("completed_at")),
+    }
+
+
+def safe_browser_operation_evidence(result) -> dict | None:
+    """Return value-free typed evidence suitable for durable verification."""
+
+    if not isinstance(result, dict):
+        return None
+    receipt = _safe_action_receipt(result.get("receipt"))
+    if receipt is None:
+        return None
+    safe_receipt = {
+        "before_state": receipt.get("before_state"),
+        "after_state": receipt.get("after_state"),
+        "dispatch_state": receipt.get("dispatch_state"),
+        "outcome": receipt.get("outcome"),
+        "evidence": receipt.get("evidence") or [],
+    }
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    safe_data = {}
+    for key in (
+        "status", "pages_advanced", "steps", "byte_size", "field_count",
+        "selected", "file_selected", "mime_type", "classification",
+    ):
+        value = data.get(key)
+        if value is None or isinstance(value, (bool, int, float)):
+            if key in data:
+                safe_data[key] = value
+        elif isinstance(value, str):
+            clean = value[:160]
+            if re.fullmatch(r"[A-Za-z0-9_+./-]{1,160}", clean):
+                safe_data[key] = clean
+    return {"receipt": safe_receipt, "data": safe_data}
+
+
+def _safe_reference_handoffs(values, current_state=None) -> list[dict]:
+    current = _safe_browser_state_ref(current_state)
+    handoffs = []
+    for item in values if isinstance(values, list) else ():
+        if not isinstance(item, dict):
+            continue
+        bound_state = _safe_browser_state_ref(item.get("state"))
+        if bound_state is None or (current is not None and bound_state != current):
+            continue
+        operation = re.sub(
+            r"[^a-z0-9_]", "", str(item.get("operation") or "").lower()
+        )[:80]
+        references = []
+        for reference in item.get("references") or []:
+            if not isinstance(reference, dict):
+                continue
+            field = re.sub(
+                r"[^a-z0-9_]", "", str(reference.get("field") or "").lower()
+            )[:48]
+            opaque = str(reference.get("ref") or "")
+            if not field.endswith("_ref") or not _HANDOFF_REF_RE.fullmatch(opaque):
+                continue
+            candidate = {"field": field, "ref": opaque}
+            if candidate not in references:
+                references.append(candidate)
+            if len(references) >= 48:
+                break
+        if operation and references:
+            handoffs.append({
+                "operation": operation,
+                "state": bound_state,
+                "references": references,
+            })
+        if len(handoffs) >= 8:
+            break
+    return handoffs
+
+
+def _collect_safe_handoff_refs(value) -> list[dict]:
+    references = []
+
+    def visit(item):
+        if len(references) >= 48:
+            return
+        if isinstance(item, dict):
+            for key, child in item.items():
+                field = re.sub(r"[^a-z0-9_]", "", str(key).lower())[:48]
+                if (
+                    field.endswith("_ref")
+                    and isinstance(child, str)
+                    and _HANDOFF_REF_RE.fullmatch(child)
+                ):
+                    candidate = {"field": field, "ref": child}
+                    if candidate not in references:
+                        references.append(candidate)
+                elif isinstance(child, (dict, list)):
+                    visit(child)
+        elif isinstance(item, list):
+            for child in item[:100]:
+                visit(child)
+
+    visit(value)
+    return references
+
+
+def normalize_browser_checkpoint(value) -> dict:
+    source = value if isinstance(value, dict) else {}
+    pending = source.get("pending_operation")
+    pending = pending if isinstance(pending, dict) else {}
+    reason = str(source.get("manual_intervention") or "")
+    browser_state = _safe_browser_state_ref(source.get("browser_state"))
+    return {
+        "browser_state": browser_state,
+        "last_verified_state": _safe_browser_state_ref(
+            source.get("last_verified_state")
+        ),
+        "active_popup_state": _safe_browser_state_ref(
+            source.get("active_popup_state")
+        ),
+        "pending_operation": {
+            "operation_id": str(pending.get("operation_id") or "")[:96],
+            "kind": (
+                str(pending.get("kind") or "")
+                if str(pending.get("kind") or "") in {"upload", "download"}
+                else ""
+            ),
+        } if pending else None,
+        "last_action_receipt": _safe_action_receipt(
+            source.get("last_action_receipt")
+        ),
+        "last_artifact_summary": (
+            {
+                "artifact_id": str(
+                    (source.get("last_artifact_summary") or {}).get("artifact_id") or ""
+                )[:64],
+                "size": _safe_nonnegative_number(
+                    (source.get("last_artifact_summary") or {}).get("size"),
+                    integer=True,
+                ),
+                "mime_type": str(
+                    (source.get("last_artifact_summary") or {}).get("mime_type") or ""
+                )[:160],
+                "classification": str(
+                    (source.get("last_artifact_summary") or {}).get("classification") or ""
+                )[:64],
+                "private": True,
+            }
+            if isinstance(source.get("last_artifact_summary"), dict)
+            and re.fullmatch(
+                r"web_[0-9a-f]{32}",
+                str(source["last_artifact_summary"].get("artifact_id") or ""),
+            )
+            else None
+        ),
+        "reference_handoffs": _safe_reference_handoffs(
+            source.get("reference_handoffs"), browser_state,
+        ),
+        "manual_intervention": (
+            reason if reason in BROWSER_SUSPENSION_REASONS else ""
+        ),
+    }
+
+
+def record_browser_execution(st: dict, tool_identity: str, result) -> None:
+    browser_tools = {
+        "navigate", "click", "go_back", "go_forward", "open_new_tab",
+        "find_and_click", "wait_for_load", "open_browser",
+        "get_browser_state", "navigate_browser", "inspect_browser_page",
+        "wait_for_browser_condition", "activate_browser_element",
+        "list_browser_tabs", "select_browser_tab", "close_browser_tab",
+        "reload_browser_page", "browser_back", "browser_forward",
+        "open_new_browser_tab", "return_to_browser_opener", "search_web",
+        "open_search_result", "paginate_browser", "scroll_infinite",
+        "list_browser_dialogs", "handle_browser_dialog",
+        "upload_browser_file", "download_browser_file",
+    }
+    if tool_identity not in browser_tools or not isinstance(result, dict):
+        return
+    checkpoint = normalize_browser_checkpoint(st.get("browser_checkpoint"))
+    receipt = _safe_action_receipt(result.get("receipt"))
+    if receipt is not None:
+        checkpoint["last_action_receipt"] = receipt
+        after = receipt.get("after_state")
+        if after is not None:
+            checkpoint["browser_state"] = after
+        if (
+            receipt.get("outcome") == "confirmed_success"
+            and receipt.get("dispatch_state") == "effect_confirmed"
+            and after is not None
+        ):
+            checkpoint["last_verified_state"] = after
+        if tool_identity in {"upload_browser_file", "download_browser_file"}:
+            checkpoint["pending_operation"] = None
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    checkpoint["reference_handoffs"] = _safe_reference_handoffs(
+        checkpoint.get("reference_handoffs"), checkpoint.get("browser_state"),
+    )
+    references = _collect_safe_handoff_refs(data)
+    if references and checkpoint.get("browser_state") is not None:
+        operation = re.sub(
+            r"[^a-z0-9_]", "", str(tool_identity or "").lower()
+        )[:80]
+        checkpoint["reference_handoffs"] = [
+            item for item in checkpoint.get("reference_handoffs") or []
+            if item.get("operation") != operation
+        ]
+        checkpoint["reference_handoffs"].append({
+            "operation": operation,
+            "state": checkpoint["browser_state"],
+            "references": references,
+        })
+        checkpoint["reference_handoffs"] = _safe_reference_handoffs(
+            checkpoint["reference_handoffs"], checkpoint["browser_state"],
+        )
+    intervention = str(data.get("manual_intervention") or "")
+    artifact = data.get("artifact")
+    if isinstance(artifact, dict) and re.fullmatch(
+        r"web_[0-9a-f]{32}", str(artifact.get("artifact_id") or ""),
+    ):
+        checkpoint["last_artifact_summary"] = {
+            "artifact_id": str(artifact["artifact_id"]),
+            "size": _safe_nonnegative_number(artifact.get("size"), integer=True),
+            "mime_type": str(artifact.get("mime_type") or "")[:160],
+            "classification": str(artifact.get("classification") or "")[:64],
+            "private": True,
+        }
+    if intervention in BROWSER_SUSPENSION_REASONS:
+        checkpoint["manual_intervention"] = intervention
+        st["run_state"] = "suspended_browser_intervention"
+    st["browser_checkpoint"] = checkpoint
+
+
+def mark_pending_browser_operation(st: dict, operation_id: str, kind: str) -> None:
+    if kind not in {"upload", "download"}:
+        return
+    checkpoint = normalize_browser_checkpoint(st.get("browser_checkpoint"))
+    checkpoint["pending_operation"] = {
+        "operation_id": str(operation_id or "")[:96], "kind": kind,
+    }
+    st["browser_checkpoint"] = checkpoint
+
+
+def suspend_browser(st: dict, reason: str) -> None:
+    if reason not in BROWSER_SUSPENSION_REASONS:
+        raise ValueError("invalid_browser_suspension_reason")
+    checkpoint = normalize_browser_checkpoint(st.get("browser_checkpoint"))
+    checkpoint["manual_intervention"] = reason
+    st["browser_checkpoint"] = checkpoint
+    st["run_state"] = (
+        "suspended_browser_state"
+        if reason == "browser_state_stale" else "suspended_browser_intervention"
+    )
+
+
+def _normalize_task(index: int, task, *, private_filenames=()) -> dict:
     """Coerce a loose task spec into the strict on-disk task schema.
 
     Accepts either a bare ``str`` (treated as the task objective) or a dict with
@@ -174,10 +577,18 @@ def _normalize_task(index: int, task) -> dict:
         task = {}
     raw_objective = task.get("objective", "") or ""
     raw_criterion = task.get("success_criterion", "") or ""
+    requirement_id = str(task.get("requirement_id") or "")
+    if not re.fullmatch(r"req_\d{3,4}", requirement_id):
+        requirement_id = ""
     normalized = {
         "id": str(task.get("id") or f"t{index}"),
-        "objective": redact_document_paths(raw_objective),
-        "success_criterion": redact_document_paths(raw_criterion),
+        "objective": sanitize_autonomous_text(
+            raw_objective, private_filenames=private_filenames,
+        ),
+        "success_criterion": sanitize_autonomous_text(
+            raw_criterion, private_filenames=private_filenames,
+        ),
+        "requirement_id": requirement_id,
         "status": task.get("status") or "pending",
         "attempts": int(task.get("attempts", 0) or 0),
         "distilled_summary": task.get("distilled_summary", "") or "",
@@ -207,7 +618,7 @@ def _normalize_artifact_ids(values) -> list[str]:
     return clean
 
 
-def _normalize_phase(phase) -> dict:
+def _normalize_phase(phase, *, private_filenames=()) -> dict:
     """Coerce a loose phase spec into the strict on-disk phase schema.
 
     Accepts either a bare ``str`` (the phase name, no tasks) or a dict with
@@ -223,9 +634,14 @@ def _normalize_phase(phase) -> dict:
     else:
         name, status, raw_tasks = "", None, []
     return {
-        "name": redact_document_paths(name),
+        "name": sanitize_autonomous_text(
+            name, private_filenames=private_filenames,
+        ),
         "status": status or "pending",
-        "tasks": [_normalize_task(i, t) for i, t in enumerate(raw_tasks)],
+        "tasks": [
+            _normalize_task(i, t, private_filenames=private_filenames)
+            for i, t in enumerate(raw_tasks)
+        ],
     }
 
 
@@ -243,7 +659,29 @@ def new_task_state(objective: str, provider: str, model: str, phases, *,
     ``context_digest`` and an empty ``log``.
     """
     now = _now_iso()
-    safe_objective = redact_document_paths(objective)
+    private_filenames = _private_path_basenames(objective)
+    safe_objective = sanitize_autonomous_text(
+        objective, private_filenames=private_filenames,
+    )
+    raw_requirements = extract_enumerated_requirements(objective)
+    checklist = []
+    for requirement in raw_requirements:
+        raw_text = requirement["text"]
+        safe_text = sanitize_autonomous_text(
+            raw_text, private_filenames=private_filenames,
+        )
+        item = {
+            "requirement_id": requirement["requirement_id"],
+            "source_number": requirement["source_number"],
+            "criterion": safe_text,
+            "status": "pending",
+            "evidence_ref": "",
+            "failure_reason": "",
+            "retry_eligible": True,
+        }
+        if safe_text != raw_text:
+            item["_runtime_criterion"] = raw_text
+        checklist.append(item)
     result = {
         "schema_version": SCHEMA_VERSION,
         "task_id": uuid.uuid4().hex,
@@ -274,6 +712,7 @@ def new_task_state(objective: str, provider: str, model: str, phases, *,
         },
         "operation_records": [],
         "ambiguity_barriers": [],
+        "browser_checkpoint": normalize_browser_checkpoint({}),
         "language": normalize_locale(language) or i18n.DEFAULT_LANG,
         "cursor": {"phase": 0, "task": 0},
         "budgets": {
@@ -282,8 +721,12 @@ def new_task_state(objective: str, provider: str, model: str, phases, *,
             "replan_count": 0,
         },
         "context_digest": "",
+        "checklist": checklist,
         "artifacts": [],
-        "phases": [_normalize_phase(p) for p in (phases or [])],
+        "phases": [
+            _normalize_phase(p, private_filenames=private_filenames)
+            for p in (phases or [])
+        ],
         "log": [],
         "failure_diagnostic": None,
         "diagnostic_history": [],
@@ -334,6 +777,7 @@ def equivalent_operation_record(
     tool_identity: str,
     normalized_call_hash: str,
     private_scope_hash: str,
+    autonomous_equivalence_hash: str = "",
     statuses=None,
 ) -> dict | None:
     """Find a durable equivalent operation without relying on plan revision."""
@@ -342,10 +786,17 @@ def equivalent_operation_record(
     for record in st.get("operation_records") or []:
         if not isinstance(record, dict) or record.get("status") not in allowed:
             continue
-        if (
-            record.get("tool_identity") == tool_identity
-            and record.get("normalized_call_hash") == normalized_call_hash
+        exact_match = (
+            record.get("normalized_call_hash") == normalized_call_hash
             and record.get("private_scope_hash") == private_scope_hash
+        )
+        semantic_match = bool(
+            autonomous_equivalence_hash
+            and record.get("autonomous_equivalence_hash")
+            == autonomous_equivalence_hash
+        )
+        if record.get("tool_identity") == tool_identity and (
+            exact_match or semantic_match
         ):
             return record
     return None
@@ -381,16 +832,24 @@ def equivalent_ambiguity_barrier(
     tool_identity: str,
     normalized_call_hash: str,
     private_scope_hash: str,
+    autonomous_equivalence_hash: str = "",
 ) -> dict | None:
     """Find a durable no-replay barrier for an equivalent private operation."""
 
     for barrier in st.get("ambiguity_barriers") or []:
         if not isinstance(barrier, dict):
             continue
-        if (
-            barrier.get("tool_identity") == tool_identity
-            and barrier.get("normalized_call_hash") == normalized_call_hash
+        exact_match = (
+            barrier.get("normalized_call_hash") == normalized_call_hash
             and barrier.get("private_scope_hash") == private_scope_hash
+        )
+        semantic_match = bool(
+            autonomous_equivalence_hash
+            and barrier.get("autonomous_equivalence_hash")
+            == autonomous_equivalence_hash
+        )
+        if barrier.get("tool_identity") == tool_identity and (
+            exact_match or semantic_match
         ):
             return barrier
     return None
@@ -404,6 +863,9 @@ def add_ambiguity_barrier(st: dict, record: dict) -> dict:
         tool_identity=str(record.get("tool_identity") or ""),
         normalized_call_hash=str(record.get("normalized_call_hash") or ""),
         private_scope_hash=str(record.get("private_scope_hash") or ""),
+        autonomous_equivalence_hash=str(
+            record.get("autonomous_equivalence_hash") or ""
+        ),
     )
     if existing is not None:
         return existing
@@ -412,6 +874,9 @@ def add_ambiguity_barrier(st: dict, record: dict) -> dict:
         "tool_identity": str(record.get("tool_identity") or ""),
         "normalized_call_hash": str(record.get("normalized_call_hash") or ""),
         "private_scope_hash": str(record.get("private_scope_hash") or ""),
+        "autonomous_equivalence_hash": str(
+            record.get("autonomous_equivalence_hash") or ""
+        ),
         "reason_code": "outcome_unknown",
         "created_at": _now_iso(),
     }
@@ -490,7 +955,52 @@ def set_task_status(state: dict, phase_idx: int, task_idx: int, status: str,
             task["status"] = status
             for key, value in fields.items():
                 task[key] = value
+            requirement_id = str(task.get("requirement_id") or "")
+            checklist_item = next((
+                item for item in state.get("checklist") or []
+                if isinstance(item, dict)
+                and item.get("requirement_id") == requirement_id
+            ), None)
+            if checklist_item is not None:
+                attempts = max(0, int(task.get("attempts", 0) or 0))
+                max_attempts = max(1, int(
+                    (state.get("budgets") or {}).get(
+                        "max_attempts_per_task", DEFAULT_MAX_ATTEMPTS_PER_TASK,
+                    ) or DEFAULT_MAX_ATTEMPTS_PER_TASK
+                ))
+                if status == "done":
+                    checklist_item.update({
+                        "status": "verified",
+                        "evidence_ref": f"task:{str(task.get('id') or '')[:64]}",
+                        "failure_reason": "",
+                        "retry_eligible": False,
+                    })
+                elif status == "failed":
+                    checklist_item.update({
+                        "status": "blocked",
+                        "evidence_ref": "",
+                        "failure_reason": str(
+                            task.get("last_error") or "requirement_not_verified"
+                        )[:96],
+                        "retry_eligible": attempts < max_attempts,
+                    })
+                elif status == "in_progress":
+                    checklist_item.update({
+                        "status": "active",
+                        "evidence_ref": "",
+                        "failure_reason": str(task.get("last_error") or "")[:96],
+                        "retry_eligible": attempts < max_attempts,
+                    })
     return state
+
+
+def checklist_remaining(state: dict) -> list[dict]:
+    """Return sanitized required criteria that are not yet verified."""
+
+    return [
+        item for item in state.get("checklist") or []
+        if isinstance(item, dict) and item.get("status") != "verified"
+    ]
 
 
 def append_log(state: dict, event: str, ref=None, note=None) -> dict:
@@ -520,6 +1030,7 @@ def resume_state_is_valid(st) -> bool:
     if st.get("run_state") not in {
         "ready", "running", "suspended_scope_extension",
         "suspended_authorization_revoked", "blocked_outcome_unknown",
+        "suspended_browser_intervention", "suspended_browser_state",
     }:
         return False
     if st.get("authorization_status") not in AUTHORIZATION_STATUSES:
@@ -572,6 +1083,9 @@ def execution_state_is_valid(st) -> bool:
         return False
     if not isinstance(st.get("operation_records"), list):
         return False
+    normalized_browser = normalize_browser_checkpoint(st.get("browser_checkpoint"))
+    if normalized_browser != st.get("browser_checkpoint"):
+        return False
     for record in st["operation_records"]:
         if not isinstance(record, dict) or record.get("status") not in OPERATION_STATUSES:
             return False
@@ -597,6 +1111,7 @@ def _migrate_loaded_state(loaded: dict) -> dict:
         loaded["pending_scope_extension"] = None
         loaded["operation_records"] = []
         loaded["ambiguity_barriers"] = []
+        loaded["browser_checkpoint"] = normalize_browser_checkpoint({})
         return loaded
 
     if version < SCHEMA_VERSION:
@@ -619,6 +1134,7 @@ def _migrate_loaded_state(loaded: dict) -> dict:
         }
         loaded["operation_records"] = []
         loaded["ambiguity_barriers"] = []
+        loaded["browser_checkpoint"] = normalize_browser_checkpoint({})
         legacy_status = loaded.get("status")
         loaded["run_state"] = {
             "done": "completed",
@@ -654,6 +1170,7 @@ def _migrate_loaded_state(loaded: dict) -> dict:
         "revocation": {"revoked": False, "revoked_at": None, "reason_code": ""},
         "operation_records": [],
         "ambiguity_barriers": [],
+        "browser_checkpoint": normalize_browser_checkpoint({}),
     }
     for key, value in defaults.items():
         loaded.setdefault(key, value)

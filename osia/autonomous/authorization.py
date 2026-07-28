@@ -181,6 +181,28 @@ def _task_position(st: dict) -> tuple[str, str]:
     return phase_id, task_id
 
 
+def _task_requirement_id(st: dict) -> str:
+    """Return the planner-stable requirement bound to the current cursor."""
+
+    cursor = st.get("cursor") or {}
+    try:
+        phase_index = int(cursor.get("phase", 0) or 0)
+        task_index = int(cursor.get("task", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    phases = st.get("phases") or []
+    if not (0 <= phase_index < len(phases)):
+        return ""
+    phase = phases[phase_index]
+    if not isinstance(phase, dict):
+        return ""
+    tasks = phase.get("tasks") or []
+    if not (0 <= task_index < len(tasks)) or not isinstance(tasks[task_index], dict):
+        return ""
+    requirement_id = str(tasks[task_index].get("requirement_id") or "")
+    return requirement_id if re.fullmatch(r"req_\d{3,4}", requirement_id) else ""
+
+
 def operation_id_for_call(st: dict, tool_identity: str, call_hash: str) -> str:
     """Stable across suspend/resume, but distinct across plan tasks/revisions."""
 
@@ -194,6 +216,26 @@ def operation_id_for_call(st: dict, tool_identity: str, call_hash: str) -> str:
         str(call_hash or ""),
     )).encode("utf-8", errors="strict")
     return "op_" + hashlib.sha256(material).hexdigest()[:48]
+
+
+def operation_equivalence_hash(tool_identity: str, arguments: Mapping[str, Any]) -> str:
+    """Hash one semantic Autonomous action without optional state carriers."""
+
+    from osia.tool_contracts import normalized_call_hash
+
+    values = dict(arguments) if isinstance(arguments, Mapping) else {}
+    identity = str(tool_identity or "")
+    if identity in {"navigate_browser", "search_web"}:
+        values.pop("state_ref", None)
+    elif (
+        identity == "activate_browser_element"
+        and re.fullmatch(
+            r"[0-9a-f]{64}", str(values.get("trusted_target_binding") or ""),
+        )
+    ):
+        values.pop("state_ref", None)
+        values.pop("element_ref", None)
+    return normalized_call_hash(identity, values)
 
 
 def bind_request_execution_context(context, tool_identity: str, call_hash: str):
@@ -879,9 +921,11 @@ def _base_operation_record(request, decision) -> dict:
         "operation_id": request.operation_id,
         "task_id": task_id,
         "phase_id": phase_id,
+        "requirement_id": _task_requirement_id(st),
         "plan_revision": int(st.get("plan_revision", 0) or 0),
         "tool_identity": request.tool_identity,
         "normalized_call_hash": request.normalized_call_hash,
+        "autonomous_equivalence_hash": request.autonomous_equivalence_hash,
         "private_scope_hash": request.scope_hash,
         "grant_ref": decision.grant_ref,
         "authorization_source": decision.authorization_source.value,
@@ -907,6 +951,7 @@ def request_block_reason(request) -> str | None:
         tool_identity=request.tool_identity,
         normalized_call_hash=request.normalized_call_hash,
         private_scope_hash=request.scope_hash,
+        autonomous_equivalence_hash=request.autonomous_equivalence_hash,
     ) is not None:
         return "duplicate_outcome_unknown"
     completed = None
@@ -916,6 +961,7 @@ def request_block_reason(request) -> str | None:
             tool_identity=request.tool_identity,
             normalized_call_hash=request.normalized_call_hash,
             private_scope_hash=request.scope_hash,
+            autonomous_equivalence_hash=request.autonomous_equivalence_hash,
             statuses={"success_verified"},
         )
     if completed is not None:
@@ -1069,6 +1115,12 @@ def on_permit_consumed(request, permit) -> None:
         "policy_epoch": permit.policy_epoch,
     })
     state.upsert_operation_record(st, record)
+    if request.tool_identity in {"upload_browser_file", "download_browser_file"}:
+        state.mark_pending_browser_operation(
+            st,
+            request.operation_id,
+            "upload" if request.tool_identity == "upload_browser_file" else "download",
+        )
     _checkpoint(runtime)
 
 
@@ -1150,7 +1202,13 @@ def record_tool_execution(tool_identity: str, arguments: Mapping[str, Any], exec
             else status
         ),
     })
+    browser_evidence = state.safe_browser_operation_evidence(
+        execution_record.result
+    )
+    if browser_evidence is not None:
+        record["browser_evidence"] = browser_evidence
     state.upsert_operation_record(st, record)
+    state.record_browser_execution(st, tool_identity, execution_record.result)
     if outcome in {
         ExecutionOutcome.OUTCOME_UNKNOWN,
         ExecutionOutcome.SUCCESS_UNVERIFIED,

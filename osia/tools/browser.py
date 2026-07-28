@@ -17,7 +17,7 @@ it is driven over *WebDriver BiDi* instead. When the user asks for Firefox
 (``open_browser("firefox")``), OSIA launches the system Firefox through
 Playwright (``firefox.launch_persistent_context`` with
 ``channel="moz-firefox"``) against a persistent OSIA profile at
-``/home/OSIA/.osia/firefox-profile``, so cookies / logins survive between
+the per-user OSIA data directory, so cookies / logins survive between
 OSIA uses. The Playwright Page API is identical for both protocols, so every
 page tool (navigate, click, find_and_click, scroll, screenshot, …) works
 transparently regardless of which backend is active; ``_active_browser_type``
@@ -29,25 +29,206 @@ neither is available we surface a clear error.
 import base64
 import asyncio
 import concurrent.futures
+import hashlib
 import inspect
+import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from enum import Enum
 from pathlib import Path
+from urllib.parse import quote_plus, urlsplit
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 from osia.tools.browser_forms import FORM_MAX_FIELDS_DEFAULT, SemanticFormSession
+from osia.tools.browser_artifacts import (
+    BrowserArtifactError,
+    MAX_DOWNLOAD_BYTES,
+    MAX_SESSION_TEMP_BYTES,
+    cleanup_operation_temp,
+    get_browser_artifact_store,
+    operation_temp_dir,
+    revalidate_upload,
+    validate_upload_path,
+)
+from osia.tools.browser_state import (
+    BoundReferenceStore,
+    BrowserReferenceError,
+    BrowserStateRef,
+    BrowserStateTracker,
+    DispatchState,
+    ReceiptOutcome,
+    WaitConditionType,
+    WaitSpec,
+    action_result,
+    content_fingerprint,
+    make_receipt,
+    opaque_ref,
+    safe_origin,
+    safe_url_display,
+    scrub_browser_error,
+)
 
 # Timeout exceptions that mean "the page is just slow" — never a hard failure.
 # Playwright's TimeoutError is caught alongside the builtin for safety across
 # Playwright versions (newer versions subclass the builtin, older don't).
 _TIMEOUT_ERRORS = (PlaywrightTimeoutError, TimeoutError)
+
+_FIXED_DOM_PRIMITIVES = {
+    "main": "main",
+    "article": "article",
+    "dialog": "dialog, [role=dialog], [aria-modal=true]",
+    "form": "form",
+    "table": "table",
+    "list": "ol, ul",
+}
+
+
+def _semantic_browser_binding(kind, frame, metadata) -> str:
+    """Private stable identity for one rendered target in one document."""
+
+    material = json.dumps(
+        {
+            "frame": id(frame),
+            "kind": str(kind),
+            "metadata": metadata,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8", errors="replace")
+    return hashlib.sha256(material).hexdigest()
+
+_STRUCTURED_INSPECTION_JS = r"""
+({mode, maxItems, textOffset, textLimit}) => {
+  const clean = (v, n=600) => String(v || '').replace(/\s+/g, ' ').trim().slice(0, n);
+  const visible = (el) => {
+    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+    return s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0;
+  };
+  const all = (selector) => Array.from(document.querySelectorAll(selector)).filter(visible);
+  const indexed = (selector) => Array.from(document.querySelectorAll(selector))
+    .map((el, index) => ({el, index})).filter(item => visible(item.el));
+  const bounded = (items) => items.slice(0, maxItems);
+  const result = {
+    title: clean(document.title, 300),
+    language: clean(document.documentElement.lang, 32),
+    headings: [], sections: [], links: [], buttons: [], controls: [],
+    forms: [], tables: [], lists: [], metadata: {},
+  };
+  const headings = all('h1,h2,h3,h4,h5,h6');
+  result.headings = bounded(headings).map((el, index) => ({
+    level: Number(el.tagName.slice(1)), text: clean(el.innerText), index,
+  }));
+  const sections = all('main,article');
+  result.sections = bounded(sections).map((el, index) => ({
+    kind: el.tagName.toLowerCase(), text: clean(el.innerText, 4000), index,
+  }));
+  const links = indexed('a[href]');
+  result.links = bounded(links).map(({el, index}) => ({
+    text: clean(el.innerText || el.getAttribute('aria-label'), 300),
+    destination: el.href, index,
+  }));
+  const buttons = indexed('button,input[type=button],input[type=submit],[role=button]');
+  result.buttons = bounded(buttons).map(({el, index}) => ({
+    text: clean(el.innerText || el.value || el.getAttribute('aria-label'), 300),
+    disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+    expanded: el.getAttribute('aria-expanded'), index,
+  }));
+  const controls = indexed('input:not([type=hidden]),textarea,select');
+  const safeControls = controls.filter(({el}) =>
+    String(el.type || '').toLowerCase() !== 'password' &&
+    String(el.autocomplete || '').toLowerCase() !== 'one-time-code'
+  );
+  result.controls = bounded(safeControls).map(({el, index}) => ({
+    kind: el.tagName.toLowerCase(), type: clean(el.type, 40),
+    label: clean(el.labels && el.labels[0] ? el.labels[0].innerText : el.getAttribute('aria-label'), 300),
+    disabled: Boolean(el.disabled), index,
+  }));
+  const forms = indexed('form');
+  result.forms = bounded(forms).map(({el, index}) => ({
+    label: clean(el.getAttribute('aria-label') || el.getAttribute('name'), 300),
+    field_count: el.querySelectorAll('input:not([type=hidden]),textarea,select').length,
+    index,
+  }));
+  const tables = indexed('table');
+  result.tables = bounded(tables).map(({el: table, index}) => {
+    const headers = bounded(Array.from(table.querySelectorAll('thead th')));
+    const fallbackHeaders = headers.length ? headers : bounded(Array.from(
+      (table.rows && table.rows[0] ? table.rows[0].querySelectorAll('th') : [])
+    ));
+    const rows = bounded(Array.from(table.rows || [])).map(row =>
+      bounded(Array.from(row.cells || [])).map(cell => clean(cell.innerText, 500))
+    );
+    return {
+      caption: clean(table.caption && table.caption.innerText, 300),
+      headers: fallbackHeaders.map(cell => clean(cell.innerText, 500)),
+      rows, index,
+    };
+  });
+  const lists = indexed('ol,ul');
+  result.lists = bounded(lists).map(({el: list, index}) => ({
+    ordered: list.tagName.toLowerCase() === 'ol',
+    items: bounded(Array.from(list.children).filter(el => el.tagName === 'LI'))
+      .map(el => clean(el.innerText, 600)), index,
+  }));
+  const canonical = document.querySelector('link[rel=canonical]');
+  const description = document.querySelector('meta[name=description],meta[property="og:description"]');
+  result.metadata = {
+    canonical: canonical ? canonical.href : '',
+    description: description ? clean(description.content, 600) : '',
+  };
+  const hasCaptcha = Boolean(document.querySelector(
+    'iframe[src*="captcha" i],iframe[src*="recaptcha" i],[class*="captcha" i],[id*="captcha" i]'
+  ));
+  const hasOtp = Boolean(document.querySelector(
+    'input[autocomplete="one-time-code"],input[name*="otp" i],input[name*="verification" i]'
+  ));
+  const hasPassword = Boolean(document.querySelector('input[type="password"]'));
+  result.manual_intervention = hasCaptcha ? 'captcha_required' :
+    hasOtp ? 'two_factor_required' : hasPassword ? 'manual_login_required' : '';
+  const bodyText = document.body ? String(document.body.innerText || '') : '';
+  result.page_text = bodyText.slice(textOffset, textOffset + textLimit);
+  result.page_text_length = bodyText.length;
+  result.page_text_next_offset = Math.min(bodyText.length, textOffset + textLimit);
+  result.content_truncated = [headings, sections, links, buttons, controls, forms, tables, lists]
+    .some(items => items.length > maxItems) || result.page_text_next_offset < bodyText.length;
+  if (mode === 'article') result.sections = result.sections.filter(s => s.kind === 'article');
+  if (mode === 'main_content') result.sections = result.sections.filter(s => s.kind === 'main' || s.kind === 'article');
+  return result;
+}
+"""
+
+_ELEMENT_STATE_JS = r"""
+(el) => ({
+  disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+  checked: typeof el.checked === 'boolean' ? el.checked : null,
+  selected: typeof el.selected === 'boolean' ? el.selected : null,
+  expanded: el.getAttribute('aria-expanded'),
+  pressed: el.getAttribute('aria-pressed'),
+  hidden: Boolean(el.hidden || getComputedStyle(el).display === 'none' || getComputedStyle(el).visibility === 'hidden'),
+  fileCount: el.files ? el.files.length : null,
+})
+"""
+
+_CONTENT_FINGERPRINT_JS = r"""
+() => {
+  const body = document.body;
+  if (!body) return '';
+  return [document.title, location.pathname, body.innerText.slice(0, 200000),
+    body.querySelectorAll('*').length].join('\n');
+}
+"""
+
+_SEARCH_TEMPLATE = "https://www.google.com/search?q={query}"
 
 # psutil powers the stale-instance scan (Bug 1): it spots a browser left over
 # from a previous OSIA session that still holds one of OSIA's dedicated
@@ -120,6 +301,14 @@ if sys.platform == "win32":
             r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
         )
     ] + _BROWSER_CANDIDATES
+elif sys.platform == "darwin":
+    _BROWSER_CANDIDATES = [
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Firefox.app/Contents/MacOS/firefox",
+        "/Applications/Opera.app/Contents/MacOS/Opera",
+    ] + _BROWSER_CANDIDATES
 
 # Map common user-facing browser names ("open Firefox", "open Chrome") to
 # the binary candidates to try for that browser, in preference order.
@@ -130,6 +319,14 @@ _BROWSER_NAME_MAP = {
     "firefox": ["firefox", "firefox-esr"],
     "opera": ["opera"],
     "edge": ["microsoft-edge", "microsoft-edge-stable", "msedge"],
+}
+
+_MACOS_NAME_PATHS = {
+    "brave": ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"],
+    "chrome": ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
+    "edge": ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"],
+    "firefox": ["/Applications/Firefox.app/Contents/MacOS/firefox"],
+    "opera": ["/Applications/Opera.app/Contents/MacOS/Opera"],
 }
 
 # On Windows, prepend the full install paths (env vars expanded) so the name
@@ -158,6 +355,9 @@ if sys.platform == "win32":
         _BROWSER_NAME_MAP[_key] = (
             [os.path.expandvars(p) for p in _paths] + _BROWSER_NAME_MAP[_key]
         )
+elif sys.platform == "darwin":
+    for _key, _paths in _MACOS_NAME_PATHS.items():
+        _BROWSER_NAME_MAP[_key] = list(_paths) + _BROWSER_NAME_MAP[_key]
 
 # Browsers that can NOT be driven over the Chrome DevTools Protocol
 # (non-Chromium engines). They are skipped for CDP automation; Firefox is
@@ -405,7 +605,7 @@ def _terminate_processes(procs) -> None:
 
 def _launch_cdp_browser(binary: str | None = None) -> tuple[bool, str]:
     """Spawn Brave (or another Chromium browser if Brave isn't installed)
-    against OSIA's dedicated profile at ``/home/OSIA/.osia/brave-profile``.
+    against OSIA's dedicated per-user profile.
 
     NEVER launches a second instance: if a CDP debugger already responds on
     ``CDP_PORT`` the existing window is reused, and if another launch is
@@ -510,7 +710,7 @@ _OWNER_START_TIMEOUT_S = 25.0
 _OWNER_CALL_TIMEOUT_S = 45.0
 _OWNER_CANCEL_TIMEOUT_S = 2.0
 _OWNER_SHUTDOWN_TIMEOUT_S = 25.0
-_POPUP_EVENT_WINDOW_MS = 150
+_PAGINATION_POSTCONDITION_TIMEOUT_S = 15.0
 
 
 class _AsyncBrowserOwner:
@@ -543,6 +743,15 @@ class _AsyncBrowserOwner:
         self._browser_disconnected_handler = None
         self._page_tombstones = set()
         self._form_session = SemanticFormSession()
+        self._state_tracker = BrowserStateTracker()
+        self._bound_refs = BoundReferenceStore()
+        self._pending_dialogs = {}
+        self._dialog_sequence = 0
+        self._network_activity = {}
+        self._download_session_bytes = 0
+        self._download_phase = ""
+        self._prepared_uploads = {}
+        self._browser_progress_callback = None
         self._disconnecting = False
         self._startup_count = 0
         self._driver_stop_count = 0
@@ -583,6 +792,14 @@ class _AsyncBrowserOwner:
             active_url = page.url if page is not None and not page.is_closed() else None
         except Exception:
             active_url = None
+        try:
+            browser_state = (
+                self._state_tracker.current(page).to_dict()
+                if page is not None and not self._page_is_closed(page)
+                else None
+            )
+        except BrowserReferenceError:
+            browser_state = None
         with self._snapshot_lock:
             self._published = {
                 "state": self._state.value,
@@ -590,9 +807,12 @@ class _AsyncBrowserOwner:
                 "nativeThreadId": self._owner_native_thread_id,
                 "threadAlive": bool(self._thread and self._thread.is_alive()),
                 "backend": self._active_browser_type,
-                "activeUrl": active_url,
+                # Published snapshots are diagnostics/mobile-adjacent state.
+                # Keep query, fragment, userinfo and private file paths out.
+                "activeUrl": safe_url_display(active_url),
                 "registryCount": len(self._registry),
                 "generation": self._registry_generation,
+                "browserState": browser_state,
                 "startupCount": self._startup_count,
                 "driverStopCount": self._driver_stop_count,
             }
@@ -823,6 +1043,7 @@ class _AsyncBrowserOwner:
                 and id(page) in self._registry
             ):
                 self._registry[id(page)]["opener"] = opener
+                self._state_tracker.set_opener(page, opener)
                 self._publish()
 
         asyncio.create_task(resolve())
@@ -852,6 +1073,13 @@ class _AsyncBrowserOwner:
             self._detach_page_handlers()
         self._registry.clear()
         self._page_tombstones.clear()
+        self._state_tracker.retire_all(reason="context_retired")
+        self._bound_refs.clear()
+        self._pending_dialogs.clear()
+        self._network_activity.clear()
+        self._prepared_uploads.clear()
+        self._download_session_bytes = 0
+        self._download_phase = ""
         self._form_session.reset()
         self._active_page = None
         self._registry_context = None
@@ -859,13 +1087,19 @@ class _AsyncBrowserOwner:
         self._registry_generation += 1
         self._publish()
 
-    def _remove_page(self, page, generation):
+    def _remove_page(self, page, generation, reason="page_closed"):
         self._assert_owner_thread()
         if generation != self._registry_generation:
             return
         key = id(page)
         item = self._registry.pop(key, None)
         self._page_tombstones.add(key)
+        try:
+            page_id = self._state_tracker.current(page).page_id
+            self._bound_refs.invalidate_page(page_id)
+        except BrowserReferenceError:
+            pass
+        self._state_tracker.retire_page(page, reason=reason)
         self._form_session.invalidate_page(page)
         if item is None:
             return
@@ -886,12 +1120,50 @@ class _AsyncBrowserOwner:
                 self._active_page = self._most_recent_live_page()
         self._publish()
 
-    def _handle_frame_navigated(self, page, generation):
+    def _handle_frame_navigated(self, page, generation, frame=None):
         self._assert_owner_thread()
         if generation != self._registry_generation or id(page) not in self._registry:
             return
-        self._form_session.invalidate_page(page)
+        try:
+            is_main = frame is None or frame is page.main_frame
+        except Exception:
+            is_main = True
+        if is_main:
+            try:
+                previous = self._state_tracker.current(page)
+                self._bound_refs.invalidate_page(previous.page_id)
+            except BrowserReferenceError:
+                pass
+            self._state_tracker.note_navigation(page)
+            self._form_session.invalidate_page(page)
         self._publish()
+
+    def _handle_dialog(self, page, generation, dialog):
+        self._assert_owner_thread()
+        if generation != self._registry_generation or id(page) not in self._registry:
+            return
+        try:
+            state = self._state_tracker.current(page)
+        except BrowserReferenceError:
+            return
+        self._dialog_sequence += 1
+        dialog_ref = self._bound_refs.issue("dialog", state, dialog)
+        self._pending_dialogs[dialog_ref] = {
+            "dialog": dialog,
+            "page": page,
+            "state": state,
+            "sequence": self._dialog_sequence,
+        }
+        self._publish()
+
+    def _handle_network_activity(self, page, generation, delta):
+        if generation != self._registry_generation or id(page) not in self._registry:
+            return
+        state = self._network_activity.setdefault(
+            id(page), {"inflight": 0, "last_change": time.monotonic()},
+        )
+        state["inflight"] = max(0, int(state["inflight"]) + int(delta))
+        state["last_change"] = time.monotonic()
 
     def _register_page(
         self, page, *, context, generation, opener=None, make_active=False
@@ -917,10 +1189,26 @@ class _AsyncBrowserOwner:
                     opener=page,
                     make_active=True,
                 ),
-                "close": lambda *_args: self._remove_page(page, generation),
-                "crash": lambda *_args: self._remove_page(page, generation),
-                "framenavigated": lambda *_args: self._handle_frame_navigated(
-                    page, generation
+                "close": lambda *_args: self._remove_page(
+                    page, generation, "page_closed"
+                ),
+                "crash": lambda *_args: self._remove_page(
+                    page, generation, "page_crashed"
+                ),
+                "framenavigated": lambda frame=None, *_args: self._handle_frame_navigated(
+                    page, generation, frame
+                ),
+                "dialog": lambda dialog: self._handle_dialog(
+                    page, generation, dialog
+                ),
+                "request": lambda *_args: self._handle_network_activity(
+                    page, generation, 1
+                ),
+                "requestfinished": lambda *_args: self._handle_network_activity(
+                    page, generation, -1
+                ),
+                "requestfailed": lambda *_args: self._handle_network_activity(
+                    page, generation, -1
                 ),
             }
             item = {
@@ -930,6 +1218,12 @@ class _AsyncBrowserOwner:
                 "handlers": handlers,
             }
             self._registry[key] = item
+            self._state_tracker.register_page(
+                page, opener=item["opener"], popup=item["opener"] is not None,
+            )
+            self._network_activity[key] = {
+                "inflight": 0, "last_change": time.monotonic(),
+            }
             if item["opener"] is None:
                 self._schedule_opener_resolution(page, context, generation)
             for event, handler in handlers.items():
@@ -939,6 +1233,7 @@ class _AsyncBrowserOwner:
                     pass
         elif opener is not None:
             item["opener"] = opener
+            self._state_tracker.set_opener(page, opener)
         if make_active:
             if self._active_page is not None and self._active_page is not page:
                 self._form_session.invalidate_page(self._active_page)
@@ -961,6 +1256,7 @@ class _AsyncBrowserOwner:
             return self._registry_generation
         self._reset_registry()
         self._registry_context = context
+        self._state_tracker.start_context(context)
         generation = self._registry_generation
         handlers = {
             "page": lambda page: self._register_page(
@@ -1197,7 +1493,10 @@ class _AsyncBrowserOwner:
             png = await page.screenshot(type="png", full_page=False)
             return base64.b64encode(png).decode("ascii")
         except Exception as exc:
-            print(f"[OSIA Browser] screenshot capture failed: {exc}")
+            print(
+                "[OSIA Browser] screenshot capture failed: "
+                f"{scrub_browser_error(exc)}"
+            )
             return None
 
     async def _result(self, text, page):
@@ -1212,13 +1511,1668 @@ class _AsyncBrowserOwner:
         return page.url
 
     async def _after_interaction_page(self, fallback):
-        try:
-            await fallback.wait_for_timeout(_POPUP_EVENT_WINDOW_MS)
-        except Exception:
-            await asyncio.sleep(0)
+        # Yield only so already-queued lifecycle events can run.  Correctness
+        # is proven by BrowserStateRef/WaitSpec evidence, never this yield.
+        await asyncio.sleep(0)
         if self._context is not None:
             return self._reconcile_pages(self._context) or fallback
         return self._active_page or fallback
+
+    def _current_state(self, page):
+        return self._state_tracker.current(page)
+
+    async def _resolve_state_page(self, state_ref=None, *, activate=False):
+        page = await self._ensure_browser()
+        if state_ref is not None:
+            page = self._state_tracker.validate(state_ref)
+        if self._page_is_closed(page):
+            raise BrowserReferenceError()
+        if activate:
+            self._active_page = page
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
+            self._publish()
+        return page, self._current_state(page)
+
+    @staticmethod
+    def _receipt_failure(
+        *, before=None, after=None, started_at=None, code="browser_operation_failed",
+        dispatched=False, evidence=(), unknown=False,
+    ):
+        receipt = make_receipt(
+            before_state=before,
+            after_state=after if after is not None else before,
+            dispatch_state=(
+                DispatchState.EFFECT_UNKNOWN if unknown else
+                DispatchState.DISPATCHED if dispatched else DispatchState.NOT_DISPATCHED
+            ),
+            outcome=(
+                ReceiptOutcome.OUTCOME_UNKNOWN if unknown else
+                ReceiptOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
+            ),
+            evidence=list(evidence),
+            started_at=started_at,
+        )
+        return action_result(ok=False, receipt=receipt, error_code=code)
+
+    @staticmethod
+    def _receipt_success(
+        *, before, after, started_at, evidence=(), data=None, text="",
+    ):
+        receipt = make_receipt(
+            before_state=before,
+            after_state=after,
+            dispatch_state=DispatchState.EFFECT_CONFIRMED,
+            outcome=ReceiptOutcome.CONFIRMED_SUCCESS,
+            evidence=list(evidence),
+            started_at=started_at,
+        )
+        return action_result(ok=True, receipt=receipt, data=data, text=text)
+
+    async def _page_fingerprint(self, page):
+        try:
+            raw = await page.evaluate(_CONTENT_FINGERPRINT_JS)
+        except Exception:
+            raw = ""
+        return content_fingerprint(raw)
+
+    async def _locator_state(self, locator):
+        try:
+            value = await locator.evaluate(_ELEMENT_STATE_JS)
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    async def _target_manual_intervention(self, locator):
+        try:
+            reason = await locator.evaluate(r"""
+                el => {
+                  if (String(el.type || '').toLowerCase() === 'password') return 'manual_login_required';
+                  if (String(el.autocomplete || '').toLowerCase() === 'one-time-code') return 'two_factor_required';
+                  if (el.closest('[class*="captcha" i],[id*="captcha" i]')) return 'captcha_required';
+                  return '';
+                }
+            """)
+        except Exception:
+            return ""
+        return reason if reason in {
+            "manual_login_required", "captcha_required", "two_factor_required",
+        } else ""
+
+    async def _wait_condition(self, page, spec, baseline=None):
+        wait = WaitSpec.parse(spec)
+        baseline = dict(baseline or {})
+        deadline = asyncio.get_running_loop().time() + wait.timeout_seconds
+        stable_value = None
+        stable_since = None
+        while True:
+            now = asyncio.get_running_loop().time()
+            if now >= deadline:
+                return False, {"condition": wait.condition_type.value}
+            condition = wait.condition_type
+            try:
+                state = self._current_state(page)
+                raw_url = await self._page_url(page)
+            except Exception:
+                return False, {"condition": condition.value, "state": "closed"}
+            matched = False
+            evidence = {"condition": condition.value}
+            if condition in {
+                WaitConditionType.NAVIGATION_COMMIT,
+                WaitConditionType.DOCUMENT_EPOCH_CHANGE,
+            }:
+                matched = state.document_epoch != baseline.get(
+                    "document_epoch", state.document_epoch
+                )
+                evidence["document_epoch_advanced"] = matched
+            elif condition == WaitConditionType.URL_CHANGE:
+                matched = raw_url != baseline.get("url", raw_url)
+                evidence["url_changed"] = matched
+            elif condition == WaitConditionType.URL_MATCH:
+                expected = str(wait.expected or "")
+                matched = bool(expected and expected.casefold() in raw_url.casefold())
+                evidence["url_matched"] = matched
+            elif condition == WaitConditionType.DOM_SELECTOR_STATE:
+                expected = wait.expected if isinstance(wait.expected, dict) else {}
+                selector = _FIXED_DOM_PRIMITIVES.get(str(expected.get("primitive") or ""))
+                desired = str(expected.get("state") or "visible")
+                if selector:
+                    locator = page.locator(selector).first
+                    count = await locator.count()
+                    visible = bool(count and await locator.is_visible())
+                    matched = (
+                        (desired == "attached" and count > 0)
+                        or (desired == "visible" and visible)
+                        or (desired == "hidden" and not visible)
+                    )
+                evidence["element_state_matched"] = matched
+            elif condition == WaitConditionType.ELEMENT_STATE:
+                expected = wait.expected if isinstance(wait.expected, dict) else {}
+                ref_id = str(expected.get("element_ref") or "")
+                desired = str(expected.get("state") or "visible")
+                try:
+                    locator = self._bound_refs.resolve(ref_id, state, kinds={
+                        "link", "button", "control", "form", "table", "list",
+                        "search_result", "pagination",
+                    })
+                    count = await locator.count()
+                    element_state = await self._locator_state(locator) if count else {}
+                    visible = bool(count and await locator.is_visible())
+                    matched = {
+                        "visible": visible,
+                        "hidden": not visible,
+                        "enabled": visible and not element_state.get("disabled", False),
+                        "disabled": bool(element_state.get("disabled")),
+                        "checked": element_state.get("checked") is True,
+                        "selected": element_state.get("selected") is True,
+                        "expanded": element_state.get("expanded") == "true",
+                        "collapsed": element_state.get("expanded") == "false",
+                    }.get(desired, False)
+                except BrowserReferenceError:
+                    matched = False
+                evidence["element_state_matched"] = matched
+            elif condition in {
+                WaitConditionType.TEXT_APPEARANCE,
+                WaitConditionType.TEXT_DISAPPEARANCE,
+            }:
+                expected = str(wait.expected or "")
+                body = await page.evaluate(
+                    "() => document.body ? document.body.innerText : ''"
+                )
+                present = expected.casefold() in str(body or "").casefold()
+                matched = present if condition == WaitConditionType.TEXT_APPEARANCE else not present
+                evidence["text_state_matched"] = matched
+            elif condition == WaitConditionType.POPUP_CREATION:
+                known = set(baseline.get("page_ids") or ())
+                current = {ref.page_id for _item, ref in self._state_tracker.tab_refs()}
+                matched = bool(current - known)
+                evidence["popup_created"] = matched
+            elif condition == WaitConditionType.DIALOG_APPEARANCE:
+                matched = self._dialog_sequence > int(baseline.get("dialog_sequence", 0))
+                evidence["dialog_appeared"] = matched
+            elif condition == WaitConditionType.DIALOG_CLOSURE:
+                matched = str(wait.expected or "") not in self._pending_dialogs
+                evidence["dialog_closed"] = matched
+            elif condition == WaitConditionType.NETWORK_QUIET:
+                activity = self._network_activity.get(id(page), {})
+                quiet_for = time.monotonic() - float(activity.get("last_change", 0))
+                matched = int(activity.get("inflight", 0)) == 0 and quiet_for >= wait.quiet_period_seconds
+                evidence["network_quiet"] = matched
+            elif condition == WaitConditionType.STABLE_CONTENT:
+                current = await self._page_fingerprint(page)
+                if current != stable_value:
+                    stable_value = current
+                    stable_since = now
+                matched = stable_since is not None and now - stable_since >= wait.quiet_period_seconds
+                evidence["content_stable"] = matched
+                if matched:
+                    evidence["content_fingerprint"] = current
+            elif condition == WaitConditionType.CUSTOM_POSTCONDITION:
+                nested_evidence = []
+                matched = True
+                for nested in wait.expected:
+                    nested_ok, nested_item = await self._wait_condition(
+                        page, nested, baseline=baseline,
+                    )
+                    nested_evidence.append(nested_item)
+                    if not nested_ok:
+                        matched = False
+                        break
+                evidence["all_conditions_matched"] = matched
+                evidence["condition_count"] = len(nested_evidence)
+            elif condition in {
+                WaitConditionType.DOWNLOAD_START,
+                WaitConditionType.DOWNLOAD_COMPLETION,
+            }:
+                phase = self._download_phase
+                wanted = "downloading" if condition == WaitConditionType.DOWNLOAD_START else "complete"
+                matched = phase == wanted
+                evidence["download_phase_matched"] = matched
+            if matched:
+                return True, evidence
+            await asyncio.sleep(min(0.05, max(0.001, deadline - now)))
+
+    async def _wait_after_dispatch(self, page, wait_spec, baseline):
+        try:
+            return await self._wait_condition(page, wait_spec, baseline=baseline)
+        except Exception:
+            return False, {"condition": "wait_failed"}
+
+    async def _op_browser_state(self):
+        started = time.time()
+        try:
+            page, state = await self._resolve_state_page()
+            display = safe_url_display(await self._page_url(page))
+        except Exception as exc:
+            return self._receipt_failure(
+                started_at=started, code=scrub_browser_error(exc),
+            )
+        return self._receipt_success(
+            before=state, after=state, started_at=started,
+            evidence=[{"state_observed": True}],
+            data={
+                "state": state.to_dict(),
+                "safe_url": display,
+                "lifecycle_events": self._state_tracker.events(
+                    after=max(0, len(self._state_tracker.events()) - 16)
+                ),
+            },
+        )
+
+    async def _inspect_frame_summaries(self, page, state):
+        summaries = []
+        try:
+            frames = list(page.frames)
+            main = page.main_frame
+            main_origin = safe_origin(await self._page_url(page))
+        except Exception:
+            return summaries
+        for frame in frames[:32]:
+            if frame is main:
+                continue
+            try:
+                frame_url = frame.url
+            except Exception:
+                frame_url = ""
+            origin = safe_origin(frame_url)
+            same_origin = bool(
+                origin and (origin == main_origin or frame_url.startswith("about:blank"))
+            )
+            item = {
+                "safe_url": safe_url_display(frame_url),
+                "same_origin": same_origin,
+                "accessible": same_origin,
+            }
+            if same_origin:
+                item["frame_ref"] = self._bound_refs.issue(
+                    "frame",
+                    state,
+                    frame,
+                    binding_key=_semantic_browser_binding(
+                        "frame", frame, {"url": frame_url},
+                    ),
+                )
+            else:
+                item["status"] = "cross_origin_inaccessible"
+            summaries.append(item)
+        return summaries
+
+    async def _structured_frame_data(
+        self, frame, state, *, mode, max_items, text_offset, text_limit,
+    ):
+        raw = await frame.evaluate(_STRUCTURED_INSPECTION_JS, {
+            "mode": mode,
+            "maxItems": max_items,
+            "textOffset": text_offset,
+            "textLimit": text_limit,
+        })
+        if not isinstance(raw, dict):
+            raise RuntimeError("invalid_structured_snapshot")
+        links = []
+        for item in raw.get("links") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("index"), int):
+                continue
+            locator = frame.locator("a[href]").nth(item["index"])
+            links.append({
+                "element_ref": self._bound_refs.issue(
+                    "link",
+                    state,
+                    locator,
+                    binding_key=_semantic_browser_binding("link", frame, item),
+                ),
+                "text": str(item.get("text") or "")[:300],
+                "safe_destination": safe_url_display(item.get("destination")),
+            })
+        buttons = []
+        button_selector = "button,input[type=button],input[type=submit],[role=button]"
+        for item in raw.get("buttons") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("index"), int):
+                continue
+            locator = frame.locator(button_selector).nth(item["index"])
+            buttons.append({
+                "element_ref": self._bound_refs.issue(
+                    "button",
+                    state,
+                    locator,
+                    binding_key=_semantic_browser_binding("button", frame, item),
+                ),
+                "text": str(item.get("text") or "")[:300],
+                "disabled": item.get("disabled") is True,
+                "expanded": item.get("expanded") if item.get("expanded") in {"true", "false"} else None,
+            })
+        controls = []
+        for item in raw.get("controls") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("index"), int):
+                continue
+            locator = frame.locator("input:not([type=hidden]),textarea,select").nth(item["index"])
+            controls.append({
+                "element_ref": self._bound_refs.issue(
+                    "control",
+                    state,
+                    locator,
+                    binding_key=_semantic_browser_binding("control", frame, item),
+                ),
+                "kind": str(item.get("kind") or "")[:40],
+                "type": str(item.get("type") or "")[:40],
+                "label": str(item.get("label") or "")[:300],
+                "disabled": item.get("disabled") is True,
+            })
+        tables = []
+        for item in raw.get("tables") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("index"), int):
+                continue
+            rows = []
+            for row in (item.get("rows") or [])[:max_items]:
+                if isinstance(row, list):
+                    rows.append([str(cell)[:500] for cell in row[:max_items]])
+            tables.append({
+                "element_ref": self._bound_refs.issue(
+                    "table",
+                    state,
+                    frame.locator("table").nth(item["index"]),
+                    binding_key=_semantic_browser_binding("table", frame, item),
+                ),
+                "caption": str(item.get("caption") or "")[:300],
+                "headers": [
+                    str(value)[:500]
+                    for value in (item.get("headers") or [])[:max_items]
+                ],
+                "rows": rows,
+            })
+        lists = []
+        for item in raw.get("lists") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("index"), int):
+                continue
+            lists.append({
+                "element_ref": self._bound_refs.issue(
+                    "list",
+                    state,
+                    frame.locator("ol,ul").nth(item["index"]),
+                    binding_key=_semantic_browser_binding("list", frame, item),
+                ),
+                "ordered": item.get("ordered") is True,
+                "items": [str(value)[:600] for value in (item.get("items") or [])[:max_items]],
+            })
+        forms = []
+        for item in raw.get("forms") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("index"), int):
+                continue
+            forms.append({
+                "element_ref": self._bound_refs.issue(
+                    "form",
+                    state,
+                    frame.locator("form").nth(item["index"]),
+                    binding_key=_semantic_browser_binding("form", frame, item),
+                ),
+                "label": str(item.get("label") or "")[:300],
+                "field_count": max(0, min(int(item.get("field_count") or 0), 10_000)),
+            })
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        payload = {
+            "title": str(raw.get("title") or "")[:300],
+            "language": str(raw.get("language") or "")[:32],
+            "headings": [
+                {
+                    "level": max(1, min(int(item.get("level") or 1), 6)),
+                    "text": str(item.get("text") or "")[:600],
+                }
+                for item in (raw.get("headings") or [])[:max_items]
+                if isinstance(item, dict)
+            ],
+            "sections": [
+                {
+                    "kind": str(item.get("kind") or "")[:32],
+                    "text": str(item.get("text") or "")[:4_000],
+                }
+                for item in (raw.get("sections") or [])[:max_items]
+                if isinstance(item, dict)
+            ],
+            "links": links,
+            "buttons": buttons,
+            "controls": controls,
+            "forms": forms,
+            "tables": tables,
+            "lists": lists,
+            "metadata": {
+                "canonical": safe_url_display(metadata.get("canonical")),
+                "description": str(metadata.get("description") or "")[:600],
+            },
+            "manual_intervention": (
+                str(raw.get("manual_intervention") or "")
+                if str(raw.get("manual_intervention") or "") in {
+                    "manual_login_required", "captcha_required", "two_factor_required",
+                } else ""
+            ),
+            "page_text": str(raw.get("page_text") or "")[:text_limit],
+            "content_truncated": raw.get("content_truncated") is True,
+            "page_text_length": max(0, int(raw.get("page_text_length") or 0)),
+            "page_text_next_offset": max(0, int(raw.get("page_text_next_offset") or 0)),
+        }
+        return payload
+
+    async def _op_inspect_page(
+        self, state_ref=None, mode="snapshot", target_ref=None, cursor=None,
+        frame_ref=None, max_items=40,
+    ):
+        started = time.time()
+        allowed_modes = {
+            "snapshot", "main_content", "article", "headings", "links",
+            "metadata", "table", "list", "page_text_chunk",
+        }
+        if mode not in allowed_modes:
+            return self._receipt_failure(
+                started_at=started, code="unsupported_extraction_mode",
+            )
+        try:
+            max_items = max(1, min(int(max_items), 100))
+            page, state = await self._resolve_state_page(state_ref)
+            if target_ref:
+                # Targeted table/list extraction is deliberately not guessed:
+                # validate ownership/staleness first, then report the currently
+                # unsupported narrower operation explicitly.
+                self._bound_refs.resolve(
+                    target_ref, state, kinds={"table", "list"},
+                )
+                return self._receipt_failure(
+                    before=state, started_at=started,
+                    code="unsupported_targeted_extraction",
+                )
+            frame = page
+            if frame_ref:
+                frame = self._bound_refs.resolve(frame_ref, state, kinds={"frame"})
+            text_offset = 0
+            if cursor:
+                text_offset = int(self._bound_refs.resolve(
+                    cursor, state, kinds={"cursor"},
+                ))
+            payload = await self._structured_frame_data(
+                frame, state, mode=mode, max_items=max_items,
+                text_offset=text_offset, text_limit=8_000,
+            )
+            payload["browser_state"] = state.to_dict()
+            payload["safe_url"] = safe_url_display(await self._page_url(page))
+            if frame is page:
+                payload["frames"] = await self._inspect_frame_summaries(page, state)
+            else:
+                payload["frames"] = []
+            next_offset = payload.pop("page_text_next_offset")
+            length = payload.get("page_text_length", 0)
+            payload["next_cursor"] = (
+                self._bound_refs.issue("cursor", state, next_offset)
+                if next_offset < length else None
+            )
+            if mode in {"snapshot", "main_content", "article"} and frame is page:
+                form_result = await self._form_session.inspect(
+                    page=page,
+                    context_generation=self._registry_generation,
+                    include_hidden=False,
+                    include_disabled=False,
+                    max_fields=min(max_items, FORM_MAX_FIELDS_DEFAULT),
+                )
+                try:
+                    if str(form_result).startswith("ERROR: "):
+                        form_result = str(form_result)[7:]
+                    semantic = json.loads(str(form_result))
+                except (TypeError, ValueError):
+                    semantic = {"ok": False, "category": "inspection_failed"}
+                payload["semantic_forms"] = semantic
+            selection = {
+                "headings": payload["headings"],
+                "links": payload["links"],
+                "metadata": payload["metadata"],
+                "table": payload["tables"],
+                "list": payload["lists"],
+                "article": [s for s in payload["sections"] if s["kind"] == "article"],
+                "main_content": payload["sections"],
+                "page_text_chunk": payload["page_text"],
+            }.get(mode)
+            status = "ok"
+            if mode != "snapshot" and selection in (None, "", []):
+                status = "not_found"
+            elif payload["content_truncated"]:
+                status = "truncated"
+            payload["status"] = status
+            fingerprint = await self._page_fingerprint(page)
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except Exception as exc:
+            return self._receipt_failure(
+                started_at=started, code=scrub_browser_error(exc),
+            )
+        return self._receipt_success(
+            before=state, after=state, started_at=started,
+            evidence=[{
+                "structured_snapshot": True,
+                "content_fingerprint": fingerprint,
+                "truncated": payload["content_truncated"],
+            }],
+            data=payload,
+        )
+
+    async def _op_wait_spec(self, state_ref, wait_spec):
+        started = time.time()
+        try:
+            page, state = await self._resolve_state_page(state_ref)
+            baseline = {
+                "url": await self._page_url(page),
+                "document_epoch": state.document_epoch,
+                "page_ids": [ref.page_id for _item, ref in self._state_tracker.tab_refs()],
+                "dialog_sequence": self._dialog_sequence,
+            }
+            ok, evidence = await self._wait_condition(page, wait_spec, baseline)
+            after = self._current_state(page)
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except ValueError:
+            return self._receipt_failure(started_at=started, code="invalid_wait_spec")
+        except Exception as exc:
+            return self._receipt_failure(
+                started_at=started, code=scrub_browser_error(exc),
+            )
+        if not ok:
+            return self._receipt_failure(
+                before=state, started_at=started, code="wait_condition_timeout",
+                evidence=[evidence],
+            )
+        return self._receipt_success(
+            before=state, after=after, started_at=started,
+            evidence=[evidence], data={"state": after.to_dict()},
+        )
+
+    async def _op_navigate_safe(self, url, state_ref=None, wait_spec=None):
+        started = time.time()
+        try:
+            normalized = _normalize_url(url)
+            target_display = safe_url_display(normalized)
+            if not target_display or target_display == "invalid-url":
+                raise ValueError("invalid_url")
+            page, before = await self._resolve_state_page(state_ref, activate=True)
+            before_url = await self._page_url(page)
+            baseline = {
+                "url": before_url,
+                "document_epoch": before.document_epoch,
+                "page_ids": [ref.page_id for _item, ref in self._state_tracker.tab_refs()],
+                "dialog_sequence": self._dialog_sequence,
+            }
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except Exception:
+            return self._receipt_failure(started_at=started, code="invalid_navigation_target")
+        try:
+            await page.goto(normalized, wait_until="commit", timeout=10_000)
+        except _TIMEOUT_ERRORS as exc:
+            try:
+                after = self._current_state(page)
+                after_url = await self._page_url(page)
+            except Exception:
+                after, after_url = before, before_url
+            evidence = [{
+                "navigation_dispatched": True,
+                "url_changed": after_url != before_url,
+                "document_epoch_advanced": after.document_epoch != before.document_epoch,
+            }]
+            return self._receipt_failure(
+                before=before, after=after, started_at=started,
+                code=scrub_browser_error(exc), dispatched=True,
+                unknown=True, evidence=evidence,
+            )
+        except Exception as exc:
+            return self._receipt_failure(
+                before=before, started_at=started,
+                code=scrub_browser_error(exc), dispatched=True, unknown=True,
+                evidence=[{"navigation_dispatched": True}],
+            )
+        await asyncio.sleep(0)
+        after = self._current_state(page)
+        if after.document_epoch == before.document_epoch:
+            after = self._state_tracker.note_navigation(
+                page, reason="navigation_committed",
+            )
+            self._bound_refs.invalidate_page(before.page_id)
+        after_url = await self._page_url(page)
+        try:
+            # The committed document is already authoritative success evidence.
+            # This event-based wait only gives subframes and semantic controls a
+            # chance to become available; its timeout never fabricates failure
+            # or success and is not a fixed correctness delay.
+            await page.wait_for_load_state("domcontentloaded", timeout=3_000)
+        except Exception:
+            pass
+        evidence = [{
+            "navigation_commit": True,
+            "document_epoch_advanced": after.document_epoch > before.document_epoch,
+            "safe_url_before": safe_url_display(before_url),
+            "safe_url_after": safe_url_display(after_url),
+        }]
+        if wait_spec is not None:
+            ok, waited = await self._wait_after_dispatch(page, wait_spec, baseline)
+            evidence.append(waited)
+            if not ok:
+                return self._receipt_failure(
+                    before=before, after=after, started_at=started,
+                    code="postcondition_timeout", dispatched=True, unknown=True,
+                    evidence=evidence,
+                )
+            after = self._current_state(page)
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        self._active_page = page
+        self._publish()
+        return self._receipt_success(
+            before=before, after=after, started_at=started, evidence=evidence,
+            data={"state": after.to_dict(), "safe_url": safe_url_display(after_url)},
+            text=f"Navigated to: {safe_url_display(after_url)}",
+        )
+
+    async def _op_activate(self, state_ref, element_ref, wait_spec=None):
+        started = time.time()
+        try:
+            page, before = await self._resolve_state_page(state_ref, activate=True)
+            locator = self._bound_refs.resolve(
+                element_ref, before,
+                kinds={"link", "button", "control", "search_result", "pagination"},
+            )
+            if await locator.count() != 1 or not await locator.is_visible():
+                return self._receipt_failure(
+                    before=before, started_at=started, code="target_not_actionable",
+                )
+            intervention = await self._target_manual_intervention(locator)
+            if intervention:
+                blocked = self._receipt_failure(
+                    before=before, started_at=started, code=intervention,
+                )
+                blocked["data"] = {"manual_intervention": intervention}
+                return blocked
+            element_before = await self._locator_state(locator)
+            before_url = await self._page_url(page)
+            before_fingerprint = await self._page_fingerprint(page)
+            baseline = {
+                "url": before_url,
+                "document_epoch": before.document_epoch,
+                "page_ids": [ref.page_id for _item, ref in self._state_tracker.tab_refs()],
+                "dialog_sequence": self._dialog_sequence,
+            }
+            downloads = []
+            download_handler = lambda download: downloads.append(download)
+            page.on("download", download_handler)
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except Exception as exc:
+            return self._receipt_failure(
+                started_at=started, code=scrub_browser_error(exc),
+            )
+        try:
+            await locator.click(timeout=5_000)
+            click_error = None
+        except Exception as exc:
+            click_error = exc
+        evidence = [{"single_dispatch": True}]
+        # A JavaScript dialog deliberately blocks the page's event loop.  With
+        # a dialog listener installed, Playwright can therefore time out the
+        # click even though the one permitted dispatch demonstrably created
+        # the dialog.  That event is authoritative effect evidence; it must
+        # not trigger a retry or be downgraded to an unknown outcome.
+        if click_error is not None and self._dialog_sequence > baseline["dialog_sequence"]:
+            evidence.append({"dialog_appeared": True})
+            ok = True
+        elif click_error is not None:
+            self._emitter_off(page, "download", download_handler)
+            return self._receipt_failure(
+                before=before, started_at=started,
+                code=scrub_browser_error(click_error), dispatched=True, unknown=True,
+                evidence=evidence,
+            )
+        else:
+            ok = False
+        if wait_spec is not None:
+            ok, waited = await self._wait_after_dispatch(page, wait_spec, baseline)
+            evidence.append(waited)
+        elif not ok:
+            deadline = asyncio.get_running_loop().time() + 3.0
+            ok = False
+            while asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.05)
+                active = self._reconcile_pages(self._context) or page
+                try:
+                    current = self._current_state(page)
+                    current_url = await self._page_url(page)
+                except Exception:
+                    current, current_url = before, before_url
+                current_pages = {
+                    ref.page_id for _item, ref in self._state_tracker.tab_refs()
+                }
+                if current.document_epoch != before.document_epoch or current_url != before_url:
+                    evidence.append({
+                        "navigation_or_url_change": True,
+                        "document_epoch_advanced": current.document_epoch != before.document_epoch,
+                    })
+                    ok = True
+                    break
+                if current_pages - set(baseline["page_ids"]):
+                    evidence.append({"popup_created": True})
+                    ok = True
+                    break
+                if self._dialog_sequence > baseline["dialog_sequence"]:
+                    evidence.append({"dialog_appeared": True})
+                    ok = True
+                    break
+                if downloads:
+                    evidence.append({"download_created": True})
+                    ok = True
+                    break
+                element_after = await self._locator_state(locator)
+                if element_after and element_after != element_before:
+                    evidence.append({"expected_element_state_changed": True})
+                    ok = True
+                    break
+                if await self._page_fingerprint(active) != before_fingerprint:
+                    evidence.append({"content_fingerprint_changed": True})
+                    ok = True
+                    break
+        self._emitter_off(page, "download", download_handler)
+        active = self._reconcile_pages(self._context) or page
+        self._active_page = active
+        self._publish()
+        try:
+            after = self._current_state(active)
+        except BrowserReferenceError:
+            after = before
+        if not ok:
+            return self._receipt_failure(
+                before=before, started_at=started,
+                code="postcondition_not_observed", dispatched=True, unknown=True,
+                evidence=evidence,
+            )
+        return self._receipt_success(
+            before=before, after=after, started_at=started, evidence=evidence,
+            data={"state": after.to_dict()},
+        )
+
+    async def _op_list_tabs(self, state_ref=None):
+        started = time.time()
+        try:
+            _page, before = await self._resolve_state_page(state_ref)
+            tabs = []
+            for page, ref in self._state_tracker.tab_refs()[:64]:
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = ""
+                tabs.append({
+                    "state": ref.to_dict(),
+                    "safe_url": safe_url_display(await self._page_url(page)),
+                    "title": str(title or "")[:300],
+                    "active": page is self._active_page,
+                    "has_opener": self._state_tracker.opener(page) is not None,
+                })
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except Exception as exc:
+            return self._receipt_failure(started_at=started, code=scrub_browser_error(exc))
+        return self._receipt_success(
+            before=before, after=before, started_at=started,
+            evidence=[{"tab_count": len(tabs)}], data={"tabs": tabs},
+        )
+
+    async def _op_select_tab(self, state_ref):
+        started = time.time()
+        try:
+            page = self._state_tracker.validate(state_ref)
+            before = self._current_state(self._active_page) if self._active_page else None
+            await page.bring_to_front()
+            self._active_page = page
+            after = self._current_state(page)
+            self._publish()
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except Exception as exc:
+            return self._receipt_failure(started_at=started, code=scrub_browser_error(exc))
+        return self._receipt_success(
+            before=before, after=after, started_at=started,
+            evidence=[{"active_page_selected": True}],
+            data={"state": after.to_dict()},
+        )
+
+    async def _op_close_tab(self, state_ref):
+        started = time.time()
+        try:
+            page = self._state_tracker.validate(state_ref)
+            before = self._current_state(page)
+            await page.close()
+            await asyncio.sleep(0)
+            active = self._reconcile_pages(self._context) if self._context is not None else None
+            after = self._current_state(active) if active is not None else None
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except Exception as exc:
+            return self._receipt_failure(
+                before=locals().get("before"), started_at=started,
+                code=scrub_browser_error(exc), dispatched=True, unknown=True,
+            )
+        return self._receipt_success(
+            before=before, after=after, started_at=started,
+            evidence=[{"page_closed": True}],
+            data={"active_state": after.to_dict() if after else None},
+        )
+
+    async def _op_return_to_opener(self, state_ref):
+        started = time.time()
+        try:
+            page = self._state_tracker.validate(state_ref)
+            before = self._current_state(page)
+            opener = self._state_tracker.opener(page)
+            if opener is None:
+                item = self._registry.get(id(page)) or {}
+                opener = item.get("opener")
+            if opener is None or self._page_is_closed(opener):
+                return self._receipt_failure(
+                    before=before, started_at=started, code="opener_unavailable",
+                )
+            await opener.bring_to_front()
+            self._active_page = opener
+            after = self._current_state(opener)
+            self._publish()
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except Exception as exc:
+            return self._receipt_failure(started_at=started, code=scrub_browser_error(exc))
+        return self._receipt_success(
+            before=before, after=after, started_at=started,
+            evidence=[{"opener_selected": True}], data={"state": after.to_dict()},
+        )
+
+    async def _history_operation(self, action, state_ref=None):
+        started = time.time()
+        try:
+            page, before = await self._resolve_state_page(state_ref, activate=True)
+            before_url = await self._page_url(page)
+            if action == "back":
+                response = (
+                    await self._bidi_history_step(page, -1)
+                    if self._active_browser_type == "bidi" else
+                    await page.go_back(wait_until="commit", timeout=10_000)
+                )
+            elif action == "forward":
+                response = (
+                    await self._bidi_history_step(page, 1)
+                    if self._active_browser_type == "bidi" else
+                    await page.go_forward(wait_until="commit", timeout=10_000)
+                )
+            else:
+                response = await page.reload(wait_until="commit", timeout=10_000)
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except _TIMEOUT_ERRORS as exc:
+            return self._receipt_failure(
+                before=locals().get("before"), started_at=started,
+                code=scrub_browser_error(exc), dispatched=True, unknown=True,
+                evidence=[{"history_action": action}],
+            )
+        except Exception as exc:
+            return self._receipt_failure(
+                before=locals().get("before"), started_at=started,
+                code=scrub_browser_error(exc), dispatched="before" in locals(),
+                unknown="before" in locals(),
+            )
+        await asyncio.sleep(0)
+        after = self._current_state(page)
+        after_url = await self._page_url(page)
+        if response is None and action != "reload" and after_url == before_url:
+            return self._receipt_failure(
+                before=before, started_at=started, code=f"history_{action}_unavailable",
+                evidence=[{"no_history_entry": True}],
+            )
+        if after.document_epoch == before.document_epoch:
+            after = self._state_tracker.note_navigation(page, reason=f"history_{action}")
+            self._bound_refs.invalidate_page(before.page_id)
+        return self._receipt_success(
+            before=before, after=after, started_at=started,
+            evidence=[{
+                "history_action": action,
+                "document_epoch_advanced": after.document_epoch > before.document_epoch,
+                "safe_url_before": safe_url_display(before_url),
+                "safe_url_after": safe_url_display(after_url),
+            }],
+            data={"state": after.to_dict(), "safe_url": safe_url_display(after_url)},
+        )
+
+    async def _op_reload(self, state_ref):
+        return await self._history_operation("reload", state_ref)
+
+    async def _op_go_back_safe(self, state_ref=None):
+        return await self._history_operation("back", state_ref)
+
+    async def _op_go_forward_safe(self, state_ref=None):
+        return await self._history_operation("forward", state_ref)
+
+    async def _op_open_new_tab_safe(self, url, state_ref=None):
+        started = time.time()
+        try:
+            normalized = _normalize_url(url)
+            opener, before = await self._resolve_state_page(state_ref)
+            page = await self._context.new_page()
+            generation = self._register_context(self._context)
+            self._register_page(
+                page, context=self._context, generation=generation,
+                opener=opener, make_active=True,
+            )
+            created = self._current_state(page)
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except Exception as exc:
+            return self._receipt_failure(started_at=started, code=scrub_browser_error(exc))
+        try:
+            await page.goto(normalized, wait_until="commit", timeout=20_000)
+        except Exception as exc:
+            return self._receipt_failure(
+                before=before, started_at=started,
+                code=scrub_browser_error(exc), dispatched=True, unknown=True,
+                evidence=[{"tab_created": True, "navigation_verified": False}],
+            )
+        await asyncio.sleep(0)
+        after = self._current_state(page)
+        if after.document_epoch == created.document_epoch:
+            after = self._state_tracker.note_navigation(page, reason="new_tab_navigation")
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        self._active_page = page
+        self._publish()
+        return self._receipt_success(
+            before=before, after=after, started_at=started,
+            evidence=[{"tab_created": True, "navigation_commit": True}],
+            data={
+                "state": after.to_dict(),
+                "safe_url": safe_url_display(await self._page_url(page)),
+            },
+        )
+
+    async def _op_search_web(self, query, state_ref=None):
+        started = time.time()
+        normalized_query = " ".join(str(query or "").split())[:300]
+        if not normalized_query:
+            return self._receipt_failure(started_at=started, code="empty_search_query")
+        target = _SEARCH_TEMPLATE.format(query=quote_plus(normalized_query))
+        navigation = await self._op_navigate_safe(target, state_ref)
+        if not isinstance(navigation, dict) or navigation.get("ok") is not True:
+            if isinstance(navigation, dict):
+                navigation.setdefault("error", {"code": "search_engine_unavailable"})
+            return navigation
+        try:
+            search_before = BrowserStateRef.parse(
+                (navigation.get("receipt") or {}).get("before_state")
+            )
+        except BrowserReferenceError:
+            search_before = None
+        try:
+            page = self._active_page
+            state = self._current_state(page)
+            preferred = page.locator("[data-osia-search-result] a[href]")
+            count = await preferred.count()
+            locator = preferred if count else page.locator(
+                "main a[href], #search a[href], #b_results a[href]"
+            )
+            count = min(await locator.count(), 20)
+            results = []
+            seen = set()
+            for index in range(count):
+                item = locator.nth(index)
+                try:
+                    destination = await item.get_attribute("href") or ""
+                    display = safe_url_display(destination)
+                    if not display or display in seen:
+                        continue
+                    title = " ".join((await item.inner_text()).split())[:300]
+                    summary = ""
+                    parent = item.locator("xpath=..")
+                    if await parent.count():
+                        summary = " ".join((await parent.inner_text()).split())[:600]
+                except Exception:
+                    continue
+                seen.add(display)
+                results.append({
+                    "result_ref": self._bound_refs.issue(
+                        "search_result", state, item,
+                    ),
+                    "title": title,
+                    "safe_destination": display,
+                    "summary": summary,
+                })
+            after = self._current_state(page)
+        except Exception as exc:
+            return self._receipt_failure(
+                before=(
+                    search_before
+                    or BrowserStateRef.parse(navigation["data"]["state"])
+                ),
+                started_at=started, code=scrub_browser_error(exc),
+            )
+        if not results:
+            return self._receipt_failure(
+                before=after, started_at=started, code="search_results_not_found",
+                evidence=[{"search_navigation_verified": True}],
+            )
+        return self._receipt_success(
+            before=search_before or after, after=after, started_at=started,
+            evidence=[{"search_navigation_verified": True, "result_count": len(results)}],
+            data={
+                "state": after.to_dict(), "results": results,
+                "engine": urlsplit(_SEARCH_TEMPLATE).hostname or "configured",
+            },
+        )
+
+    async def _op_open_search_result(self, state_ref, result_ref):
+        return await self._op_activate(
+            state_ref,
+            result_ref,
+            {
+                "condition_type": "document_epoch_change",
+                "timeout_seconds": 15.0,
+                "quiet_period_seconds": 0.1,
+                "failure_policy": "outcome_unknown_if_dispatched",
+            },
+        )
+
+    async def _op_paginate(self, state_ref, next_ref, max_pages=1):
+        started = time.time()
+        try:
+            page, before = await self._resolve_state_page(state_ref, activate=True)
+            locator = self._bound_refs.resolve(
+                next_ref, before, kinds={"link", "button", "pagination"},
+            )
+            maximum = max(1, min(int(max_pages), 20))
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except Exception:
+            return self._receipt_failure(started_at=started, code="invalid_pagination_request")
+        fingerprints = {await self._page_fingerprint(page)}
+        completed = 0
+        dispatches = 0
+        status = "max_pages"
+        evidence = []
+        for _index in range(maximum):
+            subscribed_page = page
+            navigation_seen = asyncio.Event()
+
+            def _navigation_handler(frame=None, *_args):
+                try:
+                    if frame is None or frame is subscribed_page.main_frame:
+                        navigation_seen.set()
+                except Exception:
+                    navigation_seen.set()
+
+            try:
+                if await locator.count() != 1 or not await locator.is_visible():
+                    status = "missing_next_control"
+                    break
+                current = self._current_state(page)
+                before_url = await self._page_url(page)
+                before_fingerprint = await self._page_fingerprint(page)
+                page.on("framenavigated", _navigation_handler)
+            except Exception as exc:
+                return self._receipt_failure(
+                    before=before, started_at=started, code=(
+                        "stale_element_reference"
+                        if completed == 0 else scrub_browser_error(exc)
+                    ),
+                    dispatched=completed > 0,
+                    unknown=completed > 0,
+                    evidence=evidence,
+                )
+            click_error = None
+            try:
+                dispatches += 1
+                await locator.click(timeout=5_000)
+            except Exception as exc:
+                # A navigation can retire the exact locator before Playwright's
+                # click coroutine returns.  The dispatch has still happened;
+                # verify the subscribed navigation/content postcondition before
+                # classifying its completion error.
+                click_error = exc
+
+            deadline = (
+                asyncio.get_running_loop().time()
+                + _PAGINATION_POSTCONDITION_TIMEOUT_S
+            )
+            changed = False
+            navigation_changed = False
+            content_changed = False
+            stable_fingerprint = ""
+            stable_since = 0.0
+            new_state = current
+            fingerprint = before_fingerprint
+            try:
+                while asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.05)
+                    page = self._reconcile_pages(self._context) or page
+                    new_state = self._current_state(page)
+                    after_url = await self._page_url(page)
+                    fingerprint = await self._page_fingerprint(page)
+                    navigation_changed = bool(
+                        navigation_seen.is_set()
+                        or new_state.document_epoch != current.document_epoch
+                        or new_state.navigation_id != current.navigation_id
+                        or after_url != before_url
+                    )
+                    if navigation_changed:
+                        if new_state.document_epoch == current.document_epoch:
+                            self._bound_refs.invalidate_page(current.page_id)
+                            new_state = self._state_tracker.note_navigation(
+                                page, reason="pagination_navigation_verified",
+                            )
+                        changed = True
+                        break
+                    if fingerprint != before_fingerprint:
+                        now = asyncio.get_running_loop().time()
+                        if fingerprint != stable_fingerprint:
+                            stable_fingerprint = fingerprint
+                            stable_since = now
+                        elif now - stable_since >= 0.2:
+                            content_changed = True
+                            changed = True
+                            break
+                    else:
+                        stable_fingerprint = ""
+                        stable_since = 0.0
+            finally:
+                self._emitter_off(
+                    subscribed_page, "framenavigated", _navigation_handler,
+                )
+            if not changed:
+                return self._receipt_failure(
+                    before=before, after=self._current_state(page), started_at=started,
+                    code="pagination_postcondition_timeout",
+                    dispatched=True, unknown=True,
+                    evidence=evidence + [{
+                        "single_dispatch": dispatches == 1,
+                        "page_count_advanced": completed,
+                        "navigation_changed": False,
+                        "content_changed": False,
+                    }],
+                )
+            completed += 1
+            evidence.append({
+                "pagination_step": completed,
+                "single_dispatch": True,
+                "navigation_changed": navigation_changed,
+                "document_epoch_advanced": (
+                    new_state.document_epoch > current.document_epoch
+                ),
+                "content_changed": content_changed,
+                "dispatch_completion_error_after_verified_effect": (
+                    click_error is not None
+                ),
+            })
+            if fingerprint in fingerprints:
+                status = "repeated_document"
+                break
+            fingerprints.add(fingerprint)
+            candidates = page.locator(
+                "a[rel=next],button[data-next],a[data-next],"
+                "button[aria-label='Next'],a[aria-label='Next']"
+            )
+            if await candidates.count() != 1:
+                status = "missing_next_control"
+                break
+            locator = candidates.first
+        if completed == 0:
+            return self._receipt_failure(
+                before=before, started_at=started,
+                code="pagination_control_missing",
+                evidence=[{"single_dispatch": dispatches == 1}],
+            )
+        after = self._current_state(page)
+        return self._receipt_success(
+            before=before, after=after, started_at=started, evidence=evidence,
+            data={
+                "state": after.to_dict(), "pages_advanced": completed,
+                "status": status, "dispatch_count": dispatches,
+            },
+        )
+
+    async def _op_infinite_scroll(self, state_ref, max_steps=8):
+        started = time.time()
+        try:
+            page, before = await self._resolve_state_page(state_ref, activate=True)
+            maximum = max(1, min(int(max_steps), 20))
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except Exception:
+            return self._receipt_failure(started_at=started, code="invalid_scroll_request")
+        previous = await self._page_fingerprint(page)
+        stable = 0
+        completed = 0
+        status = "max_steps"
+        for _index in range(maximum):
+            try:
+                await page.evaluate(
+                    "() => window.scrollBy(0, document.documentElement.clientHeight)"
+                )
+            except Exception as exc:
+                return self._receipt_failure(
+                    before=before, started_at=started,
+                    code=scrub_browser_error(exc), dispatched=True, unknown=True,
+                )
+            completed += 1
+            deadline = asyncio.get_running_loop().time() + 5.0
+            changed = False
+            while asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.1)
+                current = await self._page_fingerprint(page)
+                if current != previous:
+                    previous = current
+                    changed = True
+                    stable = 0
+                    break
+            if not changed:
+                stable += 1
+                if stable >= 2:
+                    try:
+                        at_end = await page.evaluate(
+                            "() => Math.ceil(scrollY + innerHeight) >= document.documentElement.scrollHeight"
+                        )
+                    except Exception:
+                        at_end = False
+                    status = "reached_end" if at_end else "no_progress"
+                    break
+        after = self._current_state(page)
+        return self._receipt_success(
+            before=before, after=after, started_at=started,
+            evidence=[{
+                "bounded_scroll_steps": completed,
+                "stable_observations": stable,
+            }],
+            data={"state": after.to_dict(), "steps": completed, "status": status},
+        )
+
+    async def _op_list_dialogs(self, state_ref):
+        started = time.time()
+        try:
+            _page, state = await self._resolve_state_page(state_ref)
+            dialogs = []
+            for ref_id, item in list(self._pending_dialogs.items())[:16]:
+                if item["state"].page_id != state.page_id:
+                    continue
+                try:
+                    kind = str(item["dialog"].type or "")[:32]
+                except Exception:
+                    kind = "unknown"
+                dialogs.append({"dialog_ref": ref_id, "type": kind})
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except Exception as exc:
+            return self._receipt_failure(started_at=started, code=scrub_browser_error(exc))
+        return self._receipt_success(
+            before=state, after=state, started_at=started,
+            evidence=[{"dialog_count": len(dialogs)}], data={"dialogs": dialogs},
+        )
+
+    async def _op_handle_dialog(
+        self, state_ref, dialog_ref, action, prompt_text=None,
+    ):
+        started = time.time()
+        if action not in {"accept", "dismiss"}:
+            return self._receipt_failure(started_at=started, code="invalid_dialog_action")
+        try:
+            _page, before = await self._resolve_state_page(state_ref)
+            dialog = self._bound_refs.resolve(dialog_ref, before, kinds={"dialog"})
+            item = self._pending_dialogs.get(dialog_ref)
+            if item is None:
+                raise BrowserReferenceError("stale_dialog_reference")
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        try:
+            if action == "accept":
+                if prompt_text is None:
+                    await dialog.accept()
+                else:
+                    await dialog.accept(str(prompt_text)[:4_000])
+            else:
+                await dialog.dismiss()
+            self._pending_dialogs.pop(dialog_ref, None)
+            after = self._current_state(item["page"])
+        except Exception as exc:
+            return self._receipt_failure(
+                before=before, started_at=started,
+                code=scrub_browser_error(exc), dispatched=True, unknown=True,
+            )
+        return self._receipt_success(
+            before=before, after=after, started_at=started,
+            evidence=[{"dialog_closed": True, "dialog_action": action}],
+            data={"state": after.to_dict()},
+        )
+
+    async def _op_prepare_upload(self, arguments):
+        values = dict(arguments or {})
+        try:
+            page, state = await self._resolve_state_page(values.get("state_ref"))
+            element_ref = str(values.get("element_ref") or "")
+            self._bound_refs.resolve(element_ref, state, kinds={"control", "button"})
+            artifact_id = str(values.get("artifact_id") or "")
+            local_path = values.get("local_path")
+            if bool(artifact_id) == bool(local_path):
+                raise BrowserArtifactError("exactly_one_upload_source_required")
+            path = (
+                get_browser_artifact_store().resolve_private_path(artifact_id)
+                if artifact_id else Path(str(local_path))
+            )
+            validated = validate_upload_path(path)
+            origin = safe_origin(await self._page_url(page))
+            now = time.time()
+            for existing_ref, existing in list(self._prepared_uploads.items()):
+                if now >= float(existing.get("expires_at", 0)):
+                    self._prepared_uploads.pop(existing_ref, None)
+                    continue
+                if (
+                    existing.get("state") == state
+                    and existing.get("element_ref") == element_ref
+                    and existing.get("origin") == origin
+                    and existing.get("validated") == validated
+                ):
+                    return {
+                        "prepared_upload_ref": existing_ref,
+                        "destination_origin": origin,
+                        "file_size": validated.size,
+                        "detected_mime": validated.mime_type,
+                        "operation_expires_at": existing["expires_at"],
+                    }
+            prepared_ref = opaque_ref("upload")
+            expires_at = now + 120.0
+            self._prepared_uploads[prepared_ref] = {
+                "validated": validated,
+                "state": state,
+                "element_ref": element_ref,
+                "origin": origin,
+                "expires_at": expires_at,
+            }
+            while len(self._prepared_uploads) > 64:
+                self._prepared_uploads.pop(next(iter(self._prepared_uploads)))
+            return {
+                "prepared_upload_ref": prepared_ref,
+                "destination_origin": origin,
+                "file_size": validated.size,
+                "detected_mime": validated.mime_type,
+                "operation_expires_at": expires_at,
+            }
+        except BrowserReferenceError as exc:
+            return {"error": exc.code}
+        except BrowserArtifactError as exc:
+            return {"error": exc.code}
+        except Exception as exc:
+            return {"error": scrub_browser_error(exc)}
+
+    async def _op_prepare_action(self, arguments):
+        values = dict(arguments or {})
+        try:
+            page, state = await self._resolve_state_page(values.get("state_ref"))
+            locator = self._bound_refs.resolve(
+                str(values.get("element_ref") or ""), state,
+                kinds={"link", "button", "control"},
+            )
+            intervention = await self._target_manual_intervention(locator)
+            if intervention:
+                return {"error": intervention}
+            metadata = await locator.evaluate(r"""
+                el => ({
+                  tag: el.tagName.toLowerCase(),
+                  type: String(el.type || '').toLowerCase(),
+                  role: String(el.getAttribute('role') || '').toLowerCase(),
+                  href: el.href || '',
+                  markup: String(el.outerHTML || '').slice(0, 12000),
+                  inForm: Boolean(el.form || el.closest('form')),
+                  formMethod: String((el.form || el.closest('form'))?.method || '').toLowerCase(),
+                })
+            """)
+            if not isinstance(metadata, dict):
+                raise RuntimeError("invalid_action_metadata")
+            tag = str(metadata.get("tag") or "")
+            input_type = str(metadata.get("type") or "")
+            final = bool(
+                input_type == "submit"
+                or (tag == "button" and metadata.get("inForm") is True)
+                or str(metadata.get("role") or "") == "submit"
+                or str(metadata.get("href") or "").startswith(("mailto:", "tel:"))
+            )
+            destination = (
+                safe_origin(metadata.get("href"))
+                or safe_origin(await self._page_url(page))
+            )
+            target_binding = hashlib.sha256(json.dumps(
+                metadata,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8", errors="replace")).hexdigest()
+            return {
+                "trusted_final_action": final,
+                "destination_origin": destination,
+                "trusted_target_binding": target_binding,
+            }
+        except BrowserReferenceError as exc:
+            return {"error": exc.code}
+        except Exception as exc:
+            return {"error": scrub_browser_error(exc)}
+
+    async def _op_upload_file(
+        self, state_ref, element_ref, artifact_id=None, local_path=None,
+        prepared_upload_ref=None, destination_origin=None, file_size=None,
+        detected_mime=None, operation_expires_at=None,
+    ):
+        del destination_origin, file_size, detected_mime, operation_expires_at
+        started = time.time()
+        prepared = self._prepared_uploads.pop(str(prepared_upload_ref or ""), None)
+        if prepared is None:
+            prepared_values = await self._op_prepare_upload({
+                "state_ref": state_ref, "element_ref": element_ref,
+                "artifact_id": artifact_id, "local_path": local_path,
+            })
+            if "error" in prepared_values:
+                return self._receipt_failure(
+                    started_at=started, code=prepared_values["error"],
+                )
+            prepared = self._prepared_uploads.pop(
+                prepared_values["prepared_upload_ref"], None,
+            )
+        try:
+            if prepared is None or time.time() >= prepared["expires_at"]:
+                raise BrowserArtifactError("upload_authorization_expired")
+            page, before = await self._resolve_state_page(state_ref, activate=True)
+            if before != prepared["state"] or element_ref != prepared["element_ref"]:
+                raise BrowserArtifactError("upload_binding_changed")
+            if safe_origin(await self._page_url(page)) != prepared["origin"]:
+                raise BrowserArtifactError("upload_origin_changed")
+            validated = revalidate_upload(prepared["validated"])
+            locator = self._bound_refs.resolve(
+                element_ref, before, kinds={"control", "button"},
+            )
+            tag = await locator.evaluate(
+                "el => ({tag: el.tagName.toLowerCase(), type: String(el.type || '').toLowerCase()})"
+            )
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except BrowserArtifactError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except Exception as exc:
+            return self._receipt_failure(started_at=started, code=scrub_browser_error(exc))
+        dispatched = False
+        try:
+            if tag == {"tag": "input", "type": "file"}:
+                dispatched = True
+                await locator.set_input_files(str(validated.canonical_path))
+                input_locator = locator
+            else:
+                async with page.expect_file_chooser(timeout=10_000) as chooser_info:
+                    dispatched = True
+                    await locator.click(timeout=5_000)
+                chooser = await chooser_info.value
+                await chooser.set_files(str(validated.canonical_path))
+                input_locator = chooser.element
+            selected = await input_locator.evaluate(
+                "el => el.files ? el.files.length : 0"
+            )
+        except Exception as exc:
+            return self._receipt_failure(
+                before=before, started_at=started,
+                code=scrub_browser_error(exc), dispatched=dispatched,
+                unknown=dispatched, evidence=[{"single_dispatch": dispatched}],
+            )
+        after = self._current_state(page)
+        if int(selected or 0) < 1:
+            return self._receipt_failure(
+                before=before, started_at=started,
+                code="upload_selection_unverified", dispatched=True, unknown=True,
+                evidence=[{"selected_file_count": 0}],
+            )
+        return self._receipt_success(
+            before=before, after=after, started_at=started,
+            evidence=[{
+                "single_dispatch": True,
+                "upload_selection_verified": True,
+                "safe_file_count": int(selected),
+            }],
+            data={
+                "state": after.to_dict(),
+                "selected_file_count": int(selected),
+                "size": validated.size,
+                "mime_type": validated.mime_type,
+                "classification": validated.classification,
+            },
+        )
+
+    def _emit_browser_progress(self, phase, **safe_values):
+        self._download_phase = str(phase)[:32]
+        callback = self._browser_progress_callback
+        if callback is None:
+            return
+        frame = {"phase": str(phase)[:32]}
+        for key, value in safe_values.items():
+            if isinstance(value, str):
+                frame[str(key)[:32]] = value[:300]
+            elif value is None or isinstance(value, (bool, int, float)):
+                frame[str(key)[:32]] = value
+        try:
+            callback(frame)
+        except Exception:
+            pass
+
+    async def _op_download_file(self, state_ref, element_ref):
+        started = time.time()
+        operation_id = opaque_ref("download")
+        temporary = None
+        try:
+            page, before = await self._resolve_state_page(state_ref, activate=True)
+            locator = self._bound_refs.resolve(
+                element_ref, before,
+                kinds={"link", "button", "search_result"},
+            )
+            if await locator.count() != 1 or not await locator.is_visible():
+                return self._receipt_failure(
+                    before=before, started_at=started, code="target_not_actionable",
+                )
+            metadata = await locator.evaluate(
+                "el => ({tag: el.tagName.toLowerCase(), href: el.href || '', download: el.hasAttribute('download')})"
+            )
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("tag") == "a"
+                and metadata.get("download") is True
+                and safe_origin(metadata.get("href")) == safe_origin(
+                    await self._page_url(page)
+                )
+            ):
+                response = None
+                try:
+                    response = await page.context.request.head(
+                        metadata["href"], timeout=5_000,
+                        fail_on_status_code=False,
+                    )
+                    raw_length = response.headers.get("content-length", "")
+                    content_length = int(raw_length)
+                    if content_length < 0 or content_length > MAX_DOWNLOAD_BYTES:
+                        return self._receipt_failure(
+                            before=before, started_at=started,
+                            code="file_size_limit_exceeded",
+                            evidence=[{"content_length_preflight": True}],
+                        )
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                except Exception:
+                    # Missing/untrustworthy HEAD metadata is not proof of a
+                    # failure; the post-download bounded copy remains the cap.
+                    pass
+                finally:
+                    if response is not None:
+                        try:
+                            await response.dispose()
+                        except Exception:
+                            pass
+            temporary = operation_temp_dir(operation_id)
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except BrowserArtifactError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except Exception as exc:
+            return self._receipt_failure(started_at=started, code=scrub_browser_error(exc))
+        self._emit_browser_progress("waiting")
+        try:
+            async with page.expect_download(timeout=15_000) as download_info:
+                await locator.click(timeout=5_000)
+            download = await download_info.value
+            self._emit_browser_progress("downloading")
+            partial = temporary / "download.part"
+            await download.save_as(str(partial))
+            size = partial.stat().st_size
+            if size > MAX_DOWNLOAD_BYTES:
+                raise BrowserArtifactError("file_size_limit_exceeded")
+            if self._download_session_bytes + size > MAX_SESSION_TEMP_BYTES:
+                raise BrowserArtifactError("browser_session_quota_exceeded")
+            self._emit_browser_progress("finalizing", bytes=size)
+            reference = get_browser_artifact_store().finalize_download(
+                partial, suggested_filename=download.suggested_filename,
+            )
+            self._download_session_bytes += size
+            after = self._current_state(page)
+        except BrowserArtifactError as exc:
+            self._emit_browser_progress("failed")
+            if temporary is not None:
+                cleanup_operation_temp(temporary)
+            return self._receipt_failure(
+                before=before, started_at=started, code=exc.code,
+                dispatched=True, unknown=False,
+                evidence=[{"download_rejected": True, "partial_cleaned": True}],
+            )
+        except asyncio.CancelledError:
+            self._emit_browser_progress("cancelled")
+            if temporary is not None:
+                cleanup_operation_temp(temporary)
+            raise
+        except Exception as exc:
+            self._emit_browser_progress("failed")
+            if temporary is not None:
+                cleanup_operation_temp(temporary)
+            return self._receipt_failure(
+                before=before, started_at=started,
+                code=scrub_browser_error(exc), dispatched=True, unknown=True,
+                evidence=[{"single_dispatch": True, "partial_cleaned": True}],
+            )
+        if temporary is not None:
+            cleanup_operation_temp(temporary)
+        self._emit_browser_progress("complete", bytes=reference["size"])
+        return self._receipt_success(
+            before=before, after=after, started_at=started,
+            evidence=[{
+                "single_dispatch": True,
+                "download_created": True,
+                "download_finalized": True,
+                "byte_size": reference["size"],
+            }],
+            data={"state": after.to_dict(), "artifact": reference},
+        )
 
     async def _bidi_history_step(self, page, delta):
         before = await page.evaluate("location.href")
@@ -1235,6 +3189,7 @@ class _AsyncBrowserOwner:
         return None
 
     async def _op_navigate(self, url):
+        return await self._op_navigate_safe(url)
         url = _normalize_url(url)
         try:
             page = await self._ensure_browser()
@@ -1266,6 +3221,22 @@ class _AsyncBrowserOwner:
         )
 
     async def _op_click(self, selector):
+        started = time.time()
+        try:
+            page, state = await self._resolve_state_page()
+            locator = page.locator(selector)
+            if await locator.count() != 1:
+                return self._receipt_failure(
+                    before=state, started_at=started, code="target_not_unique",
+                )
+            element_ref = self._bound_refs.issue("button", state, locator)
+            return await self._op_activate(state.to_dict(), element_ref)
+        except Exception as exc:
+            return self._receipt_failure(
+                started_at=started, code=scrub_browser_error(exc),
+            )
+        # Compatibility source below is intentionally unreachable; keeping the
+        # surrounding launch-sensitive block stable minimizes regression risk.
         try:
             page = await self._ensure_browser()
             await page.click(selector, timeout=5000)
@@ -1277,10 +3248,16 @@ class _AsyncBrowserOwner:
     async def _op_fill(self, selector, value):
         try:
             page = await self._ensure_browser()
+            locator = page.locator(selector)
+            if await locator.count() != 1:
+                return "ERROR: fill target is not unique"
+            intervention = await self._target_manual_intervention(locator)
+            if intervention:
+                return f"ERROR: manual intervention required ({intervention})"
             await page.fill(selector, value, timeout=5000)
-            return f"Filled {selector} with: {value}"
+            return "Field filled; the private value was withheld."
         except Exception as exc:
-            return f"ERROR filling {selector}: {exc}"
+            return f"ERROR: fill failed ({scrub_browser_error(exc)})"
 
     async def _op_read_page(self):
         try:
@@ -1294,14 +3271,14 @@ class _AsyncBrowserOwner:
                 text = text[:4000] + "\n... [TRUNCATED]"
             return f"Page content:\n{text}"
         except Exception as exc:
-            return f"ERROR reading page: {exc}"
+            return f"ERROR: page read failed ({scrub_browser_error(exc)})"
 
     async def _op_get_current_url(self):
         try:
             page = await self._ensure_browser()
-            return f"Current URL: {await self._page_url(page)}"
+            return f"Current URL: {safe_url_display(await self._page_url(page))}"
         except Exception as exc:
-            return f"ERROR reading current URL: {exc}"
+            return f"ERROR: URL read failed ({scrub_browser_error(exc)})"
 
     async def _op_scroll(self, direction="down", amount=600):
         direction = (direction or "down").lower()
@@ -1317,9 +3294,10 @@ class _AsyncBrowserOwner:
             await page.evaluate(f"window.scrollBy(0, {delta})")
             return f"Scrolled {direction} by {abs(delta)}px"
         except Exception as exc:
-            return f"ERROR scrolling: {exc}"
+            return f"ERROR scrolling: {scrub_browser_error(exc)}"
 
     async def _op_go_back(self):
+        return await self._op_go_back_safe()
         try:
             page = await self._ensure_browser()
             if self._active_browser_type == "bidi":
@@ -1335,6 +3313,7 @@ class _AsyncBrowserOwner:
             return f"ERROR going back: {exc}"
 
     async def _op_go_forward(self):
+        return await self._op_go_forward_safe()
         try:
             page = await self._ensure_browser()
             if self._active_browser_type == "bidi":
@@ -1355,7 +3334,10 @@ class _AsyncBrowserOwner:
                 await self._disconnect_active_browser()
             page = await self._ensure_firefox_bidi()
         except Exception as exc:
-            print(f"[OSIA Browser] Firefox BiDi launch failed: {exc}")
+            print(
+                "[OSIA Browser] Firefox BiDi launch failed: "
+                f"{scrub_browser_error(exc)}"
+            )
             await self._disconnect_active_browser()
             return None
         try:
@@ -1363,8 +3345,16 @@ class _AsyncBrowserOwner:
         except Exception:
             pass
         _raise_browser_window(self._active_browser_type)
+        state = self._current_state(page)
+        if url:
+            return await self._op_navigate_safe(url, state.to_dict())
         if not url:
-            return await self._result("Opened Firefox (driven over WebDriver BiDi)", page)
+            return self._receipt_success(
+                before=state, after=state, started_at=time.time(),
+                evidence=[{"browser_ready": True, "backend": "bidi"}],
+                data={"state": state.to_dict(), "backend": "firefox"},
+                text="Opened Firefox (driven over WebDriver BiDi)",
+            )
         try:
             await page.goto(
                 _normalize_url(url), wait_until="domcontentloaded", timeout=20000
@@ -1387,11 +3377,14 @@ class _AsyncBrowserOwner:
             if not reused:
                 ok, message = _launch_cdp_browser(binary)
                 if not ok:
-                    print(f"[OSIA Browser] CDP launch failed: {message}")
+                    print("[OSIA Browser] CDP launch failed (details withheld)")
                     return None
             page = await self._ensure_cdp_browser(binary)
         except Exception as exc:
-            print(f"[OSIA Browser] CDP connect failed: {exc}")
+            print(
+                "[OSIA Browser] CDP connect failed: "
+                f"{scrub_browser_error(exc)}"
+            )
             return None
         label = _canonical_browser_name(binary)
         verb = "Reusing existing" if reused else "Opened"
@@ -1400,9 +3393,14 @@ class _AsyncBrowserOwner:
         except Exception:
             pass
         _raise_browser_window(self._active_browser_type)
+        state = self._current_state(page)
+        if url:
+            return await self._op_navigate_safe(url, state.to_dict())
         if not url:
-            return await self._result(
-                f"{verb} {label} window (CDP on port {CDP_PORT})", page
+            return self._receipt_success(
+                before=state, after=state, started_at=time.time(),
+                evidence=[{"browser_ready": True, "backend": "cdp"}],
+                data={"state": state.to_dict(), "backend": label},
             )
         try:
             await page.goto(
@@ -1418,6 +3416,7 @@ class _AsyncBrowserOwner:
             )
 
     async def _op_open_new_tab(self, url):
+        return await self._op_open_new_tab_safe(url)
         url = _normalize_url(url)
         try:
             await self._ensure_browser()
@@ -1500,7 +3499,7 @@ class _AsyncBrowserOwner:
         try:
             page = await self._ensure_browser()
         except Exception as exc:
-            return f"ERROR clicking element with text {text!r}: {exc}"
+            return f"ERROR: click preparation failed ({scrub_browser_error(exc)})"
         locator, label = None, ""
         try:
             from osia.tools import desktop_control as desktop
@@ -1512,6 +3511,14 @@ class _AsyncBrowserOwner:
                 )
         except Exception:
             locator = None
+        if locator is None:
+            return self._receipt_failure(
+                before=self._current_state(page), started_at=time.time(),
+                code="target_not_found",
+            )
+        state = self._current_state(page)
+        element_ref = self._bound_refs.issue("button", state, locator)
+        return await self._op_activate(state.to_dict(), element_ref)
         try:
             try:
                 before = await page.screenshot(type="png", full_page=False)
@@ -1563,6 +3570,9 @@ class _AsyncBrowserOwner:
             )
             if locator is None:
                 return None
+            state = self._current_state(page)
+            element_ref = self._bound_refs.issue("button", state, locator)
+            return await self._op_activate(state.to_dict(), element_ref)
             try:
                 await locator.click(timeout=5000)
             except Exception:
@@ -1579,6 +3589,30 @@ class _AsyncBrowserOwner:
             return None
 
     async def _op_wait_for_load(self):
+        started = time.time()
+        try:
+            page, state = await self._resolve_state_page()
+            await page.wait_for_load_state("domcontentloaded", timeout=8000)
+            after = self._current_state(page)
+        except _TIMEOUT_ERRORS as exc:
+            return self._receipt_failure(
+                before=locals().get("state"), started_at=started,
+                code=scrub_browser_error(exc),
+                evidence=[{"dom_content_loaded": False}],
+            )
+        except Exception as exc:
+            return self._receipt_failure(
+                before=locals().get("state"), started_at=started,
+                code=scrub_browser_error(exc),
+            )
+        return self._receipt_success(
+            before=state, after=after, started_at=started,
+            evidence=[{"dom_content_loaded": True}],
+            data={
+                "state": after.to_dict(),
+                "safe_url": safe_url_display(await self._page_url(page)),
+            },
+        )
         try:
             page = await self._ensure_browser()
         except Exception as exc:
@@ -1606,7 +3640,7 @@ class _AsyncBrowserOwner:
                 text = text[:8000] + "\n... [TRUNCATED]"
             return text
         except Exception as exc:
-            return f"ERROR reading page: {exc}"
+            return f"ERROR: page read failed ({scrub_browser_error(exc)})"
 
     async def _op_scroll_down(self, amount=None):
         try:
@@ -1621,16 +3655,22 @@ class _AsyncBrowserOwner:
             await page.evaluate(f"window.scrollBy(0, {value})")
             return f"Scrolled down {value}px"
         except Exception as exc:
-            return f"ERROR scrolling: {exc}"
+            return f"ERROR scrolling: {scrub_browser_error(exc)}"
 
     async def _op_type_text(self, selector, text):
         try:
             page = await self._ensure_browser()
+            locator = page.locator(selector)
+            if await locator.count() != 1:
+                return "ERROR: text target is not unique"
+            intervention = await self._target_manual_intervention(locator)
+            if intervention:
+                return f"ERROR: manual intervention required ({intervention})"
             await page.click(selector, timeout=5000)
             await page.keyboard.type(text)
-            return f"Typed into {selector}: {text}"
+            return "Text entered; the private value was withheld."
         except Exception as exc:
-            return f"ERROR typing into {selector}: {exc}"
+            return f"ERROR: text entry failed ({scrub_browser_error(exc)})"
 
     async def _op_press_key(self, key):
         if not key:
@@ -1640,7 +3680,7 @@ class _AsyncBrowserOwner:
             await page.keyboard.press(key)
             return f"Pressed key: {key}"
         except Exception as exc:
-            return f"ERROR pressing key {key}: {exc}"
+            return f"ERROR pressing browser key: {scrub_browser_error(exc)}"
 
     async def _selector_present(self, page, selector):
         value = str(selector).strip()
@@ -1693,7 +3733,7 @@ class _AsyncBrowserOwner:
             checks["selector_found"] = await self._selector_present(
                 page, expect_selector
             )
-        return {"available": True, "url": url, "checks": checks}
+        return {"available": True, "url": safe_url_display(url), "checks": checks}
 
     async def _op_inspect_form_fields(
         self,
@@ -1899,28 +3939,31 @@ def _foreground_is_osia_browser(browser_type: str | None = None) -> bool:
 # ── Synchronous public bridge to the dedicated async owner ────────────────
 
 def _owner_error(prefix: str, error: Exception) -> str:
-    return f"ERROR {prefix}: {error}"
+    category = scrub_browser_error(error)
+    if prefix == "navigation":
+        return f"ERROR: the browser did not open ({category})"
+    return f"ERROR {prefix}: {category}"
 
 
 def navigate(url: str):
     try:
         return _owner.call("navigate", url)
     except Exception as exc:
-        return f"ERROR: the browser did not open — {exc}"
+        return _owner_error("navigation", exc)
 
 
 def click(selector: str):
     try:
         return _owner.call("click", selector)
     except Exception as exc:
-        return _owner_error(f"clicking {selector}", exc)
+        return _owner_error("clicking page element", exc)
 
 
 def fill(selector: str, value: str) -> str:
     try:
         return _owner.call("fill", selector, value)
     except Exception as exc:
-        return _owner_error(f"filling {selector}", exc)
+        return _owner_error("filling page field", exc)
 
 
 def read_page() -> str:
@@ -1961,8 +4004,20 @@ def go_forward():
 def open_browser(name: str, url: str | None = None):
     binary = resolve_browser_name(name)
     if not binary:
-        known = ", ".join(sorted(_BROWSER_NAME_MAP))
-        return f"ERROR: browser {name!r} is not installed (known browsers: {known})"
+        receipt = make_receipt(
+            before_state=None, after_state=None,
+            dispatch_state=DispatchState.NOT_DISPATCHED,
+            outcome=ReceiptOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT,
+            evidence=[{"browser_unavailable": True}],
+        )
+        return action_result(
+            ok=False, receipt=receipt, error_code="browser_unavailable",
+            data={
+                "supported_installation_options": [
+                    "a compatible system Chromium-family browser", "Firefox",
+                ],
+            },
+        )
     note = ""
     try:
         if _canonical_browser_name(binary) == "firefox":
@@ -1972,10 +4027,24 @@ def open_browser(name: str, url: str | None = None):
             result = _owner.call("open_cdp_browser", binary, url)
             note = " (CDP unavailable — page tools cannot drive this window)"
     except Exception as exc:
-        print(f"[OSIA Browser] automated browser launch failed: {exc}")
+        print("[OSIA Browser] automated browser launch failed (details withheld)")
         result = None
     if result is not None:
         return result
+    receipt = make_receipt(
+        before_state=None, after_state=None,
+        dispatch_state=DispatchState.NOT_DISPATCHED,
+        outcome=ReceiptOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT,
+        evidence=[{"browser_unavailable": True}],
+    )
+    return action_result(
+        ok=False, receipt=receipt, error_code="browser_unavailable",
+        data={
+            "supported_installation_options": [
+                "a compatible system Chromium-family browser", "Firefox",
+            ],
+        },
+    )
     cmd = [binary, *_profile_args(binary)]
     if url:
         cmd.append(_normalize_url(url))
@@ -1999,14 +4068,16 @@ def open_new_tab(url: str) -> str:
     try:
         return _owner.call("open_new_tab", url)
     except Exception as exc:
-        return _owner_error(f"opening new tab {_normalize_url(url)}", exc)
+        return _owner_error(
+            f"opening new tab {safe_url_display(_normalize_url(url))}", exc,
+        )
 
 
 def find_and_click(text: str):
     try:
         return _owner.call("find_and_click", text)
     except Exception as exc:
-        return _owner_error(f"clicking element with text {text!r}", exc)
+        return _owner_error("clicking named page element", exc)
 
 
 def dom_click(description: str):
@@ -2046,14 +4117,14 @@ def type_text(selector: str, text: str) -> str:
     try:
         return _owner.call("type_text", selector, text)
     except Exception as exc:
-        return _owner_error(f"typing into {selector}", exc)
+        return _owner_error("typing into page field", exc)
 
 
 def press_key(key: str) -> str:
     try:
         return _owner.call("press_key", key)
     except Exception as exc:
-        return _owner_error(f"pressing key {key}", exc)
+        return _owner_error("pressing browser key", exc)
 
 
 def inspect_form_fields(
@@ -2107,6 +4178,160 @@ def _browser_owner_snapshot() -> dict:
     return _owner.snapshot()
 
 
+def get_browser_state() -> dict:
+    return _owner.call("browser_state", timeout=10.0)
+
+
+def navigate_browser(
+    url: str, state_ref: dict | None = None, wait_spec: dict | None = None,
+) -> dict:
+    return _owner.call(
+        "navigate_safe", url, state_ref, wait_spec, timeout=45.0,
+    )
+
+
+def inspect_browser_page(
+    state_ref: dict | None = None,
+    mode: str = "snapshot",
+    target_ref: str | None = None,
+    cursor: str | None = None,
+    frame_ref: str | None = None,
+    max_items: int = 40,
+) -> dict:
+    return _owner.call(
+        "inspect_page", state_ref, mode, target_ref, cursor, frame_ref,
+        max_items, timeout=20.0,
+    )
+
+
+def wait_for_browser_condition(state_ref: dict, wait_spec: dict) -> dict:
+    return _owner.call("wait_spec", state_ref, wait_spec, timeout=65.0)
+
+
+def activate_browser_element(
+    state_ref: dict, element_ref: str, wait_spec: dict | None = None,
+) -> dict:
+    return _owner.call(
+        "activate", state_ref, element_ref, wait_spec, timeout=65.0,
+    )
+
+
+def list_browser_tabs(state_ref: dict | None = None) -> dict:
+    return _owner.call("list_tabs", state_ref, timeout=10.0)
+
+
+def select_browser_tab(state_ref: dict) -> dict:
+    return _owner.call("select_tab", state_ref, timeout=10.0)
+
+
+def close_browser_tab(state_ref: dict) -> dict:
+    return _owner.call("close_tab", state_ref, timeout=15.0)
+
+
+def reload_browser_page(state_ref: dict) -> dict:
+    return _owner.call("reload", state_ref, timeout=20.0)
+
+
+def browser_back(state_ref: dict) -> dict:
+    return _owner.call("go_back_safe", state_ref, timeout=20.0)
+
+
+def browser_forward(state_ref: dict) -> dict:
+    return _owner.call("go_forward_safe", state_ref, timeout=20.0)
+
+
+def open_new_browser_tab(url: str, state_ref: dict | None = None) -> dict:
+    return _owner.call("open_new_tab_safe", url, state_ref, timeout=30.0)
+
+
+def return_to_browser_opener(state_ref: dict) -> dict:
+    return _owner.call("return_to_opener", state_ref, timeout=10.0)
+
+
+def search_web(query: str, state_ref: dict | None = None) -> dict:
+    return _owner.call("search_web", query, state_ref, timeout=45.0)
+
+
+def open_search_result(state_ref: dict, result_ref: str) -> dict:
+    return _owner.call(
+        "open_search_result", state_ref, result_ref, timeout=30.0,
+    )
+
+
+def paginate_browser(state_ref: dict, next_ref: str, max_pages: int = 1) -> dict:
+    return _owner.call(
+        "paginate", state_ref, next_ref, max_pages,
+        timeout=min(45.0 + max(1, min(int(max_pages), 20)) * 20.0, 450.0),
+    )
+
+
+def scroll_infinite(state_ref: dict, max_steps: int = 8) -> dict:
+    return _owner.call(
+        "infinite_scroll", state_ref, max_steps,
+        timeout=min(20.0 + max(1, min(int(max_steps), 20)) * 6.0, 150.0),
+    )
+
+
+def list_browser_dialogs(state_ref: dict) -> dict:
+    return _owner.call("list_dialogs", state_ref, timeout=10.0)
+
+
+def handle_browser_dialog(
+    state_ref: dict, dialog_ref: str, action: str,
+    prompt_text: str | None = None,
+) -> dict:
+    return _owner.call(
+        "handle_dialog", state_ref, dialog_ref, action, prompt_text,
+        timeout=15.0,
+    )
+
+
+def prepare_upload_authorization(arguments: dict) -> dict:
+    """Bind one upload to an exact live page, origin, target and file identity."""
+    return _owner.call("prepare_upload", dict(arguments), timeout=60.0)
+
+
+def prepare_browser_action_authorization(arguments: dict) -> dict:
+    return _owner.call("prepare_action", dict(arguments), timeout=10.0)
+
+
+def upload_browser_file(
+    state_ref: dict,
+    element_ref: str,
+    artifact_id: str | None = None,
+    local_path: str | None = None,
+    prepared_upload_ref: str | None = None,
+    destination_origin: str | None = None,
+    file_size: int | None = None,
+    detected_mime: str | None = None,
+    operation_expires_at: float | None = None,
+) -> dict:
+    return _owner.call(
+        "upload_file", state_ref, element_ref, artifact_id, local_path,
+        prepared_upload_ref, destination_origin, file_size, detected_mime,
+        operation_expires_at, timeout=90.0,
+    )
+
+
+def download_browser_file(state_ref: dict, element_ref: str) -> dict:
+    return _owner.call(
+        "download_file", state_ref, element_ref, timeout=180.0,
+    )
+
+
+def set_browser_progress_callback(callback) -> None:
+    _owner._browser_progress_callback = callback
+
+
+def _set_search_template_for_testing(template: str) -> str:
+    global _SEARCH_TEMPLATE
+    previous = _SEARCH_TEMPLATE
+    if "{query}" not in str(template):
+        raise ValueError("search template must contain {query}")
+    _SEARCH_TEMPLATE = str(template)
+    return previous
+
+
 def _dom_gate_ok() -> bool:
     snapshot = _owner.snapshot()
     return bool(
@@ -2119,4 +4344,7 @@ def close_browser():
     try:
         _owner.close()
     except Exception as exc:
-        print(f"[OSIA Browser] owner shutdown failed: {exc}")
+        print(
+            "[OSIA Browser] owner shutdown failed: "
+            f"{scrub_browser_error(exc)}"
+        )

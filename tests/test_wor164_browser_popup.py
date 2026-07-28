@@ -109,6 +109,14 @@ class FakeLocator:
 
     async def evaluate(self, _expression):
         self.page.control.check("locator.evaluate")
+        if "manual_login_required" in _expression:
+            return ""
+        if "fileCount" in _expression:
+            return {
+                "disabled": False, "checked": None, "selected": None,
+                "expanded": None, "pressed": None, "hidden": False,
+                "fileCount": None,
+            }
         return self.label
 
     async def click(self, timeout=None):
@@ -126,6 +134,7 @@ class FakePage(FakeEmitter):
         self.keyboard = FakeKeyboard(self)
         self.typed = []
         self.pressed = []
+        self.content_revision = 0
 
     @property
     def url(self):
@@ -165,17 +174,24 @@ class FakePage(FakeEmitter):
 
     async def click(self, _selector, timeout=None):
         self.control.check("page.click")
+        self.content_revision += 1
 
     async def fill(self, _selector, _value, timeout=None):
         self.control.check("page.fill")
 
     async def evaluate(self, expression):
         self.control.check("page.evaluate")
+        if expression == browser._CONTENT_FINGERPRINT_JS:
+            return f"content-revision:{self.content_revision}"
         if "innerText" in expression:
             return f"content:{self._url}"
         if expression == "location.href":
             return self._url
         return None
+
+    def locator(self, selector):
+        self.control.check("page.locator")
+        return FakeLocator(self, selector)
 
     def get_by_text(self, text, exact=False):
         self.control.check("page.get_by_text")
@@ -484,17 +500,18 @@ def test_navigation_click_fill_keyboard_tabs_and_state(owner_harness):
     _control, owner = owner_harness
     result = browser.navigate("example.test")
     assert result["text"] == "Navigated to: https://example.test"
-    assert result["screenshot"]
-    assert browser.click("#button")["text"] == "Clicked element: #button"
-    assert browser.find_and_click("Continue")["text"].startswith(
-        "Clicked element with text:"
-    )
-    assert browser.fill("#field", "value") == "Filled #field with: value"
-    assert browser.type_text("#field", "abc") == "Typed into #field: abc"
+    assert "screenshot" not in result
+    assert result["receipt"]["outcome"] == "confirmed_success"
+    assert browser.click("#button")["receipt"]["outcome"] == "confirmed_success"
+    assert browser.find_and_click("Continue")["receipt"]["outcome"] == "confirmed_success"
+    assert browser.fill("#field", "value") == "Field filled; the private value was withheld."
+    assert browser.type_text("#field", "abc") == "Text entered; the private value was withheld."
     assert browser.press_key("Enter") == "Pressed key: Enter"
     assert browser.scroll("down", 40) == "Scrolled down by 40px"
     assert browser.scroll_down() == "Scrolled down one viewport"
-    assert browser.open_new_tab("new.test") == "Opened new tab: https://new.test"
+    new_tab = browser.open_new_tab("new.test")
+    assert new_tab["receipt"]["outcome"] == "confirmed_success"
+    assert new_tab["data"]["safe_url"] == "https://new.test"
     assert owner.snapshot()["activeUrl"] == "https://new.test"
     state = browser.get_web_state("new.test", "content:", "#present")
     assert state == {

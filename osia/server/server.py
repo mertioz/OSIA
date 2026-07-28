@@ -3890,6 +3890,23 @@ _autonomous_lock = threading.Lock()
 # Sentinel so _autonomous_frame() can tell "snapshot the current run" (default)
 # apart from an explicit "no run → empty snapshot" (st=None).
 _AUTO_UNSET = object()
+_AUTONOMOUS_PROTOCOL_LOCK = threading.Lock()
+_AUTONOMOUS_PROTOCOL_SESSION_ID = "autonomous-session:" + secrets.token_urlsafe(24)
+_AUTONOMOUS_PROTOCOL_STATE = {
+    "sequences": {},
+    "terminals": {},
+}
+_BROWSER_PROTOCOL_SESSION_ID = "browser-session:" + secrets.token_urlsafe(24)
+_BROWSER_PROTOCOL_SEQUENCE = 0
+_AUTONOMOUS_SAFE_EVENTS = frozenset({
+    "aborted", "authorization_denied", "authorization_pending",
+    "blocked_outcome_unknown", "busy", "cancelled", "done", "failed", "idle",
+    "interrupted", "plan_failed", "running", "salvaged",
+    "scope_extension_denied", "state_updated",
+    "suspended_authorization_revoked", "suspended_browser_intervention",
+    "suspended_browser_state", "suspended_scope_extension",
+    "task_done", "task_failed",
+})
 
 
 def _autonomous_snapshot(st) -> dict:
@@ -3899,6 +3916,21 @@ def _autonomous_snapshot(st) -> dict:
     if not isinstance(st, dict):
         return {}
     done, total, _phase_name = _astate.count_progress(st)
+    browser_checkpoint = _astate.normalize_browser_checkpoint(
+        st.get("browser_checkpoint")
+    )
+    receipt = browser_checkpoint.get("last_action_receipt") or {}
+    safe_site = ""
+    for item in reversed(receipt.get("evidence") or []):
+        if not isinstance(item, dict):
+            continue
+        candidate = item.get("safe_url_after") or item.get("safe_url_before")
+        if isinstance(candidate, str):
+            from osia.tools.browser_state import safe_origin
+
+            safe_site = safe_origin(candidate)[:512]
+            break
+    pending = browser_checkpoint.get("pending_operation") or {}
     return {
         "tasks_done": done,
         "tasks_total": total,
@@ -3921,6 +3953,19 @@ def _autonomous_snapshot(st) -> dict:
             for phase_index, phase in enumerate(st.get("phases") or [])
             if isinstance(phase, dict)
         ],
+        "browser_progress": {
+            "state": (
+                "manual_intervention"
+                if browser_checkpoint.get("manual_intervention")
+                else "pending" if pending else "current"
+            ),
+            "safe_operation_phase": str(pending.get("kind") or "")[:32],
+            "safe_site_display": safe_site,
+            "manual_intervention": str(
+                browser_checkpoint.get("manual_intervention") or ""
+            )[:64],
+            "artifact_summary": browser_checkpoint.get("last_artifact_summary"),
+        },
         **_aauthorization.mobile_projection(st),
         **_adiagnostics.projection(st),
     }
@@ -3976,11 +4021,74 @@ def _autonomous_frame(payload: dict, st=_AUTO_UNSET) -> dict:
     an empty snapshot (no run); omit ``st`` to snapshot the current run."""
     if st is _AUTO_UNSET:
         st = _autonomous.get("st")
-    return {
+    snapshot = _autonomous_snapshot(st)
+    event = str(payload.get("event") or "idle")[:64]
+    if event not in _AUTONOMOUS_SAFE_EVENTS:
+        event = "state_updated"
+    run_id = str(st.get("run_id") or "")[:256] if isinstance(st, dict) else "idle"
+    terminal = event in {"done", "failed", "aborted", "plan_failed", "cancelled"}
+    terminal_state = bool(
+        isinstance(st, dict)
+        and (
+            st.get("status") in {"done", "failed", "cancelled"}
+            or st.get("run_state") in {"completed", "failed", "cancelled"}
+        )
+    )
+    with _AUTONOMOUS_PROTOCOL_LOCK:
+        existing_terminal = _AUTONOMOUS_PROTOCOL_STATE["terminals"].get(run_id)
+        if existing_terminal is not None:
+            if terminal:
+                return dict(existing_terminal)
+            return {"_drop_after_terminal": True, "run_id": run_id}
+        sequence = int(
+            _AUTONOMOUS_PROTOCOL_STATE["sequences"].get(run_id, 0)
+        ) + 1
+        _AUTONOMOUS_PROTOCOL_STATE["sequences"][run_id] = sequence
+        while len(_AUTONOMOUS_PROTOCOL_STATE["sequences"]) > 256:
+            retired_run = next(iter(_AUTONOMOUS_PROTOCOL_STATE["sequences"]))
+            if retired_run == run_id:
+                break
+            _AUTONOMOUS_PROTOCOL_STATE["sequences"].pop(retired_run, None)
+            _AUTONOMOUS_PROTOCOL_STATE["terminals"].pop(retired_run, None)
+    frame = {
         "type": "autonomous_progress",
-        **dict(payload),
-        **_autonomous_snapshot(st),
+        "schema_version": 1,
+        "event_id": "autonomous-event:" + secrets.token_urlsafe(24),
+        "sequence": sequence,
+        "server_id": _PERMISSION_SERVER_ID,
+        "session_id": _AUTONOMOUS_PROTOCOL_SESSION_ID,
+        "run_id": run_id,
+        "plan_revision": int(st.get("plan_revision", 0) or 0) if isinstance(st, dict) else 0,
+        "authorization_revision": int(
+            st.get("authorization_revision", 0) or 0
+        ) if isinstance(st, dict) else 0,
+        "event": event,
+        "safe_operation_phase": event,
+        "safe_site_display": str(
+            (snapshot.get("browser_progress") or {}).get("safe_site_display") or ""
+        )[:512],
+        "safe_progress_text": {
+            "running": "Autonomous work is running",
+            "task_done": "One planned step completed",
+            "task_failed": "One planned step needs attention",
+            "done": "Autonomous work completed",
+            "failed": "Autonomous work stopped with an error",
+            "plan_failed": "Autonomous work stopped with an error",
+            "interrupted": "Autonomous work is paused",
+            "aborted": "Autonomous work was cancelled",
+            "cancelled": "Autonomous work was cancelled",
+            "idle": "No Autonomous work is active",
+        }.get(event, "Autonomous state updated"),
+        "artifact_safe_summary": (
+            (snapshot.get("browser_progress") or {}).get("artifact_summary")
+        ),
+        "terminal": terminal,
+        **snapshot,
     }
+    if terminal and terminal_state:
+        with _AUTONOMOUS_PROTOCOL_LOCK:
+            _AUTONOMOUS_PROTOCOL_STATE["terminals"][run_id] = dict(frame)
+    return frame
 
 
 def _snapshot_ws_clients() -> tuple:
@@ -4002,13 +4110,100 @@ def _broadcast_autonomous(frame: dict) -> None:
     connection's single writer task enqueues it (the same thread→loop pattern
     the chat stream uses). Best-effort — a dead client is skipped, never fatal."""
     loop = _autonomous.get("loop")
-    if loop is None:
+    if loop is None or frame.get("_drop_after_terminal") is True:
         return
     for ch in _snapshot_ws_clients():
         try:
             asyncio.run_coroutine_threadsafe(ch.send_json(frame), loop)
         except Exception:
             pass
+
+
+def _browser_progress_frame(payload: dict | None = None, *, snapshot=False) -> dict:
+    """Build a value-free, versioned projection of browser progress."""
+    global _BROWSER_PROTOCOL_SEQUENCE
+    payload = payload if isinstance(payload, dict) else {}
+    allowed_phases = {
+        "snapshot", "waiting", "downloading", "finalizing", "complete",
+        "failed", "cancelled",
+    }
+    phase = "snapshot" if snapshot else str(payload.get("phase") or "")
+    if phase not in allowed_phases:
+        phase = "failed"
+    st = _autonomous.get("st")
+    run_id = (
+        str(st.get("run_id") or "")[:256]
+        if isinstance(st, dict) else "chat"
+    ) or "chat"
+    safe_site = ""
+    browser_session_id = ""
+    try:
+        from osia.tools.browser import _browser_owner_snapshot
+        from osia.tools.browser_state import safe_origin
+
+        owner_snapshot = _browser_owner_snapshot()
+        safe_site = safe_origin(owner_snapshot.get("activeUrl"))[:512]
+        browser_state = owner_snapshot.get("browserState")
+        if isinstance(browser_state, dict):
+            browser_session_id = str(
+                browser_state.get("browser_session_id") or ""
+            )[:96]
+    except Exception:
+        pass
+    with _AUTONOMOUS_PROTOCOL_LOCK:
+        _BROWSER_PROTOCOL_SEQUENCE += 1
+        sequence = _BROWSER_PROTOCOL_SEQUENCE
+    byte_size = payload.get("bytes")
+    if not isinstance(byte_size, int) or isinstance(byte_size, bool) or byte_size < 0:
+        byte_size = None
+    artifact_summary = (
+        {"private": True, "size": byte_size}
+        if byte_size is not None and phase in {"finalizing", "complete"}
+        else None
+    )
+    return {
+        "type": "browser_progress",
+        "schema_version": 1,
+        "event_id": "browser-event:" + secrets.token_urlsafe(24),
+        "sequence": sequence,
+        "server_id": _PERMISSION_SERVER_ID,
+        "session_id": _BROWSER_PROTOCOL_SESSION_ID,
+        "browser_session_id": browser_session_id,
+        "run_id": run_id,
+        "plan_revision": int(st.get("plan_revision", 0) or 0) if isinstance(st, dict) else 0,
+        "authorization_revision": int(
+            st.get("authorization_revision", 0) or 0
+        ) if isinstance(st, dict) else 0,
+        "safe_operation_phase": phase,
+        "safe_site_display": safe_site,
+        "safe_progress_text": {
+            "snapshot": "Browser state refreshed",
+            "waiting": "Waiting for the download",
+            "downloading": "Downloading to private storage",
+            "finalizing": "Finalizing the private artifact",
+            "complete": "Private artifact ready",
+            "failed": "Browser operation needs attention",
+            "cancelled": "Browser operation cancelled",
+        }[phase],
+        "artifact_safe_summary": artifact_summary,
+        "terminal": phase in {"complete", "failed", "cancelled"},
+    }
+
+
+def _on_browser_progress(payload: dict) -> None:
+    """Thread-safe callback installed on the browser owner."""
+    try:
+        frame = _browser_progress_frame(payload)
+        loop = _autonomous.get("loop")
+        if loop is None:
+            return
+        for channel in _snapshot_ws_clients():
+            try:
+                asyncio.run_coroutine_threadsafe(channel.send_json(frame), loop)
+            except Exception:
+                pass
+    except Exception:
+        print("[WOR-186] browser progress callback failed")
 
 
 def _read_autonomous_lock():
@@ -5538,6 +5733,15 @@ async def websocket_endpoint(ws: WebSocket):
                 print(f"[WS] auth attempt received (matches={matched})")
                 if matched:
                     authenticated = True
+                    # Browser work can originate from ordinary Chat as well as
+                    # Autonomous. Capture the authenticated server loop and
+                    # install the value-free progress bridge on first auth.
+                    _autonomous["loop"] = asyncio.get_running_loop()
+                    try:
+                        from osia.tools.browser import set_browser_progress_callback
+                        set_browser_progress_callback(_on_browser_progress)
+                    except Exception:
+                        pass
                     permission_session.bind_device(msg.get("device_id"))
                     permission_session.activate()
                     session_history = []
@@ -5636,6 +5840,12 @@ async def websocket_endpoint(ws: WebSocket):
                 ):
                     pending_ids = []
                 await permission_session.send_snapshot(tuple(pending_ids[:64]))
+                continue
+
+            if msg_type == "get_browser_status":
+                if msg.get("schema_version") != 1:
+                    continue
+                await out.send_json(_browser_progress_frame(snapshot=True))
                 continue
 
             if msg_type == "permission_revocation_request":

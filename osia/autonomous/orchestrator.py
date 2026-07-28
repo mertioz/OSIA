@@ -36,6 +36,7 @@ Naming note: the *module* :mod:`osia.autonomous.state` is imported as ``state``
 import os
 import re
 import inspect
+import json
 import threading
 from contextlib import contextmanager
 from typing import NamedTuple
@@ -124,10 +125,12 @@ class Orchestrator:
         # success_criterion BEFORE re-executing it (crash-salvage). Consumed on
         # the first task examined, regardless of outcome.
         self._resume_recheck = False
+        self._resume_scope_extension = False
+        self._resume_scope_tool = ""
         self._active_task = None
         self._origin_ref = str(origin_ref or "desktop")
 
-    def _agent_run(self, message: str):
+    def _agent_run(self, message: str, *, verification: bool = False):
         """Run one autonomous provider turn under the checkpoint language."""
 
         st = self._state if isinstance(self._state, dict) else {}
@@ -156,16 +159,53 @@ class Orchestrator:
             store=policy.store,
         )
         origin_ref = str(st.get("authorization_origin_ref") or self._origin_ref)
+        from osia.tool_contracts import effective_tool_surface_scope
+
+        web_surface = self._uses_autonomous_web_surface(st)
+        surface = (
+            "autonomous_web_verify" if web_surface and verification
+            else "autonomous_web" if web_surface
+            else "autonomous"
+        )
         with authorization.run_authorization_scope(
             st,
             save=state.save_task_state,
             emit=self._emit,
             origin_ref=origin_ref,
-        ), execution_context_scope(execution_context):
+        ), execution_context_scope(execution_context), effective_tool_surface_scope(
+            surface
+        ):
             if hasattr(self.agent, "set_turn_context"):
                 self.agent.set_turn_context(context)
                 return self.agent.run(message, turn_context=context)
             return self.agent.run(message)
+
+    @staticmethod
+    def _uses_autonomous_web_surface(st: dict) -> bool:
+        """Classify a Web run from its trusted plan metadata and objective."""
+
+        for item in st.get("capability_summary") or []:
+            if not isinstance(item, dict):
+                continue
+            if (
+                item.get("tool_category") == "browser"
+                or item.get("operation_class") == "browser_target"
+                or item.get("target_category") == "browser_target"
+            ):
+                return True
+        text = " ".join((
+            str(st.get("_runtime_objective", st.get("objective", "")) or ""),
+            *(str(task.get("_runtime_objective", task.get("objective", "")) or "")
+              for phase in st.get("phases") or [] if isinstance(phase, dict)
+              for task in phase.get("tasks") or [] if isinstance(task, dict)),
+        )).lower()
+        return bool(
+            re.search(r"https?://", text)
+            or any(marker in text for marker in (
+                " browser", " web ", " website", " site ", " webpage",
+                "page web", "navigateur", "popup", "iframe",
+            ))
+        )
 
     def _agent_run_failure(self):
         """Read only the agent's allow-listed typed run diagnostic."""
@@ -200,6 +240,34 @@ class Orchestrator:
         """Resume a persisted, partially-run plan — re-checks the interrupted
         task's success_criterion before re-executing it (idempotent)."""
         self._begin(state, resume=True)
+
+    def _validate_browser_resume(self, st) -> str | None:
+        checkpoint = state.normalize_browser_checkpoint(
+            st.get("browser_checkpoint")
+        )
+        stored = checkpoint.get("browser_state")
+        if stored is None:
+            return None
+        pending = checkpoint.get("pending_operation") or {}
+        if pending.get("kind") == "download":
+            return "download_attention_required"
+        if pending.get("kind") == "upload":
+            return "browser_state_stale"
+        try:
+            from osia.tools.browser import get_browser_state
+
+            observed = get_browser_state()
+            data = observed.get("data") if isinstance(observed, dict) else None
+            live = data.get("state") if isinstance(data, dict) else None
+        except Exception:
+            return "unsupported_browser_behavior"
+        if not isinstance(observed, dict) or observed.get("ok") is not True:
+            return "unsupported_browser_behavior"
+        if live != stored:
+            checkpoint["browser_state"] = live
+            st["browser_checkpoint"] = checkpoint
+            return "browser_state_stale"
+        return None
 
     def _begin(self, st, resume):
         # Idempotent: never spawn a second loop over the same Orchestrator.
@@ -272,7 +340,41 @@ class Orchestrator:
             self._safe_save(st)
             self._emit({"event": "failed", **diagnostic})
             return
-        self._resume_recheck = bool(resume)
+        browser_resume_reason = self._validate_browser_resume(st) if resume else None
+        if browser_resume_reason is not None:
+            state.suspend_browser(st, browser_resume_reason)
+            self._safe_save(st)
+            self._emit({
+                "event": browser_resume_reason,
+                **authorization.pc_projection(st),
+            })
+            return
+        current_task = None
+        cursor = st.get("cursor") or {}
+        try:
+            current_task = (st.get("phases") or [])[int(
+                cursor.get("phase", 0) or 0
+            )]["tasks"][int(cursor.get("task", 0) or 0)]
+        except (IndexError, KeyError, TypeError, ValueError):
+            current_task = None
+        self._resume_scope_extension = bool(
+            resume
+            and isinstance(current_task, dict)
+            and current_task.get("last_error") == "scope_extension_required"
+            and len(getattr(self.agent, "messages", []) or []) > 1
+        )
+        self._resume_scope_tool = ""
+        if self._resume_scope_extension:
+            for record in reversed(st.get("operation_records") or []):
+                if (
+                    isinstance(record, dict)
+                    and record.get("status") == "suspended_scope_extension"
+                ):
+                    candidate = str(record.get("tool_identity") or "")
+                    if re.fullmatch(r"[a-z][a-z0-9_]{0,79}", candidate):
+                        self._resume_scope_tool = candidate
+                    break
+        self._resume_recheck = bool(resume and not self._resume_scope_extension)
         # We are (re-)entering execution ⇒ the run is in progress. Persist once
         # up front so the on-disk checkpoint matches what we are about to run.
         st["status"] = "in_progress"
@@ -333,6 +435,22 @@ class Orchestrator:
             if not keep_going:
                 break
 
+    def _approved_scope_resume_call(self, approved_tool: str) -> dict | None:
+        """Return the private exact call retained at pre-dispatch suspension."""
+
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,79}", approved_tool or ""):
+            return None
+        for message in reversed(getattr(self.agent, "messages", []) or []):
+            if not isinstance(message, dict):
+                continue
+            call = message.get("_autonomous_resume_call")
+            if (
+                isinstance(call, dict)
+                and call.get("tool") == approved_tool
+            ):
+                return dict(call)
+        return None
+
     def _step(self, st) -> bool:
         """Run ONE task-cycle. Returns whether the loop should continue."""
         cursor = st.get("cursor") or {"phase": 0, "task": 0}
@@ -342,6 +460,35 @@ class Orchestrator:
 
         # (A) Termination — the cursor has walked past the last phase.
         if p >= len(phases):
+            remaining_requirements = state.checklist_remaining(st)
+            if remaining_requirements:
+                budgets = st.get("budgets") or {}
+                replan_count = int(budgets.get("replan_count", 0) or 0)
+                max_replans = int(
+                    budgets.get("max_replans", state.DEFAULT_MAX_REPLANS)
+                )
+                if replan_count < max_replans and self._replan(st):
+                    return st.get("run_state") == "ready"
+                st["status"] = "failed"
+                st["run_state"] = "failed"
+                diagnostic = self._record_failure(
+                    st,
+                    diagnostics.AutonomousStage.VERIFICATION,
+                    diagnostics.FailureCategory.VERIFICATION_NOT_COMPLETED,
+                    reason_code="required_criteria_incomplete",
+                    resumable=False,
+                    checkpoint_present=True,
+                )
+                self._append_log(
+                    st, "failed", note="required_criteria_incomplete",
+                )
+                self._safe_save(st)
+                self._emit({
+                    "event": "failed",
+                    "reason": "required_criteria_incomplete",
+                    **diagnostic,
+                })
+                return False
             st["status"] = "done"
             st["run_state"] = "completed"
             diagnostics.clear_current(st)
@@ -405,6 +552,24 @@ class Orchestrator:
             # Not salvageable ⇒ fall through and (re-)execute it normally.
 
         # (C) Begin an attempt — phase in_progress, bump attempts, CHECKPOINT A.
+        # A replan or scope-extension resume can arrive after every explicitly
+        # named operation for this stable requirement already produced a
+        # dispatcher-verified receipt. Re-verify read-only before asking the
+        # model to execute again; this is the durable no-replay path.
+        required_operations = self._required_browser_operations(task)
+        if required_operations and required_operations.issubset(set(
+            self._verified_operations_for_task(task)
+        )):
+            verification = self._verify_outcome(
+                task, task.get("distilled_summary", "") or "",
+            )
+            if verification.ok:
+                self._resume_scope_extension = False
+                self._salvage(
+                    st, p, t, task, "verified_operation_receipt_reuse",
+                )
+                return True
+
         phase["status"] = "in_progress"
         attempts = int(task.get("attempts", 0) or 0) + 1
         state.set_task_status(st, p, t, "in_progress", attempts=attempts)
@@ -415,10 +580,43 @@ class Orchestrator:
         # (D) Run the isolated subtask. run() can raise when fallbacks are
         # exhausted ⇒ treat as an empty result + recorded error (never crash).
         agent_failure = None
+        previous_exact_resume_call = getattr(
+            self.agent, "_autonomous_resume_exact_call", None,
+        )
         try:
-            self.agent.reset()
+            continue_approved_scope = self._resume_scope_extension
+            self._resume_scope_extension = False
+            if continue_approved_scope:
+                approved_tool = self._resume_scope_tool
+                self._resume_scope_tool = ""
+                exact_resume_call = self._approved_scope_resume_call(
+                    approved_tool,
+                )
+                if exact_resume_call is not None:
+                    self.agent._autonomous_resume_exact_call = exact_resume_call
+                tool_instruction = (
+                    f"The approved operation is {approved_tool}. "
+                    if approved_tool else
+                    "Identify the one operation that was rejected before "
+                    "dispatch. "
+                )
+                execution_prompt = (
+                    "The exact scope extension requested in this same step is "
+                    "now approved. Continue the interrupted step from this "
+                    "conversation. " + tool_instruction +
+                    "The immediately preceding assistant message may contain "
+                    "other batched calls; ignore all of them. Reissue only the "
+                    "approved operation with exactly the same arguments as "
+                    "your sole next tool call. The earlier rejection occurred before "
+                    "dispatch, so do not inspect, refresh, navigate, or obtain "
+                    "replacement opaque references first; do not broaden or "
+                    "replace the approved call."
+                )
+            else:
+                self.agent.reset()
+                execution_prompt = self._compose(task, digest)
             with self._artifact_scope(st, task):
-                result = self._agent_run(self._compose(task, digest))
+                result = self._agent_run(execution_prompt)
             if not isinstance(result, str):
                 result = "" if result is None else str(result)
             agent_failure = self._agent_run_failure()
@@ -451,12 +649,18 @@ class Orchestrator:
                 resumable=True,
                 checkpoint_present=True,
             )
+        finally:
+            self.agent._autonomous_resume_exact_call = (
+                previous_exact_resume_call
+            )
 
         barrier = st.get("run_state")
         if barrier in {
             "suspended_scope_extension",
             "suspended_authorization_revoked",
             "blocked_outcome_unknown",
+            "suspended_browser_intervention",
+            "suspended_browser_state",
         }:
             if barrier != "blocked_outcome_unknown":
                 # Authorization failed before dispatch and is not a task retry.
@@ -466,7 +670,13 @@ class Orchestrator:
                     last_error=(
                         "scope_extension_required"
                         if barrier == "suspended_scope_extension"
-                        else "authorization_revoked"
+                        else (
+                            state.normalize_browser_checkpoint(
+                                st.get("browser_checkpoint")
+                            ).get("manual_intervention")
+                            if barrier.startswith("suspended_browser")
+                            else "authorization_revoked"
+                        )
                     ),
                 )
             else:
@@ -740,6 +950,21 @@ class Orchestrator:
         if len(digest) > DIGEST_MAX_CHARS:  # defensive — digest is already capped
             digest = digest[-DIGEST_MAX_CHARS:]
         parts = [
+            "When this step uses the Web, use only the authoritative WOR-186 "
+            "browser tools that return opaque state and element references: "
+            "navigate_browser, search_web, open_search_result, "
+            "inspect_browser_page, activate_browser_element, the browser tab/"
+            "history/popup tools, paginate_browser, scroll_infinite, "
+            "upload_browser_file, and download_browser_file. Semantic forms "
+            "may use inspect_form_fields and fill_form_field. Legacy selector-"
+            "based browser tools such as navigate, read_page, click, fill, "
+            "find_and_click, type_text and press_key are not eligible in "
+            "Autonomous. Never invent a reference; carry forward only a "
+            "reference returned by the current document.",
+            "When a step requires a structured search, call search_web and use "
+            "its returned result_ref with open_search_result. Inspecting or "
+            "generically activating a pre-existing link does not execute the "
+            "structured-search step.",
             "You are executing ONE step of a larger autonomous task. Do ONLY "
             "this step — do not attempt the rest of the overall objective.",
             "",
@@ -748,6 +973,62 @@ class Orchestrator:
             "SUCCESS CRITERION (you are done only when this is OBSERVABLY true):\n"
             f"{criterion}",
         ]
+        checklist = [
+            item for item in (self._state or {}).get("checklist") or []
+            if isinstance(item, dict)
+        ]
+        if checklist:
+            lines = []
+            for item in checklist[:64]:
+                status = str(item.get("status") or "pending")
+                criterion_text = " ".join(
+                    str(item.get("criterion") or "").split()
+                )[:180]
+                lines.append(
+                    f"{item.get('requirement_id')} {status}: {criterion_text}"
+                )
+            parts += [
+                "",
+                "RUN CHECKLIST (a terminal answer is forbidden while any item "
+                "is not verified):\n" + "\n".join(lines),
+            ]
+        checkpoint = state.normalize_browser_checkpoint(
+            (self._state or {}).get("browser_checkpoint")
+        )
+        browser_state = checkpoint.get("browser_state")
+        if browser_state is not None:
+            parts += [
+                "",
+                "CURRENT AUTHORITATIVE BROWSER STATE (re-observe if a tool "
+                "reports it stale):\n" + json.dumps(
+                    browser_state, sort_keys=True, separators=(",", ":"),
+                ),
+            ]
+        reference_handoffs = checkpoint.get("reference_handoffs") or []
+        if reference_handoffs:
+            parts += [
+                "",
+                "SAFE OPAQUE REFERENCES FROM THE CURRENT DOCUMENT (use only "
+                "with the matching current state; re-observe if stale):\n"
+                + json.dumps(
+                    reference_handoffs, sort_keys=True, separators=(",", ":"),
+                ),
+            ]
+        completed_operations = self._verified_operations_for_task(task)
+        if completed_operations:
+            parts += [
+                "",
+                "VERIFIED OPERATIONS FOR THIS STEP (do not replay them): "
+                + ", ".join(completed_operations[:32]),
+            ]
+        if self._uses_autonomous_web_surface(self._state or {}):
+            from osia.tool_contracts import AUTONOMOUS_WEB_TOOL_NAMES
+
+            parts += [
+                "",
+                "AVAILABLE STRUCTURED WEB TOOLS: "
+                + ", ".join(sorted(AUTONOMOUS_WEB_TOOL_NAMES)),
+            ]
         if digest.strip():
             parts += [
                 "",
@@ -800,6 +1081,18 @@ class Orchestrator:
                 "missing_success_criterion",
             )
 
+        if self._uses_autonomous_web_surface(self._state or {}):
+            required_operations = self._required_browser_operations(task)
+            verified_operations = set(
+                self._verified_operations_for_active_task()
+            )
+            if not required_operations.issubset(verified_operations):
+                return _VerificationOutcome(
+                    False,
+                    diagnostics.FailureCategory.VERIFICATION_NOT_COMPLETED,
+                    "required_browser_operation_missing",
+                )
+
         verdict = self._file_precheck(criterion)
         if verdict is True:
             return _VerificationOutcome(True, None, "file_criterion_satisfied")
@@ -811,7 +1104,25 @@ class Orchestrator:
 
         # Undecided ⇒ LLM judge by direct observation (evidence intentionally
         # NOT fed in: the whole point is to re-check, not to echo a self-report).
-        return self._llm_judge_outcome(criterion)
+        return self._llm_judge_outcome(criterion, evidence)
+
+    def _required_browser_operations(self, task) -> set[str]:
+        if not self._uses_autonomous_web_surface(self._state or {}):
+            return set()
+        from osia.tool_contracts import AUTONOMOUS_WEB_TOOL_NAMES
+
+        current_task = task if isinstance(task, dict) else {}
+        criterion = str(current_task.get(
+            "_runtime_success_criterion",
+            current_task.get("success_criterion", ""),
+        ) or "")
+        return {
+            name for name in AUTONOMOUS_WEB_TOOL_NAMES
+            if re.search(
+                rf"(?<![a-z0-9_]){re.escape(name)}(?![a-z0-9_])",
+                criterion,
+            )
+        }
 
     def _file_precheck(self, criterion):
         """Tri-state deterministic check: ``True`` (accept) / ``False`` (reject)
@@ -881,12 +1192,108 @@ class Orchestrator:
                 out.append(c)
         return out
 
+    def _verified_operation_records_for_task(self, task) -> list[dict]:
+        st = self._state if isinstance(self._state, dict) else {}
+        current_task = task if isinstance(task, dict) else {}
+        task_id = str(current_task.get("id") or "")
+        durable_task_ids = {task_id, f"task:{task_id}"}
+        requirement_id = str(current_task.get("requirement_id") or "")
+        records = []
+        for record in st.get("operation_records") or []:
+            if (
+                isinstance(record, dict)
+                and record.get("status") == "success_verified"
+                and (
+                    record.get("task_id") in durable_task_ids
+                    or (
+                        requirement_id
+                        and record.get("requirement_id") == requirement_id
+                    )
+                )
+            ):
+                records.append(record)
+        return records
+
+    def _verified_operations_for_task(self, task) -> list[str]:
+        operations = []
+        for record in self._verified_operation_records_for_task(task):
+            name = str(record.get("tool_identity") or "")[:80]
+            if name and name not in operations:
+                operations.append(name)
+        return operations
+
+    def _verified_operations_for_active_task(self) -> list[str]:
+        return self._verified_operations_for_task(self._active_task)
+
+    def _browser_verification_context(self) -> str:
+        """Return bounded receipt-derived evidence for the active task."""
+
+        st = self._state if isinstance(self._state, dict) else {}
+        operations = self._verified_operations_for_active_task()
+        operation_receipts = []
+        for record in self._verified_operation_records_for_task(
+            self._active_task
+        ):
+            evidence = record.get("browser_evidence")
+            if not isinstance(evidence, dict):
+                continue
+            operation_receipts.append({
+                "operation": str(record.get("tool_identity") or "")[:80],
+                "typed_evidence": evidence,
+            })
+            if len(operation_receipts) >= 32:
+                break
+        checkpoint = state.normalize_browser_checkpoint(
+            st.get("browser_checkpoint")
+        )
+        receipt = checkpoint.get("last_action_receipt") or {}
+        safe_receipt = None
+        if isinstance(receipt, dict):
+            safe_receipt = {
+                "before_state": receipt.get("before_state"),
+                "after_state": receipt.get("after_state"),
+                "dispatch_state": receipt.get("dispatch_state"),
+                "outcome": receipt.get("outcome"),
+                "evidence": [
+                    {
+                        key: value
+                        for key, value in item.items()
+                        if value is None or isinstance(value, (bool, int, float))
+                    }
+                    for item in (receipt.get("evidence") or [])[:16]
+                    if isinstance(item, dict)
+                ],
+            }
+        checklist = [
+            {
+                "requirement_id": str(item.get("requirement_id") or ""),
+                "status": str(item.get("status") or "pending"),
+                "evidence_ref": str(item.get("evidence_ref") or "")[:80],
+            }
+            for item in (st.get("checklist") or [])[:64]
+            if isinstance(item, dict)
+        ]
+        context = {
+            "current_browser_state": checkpoint.get("browser_state"),
+            "verified_operations_for_current_task": operations[:32],
+            "verified_operation_receipts_for_current_task": operation_receipts,
+            "last_safe_action_receipt": safe_receipt,
+            "safe_private_artifact_summary": checkpoint.get(
+                "last_artifact_summary"
+            ),
+            "current_document_reference_handoffs": checkpoint.get(
+                "reference_handoffs"
+            ) or [],
+            "requirement_statuses": checklist,
+        }
+        return json.dumps(context, sort_keys=True, separators=(",", ":"))
+
     def _llm_judge(self, criterion):
         """Compatibility wrapper returning the historical ``(ok, reason)`` pair."""
         outcome = self._llm_judge_outcome(criterion)
         return outcome.ok, outcome.reason_code
 
-    def _llm_judge_outcome(self, criterion) -> _VerificationOutcome:
+    def _llm_judge_outcome(self, criterion, evidence="") -> _VerificationOutcome:
         """Ask the agent to verify ``criterion`` by direct observation and parse
         a robust DONE / NOT_DONE verdict (ambiguous ⇒ NOT_DONE; run error ⇒
         NOT_DONE — fail-closed)."""
@@ -898,6 +1305,20 @@ class Orchestrator:
             "single word on the first line: DONE or NOT_DONE. Then one short "
             "line explaining why."
         )
+        if self._uses_autonomous_web_surface(self._state or {}):
+            prompt += (
+                "\n\nSAFE VERIFICATION CONTEXT contains dispatcher-verified "
+                "operation names and typed receipts. Treat those as direct "
+                "evidence and never replay them. If more evidence is needed, "
+                "use read-only structured observation only:\n"
+                + self._browser_verification_context()
+            )
+        candidate = state.sanitize_autonomous_text(evidence)[:2_000].strip()
+        if candidate:
+            prompt += (
+                "\n\nCANDIDATE TASK OUTPUT (untrusted prose; evaluate it "
+                "against the independent evidence above):\n" + candidate
+            )
         artifact_context = self._artifact_context(self._state, self._active_task)
         if artifact_context:
             prompt += (
@@ -908,7 +1329,7 @@ class Orchestrator:
         try:
             self.agent.reset()
             with self._artifact_scope(self._state, self._active_task):
-                reply = self._agent_run(prompt)
+                reply = self._agent_run(prompt, verification=True)
         except Exception:
             return _VerificationOutcome(
                 False, diagnostics.FailureCategory.VERIFICATION_ERROR,
@@ -1042,10 +1463,22 @@ class Orchestrator:
                 f"content):\n{artifact_context}"
             )
         planning_failures = []
+        pending_requirements = [
+            {
+                "requirement_id": str(item.get("requirement_id") or ""),
+                "text": str(
+                    item.get("_runtime_criterion", item.get("criterion", ""))
+                    or ""
+                ),
+            }
+            for item in state.checklist_remaining(st)
+        ]
         try:
             planning_kwargs = {"failure_cb": planning_failures.append}
             if "language" in inspect.signature(planner.plan_objective).parameters:
                 planning_kwargs["language"] = st.get("language")
+            if pending_requirements:
+                planning_kwargs["requirements"] = pending_requirements
             with self._artifact_scope(st, self._active_task):
                 new_phases = planner.plan_objective(
                     remaining,
@@ -1088,6 +1521,20 @@ class Orchestrator:
 
         first_new = len(st.get("phases") or [])
         st.setdefault("phases", []).extend(new_phases)
+        pending_ids = {
+            item["requirement_id"] for item in pending_requirements
+        }
+        for item in st.get("checklist") or []:
+            if (
+                isinstance(item, dict)
+                and item.get("requirement_id") in pending_ids
+            ):
+                item.update({
+                    "status": "pending",
+                    "evidence_ref": "",
+                    "failure_reason": "",
+                    "retry_eligible": True,
+                })
         st["cursor"] = {"phase": first_new, "task": 0}
         authorization.prepare_replan(
             st,

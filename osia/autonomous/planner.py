@@ -70,6 +70,16 @@ _SCHEMA_HINT = (
 )
 
 
+def _schema_hint(requirement_ids=()) -> str:
+    if requirement_ids:
+        return (
+            '{"phases":[{"name":"...","tasks":'
+            '[{"requirement_id":"req_001","objective":"...",'
+            '"success_criterion":"..."}]}]}'
+        )
+    return _SCHEMA_HINT
+
+
 class PlanFailure(NamedTuple):
     """Sanitized final planning failure exposed to an optional callback.
 
@@ -95,9 +105,13 @@ class _AttemptOutcome(NamedTuple):
 
 # ── Prompt construction ──────────────────────────────────────────────────────
 
-def _build_planning_prompt(objective: str, max_phases: int,
-                           max_tasks_per_phase: int,
-                           language: str | None = None) -> str:
+def _build_planning_prompt(
+    objective: str,
+    max_phases: int,
+    max_tasks_per_phase: int,
+    language: str | None = None,
+    requirements=(),
+) -> str:
     """Build the strict planning prompt for ``objective``.
 
     Instructs the model to decompose the objective into a SMALL number of
@@ -105,6 +119,23 @@ def _build_planning_prompt(objective: str, max_phases: int,
     tasks, each carrying an observable ``success_criterion``, and to return ONLY
     raw JSON in the exact :data:`_SCHEMA_HINT` shape.
     """
+    requirement_ids = tuple(
+        str(item.get("requirement_id") or "")
+        for item in requirements if isinstance(item, dict)
+    )
+    explicit_rules = ""
+    if requirement_ids:
+        rows = "\n".join(
+            f"  {item['requirement_id']}: {item['text']}"
+            for item in requirements
+        )
+        explicit_rules = (
+            "- The objective has explicit numbered requirements listed below. "
+            "Create EXACTLY ONE independently verifiable task for EACH stable "
+            "requirement_id, preserve their order, never merge two IDs, never "
+            "drop an ID, and do not add unlabelled tasks.\n"
+            f"{rows}\n"
+        )
     return (
         language_instruction(language or i18n.DEFAULT_LANG) + "\n\n"
         "You are a planning module. Decompose the OBJECTIVE below into a short, "
@@ -121,11 +152,12 @@ def _build_planning_prompt(objective: str, max_phases: int,
         "report.txt exists and is non-empty\", \"the page shows the order "
         "confirmation number\", \"the command prints OK\"). It MUST be checkable "
         "by inspection — never \"the task is marked complete\".\n"
+        f"{explicit_rules}"
         "- Write `name`, `objective` and `success_criterion` in the SAME "
         "LANGUAGE as the OBJECTIVE above.\n\n"
         "Return ONLY raw JSON — no prose, no explanation, no markdown code "
         "fences. Output EXACTLY this shape and nothing else:\n"
-        f"{_SCHEMA_HINT}\n"
+        f"{_schema_hint(requirement_ids)}\n"
     )
 
 
@@ -137,6 +169,20 @@ _CORRECTIVE_PROMPT = (
     'Every phase needs a non-empty "name" and a non-empty "tasks" list; every '
     'task needs a non-empty "objective" and a non-empty "success_criterion".'
 )
+
+
+def _corrective_prompt(requirement_ids=()) -> str:
+    if not requirement_ids:
+        return _CORRECTIVE_PROMPT
+    ids = ", ".join(requirement_ids)
+    return (
+        "Your previous response did not preserve the explicit numbered "
+        "requirements. Return ONLY raw JSON in EXACTLY this schema:\n"
+        f"{_schema_hint(requirement_ids)}\n"
+        f"Create exactly one task for each of these IDs, in order: {ids}. "
+        "Every task needs a non-empty objective and observable "
+        "success_criterion. Do not merge, omit, duplicate, or invent IDs."
+    )
 
 
 # ── Robust JSON extraction ───────────────────────────────────────────────────
@@ -230,7 +276,9 @@ def _nonempty_str(value) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def _validate_and_normalize(obj, max_phases: int, max_tasks_per_phase: int):
+def _validate_and_normalize(
+    obj, max_phases: int, max_tasks_per_phase: int, requirement_ids=(),
+):
     """Validate the planning dict's shape and normalize it to the state schema.
 
     Required shape: ``obj["phases"]`` is a non-empty list; each phase is a dict
@@ -250,6 +298,8 @@ def _validate_and_normalize(obj, max_phases: int, max_tasks_per_phase: int):
     if not isinstance(phases, list) or not phases:
         return None
 
+    required_ids = tuple(str(value) for value in requirement_ids if str(value))
+    seen_requirement_ids = []
     out_phases = []
     for p_idx, phase in enumerate(phases):
         if max_phases and p_idx >= max_phases:
@@ -270,7 +320,12 @@ def _validate_and_normalize(obj, max_phases: int, max_tasks_per_phase: int):
             criterion = task.get("success_criterion")
             if not _nonempty_str(objective) or not _nonempty_str(criterion):
                 return None
-            out_tasks.append({
+            requirement_id = str(task.get("requirement_id") or "")
+            if required_ids:
+                if requirement_id not in required_ids:
+                    return None
+                seen_requirement_ids.append(requirement_id)
+            normalized_task = {
                 "id": f"{p_idx}.{t_idx}",
                 "objective": objective.strip(),
                 "success_criterion": criterion.strip(),
@@ -278,7 +333,10 @@ def _validate_and_normalize(obj, max_phases: int, max_tasks_per_phase: int):
                 "attempts": 0,
                 "distilled_summary": "",
                 "last_error": None,
-            })
+            }
+            if requirement_id:
+                normalized_task["requirement_id"] = requirement_id
+            out_tasks.append(normalized_task)
         if not out_tasks:  # defensive: never emit a task-less phase
             return None
         out_phases.append({
@@ -288,6 +346,8 @@ def _validate_and_normalize(obj, max_phases: int, max_tasks_per_phase: int):
         })
 
     if not out_phases:
+        return None
+    if required_ids and tuple(seen_requirement_ids) != required_ids:
         return None
     return out_phases
 
@@ -311,7 +371,7 @@ def _provider_failure(exc: Exception) -> PlanFailure:
 
 def _attempt(
     agent, message, max_phases, max_tasks_per_phase, turn_context=None,
-    permission_context=None,
+    permission_context=None, requirement_ids=(),
 ):
     """Run ONE planning message through the agent and parse/validate the reply.
 
@@ -344,7 +404,7 @@ def _attempt(
         return _AttemptOutcome(None, PlanFailure("invalid_json"))
     try:
         phases = _validate_and_normalize(
-            obj, max_phases, max_tasks_per_phase,
+            obj, max_phases, max_tasks_per_phase, requirement_ids,
         )
     except Exception:
         # Fail closed on a pathological decoded object and discard all content.
@@ -364,6 +424,28 @@ def _report_failure(failure_cb, failure: PlanFailure | None) -> None:
         pass
 
 
+def _apply_explicit_requirement_criteria(phases, requirements):
+    """Keep the user's numbered acceptance text authoritative verbatim."""
+
+    criteria = {
+        str(item.get("requirement_id") or ""): str(item.get("text") or "").strip()
+        for item in requirements
+        if isinstance(item, dict) and str(item.get("text") or "").strip()
+    }
+    if not criteria:
+        return phases
+    for phase in phases or []:
+        if not isinstance(phase, dict):
+            continue
+        for task in phase.get("tasks") or []:
+            if not isinstance(task, dict):
+                continue
+            criterion = criteria.get(str(task.get("requirement_id") or ""))
+            if criterion:
+                task["success_criterion"] = criterion
+    return phases
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 def plan_objective(objective: str, agent, *,
@@ -372,7 +454,8 @@ def plan_objective(objective: str, agent, *,
                    failure_cb=None,
                    language: str | None = None,
                    run_id: str | None = None,
-                   plan_revision: int = 1):
+                   plan_revision: int = 1,
+                   requirements=None):
     """Decompose ``objective`` into a validated, normalized ``phases`` list.
 
     ``agent`` is a ready :class:`osia.agent.OSIAAgent` (already model-set by the
@@ -393,6 +476,25 @@ def plan_objective(objective: str, agent, *,
         _report_failure(failure_cb, PlanFailure("blank_objective"))
         return None
     objective = objective.strip()
+    explicit_requirements = (
+        [dict(item) for item in requirements if isinstance(item, dict)]
+        if requirements is not None
+        else state.extract_enumerated_requirements(objective)
+    )
+    requirement_ids = tuple(
+        str(item.get("requirement_id") or "")
+        for item in explicit_requirements
+    )
+    if (
+        requirement_ids
+        and max_phases
+        and max_tasks_per_phase
+        and len(requirement_ids) > max_phases * max_tasks_per_phase
+    ):
+        _report_failure(
+            failure_cb, PlanFailure("requirements_exceed_plan_capacity"),
+        )
+        return None
     target_language = normalize_locale(language)
     if target_language is None:
         target_language = resolve_turn_context(
@@ -414,6 +516,7 @@ def plan_objective(objective: str, agent, *,
     )
     prompt = _build_planning_prompt(
         objective, max_phases, max_tasks_per_phase, target_language,
+        explicit_requirements,
     )
 
     # First attempt: fresh context (reset clears history except the system
@@ -425,10 +528,12 @@ def plan_objective(objective: str, agent, *,
         return None
     outcome = _attempt(
         agent, prompt, max_phases, max_tasks_per_phase, turn_context,
-        permission_context,
+        permission_context, requirement_ids,
     )
     if outcome.phases is not None:
-        return outcome.phases
+        return _apply_explicit_requirement_criteria(
+            outcome.phases, explicit_requirements,
+        )
 
     if outcome.failure and outcome.failure.reason.startswith("provider_"):
         _report_failure(failure_cb, outcome.failure)
@@ -439,14 +544,19 @@ def plan_objective(objective: str, agent, *,
     # None) is final.
     outcome = _attempt(
         agent,
-        language_instruction(target_language) + "\n\n" + _CORRECTIVE_PROMPT,
+        language_instruction(target_language) + "\n\n" + _corrective_prompt(
+            requirement_ids
+        ),
         max_phases,
         max_tasks_per_phase,
         turn_context,
         permission_context,
+        requirement_ids,
     )
     if outcome.phases is not None:
-        return outcome.phases
+        return _apply_explicit_requirement_criteria(
+            outcome.phases, explicit_requirements,
+        )
     _report_failure(failure_cb, outcome.failure)
     return None
 

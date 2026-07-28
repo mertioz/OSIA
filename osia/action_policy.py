@@ -739,6 +739,20 @@ def autonomous_permission_gate(
     context = _CURRENT_EXECUTION_CONTEXT.get()
     if context is None or context.execution_type != ExecutionType.AUTONOMOUS:
         return None
+    try:
+        from osia.tool_contracts import (
+            get_tool_spec,
+            tool_is_eligible_in_current_surface,
+        )
+
+        spec = get_tool_spec(tool_name)
+        if spec is not None and (
+            not spec.autonomous_eligible
+            or not tool_is_eligible_in_current_surface(spec)
+        ):
+            return "ERROR: tool is not eligible for Autonomous execution"
+    except Exception:
+        return "ERROR: autonomous tool eligibility unavailable"
     if tool_name.startswith("gmail_") or tool_name.startswith("mcp__"):
         # Their wrappers own the same facade and consume permits at the actual
         # remote dispatch boundary.
@@ -794,6 +808,14 @@ def scheduled_permission_gate(
     context = _CURRENT_EXECUTION_CONTEXT.get()
     if context is None or context.execution_type != ExecutionType.SCHEDULED:
         return None
+    try:
+        from osia.tool_contracts import get_tool_spec
+
+        spec = get_tool_spec(tool_name)
+        if spec is not None and not spec.scheduled_eligible:
+            return "ERROR: tool is not eligible for Scheduled Task execution"
+    except Exception:
+        return "ERROR: scheduled tool eligibility unavailable"
     if tool_name.startswith("gmail_") or tool_name.startswith("mcp__"):
         # Their wrappers evaluate the same policy at the remote dispatch edge.
         return None
@@ -865,6 +887,61 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
     if system_barrier is not None:
         return system_barrier
 
+    # Product-policy blocks are absolute.  They must run before deletion
+    # permits, Autonomous/Scheduled grants, Full Access, or any other source of
+    # execution authority so no permission mode can broaden the policy.
+    if decision.action_class == ActionClass.DISALLOWED:
+        return f"ERROR: action blocked for safety: {decision.reason}"
+
+    if tool == "activate_browser_element":
+        try:
+            from osia.tools.browser import prepare_browser_action_authorization
+
+            prepared_action = prepare_browser_action_authorization(values)
+        except Exception:
+            prepared_action = {"error": "browser_action_preflight_unavailable"}
+        if not isinstance(prepared_action, Mapping) or prepared_action.get("error"):
+            code = str(
+                prepared_action.get("error")
+                if isinstance(prepared_action, Mapping)
+                else "browser_action_preflight_unavailable"
+            )
+            return f"ERROR: browser action rejected before dispatch ({code[:80]})"
+        values["trusted_final_action"] = (
+            prepared_action.get("trusted_final_action") is True
+        )
+        values["destination_origin"] = str(
+            prepared_action.get("destination_origin") or ""
+        )[:512]
+        target_binding = str(
+            prepared_action.get("trusted_target_binding") or ""
+        )
+        if not re.fullmatch(r"[0-9a-f]{64}", target_binding):
+            return "ERROR: browser action rejected before dispatch (invalid_target_binding)"
+        values["trusted_target_binding"] = target_binding
+
+    # Upload authorization is bound from trusted live browser/file state before
+    # any permission source evaluates the request.  The returned fields are
+    # opaque or safe metadata and replace any model-supplied binding values.
+    if tool == "upload_browser_file":
+        try:
+            from osia.tools.browser import prepare_upload_authorization
+
+            prepared = prepare_upload_authorization(values)
+        except Exception:
+            prepared = {"error": "upload_preflight_unavailable"}
+        if not isinstance(prepared, Mapping) or prepared.get("error"):
+            code = str(
+                prepared.get("error") if isinstance(prepared, Mapping)
+                else "upload_preflight_unavailable"
+            )
+            return f"ERROR: upload rejected before selection ({code[:80]})"
+        for field in (
+            "prepared_upload_ref", "destination_origin", "file_size",
+            "detected_mime", "operation_expires_at",
+        ):
+            values[field] = prepared[field]
+
     # Build trusted deletion evidence before any permission-mode decision.  A
     # direct deletion or exact shell deletion can proceed only with a complete
     # plan; non-deletion shell behavior falls through unchanged.
@@ -902,13 +979,6 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
     )
     if scheduled_error is not None:
         return scheduled_error
-
-    if decision.action_class == ActionClass.DISALLOWED and tool not in _READ_ONLY_TOOLS:
-        if not _explicit_central_authority(tool, values):
-            return f"ERROR: action blocked for safety: {decision.reason}"
-        return _finish_ordinary_deletion_authorization(
-            tool, values, deletion_plan,
-        )
 
     if tool in _LOCAL_CONFIRM_TOOLS:
         blocked = _confirmation_with_permit(decision, tool, values)
@@ -1035,6 +1105,15 @@ AUTOMATIC_PERMISSION_CATEGORIES = (
     "autonomous_actions",
     "scheduled_actions",
 )
+
+_EXACT_STRUCTURED_BROWSER_ACTIONS = frozenset({
+    "navigate_browser", "activate_browser_element", "select_browser_tab",
+    "close_browser_tab", "reload_browser_page", "browser_back",
+    "browser_forward", "open_new_browser_tab", "return_to_browser_opener",
+    "search_web", "open_search_result", "paginate_browser",
+    "scroll_infinite", "handle_browser_dialog", "download_browser_file",
+    "fill_form_field",
+})
 
 
 class UsePolicy(str, Enum):
@@ -1209,6 +1288,7 @@ class PermissionRequest:
     tool_category: str
     optional_constraints: Mapping[str, Any] = field(default_factory=dict, repr=False)
     ambiguous_legacy_identity: bool = False
+    autonomous_equivalence_hash: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         from osia.tool_contracts import EffectiveToolContract, ToolSpec
@@ -1241,6 +1321,10 @@ class PermissionRequest:
         _validate_constraint_mapping(self.optional_constraints, grant=False)
         if not isinstance(self.ambiguous_legacy_identity, bool):
             raise ValueError("invalid_legacy_identity_state")
+        if self.autonomous_equivalence_hash and not re.fullmatch(
+            r"[0-9a-f]{64}", self.autonomous_equivalence_hash,
+        ):
+            raise ValueError("invalid_autonomous_equivalence_hash")
 
     @property
     def system_destruction(self) -> bool:
@@ -2552,6 +2636,22 @@ def _request_scope(
         return normalize_exact_call_scope(
             call_hash, safe_category="safe_local_setting", grantable=True,
         ), False
+    if tool_name == "upload_browser_file":
+        return normalize_exact_call_scope(
+            call_hash, safe_category="browser_upload", grantable=True,
+        ), False
+    if tool_name == "activate_browser_element" and arguments.get(
+        "trusted_final_action"
+    ) is True:
+        return normalize_exact_call_scope(
+            call_hash, safe_category="browser_final_action", grantable=True,
+        ), False
+    if tool_name in _EXACT_STRUCTURED_BROWSER_ACTIONS:
+        # Autonomous Web approval is single-call and argument-bound.  This is
+        # deliberately not an origin-wide or browser-wide permission.
+        return normalize_exact_call_scope(
+            call_hash, safe_category="browser_action", grantable=True,
+        ), False
     return normalize_exact_call_scope(
         call_hash, safe_category="tool_operation", grantable=False,
     ), False
@@ -2573,7 +2673,15 @@ def _tool_category(tool_name: str, confirmation_domain: str) -> str:
     if tool_name in {
         "click", "find_and_click", "press_key", "desktop_click",
         "desktop_press", "desktop_type", "fill", "fill_form_field",
-        "navigate", "open_browser", "type_text",
+        "navigate", "open_browser", "type_text", "get_browser_state",
+        "navigate_browser", "inspect_browser_page",
+        "wait_for_browser_condition", "activate_browser_element",
+        "list_browser_tabs", "select_browser_tab", "close_browser_tab",
+        "reload_browser_page", "browser_back", "browser_forward",
+        "open_new_browser_tab", "return_to_browser_opener", "search_web",
+        "open_search_result", "paginate_browser", "scroll_infinite",
+        "list_browser_dialogs", "handle_browser_dialog",
+        "upload_browser_file", "download_browser_file",
     }:
         return "browser"
     return "native"
@@ -2710,6 +2818,16 @@ def build_permission_request(
 
         if is_bound_scheduled_context(context):
             context = bind_request_execution_context(context, identity, call_hash)
+    autonomous_equivalence_hash = ""
+    if context.execution_type == ExecutionType.AUTONOMOUS:
+        try:
+            from osia.autonomous.authorization import operation_equivalence_hash
+
+            autonomous_equivalence_hash = operation_equivalence_hash(
+                identity, values,
+            )
+        except Exception:
+            autonomous_equivalence_hash = call_hash
     return PermissionRequest(
         tool_identity=identity,
         confirmation_domain=str(confirmation_domain),
@@ -2728,6 +2846,7 @@ def build_permission_request(
             values, scope, optional_constraints,
         ),
         ambiguous_legacy_identity=ambiguous,
+        autonomous_equivalence_hash=autonomous_equivalence_hash,
     )
 
 

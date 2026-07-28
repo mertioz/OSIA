@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,10 +12,47 @@ from osia import action_policy
 from osia.action_policy import (
     ActionClass,
     ActionOutcome,
+    PermissionPolicy,
+    UsePolicy,
     action_policy_prompt_block,
+    build_permission_request,
     classify_action_request,
+    create_grant,
     guard_tool_call,
 )
+from osia.local_reauth import issue_full_access_activation_proof
+from osia.permission_store import (
+    BackendAvailability,
+    PermissionStore,
+    SecureStorageBackend,
+)
+
+
+class _HermeticProtectedBackend(SecureStorageBackend):
+    @property
+    def availability(self):
+        return BackendAvailability(True, "wor186_test", True)
+
+    def protect(self, plaintext: bytes) -> bytes:
+        return b"W186" + bytes(value ^ 0xA7 for value in plaintext)
+
+    def unprotect(self, protected: bytes) -> bytes:
+        if not protected.startswith(b"W186"):
+            raise ValueError("invalid_test_blob")
+        return bytes(value ^ 0xA7 for value in protected[4:])
+
+
+@pytest.fixture(autouse=True)
+def _isolated_permission_policy(tmp_path: Path):
+    policy = PermissionPolicy(PermissionStore(
+        tmp_path / "permissions.dat", backend=_HermeticProtectedBackend(),
+    ))
+    action_policy.set_default_permission_policy(policy)
+    try:
+        yield policy
+    finally:
+        action_policy.clear_pending_execution_permit()
+        action_policy.set_default_permission_policy(None)
 
 
 @pytest.mark.parametrize(
@@ -265,6 +303,41 @@ def test_harmful_shell_action_cannot_bypass_the_gate():
         {"command": "placeholder"},
     )
     assert error == "ERROR: action blocked for safety: threats"
+
+
+@pytest.mark.parametrize(
+    "authority_mode", ["ask", "granular", "task_grant", "full_access"],
+)
+def test_disallowed_precedes_every_permission_source(
+    authority_mode, _isolated_permission_policy, tmp_path,
+):
+    policy = _isolated_permission_policy
+    tool = "find_and_click"
+    arguments = {"text": "Send"}
+    if authority_mode == "granular":
+        policy.store.update_automatic_permissions({"browser_account": True})
+    elif authority_mode == "task_grant":
+        target = tmp_path / "exact-grant.txt"
+        target.write_text("fixture", encoding="utf-8")
+        tool = "delete_file"
+        arguments = {"path": str(target)}
+        request = build_permission_request(
+            tool, arguments, force_sensitive=True, policy=policy,
+        )
+        policy.store.add_grant(create_grant(
+            request, use_policy=UsePolicy.BOUNDED, max_uses=1,
+        ))
+    elif authority_mode == "full_access":
+        policy.store.activate_full_access(
+            activation_proof=issue_full_access_activation_proof(),
+        )
+
+    error = guard_tool_call(
+        "Threaten Contact Alpha in a message.", tool, arguments,
+    )
+    assert error == "ERROR: action blocked for safety: threats"
+    if authority_mode == "task_grant":
+        assert target.exists()
 
 
 @pytest.mark.parametrize("lang", ["en", "fr"])

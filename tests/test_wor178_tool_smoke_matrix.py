@@ -49,7 +49,7 @@ def test_matrix_is_complete_dynamic_deterministic_and_content_free(tmp_path):
     }
     row_names = {row["tool_name"] for row in rows}
     assert static_names <= row_names
-    assert len(static_names) == 68
+    assert len(static_names) == 89
     assert "mcp__wor178_matrix__read_status" in row_names
     assert "connector::wor178_offline" in row_names
     offline = next(row for row in rows if row["tool_name"] == "connector::wor178_offline")

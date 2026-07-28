@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -19,6 +20,39 @@ from osia.tool_contracts import (
     get_static_registry,
     shell_command_is_proven_read_only,
 )
+from osia.action_policy import PermissionPolicy
+from osia.permission_store import (
+    BackendAvailability,
+    PermissionStore,
+    SecureStorageBackend,
+)
+
+
+class _HermeticProtectedBackend(SecureStorageBackend):
+    @property
+    def availability(self):
+        return BackendAvailability(True, "wor178_test", True)
+
+    def protect(self, plaintext: bytes) -> bytes:
+        return b"W178" + bytes(value ^ 0x6D for value in plaintext)
+
+    def unprotect(self, protected: bytes) -> bytes:
+        if not protected.startswith(b"W178"):
+            raise ValueError("invalid_test_blob")
+        return bytes(value ^ 0x6D for value in protected[4:])
+
+
+@pytest.fixture(autouse=True)
+def _isolated_ask_permissions(tmp_path: Path):
+    policy = PermissionPolicy(PermissionStore(
+        tmp_path / "permissions.dat", backend=_HermeticProtectedBackend(),
+    ))
+    action_policy.set_default_permission_policy(policy)
+    try:
+        yield
+    finally:
+        action_policy.clear_pending_execution_permit()
+        action_policy.set_default_permission_policy(None)
 
 
 def test_representative_static_side_effect_and_confirmation_classes():

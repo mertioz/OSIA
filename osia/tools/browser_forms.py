@@ -29,12 +29,43 @@ FORM_MAX_LIVE_REFERENCES = 500
 FORM_MAX_STALE_REFERENCES = 1000
 FORM_INSPECTION_TIMEOUT_SECONDS = 6.0
 FORM_FILL_TIMEOUT_SECONDS = 8.0
-FORM_VALIDATION_SETTLE_MS = 450
+FORM_VALIDATION_QUIET_MS = 250
+FORM_VALIDATION_TIMEOUT_MS = 3000
 FORM_TEXT_LIMIT = 120
 FORM_MAX_VALUE_CHARS = 16_000
 
 _FIELD_REF_RE = re.compile(r"^fld_[A-Za-z0-9_-]{24}$")
 _FIELD_SELECTOR = "input, textarea, select"
+_WAIT_VALIDATION_STABLE_JS = r"""
+(el, options) => new Promise(resolve => {
+  const quietMs = options.quietMs;
+  const timeoutMs = options.timeoutMs;
+  let quietTimer = null;
+  let finished = false;
+  const done = () => {
+    if (finished) return;
+    finished = true;
+    observer.disconnect();
+    el.removeEventListener('input', changed);
+    el.removeEventListener('change', changed);
+    clearTimeout(quietTimer);
+    clearTimeout(deadlineTimer);
+    resolve(true);
+  };
+  const changed = () => {
+    clearTimeout(quietTimer);
+    quietTimer = setTimeout(done, quietMs);
+  };
+  const observer = new MutationObserver(changed);
+  observer.observe(document.documentElement, {
+    subtree: true, childList: true, characterData: true, attributes: true,
+  });
+  el.addEventListener('input', changed);
+  el.addEventListener('change', changed);
+  const deadlineTimer = setTimeout(done, timeoutMs);
+  changed();
+})
+"""
 _TEXT_TYPES = frozenset({
     "text", "search", "url", "email", "tel", "number", "date",
     "time", "datetime-local", "month", "week",
@@ -802,9 +833,14 @@ class SemanticFormSession:
             reresolved = True
 
         try:
-            await page.wait_for_timeout(FORM_VALIDATION_SETTLE_MS)
+            await handle.evaluate(_WAIT_VALIDATION_STABLE_JS, {
+                "quietMs": FORM_VALIDATION_QUIET_MS,
+                "timeoutMs": FORM_VALIDATION_TIMEOUT_MS,
+            })
         except Exception:
-            await asyncio.sleep(FORM_VALIDATION_SETTLE_MS / 1000)
+            # Verification below still decides success; an unavailable event
+            # observer never causes the action to be replayed.
+            await asyncio.sleep(0)
 
         post_metadata = await self._metadata_for_handle(handle)
         if post_metadata is None or not self._matches_entry(entry, post_metadata):

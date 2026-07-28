@@ -424,10 +424,39 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
     running on (and can answer if asked).
     """
     lang = normalize_locale(lang) or i18n.get_language()
-    body = SYSTEM_PROMPT_FR if lang == "fr" else SYSTEM_PROMPT_EN
     # WOR-178: render provider-facing native-tool schemas from the same
     # authoritative registry used by dispatch validation.
-    from osia.tool_contracts import replace_static_tool_prompt_section
+    from osia.tool_contracts import (
+        current_tool_surface,
+        replace_static_tool_prompt_section,
+        static_tool_prompt_block,
+    )
+    autonomous_web_surface = current_tool_surface() in {
+        "autonomous_web", "autonomous_web_verify",
+    }
+    if autonomous_web_surface:
+        intro = (
+            "Tu es OSIA et tu exécutes une étape Web autonome approuvée. "
+            "Seuls les outils du bloc autoritatif ci-dessous existent pour ce "
+            "tour. Utilise uniquement les références opaques renvoyées par "
+            "l'état ou l'inspection courante. N'invente jamais une référence, "
+            "ne contourne jamais une authentification, un CAPTCHA ou une 2FA, "
+            "et n'expose aucune valeur privée. Un résultat incertain ne doit "
+            "jamais être rejoué. Après une référence périmée, réobserve l'état."
+            if lang == "fr" else
+            "You are OSIA executing one approved Autonomous Web step. Only the "
+            "tools in the authoritative block below exist for this turn. Use "
+            "only opaque references returned by the current state or current "
+            "inspection. Never invent a reference, bypass authentication, "
+            "CAPTCHA, or 2FA, or expose a private value. Never replay an "
+            "uncertain result. Re-observe state after a stale reference."
+        )
+        body = intro + "\n\n" + static_tool_prompt_block(lang)
+        if model and provider:
+            body = f"OSIA model: {model} ({provider}).\n\n" + body
+        return body + "\n\n" + language_instruction(lang)
+
+    body = SYSTEM_PROMPT_FR if lang == "fr" else SYSTEM_PROMPT_EN
     body = replace_static_tool_prompt_section(body, lang)
     # Point the model at the real project root on this machine instead of the
     # /home/OSIA path baked into the prompt text (works on Windows + Linux).
@@ -452,7 +481,7 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
         if persona:
             body = persona + "\n\n" + body
         skills = personality.load_enabled_skills_text().strip()
-        if skills:
+        if skills and not autonomous_web_surface:
             body = body + "\n\n" + skills
     except Exception:
         pass
@@ -463,13 +492,14 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
         pass
     body = body + "\n\n" + language_instruction(lang)
     from osia.tool_contracts import assert_prompt_tool_examples_compatible
-    for tool_guidance in (
-        _memory_tool_prompt_block(lang),
-        _scheduled_task_tool_prompt_block(lang),
-        _gmail_rest_prompt_block(lang),
-    ):
-        assert_prompt_tool_examples_compatible(tool_guidance)
-        body = body + "\n\n" + tool_guidance
+    if not autonomous_web_surface:
+        for tool_guidance in (
+            _memory_tool_prompt_block(lang),
+            _scheduled_task_tool_prompt_block(lang),
+            _gmail_rest_prompt_block(lang),
+        ):
+            assert_prompt_tool_examples_compatible(tool_guidance)
+            body = body + "\n\n" + tool_guidance
     # WOR-44 Phase 2 — list the tools exposed by connected MCP servers so the
     # model can see and call them like native tools. Built FRESH on every
     # get_system_prompt() call. On the SERVER path run(history=...) rebuilds the
@@ -488,20 +518,21 @@ def get_system_prompt(lang: str = None, model: str = None, provider: str = None)
     # listing below so the model reads "you have Linear" before the tool dump.
     # Soft + lazy (same discipline as the blocks above): any failure yields no
     # block and never breaks prompt construction.
-    try:
-        from osia.mcp_client.registry import mcp_connectors_prompt_block
-        connectors_block = mcp_connectors_prompt_block(lang)
-        if connectors_block:
-            body = body + "\n\n" + connectors_block
-    except Exception:
-        pass
-    try:
-        from osia.mcp_client.registry import mcp_tool_prompt_block
-        mcp_block = mcp_tool_prompt_block(lang)
-        if mcp_block:
-            body = body + "\n\n" + mcp_block
-    except Exception:
-        pass
+    if not autonomous_web_surface:
+        try:
+            from osia.mcp_client.registry import mcp_connectors_prompt_block
+            connectors_block = mcp_connectors_prompt_block(lang)
+            if connectors_block:
+                body = body + "\n\n" + connectors_block
+        except Exception:
+            pass
+        try:
+            from osia.mcp_client.registry import mcp_tool_prompt_block
+            mcp_block = mcp_tool_prompt_block(lang)
+            if mcp_block:
+                body = body + "\n\n" + mcp_block
+        except Exception:
+            pass
     return body
 
 
@@ -2380,7 +2411,14 @@ def _get_browser_tools():
             get_current_url, scroll, go_back, go_forward, open_new_tab,
             find_and_click, wait_for_load, get_page_text, scroll_down,
             type_text, press_key, open_browser, inspect_form_fields,
-            fill_form_field,
+            fill_form_field, get_browser_state, navigate_browser,
+            inspect_browser_page, wait_for_browser_condition,
+            activate_browser_element, list_browser_tabs, select_browser_tab,
+            close_browser_tab, reload_browser_page, browser_back,
+            browser_forward, open_new_browser_tab, return_to_browser_opener,
+            search_web, open_search_result, paginate_browser, scroll_infinite,
+            list_browser_dialogs, handle_browser_dialog, upload_browser_file,
+            download_browser_file,
         )
         _browser_tools = {
             "navigate": navigate,
@@ -2401,6 +2439,27 @@ def _get_browser_tools():
             "type_text": type_text,
             "press_key": press_key,
             "open_browser": open_browser,
+            "get_browser_state": get_browser_state,
+            "navigate_browser": navigate_browser,
+            "inspect_browser_page": inspect_browser_page,
+            "wait_for_browser_condition": wait_for_browser_condition,
+            "activate_browser_element": activate_browser_element,
+            "list_browser_tabs": list_browser_tabs,
+            "select_browser_tab": select_browser_tab,
+            "close_browser_tab": close_browser_tab,
+            "reload_browser_page": reload_browser_page,
+            "browser_back": browser_back,
+            "browser_forward": browser_forward,
+            "open_new_browser_tab": open_new_browser_tab,
+            "return_to_browser_opener": return_to_browser_opener,
+            "search_web": search_web,
+            "open_search_result": open_search_result,
+            "paginate_browser": paginate_browser,
+            "scroll_infinite": scroll_infinite,
+            "list_browser_dialogs": list_browser_dialogs,
+            "handle_browser_dialog": handle_browser_dialog,
+            "upload_browser_file": upload_browser_file,
+            "download_browser_file": download_browser_file,
         }
     return _browser_tools
 
@@ -2475,6 +2534,146 @@ def tool_open_browser(name: str, url: str | None = None):
     if url:
         _maybe_remember_verified_site(url, result)
     return result
+
+
+def tool_get_browser_state() -> dict:
+    return _get_browser_tools()["get_browser_state"]()
+
+
+def tool_navigate_browser(
+    url: str, state_ref: dict | None = None, wait_spec: dict | None = None,
+) -> dict:
+    result = _get_browser_tools()["navigate_browser"](url, state_ref, wait_spec)
+    _maybe_remember_verified_site(url, result)
+    return result
+
+
+def tool_inspect_browser_page(
+    state_ref: dict | None = None,
+    mode: str = "snapshot",
+    target_ref: str | None = None,
+    cursor: str | None = None,
+    frame_ref: str | None = None,
+    max_items: int = 40,
+) -> dict:
+    return _get_browser_tools()["inspect_browser_page"](
+        state_ref, mode, target_ref, cursor, frame_ref, max_items,
+    )
+
+
+def tool_wait_for_browser_condition(state_ref: dict, wait_spec: dict) -> dict:
+    return _get_browser_tools()["wait_for_browser_condition"](
+        state_ref, wait_spec,
+    )
+
+
+def tool_activate_browser_element(
+    state_ref: dict,
+    element_ref: str,
+    wait_spec: dict | None = None,
+    trusted_final_action: bool | None = None,
+    destination_origin: str | None = None,
+    trusted_target_binding: str | None = None,
+) -> dict:
+    del trusted_final_action, destination_origin, trusted_target_binding
+    return _get_browser_tools()["activate_browser_element"](
+        state_ref, element_ref, wait_spec,
+    )
+
+
+def tool_list_browser_tabs(state_ref: dict | None = None) -> dict:
+    return _get_browser_tools()["list_browser_tabs"](state_ref)
+
+
+def tool_select_browser_tab(state_ref: dict) -> dict:
+    return _get_browser_tools()["select_browser_tab"](state_ref)
+
+
+def tool_close_browser_tab(state_ref: dict) -> dict:
+    return _get_browser_tools()["close_browser_tab"](state_ref)
+
+
+def tool_reload_browser_page(state_ref: dict) -> dict:
+    return _get_browser_tools()["reload_browser_page"](state_ref)
+
+
+def tool_browser_back(state_ref: dict) -> dict:
+    return _get_browser_tools()["browser_back"](state_ref)
+
+
+def tool_browser_forward(state_ref: dict) -> dict:
+    return _get_browser_tools()["browser_forward"](state_ref)
+
+
+def tool_open_new_browser_tab(
+    url: str, state_ref: dict | None = None,
+) -> dict:
+    result = _get_browser_tools()["open_new_browser_tab"](url, state_ref)
+    _maybe_remember_verified_site(url, result)
+    return result
+
+
+def tool_return_to_browser_opener(state_ref: dict) -> dict:
+    return _get_browser_tools()["return_to_browser_opener"](state_ref)
+
+
+def tool_search_web(query: str, state_ref: dict | None = None) -> dict:
+    return _get_browser_tools()["search_web"](query, state_ref)
+
+
+def tool_open_search_result(state_ref: dict, result_ref: str) -> dict:
+    return _get_browser_tools()["open_search_result"](state_ref, result_ref)
+
+
+def tool_paginate_browser(
+    state_ref: dict, next_ref: str, max_pages: int = 1,
+) -> dict:
+    return _get_browser_tools()["paginate_browser"](
+        state_ref, next_ref, max_pages,
+    )
+
+
+def tool_scroll_infinite(state_ref: dict, max_steps: int = 8) -> dict:
+    return _get_browser_tools()["scroll_infinite"](state_ref, max_steps)
+
+
+def tool_list_browser_dialogs(state_ref: dict) -> dict:
+    return _get_browser_tools()["list_browser_dialogs"](state_ref)
+
+
+def tool_handle_browser_dialog(
+    state_ref: dict,
+    dialog_ref: str,
+    action: str,
+    prompt_text: str | None = None,
+) -> dict:
+    return _get_browser_tools()["handle_browser_dialog"](
+        state_ref, dialog_ref, action, prompt_text,
+    )
+
+
+def tool_upload_browser_file(
+    state_ref: dict,
+    element_ref: str,
+    artifact_id: str | None = None,
+    local_path: str | None = None,
+    prepared_upload_ref: str | None = None,
+    destination_origin: str | None = None,
+    file_size: int | None = None,
+    detected_mime: str | None = None,
+    operation_expires_at: float | None = None,
+) -> dict:
+    return _get_browser_tools()["upload_browser_file"](
+        state_ref, element_ref, artifact_id, local_path,
+        prepared_upload_ref, destination_origin, file_size, detected_mime,
+        operation_expires_at,
+    )
+
+
+def tool_download_browser_file(state_ref: dict, element_ref: str) -> dict:
+    return _get_browser_tools()["download_browser_file"](
+        state_ref, element_ref,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3459,6 +3658,27 @@ TOOL_MAP = {
     "type_text": tool_type_text,
     "press_key": tool_press_key,
     "open_browser": tool_open_browser,
+    "get_browser_state": tool_get_browser_state,
+    "navigate_browser": tool_navigate_browser,
+    "inspect_browser_page": tool_inspect_browser_page,
+    "wait_for_browser_condition": tool_wait_for_browser_condition,
+    "activate_browser_element": tool_activate_browser_element,
+    "list_browser_tabs": tool_list_browser_tabs,
+    "select_browser_tab": tool_select_browser_tab,
+    "close_browser_tab": tool_close_browser_tab,
+    "reload_browser_page": tool_reload_browser_page,
+    "browser_back": tool_browser_back,
+    "browser_forward": tool_browser_forward,
+    "open_new_browser_tab": tool_open_new_browser_tab,
+    "return_to_browser_opener": tool_return_to_browser_opener,
+    "search_web": tool_search_web,
+    "open_search_result": tool_open_search_result,
+    "paginate_browser": tool_paginate_browser,
+    "scroll_infinite": tool_scroll_infinite,
+    "list_browser_dialogs": tool_list_browser_dialogs,
+    "handle_browser_dialog": tool_handle_browser_dialog,
+    "upload_browser_file": tool_upload_browser_file,
+    "download_browser_file": tool_download_browser_file,
     # Desktop automation (native apps — OS-level mouse/keyboard, WOR-42)
     "desktop_click": tool_desktop_click,
     "desktop_type": tool_desktop_type,
@@ -3542,6 +3762,201 @@ def _result_text(result) -> str:
     return str(result) if result is not None else ""
 
 
+_BROWSER_MODEL_PRIVATE_KEYS = frozenset({
+    "filename", "file_name", "local_path", "path", "sha256", "hash",
+    "storage", "storage_path", "provenance", "query", "selector", "token",
+    "operation_id", "tool_call_id", "started_at", "completed_at",
+})
+
+
+def _safe_browser_model_data(value, *, key=""):
+    """Project operation data while withholding private storage/value fields."""
+
+    name = str(key or "").lower()
+    if name in _BROWSER_MODEL_PRIVATE_KEYS or name in {
+        "value", "values", "content", "contents", "prompt_text",
+    }:
+        return None
+    if isinstance(value, dict):
+        if name == "artifact":
+            return {
+                field: value[field]
+                for field in (
+                    "artifact_id", "size", "mime_type", "classification",
+                    "private", "executable", "extractable",
+                )
+                if field in value
+            }
+        clean = {}
+        for child_key, child_value in value.items():
+            child_name = str(child_key or "").lower()
+            if (
+                child_name in _BROWSER_MODEL_PRIVATE_KEYS
+                or child_name in {
+                    "value", "values", "content", "contents", "prompt_text",
+                }
+                or ("url" in child_name and not child_name.startswith("safe_"))
+            ):
+                continue
+            projected = _safe_browser_model_data(
+                child_value, key=child_name,
+            )
+            if projected is not None:
+                clean[str(child_key)[:80]] = projected
+        return clean
+    if isinstance(value, list):
+        return [
+            projected for item in value[:100]
+            if (projected := _safe_browser_model_data(item, key=name)) is not None
+        ]
+    if isinstance(value, str):
+        if name.startswith("safe_") and "url" in name:
+            try:
+                from osia.tools.browser_state import safe_url_display
+
+                return safe_url_display(value)
+            except Exception:
+                return ""
+        return value[:4_000]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return None
+
+
+def _model_result_text(result, tool_name: str = "") -> str:
+    """Return the concise private browser projection shown to the model."""
+    if (
+        isinstance(result, dict)
+        and isinstance(result.get("receipt"), dict)
+        and result["receipt"].get("schema_version") == 1
+        and isinstance(result.get("ok"), bool)
+    ):
+        receipt = result["receipt"]
+        before = receipt.get("before_state")
+        after = receipt.get("after_state")
+        current = after if isinstance(after, dict) else before
+        typed_outcome = str(receipt.get("outcome") or "")
+        dispatch_state = str(receipt.get("dispatch_state") or "")
+        projection = {
+            "operation": str(tool_name or "browser_operation")[:80],
+            "ok": result["ok"],
+            "typed_outcome": typed_outcome,
+            "dispatch_state": dispatch_state,
+            "current_page_ref": current,
+            "state_changed": {
+                "navigation": bool(
+                    isinstance(before, dict) and isinstance(after, dict)
+                    and before.get("navigation_id") != after.get("navigation_id")
+                ),
+                "document": bool(
+                    isinstance(before, dict) and isinstance(after, dict)
+                    and before.get("document_epoch") != after.get("document_epoch")
+                ),
+            },
+            "safe_evidence": [
+                {
+                    str(key)[:48]: value
+                    for key, value in item.items()
+                    if value is None or isinstance(value, (bool, int, float))
+                }
+                for item in (receipt.get("evidence") or [])[:16]
+                if isinstance(item, dict)
+            ],
+        }
+        if isinstance(result.get("data"), dict):
+            data = _safe_browser_model_data(result["data"], key="data")
+            if isinstance(data, dict):
+                data.pop("state", None)
+                data.pop("browser_state", None)
+                projection["operation_data"] = data
+        if isinstance(result.get("error"), dict):
+            error_code = str(result["error"].get("code") or "browser_error")[:96]
+            projection["error_code"] = error_code
+            if error_code in {
+                "stale_browser_reference", "stale_element_reference",
+                "stale_pagination_reference", "browser_state_stale",
+            }:
+                projection["stale_reference_guidance"] = {
+                    "reobserve_with": "get_browser_state",
+                    "then": "inspect_browser_page",
+                    "may_replay_stale_action": False,
+                }
+        if typed_outcome == "outcome_unknown" or dispatch_state == "effect_unknown":
+            projection["must_not_replay"] = True
+        elif typed_outcome == "confirmed_failure_before_effect":
+            projection["safe_retry"] = True
+        deterministic_next = {
+            "get_browser_state": ("inspect_browser_page",),
+            "navigate_browser": ("inspect_browser_page",),
+            "search_web": ("open_search_result",),
+            "open_search_result": ("inspect_browser_page",),
+            "paginate_browser": ("inspect_browser_page",),
+            "open_new_browser_tab": ("inspect_browser_page", "return_to_browser_opener"),
+            "reload_browser_page": ("inspect_browser_page",),
+            "browser_back": ("inspect_browser_page",),
+            "browser_forward": ("inspect_browser_page",),
+        }.get(str(tool_name or ""), ())
+        if result["ok"] and deterministic_next:
+            projection["next_valid_operations"] = list(deterministic_next)
+        try:
+            return json.dumps(
+                projection,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return "ERROR: invalid typed browser result"
+    return _result_text(result)
+
+
+def _retain_only_attempted_provisional_call(messages, tool_name, arguments):
+    """Drop unexecuted siblings from a suspended model-selected tool batch."""
+
+    name = str(tool_name or "")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", name):
+        return False
+    call = {"tool": name}
+    if isinstance(arguments, dict):
+        call.update(arguments)
+    try:
+        content = (
+            "<tool_call>\n"
+            + json.dumps(call, ensure_ascii=False)
+            + "\n</tool_call>"
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    for message in reversed(messages if isinstance(messages, list) else []):
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and message.get("_provisional") is True
+        ):
+            message["content"] = content
+            # Keep the exact model-selected call in internal turn state so an
+            # approved Autonomous resume cannot substitute a stale sibling
+            # from the original batch.  Underscore-prefixed message fields are
+            # stripped by _wire_messages and provisional frames are excluded
+            # from persisted/exported history.
+            message["_autonomous_resume_call"] = call
+            return True
+    return False
+
+
+def _apply_exact_autonomous_resume_call(agent, tool_calls):
+    """Consume the one exact call selected before an approved suspension."""
+
+    call = getattr(agent, "_autonomous_resume_exact_call", None)
+    if not isinstance(call, dict):
+        return tool_calls
+    agent._autonomous_resume_exact_call = None
+    name = str(call.get("tool") or "")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", name):
+        return tool_calls
+    return [dict(call)]
+
+
 def _is_tool_error(result) -> bool:
     """A tool result is treated as a failure when its text is empty/whitespace
     or its first non-blank token begins with ERROR/ERREUR (with or
@@ -3605,6 +4020,34 @@ def _tool_spec_and_contract(tool_name: str, kwargs: dict, user_request: str = ""
 
 class _ExecutionPermitUnavailable(RuntimeError):
     """Internal value-free marker raised before a gated dispatcher starts."""
+
+
+def _typed_browser_receipt_outcome(result):
+    """Map a validated WOR-186 receipt; friendly text is never success proof."""
+    from osia.tool_contracts import ExecutionOutcome
+
+    if not isinstance(result, dict) or not isinstance(result.get("receipt"), dict):
+        return None
+    receipt = result["receipt"]
+    if receipt.get("schema_version") != 1:
+        return None
+    dispatch = str(receipt.get("dispatch_state") or "")
+    outcome = str(receipt.get("outcome") or "")
+    valid_dispatch = {
+        "not_dispatched", "dispatched", "effect_confirmed", "effect_unknown",
+    }
+    valid_outcomes = {
+        "confirmed_failure_before_effect", "confirmed_success", "outcome_unknown",
+    }
+    if dispatch not in valid_dispatch or outcome not in valid_outcomes:
+        return None
+    if outcome == "outcome_unknown" or dispatch == "effect_unknown":
+        return ExecutionOutcome.OUTCOME_UNKNOWN, True
+    if outcome == "confirmed_failure_before_effect":
+        return ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT, dispatch != "not_dispatched"
+    if outcome == "confirmed_success" and dispatch == "effect_confirmed":
+        return ExecutionOutcome.SUCCESS_VERIFIED, True
+    return ExecutionOutcome.OUTCOME_UNKNOWN, dispatch != "not_dispatched"
 
 
 def _execute_tool_once_record(
@@ -3680,6 +4123,21 @@ def _execute_tool_once_record(
         return ToolExecutionRecord(text, True, outcome, 1, True, False, contract)
 
     is_error = _is_tool_error(result)
+    typed_browser_outcome = _typed_browser_receipt_outcome(result)
+    if typed_browser_outcome is not None:
+        outcome, dispatched = typed_browser_outcome
+        return ToolExecutionRecord(
+            result,
+            is_error or outcome in {
+                ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT,
+                ExecutionOutcome.OUTCOME_UNKNOWN,
+            },
+            outcome,
+            1 if dispatched else 0,
+            dispatched,
+            False,
+            contract,
+        )
     proven_before_effect = False
     if is_error:
         text = _result_text(result).lower().strip()
@@ -6728,6 +7186,7 @@ class OSIAAgent:
             tool_calls = _extract_tool_calls(
                 content, message=message, provider=self.provider,
             )
+            tool_calls = _apply_exact_autonomous_resume_call(self, tool_calls)
             if tool_calls and self.provider == "chatgpt_account":
                 _account_attempt_committed = True
 
@@ -6798,6 +7257,8 @@ class OSIAAgent:
                 # that depended on the failed one.
                 tool_results = []
                 tool_screenshots: list[str] = []
+                attempted_model_tool_name = ""
+                attempted_model_kwargs = {}
                 for i, tc in enumerate(tool_calls):
                     tool_name = tc.get("tool", "")
                     if guard.check_time():
@@ -6855,6 +7316,8 @@ class OSIAAgent:
                         )
                         guard.record(tool_name, kwargs, "", True)
                         break
+                    attempted_model_tool_name = tool_name
+                    attempted_model_kwargs = dict(kwargs)
 
                     if (
                         tool_name in _SCHEDULED_TASK_TOOL_NAMES
@@ -6872,8 +7335,14 @@ class OSIAAgent:
                         )
                         continue
 
-                    if tool_name == "fill_form_field":
+                    if tool_name in {"fill_form_field", "fill"}:
                         self._remember_semantic_form_value(kwargs.get("value"))
+                    elif tool_name == "type_text":
+                        self._remember_semantic_form_value(kwargs.get("text"))
+                    elif tool_name == "handle_browser_dialog":
+                        self._remember_semantic_form_value(kwargs.get("prompt_text"))
+                    elif tool_name == "upload_browser_file":
+                        self._remember_semantic_form_value(kwargs.get("local_path"))
                     print(
                         f"[OSIA Agent] tool start: {tool_name} "
                         f"({len(kwargs)} argument field(s))"
@@ -7087,7 +7556,7 @@ class OSIAAgent:
                         turn_has_unknown_outcome = True
                         if execution_record.timed_out:
                             turn_has_tool_timeout = True
-                    text_part = _result_text(result)
+                    text_part = _model_result_text(result, tool_name)
                     document_reference = _document_reference_from_result(
                         tool_name, result,
                     )
@@ -7244,6 +7713,11 @@ class OSIAAgent:
                 }:
                     # Do not give the provider another turn after a typed
                     # zero-dispatch suspension; the orchestrator owns resume.
+                    _retain_only_attempted_provisional_call(
+                        self.messages,
+                        attempted_model_tool_name,
+                        attempted_model_kwargs,
+                    )
                     return "ERROR: autonomous authorization suspended before dispatch"
                 if autonomous_run_state == "blocked_outcome_unknown":
                     return self._finish_execution_barrier_stop(

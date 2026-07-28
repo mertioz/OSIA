@@ -113,6 +113,52 @@ ALL_TEXT_PROVIDERS = (
 )
 
 
+# The exact provider-facing surface for an Autonomous Web run.  These tools
+# either return WOR-186 opaque browser state/receipts or are the established
+# WOR-176 semantic-form operations.  Normal Chat keeps the complete registry.
+AUTONOMOUS_WEB_TOOL_NAMES = frozenset({
+    "get_browser_state", "navigate_browser", "inspect_browser_page",
+    "wait_for_browser_condition", "activate_browser_element",
+    "list_browser_tabs", "select_browser_tab", "close_browser_tab",
+    "reload_browser_page", "browser_back", "browser_forward",
+    "open_new_browser_tab", "return_to_browser_opener", "search_web",
+    "open_search_result", "paginate_browser", "scroll_infinite",
+    "list_browser_dialogs", "handle_browser_dialog",
+    "upload_browser_file", "download_browser_file",
+    "inspect_form_fields", "fill_form_field",
+})
+AUTONOMOUS_WEB_VERIFY_TOOL_NAMES = frozenset({
+    "inspect_form_fields", "get_browser_state", "inspect_browser_page",
+    "wait_for_browser_condition", "list_browser_tabs",
+    "list_browser_dialogs",
+})
+
+_ACTIVE_TOOL_SURFACE: ContextVar[str] = ContextVar(
+    "osia_active_tool_surface", default="",
+)
+
+
+@contextmanager
+def effective_tool_surface_scope(surface: str):
+    """Select a bounded provider/dispatch surface for one execution turn."""
+
+    normalized = str(surface or "")
+    if normalized not in {
+        "", "autonomous", "autonomous_web", "autonomous_web_verify",
+        "scheduled",
+    }:
+        raise ValueError("invalid_tool_surface")
+    token = _ACTIVE_TOOL_SURFACE.set(normalized)
+    try:
+        yield normalized
+    finally:
+        _ACTIVE_TOOL_SURFACE.reset(token)
+
+
+def current_tool_surface() -> str:
+    return _ACTIVE_TOOL_SURFACE.get()
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     name: str
@@ -133,6 +179,12 @@ class ToolSpec:
     controlled_integration_status: EvidenceClassification
     real_validation_requirement: RealValidationRequirement
     verified_success: bool = False
+    permission_category: str = "none"
+    postcondition_required: bool = False
+    redaction_policy: str = "bounded_model_result"
+    chat_eligible: bool = True
+    autonomous_eligible: bool = True
+    scheduled_eligible: bool = True
     dispatcher: Callable[..., Any] | None = None
     dynamic: bool = False
     connector_id: str = ""
@@ -286,6 +338,38 @@ URL = _string(maximum=8192, pattern=r"^\S+$")
 IDENTIFIER = _string(maximum=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@+/-]*$")
 FIELD_REF = _string(maximum=28, pattern=r"^fld_[A-Za-z0-9_-]{24}$")
 ARTIFACT_ID = _string(maximum=36, pattern=r"^doc_[0-9a-f]{32}$")
+WEB_ARTIFACT_ID = _string(maximum=36, pattern=r"^web_[0-9a-f]{32}$")
+ELEMENT_REF = _string(maximum=80, pattern=r"^el_[A-Za-z0-9_-]{16,64}$")
+BROWSER_STATE_REF = _object({
+    "schema_version": {"const": 1},
+    "browser_session_id": _string(maximum=80, pattern=r"^browser_[A-Za-z0-9_-]{16,64}$"),
+    "context_id": _string(maximum=80, pattern=r"^context_[A-Za-z0-9_-]{16,64}$"),
+    "context_epoch": _integer(1, 2_147_483_647),
+    "page_id": _string(maximum=80, pattern=r"^page_[A-Za-z0-9_-]{16,64}$"),
+    "page_generation": _integer(1, 2_147_483_647),
+    "navigation_id": _string(maximum=80, pattern=r"^nav_[A-Za-z0-9_-]{16,64}$"),
+    "document_epoch": _integer(0, 2_147_483_647),
+    "created_at": _number(0.0, 99_999_999_999.0),
+}, required=(
+    "schema_version", "browser_session_id", "context_id", "context_epoch",
+    "page_id", "page_generation", "navigation_id", "document_epoch",
+    "created_at",
+))
+WAIT_SPEC = _object({
+    "condition_type": _string(enum=(
+        "navigation_commit", "document_epoch_change", "url_change", "url_match",
+        "dom_selector_state", "element_state", "text_appearance",
+        "text_disappearance", "popup_creation", "dialog_appearance",
+        "dialog_closure", "download_start", "download_completion",
+        "network_quiet", "stable_content_fingerprint", "custom_postcondition",
+    ), maximum=64),
+    "expected": {},
+    "timeout_seconds": _number(0.05, 60.0),
+    "quiet_period_seconds": _number(0.05, 10.0),
+    "failure_policy": _string(enum=(
+        "confirmed_failure", "outcome_unknown_if_dispatched",
+    ), maximum=48),
+}, required=("condition_type",))
 TEXT = _string(minimum=0, maximum=16_000)
 LARGE_TEXT = _string(minimum=0, maximum=2_000_000)
 
@@ -365,6 +449,12 @@ def _spec(
     integration: EvidenceClassification = EvidenceClassification.METADATA_ONLY,
     real: RealValidationRequirement = RealValidationRequirement.NONE,
     verified: bool = False,
+    permission_category: str = "none",
+    postcondition_required: bool = False,
+    redaction_policy: str = "bounded_model_result",
+    chat_eligible: bool = True,
+    autonomous_eligible: bool = True,
+    scheduled_eligible: bool = True,
 ) -> ToolSpec:
     if retry is None:
         retry = (
@@ -392,6 +482,12 @@ def _spec(
         controlled_integration_status=integration,
         real_validation_requirement=real,
         verified_success=verified,
+        permission_category=permission_category,
+        postcondition_required=postcondition_required,
+        redaction_policy=redaction_policy,
+        chat_eligible=chat_eligible,
+        autonomous_eligible=autonomous_eligible,
+        scheduled_eligible=scheduled_eligible,
     )
 
 
@@ -681,6 +777,180 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
                        "expect_selector": _nullable(_string(maximum=4096))}), R, I, NC,
               preconditions=("managed_browser",), progress=state, real=read_real,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),
+        _spec("get_browser_state", "Read the authoritative opaque browser state",
+              _object(), R, I, NC, preconditions=("managed_browser",),
+              progress=state, real=read_real,
+              observability=ObservabilityPolicy.IDENTIFIERS_ONLY,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("navigate_browser", "Navigate from an optional authoritative browser state",
+              _object({"url": URL, "state_ref": _nullable(BROWSER_STATE_REF),
+                       "wait_spec": _nullable(WAIT_SPEC)}, required=("url",)),
+              RL, C, NC, preconditions=("managed_browser",), progress=effect,
+              real=RealValidationRequirement.USER_VISIBLE,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("inspect_browser_page", "Inspect bounded structured rendered page content",
+              _object({
+                  "state_ref": _nullable(BROWSER_STATE_REF),
+                  "mode": _string(enum=(
+                      "snapshot", "main_content", "article", "headings", "links",
+                      "metadata", "table", "list", "page_text_chunk",
+                  ), maximum=32),
+                  "target_ref": _nullable(ELEMENT_REF),
+                  "cursor": _nullable(ELEMENT_REF),
+                  "frame_ref": _nullable(ELEMENT_REF),
+                  "max_items": _integer(1, 100),
+              }), R, I, NC, preconditions=("managed_browser",), progress=state,
+              result=ResultPolicy.PRIVATE_MODEL_ONLY,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              real=read_real, redaction_policy="browser_private_bounded",
+              scheduled_eligible=False),
+        _spec("wait_for_browser_condition", "Wait for one bounded browser condition",
+              _object({"state_ref": BROWSER_STATE_REF, "wait_spec": WAIT_SPEC},
+                      required=("state_ref", "wait_spec")), R, I, NC,
+              preconditions=("fresh_browser_reference",), timeout=65.0,
+              progress=state, real=read_real,
+              observability=ObservabilityPolicy.IDENTIFIERS_ONLY,
+              postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("activate_browser_element", "Activate one opaque browser element exactly once",
+              _object({
+                  "state_ref": BROWSER_STATE_REF, "element_ref": ELEMENT_REF,
+                  "wait_spec": _nullable(WAIT_SPEC),
+                  "trusted_final_action": _nullable(_boolean()),
+                  "destination_origin": _nullable(_string(maximum=512)),
+                  "trusted_target_binding": _nullable(_string(maximum=64)),
+              }, required=("state_ref", "element_ref")), DY, D, FC,
+              preconditions=("fresh_browser_and_element_references",), timeout=65.0,
+              progress=effect, real=RealValidationRequirement.USER_VISIBLE,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("list_browser_tabs", "List authoritative managed-browser tabs",
+              _object({"state_ref": _nullable(BROWSER_STATE_REF)}), R, I, NC,
+              preconditions=("managed_browser",), progress=state, real=read_real,
+              observability=ObservabilityPolicy.IDENTIFIERS_ONLY,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("select_browser_tab", "Select one authoritative managed-browser tab",
+              _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
+              RL, I, NC, preconditions=("fresh_browser_reference",), progress=effect,
+              real=RealValidationRequirement.USER_VISIBLE,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("close_browser_tab", "Close one authoritative managed-browser tab",
+              _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
+              RL, I, NC, preconditions=("fresh_browser_reference",), progress=effect,
+              real=RealValidationRequirement.USER_VISIBLE,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("reload_browser_page", "Reload one authoritative browser page",
+              _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
+              RL, C, NC, preconditions=("fresh_browser_reference",), progress=effect,
+              real=RealValidationRequirement.USER_VISIBLE,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("browser_back", "Navigate backward from an authoritative browser state",
+              _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
+              RL, C, NC, preconditions=("fresh_browser_reference",), progress=effect,
+              real=RealValidationRequirement.USER_VISIBLE,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("browser_forward", "Navigate forward from an authoritative browser state",
+              _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
+              RL, C, NC, preconditions=("fresh_browser_reference",), progress=effect,
+              real=RealValidationRequirement.USER_VISIBLE,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("open_new_browser_tab", "Open and verify one new managed-browser tab",
+              _object({"url": URL, "state_ref": _nullable(BROWSER_STATE_REF)},
+                      required=("url",)), RL, N, NC,
+              preconditions=("managed_browser",), progress=effect,
+              real=RealValidationRequirement.USER_VISIBLE,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("return_to_browser_opener", "Return from a popup to its opener",
+              _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
+              RL, I, NC, preconditions=("popup_with_live_opener",), progress=effect,
+              real=RealValidationRequirement.USER_VISIBLE,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("search_web", "Execute the current step's structured search query and return opaque structured result references; inspecting existing links is not a search",
+              _object({"query": _string(minimum=1, maximum=300),
+                       "state_ref": _nullable(BROWSER_STATE_REF)}, required=("query",)),
+              RL, C, NC, preconditions=("configured_search_engine",), progress=effect,
+              real=RealValidationRequirement.CONTROLLED_READ_ONLY,
+              result=ResultPolicy.PRIVATE_MODEL_ONLY,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("open_search_result", "Open one opaque result_ref returned by search_web; use this instead of generic element activation for a structured search result",
+              _object({"state_ref": BROWSER_STATE_REF, "result_ref": ELEMENT_REF},
+                      required=("state_ref", "result_ref")), RL, N, NC,
+              preconditions=("fresh_search_result_reference",), progress=effect,
+              real=RealValidationRequirement.USER_VISIBLE,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("paginate_browser", "Activate one fresh opaque next-page control per bounded page and return the verified current page state",
+              _object({"state_ref": BROWSER_STATE_REF, "next_ref": ELEMENT_REF,
+                       "max_pages": _integer(1, 20)},
+                      required=("state_ref", "next_ref")), RL, N, NC,
+              preconditions=("fresh_pagination_reference",), timeout=450.0,
+              progress=effect, real=RealValidationRequirement.USER_VISIBLE,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("scroll_infinite", "Perform bounded infinite-scroll observations",
+              _object({"state_ref": BROWSER_STATE_REF, "max_steps": _integer(1, 20)},
+                      required=("state_ref",)), RL, C, NC,
+              preconditions=("fresh_browser_reference",), timeout=150.0,
+              progress=effect, real=RealValidationRequirement.USER_VISIBLE,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("list_browser_dialogs", "List pending browser dialogs without message content",
+              _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
+              R, I, NC, preconditions=("fresh_browser_reference",), progress=state,
+              real=read_real, observability=ObservabilityPolicy.IDENTIFIERS_ONLY,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("handle_browser_dialog", "Accept or dismiss one exact browser dialog",
+              _object({"state_ref": BROWSER_STATE_REF, "dialog_ref": ELEMENT_REF,
+                       "action": _string(enum=("accept", "dismiss"), maximum=16),
+                       "prompt_text": _nullable(_string(maximum=4_000))},
+                      required=("state_ref", "dialog_ref", "action")),
+              EM, N, NC, preconditions=("fresh_dialog_reference",), progress=effect,
+              real=RealValidationRequirement.USER_VISIBLE,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+        _spec("upload_browser_file", "Select one exact private file for one exact browser target",
+              _object({
+                  "state_ref": BROWSER_STATE_REF, "element_ref": ELEMENT_REF,
+                  "artifact_id": _nullable(WEB_ARTIFACT_ID),
+                  "local_path": _nullable(PATH),
+                  "prepared_upload_ref": _nullable(_string(maximum=80)),
+                  "destination_origin": _nullable(_string(maximum=512)),
+                  "file_size": _nullable(_integer(0, 512 * 1024 * 1024)),
+                  "detected_mime": _nullable(_string(maximum=160)),
+                  "operation_expires_at": _nullable(_number(0.0, 99_999_999_999.0)),
+              }, required=("state_ref", "element_ref"), oneOf=[
+                  {"required": ["artifact_id"], "properties": {"artifact_id": WEB_ARTIFACT_ID}},
+                  {"required": ["local_path"], "properties": {"local_path": PATH}},
+              ]), IE, N, CR, preconditions=(
+                  "fresh_browser_reference", "exact_file_identity", "exact_origin",
+                  "exact_upload_target", "unexpired_upload_operation",
+              ), timeout=90.0, progress=effect, real=local_real,
+              result=ResultPolicy.PRIVATE_MODEL_ONLY,
+              observability=ObservabilityPolicy.IDENTIFIERS_ONLY,
+              permission_category="send_publish_submit", postcondition_required=True,
+              redaction_policy="browser_upload_private", scheduled_eligible=False),
+        _spec("download_browser_file", "Download one exact target into a private opaque artifact",
+              _object({"state_ref": BROWSER_STATE_REF, "element_ref": ELEMENT_REF},
+                      required=("state_ref", "element_ref")), EM, N, NC,
+              preconditions=("fresh_browser_and_element_references",), timeout=180.0,
+              progress=ProgressEvidencePolicy.DOCUMENT_ARTIFACT, real=local_real,
+              result=ResultPolicy.PRIVATE_MODEL_ONLY,
+              observability=ObservabilityPolicy.IDENTIFIERS_ONLY,
+              permission_category="browser_account", postcondition_required=True,
+              redaction_policy="browser_download_private", scheduled_eligible=False),
         _spec("gmail_list_labels", "List Gmail labels", _object(), R, I, NC,
               preconditions=("gmail_read_connected",), progress=state, real=read_real,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),
@@ -736,7 +1006,51 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               preconditions=("gmail_modify_connected",), real=external_real, verified=True,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),
     ]
-    return tuple(specs)
+    browser_tools = {
+        "navigate", "click", "fill", "inspect_form_fields", "fill_form_field",
+        "read_page", "get_current_url", "scroll", "go_back", "go_forward",
+        "open_new_tab", "find_and_click", "wait_for_load", "get_page_text",
+        "scroll_down", "type_text", "press_key", "open_browser", "web_state",
+        "get_browser_state", "navigate_browser", "inspect_browser_page",
+        "wait_for_browser_condition", "activate_browser_element",
+        "list_browser_tabs", "select_browser_tab", "close_browser_tab",
+        "reload_browser_page", "browser_back", "browser_forward",
+        "open_new_browser_tab", "return_to_browser_opener", "search_web",
+        "open_search_result", "paginate_browser", "scroll_infinite",
+        "list_browser_dialogs", "handle_browser_dialog",
+        "upload_browser_file", "download_browser_file",
+    }
+    legacy_browser_tools = {
+        "navigate", "click", "fill", "read_page", "get_current_url",
+        "scroll", "go_back", "go_forward", "open_new_tab",
+        "find_and_click", "wait_for_load", "get_page_text", "scroll_down",
+        "type_text", "press_key", "open_browser", "web_state",
+    }
+    normalized = []
+    for spec in specs:
+        if spec.name not in browser_tools:
+            normalized.append(spec)
+            continue
+        normalized.append(replace(
+            spec,
+            permission_category=(
+                spec.permission_category
+                if spec.permission_category != "none"
+                else "browser_account"
+            ),
+            postcondition_required=(
+                spec.postcondition_required
+                or spec.side_effect != SideEffectClass.READ_ONLY
+            ),
+            redaction_policy=(
+                spec.redaction_policy
+                if spec.redaction_policy != "bounded_model_result"
+                else "browser_private_bounded"
+            ),
+            autonomous_eligible=(spec.name not in legacy_browser_tools),
+            scheduled_eligible=False,
+        ))
+    return tuple(normalized)
 
 
 STATIC_TOOL_SPECS = _build_static_specs()
@@ -992,6 +1306,8 @@ _FINAL_COMMIT_RE = re.compile(
 def is_final_browser_commit(tool_name: str, arguments: Mapping[str, Any]) -> bool:
     name = str(tool_name or "")
     values = arguments if isinstance(arguments, Mapping) else {}
+    if name == "activate_browser_element":
+        return values.get("trusted_final_action") is True
     if name in {"press_key", "desktop_press"}:
         return str(values.get("key") or "").strip().lower() in {"enter", "return"}
     field = {
@@ -1130,6 +1446,10 @@ def safe_confirmation_summary(
         return "Run one high-risk local command"
     if name == "gmail_send_draft":
         return "Send one existing Gmail draft"
+    if name == "upload_browser_file":
+        return "Select one exact private file for one exact site target"
+    if name == "activate_browser_element":
+        return "Commit one exact final browser action"
     if name.startswith("gmail_"):
         return "Change one Gmail item"
     if side_effect == SideEffectClass.IRREVERSIBLE_EXTERNAL:
@@ -1157,6 +1477,43 @@ def bounded_model_result(result: Any, *, limit: int = 64_000) -> Any:
     return text if len(text) <= limit else text[:limit] + "\n... [TRUNCATED]"
 
 
+def tool_is_eligible_in_current_surface(spec_or_name: ToolSpec | str) -> bool:
+    """Return whether one static tool belongs to the active execution surface."""
+
+    spec = (
+        spec_or_name
+        if isinstance(spec_or_name, ToolSpec)
+        else get_tool_spec(str(spec_or_name or ""))
+    )
+    if spec is None:
+        return False
+    surface = current_tool_surface()
+    if surface == "autonomous_web":
+        return bool(
+            spec.autonomous_eligible
+            and spec.name in AUTONOMOUS_WEB_TOOL_NAMES
+        )
+    if surface == "autonomous_web_verify":
+        return bool(
+            spec.autonomous_eligible
+            and spec.name in AUTONOMOUS_WEB_VERIFY_TOOL_NAMES
+        )
+    if surface == "autonomous":
+        return bool(spec.autonomous_eligible)
+    if surface == "scheduled":
+        return bool(spec.scheduled_eligible)
+    return bool(spec.chat_eligible)
+
+
+def effective_static_tool_specs() -> tuple[ToolSpec, ...]:
+    """Return the exact ordered static specs exposed in the current turn."""
+
+    return tuple(
+        spec for spec in get_static_registry().values()
+        if tool_is_eligible_in_current_surface(spec)
+    )
+
+
 def static_tool_prompt_block(lang: str = "en") -> str:
     """Render provider-facing native schemas from the authoritative registry."""
     fr = str(lang or "").lower().startswith("fr")
@@ -1169,7 +1526,7 @@ def static_tool_prompt_block(lang: str = "en") -> str:
             "Arguments must match these schemas exactly; unknown fields are rejected."
         ),
     ]
-    for spec in get_static_registry().values():
+    for spec in effective_static_tool_specs():
         schema = spec.input_schema
         props = schema.get("properties") if isinstance(schema, dict) else {}
         props = props if isinstance(props, dict) else {}
@@ -1278,6 +1635,12 @@ def matrix_rows(
             "fallback_barrier": "on_dispatch",
             "result_redaction_policy": ResultPolicy.PRIVATE_MODEL_ONLY.value,
             "observability_policy": ObservabilityPolicy.PRIVATE_METADATA_ONLY.value,
+            "permission_category": "connectors",
+            "postcondition_required": True,
+            "redaction_policy": "private_connector_metadata",
+            "chat_eligible": True,
+            "autonomous_eligible": True,
+            "scheduled_eligible": False,
             "supported_providers": list(ALL_TEXT_PROVIDERS),
             "deterministic_test_status": EvidenceClassification.METADATA_ONLY.value,
             "controlled_integration_status": EvidenceClassification.UNAVAILABLE_IN_ENVIRONMENT.value,
@@ -1310,6 +1673,12 @@ def _matrix_row(spec: ToolSpec, *, executable: bool) -> dict[str, Any]:
         "fallback_barrier": "on_dispatch" if spec.fallback_barrier_on_dispatch else "on_unknown_outcome",
         "result_redaction_policy": spec.result_policy.value,
         "observability_policy": spec.observability.value,
+        "permission_category": spec.permission_category,
+        "postcondition_required": spec.postcondition_required,
+        "redaction_policy": spec.redaction_policy,
+        "chat_eligible": spec.chat_eligible,
+        "autonomous_eligible": spec.autonomous_eligible,
+        "scheduled_eligible": spec.scheduled_eligible,
         "supported_providers": list(spec.providers),
         "deterministic_test_status": spec.deterministic_test_status.value,
         "controlled_integration_status": spec.controlled_integration_status.value,
@@ -1320,7 +1689,9 @@ def _matrix_row(spec: ToolSpec, *, executable: bool) -> dict[str, Any]:
 
 
 __all__ = [
-    "ALL_TEXT_PROVIDERS", "CONFIRMATION_LEDGER", "ConfirmationLedger",
+    "ALL_TEXT_PROVIDERS", "AUTONOMOUS_WEB_TOOL_NAMES",
+    "AUTONOMOUS_WEB_VERIFY_TOOL_NAMES", "CONFIRMATION_LEDGER",
+    "ConfirmationLedger",
     "ConfirmationPolicy", "EffectiveToolContract", "EvidenceClassification",
     "ExecutionOutcome", "IdempotencyClass", "ObservabilityPolicy",
     "ProgressEvidencePolicy", "RealValidationRequirement", "ResultPolicy",
@@ -1330,10 +1701,12 @@ __all__ = [
     "bind_static_registry", "bounded_model_result",
     "compatibility_tool_spec",
     "confirmed_call_scope", "current_call_is_confirmed", "dynamic_tool_specs",
-    "effective_contract", "get_static_registry", "get_tool_spec",
+    "current_tool_surface", "effective_contract", "effective_static_tool_specs",
+    "effective_tool_surface_scope", "get_static_registry", "get_tool_spec",
     "harden_input_schema", "is_final_browser_commit", "matrix_rows",
     "normalized_call_hash", "register_dynamic_tool",
     "replace_static_tool_prompt_section", "safe_confirmation_summary",
     "shell_command_is_proven_read_only", "static_tool_prompt_block",
+    "tool_is_eligible_in_current_surface",
     "unregister_dynamic_tools", "validate_arguments", "validation_error_text",
 ]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -20,6 +21,8 @@ from osia.runtime import (
     is_frozen,
     resource_path,
 )
+
+BROWSER_SMOKE_MODE = "--osia-browser-smoke"
 
 
 def _normalized_args(args: list[str] | None = None) -> list[str]:
@@ -156,6 +159,140 @@ def _package_smoke() -> int:
     return 0
 
 
+def _browser_smoke() -> int:
+    """Exercise the frozen browser subsystem against loopback only."""
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from osia.tools import browser
+    from osia.tools.browser_artifacts import (
+        BrowserArtifactStore,
+        set_browser_artifact_store_for_testing,
+    )
+
+    download_bytes = b"OSIA frozen browser smoke download\n"
+
+    class Handler(BaseHTTPRequestHandler):
+        def _download_headers(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(download_bytes)))
+            self.send_header(
+                "Content-Disposition", "attachment; filename=browser-smoke.txt",
+            )
+            self.end_headers()
+
+        def do_HEAD(self):  # noqa: N802 - stdlib handler API
+            if self.path == "/download":
+                self._download_headers()
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_GET(self):  # noqa: N802 - stdlib handler API
+            if self.path == "/download":
+                self._download_headers()
+                self.wfile.write(download_bytes)
+                return
+            body = (
+                b"<!doctype html><main><h1>OSIA browser smoke</h1>"
+                b'<a href="/download" download>Safe download</a></main>'
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    binary = browser._detect_chromium_browser()
+    if not binary:
+        print("ERROR: no compatible installed system browser was discovered")
+        return 2
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    original = (
+        browser.CDP_PORT,
+        browser.CDP_URL,
+        browser.OSIA_PROFILE_DIR,
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="osia-browser-smoke-") as temporary:
+            smoke_profile = str(Path(temporary) / "profile")
+            smoke_store = BrowserArtifactStore(Path(temporary) / "artifacts")
+            previous_store = set_browser_artifact_store_for_testing(smoke_store)
+            try:
+                browser.OSIA_PROFILE_DIR = smoke_profile
+                with socket.socket() as probe:
+                    probe.bind(("127.0.0.1", 0))
+                    browser.CDP_PORT = int(probe.getsockname()[1])
+                browser.CDP_URL = f"http://127.0.0.1:{browser.CDP_PORT}"
+                opened = browser._owner.call(
+                    "open_cdp_browser", binary,
+                    f"http://127.0.0.1:{server.server_port}/",
+                    timeout=45.0,
+                )
+                if not isinstance(opened, dict) or opened.get("ok") is not True:
+                    raise RuntimeError("browser did not produce a verified navigation")
+                state = (opened.get("data") or {}).get("state")
+                inspected = browser.inspect_browser_page(state)
+                inspected_data = inspected.get("data") or {}
+                headings = inspected_data.get("headings", [])
+                if not inspected.get("ok") or not any(
+                    item.get("text") == "OSIA browser smoke" for item in headings
+                ):
+                    raise RuntimeError("structured loopback inspection failed")
+                links = inspected_data.get("links") or []
+                download_link = next(
+                    (
+                        item for item in links
+                        if str(item.get("safe_destination") or "").endswith(
+                            "/download"
+                        )
+                    ),
+                    None,
+                )
+                if not isinstance(download_link, dict):
+                    raise RuntimeError("safe download reference missing")
+                downloaded = browser.download_browser_file(
+                    state, str(download_link.get("element_ref") or ""),
+                )
+                artifact = (downloaded.get("data") or {}).get("artifact") or {}
+                if downloaded.get("ok") is not True or not artifact.get("artifact_id"):
+                    raise RuntimeError("private browser download failed")
+                stored = smoke_store.inspect(str(artifact["artifact_id"]))
+                if not (
+                    stored.get("size") == len(download_bytes)
+                    and stored.get("sha256")
+                    == hashlib.sha256(download_bytes).hexdigest()
+                    and stored.get("private") is True
+                    and stored.get("executable") is False
+                    and stored.get("extractable") is False
+                ):
+                    raise RuntimeError("private browser artifact verification failed")
+            finally:
+                set_browser_artifact_store_for_testing(previous_store)
+                browser.close_browser()
+                leftovers = browser._processes_using_profile(smoke_profile)
+                if leftovers:
+                    browser._terminate_processes(leftovers)
+        print("OSIA frozen browser smoke OK")
+        return 0
+    except Exception as exc:
+        print(f"ERROR: frozen browser smoke failed: {type(exc).__name__}")
+        return 1
+    finally:
+        browser.close_browser()
+        browser.CDP_PORT, browser.CDP_URL, browser.OSIA_PROFILE_DIR = original
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
 def _acquire_gui_mutex():
     """Keep one desktop instance per Windows login session."""
     if sys.platform != "win32":
@@ -206,6 +343,8 @@ def main(args: list[str] | None = None) -> int:
         return 0 if remove_windows_services() else 1
     if mode == PACKAGE_SMOKE_MODE:
         return _package_smoke()
+    if mode == BROWSER_SMOKE_MODE:
+        return _browser_smoke()
     if mode == RELAUNCH_MODE:
         if len(argv) != 2:
             return 2
