@@ -130,6 +130,9 @@ def test_task_to_task_verifier_tail_propagation_and_terminal_cleanup(isolated):
     assert all(_TAIL_TEXT not in json.dumps(event) for event in events)
 
     assert runner._step(st) is False
+    # One later-step read plus one terminal consolidation query; neither
+    # reparses the source document.
+    assert agent.execution_reads == 2
     assert st["status"] == "done"
     assert st["artifacts"] == []
     assert not (store.root / artifact_id).exists()
@@ -182,7 +185,7 @@ def test_background_resume_salvages_then_completes_and_cleans(isolated):
     assert not runner._thread.is_alive()
     assert loaded["status"] == "done"
     assert agent.verifier_reads >= 2
-    assert agent.execution_reads == 1
+    assert agent.execution_reads == 2
     assert loaded["artifacts"] == []
     assert not (store.root / ref["artifact_id"]).exists()
 

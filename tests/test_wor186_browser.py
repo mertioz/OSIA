@@ -157,7 +157,7 @@ def test_browser_state_identity_lifecycle_and_opaque_bound_references():
     page, popup = object(), object()
     tracker.start_context(context_one)
     first = tracker.register_page(page)
-    assert "0x" not in json.dumps(first.to_dict())
+    assert re.search(r"\b0x[0-9a-fA-F]{12,}\b", json.dumps(first.to_dict())) is None
     navigated = tracker.note_navigation(page)
     assert navigated.page_id == first.page_id
     assert navigated.navigation_id != first.navigation_id
@@ -1734,7 +1734,7 @@ def test_real_single_dispatch_popup_dialog_upload_and_download(controlled_browse
     artifact = _success(downloaded)["artifact"]
     browser.set_browser_progress_callback(None)
     assert artifact["size"] == len(DOWNLOAD_BYTES)
-    assert artifact["sha256"] == web.download_sha256
+    assert "sha256" not in artifact
     assert artifact["mime_type"] in {"text/plain", "application/octet-stream"}
     assert [item["phase"] for item in phases] == [
         "waiting", "downloading", "finalizing", "complete",

@@ -9503,7 +9503,12 @@ class _AutonomousPanel(QWidget):
             self._authorize_btn.hide()
             self._revoke_btn.hide()
             self._scope_frame.hide()
-            self._set_status(i18n.t("autonomous.status_done"))
+            final_answer = payload.get("final_answer")
+            self._set_status(
+                final_answer[:8_000]
+                if isinstance(final_answer, str) and final_answer.strip()
+                else i18n.t("autonomous.status_done")
+            )
         elif event == "failed":
             self._set_running(False)
             self._authorize_btn.hide()

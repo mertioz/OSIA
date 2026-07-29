@@ -708,7 +708,7 @@ def test_release_gate_runs_before_smoke_and_after_installer_manifest():
     bundle_manifest = build.index("_write_bundle_file_manifest()", pyinstaller)
     payload_gate = build.index("_validate_release_payload(DIST)", bundle_manifest)
     secret_scan = build.index("_secret_scan(DIST)", payload_gate)
-    smoke = build.index('DIST / "OSIA.exe"), "--osia-package-smoke"', secret_scan)
+    smoke = build.index('_run_package_smoke(DIST / "OSIA.exe")', secret_scan)
     final_manifest = build.index('RELEASE / "release-manifest.json"', smoke)
     final_gate = build.index("_validate_release_payload(RELEASE)", final_manifest)
     assert pyinstaller < bundle_manifest < payload_gate < secret_scan < smoke

@@ -28,8 +28,8 @@ def test_static_registry_is_complete_unique_and_provider_prompt_derived():
         name: dispatcher for name, dispatcher in agent_module.TOOL_MAP.items()
         if not name.startswith("mcp__")
     }
-    assert len(executable) == 89
-    assert len(registry.names()) == 89
+    assert len(executable) == 90
+    assert len(registry.names()) == 90
     registry.assert_complete(executable)
     prompt = static_tool_prompt_block("en")
     for spec in registry.values():

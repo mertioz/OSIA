@@ -111,6 +111,7 @@ def _build_planning_prompt(
     max_tasks_per_phase: int,
     language: str | None = None,
     requirements=(),
+    document_sources=(),
 ) -> str:
     """Build the strict planning prompt for ``objective``.
 
@@ -136,6 +137,27 @@ def _build_planning_prompt(
             "drop an ID, and do not add unlabelled tasks.\n"
             f"{rows}\n"
         )
+    inventory = state.normalize_document_sources(list(document_sources))
+    document_rules = ""
+    if inventory:
+        rows = "\n".join(
+            "  - source_ref={source_ref} format={type_label} family="
+            "{document_family} state={state} warnings={warnings}".format_map({
+                **item,
+                "warnings": ",".join(item.get("warnings") or []) or "none",
+            })
+            for item in inventory
+        )
+        document_rules = (
+            "- The following documents are explicit inputs to this run. Retain "
+            "EVERY source_ref in at least one task, never substitute or invent a "
+            "source_ref, use read_document for each source and targeted "
+            "query_document operations on the resulting artifacts, and make the "
+            "success criteria verify the requested document result. Selecting a "
+            "source does not authorize reading it; execution remains subject to "
+            "the run authorization ceremony.\n"
+            f"ATTACHED DOCUMENT INVENTORY (safe metadata only):\n{rows}\n"
+        )
     return (
         language_instruction(language or i18n.DEFAULT_LANG) + "\n\n"
         "You are a planning module. Decompose the OBJECTIVE below into a short, "
@@ -153,6 +175,7 @@ def _build_planning_prompt(
         "confirmation number\", \"the command prints OK\"). It MUST be checkable "
         "by inspection — never \"the task is marked complete\".\n"
         f"{explicit_rules}"
+        f"{document_rules}"
         "- Write `name`, `objective` and `success_criterion` in the SAME "
         "LANGUAGE as the OBJECTIVE above.\n\n"
         "Return ONLY raw JSON — no prose, no explanation, no markdown code "
@@ -455,7 +478,8 @@ def plan_objective(objective: str, agent, *,
                    language: str | None = None,
                    run_id: str | None = None,
                    plan_revision: int = 1,
-                   requirements=None):
+                   requirements=None,
+                   document_sources=()):
     """Decompose ``objective`` into a validated, normalized ``phases`` list.
 
     ``agent`` is a ready :class:`osia.agent.OSIAAgent` (already model-set by the
@@ -516,8 +540,20 @@ def plan_objective(objective: str, agent, *,
     )
     prompt = _build_planning_prompt(
         objective, max_phases, max_tasks_per_phase, target_language,
-        explicit_requirements,
+        explicit_requirements, document_sources,
     )
+
+    inventory = state.normalize_document_sources(list(document_sources))
+
+    def retained(phases) -> bool:
+        if not inventory:
+            return True
+        expected = {item["source_ref"] for item in inventory}
+        found = set(re.findall(
+            r"src_[A-Za-z0-9_:-]+",
+            json.dumps(phases, ensure_ascii=False, sort_keys=True),
+        ))
+        return found == expected
 
     # First attempt: fresh context (reset clears history except the system
     # prompt). The agent is the caller's; reset() is part of its public contract.
@@ -530,7 +566,7 @@ def plan_objective(objective: str, agent, *,
         agent, prompt, max_phases, max_tasks_per_phase, turn_context,
         permission_context, requirement_ids,
     )
-    if outcome.phases is not None:
+    if outcome.phases is not None and retained(outcome.phases):
         return _apply_explicit_requirement_criteria(
             outcome.phases, explicit_requirements,
         )
@@ -546,14 +582,19 @@ def plan_objective(objective: str, agent, *,
         agent,
         language_instruction(target_language) + "\n\n" + _corrective_prompt(
             requirement_ids
-        ),
+        ) + ((
+            "\nPreserve exactly these document source_refs in the corrected "
+            "plan: " + ", ".join(
+                item["source_ref"] for item in inventory
+            )
+        ) if inventory else ""),
         max_phases,
         max_tasks_per_phase,
         turn_context,
         permission_context,
         requirement_ids,
     )
-    if outcome.phases is not None:
+    if outcome.phases is not None and retained(outcome.phases):
         return _apply_explicit_requirement_criteria(
             outcome.phases, explicit_requirements,
         )
@@ -568,7 +609,8 @@ def create_plan_state(objective: str, provider: str, model: str, agent, *,
                       language: str | None = None,
                       run_id: str | None = None,
                       origin_ref: str = "desktop",
-                      permission_policy=None):
+                      permission_policy=None,
+                      document_sources=()):
     """Plan ``objective`` and build a fresh (UNSAVED) ``task_state`` dict.
 
     Thin convenience over :func:`plan_objective` +
@@ -585,12 +627,16 @@ def create_plan_state(objective: str, provider: str, model: str, agent, *,
     phases = plan_objective(objective, agent, max_phases=max_phases,
                             max_tasks_per_phase=max_tasks_per_phase,
                             failure_cb=failure_cb, language=target_language,
-                            run_id=stable_run_id, plan_revision=1)
+                            run_id=stable_run_id, plan_revision=1,
+                            document_sources=document_sources)
     if phases is None:
         return None
     planned = state.new_task_state(
         objective, provider, model, phases, language=target_language,
         run_id=stable_run_id,
+    )
+    planned["document_sources"] = state.normalize_document_sources(
+        list(document_sources)
     )
     from osia.autonomous import authorization
 

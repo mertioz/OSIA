@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from osia import document_artifacts, document_reader
 from osia.autonomous import state
+from osia.document_sources import DocumentSourceStore, set_source_store_for_testing
 
 
 def _runtime_text(chars: int = 48) -> str:
@@ -171,8 +172,8 @@ def test_text_unicode_multipage_pdf_native_hash_and_complete_chunks(
     assert tail_probe in combined
     assert second["eof_marker"] == "END_OF_DOCUMENT"
     assert ref["content_length"] == len(combined)
-    assert len(ref["content_hash"]) == 64
-    assert repeated["content_hash"] == ref["content_hash"]
+    assert "content_hash" not in ref
+    assert repeated["artifact_id"] == ref["artifact_id"]
     assert repeated["content_length"] == ref["content_length"]
 
 
@@ -244,8 +245,8 @@ def test_native_extraction_never_calls_ocr(monkeypatch):
 
 @pytest.mark.parametrize(
     "payload,category",
-    [(b"", "malformed_document"), (b"not a document", "unsupported_format"),
-     (b"%PDF-1.4\nnot valid", "malformed_document")],
+    [(b"", "corrupted_document"),
+     (b"%PDF-1.4\nnot valid", "corrupted_document")],
 )
 def test_safe_input_errors(payload, category, tmp_path, private_store):
     source = tmp_path / "bad.bin"
@@ -472,7 +473,7 @@ def test_agent_registration_history_privacy_read_file_and_progress(tmp_path):
     assert agent.TOOL_MAP["read_document_artifact"] is agent.tool_read_document_artifact
     private = {"role": "assistant", "content": "secret", "_document_private": True}
     assert agent._sanitize_persisted_history_message(private) is None
-    ref = {"content_hash": "a" * 64}
+    ref = {"artifact_id": "doc_" + "a" * 32}
     first = agent._document_progress_fingerprint(ref)
     second = agent._document_progress_fingerprint(ref)
     assert first == second and len(first) == 64
@@ -486,16 +487,24 @@ def test_normal_agent_tool_pipeline_keeps_path_and_payload_out_of_logs(
     payload = _runtime_text()
     source = tmp_path / f"{_runtime_text()}.pdf"
     source.write_bytes(make_pdf([("text", payload)]))
-    with document_artifacts.artifact_access_scope("normal-chat"):
-        result, is_error = agent._execute_tool_with_retry(
-            "read_document", {"path": str(source)},
-        )
-        assert is_error is False
-        ref = json.loads(result)
-        chunk, chunk_error = agent._execute_tool_with_retry(
-            "read_document_artifact",
-            {"artifact_id": ref["artifact_id"], "offset": 0, "chunk_chars": 400},
-        )
+    source_store = DocumentSourceStore(tmp_path / "sources")
+    previous = set_source_store_for_testing(source_store)
+    try:
+        with document_artifacts.artifact_access_scope("normal-chat"):
+            capability = source_store.create_for_current_owner(
+                source, source_kind="test_attachment",
+            )
+            result, is_error = agent._execute_tool_with_retry(
+                "read_document", {"source_ref": capability["source_ref"]},
+            )
+            assert is_error is False
+            ref = json.loads(result)
+            chunk, chunk_error = agent._execute_tool_with_retry(
+                "read_document_artifact",
+                {"artifact_id": ref["artifact_id"], "offset": 0, "chunk_chars": 400},
+            )
+    finally:
+        set_source_store_for_testing(previous)
     assert chunk_error is False
     assert payload in json.loads(chunk)["content"]
     output = capsys.readouterr().out

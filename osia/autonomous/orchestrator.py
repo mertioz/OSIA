@@ -41,7 +41,8 @@ import threading
 from contextlib import contextmanager
 from typing import NamedTuple
 
-from osia import document_artifacts
+from osia import document_artifacts, document_sources
+from osia.document_progress import document_progress_scope
 from osia.autonomous import authorization, diagnostics, planner
 # Module-qualified on purpose (like planner.py) so the persistence/mutator layer
 # stays a single black box — and so a test can monkeypatch state.save_task_state.
@@ -55,6 +56,7 @@ DIGEST_MAX_CHARS = 2000       # hard char cap on the whole digest (FIFO-drop old
 DIGEST_MAX_LINES = 6          # K — keep at most this many digest lines
 SUMMARY_MAX_CHARS = 300       # per-task distilled summary cap (cheap string trim)
 ARTIFACT_CONTEXT_MAX_CHARS = 4096
+DOCUMENT_FINAL_MAX_CHARS = 8000
 
 # ── Verifier keyword heuristics (deterministic pre-check, layer 1) ───────────
 # Stems/words that mark a criterion as a *file-existence* claim. Stems (e.g.
@@ -115,9 +117,11 @@ class Orchestrator:
         thread-safe GUI bridge on top. Any exception it raises is swallowed.
     """
 
-    def __init__(self, agent, progress_cb=None, *, origin_ref="desktop"):
+    def __init__(self, agent, progress_cb=None, *, origin_ref="desktop",
+                 document_progress_cb=None):
         self.agent = agent
         self._progress_cb = progress_cb
+        self._document_progress_cb = document_progress_cb
         self._state = None
         self._stop = threading.Event()
         self._thread = None
@@ -174,6 +178,11 @@ class Orchestrator:
             origin_ref=origin_ref,
         ), execution_context_scope(execution_context), effective_tool_surface_scope(
             surface
+        ), document_progress_scope(
+            "autonomous",
+            str(st.get("run_id") or st.get("task_id") or "autonomous"),
+            revision=int(st.get("plan_revision", 0) or 0),
+            sink=self._document_progress_cb,
         ):
             if hasattr(self.agent, "set_turn_context"):
                 self.agent.set_turn_context(context)
@@ -209,12 +218,19 @@ class Orchestrator:
 
     def _agent_run_failure(self):
         """Read only the agent's allow-listed typed run diagnostic."""
-        if getattr(self.agent, "last_run_document_error", None) == (
-            "document_extraction_failure"
-        ):
+        document_error = str(
+            getattr(self.agent, "last_run_document_error", None) or ""
+        )
+        if document_error in {
+            "document_extraction_failure", "file_identity_mismatch",
+            "unsupported_format", "unsupported_legacy_format",
+            "encrypted_document", "drm_protected", "protected_document",
+            "corrupted_document", "active_content_detected",
+            "external_reference_detected", "resource_limit_exceeded",
+        }:
             return (
                 diagnostics.FailureCategory.TASK_EXECUTION_FAILURE,
-                "document_extraction_failure",
+                document_error,
             )
         raw = getattr(self.agent, "last_run_diagnostic", None)
         if not isinstance(raw, dict):
@@ -489,12 +505,63 @@ class Orchestrator:
                     **diagnostic,
                 })
                 return False
+            if (
+                state.normalize_document_sources(st.get("document_sources"))
+                and not self._document_sources_ready(st)
+            ):
+                st["status"] = "failed"
+                st["run_state"] = "failed"
+                diagnostic = self._record_failure(
+                    st,
+                    diagnostics.AutonomousStage.VERIFICATION,
+                    diagnostics.FailureCategory.VERIFICATION_NOT_COMPLETED,
+                    reason_code="verification_not_completed",
+                    resumable=False,
+                    checkpoint_present=True,
+                )
+                self._append_log(
+                    st, "failed", note="document_sources_incomplete",
+                )
+                self._safe_save(st)
+                self._emit({
+                    "event": "failed",
+                    "reason": "verification_not_completed",
+                    **diagnostic,
+                })
+                return False
+            final_answer = ""
+            if document_artifacts.normalize_references(st.get("artifacts")):
+                final_answer = self._consolidate_document_final(st)
+                if not final_answer:
+                    st["status"] = "failed"
+                    st["run_state"] = "failed"
+                    diagnostic = self._record_failure(
+                        st,
+                        diagnostics.AutonomousStage.TASK_EXECUTION,
+                        diagnostics.FailureCategory.TASK_EXECUTION_FAILURE,
+                        reason_code="task_execution_failure",
+                        resumable=False,
+                        checkpoint_present=True,
+                    )
+                    self._append_log(
+                        st, "failed", note="document_finalization_failure",
+                    )
+                    self._safe_save(st)
+                    self._emit({
+                        "event": "failed",
+                        "reason": "document_finalization_failure",
+                        **diagnostic,
+                    })
+                    return False
             st["status"] = "done"
             st["run_state"] = "completed"
             diagnostics.clear_current(st)
             self._append_log(st, "done", note="all phases complete")
             self._safe_save(st)
-            self._emit({"event": "done", "status": "done"})
+            payload = {"event": "done", "status": "done"}
+            if final_answer:
+                payload["final_answer"] = final_answer
+            self._emit(payload)
             return False
 
         phase = phases[p]
@@ -881,6 +948,35 @@ class Orchestrator:
         if changed:
             self._safe_save(st)
 
+    def _document_sources_ready(self, st: dict) -> bool:
+        """Require one valid retained artifact for every explicit run source."""
+
+        inventory = state.normalize_document_sources(st.get("document_sources"))
+        try:
+            linked = document_sources.get_source_store().linked_artifacts(
+                [item["source_ref"] for item in inventory],
+                run_owner_id=str(st.get("task_id") or ""),
+                run_id=str(st.get("run_id") or ""),
+                policy_epoch=int(st.get("policy_epoch", 0) or 0),
+            )
+            references = document_artifacts.normalize_references(
+                st.get("artifacts")
+            )
+            known = {item["artifact_id"] for item in references}
+            if len(linked) != len(inventory) or any(
+                artifact_id not in known for artifact_id in linked
+            ):
+                return False
+            with self._artifact_scope(st):
+                for artifact_id in linked:
+                    document_artifacts.get_store().inspect(artifact_id)
+            return True
+        except (
+            document_sources.DocumentSourceError,
+            document_artifacts.ArtifactStoreError,
+        ):
+            return False
+
     @staticmethod
     def _artifact_context(st, task=None) -> str:
         """Render bounded non-sensitive metadata for execution and verifier."""
@@ -890,16 +986,13 @@ class Orchestrator:
         references = document_artifacts.normalize_references(st.get("artifacts"))
         lines = []
         for ref in references:
-            confidence = ref.get("confidence")
-            confidence_text = (
-                "unknown" if confidence is None else f"{float(confidence):.4f}"
-            )
             lines.append(
-                f"{ref['artifact_id']} type={ref['document_type']} "
-                f"pages={ref['page_count']} "
-                f"methods={','.join(ref['page_methods'])} "
-                f"chars={ref['content_length']} "
-                f"sha256={ref['content_hash']} confidence={confidence_text}"
+                f"{ref['artifact_id']} type={ref.get('format_label', ref.get('document_type'))} "
+                f"family={ref.get('document_family', 'document')} "
+                f"pages={ref.get('page_count', 0)} sections={ref.get('section_count', 0)} "
+                f"tables={ref.get('table_count', 0)} sheets={ref.get('sheet_count', 0)} "
+                f"slides={ref.get('slide_count', 0)} chunks={ref.get('chunk_count', 0)} "
+                f"queries={','.join(ref.get('supported_queries') or [])}"
             )
         return "\n".join(lines)[:ARTIFACT_CONTEXT_MAX_CHARS]
 
@@ -933,6 +1026,62 @@ class Orchestrator:
         except document_artifacts.ArtifactStoreError as exc:
             return mapping.get(exc.category, "document_artifact_corrupted")
         return None
+
+    def _consolidate_document_final(self, st: dict) -> str:
+        """Produce one transient, bounded document answer at terminal time.
+
+        The answer is deliberately never written into the Autonomous
+        checkpoint.  It is emitted only on the canonical terminal event; the
+        retained document payload remains in the private artifact store.
+        """
+
+        references = document_artifacts.normalize_references(st.get("artifacts"))
+        if not references:
+            return ""
+        objective = state.sanitize_autonomous_text(
+            st.get("objective", ""),
+        )[:2_000]
+        criteria = [
+            state.sanitize_autonomous_text(item.get("criterion", ""))[:500]
+            for item in st.get("checklist") or []
+            if isinstance(item, dict) and item.get("criterion")
+        ][:25]
+        prompt = (
+            "Produce the single consolidated final answer for this completed "
+            "document task. Use query_document with targeted operations on the "
+            "opaque retained artifacts before answering; do not read sequentially "
+            "through the whole document and do not re-run extraction. Answer the "
+            "user's objective directly, report unsupported or uncertain facts "
+            "truthfully, and never reveal a local path, private filename, storage "
+            "key, or content hash. Return only the final answer text.\n\n"
+            f"OBJECTIVE:\n{objective}\n\n"
+            "VERIFIED CRITERIA:\n"
+            + "\n".join(f"- {criterion}" for criterion in criteria)
+            + "\n\nOPAQUE ARTIFACTS:\n"
+            + self._artifact_context(st)
+        )
+        try:
+            self.agent.reset()
+            with self._artifact_scope(st):
+                result = self._agent_run(prompt)
+        except Exception:
+            return ""
+        if not isinstance(result, str) or not result.strip():
+            return ""
+        if result.lstrip().startswith("ERROR:"):
+            return ""
+        activity = getattr(self.agent, "last_run_document_activity", None)
+        requires_targeted_activity = any(
+            int(reference.get("schema_version", 1) or 1) >= 2
+            for reference in references
+        )
+        if (
+            requires_targeted_activity and activity is not True
+        ) or (
+            not requires_targeted_activity and activity is False
+        ):
+            return ""
+        return state.sanitize_autonomous_text(result).strip()[:DOCUMENT_FINAL_MAX_CHARS]
 
     def _compose(self, task, digest) -> str:
         """Build the isolated subtask prompt: objective + success_criterion +
@@ -1035,12 +1184,29 @@ class Orchestrator:
                 "CONTEXT SO FAR (results of previous steps — for reference only):\n"
                 f"{digest}",
             ]
+        source_inventory = state.normalize_document_sources(
+            (self._state or {}).get("document_sources")
+        )
+        if source_inventory:
+            parts += [
+                "",
+                "EXPLICIT DOCUMENT INPUTS (opaque references and safe metadata "
+                "only):\n" + "\n".join(
+                    f"{item['source_ref']} type={item['type_label']} "
+                    f"family={item['document_family']} state={item['state']}"
+                    for item in source_inventory
+                ),
+                "Use read_document on every source_ref required by this step, "
+                "then use targeted query_document operations on the returned "
+                "artifact. Never substitute or omit a selected source.",
+            ]
         artifact_context = self._artifact_context(self._state, task)
         if artifact_context:
             parts += [
                 "",
                 "LOCAL DOCUMENT ARTIFACTS (opaque metadata only; use "
-                "read_document_artifact for bounded local chunks):\n"
+                "targeted query_document operations; read_document_artifact "
+                "is compatibility-only):\n"
                 f"{artifact_context}",
             ]
         parts += ["", "Carry out the step now, then stop."]
@@ -1323,7 +1489,8 @@ class Orchestrator:
         if artifact_context:
             prompt += (
                 "\n\nAvailable local document artifacts (opaque metadata; "
-                "read bounded content with read_document_artifact):\n"
+                "use targeted query_document operations; read_document_artifact "
+                "remains available for v1 compatibility):\n"
                 f"{artifact_context}"
             )
         try:
@@ -1459,8 +1626,21 @@ class Orchestrator:
         if artifact_context:
             remaining += (
                 "\n\nRETAINED LOCAL DOCUMENT ARTIFACTS (opaque metadata only; "
-                "use read_document_artifact if a later execution step needs "
+                "use targeted query_document operations if a later step needs "
                 f"content):\n{artifact_context}"
+            )
+        pending_sources = state.normalize_document_sources(
+            st.get("document_sources")
+        )
+        if pending_sources:
+            remaining += (
+                "\n\nEXPLICIT DOCUMENT INPUTS (retain every exact opaque "
+                "source_ref; never substitute):\n"
+                + "\n".join(
+                    f"{item['source_ref']} type={item['type_label']} "
+                    f"family={item['document_family']} state={item['state']}"
+                    for item in pending_sources
+                )
             )
         planning_failures = []
         pending_requirements = [
@@ -1479,6 +1659,8 @@ class Orchestrator:
                 planning_kwargs["language"] = st.get("language")
             if pending_requirements:
                 planning_kwargs["requirements"] = pending_requirements
+            if pending_sources:
+                planning_kwargs["document_sources"] = pending_sources
             with self._artifact_scope(st, self._active_task):
                 new_phases = planner.plan_objective(
                     remaining,

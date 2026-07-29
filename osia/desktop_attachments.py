@@ -351,6 +351,7 @@ def prepare_desktop_turn(
     *,
     provider: str,
     model: str,
+    owner_id: str | None = None,
 ) -> PreparedDesktopTurn:
     """Validate and prepare every item before any provider execution begins."""
 
@@ -362,51 +363,66 @@ def prepare_desktop_turn(
     for item in ordered:
         _validate_metadata(item)
 
-    images = [item for item in ordered if item.attachment_type == "image"]
-    files = [item for item in ordered if item.attachment_type == "file"]
-    _preflight_image_policy(images, provider, model)
-    _preflight_memory(images)
+    files = list(ordered)
+
+    document_capabilities = []
+    if files:
+        from osia.document_sources import DocumentSourceError, get_source_store
+
+        try:
+            for item in files:
+                if owner_id:
+                    capability = get_source_store().create(
+                        item.source_path,
+                        owner_id=owner_id,
+                        source_kind="desktop_attachment",
+                        display_name=item.display_name,
+                        declared_mime=item.detected_mime,
+                    )
+                else:
+                    capability = get_source_store().create_for_current_owner(
+                        item.source_path,
+                        source_kind="desktop_attachment",
+                        display_name=item.display_name,
+                        declared_mime=item.detected_mime,
+                    )
+                document_capabilities.append(capability)
+        except DocumentSourceError as exc:
+            raise DesktopAttachmentError(
+                exc.category,
+                attachment_id=item.draft_id,
+                display_name=item.display_name,
+            ) from exc
 
     manifest = "\n".join(
-        f"{position}. {item.display_name} ({item.attachment_type})"
+        f"{position}. attachment ({item.attachment_type})"
         for position, item in enumerate(ordered, start=1)
     )
     text_parts = [
         "[Attachments in original order:\n" + manifest + "\n]",
     ]
     if files:
-        file_paths = "\n".join(
-            f"{ordered.index(item) + 1}. {item.display_name}: {item.source_path}"
-            for item in files
+        source_lines = "\n".join(
+            f"{ordered.index(item) + 1}. source_ref={capability['source_ref']} "
+            f"type={capability['type_label']} state={capability['state']}"
+            + (f" category={capability['category']}" if capability.get("category") else "")
+            for item, capability in zip(files, document_capabilities)
         )
         text_parts.append(
-            "[Local files available through the type:file tool. Use each "
-            "entry's own path and never substitute another entry's path:\n"
-            + file_paths
+            "[Documents available through read_document using only each opaque "
+            "source_ref, followed by query_document. Never request or infer a "
+            "local path:\n"
+            + source_lines
             + "\n]"
         )
     clean_prompt = str(prompt or "").strip()
     if clean_prompt:
         text_parts.append(clean_prompt)
-    elif images and not files:
-        text_parts.append("Analyze the attached image or images.")
+    elif files:
+        text_parts.append("Analyze the attached document or documents.")
     provider_text = "\n\n".join(text_parts)
 
-    if images:
-        provider_content: str | list[dict] = [
-            {"type": "text", "text": provider_text},
-        ]
-        for item in images:
-            data = _read_image_snapshot(item)
-            encoded = base64.b64encode(data).decode("ascii")
-            provider_content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{item.detected_mime};base64,{encoded}",
-                },
-            })
-    else:
-        provider_content = provider_text
+    provider_content: str | list[dict] = provider_text
 
     display_lines = [clean_prompt] if clean_prompt else []
     display_lines.extend(f"📎 {item.display_name}" for item in ordered)

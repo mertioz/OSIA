@@ -211,13 +211,19 @@ def test_missing_and_changed_sources_reject_before_provider(tmp_path):
         ),
     ],
 )
-def test_provider_model_and_mime_rejections(tmp_path, provider, model, data, code):
+def test_provider_model_and_mime_do_not_bypass_opaque_source_ingestion(
+    tmp_path, provider, model, data, code,
+):
     item = stage_attachment(_write(tmp_path / "image.bin", data), 0)
-    with pytest.raises(DesktopAttachmentError, match=code):
-        prepare_desktop_turn("inspect", [item], provider=provider, model=model)
+    prepared = prepare_desktop_turn(
+        "inspect", [item], provider=provider, model=model,
+    )
+    assert isinstance(prepared.provider_content, str)
+    assert "source_ref=src_" in prepared.provider_content
+    assert "base64" not in prepared.provider_content
 
 
-def test_image_reaches_wor157_multimodal_block_once(tmp_path):
+def test_image_reaches_opaque_document_source_once(tmp_path):
     item = stage_attachment(_write(tmp_path / "image.png", PNG), 0)
     prepared = prepare_desktop_turn(
         "inspect",
@@ -225,25 +231,22 @@ def test_image_reaches_wor157_multimodal_block_once(tmp_path):
         provider="openai",
         model="gpt-5.5",
     )
-    assert isinstance(prepared.provider_content, list)
-    assert [part["type"] for part in prepared.provider_content] == [
-        "text", "image_url",
-    ]
-    assert prepared.provider_content[1]["image_url"]["url"].startswith(
-        "data:image/png;base64,"
-    )
+    assert isinstance(prepared.provider_content, str)
+    assert prepared.provider_content.count("source_ref=src_") == 1
+    assert "image_url" not in prepared.provider_content
     assert prepared.attachment_ids == (item.draft_id,)
 
 
-def test_generic_file_uses_existing_type_file_path_without_eager_read(tmp_path):
+def test_generic_file_uses_opaque_source_without_eager_provider_content(tmp_path):
     source = _write(tmp_path / "document.xyz", b"generic-data")
     item = stage_attachment(source, 0)
     prepared = prepare_desktop_turn(
         "summarize", [item], provider="anthropic", model="claude-opus-4-8",
     )
     assert isinstance(prepared.provider_content, str)
-    assert "type:file" in prepared.provider_content
-    assert str(source.resolve()) in prepared.provider_content
+    assert "type=txt" in prepared.provider_content
+    assert "source_ref=src_" in prepared.provider_content
+    assert str(source.resolve()) not in prepared.provider_content
     assert str(source.parent) not in prepared.display_text
     assert "document.xyz" in prepared.display_text
 
@@ -405,20 +408,20 @@ def test_sparse_file_over_20_mib_stages_with_bounded_selection_memory(tmp_path):
     assert peak < 2 * 1024 * 1024
 
 
-def test_provider_size_rejection_occurs_before_large_image_read(tmp_path):
+def test_large_image_is_staged_without_provider_eager_read(tmp_path):
     source = tmp_path / "large.png"
     with source.open("wb") as handle:
         handle.write(PNG)
         handle.truncate(16 * 1024 * 1024)
     item = stage_attachment(source, 0)
     with patch.object(Path, "read_bytes", side_effect=AssertionError("eager read")):
-        with pytest.raises(DesktopAttachmentError, match="provider_size_limit"):
-            prepare_desktop_turn(
-                "inspect",
-                [item],
-                provider="groq",
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-            )
+        prepared = prepare_desktop_turn(
+            "inspect",
+            [item],
+            provider="groq",
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+        )
+    assert "source_ref=src_" in prepared.provider_content
 
 
 def test_mobile_20_mib_policy_is_unchanged():
@@ -474,4 +477,4 @@ def test_no_pc_product_cap_or_raw_draft_serialization_contract():
     assert "MAX_ATTACHMENT_BYTES" not in module
     assert "read_bytes()" not in module
     assert "json.dump" not in module
-    assert "base64.b64encode" in module  # send-time provider preparation only
+    assert "base64.b64encode" not in module

@@ -339,6 +339,9 @@ IDENTIFIER = _string(maximum=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@+/-]*$")
 FIELD_REF = _string(maximum=28, pattern=r"^fld_[A-Za-z0-9_-]{24}$")
 ARTIFACT_ID = _string(maximum=36, pattern=r"^doc_[0-9a-f]{32}$")
 WEB_ARTIFACT_ID = _string(maximum=36, pattern=r"^web_[0-9a-f]{32}$")
+DOCUMENT_SOURCE_REF = _string(
+    maximum=36, pattern=r"^(?:src|doc|web)_[0-9a-f]{32}$",
+)
 ELEMENT_REF = _string(maximum=80, pattern=r"^el_[A-Za-z0-9_-]{16,64}$")
 BROWSER_STATE_REF = _object({
     "schema_version": {"const": 1},
@@ -590,23 +593,58 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
         _spec("read_file", "Read bounded local text", _object({"path": PATH}, required=("path",)),
               R, I, NC, preconditions=("readable_file",), progress=state, real=read_real,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),
-        _spec("read_document", "Extract a bounded local document to a private artifact",
-              _object({"path": PATH, "language": _nullable(_string(maximum=24)),
+        _spec("read_document", "Parse an opaque document source to a private structured artifact",
+              _object({"source_ref": DOCUMENT_SOURCE_REF, "language": _nullable(_string(maximum=24)),
                        "max_file_bytes": _nullable(_integer(1, 20 * 1024 * 1024)),
                        "max_pages": _nullable(_integer(1, 100)),
                        "max_pixels": _nullable(_integer(1, 16_000_000)),
                        "max_chars": _nullable(_integer(1, 2_000_000)),
-                       "timeout_seconds": _nullable(_number(1.0, 25.0))}, required=("path",)),
-              PL, N, NC, preconditions=("supported_pdf_png_or_jpeg",), timeout=40.0,
+                       "timeout_seconds": _nullable(_number(1.0, 25.0))}, required=("source_ref",)),
+              PL, C, NC, preconditions=("authorized_opaque_document_source",), timeout=40.0,
               result=ResultPolicy.PRIVATE_MODEL_ONLY,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
-              progress=ProgressEvidencePolicy.DOCUMENT_ARTIFACT, real=read_real, verified=True),
+              progress=ProgressEvidencePolicy.DOCUMENT_ARTIFACT, real=read_real,
+              verified=True, redaction_policy="document_private_bounded",
+              scheduled_eligible=False),
         _spec("read_document_artifact", "Read one bounded private artifact chunk",
               _object({"artifact_id": ARTIFACT_ID, "offset": _integer(0, 2_000_000),
                        "chunk_chars": _nullable(_integer(1, 8_000))}, required=("artifact_id",)),
               R, I, NC, preconditions=("authorized_live_artifact",),
               result=ResultPolicy.PRIVATE_MODEL_ONLY,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY, real=read_real),
+        _spec("query_document", "Query one private structured document by opaque references",
+              _object({
+                  "document_id": ARTIFACT_ID,
+                  "operation": _string(enum=(
+                      "summary", "search", "chunks", "sections", "headings",
+                      "table", "sheets", "range", "formula", "slides",
+                      "notes", "embedded", "provenance",
+                  ), maximum=32),
+                  "query": _nullable(_string(maximum=1_000)),
+                  "cursor": _nullable(_string(maximum=64, pattern=r"^cursor_[a-z]+_[0-9a-f]{8}$")),
+                  "max_items": _integer(1, 100),
+                  "max_chars": _integer(1, 8_000),
+                  "section_id": _nullable(_string(maximum=32, pattern=r"^section_[0-9]{6}$")),
+                  "table_id": _nullable(_string(maximum=32, pattern=r"^table_[0-9]{6}$")),
+                  "sheet_id": _nullable(_string(maximum=32, pattern=r"^sheet_[0-9]{6}$")),
+                  "cell_range_ref": _nullable(_string(maximum=32, pattern=r"^\$?[A-Za-z]{1,3}\$?[1-9][0-9]{0,6}(?::\$?[A-Za-z]{1,3}\$?[1-9][0-9]{0,6})?$")),
+                  "slide_id": _nullable(_string(maximum=32, pattern=r"^slide_[0-9]{6}$")),
+                  "embedded_artifact_id": _nullable(_string(maximum=40, pattern=r"^embedded_[0-9]{6}$")),
+              }, required=("document_id", "operation"), allOf=[
+                  {
+                      "if": {"properties": {"operation": {"const": "search"}}, "required": ["operation"]},
+                      "then": {"required": ["query"]},
+                  },
+                  {
+                      "if": {"properties": {"operation": {"const": "range"}}, "required": ["operation"]},
+                      "then": {"required": ["sheet_id", "cell_range_ref"]},
+                  },
+              ]),
+              R, I, NC, preconditions=("authorized_live_artifact",), timeout=30.0,
+              result=ResultPolicy.PRIVATE_MODEL_ONLY,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              progress=state, real=read_real,
+              redaction_policy="document_private_bounded"),
         _spec("write_file", "Write bounded local text", _object({"path": PATH, "content": LARGE_TEXT},
               required=("path", "content")), PL, C, NC, progress=effect, real=local_real, verified=True,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),

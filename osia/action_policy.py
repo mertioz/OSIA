@@ -2636,6 +2636,14 @@ def _request_scope(
         return normalize_exact_call_scope(
             call_hash, safe_category="safe_local_setting", grantable=True,
         ), False
+    if tool_name == "read_document" and re.fullmatch(
+        r"src_[0-9a-f]{32}", str(arguments.get("source_ref") or ""),
+    ):
+        # Autonomous document approval is bound to one exact opaque source and
+        # one exact read call.  It cannot authorize a path or another source.
+        return normalize_exact_call_scope(
+            call_hash, safe_category="document_source", grantable=True,
+        ), False
     if tool_name == "upload_browser_file":
         return normalize_exact_call_scope(
             call_hash, safe_category="browser_upload", grantable=True,

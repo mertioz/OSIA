@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,6 +88,27 @@ MODELS = {
 def _run(args: list[str], **kwargs) -> None:
     print("+", subprocess.list2cmdline(args), flush=True)
     subprocess.run(args, cwd=ROOT, check=True, **kwargs)
+
+
+def _run_package_smoke(executable: Path) -> None:
+    """Run the windowed executable with one sanitized temporary report."""
+
+    report = Path(tempfile.gettempdir()) / (
+        f"osia-package-smoke-result-{os.urandom(8).hex()}.txt"
+    )
+    environment = os.environ.copy()
+    environment["OSIA_PACKAGE_SMOKE_REPORT"] = str(report)
+    try:
+        _run([str(executable), "--osia-package-smoke"], env=environment)
+    except subprocess.CalledProcessError:
+        try:
+            diagnostic = report.read_text("utf-8").strip()
+        except OSError:
+            diagnostic = "status=failed\nstep=unknown\nerror_type=Unavailable"
+        print("Package smoke diagnostic:\n" + diagnostic, flush=True)
+        raise
+    finally:
+        report.unlink(missing_ok=True)
 
 
 def _iter_inno_source_lines(
@@ -672,7 +694,7 @@ def build(
     _write_bundle_file_manifest()
     _validate_release_payload(DIST)
     _secret_scan(DIST)
-    _run([str(DIST / "OSIA.exe"), "--osia-package-smoke"])
+    _run_package_smoke(DIST / "OSIA.exe")
     signed_app = _sign(DIST / "OSIA.exe")
     if skip_installer:
         if channel == "stable" and not signed_app:

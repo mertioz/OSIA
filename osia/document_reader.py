@@ -19,6 +19,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from osia import document_artifacts
+from osia.document_identity import (
+    DocumentIdentity,
+    DocumentIdentityError,
+    identify_document,
+)
+from osia.document_models import StructuredDocumentError, baseline_document
+from osia.document_progress import emit_document_progress
+from osia.document_sources import DocumentSourceError, get_source_store
 from osia.runtime import DOCUMENT_WORKER_MODE, is_frozen
 
 
@@ -29,6 +37,7 @@ MAX_IMAGE_PIXELS = 16_000_000
 MAX_OUTPUT_CHARS = document_artifacts.MAX_CONTENT_CHARS
 MAX_OUTPUT_BYTES = document_artifacts.MAX_PAYLOAD_BYTES
 DEFAULT_TIMEOUT_SECONDS = 25.0
+MAX_WORKER_MEMORY_BYTES = 512 * 1024 * 1024
 MIN_TIMEOUT_SECONDS = 1.0
 WORKER_JOB_RE = re.compile(r"^osia-document-job-[0-9a-f]{16}$")
 _SAFE_LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{2,8})?$")
@@ -65,13 +74,13 @@ def _bounded_int(value, default: int, ceiling: int, kind: str) -> int:
     if value is None:
         return default
     if isinstance(value, bool):
-        raise DocumentReadError("limit_exceeded", limit_kind=kind)
+        raise DocumentReadError("resource_limit_exceeded", limit_kind=kind)
     try:
         parsed = int(value)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise DocumentReadError("limit_exceeded", limit_kind=kind) from exc
+        raise DocumentReadError("resource_limit_exceeded", limit_kind=kind) from exc
     if parsed < 1:
-        raise DocumentReadError("limit_exceeded", limit_kind=kind)
+        raise DocumentReadError("resource_limit_exceeded", limit_kind=kind)
     return min(parsed, ceiling)
 
 
@@ -86,10 +95,10 @@ def resolve_limits(
             timeout = float(timeout_seconds)
         except (TypeError, ValueError, OverflowError) as exc:
             raise DocumentReadError(
-                "limit_exceeded", limit_kind="execution_time",
+                "resource_limit_exceeded", limit_kind="execution_time",
             ) from exc
         if not math.isfinite(timeout) or timeout < MIN_TIMEOUT_SECONDS:
-            raise DocumentReadError("limit_exceeded", limit_kind="execution_time")
+            raise DocumentReadError("resource_limit_exceeded", limit_kind="execution_time")
         timeout = min(timeout, DEFAULT_TIMEOUT_SECONDS)
     return SafeLimits(
         max_file_bytes=_bounded_int(
@@ -116,17 +125,13 @@ def _safe_language(value) -> str:
 
 
 def _document_type(data: bytes) -> str:
-    prefix = data[:1024]
-    if b"%PDF-" in prefix:
-        return "pdf"
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "png"
-    if data.startswith(b"\xff\xd8\xff"):
-        return "jpeg"
-    raise DocumentReadError("unsupported_format")
+    try:
+        return identify_document(data).format_label
+    except DocumentIdentityError as exc:
+        raise DocumentReadError(exc.category, limit_kind=exc.limit_kind) from exc
 
 
-def _read_snapshot(path: str | Path, limit: int) -> tuple[bytes, str]:
+def _read_snapshot_identity(path: str | Path, limit: int) -> tuple[bytes, DocumentIdentity]:
     candidate = Path(path).expanduser()
     try:
         source = candidate.resolve(strict=True)
@@ -135,9 +140,9 @@ def _read_snapshot(path: str | Path, limit: int) -> tuple[bytes, str]:
             if not stat.S_ISREG(before.st_mode):
                 raise DocumentReadError("unsupported_format")
             if before.st_size <= 0:
-                raise DocumentReadError("malformed_document")
+                raise DocumentReadError("corrupted_document")
             if before.st_size > limit:
-                raise DocumentReadError("limit_exceeded", limit_kind="file_size")
+                raise DocumentReadError("resource_limit_exceeded", limit_kind="file_size")
             data = handle.read(limit + 1)
             after = os.fstat(handle.fileno())
     except DocumentReadError:
@@ -145,10 +150,24 @@ def _read_snapshot(path: str | Path, limit: int) -> tuple[bytes, str]:
     except (OSError, RuntimeError) as exc:
         raise DocumentReadError("extraction_failure") from exc
     if len(data) > limit:
-        raise DocumentReadError("limit_exceeded", limit_kind="file_size")
-    if before.st_size != after.st_size or len(data) != before.st_size:
+        raise DocumentReadError("resource_limit_exceeded", limit_kind="file_size")
+    if (
+        before.st_size != after.st_size or len(data) != before.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or (before.st_ino and after.st_ino and before.st_ino != after.st_ino)
+        or (before.st_dev and after.st_dev and before.st_dev != after.st_dev)
+    ):
         raise DocumentReadError("extraction_failure")
-    return data, _document_type(data)
+    try:
+        identity = identify_document(data, display_name=source.name)
+    except DocumentIdentityError as exc:
+        raise DocumentReadError(exc.category, limit_kind=exc.limit_kind) from exc
+    return data, identity
+
+
+def _read_snapshot(path: str | Path, limit: int) -> tuple[bytes, str]:
+    data, identity = _read_snapshot_identity(path, limit)
+    return data, identity.format_label
 
 
 def _job_directory() -> Path:
@@ -181,7 +200,7 @@ def _bounded_read(path: Path, limit: int, *, limit_kind="output_size") -> bytes:
     except OSError as exc:
         raise DocumentReadError("extraction_failure") from exc
     if len(data) > limit:
-        raise DocumentReadError("limit_exceeded", limit_kind=limit_kind)
+        raise DocumentReadError("resource_limit_exceeded", limit_kind=limit_kind)
     return data
 
 
@@ -237,14 +256,40 @@ def _run_worker(data: bytes, document_type: str, language: str,
             stderr=subprocess.DEVNULL,
             close_fds=True,
         )
+        deadline = time.monotonic() + limits.timeout_seconds
+        memory_process = None
         try:
-            return_code = process.wait(timeout=limits.timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
-            if _stop_worker(process):
-                raise DocumentReadError(
-                    "limit_exceeded", limit_kind="execution_time",
-                ) from exc
-            raise DocumentReadError("extraction_failure") from exc
+            import psutil
+
+            memory_process = psutil.Process(process.pid)
+        except Exception:
+            pass
+        while process.poll() is None:
+            if time.monotonic() >= deadline:
+                if _stop_worker(process):
+                    raise DocumentReadError(
+                        "resource_limit_exceeded", limit_kind="execution_time",
+                    )
+                raise DocumentReadError("extraction_failure")
+            if memory_process is not None:
+                try:
+                    resident = int(memory_process.memory_info().rss)
+                    resident += sum(
+                        int(child.memory_info().rss)
+                        for child in memory_process.children(recursive=True)
+                    )
+                    if resident > MAX_WORKER_MEMORY_BYTES:
+                        if _stop_worker(process):
+                            raise DocumentReadError(
+                                "resource_limit_exceeded", limit_kind="worker_memory",
+                            )
+                        raise DocumentReadError("extraction_failure")
+                except DocumentReadError:
+                    raise
+                except Exception:
+                    memory_process = None
+            time.sleep(0.02)
+        return_code = int(process.returncode or 0)
         if return_code != 0:
             raise DocumentReadError("extraction_failure")
         try:
@@ -260,7 +305,11 @@ def _run_worker(data: bytes, document_type: str, language: str,
         if not isinstance(result, dict) or result.get("ok") is not True:
             category = str(result.get("category") or "extraction_failure")
             if category not in {
-                "unsupported_format", "encrypted_document", "malformed_document",
+                "file_identity_mismatch", "unsupported_format",
+                "unsupported_legacy_format", "encrypted_document",
+                "drm_protected", "protected_document", "corrupted_document",
+                "active_content_detected", "external_reference_detected",
+                "resource_limit_exceeded", "malformed_document",
                 "limit_exceeded", "ocr_unavailable", "ocr_failure",
                 "extraction_failure",
             }:
@@ -280,7 +329,7 @@ def _run_worker(data: bytes, document_type: str, language: str,
         except (OSError, UnicodeDecodeError) as exc:
             raise DocumentReadError("extraction_failure") from exc
         if len(content) > limits.max_chars:
-            raise DocumentReadError("limit_exceeded", limit_kind="output_size")
+            raise DocumentReadError("resource_limit_exceeded", limit_kind="output_size")
         if hashlib.sha256(payload).hexdigest() != result.get("content_hash"):
             raise DocumentReadError("extraction_failure")
         if len(content) != result.get("content_length"):
@@ -292,25 +341,38 @@ def _run_worker(data: bytes, document_type: str, language: str,
 
 def _error_result(error: DocumentReadError) -> dict:
     result = {"ok": False, "category": error.category}
-    if error.limit_kind in {
-        "file_size", "page_count", "image_pixels", "image_dimensions",
-        "output_size", "execution_time", "artifact_count",
-    }:
+    if error.limit_kind and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error.limit_kind):
         result["limit_kind"] = error.limit_kind
     return result
 
 
+def _document_policy_epoch() -> int:
+    from osia.action_policy import get_default_permission_policy
+
+    return int(
+        get_default_permission_policy().store.load_state().policy_epoch,
+    )
+
+
 def read_document(
-    path: str,
+    path: str | None = None,
     language: str | None = None,
     max_file_bytes=None,
     max_pages=None,
     max_pixels=None,
     max_chars=None,
     timeout_seconds=None,
+    source_ref: str | None = None,
 ) -> str:
-    """Extract one local PDF/PNG/JPEG into a private artifact."""
+    """Parse one opaque source (or legacy trusted path) into a v2 artifact."""
 
+    source_key = str(source_ref or "")
+    if not source_key and path:
+        source_key = "path:" + hashlib.sha256(
+            str(path).encode("utf-8", errors="replace"),
+        ).hexdigest()
+    document_type = "document"
+    emit_document_progress(source_key, "identifying")
     try:
         limits = resolve_limits(
             max_file_bytes=max_file_bytes,
@@ -320,29 +382,188 @@ def read_document(
             timeout_seconds=timeout_seconds,
         )
         language_value = _safe_language(language)
-        data, document_type = _read_snapshot(path, limits.max_file_bytes)
+        private_filename = ""
+        source_identity = ""
+        resolved_source_ref = ""
+        identity: DocumentIdentity
+        if source_ref:
+            ref = str(source_ref)
+            if ref.startswith("doc_"):
+                reference = document_artifacts.get_store().inspect(ref)
+                document_type = str(reference.get("format_label") or "document")
+                emit_document_progress(
+                    source_key, "inspecting", document_type=document_type,
+                )
+                emit_document_progress(
+                    source_key, "extracting", document_type=document_type,
+                )
+                emit_document_progress(
+                    source_key, "indexing", document_type=document_type,
+                )
+                document_artifacts.capture_reference(reference)
+                emit_document_progress(
+                    source_key, "ready", document_type=document_type,
+                )
+                return json.dumps(
+                    {"ok": True, **reference},
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                )
+            if ref.startswith("web_"):
+                from osia.tools.browser_artifacts import (
+                    BrowserArtifactError,
+                    get_browser_artifact_store,
+                )
+
+                try:
+                    source_identity = ref
+                    browser_store = get_browser_artifact_store()
+                    browser_metadata = browser_store.inspect(ref)
+                    browser_path = browser_store.resolve_private_path(ref)
+                    staged = get_source_store().create_for_current_owner(
+                        browser_path,
+                        source_kind="browser_download",
+                        declared_mime=str(browser_metadata.get("mime_type") or ""),
+                    )
+                    ref = staged["source_ref"]
+                except BrowserArtifactError as exc:
+                    raise DocumentReadError("source_unavailable") from exc
+            data, source_metadata = get_source_store().resolve(ref)
+            resolved_source_ref = ref
+            if len(data) > limits.max_file_bytes:
+                raise DocumentReadError("resource_limit_exceeded", limit_kind="file_size")
+            identity = DocumentIdentity(
+                str(source_metadata.get("format_label") or ""),
+                str(source_metadata.get("document_family") or ""),
+                tuple(source_metadata.get("warnings") or ()),
+            )
+            private_filename = str(source_metadata.get("private_filename") or "")
+            if not source_identity:
+                source_identity = ref
+        else:
+            if not path:
+                raise DocumentReadError("invalid_source_reference")
+            data, identity = _read_snapshot_identity(path, limits.max_file_bytes)
+            private_filename = Path(str(path)).name[:260]
+            canonical = str(Path(path).expanduser().resolve(strict=True))
+            source_identity = "path:" + hashlib.sha256(
+                canonical.encode("utf-8", errors="replace"),
+            ).hexdigest()
+        document_type = identity.format_label
+        emit_document_progress(
+            source_key, "inspecting", document_type=document_type,
+        )
+        policy_epoch = _document_policy_epoch()
+        cached_artifact = (
+            str(source_metadata.get("artifact_id") or "")
+            if source_ref and resolved_source_ref
+            else ""
+        )
+        if (
+            cached_artifact
+            and source_metadata.get("artifact_policy_epoch") == policy_epoch
+        ):
+            try:
+                reference = document_artifacts.get_store().inspect(cached_artifact)
+                emit_document_progress(
+                    source_key, "extracting", document_type=document_type,
+                )
+                emit_document_progress(
+                    source_key, "indexing", document_type=document_type,
+                )
+                document_artifacts.capture_reference(reference)
+                emit_document_progress(
+                    source_key, "ready", document_type=document_type,
+                )
+                return json.dumps(
+                    {"ok": True, **reference},
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                )
+            except document_artifacts.ArtifactStoreError:
+                # A missing/expired link is not authority and may be rebuilt.
+                pass
+        emit_document_progress(
+            source_key, "extracting", document_type=document_type,
+        )
         content, metadata = _run_worker(
             data, document_type, language_value, limits,
         )
-        reference = document_artifacts.get_store().create(content, metadata)
+        if metadata.get("structured_document") is True:
+            try:
+                document = json.loads(content)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise DocumentReadError("extraction_failure") from exc
+            if not isinstance(document, dict) or document.get("format_label") != document_type:
+                raise DocumentReadError("extraction_failure")
+            document["warnings"] = sorted(set(
+                list(document.get("warnings") or []) + list(identity.warnings)
+            ))
+        else:
+            metadata["warnings"] = sorted(set(
+                list(metadata.get("warnings") or []) + list(identity.warnings)
+            ))
+            document = baseline_document(content, metadata)
+        emit_document_progress(
+            source_key, "indexing", document_type=document_type,
+        )
+        reference = document_artifacts.get_store().create_v2(document, {
+            "source_hash": hashlib.sha256(data).hexdigest(),
+            "source_identity": source_identity,
+            "private_filename": private_filename,
+            "parser_version": "wor187_v2",
+            "dependency_versions": {
+                "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            },
+            "limits": limits.as_dict(),
+            "policy_epoch": policy_epoch,
+        })
+        if resolved_source_ref:
+            get_source_store().link_artifact(
+                resolved_source_ref,
+                reference["artifact_id"],
+                policy_epoch=policy_epoch,
+            )
         document_artifacts.capture_reference(reference)
+        emit_document_progress(
+            source_key, "ready", document_type=document_type,
+        )
         return json.dumps(
             {"ok": True, **reference},
             ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         )
+    except (DocumentIdentityError, DocumentSourceError, StructuredDocumentError) as exc:
+        emit_document_progress(
+            source_key, "failed", document_type=document_type,
+            failure_category=exc.category,
+        )
+        error = DocumentReadError(exc.category, limit_kind=getattr(exc, "limit_kind", None))
+        return "ERROR: " + json.dumps(
+            _error_result(error), sort_keys=True, separators=(",", ":"),
+        )
     except DocumentReadError as exc:
+        emit_document_progress(
+            source_key, "failed", document_type=document_type,
+            failure_category=exc.category,
+        )
         return "ERROR: " + json.dumps(
             _error_result(exc), sort_keys=True, separators=(",", ":"),
         )
     except document_artifacts.ArtifactStoreError as exc:
         error = DocumentReadError(
-            exc.category,
+            "resource_limit_exceeded" if exc.category == "limit_exceeded" else exc.category,
             limit_kind="artifact_count" if exc.category == "limit_exceeded" else None,
+        )
+        emit_document_progress(
+            source_key, "failed", document_type=document_type,
+            failure_category=error.category,
         )
         return "ERROR: " + json.dumps(
             _error_result(error), sort_keys=True, separators=(",", ":"),
         )
     except Exception:
+        emit_document_progress(
+            source_key, "failed", document_type=document_type,
+            failure_category="extraction_failure",
+        )
         return 'ERROR: {"category":"extraction_failure","ok":false}'
 
 
@@ -371,6 +592,51 @@ def read_document_artifact(
         return 'ERROR: {"category":"corrupted_artifact","ok":false}'
 
 
+def query_document(
+    document_id: str,
+    operation: str,
+    query: str | None = None,
+    cursor: str | None = None,
+    max_items: int = 20,
+    max_chars: int = document_artifacts.MAX_CHUNK_CHARS,
+    section_id: str | None = None,
+    table_id: str | None = None,
+    sheet_id: str | None = None,
+    cell_range_ref: str | None = None,
+    slide_id: str | None = None,
+    embedded_artifact_id: str | None = None,
+) -> str:
+    """Run one bounded, owner-authorized structured artifact query."""
+
+    try:
+        result = document_artifacts.get_store().query(
+            document_id,
+            operation,
+            query=query,
+            cursor=cursor,
+            max_items=max_items,
+            max_chars=max_chars,
+            section_id=section_id,
+            table_id=table_id,
+            sheet_id=sheet_id,
+            cell_range_ref=cell_range_ref,
+            slide_id=slide_id,
+            embedded_artifact_id=embedded_artifact_id,
+        )
+        reference = document_artifacts.get_store().inspect(document_id)
+        document_artifacts.capture_reference(reference)
+        return json.dumps(
+            result, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+    except document_artifacts.ArtifactStoreError as exc:
+        return "ERROR: " + json.dumps(
+            {"ok": False, "category": exc.category},
+            sort_keys=True, separators=(",", ":"),
+        )
+    except Exception:
+        return 'ERROR: {"category":"corrupted_artifact","ok":false}'
+
+
 def _native_text_is_reliable(text: str) -> bool:
     clean = str(text or "").replace("\ufffd", "")
     visible = [char for char in clean if not char.isspace()]
@@ -381,11 +647,11 @@ def _native_text_is_reliable(text: str) -> bool:
 
 def _check_image_limits(width: int, height: int, limits: SafeLimits) -> None:
     if width <= 0 or height <= 0:
-        raise DocumentReadError("malformed_document")
+        raise DocumentReadError("corrupted_document")
     if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
-        raise DocumentReadError("limit_exceeded", limit_kind="image_dimensions")
+        raise DocumentReadError("resource_limit_exceeded", limit_kind="image_dimensions")
     if width * height > limits.max_pixels:
-        raise DocumentReadError("limit_exceeded", limit_kind="image_pixels")
+        raise DocumentReadError("resource_limit_exceeded", limit_kind="image_pixels")
 
 
 _OCR_ENGINE = None
@@ -446,7 +712,7 @@ def _bounded_content(pages: list[str], limits: SafeLimits) -> str:
     ).strip()
     encoded = content.encode("utf-8")
     if len(content) > limits.max_chars or len(encoded) > MAX_OUTPUT_BYTES:
-        raise DocumentReadError("limit_exceeded", limit_kind="output_size")
+        raise DocumentReadError("resource_limit_exceeded", limit_kind="output_size")
     return content
 
 
@@ -461,14 +727,14 @@ def _extract_image(data: bytes, document_type: str,
         with Image.open(io.BytesIO(data)) as image:
             expected = "PNG" if document_type == "png" else "JPEG"
             if image.format != expected:
-                raise DocumentReadError("malformed_document")
+                raise DocumentReadError("corrupted_document")
             _check_image_limits(image.width, image.height, limits)
             image.load()
             text, scores = _ocr_image(image)
     except DocumentReadError:
         raise
     except (OSError, UnidentifiedImageError) as exc:
-        raise DocumentReadError("malformed_document") from exc
+        raise DocumentReadError("corrupted_document") from exc
     content = _bounded_content([text], limits)
     return content, {
         "document_type": document_type,
@@ -499,16 +765,16 @@ def _extract_pdf(data: bytes, limits: SafeLimits) -> tuple[str, dict]:
     except Exception as exc:
         if _pdfium_password_error(exc):
             raise DocumentReadError("encrypted_document") from exc
-        raise DocumentReadError("malformed_document") from exc
+        raise DocumentReadError("corrupted_document") from exc
     pages: list[str] = []
     methods: list[str] = []
     scores: list[float] = []
     try:
         page_count = len(pdf)
         if page_count < 1:
-            raise DocumentReadError("malformed_document")
+            raise DocumentReadError("corrupted_document")
         if page_count > limits.max_pages:
-            raise DocumentReadError("limit_exceeded", limit_kind="page_count")
+            raise DocumentReadError("resource_limit_exceeded", limit_kind="page_count")
         for index in range(page_count):
             page = pdf[index]
             try:
@@ -558,14 +824,31 @@ def _worker_extract(request: dict, data: bytes) -> tuple[str, dict]:
         raise DocumentReadError("extraction_failure")
     document_type = _document_type(data)
     if document_type != request.get("document_type"):
-        raise DocumentReadError("malformed_document")
+        raise DocumentReadError("corrupted_document")
     raw_limits = request.get("limits") if isinstance(request.get("limits"), dict) else {}
     limits = resolve_limits(**raw_limits)
     if len(data) > limits.max_file_bytes:
-        raise DocumentReadError("limit_exceeded", limit_kind="file_size")
+        raise DocumentReadError("resource_limit_exceeded", limit_kind="file_size")
     if document_type == "pdf":
         return _extract_pdf(data, limits)
-    return _extract_image(data, document_type, limits)
+    if document_type in {"png", "jpeg"}:
+        return _extract_image(data, document_type, limits)
+    try:
+        from osia.document_extractors import extract_structured_document
+
+        document = extract_structured_document(data, document_type)
+        content = json.dumps(
+            document, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        if len(content) > limits.max_chars or len(content.encode("utf-8")) > MAX_OUTPUT_BYTES:
+            raise DocumentReadError("resource_limit_exceeded", limit_kind="output_size")
+        return content, {
+            "document_type": document_type,
+            "structured_document": True,
+            "warnings": list(document.get("warnings") or []),
+        }
+    except StructuredDocumentError as exc:
+        raise DocumentReadError(exc.category, limit_kind=exc.limit_kind) from exc
 
 
 def _worker_result(directory: Path, result: dict, content: str | None = None) -> None:
@@ -589,6 +872,16 @@ def worker_main(job_path: str) -> int:
 
     directory: Path | None = None
     try:
+        if os.name != "nt":
+            try:
+                import resource
+
+                resource.setrlimit(
+                    resource.RLIMIT_AS,
+                    (MAX_WORKER_MEMORY_BYTES, MAX_WORKER_MEMORY_BYTES),
+                )
+            except Exception:
+                pass
         root = Path(tempfile.gettempdir()).resolve(strict=True)
         directory = Path(job_path).resolve(strict=True)
         if directory.parent != root or not WORKER_JOB_RE.fullmatch(directory.name):
@@ -629,6 +922,8 @@ def verify_packaged_dependencies() -> bool:
 
     try:
         import pypdfium2  # noqa: F401
+        from osia.document_extractors import extract_structured_document  # noqa: F401
+        from osia.document_identity import identify_document  # noqa: F401
         _ocr_engine()
         return True
     except Exception:
@@ -646,6 +941,7 @@ __all__ = [
     "SafeLimits",
     "read_document",
     "read_document_artifact",
+    "query_document",
     "resolve_limits",
     "verify_packaged_dependencies",
     "worker_main",

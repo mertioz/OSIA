@@ -239,7 +239,6 @@ class BrowserArtifactStore:
             "schema_version": 1,
             "artifact_id": artifact_id,
             "size": size,
-            "sha256": digest,
             "mime_type": mime,
             "classification": classification,
             "created_at": created_at,
@@ -249,7 +248,17 @@ class BrowserArtifactStore:
             "executable": False,
             "extractable": False,
         }
-        stored = {**reference, "private_filename": safe_name}
+        stored = {
+            **reference,
+            "sha256": digest,
+            "private_filename": safe_name,
+        }
+        try:
+            from osia.document_artifacts import current_owner_hash
+
+            stored["owner_hash"] = current_owner_hash()
+        except Exception:
+            pass
         encoded = json.dumps(
             stored, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
         ).encode("utf-8")
@@ -308,6 +317,12 @@ class BrowserArtifactStore:
                 raise ValueError
             if not _HASH_RE.fullmatch(str(metadata.get("sha256") or "")):
                 raise ValueError
+            owner = metadata.get("owner_hash")
+            if owner is not None:
+                from osia.document_artifacts import current_owner_hash
+
+                if owner != current_owner_hash():
+                    raise BrowserArtifactError("artifact_unauthorized")
             if self._clock() >= float(metadata.get("expires_at", 0)):
                 raise BrowserArtifactError("artifact_expired")
             path = directory / "payload.bin"
@@ -323,7 +338,7 @@ class BrowserArtifactStore:
         path = self.resolve_private_path(artifact_id)
         metadata = json.loads((path.parent / "metadata.json").read_text("utf-8"))
         return {key: metadata[key] for key in (
-            "schema_version", "artifact_id", "size", "sha256", "mime_type",
+            "schema_version", "artifact_id", "size", "mime_type",
             "classification", "created_at", "expires_at", "provenance",
             "private", "executable", "extractable",
         )}

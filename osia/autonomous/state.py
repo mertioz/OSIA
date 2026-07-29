@@ -60,7 +60,7 @@ from datetime import datetime
 from pathlib import Path
 
 from osia.autonomous import diagnostics
-from osia import document_artifacts, i18n
+from osia import document_artifacts, document_sources, i18n
 from osia.turn_context import normalize_locale
 from osia.tools.browser_state import (
     BrowserReferenceError,
@@ -618,6 +618,49 @@ def _normalize_artifact_ids(values) -> list[str]:
     return clean
 
 
+def normalize_document_sources(values) -> list[dict]:
+    """Keep only opaque run inputs and bounded safe inventory metadata."""
+
+    clean = []
+    seen = set()
+    for item in values if isinstance(values, list) else ():
+        if not isinstance(item, dict):
+            continue
+        try:
+            source_ref = document_sources.valid_source_ref(item.get("source_ref"))
+        except document_sources.DocumentSourceError:
+            continue
+        if source_ref in seen:
+            continue
+        type_label = str(item.get("type_label") or "document").lower()
+        family = str(item.get("document_family") or "unknown").lower()
+        source_state = str(item.get("state") or "ready").lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9.+-]{0,31}", type_label):
+            type_label = "document"
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", family):
+            family = "unknown"
+        if source_state not in {"ready", "failed"}:
+            source_state = "failed"
+        warnings = []
+        for warning in item.get("warnings") or []:
+            candidate = str(warning or "")
+            if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", candidate):
+                warnings.append(candidate)
+            if len(warnings) >= 8:
+                break
+        clean.append({
+            "source_ref": source_ref,
+            "type_label": type_label,
+            "document_family": family,
+            "state": source_state,
+            "warnings": warnings,
+        })
+        seen.add(source_ref)
+        if len(clean) >= 10:
+            break
+    return clean
+
+
 def _normalize_phase(phase, *, private_filenames=()) -> dict:
     """Coerce a loose phase spec into the strict on-disk phase schema.
 
@@ -722,6 +765,7 @@ def new_task_state(objective: str, provider: str, model: str, phases, *,
         },
         "context_digest": "",
         "checklist": checklist,
+        "document_sources": [],
         "artifacts": [],
         "phases": [
             _normalize_phase(p, private_filenames=private_filenames)
@@ -1083,6 +1127,10 @@ def execution_state_is_valid(st) -> bool:
         return False
     if not isinstance(st.get("operation_records"), list):
         return False
+    if normalize_document_sources(st.get("document_sources")) != st.get(
+        "document_sources"
+    ):
+        return False
     normalized_browser = normalize_browser_checkpoint(st.get("browser_checkpoint"))
     if normalized_browser != st.get("browser_checkpoint"):
         return False
@@ -1174,6 +1222,9 @@ def _migrate_loaded_state(loaded: dict) -> dict:
     }
     for key, value in defaults.items():
         loaded.setdefault(key, value)
+    loaded["document_sources"] = normalize_document_sources(
+        loaded.get("document_sources")
+    )
     if not execution_state_is_valid(loaded):
         loaded["run_state"] = "authorization_pending"
         loaded["authorization_status"] = "corrupt"
@@ -1249,6 +1300,9 @@ def load_task_state() -> "dict | None":
         loaded["language"] = (
             normalize_locale(loaded.get("language")) or i18n.DEFAULT_LANG
         )
+        loaded["document_sources"] = normalize_document_sources(
+            loaded.get("document_sources")
+        )
         loaded["artifacts"] = document_artifacts.normalize_references(
             loaded.get("artifacts")
         )
@@ -1306,6 +1360,17 @@ def save_task_state(state: dict) -> None:
             "run_state"
         ) in {"completed", "cancelled"}:
             document_artifacts.cleanup_state_artifacts(state)
+            document_sources.get_source_store().release_bound_run(
+                [
+                    item["source_ref"]
+                    for item in normalize_document_sources(
+                        state.get("document_sources")
+                    )
+                ],
+                run_owner_id=str(state.get("task_id") or ""),
+                run_id=str(state.get("run_id") or ""),
+            )
+            state["document_sources"] = []
             _write_atomic(TASK_STATE_FILE, state)
 
 
@@ -1324,6 +1389,16 @@ def clear_task_state() -> bool:
             TASK_STATE_FILE.unlink()
             if existing is not None:
                 document_artifacts.cleanup_state_artifacts(existing)
+                document_sources.get_source_store().release_bound_run(
+                    [
+                        item["source_ref"]
+                        for item in normalize_document_sources(
+                            existing.get("document_sources")
+                        )
+                    ],
+                    run_owner_id=str(existing.get("task_id") or ""),
+                    run_id=str(existing.get("run_id") or ""),
+                )
             return True
         except OSError:
             return False

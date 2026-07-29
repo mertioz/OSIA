@@ -23,6 +23,38 @@ from osia.runtime import (
 )
 
 BROWSER_SMOKE_MODE = "--osia-browser-smoke"
+_PACKAGE_SMOKE_REPORT_ENV = "OSIA_PACKAGE_SMOKE_REPORT"
+
+
+def _write_package_smoke_report(
+    status: str, step: str, error_type: str = "",
+) -> None:
+    """Write one path/content-free diagnostic for the trusted build script."""
+
+    raw = os.environ.get(_PACKAGE_SMOKE_REPORT_ENV, "")
+    if not raw:
+        return
+    try:
+        target = Path(raw).resolve(strict=False)
+        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        name = target.name
+        prefix = "osia-package-smoke-result-"
+        suffix = ".txt"
+        token = name[len(prefix):-len(suffix)]
+        if (
+            target.parent != temp_root
+            or not name.startswith(prefix)
+            or not name.endswith(suffix)
+            or len(token) != 16
+            or any(char not in "0123456789abcdef" for char in token)
+        ):
+            return
+        target.write_text(
+            f"status={status}\nstep={step}\nerror_type={error_type}\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 def _normalized_args(args: list[str] | None = None) -> list[str]:
@@ -39,6 +71,7 @@ def _package_smoke() -> int:
     """Offline dependency/model probe used by build and install validation."""
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    step = "resources"
     from osia.utils.assets import ICON_PATH, LOGO_PATH, asset_path
     from osia.guide_content import LESSONS
 
@@ -57,9 +90,11 @@ def _package_smoke() -> int:
     )
     missing = [label for label, path in required if path is None or not os.path.exists(path)]
     if missing:
+        _write_package_smoke_report("failed", step, "MissingResource")
         print("ERROR: missing packaged resources: " + ", ".join(missing))
         return 1
     try:
+        step = "imports"
         import io
 
         import aiortc  # noqa: F401
@@ -84,15 +119,19 @@ def _package_smoke() -> int:
         from osia.release_notes import release_for_version
         from osia.updater import load_app_metadata
         from osia.document_reader import verify_packaged_dependencies
+        from osia.document_extractors.smoke import run_packaged_document_smoke
 
+        step = "metadata"
         metadata = load_app_metadata()
         if metadata.product != "OSIA" or metadata.platform != "windows":
             raise RuntimeError("embedded app metadata is invalid")
 
+        step = "playwright"
         node, cli = compute_driver_executable()
         if not os.path.isfile(node) or not os.path.isfile(cli):
             raise RuntimeError("Playwright driver is incomplete")
 
+        step = "qt"
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         qt_app = QApplication.instance() or QApplication([])
         if not qt_app.platformName():
@@ -100,10 +139,17 @@ def _package_smoke() -> int:
         if QPixmap(LOGO_PATH).isNull():
             raise RuntimeError("Qt could not load the packaged logo")
 
+        step = "release_notes"
         if release_for_version(metadata.version) is None:
             raise RuntimeError("embedded release notes are unavailable")
+        step = "pdf_ocr_dependencies"
         if not verify_packaged_dependencies():
             raise RuntimeError("local PDF/OCR dependencies are incomplete")
+        step = "structured_documents"
+        with tempfile.TemporaryDirectory(prefix="osia-document-smoke-") as temporary:
+            if not run_packaged_document_smoke(Path(temporary)):
+                raise RuntimeError("offline structured-document smoke failed")
+        step = "onboarding_state"
         with tempfile.TemporaryDirectory(prefix="osia-package-smoke-") as temporary:
             state_path = Path(temporary) / "onboarding.json"
             if not create_fresh_install_marker(state_path):
@@ -113,6 +159,7 @@ def _package_smoke() -> int:
             mark_onboarding_handled("completed", state_path)
             if onboarding_state(state_path).get("outcome") != "completed":
                 raise RuntimeError("onboarding completion did not persist")
+        step = "onboarding_ui"
         onboarding = OnboardingDialog(automatic=False)
         if (
             onboarding.ESSENTIAL_COUNT < 7
@@ -123,11 +170,13 @@ def _package_smoke() -> int:
         onboarding.deleteLater()
         qt_app.processEvents()
 
+        step = "uiautomation"
         if uiautomation.GetRootControl() is None:
             raise RuntimeError("Windows UI Automation did not initialize")
         if _DllClient.instance().dll is None:
             raise RuntimeError("uiautomation native bitmap client did not initialize")
 
+        step = "codex_runtime"
         codex_path = resource_path("runtimes", "codex", "bin", "codex.exe")
         codex_version = AppServerClient(
             runtime_executable=codex_path,
@@ -135,11 +184,13 @@ def _package_smoke() -> int:
         if not codex_version or "0.144.1" not in codex_version:
             raise RuntimeError("managed Codex runtime did not initialize")
 
+        step = "whisper_model"
         whisper_path = bundled_model_path("faster-whisper-small")
         WhisperModel(
             str(whisper_path), device="cpu", compute_type="int8", local_files_only=True,
         )
 
+        step = "tts"
         from osia.voice.tts import _get_kokoro_pipeline
 
         pipeline = _get_kokoro_pipeline("a")
@@ -147,14 +198,17 @@ def _package_smoke() -> int:
         if segment is None or segment[2] is None:
             raise RuntimeError("Kokoro produced no audio")
 
+        step = "mp3"
         output = io.BytesIO()
         container = av.open(output, mode="w", format="mp3")
         stream = container.add_stream("libmp3lame", rate=24000)
         stream.bit_rate = 128000
         container.close()
     except Exception as exc:
+        _write_package_smoke_report("failed", step, type(exc).__name__)
         print(f"ERROR: packaged runtime smoke failed: {type(exc).__name__}: {exc}")
         return 1
+    _write_package_smoke_report("ok", "complete")
     print(f"OSIA package smoke OK (frozen={is_frozen()})")
     return 0
 

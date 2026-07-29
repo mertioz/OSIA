@@ -301,6 +301,7 @@ class _BatchState:
     batch_id: str
     conversation_id: str
     request_id: str
+    attachment_purpose: str
     file_count: int
     aggregate_size: int
     created_at: float
@@ -422,7 +423,12 @@ class AttachmentBatchManager:
             raise AttachmentProtocolError("unsupported_protocol_version")
         if frame.get("source_device_role") != "mobile":
             raise AttachmentProtocolError("invalid_source_role")
+        attachment_purpose = str(frame.get("attachment_purpose") or "chat")
+        if attachment_purpose not in {"chat", "autonomous"}:
+            raise AttachmentProtocolError("invalid_attachment_purpose")
         conversation_id = str(frame.get("conversation_id") or "")
+        if attachment_purpose == "autonomous" and conversation_id:
+            raise AttachmentProtocolError("invalid_conversation_id")
         if conversation_id:
             _require_id(conversation_id, "invalid_conversation_id")
         request_id = _require_id(
@@ -544,11 +550,13 @@ class AttachmentBatchManager:
             "sequence": sequence,
             "file_count": file_count,
             "aggregate_size": aggregate_size,
+            "attachment_purpose": attachment_purpose,
         }
         self._batches[batch_id] = _BatchState(
             batch_id=batch_id,
             conversation_id=conversation_id,
             request_id=request_id,
+            attachment_purpose=attachment_purpose,
             file_count=file_count,
             aggregate_size=aggregate_size,
             created_at=created_at,
@@ -789,6 +797,7 @@ class AttachmentBatchManager:
             "file_count": batch.file_count,
             "aggregate_size": batch.aggregate_size,
             "attachments": attachments,
+            "attachment_purpose": batch.attachment_purpose,
         }
         batch.committed = True
         batch.commit_ack = ack
@@ -800,6 +809,9 @@ class AttachmentBatchManager:
         conversation_id: str,
         request_id: str,
     ) -> list[CommittedAttachment]:
+        batch = self._batches.get(str(batch_id or ""))
+        if batch is not None and batch.attachment_purpose != "chat":
+            raise AttachmentProtocolError("attachment_purpose_mismatch")
         batch = self.validate_turn_reference(
             batch_id,
             conversation_id,
@@ -823,6 +835,35 @@ class AttachmentBatchManager:
                 detected_mime=item.detected_mime,
             )
             for item in sorted(batch.files.values(), key=lambda value: value.logical_order)
+        ]
+
+    def consume_for_autonomous(
+        self,
+        batch_id: str,
+        request_id: str,
+    ) -> list[CommittedAttachment]:
+        """Consume one committed Autonomous batch without Chat binding."""
+
+        batch = self.validate_turn_reference(batch_id, "", request_id)
+        if batch.attachment_purpose != "autonomous":
+            raise AttachmentProtocolError("attachment_purpose_mismatch")
+        batch.consumed = True
+        batch.consumed_request_id = request_id
+        return [
+            CommittedAttachment(
+                attachment_id=item.internal_id,
+                file_id=item.file_id,
+                logical_order=item.logical_order,
+                display_name=item.display_name,
+                path=item.ready_path,
+                byte_size=item.bytes_written,
+                sha256=item.declared_sha256,
+                detected_category=item.detected_category,
+                detected_mime=item.detected_mime,
+            )
+            for item in sorted(
+                batch.files.values(), key=lambda value: value.logical_order,
+            )
         ]
 
     def validate_turn_reference(
@@ -938,6 +979,8 @@ def _build_image_content(prompt: str, images: list[tuple[str, str, bytes]]) -> l
 def build_local_attachment_input(
     prompt: str,
     path: str | Path,
+    *,
+    owner_id: str | None = None,
 ) -> tuple[str | list[dict], str]:
     """Capture one desktop attachment before its selected path can disappear."""
 
@@ -957,46 +1000,73 @@ def build_local_attachment_input(
     if len(data) != before.st_size:
         raise AttachmentProtocolError("file_size_mismatch")
 
-    mime = detect_image_mime(data)
-    if mime is None:
-        text = f"[File attached: {source}]"
-        if prompt.strip():
-            text = f"{text}\n\n{prompt.strip()}"
-        return text, display_name
+    from osia.document_sources import get_source_store
 
-    image_prompt = prompt.strip() or "Analyze the attached image."
-    return _build_image_content(
-        image_prompt,
-        [(display_name, mime, data)],
-    ), display_name
+    if owner_id:
+        capability = get_source_store().create(
+            source,
+            owner_id=owner_id,
+            source_kind="desktop_attachment",
+            display_name=display_name,
+        )
+    else:
+        capability = get_source_store().create_for_current_owner(
+            source,
+            source_kind="desktop_attachment",
+            display_name=display_name,
+        )
+    text = (
+        "[Document attachment available through structured tools: "
+        f"source_ref={capability['source_ref']} "
+        f"type={capability['type_label']} state={capability['state']}]"
+    )
+    if prompt.strip():
+        text = f"{text}\n\n{prompt.strip()}"
+    return text, display_name
 
 
 def build_agent_input(
     prompt: str,
     attachments: list[CommittedAttachment],
+    *,
+    owner_id: str | None = None,
 ) -> str | list[dict]:
-    """Use the established path-tool flow plus existing image vision parts."""
+    """Create opaque sources before provider input plus existing image parts."""
 
     ordered = sorted(attachments, key=lambda item: item.logical_order)
-    non_images = [item for item in ordered if item.detected_category != "image"]
-    images = [item for item in ordered if item.detected_category == "image"]
+    sources = list(ordered)
     text = prompt.strip()
-    if non_images:
+    if sources:
+        from osia.document_sources import get_source_store
+
+        capabilities = []
+        for item in sources:
+            if owner_id:
+                capability = get_source_store().create(
+                    item.path,
+                    owner_id=owner_id,
+                    source_kind="mobile_attachment",
+                    display_name=item.display_name,
+                    declared_mime=item.detected_mime,
+                )
+            else:
+                capability = get_source_store().create_for_current_owner(
+                    item.path,
+                    source_kind="mobile_attachment",
+                    display_name=item.display_name,
+                    declared_mime=item.detected_mime,
+                )
+            capabilities.append(capability)
         bullets = "\n".join(
-            f"{index}. {item.display_name}: {item.path}"
-            for index, item in enumerate(non_images, start=1)
+            f"{index}. source_ref={item['source_ref']} type={item['type_label']} "
+            f"state={item['state']}"
+            + (f" category={item['category']}" if item.get("category") else "")
+            for index, item in enumerate(capabilities, start=1)
         )
         text = (
-            "[Fichiers joints distincts disponibles localement, dans leur "
-            "ordre d'origine. Si la demande porte sur plusieurs fichiers, "
-            "utilise le chemin propre à chaque entrée ; ne réutilise jamais "
-            "le chemin d'une entrée pour une autre :\n"
+            "[Document attachments in original order. Use read_document with "
+            "each opaque source_ref, then query_document; never request or "
+            "infer a local path:\n"
             f"{bullets}\n]\n\n{text}"
         ).strip()
-    if not images:
-        return text
-    captured = [
-        (item.display_name, item.detected_mime, item.path.read_bytes())
-        for item in images
-    ]
-    return _build_image_content(text, captured)
+    return text

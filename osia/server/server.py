@@ -72,7 +72,7 @@ Protocol (JSON over WebSocket, port 8765):
                                        "models": [...], "current": "...", "current_provider": "...",
                                        "account": {...}}
     {"type": "chatgpt_account_state", "account": {...}}
-    {"type": "file_received",        "filename": "...", "path": "...", "success": true|false}
+    {"type": "file_received",        "filename": "...", "success": true|false}
     {"type": "config",               "config": {...}}                  # full config snapshot (settings incl. api_key_fallbacks, personality, skills)
     {"type": "cron_notification",    "id": "...", "task_id": "...", "title": "...",
                                      "status": "completed|failed", "conversation_id": "...", "created_at": "..."}  # in-app fallback for scheduled task completion
@@ -110,7 +110,7 @@ import psutil
 import soundfile as sf
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 
-from osia import conversations, i18n
+from osia import conversations, document_sources, i18n
 from osia.attachments import (
     ATTACHMENT_EVENT_TYPES,
     AttachmentBatchManager,
@@ -119,6 +119,7 @@ from osia.attachments import (
     cleanup_orphan_batches,
 )
 from osia.config import CONFIG_DIR as _CONFIG_DIR, regenerate_mobile_token
+from osia.document_progress import document_progress_scope
 from osia.version import current_product_version
 from osia.legacy_uploads import (
     LegacyUploadError,
@@ -652,6 +653,17 @@ _PERMISSION_REQUEST_FIELDS = {
 def _permission_safe_id(value) -> str:
     candidate = str(value or "")
     return candidate if _PERMISSION_ID_RE.fullmatch(candidate) else ""
+
+
+def _mobile_document_owner(device_id: str) -> str:
+    """Stable private owner identity for one authenticated mobile device."""
+
+    safe_device = _permission_safe_id(device_id)
+    if not safe_device:
+        return ""
+    return "mobile-document:" + hashlib.sha256(
+        f"{_PERMISSION_SERVER_ID}\0{safe_device}".encode("utf-8"),
+    ).hexdigest()
 
 
 def _purge_permission_requests(now: float) -> None:
@@ -3881,6 +3893,7 @@ _autonomous: dict = {
                       # stop()/release a newer run (R2) — see
                       # _on_autonomous_progress and _autonomous_resume_worker.
     "origin_ref": "",
+    "document_owner_device": "",
 }
 # Guards `_autonomous` lifecycle mutations + the lockfile across the event-loop
 # thread and the orchestrator/worker daemon threads. Non-reentrant — the helpers
@@ -3896,6 +3909,27 @@ _AUTONOMOUS_PROTOCOL_STATE = {
     "sequences": {},
     "terminals": {},
 }
+_DOCUMENT_PROTOCOL_LOCK = threading.Lock()
+_DOCUMENT_PROTOCOL_SESSION_ID = "document-session:" + secrets.token_urlsafe(24)
+_DOCUMENT_PROTOCOL_STATE = {"scopes": OrderedDict()}
+_DOCUMENT_PHASE_RANK = {
+    "identifying": 0,
+    "inspecting": 1,
+    "extracting": 2,
+    "indexing": 3,
+    "ready": 4,
+}
+_DOCUMENT_SAFE_FAILURES = frozenset({
+    "active_content_detected", "corrupted_document", "drm_protected",
+    "encrypted_document", "expired_source", "external_reference_detected",
+    "extraction_failure", "file_identity_mismatch", "invalid_source_reference",
+    "missing_source", "ocr_unavailable", "protected_document",
+    "resource_limit_exceeded", "source_changed", "source_unavailable",
+    "unauthorized_source", "unsupported_format", "unsupported_legacy_format",
+})
+_DOCUMENT_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_DOCUMENT_ITEM_RE = re.compile(r"^item_[0-9a-f]{24}$")
+_DOCUMENT_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,31}$")
 _BROWSER_PROTOCOL_SESSION_ID = "browser-session:" + secrets.token_urlsafe(24)
 _BROWSER_PROTOCOL_SEQUENCE = 0
 _AUTONOMOUS_SAFE_EVENTS = frozenset({
@@ -3907,6 +3941,180 @@ _AUTONOMOUS_SAFE_EVENTS = frozenset({
     "suspended_browser_state", "suspended_scope_extension",
     "task_done", "task_failed",
 })
+
+
+def _document_progress_frame(
+    payload: dict,
+    *,
+    owner_device: str = "",
+    snapshot: bool = False,
+) -> dict | None:
+    """Validate and project one value-free document phase transition."""
+
+    if not isinstance(payload, dict):
+        return None
+    scope_type = str(payload.get("scope_type") or "")
+    scope_id = str(payload.get("scope_id") or "")
+    item_id = str(payload.get("item_id") or "")
+    phase = str(payload.get("phase") or "")
+    if (
+        scope_type not in {"chat", "autonomous"}
+        or not _DOCUMENT_SAFE_ID_RE.fullmatch(scope_id)
+        or not _DOCUMENT_ITEM_RE.fullmatch(item_id)
+        or phase not in {*_DOCUMENT_PHASE_RANK, "failed"}
+    ):
+        return None
+    if scope_type == "autonomous":
+        with _AUTONOMOUS_PROTOCOL_LOCK:
+            if scope_id in _AUTONOMOUS_PROTOCOL_STATE["terminals"]:
+                return None
+    revision = payload.get("revision", 0)
+    if type(revision) is not int or revision < 0:
+        return None
+    document_type = str(payload.get("document_type") or "document").lower()
+    if not _DOCUMENT_TYPE_RE.fullmatch(document_type):
+        document_type = "document"
+    failure_category = ""
+    if phase == "failed":
+        candidate = str(payload.get("failure_category") or "")
+        failure_category = (
+            candidate if candidate in _DOCUMENT_SAFE_FAILURES
+            else "extraction_failure"
+        )
+    raw_counts = payload.get("counts")
+    counts = None
+    if isinstance(raw_counts, dict) and set(raw_counts) == {"completed", "total"}:
+        completed = raw_counts.get("completed")
+        total = raw_counts.get("total")
+        if (
+            type(completed) is int and type(total) is int
+            and 0 <= completed <= total <= 1_000_000
+        ):
+            counts = {"completed": completed, "total": total}
+
+    scope_key = (scope_type, scope_id)
+    with _DOCUMENT_PROTOCOL_LOCK:
+        scopes = _DOCUMENT_PROTOCOL_STATE["scopes"]
+        scope = scopes.get(scope_key)
+        if scope is None:
+            scope = {
+                "sequence": 0,
+                "revision": revision,
+                "owner_device": str(owner_device or "")[:128],
+                "terminal": False,
+                "items": OrderedDict(),
+            }
+            scopes[scope_key] = scope
+        if scope.get("terminal") or revision < int(scope.get("revision", 0)):
+            return None
+        if revision > int(scope.get("revision", 0)):
+            scope["revision"] = revision
+        item = scope["items"].get(item_id)
+        if item is not None:
+            if item.get("terminal"):
+                return None
+            prior_rank = int(item.get("rank", -1))
+            if phase != "failed" and _DOCUMENT_PHASE_RANK[phase] <= prior_rank:
+                return None
+        rank = (
+            int(item.get("rank", -1)) if item is not None else -1
+        ) if phase == "failed" else _DOCUMENT_PHASE_RANK[phase]
+        terminal = phase in {"ready", "failed"}
+        sequence = int(scope.get("sequence", 0)) + 1
+        scope["sequence"] = sequence
+        item_state = {
+            "item_id": item_id,
+            "document_type": document_type,
+            "phase": phase,
+            "terminal": terminal,
+            "failure_category": failure_category,
+            "counts": counts,
+            "rank": rank,
+            "sequence": sequence,
+        }
+        scope["items"][item_id] = item_state
+        scope["items"].move_to_end(item_id)
+        while len(scope["items"]) > 10:
+            scope["items"].popitem(last=False)
+        scopes.move_to_end(scope_key)
+        while len(scopes) > 256:
+            scopes.popitem(last=False)
+
+    return {
+        "type": "document_progress",
+        "schema_version": 1,
+        "event_id": "document-event:" + secrets.token_urlsafe(24),
+        "server_id": _PERMISSION_SERVER_ID,
+        "session_id": _DOCUMENT_PROTOCOL_SESSION_ID,
+        "scope_type": scope_type,
+        "scope_id": scope_id,
+        "plan_revision": revision,
+        "sequence": sequence,
+        "item_id": item_id,
+        "document_type": document_type,
+        "phase": phase,
+        "terminal": terminal,
+        "failure_category": failure_category,
+        "counts": counts,
+        "snapshot": bool(snapshot),
+    }
+
+
+def _document_progress_snapshot(
+    scope_type: str,
+    scope_id: str,
+    *,
+    owner_device: str = "",
+) -> list[dict]:
+    """Return latest safe item states for one authenticated scope."""
+
+    scope_key = (str(scope_type or ""), str(scope_id or ""))
+    frames = []
+    with _DOCUMENT_PROTOCOL_LOCK:
+        scope = _DOCUMENT_PROTOCOL_STATE["scopes"].get(scope_key)
+        if scope is None:
+            return []
+        stored_owner = str(scope.get("owner_device") or "")
+        if stored_owner and stored_owner != str(owner_device or ""):
+            return []
+        for item in scope.get("items", {}).values():
+            scope["sequence"] = int(scope.get("sequence", 0)) + 1
+            item["sequence"] = int(scope["sequence"])
+            frames.append({
+                "type": "document_progress",
+                "schema_version": 1,
+                "event_id": "document-event:" + secrets.token_urlsafe(24),
+                "server_id": _PERMISSION_SERVER_ID,
+                "session_id": _DOCUMENT_PROTOCOL_SESSION_ID,
+                "scope_type": scope_key[0],
+                "scope_id": scope_key[1],
+                "plan_revision": int(scope.get("revision", 0)),
+                "sequence": int(scope["sequence"]),
+                "item_id": item["item_id"],
+                "document_type": item["document_type"],
+                "phase": item["phase"],
+                "terminal": bool(item["terminal"]),
+                "failure_category": item["failure_category"],
+                "counts": item["counts"],
+                "snapshot": True,
+            })
+    return frames
+
+
+def _retire_document_scope(scope_type: str, scope_id: str) -> None:
+    with _DOCUMENT_PROTOCOL_LOCK:
+        scope = _DOCUMENT_PROTOCOL_STATE["scopes"].get((scope_type, scope_id))
+        if scope is not None:
+            scope["terminal"] = True
+
+
+def _on_autonomous_document_progress(payload: dict) -> None:
+    frame = _document_progress_frame(
+        payload,
+        owner_device=str(_autonomous.get("document_owner_device") or ""),
+    )
+    if frame is not None:
+        _broadcast_autonomous(frame)
 
 
 def _autonomous_snapshot(st) -> dict:
@@ -3931,6 +4139,7 @@ def _autonomous_snapshot(st) -> dict:
             safe_site = safe_origin(candidate)[:512]
             break
     pending = browser_checkpoint.get("pending_operation") or {}
+    run_id = str(st.get("run_id") or "")
     return {
         "tasks_done": done,
         "tasks_total": total,
@@ -3966,6 +4175,11 @@ def _autonomous_snapshot(st) -> dict:
             )[:64],
             "artifact_summary": browser_checkpoint.get("last_artifact_summary"),
         },
+        "document_progress": _document_progress_snapshot(
+            "autonomous",
+            run_id,
+            owner_device=str(_autonomous.get("document_owner_device") or ""),
+        ),
         **_aauthorization.mobile_projection(st),
         **_adiagnostics.projection(st),
     }
@@ -4085,6 +4299,16 @@ def _autonomous_frame(payload: dict, st=_AUTO_UNSET) -> dict:
         "terminal": terminal,
         **snapshot,
     }
+    final_answer = payload.get("final_answer")
+    if (
+        event == "done"
+        and terminal
+        and isinstance(final_answer, str)
+        and final_answer.strip()
+    ):
+        frame["final_answer"] = _astate.sanitize_autonomous_text(
+            final_answer,
+        ).strip()[:8_000]
     if terminal and terminal_state:
         with _AUTONOMOUS_PROTOCOL_LOCK:
             _AUTONOMOUS_PROTOCOL_STATE["terminals"][run_id] = dict(frame)
@@ -4368,6 +4592,9 @@ def _on_autonomous_progress(payload: dict) -> None:
                       "drain/resume decides the real state from disk")
                 return
             frame = _autonomous_frame(dict(payload), _autonomous.get("st"))
+            _retire_document_scope(
+                "autonomous", str(frame.get("run_id") or ""),
+            )
             _broadcast_autonomous(frame)
             # Capture the generation NOW (terminal-observation time) so the
             # release/stop can be gated to it — a superseded orphan's late
@@ -4397,14 +4624,24 @@ def _ensure_autonomous_engine():
             agent = OSIAAgent()
             _autonomous["agent"] = agent
             _autonomous["orch"] = _Orchestrator(
-                agent, progress_cb=_on_autonomous_progress
+                agent,
+                progress_cb=_on_autonomous_progress,
+                document_progress_cb=_on_autonomous_document_progress,
             )
         return _autonomous["agent"], _autonomous["orch"]
 
 
-def _autonomous_start_worker(objective: str, model: str, my_gen: int,
-                             language: str,
-                             origin_ref: str = "mobile_legacy") -> None:
+def _autonomous_start_worker(
+    objective: str,
+    model: str,
+    my_gen: int,
+    language: str,
+    origin_ref: str = "mobile_legacy",
+    document_inventory=(),
+    document_session_owner: str = "",
+    document_permission_epoch: int = 0,
+    document_owner_device: str = "",
+) -> None:
     """Plan + launch OFF the event loop (planning blocks on an LLM run). The
     single-runner slot (generation ``my_gen``) was already acquired by the
     handler. Mirrors main.py's ``handle_autonomous_start``: validate the exact
@@ -4512,6 +4749,7 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int,
                 agent, provider, model,
             )
         planning_failures = []
+        planned_run_id = secrets.token_hex(16)
         if provider and model and not model_setup_failed:
             try:
                 st = _aplanner.create_plan_state(
@@ -4519,6 +4757,8 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int,
                     failure_cb=planning_failures.append,
                     language=language,
                     origin_ref=origin_ref,
+                    run_id=planned_run_id,
+                    document_sources=document_inventory,
                 )
             except Exception:
                 st = None
@@ -4555,11 +4795,57 @@ def _autonomous_start_worker(objective: str, model: str, my_gen: int,
 
         # ── Establish the run atomically — only if our slot is still current ──
         established = False
+        source_binding_failed = False
         with _autonomous_lock:
             if _autonomous.get("active") and int(_autonomous.get("gen", 0)) == my_gen:
-                _autonomous["st"] = st
-                _write_autonomous_lock(st.get("task_id"))  # stamp the real id
-                established = True
+                try:
+                    if document_inventory:
+                        from osia.action_policy import get_default_permission_policy
+
+                        current_epoch = int(
+                            get_default_permission_policy().store.load_state().policy_epoch
+                        )
+                        if (
+                            current_epoch != int(document_permission_epoch)
+                            or int(st.get("policy_epoch", -1)) != current_epoch
+                        ):
+                            raise document_sources.DocumentSourceError(
+                                "stale_permission_epoch"
+                            )
+                        bound = document_sources.get_source_store().bind_for_run(
+                            [item["source_ref"] for item in document_inventory],
+                            owner_id=document_session_owner,
+                            run_owner_id=str(st.get("task_id") or ""),
+                            run_id=str(st.get("run_id") or ""),
+                            permission_epoch=current_epoch,
+                        )
+                        st["document_sources"] = _astate.normalize_document_sources(
+                            bound
+                        )
+                    _autonomous["st"] = st
+                    _autonomous["document_owner_device"] = str(
+                        document_owner_device or ""
+                    )[:128]
+                    _write_autonomous_lock(st.get("task_id"))  # stamp the real id
+                    established = True
+                except document_sources.DocumentSourceError:
+                    source_binding_failed = True
+        if source_binding_failed:
+            failed_state = _autonomous_failure_state(
+                stage=_adiagnostics.AutonomousStage.PLANNING,
+                category=_adiagnostics.FailureCategory.INVALID_PLANNING_OUTPUT,
+                reason_code="invalid_document_sources",
+                provider=provider,
+                model=model,
+                language=language,
+                emit_log=False,
+            )
+            if _establish_autonomous_failure(failed_state, my_gen):
+                _broadcast_autonomous(
+                    _autonomous_frame({"event": "plan_failed"}, failed_state)
+                )
+            _release_single_runner_if_gen(my_gen)
+            return
         if not established:
             # A cancel landed during planning (and the cancel handler already
             # released the slot, cleared any checkpoint and broadcast its
@@ -5257,6 +5543,7 @@ async def websocket_endpoint(ws: WebSocket):
     pending_files: list[str] = []
     legacy_uploads = LegacyUploadManager(UPLOAD_DIR)
     attachment_batches = AttachmentBatchManager(ATTACHMENT_UPLOAD_DIR)
+    autonomous_attachment_acks: dict[str, dict] = {}
 
     async def _expire_attachment_batches() -> None:
         while True:
@@ -5848,6 +6135,28 @@ async def websocket_endpoint(ws: WebSocket):
                 await out.send_json(_browser_progress_frame(snapshot=True))
                 continue
 
+            if msg_type == "get_document_status":
+                if msg.get("schema_version") != 1:
+                    continue
+                if not permission_session.bind_device(msg.get("device_id")):
+                    continue
+                requested = msg.get("scopes")
+                if not isinstance(requested, list) or len(requested) > 8:
+                    continue
+                for requested_scope in requested:
+                    if (
+                        not isinstance(requested_scope, dict)
+                        or set(requested_scope) != {"scope_type", "scope_id"}
+                    ):
+                        continue
+                    for frame in _document_progress_snapshot(
+                        str(requested_scope.get("scope_type") or ""),
+                        str(requested_scope.get("scope_id") or ""),
+                        owner_device=permission_session.device_id,
+                    ):
+                        await out.send_json(frame)
+                continue
+
             if msg_type == "permission_revocation_request":
                 await permission_session.handle_revocation(msg)
                 continue
@@ -6237,6 +6546,25 @@ async def websocket_endpoint(ws: WebSocket):
             # run over this WebSocket. The engine (planner/orchestrator/state) is
             # consumed as a black box; progress frames are BROADCAST to every
             # connected client (the run is machine-global, not per-connection).
+            if msg_type == "autonomous_release_sources":
+                raw_refs = msg.get("document_sources")
+                owner_id = _mobile_document_owner(permission_session.device_id)
+                released = False
+                if owner_id and isinstance(raw_refs, list) and len(raw_refs) <= 10:
+                    try:
+                        document_sources.get_source_store().release_owned(
+                            raw_refs, owner_id=owner_id,
+                        )
+                        released = True
+                    except document_sources.DocumentSourceError:
+                        released = False
+                await out.send_json({
+                    "type": "autonomous_sources_released",
+                    "schema_version": 1,
+                    "released": released,
+                })
+                continue
+
             if msg_type == "autonomous_start":
                 objective = (msg.get("objective") or "").strip()
                 model = (msg.get("model") or "").strip()
@@ -6260,6 +6588,47 @@ async def websocket_endpoint(ws: WebSocket):
                         _autonomous_frame({"event": "plan_failed"}, failed_state)
                     )
                     continue
+                raw_document_sources = msg.get("document_sources", [])
+                document_owner = _mobile_document_owner(
+                    permission_session.device_id
+                )
+                document_epoch = int(
+                    permission_session.store.load_state().policy_epoch
+                )
+                try:
+                    if (
+                        not isinstance(raw_document_sources, list)
+                        or len(raw_document_sources) > 10
+                        or any(
+                            not isinstance(item, str)
+                            for item in raw_document_sources
+                        )
+                        or (raw_document_sources and not document_owner)
+                    ):
+                        raise document_sources.DocumentSourceError(
+                            "invalid_source_reference"
+                        )
+                    document_inventory = (
+                        document_sources.get_source_store().inspect_for_binding(
+                            raw_document_sources,
+                            owner_id=document_owner,
+                            permission_epoch=document_epoch,
+                        )
+                        if raw_document_sources else []
+                    )
+                except document_sources.DocumentSourceError:
+                    failed_state = _autonomous_failure_state(
+                        stage=_adiagnostics.AutonomousStage.PLANNING,
+                        category=(
+                            _adiagnostics.FailureCategory.INVALID_PLANNING_OUTPUT
+                        ),
+                        reason_code="invalid_document_sources",
+                        language=autonomous_context.language,
+                    )
+                    await out.send_json(
+                        _autonomous_frame({"event": "plan_failed"}, failed_state)
+                    )
+                    continue
                 # Acquire the single-runner slot BEFORE spending LLM tokens on
                 # planning; refuse (busy) if another run already owns it. The
                 # returned generation lets the worker detect a cancel-then-
@@ -6272,12 +6641,17 @@ async def websocket_endpoint(ws: WebSocket):
                 # hop progress frames back onto each connection's writer.
                 _autonomous["loop"] = asyncio.get_running_loop()
                 _autonomous["origin_ref"] = authorization_origin_ref
+                _autonomous["document_owner_device"] = permission_session.device_id
                 # Plan + start OFF the event loop (planning blocks on an LLM run).
                 threading.Thread(
                     target=_autonomous_start_worker,
                     args=(
                         objective, model, _gen, autonomous_context.language,
                         authorization_origin_ref,
+                        document_inventory,
+                        document_owner,
+                        document_epoch,
+                        permission_session.device_id,
                     ),
                     daemon=True,
                 ).start()
@@ -6561,6 +6935,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # hop progress frames back onto each connection's writer.
                 _autonomous["loop"] = asyncio.get_running_loop()
                 _autonomous["origin_ref"] = authorization_origin_ref
+                _autonomous["document_owner_device"] = permission_session.device_id
                 # Resume OFF the event loop (resume() spawns the loop thread and
                 # joins ≤2 s on its first checkpoint save — never block the loop).
                 threading.Thread(
@@ -7776,7 +8151,94 @@ async def websocket_endpoint(ws: WebSocket):
 
             # --- Transactional attachment upload ---
             if msg_type in ATTACHMENT_EVENT_TYPES:
-                for response in attachment_batches.handle(msg):
+                responses = attachment_batches.handle(msg)
+                projected_responses = []
+                for response in responses:
+                    if (
+                        response.get("type") == "attachment_batch_commit_ack"
+                        and response.get("attachment_purpose") == "autonomous"
+                    ):
+                        batch_id = str(response.get("batch_id") or "")
+                        cached = autonomous_attachment_acks.get(batch_id)
+                        if cached is not None:
+                            projected_responses.append(dict(cached))
+                            continue
+                        owner_id = _mobile_document_owner(
+                            permission_session.device_id
+                        )
+                        created_refs = []
+                        try:
+                            if not owner_id:
+                                raise document_sources.DocumentSourceError(
+                                    "unauthorized_source"
+                                )
+                            committed = attachment_batches.consume_for_autonomous(
+                                batch_id,
+                                str(response.get("request_id") or ""),
+                            )
+                            permission_epoch = int(
+                                permission_session.store.load_state().policy_epoch
+                            )
+                            safe_sources = []
+                            for item in committed:
+                                source = document_sources.get_source_store().create(
+                                    item.path,
+                                    owner_id=owner_id,
+                                    source_kind="autonomous_mobile_attachment",
+                                    display_name=item.display_name,
+                                    declared_mime=item.detected_mime,
+                                    permission_epoch=permission_epoch,
+                                )
+                                created_refs.append(source["source_ref"])
+                                if source.get("state") != "ready":
+                                    raise document_sources.DocumentSourceError(
+                                        "failed_source"
+                                    )
+                                safe_sources.append({
+                                    "source_ref": source["source_ref"],
+                                    "type_label": source["type_label"],
+                                    "document_family": source["document_family"],
+                                    "state": source["state"],
+                                    "warnings": list(source.get("warnings") or []),
+                                    "logical_order": item.logical_order,
+                                })
+                            enriched = dict(response)
+                            enriched["autonomous_sources"] = safe_sources
+                            autonomous_attachment_acks[batch_id] = dict(enriched)
+                            projected_responses.append(enriched)
+                        except (
+                            AttachmentProtocolError,
+                            document_sources.DocumentSourceError,
+                        ):
+                            if created_refs and owner_id:
+                                try:
+                                    document_sources.get_source_store().release_owned(
+                                        created_refs, owner_id=owner_id,
+                                    )
+                                except document_sources.DocumentSourceError:
+                                    pass
+                            projected_responses.append({
+                                "type": "attachment_batch_failed",
+                                "protocol_version": response.get(
+                                    "protocol_version", 1
+                                ),
+                                "batch_id": batch_id,
+                                "conversation_id": "",
+                                "client_request_id": str(
+                                    response.get("client_request_id") or ""
+                                ),
+                                "request_id": str(
+                                    response.get("request_id") or ""
+                                ),
+                                "event_id": "event_" + secrets.token_hex(16),
+                                "sequence": int(response.get("sequence", 0)),
+                                "category": "document_validation_failed",
+                            })
+                        finally:
+                            attachment_batches.release(batch_id)
+                        continue
+                    projected_responses.append(response)
+                for response in projected_responses:
                     await out.send_json(response)
                 continue
 
@@ -7793,7 +8255,6 @@ async def websocket_endpoint(ws: WebSocket):
                     await out.send_json({
                         "type": "file_received",
                         "filename": safe_name,
-                        "path": "",
                         "success": False,
                         "error": {"code": exc.code},
                     })
@@ -7816,33 +8277,17 @@ async def websocket_endpoint(ws: WebSocket):
                     await out.send_json({
                         "type": "file_received",
                         "filename": safe_name,
-                        "path": str(target),
                         "success": True,
                     })
                     ack_sent = True
                     if image_mime is not None:
-                        # Image: re-read from disk, base64-encode, and trigger
-                        # the agent immediately with a DeepSeek Vision message
-                        # so the model can actually see and analyze the image.
-                        img_b64 = base64.b64encode(target.read_bytes()).decode("ascii")
-                        vision_content = []
+                        # Legacy images use the same opaque local OCR source as
+                        # transactional attachments. Raw bytes never enter the
+                        # provider turn or a client-visible frame.
                         image_prompt = str(msg.get("prompt") or "").strip()
-                        if image_prompt:
-                            vision_content.append({
-                                "type": "text",
-                                "text": image_prompt,
-                            })
-                        vision_content.append({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{image_mime};base64,{img_b64}",
-                            },
-                        })
-                        print(
-                            f"[OSIA Server] image upload — triggering vision agent "
-                            f"({image_mime}, {len(img_b64)} b64 chars)"
-                        )
-                        # Run the vision turn in its own task so the receive
+                        display_prompt = image_prompt or "Analyze the attached document image."
+                        upload_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                        # Run the OCR/document turn in its own task so the receive
                         # loop stays responsive while the model analyses the
                         # image (same head-of-line fix as text/audio). Resolve
                         # the conversation FIRST so the turn is keyed by a real
@@ -7859,30 +8304,49 @@ async def websocket_endpoint(ws: WebSocket):
                                 })
                                 continue
                             client_request_id = _legacy_request_id()
-                        _conv = await _resolve_turn_conversation(msg, vision_content)
+                        _conv = await _resolve_turn_conversation(msg, display_prompt)
                         if _conv is not None:
+                            from osia.document_sources import get_source_store
+
+                            capability = get_source_store().create(
+                                target,
+                                owner_id=_conv,
+                                source_kind="legacy_mobile_attachment",
+                                display_name=safe_name,
+                                declared_mime=image_mime,
+                            )
+                            document_content = (
+                                "[Document image available through read_document: "
+                                f"source_ref={capability['source_ref']} "
+                                f"type={capability['type_label']} state={capability['state']}]"
+                                f"\n\n{display_prompt}"
+                            )
                             if await _send_persisted_turn_for_request(
                                 out,
                                 _conv,
                                 client_request_id,
-                                expected_user_content=img_b64,
+                                expected_user_content=upload_digest,
                             ):
                                 continue
                             if _is_conversation_busy(_conv):
                                 await _send_conversation_busy(out, _conv)
                                 continue
                             turn_meta = _new_turn_meta(_conv, client_request_id)
+                            turn_meta["_document_owner_device"] = (
+                                permission_session.device_id
+                            )
                             turn_meta["client_locale"] = msg.get("locale")
                             turn_meta["tts_enabled"] = (
                                 msg.get("tts_enabled", True) is not False
                             )
                             turn_meta["client_content_hash"] = hashlib.sha256(
-                                img_b64.encode("ascii")
+                                upload_digest.encode("ascii")
                             ).hexdigest()
+                            turn_meta["persisted_user_content"] = display_prompt
 
                             async def _run_legacy_image_turn(
                                 snap,
-                                _vc=vision_content,
+                                _vc=document_content,
                                 _c=_conv,
                                 _m=turn_meta,
                                 _path=target,
@@ -7923,7 +8387,6 @@ async def websocket_endpoint(ws: WebSocket):
                         await out.send_json({
                             "type": "file_received",
                             "filename": safe_name,
-                            "path": "",
                             "success": False,
                             "error": {"code": "legacy_file_processing_failed"},
                         })
@@ -8059,6 +8522,7 @@ async def websocket_endpoint(ws: WebSocket):
                         agent_input = build_agent_input(
                             user_text,
                             committed_attachments,
+                            owner_id=_conv,
                         )
                         display_names = ", ".join(
                             item.display_name for item in committed_attachments
@@ -8072,10 +8536,13 @@ async def websocket_endpoint(ws: WebSocket):
                         # so a handler exception before spawn is still covered
                         # by connection teardown.
                         agent_input = _consume_pending_files(
-                            user_text, list(pending_files),
+                            user_text, list(pending_files), owner_id=_conv,
                         )
                         persisted_user_content = user_text
                     turn_meta = _new_turn_meta(_conv, client_request_id)
+                    turn_meta["_document_owner_device"] = (
+                        permission_session.device_id
+                    )
                     turn_meta["client_locale"] = msg.get("locale")
                     turn_meta["tts_enabled"] = (
                         msg.get("tts_enabled", True) is not False
@@ -8197,6 +8664,9 @@ async def websocket_endpoint(ws: WebSocket):
                         continue
                     _pf = list(pending_files)
                     turn_meta = _new_turn_meta(_conv, client_request_id)
+                    turn_meta["_document_owner_device"] = (
+                        permission_session.device_id
+                    )
                     turn_meta["client_locale"] = msg.get("locale")
                     turn_meta["tts_enabled"] = (
                         msg.get("tts_enabled", True) is not False
@@ -8501,19 +8971,44 @@ def _tail_not_sent(full: str, sent: str) -> str:
     return tail
 
 
-def _consume_pending_files(user_text: str, pending_files: list[str]) -> str:
-    """Prepend any pending uploaded file paths to ``user_text`` so the agent
-    sees them as part of the next user turn, then clear the list.
-
-    The injected block is plain text — the agent can read those files with
-    its existing filesystem tools.
-    """
+def _consume_pending_files(
+    user_text: str,
+    pending_files: list[str],
+    *,
+    owner_id: str | None = None,
+) -> str:
+    """Replace legacy pending paths with opaque sources before model access."""
     if not pending_files:
         return user_text
     paths = list(pending_files)
     pending_files.clear()
-    bullets = "\n".join(f"- {p}" for p in paths)
-    return f"[Fichiers joints disponibles localement :\n{bullets}\n]\n\n{user_text}"
+    from osia.document_sources import get_source_store
+
+    capabilities = []
+    for path in paths:
+        if owner_id:
+            capability = get_source_store().create(
+                path,
+                owner_id=owner_id,
+                source_kind="legacy_mobile_attachment",
+                display_name=Path(path).name,
+            )
+        else:
+            capability = get_source_store().create_for_current_owner(
+                path,
+                source_kind="legacy_mobile_attachment",
+                display_name=Path(path).name,
+            )
+        capabilities.append(capability)
+    bullets = "\n".join(
+        f"- source_ref={item['source_ref']} type={item['type_label']} state={item['state']}"
+        + (f" category={item['category']}" if item.get("category") else "")
+        for item in capabilities
+    )
+    return (
+        "[Document attachments available through read_document and "
+        f"query_document:\n{bullets}\n]\n\n{user_text}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -9087,22 +9582,49 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         # until agent.run finishes. (Attribute get/set is atomic under the GIL,
         # so the event loop reading _in_use never sees a torn value.)
         agent._in_use = True
+        document_loop = asyncio.get_running_loop()
+        document_progress_futures = []
+
+        def _chat_document_progress(payload: dict) -> None:
+            frame = _document_progress_frame(
+                payload,
+                owner_device=str(
+                    (turn_meta or {}).get("_document_owner_device") or ""
+                ),
+            )
+            if frame is None:
+                return
+            future = asyncio.run_coroutine_threadsafe(
+                ws.send_json(frame), document_loop,
+            )
+            if len(document_progress_futures) < 128:
+                document_progress_futures.append(future)
 
         def _run_agent_busy_tracked():
             try:
-                return agent.run(
-                    text,
-                    history=history,
-                    on_sentence=on_sentence,
-                    on_first_token=on_first_token,
-                    current_conversation_id=active_conv_id,
-                    turn_context=turn_context,
-                )
+                with document_progress_scope(
+                    "chat",
+                    str((turn_meta or {}).get("turn_id") or "chat"),
+                    sink=_chat_document_progress,
+                ):
+                    return agent.run(
+                        text,
+                        history=history,
+                        on_sentence=on_sentence,
+                        on_first_token=on_first_token,
+                        current_conversation_id=active_conv_id,
+                        turn_context=turn_context,
+                    )
             finally:
                 agent._in_use = False
 
         # Off-thread so the event loop stays free to flush response_chunks.
         response_text = await asyncio.to_thread(_run_agent_busy_tracked)
+        for future in document_progress_futures:
+            try:
+                await asyncio.wrap_future(future)
+            except Exception:
+                pass
         await _cancel_turn_progress_task(progress_task)
         progress_task = None
         print(
@@ -9138,7 +9660,15 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 pass
         await chunk_queue.put(_SENTINEL)
         await sender_task
+        for future in locals().get("document_progress_futures", ()):
+            try:
+                await asyncio.wrap_future(future)
+            except Exception:
+                pass
         if isinstance(turn_meta, dict):
+            _retire_document_scope(
+                "chat", str(turn_meta.get("turn_id") or ""),
+            )
             provisional_chunks.clear()
             error_text = localized_text("provider_failure", turn_context.language)
             chunk_frame = _turn_event_frame(
@@ -9362,6 +9892,9 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         response_frame,
         terminal_frame,
     ):
+        _retire_document_scope(
+            "chat", str(turn_meta.get("turn_id") or ""),
+        )
         if tts_session is not None:
             tts_session.cancel()
         await ws.send_json(_turn_status_frame(turn_meta, "error"))
@@ -9380,6 +9913,9 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         return new_history, active_conv_id
     turn_meta["persisted"] = True
     terminal_frame["persisted"] = True
+    _retire_document_scope(
+        "chat", str(turn_meta.get("turn_id") or ""),
+    )
     await ws.send_json(response_frame)
 
     # Text and persistence are complete. Media is tracked separately, but the
@@ -9496,7 +10032,9 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
 
         agent_input = transcript
         if pending_files:
-            agent_input = _consume_pending_files(agent_input, pending_files)
+            agent_input = _consume_pending_files(
+                agent_input, pending_files, owner_id=active_conv_id,
+            )
 
         try:
             return await _run_agent_and_respond(

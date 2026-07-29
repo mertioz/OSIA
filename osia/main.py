@@ -1344,12 +1344,14 @@ def wake_mode():
             prepare_desktop_turn,
         )
 
+        conv = _ensure_active_conversation(prompt)
         try:
             prepared = prepare_desktop_turn(
                 prompt,
                 list(attachments or ()),
                 provider=agent.provider,
                 model=agent.model,
+                owner_id=conv["id"],
             )
         except DesktopAttachmentError as error:
             popup.show_attachment_error(error)

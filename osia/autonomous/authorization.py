@@ -454,6 +454,56 @@ def derive_capability_proposal(st: dict) -> tuple[list[dict], dict[str, dict]]:
                 "private_display": ", ".join(paths[:2]),
             }
 
+    for source in state.normalize_document_sources(st.get("document_sources")):
+        source_ref = source["source_ref"]
+        arguments = {"source_ref": source_ref}
+        context = make_execution_context(
+            execution_type=__import__(
+                "osia.action_policy", fromlist=["ExecutionType"]
+            ).ExecutionType.AUTONOMOUS,
+            interactive=False,
+            run_id=str(st.get("run_id") or ""),
+            plan_revision=str(st.get("plan_revision") or 1),
+            task_revision="1",
+            operation_id="proposal_" + uuid.uuid4().hex,
+        )
+        request = build_permission_request(
+            "read_document",
+            arguments,
+            execution_context=context,
+            force_sensitive=True,
+        )
+        capability_id = "cap_" + hashlib.sha256(
+            f"read_document\0{request.scope_hash}".encode("utf-8")
+        ).hexdigest()[:32]
+        summary.append({
+            "capability_id": capability_id,
+            "label": "Read and query one attached document",
+            "tool_category": request.tool_category,
+            "effect_class": request.effect_class,
+            "operation_class": "read_document",
+            "target_category": request.safe_category,
+            "target_scope_hash": request.scope_hash,
+            "target_precision": "exact",
+            "expected_use_count": 1,
+            "grant_ttl_seconds": DEFAULT_GRANT_TTL_SECONDS,
+            "ordinary_confirmation_required": True,
+            "delegable": bool(request.private_scope.grantable),
+            "requires_later_scope_extension": not request.private_scope.grantable,
+            "universal_barrier": "",
+            "can_approve_mobile": bool(request.private_scope.grantable),
+        })
+        if request.private_scope.grantable:
+            descriptors[capability_id] = {
+                "tool_identity": "read_document",
+                "arguments": arguments,
+                "classification": _classification_for_descriptor(
+                    "read_document", arguments,
+                ),
+                "expected_use_count": 1,
+                "private_display": "",
+            }
+
     for category, target, precision in _unknown_capabilities(text):
         capability_id = "cap_" + hashlib.sha256(
             f"unknown\0{category}\0{target}".encode("utf-8")
