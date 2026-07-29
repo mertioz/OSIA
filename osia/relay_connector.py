@@ -22,6 +22,12 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 
 from osia.config import load_mobile_token
+from osia.oauth_relay import (
+    TYPE_OAUTH_CALLBACK,
+    TYPE_OAUTH_CALLBACK_ACK,
+    TYPE_OAUTH_FLOW_REGISTERED,
+    coordinator as oauth_relay_coordinator,
+)
 from osia.stun_health import start_stun_health_probe
 from osia.transport_coordinator import (
     acquire_application_transport,
@@ -239,6 +245,8 @@ class RelayBridge:
         self._reset_e2e_state()
         self._relay_send_lock = asyncio.Lock()
         self._active_relay_ws = None
+        self._relay_loop: asyncio.AbstractEventLoop | None = None
+        self._oauth_authoritative = False
         self._local_ws = None
         self._local_reader_task: asyncio.Task | None = None
         self._application_transport_lease = None
@@ -292,6 +300,7 @@ class RelayBridge:
     def _begin_relay_connection(self) -> None:
         self.seq = 0
         self._terminal_error_code = ""
+        self._oauth_authoritative = False
         self._reset_relay_chunk_capabilities()
         self._reset_e2e_state()
 
@@ -384,6 +393,28 @@ class RelayBridge:
                 self._envelope(msg_type, payload)
             )
             await relay_ws.send(encoded)
+
+    def send_oauth_control(self, msg_type: str, payload: dict) -> None:
+        """Thread-safe bridge from process-local OAuth owners to relay v2."""
+        loop = self._relay_loop
+        relay_ws = self._active_relay_ws
+        if (
+            loop is None
+            or loop.is_closed()
+            or relay_ws is None
+            or not self._oauth_authoritative
+        ):
+            raise RuntimeError("oauth relay unavailable")
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            raise RuntimeError("oauth relay control cannot block its own loop")
+        future = asyncio.run_coroutine_threadsafe(
+            self._send_relay(relay_ws, msg_type, payload), loop
+        )
+        future.result(timeout=2.0)
 
     async def _send_e2e_hello(
         self,
@@ -1435,9 +1466,24 @@ class RelayBridge:
                 await relay_ws.close()
                 return
             print("[OSIA Relay] relay pair confirmed")
+            self._oauth_authoritative = True
+            oauth_relay_coordinator.mark_authoritative(self)
             if self._relay_chunk_limits_ready():
                 print("[OSIA Relay] relay E2E chunk transport available")
             await self._send_e2e_hello(relay_ws)
+            return
+        if msg_type == TYPE_OAUTH_FLOW_REGISTERED:
+            oauth_relay_coordinator.handle_flow_registered(msg, self.pair_id)
+            return
+        if msg_type == TYPE_OAUTH_CALLBACK:
+            ack, completion, _reason = oauth_relay_coordinator.handle_callback(
+                msg, self.pair_id
+            )
+            try:
+                if ack is not None:
+                    await self._send_relay(relay_ws, TYPE_OAUTH_CALLBACK_ACK, ack)
+            finally:
+                oauth_relay_coordinator.dispatch_completion(completion)
             return
         if msg_type == "MOBILE_READY":
             if not await self._prepare_mobile_session(msg, ready=True):
@@ -1465,6 +1511,7 @@ class RelayBridge:
             return
         if msg_type == "ERROR":
             code = str(payload.get("code") or "")
+            oauth_relay_coordinator.handle_control_error(code)
             if code and code != "peer_unavailable":
                 if code in {
                     "e2e_required",
@@ -1526,6 +1573,8 @@ class RelayBridge:
 
         await self._close_local()
         self._begin_relay_connection()
+        self._relay_loop = asyncio.get_running_loop()
+        oauth_relay_coordinator.bind_transport(self)
         endpoint = self._relay_endpoint()
         async with websockets.connect(
             endpoint,
@@ -1554,6 +1603,8 @@ class RelayBridge:
                     pass
                 if self._active_relay_ws is relay_ws:
                     self._active_relay_ws = None
+                self._oauth_authoritative = False
+                oauth_relay_coordinator.mark_disconnected(self)
                 await self._webrtc_manager.cancel_preparing()
         if self._terminal_error_code == "session_superseded":
             raise RelaySessionSuperseded("relay connection replaced")

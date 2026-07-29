@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import osia.config as config
+from osia import oauth_relay
 from osia.integrations import google_oauth
 from osia.mcp_client import registry
 from osia.tools import gmail
@@ -43,6 +44,30 @@ def write_settings(*, confirm_writes: bool, unattended: bool):
 
     with patched(config, "get_setting", fake_get_setting):
         yield
+
+
+class _ConfirmingOAuthRelay:
+    def send_oauth_control(self, message_type: str, payload: dict) -> None:
+        if message_type != oauth_relay.TYPE_OAUTH_FLOW_REGISTER:
+            return
+        oauth_relay.coordinator.handle_flow_registered(
+            {
+                "v": 2,
+                "type": oauth_relay.TYPE_OAUTH_FLOW_REGISTERED,
+                "role": "pc",
+                "pair_id": "b" * 64,
+                "seq": 0,
+                "ack": 1,
+                "payload": {
+                    "schema_version": 1,
+                    "callback_id": payload["callback_id"],
+                    "expires_at": int(
+                        (google_oauth.time.time() + payload["ttl_seconds"]) * 1000
+                    ),
+                },
+            },
+            "b" * 64,
+        )
 
 
 class GmailWriteSafetyTests(unittest.TestCase):
@@ -573,13 +598,20 @@ class MobileGmailSnapshotTests(unittest.TestCase):
 
 
 class MobileGoogleOAuthAttemptTests(unittest.TestCase):
-    redirect_uri = "https://callback.example/oauth/cb/" + ("b" * 64)
+    redirect_uri = oauth_relay.OAUTH_RELAY_REDIRECT_URI
+
+    def setUp(self) -> None:
+        oauth_relay.coordinator.reset_for_tests()
+        transport = _ConfirmingOAuthRelay()
+        oauth_relay.coordinator.bind_transport(transport)
+        oauth_relay.coordinator.mark_authoritative(transport)
 
     def tearDown(self) -> None:
         for key in list(google_oauth._REMOTE_FLOW_BY_INTEGRATION):
             google_oauth.cancel_remote_authorization(key)
         with google_oauth._REMOTE_FLOW_LOCK:
             google_oauth._REMOTE_RESULTS.clear()
+        oauth_relay.coordinator.reset_for_tests()
 
     def _client(self):
         return google_oauth.GoogleOAuthClient(

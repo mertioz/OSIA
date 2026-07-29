@@ -2256,14 +2256,34 @@ async def _begin_native_gmail_rest_mobile_connect(owner=None) -> dict:
             "error_category": "configuration_missing",
             "message": "Configure Google OAuth on the PC for the Mobile callback.",
         }
+    server_loop = asyncio.get_running_loop()
+
+    def _on_complete(_result: dict) -> None:
+        def _publish() -> None:
+            _GMAIL_OAUTH_ATTEMPT_OWNERS.clear()
+            asyncio.create_task(_broadcast_gmail_rest_config())
+
+        server_loop.call_soon_threadsafe(_publish)
+
     try:
-        result = google_oauth.begin_remote_authorization(
+        result = await asyncio.to_thread(
+            google_oauth.begin_remote_authorization,
             GMAIL_REST_KEY,
             gmail_reconnect_scopes(),
             redirect_uri=redirect_uri,
             force_consent=True,
+            on_complete=_on_complete,
         )
-    except Exception:
+    except Exception as exc:
+        from osia.oauth_relay import OAuthRelayError
+
+        if isinstance(exc, OAuthRelayError):
+            await _broadcast_gmail_rest_config()
+            return {
+                "ok": False,
+                "error_category": exc.code,
+                "message": str(exc),
+            }
         await _broadcast_gmail_rest_config()
         return {
             "ok": False,
@@ -2952,20 +2972,6 @@ async def _begin_oauth_tunnel_connect(server_id: str, saved: dict) -> dict:
         return {"ok": False, "error": "unsupported transport"}
     if not str(saved.get("url") or "").strip():
         return {"ok": False, "error": "missing url"}
-    # WOR-100 Phase 2: a non-DCR (pre-registered-client) connector — Gmail/Drive —
-    # is wired for forced OAuth ONLY on the PC loopback branch (manager._serve
-    # gated on static_client). The tunnel branch does NOT force the flow nor seed
-    # the static client, so a mobile/tunnel attempt would 200-handshake into a
-    # FALSE CONNECTED with no token (Google 200s unauthenticated). Refuse it here
-    # with a clear message until a later phase wires forced auth onto the tunnel;
-    # the user authorizes these on the PC (loopback) for now. DCR connectors are
-    # unaffected (oauth_no_dcr falsy).
-    if saved.get("oauth_no_dcr"):
-        return {
-            "ok": False,
-            "error": "authorize this connector on the PC (loopback) for now",
-        }
-
     # Already CONNECTED → don't start a redundant flow (connect() would be an
     # idempotent no-op that never surfaces a new URL, so the wait would just time
     # out). Report the current state instead.
@@ -3003,25 +3009,9 @@ async def _begin_oauth_tunnel_connect(server_id: str, saved: dict) -> dict:
             cfg = build_headless_connect_cfg(saved)
             cfg["oauth_callback_mode"] = "tunnel"
             cfg["oauth_flow_id"] = fid
-            # WOR-98: use the rendezvous Worker as the OAuth redirect target so the
-            # mobile/tunnel flow works for ANY user via their quick tunnel — not
-            # only via a fixed app.osia.space endpoint. The redirect_uri becomes the
-            # STABLE per-user ``<worker>/oauth/cb/<rendezvous_key>``; the Worker
-            # forwards the callback to THIS PC's current trycloudflare
-            # ``/oauth/callback`` (host-agnostic, unchanged). Gated on a mobile
-            # token existing: with no token, leave cfg untouched so _serve falls
-            # back to the fixed app.osia.space endpoint (legacy root still
-            # registered for the migration overlap).
-            try:
-                from osia.config import load_mobile_token, rendezvous_key
-                from osia.rendezvous import WORKER_URL
-                _tok = load_mobile_token()
-                if _tok:
-                    cfg["oauth_redirect_uri"] = (
-                        WORKER_URL.rstrip("/") + "/oauth/cb/" + rendezvous_key(_tok)
-                    )
-            except Exception:
-                pass
+            # WOR-203: every new Mobile flow uses the stable relay callback.
+            from osia.oauth_relay import OAUTH_RELAY_REDIRECT_URI
+            cfg["oauth_redirect_uri"] = OAUTH_RELAY_REDIRECT_URI
             from osia.mcp_client import get_manager, STATUS_CONNECTING
             mgr = get_manager()
             # WOR-97: if a PRIOR OAuth flow for this id is still parked CONNECTING
@@ -3035,9 +3025,13 @@ async def _begin_oauth_tunnel_connect(server_id: str, saved: dict) -> dict:
                 mgr.cancel_pending(sid)
             status = mgr.connect(cfg)
         except Exception as e:
-            print(f"[OSIA Server] mcp_oauth_tunnel_connect worker {sid!r}: {e}")
+            safe_code = str(getattr(e, "code", "oauth_connect_failed"))
+            print(
+                "[OSIA Server] mcp_oauth_tunnel_connect "
+                f"kind=mcp accepted=false reason={safe_code}"
+            )
             try:
-                fail_oauth_trigger_flow(fid, f"{type(e).__name__}: {e}")
+                fail_oauth_trigger_flow(fid, safe_code)
             except Exception:
                 pass
         # If connect resolved WITHOUT ever surfacing the authorize URL (e.g.

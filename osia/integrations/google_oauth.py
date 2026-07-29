@@ -19,7 +19,7 @@ import time
 import webbrowser
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from osia.config import (
@@ -112,6 +112,7 @@ class _RemoteOAuthAttempt:
     auth_url: str
     client: GoogleOAuthClient
     expires_at: float
+    on_complete: Callable[[dict], None] | None = None
     claimed: bool = False
     cancelled: bool = False
     lock_held: bool = True
@@ -217,36 +218,10 @@ def oauth_client_supports_redirect(integration_key: str, redirect_uri: str) -> b
 
 
 def mobile_redirect_uri() -> str:
-    """Build the existing stable per-pair rendezvous callback URI.
+    """Return the one stable relay callback used by new Mobile flows."""
+    from osia.oauth_relay import OAUTH_RELAY_REDIRECT_URI
 
-    The raw pairing token never leaves ``osia.config``; only its established
-    one-way rendezvous key is used in the HTTPS path. An empty result means the
-    PC has not created pairing state yet, so Mobile OAuth cannot be configured.
-    """
-    try:
-        from osia.config import load_mobile_token, rendezvous_key
-        from osia.rendezvous import WORKER_URL
-
-        token = load_mobile_token()
-        if not token:
-            return ""
-        uri = WORKER_URL.rstrip("/") + "/oauth/cb/" + rendezvous_key(token)
-        split = urlsplit(uri)
-        worker = urlsplit(WORKER_URL)
-        suffix = split.path.removeprefix("/oauth/cb/")
-        if (
-            split.scheme != "https"
-            or split.netloc != worker.netloc
-            or not split.path.startswith("/oauth/cb/")
-            or split.query
-            or split.fragment
-            or len(suffix) != 64
-            or any(ch not in "0123456789abcdef" for ch in suffix)
-        ):
-            return ""
-        return uri
-    except Exception:
-        return ""
+    return OAUTH_RELAY_REDIRECT_URI
 
 
 def begin_remote_authorization(
@@ -255,6 +230,7 @@ def begin_remote_authorization(
     *,
     redirect_uri: str,
     force_consent: bool = True,
+    on_complete: Callable[[dict], None] | None = None,
 ) -> dict:
     """Create or reuse one bounded browser flow without opening a PC browser.
 
@@ -266,8 +242,12 @@ def begin_remote_authorization(
     key = str(integration_key or "").strip()
     uri = str(redirect_uri or "").strip()
     scope_text = _scope_string(scopes)
+    from osia.oauth_relay import OAUTH_RELAY_REDIRECT_URI
+
     if not key or not scope_text:
         raise GoogleOAuthError("OAuth integration key or scope list is empty.")
+    if uri != OAUTH_RELAY_REDIRECT_URI:
+        raise GoogleOAuthError("OAuth Mobile callback is not the stable relay URI.")
     client = load_client_config(key)
     if not uri or uri not in client.redirect_uris:
         raise GoogleOAuthError(
@@ -310,7 +290,31 @@ def begin_remote_authorization(
             auth_url=f"{GOOGLE_AUTHORIZATION_ENDPOINT}?{urlencode(auth_params)}",
             client=client,
             expires_at=now + REMOTE_AUTHORIZATION_TIMEOUT_S,
+            on_complete=on_complete,
         )
+
+    try:
+        from osia.oauth_relay import coordinator
+
+        registration = coordinator.register_flow(
+            state=attempt.state,
+            flow_kind="gmail",
+            owner=attempt.attempt_id,
+            claim_callback=claim_remote_authorization,
+            ttl_seconds=int(REMOTE_AUTHORIZATION_TIMEOUT_S),
+        )
+    except Exception:
+        with _REMOTE_FLOW_LOCK:
+            _finish_remote_flow_locked(
+                attempt,
+                status="authorization_required",
+                error_category="relay_registration_failed",
+                message="The secure OAuth relay could not register the flow.",
+            )
+        raise
+
+    attempt.expires_at = registration.expires_at
+    with _REMOTE_FLOW_LOCK:
         _REMOTE_FLOWS[state] = attempt
         _REMOTE_FLOW_BY_INTEGRATION[key] = state
         _REMOTE_RESULTS.pop(key, None)
@@ -352,6 +356,7 @@ def cancel_remote_authorization(
     """Cancel only the matching active attempt; never touch stored tokens."""
     key = str(integration_key or "").strip()
     expected = str(attempt_id or "").strip()
+    cancelled_state = ""
     with _REMOTE_FLOW_LOCK:
         _prune_remote_flows_locked(time.time())
         state = _REMOTE_FLOW_BY_INTEGRATION.get(key)
@@ -359,13 +364,34 @@ def cancel_remote_authorization(
         if attempt is None or (expected and attempt.attempt_id != expected):
             return False
         attempt.cancelled = True
+        cancelled_state = attempt.state
         _finish_remote_flow_locked(
             attempt,
             status="authorization_required",
             error_category="authorization_cancelled",
             message="Google authorization was cancelled.",
         )
-        return True
+    if cancelled_state:
+        from osia.oauth_relay import coordinator
+
+        coordinator.cancel_flow(state=cancelled_state)
+    return True
+
+
+def claim_remote_authorization(
+    state: str,
+    code: str | None,
+    error: str | None,
+) -> Callable[[], dict] | None:
+    """Atomically claim a local Gmail flow and return its completion work."""
+    state_text = str(state or "").strip()
+    with _REMOTE_FLOW_LOCK:
+        _prune_remote_flows_locked(time.time())
+        attempt = _REMOTE_FLOWS.get(state_text)
+        if attempt is None or attempt.claimed or attempt.cancelled:
+            return None
+        attempt.claimed = True
+    return lambda: _complete_and_notify_remote_authorization(attempt, code, error)
 
 
 def complete_remote_authorization(
@@ -373,20 +399,39 @@ def complete_remote_authorization(
     code: str | None,
     error: str | None,
 ) -> dict:
-    """Resolve one public callback and atomically install its token on success.
+    """Compatibility entry point for the legacy PC HTTP callback."""
+    completion = claim_remote_authorization(state, code, error)
+    if completion is None:
+        return {"matched": False, "success": False}
+    return completion()
+
+
+def _complete_and_notify_remote_authorization(
+    attempt: _RemoteOAuthAttempt,
+    code: str | None,
+    error: str | None,
+) -> dict:
+    result = _complete_claimed_remote_authorization(attempt, code, error)
+    callback = attempt.on_complete
+    if callback is not None:
+        try:
+            callback(dict(result))
+        except Exception:
+            pass
+    return result
+
+
+def _complete_claimed_remote_authorization(
+    attempt: _RemoteOAuthAttempt,
+    code: str | None,
+    error: str | None,
+) -> dict:
+    """Install a token after the relay coordinator has ACKed a local claim.
 
     Unknown/replayed state is not matched. Provider failures are reduced to a
     fixed safe category/message. The existing token blob is left byte-for-byte
     untouched until token exchange has succeeded.
     """
-    state_text = str(state or "").strip()
-    with _REMOTE_FLOW_LOCK:
-        _prune_remote_flows_locked(time.time())
-        attempt = _REMOTE_FLOWS.get(state_text)
-        if attempt is None or attempt.claimed or attempt.cancelled:
-            return {"matched": False, "success": False}
-        attempt.claimed = True
-
     provider_error = str(error or "").strip().lower()
     code_text = str(code or "").strip()
     if provider_error or not code_text:

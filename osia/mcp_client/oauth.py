@@ -41,6 +41,7 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from osia.config import get_mcp_oauth, set_mcp_oauth
+from osia.oauth_relay import OAUTH_RELAY_REDIRECT_URI
 
 
 # ── Fixed loopback callback + flow constants ────────────────────────────────
@@ -461,7 +462,7 @@ def resolve_oauth_flow(state: str, code: Optional[str],
             return False
     try:
         if error:
-            fut.set_exception(RuntimeError(f"OAuth authorization failed: {error}"))
+            fut.set_exception(RuntimeError("OAuth authorization was refused."))
         else:
             fut.set_result((code, state))
         return True
@@ -682,11 +683,32 @@ class TunnelOAuthCallback:
         (PART 2 will push it to the phone)."""
         state: Optional[str] = None
         try:
-            state = (parse_qs(urlsplit(url).query).get("state") or [None])[0]
+            query = parse_qs(urlsplit(url).query, keep_blank_values=True)
+            states = query.get("state") or []
+            redirects = query.get("redirect_uri") or []
+            if len(states) == 1 and redirects == [OAUTH_RELAY_REDIRECT_URI]:
+                state = states[0]
         except Exception:
             state = None
         self._state = state
         self._future = register_oauth_state(state) if state else None
+        if not state:
+            raise RuntimeError("OAuth relay callback: invalid state")
+        try:
+            from osia.oauth_relay import coordinator
+
+            coordinator.register_flow(
+                state=state,
+                flow_kind="mcp",
+                owner=self._flow_id,
+                claim_callback=resolve_oauth_flow,
+            )
+        except Exception as exc:
+            discard_oauth_state(state)
+            self._future = None
+            safe_code = getattr(exc, "code", "relay_registration_rejected")
+            fail_oauth_trigger_flow(self._flow_id, str(safe_code))
+            raise
         publish_oauth_auth_url(self._flow_id, url)
 
     async def callback_handler(self) -> tuple:
@@ -706,7 +728,41 @@ class TunnelOAuthCallback:
                 timeout=OAUTH_CALLBACK_TIMEOUT,
             )
         finally:
+            if self._state:
+                from osia.oauth_relay import coordinator
+
+                coordinator.cancel_flow(state=self._state)
             discard_oauth_state(self._state or "")
+
+
+def prepare_dcr_registration_for_redirect(
+    server_id: str,
+    redirect_uri: str = OAUTH_RELAY_REDIRECT_URI,
+) -> str:
+    """Prepare one connector's saved DCR metadata for the stable redirect.
+
+    MCP 1.28 exposes no registration-management update API.  A saved DCR client
+    that lacks the new URI is therefore invalidated narrowly by removing only
+    that connector's ``client`` metadata; tokens and every other connector are
+    preserved so the SDK can perform targeted DCR on the next interactive auth.
+    """
+    sid = str(server_id or "").strip()
+    uri = str(redirect_uri or "").strip()
+    if not sid or uri != OAUTH_RELAY_REDIRECT_URI:
+        return "dcr_reconnect_required"
+    blob = get_mcp_oauth(sid)
+    if not isinstance(blob, dict):
+        return "registration_missing"
+    client = blob.get("client")
+    if not isinstance(client, dict):
+        return "registration_missing"
+    redirects = client.get("redirect_uris")
+    if isinstance(redirects, list) and uri in redirects:
+        return "registration_reused"
+    updated = dict(blob)
+    updated.pop("client", None)
+    set_mcp_oauth(sid, updated)
+    return "registration_invalidated"
 
 
 # ---------------------------------------------------------------------------

@@ -829,35 +829,80 @@ class MCPManager:
                         build_oauth_provider,
                         OAUTH_LEGACY_TUNNEL_REDIRECT_URI,
                         OAUTH_REDIRECT_URI,
+                        OAUTH_RELAY_REDIRECT_URI,
                         OAUTH_TUNNEL_REDIRECT_URI,
+                        force_oauth_login,
+                        prepare_dcr_registration_for_redirect,
                     )
 
                     _cb = TunnelOAuthCallback(str(cfg.get("oauth_flow_id") or ""))
-                    # WOR-98: when the trigger supplied a rendezvous-Worker redirect
-                    # URI (any-user quick-tunnel flow), use it at index 0 — the SDK
-                    # uses redirect_uris[0] for BOTH authorize and token exchange —
-                    # while loopback + app.osia.space + legacy osia.space stay in
-                    # the registered set (DCR registers all four). When absent
-                    # (no mobile token), use app.osia.space at index 0 while
-                    # preserving loopback + legacy osia.space during migration.
-                    worker_uri = str(cfg.get("oauth_redirect_uri") or "").strip()
+                    static_client = None
+                    oauth_scope = None
+                    if cfg.get("oauth_no_dcr"):
+                        from osia.config import get_mcp_oauth
+                        _sc = (get_mcp_oauth(server_id) or {}).get("static_client") or {}
+                        _cid = str(_sc.get("client_id") or "").strip()
+                        if _cid:
+                            static_client = {
+                                "client_id": _cid,
+                                "client_secret": _sc.get("client_secret") or None,
+                                "token_endpoint_auth_method": str(
+                                    cfg.get("oauth_token_endpoint_auth_method") or "none"
+                                ),
+                            }
+                            oauth_scope = str(cfg.get("oauth_scopes") or "").strip() or None
+                            if (
+                                static_client["token_endpoint_auth_method"]
+                                in ("client_secret_post", "client_secret_basic")
+                                and not static_client["client_secret"]
+                            ):
+                                raise RuntimeError(
+                                    "client secret required for configured token endpoint"
+                                )
+                    else:
+                        prepare_dcr_registration_for_redirect(
+                            server_id, OAUTH_RELAY_REDIRECT_URI
+                        )
+                    # The SDK uses index 0 for both authorization and exchange.
+                    # New Mobile flows therefore always use the stable relay URI;
+                    # the old callback forms remain registration-only overlap.
                     ruris = (
-                        [
-                            worker_uri,
-                            OAUTH_REDIRECT_URI,
-                            OAUTH_TUNNEL_REDIRECT_URI,
-                            OAUTH_LEGACY_TUNNEL_REDIRECT_URI,
-                        ]
-                        if worker_uri
+                        [OAUTH_RELAY_REDIRECT_URI]
+                        if static_client is not None
                         else [
-                            OAUTH_TUNNEL_REDIRECT_URI,
+                            OAUTH_RELAY_REDIRECT_URI,
                             OAUTH_REDIRECT_URI,
+                            OAUTH_TUNNEL_REDIRECT_URI,
                             OAUTH_LEGACY_TUNNEL_REDIRECT_URI,
                         ]
                     )
+                    legacy_worker_uri = str(
+                        cfg.get("oauth_legacy_redirect_uri") or ""
+                    ).strip()
+                    if (
+                        static_client is None
+                        and legacy_worker_uri
+                        and legacy_worker_uri not in ruris
+                    ):
+                        ruris.append(legacy_worker_uri)
                     provider = build_oauth_provider(
-                        server_id, url, _cb, redirect_uris=ruris,
+                        server_id,
+                        url,
+                        _cb,
+                        redirect_uris=ruris,
+                        static_client=static_client,
+                        scope=oauth_scope,
                     )
+                    if static_client is not None:
+                        await force_oauth_login(
+                            provider,
+                            server_id,
+                            issuer=str(cfg.get("oauth_issuer") or ""),
+                            authorization_endpoint=str(
+                                cfg.get("oauth_authorization_endpoint") or ""
+                            ),
+                            token_endpoint=str(cfg.get("oauth_token_endpoint") or ""),
+                        )
                     async with streamablehttp_client(url, auth=provider) as (read, write, _sid):
                         async with ClientSession(read, write) as session:
                             await session.initialize()
