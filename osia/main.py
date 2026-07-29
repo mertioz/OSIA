@@ -428,8 +428,17 @@ def _persist_agent_delta(
                 clean = dict(clean)
                 clean["content"] = pending_user_display
                 pending_user_display = None
+            context = getattr(agent, "turn_context", None)
+            metadata = None
+            if context is not None:
+                metadata = {
+                    "_language": context.language,
+                    "_language_mode": context.mode,
+                    "_allowed_languages": list(context.allowed_languages),
+                }
             conversations.add_message(
                 conv_id, clean.get("role"), clean.get("content", ""),
+                metadata=metadata,
             )
     except Exception as e:
         print(f"[OSIA] failed to persist conversation: {e}")
@@ -466,15 +475,26 @@ def _finalize_controlled_refusal(
     return display
 
 
-def _persist_exchange(conv_id, user_text, assistant_text):
+def _persist_exchange(conv_id, user_text, assistant_text, turn_context=None):
     """Persist a stateless single-turn exchange (used by voice_mode,
     which currently calls run_agent() without keeping history).
     """
     if not conv_id:
         return
     try:
-        conversations.add_message(conv_id, "user", user_text)
-        conversations.add_message(conv_id, "assistant", assistant_text or "")
+        metadata = None
+        if turn_context is not None:
+            metadata = {
+                "_language": turn_context.language,
+                "_language_mode": turn_context.mode,
+                "_allowed_languages": list(turn_context.allowed_languages),
+            }
+        conversations.add_message(
+            conv_id, "user", user_text, metadata=metadata,
+        )
+        conversations.add_message(
+            conv_id, "assistant", assistant_text or "", metadata=metadata,
+        )
     except Exception as e:
         print(f"[OSIA] failed to persist conversation: {e}")
 
@@ -600,6 +620,8 @@ def text_mode():
 
 def voice_mode():
     """Single-shot voice mode: listen → agent → speak."""
+    from osia import i18n
+    from osia.turn_context import resolve_turn_context
     from osia.voice.stt import listen
     from osia.voice.tts import speak
     from osia.agent import clean_response
@@ -646,16 +668,24 @@ def voice_mode():
                 selected_model,
                 provider=settings.get("selected_model_provider") or None,
             )
+        turn_context = resolve_turn_context(
+            user_text,
+            saved_language=i18n.get_language(),
+            reference=active_conv["id"],
+        )
         response = turn_agent.run(
             user_text,
             current_conversation_id=active_conv["id"],
+            turn_context=turn_context,
         )
         response = clean_response(response)
         print(f"💬 OSIA: {response}")
 
-        _persist_exchange(active_conv["id"], user_text, response)
+        _persist_exchange(
+            active_conv["id"], user_text, response, turn_context,
+        )
         print(f"[TTS] main.voice_mode: calling speak() ({len(response)} chars)", flush=True)
-        speak(response)
+        speak(response, language=turn_context.language)
         print("[TTS] main.voice_mode: speak() returned", flush=True)
 
 
@@ -972,6 +1002,7 @@ def wake_mode():
         *,
         voice_response: bool,
         user_display_text: str | None = None,
+        language_text: str | None = None,
         lock_provider: bool = False,
     ) -> None:
         """Run the agent in the current thread, persist + mirror the result.
@@ -996,6 +1027,20 @@ def wake_mode():
             except Exception as e:
                 print(f"[DEBUG] set_model({selected_model!r}) failed: {e}")
 
+        authoritative_text = (
+            language_text
+            if isinstance(language_text, str)
+            else user_display_text
+            if isinstance(user_display_text, str)
+            else user_input
+        )
+        turn_context = resolve_turn_context(
+            authoritative_text,
+            history=history,
+            saved_language=i18n.get_language(),
+            reference=conv_id,
+        )
+
         prev_history_len = len(history)
 
         def on_first_token(*_a, **_kw):
@@ -1005,7 +1050,11 @@ def wake_mode():
         def on_stream_sentence(sentence: str) -> None:
             bridge.assistant_stream_chunk.emit(conv_id, sentence)
             if voice_response:
-                speak_streaming(sentence, session_id=tts_session_id)
+                speak_streaming(
+                    sentence,
+                    session_id=tts_session_id,
+                    language=turn_context.language,
+                )
 
         try:
             if voice_response:
@@ -1025,6 +1074,7 @@ def wake_mode():
                 on_sentence=on_stream_sentence,
                 on_first_token=on_first_token,
                 current_conversation_id=conv_id,
+                turn_context=turn_context,
             )
             if voice_response:
                 print(
@@ -1052,7 +1102,11 @@ def wake_mode():
             if refusal is not None:
                 if voice_response:
                     refusal_tts_session = start_streaming_session()
-                    speak_streaming(refusal, session_id=refusal_tts_session)
+                    speak_streaming(
+                        refusal,
+                        session_id=refusal_tts_session,
+                        language=turn_context.language,
+                    )
             else:
                 err = localized_text("provider_failure", turn_agent.lang)
                 _persist_agent_delta(
@@ -1065,7 +1119,11 @@ def wake_mode():
                 bridge.assistant_stream_error.emit(conv_id, err)
                 if voice_response:
                     error_tts_session = start_streaming_session()
-                    speak_streaming(err, session_id=error_tts_session)
+                    speak_streaming(
+                        err,
+                        session_id=error_tts_session,
+                        language=turn_context.language,
+                    )
         finally:
             _set_conversation_busy(conv_id, False)
             bridge.conversations_changed.emit(
@@ -1162,7 +1220,11 @@ def wake_mode():
     # ── Text handler (typed message in popup) ────────────────────────────
 
     def _send_user_input(
-        user_input, display_text: str, *, attachment_turn: bool = False,
+        user_input,
+        display_text: str,
+        *,
+        attachment_turn: bool = False,
+        language_text: str | None = None,
     ) -> bool:
         conv = _ensure_active_conversation(display_text)
         conv_id = conv["id"]
@@ -1184,6 +1246,7 @@ def wake_mode():
                 history,
                 voice_response=False,
                 user_display_text=display_text,
+                language_text=language_text,
                 lock_provider=attachment_turn,
             )
 
@@ -1360,6 +1423,7 @@ def wake_mode():
             prepared.provider_content,
             prepared.display_text,
             attachment_turn=True,
+            language_text=prompt,
         ):
             popup.accept_draft_submission(prepared.attachment_ids)
 
@@ -1480,8 +1544,12 @@ def wake_mode():
                         history=history,
                         current_conversation_id=conversation_id,
                     )
-                _persist_exchange(conversation_id, task_text,
-                                  clean_response(reply or ""))
+                _persist_exchange(
+                    conversation_id,
+                    task_text,
+                    clean_response(reply or ""),
+                    getattr(cron_agent, "turn_context", None),
+                )
             else:
                 cron_agent.reset()  # each scheduled run is a fresh, one-shot turn
                 if scheduled_execution is not None:
@@ -1500,7 +1568,14 @@ def wake_mode():
                     bridge.conversations_changed.emit(
                         active_conv["id"] if active_conv else ""
                     )
-                speak(display)
+                speak(
+                    display,
+                    language=getattr(
+                        getattr(cron_agent, "turn_context", None),
+                        "language",
+                        None,
+                    ),
+                )
             if conversation_stale:
                 return {
                     "status": "completed",
@@ -1688,6 +1763,7 @@ def wake_mode():
                         objective, actual_provider, actual_model, autonomous_agent,
                         failure_cb=planning_failures.append,
                         language=autonomous_context.language,
+                        turn_context=autonomous_context,
                         origin_ref="desktop",
                     )
                 except Exception:
@@ -2278,6 +2354,10 @@ def wake_mode():
                     state.get("language"),
                     source="autonomous_resume",
                     reference=str(state.get("task_id") or "autonomous"),
+                    mode=str(state.get("language_mode") or "single-language"),
+                    allowed_languages=state.get("allowed_languages") or (),
+                    source_language=state.get("source_language"),
+                    target_language=state.get("target_language"),
                 )
                 autonomous_agent.set_turn_context(resume_context)
                 if not resume_provider or not resume_model:

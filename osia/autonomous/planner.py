@@ -48,6 +48,7 @@ from typing import NamedTuple
 from osia.autonomous import diagnostics, state
 from osia import i18n
 from osia.turn_context import (
+    TurnContext,
     fixed_turn_context,
     language_instruction,
     normalize_locale,
@@ -476,6 +477,7 @@ def plan_objective(objective: str, agent, *,
                    max_tasks_per_phase: int = DEFAULT_MAX_TASKS_PER_PHASE,
                    failure_cb=None,
                    language: str | None = None,
+                   turn_context: TurnContext | None = None,
                    run_id: str | None = None,
                    plan_revision: int = 1,
                    requirements=None,
@@ -519,16 +521,19 @@ def plan_objective(objective: str, agent, *,
             failure_cb, PlanFailure("requirements_exceed_plan_capacity"),
         )
         return None
-    target_language = normalize_locale(language)
-    if target_language is None:
-        target_language = resolve_turn_context(
-            objective,
-            saved_language=i18n.DEFAULT_LANG,
-        ).language
-    turn_context = fixed_turn_context(
-        target_language,
-        source="autonomous_state",
-    )
+    if not isinstance(turn_context, TurnContext):
+        target_language = normalize_locale(language)
+        if target_language is None:
+            turn_context = resolve_turn_context(
+                objective,
+                saved_language=i18n.DEFAULT_LANG,
+            )
+        else:
+            turn_context = fixed_turn_context(
+                target_language,
+                source="autonomous_state",
+            )
+    target_language = turn_context.language
     from osia.action_policy import ExecutionType, make_execution_context
 
     permission_context = make_execution_context(
@@ -580,7 +585,7 @@ def plan_objective(objective: str, agent, *,
     # None) is final.
     outcome = _attempt(
         agent,
-        language_instruction(target_language) + "\n\n" + _corrective_prompt(
+        language_instruction(turn_context) + "\n\n" + _corrective_prompt(
             requirement_ids
         ) + ((
             "\nPreserve exactly these document source_refs in the corrected "
@@ -607,6 +612,7 @@ def create_plan_state(objective: str, provider: str, model: str, agent, *,
                       max_tasks_per_phase: int = DEFAULT_MAX_TASKS_PER_PHASE,
                       failure_cb=None,
                       language: str | None = None,
+                      turn_context: TurnContext | None = None,
                       run_id: str | None = None,
                       origin_ref: str = "desktop",
                       permission_policy=None,
@@ -619,20 +625,29 @@ def create_plan_state(objective: str, provider: str, model: str, agent, *,
     saves; persisting the returned state (via
     :func:`osia.autonomous.state.save_task_state`) is the caller's decision.
     """
-    target_language = normalize_locale(language) or resolve_turn_context(
-        objective,
-        saved_language=i18n.DEFAULT_LANG,
-    ).language
+    if not isinstance(turn_context, TurnContext):
+        normalized = normalize_locale(language)
+        turn_context = (
+            fixed_turn_context(normalized, source="autonomous_state")
+            if normalized else
+            resolve_turn_context(objective, saved_language=i18n.DEFAULT_LANG)
+        )
+    target_language = turn_context.language
     stable_run_id = str(run_id or uuid.uuid4().hex)
     phases = plan_objective(objective, agent, max_phases=max_phases,
                             max_tasks_per_phase=max_tasks_per_phase,
                             failure_cb=failure_cb, language=target_language,
+                            turn_context=turn_context,
                             run_id=stable_run_id, plan_revision=1,
                             document_sources=document_sources)
     if phases is None:
         return None
     planned = state.new_task_state(
         objective, provider, model, phases, language=target_language,
+        language_mode=turn_context.mode,
+        allowed_languages=turn_context.allowed_languages,
+        source_language=turn_context.source_language,
+        target_language=turn_context.target_language,
         run_id=stable_run_id,
     )
     planned["document_sources"] = state.normalize_document_sources(

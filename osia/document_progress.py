@@ -20,12 +20,14 @@ DOCUMENT_PHASES = (
 )
 _PHASE_RANK = {phase: index for index, phase in enumerate(DOCUMENT_PHASES)}
 _SAFE_FAILURES = frozenset({
-    "active_content_detected", "corrupted_document", "drm_protected",
-    "encrypted_document", "expired_source", "external_reference_detected",
+    "active_content_detected", "corrupted_document", "corrupted_media",
+    "drm_protected", "encrypted_document", "encrypted_media", "expired_source",
+    "external_reference_detected",
     "extraction_failure", "file_identity_mismatch", "invalid_source_reference",
     "missing_source", "ocr_unavailable", "protected_document",
     "resource_limit_exceeded", "source_changed", "source_unavailable",
-    "unauthorized_source", "unsupported_format", "unsupported_legacy_format",
+    "unauthorized_source", "unsupported_codec", "unsupported_format",
+    "unsupported_legacy_format", "unsupported_media",
 })
 _SAFE_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,31}$")
 

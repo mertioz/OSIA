@@ -2644,6 +2644,13 @@ def _request_scope(
         return normalize_exact_call_scope(
             call_hash, safe_category="document_source", grantable=True,
         ), False
+    if tool_name == "render_pdf" and arguments.get("destination") == "desktop":
+        # The model names only a well-known destination. The permit remains
+        # bound to this exact structured call; no raw path crosses the model
+        # or authorization boundary.
+        return normalize_exact_call_scope(
+            call_hash, safe_category="local_destination", grantable=True,
+        ), False
     if tool_name == "upload_browser_file":
         return normalize_exact_call_scope(
             call_hash, safe_category="browser_upload", grantable=True,
@@ -2674,6 +2681,7 @@ def _tool_category(tool_name: str, confirmation_domain: str) -> str:
         return "shell"
     if tool_name in {
         "read_file", "write_file", "delete_file", "delete_directory",
+        "render_pdf",
         "create_directory", "rename_file", "copy_file", "edit_file_lines",
         "list_files", "get_file_info", "search_files",
     }:

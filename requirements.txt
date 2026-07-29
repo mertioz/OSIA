@@ -68,6 +68,7 @@ pyperclip>=1.8.0                   # clipboard backend on Windows (get/set_clipb
 pyautogui>=0.9.54                  # native mouse/keyboard control on Windows/Mac (WOR-42 desktop_* tools; Linux uses ydotool/xdotool)
 Pillow>=10.0                       # screenshots + image handling (agent.py ImageGrab, desktop_control.py)
 pypdfium2==5.12.1                 # bundled PDFium: offline native PDF text/rendering
+reportlab==4.4.10                  # bounded offline PDF generation (BSD-3-Clause)
 rapidocr==3.9.2                    # offline OCR with bundled PP-OCR ONNX models
 onnxruntime>=1.18.0,<2.0           # explicit local inference backend for RapidOCR
 qrcode>=8.2                        # in-memory QR rendering for mobile pairing (Pillow already installed)

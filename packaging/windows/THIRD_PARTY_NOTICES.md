@@ -18,6 +18,10 @@ model limitations, provenance, and license details.
 
 ## Local document reading
 
+- **ReportLab 4.4.10** is distributed under the BSD 3-Clause license. OSIA
+  uses its pure-Python flowables and drawing primitives for bounded, fully
+  local PDF generation; no browser, office suite, external renderer, runtime
+  download, or network resource is required.
 - **pypdfium2 5.12.1** is distributed under Apache-2.0 and BSD-3-Clause terms
   and bundles PDFium plus its applicable notices. It performs native PDF text
   extraction and page rendering without a separately installed executable.

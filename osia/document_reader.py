@@ -372,6 +372,7 @@ def read_document(
             str(path).encode("utf-8", errors="replace"),
         ).hexdigest()
     document_type = "document"
+    media_family = ""
     emit_document_progress(source_key, "identifying")
     try:
         limits = resolve_limits(
@@ -449,6 +450,7 @@ def read_document(
                 canonical.encode("utf-8", errors="replace"),
             ).hexdigest()
         document_type = identity.format_label
+        media_family = identity.family if identity.family in {"image", "audio", "video"} else ""
         emit_document_progress(
             source_key, "inspecting", document_type=document_type,
         )
@@ -484,10 +486,33 @@ def read_document(
         emit_document_progress(
             source_key, "extracting", document_type=document_type,
         )
-        content, metadata = _run_worker(
-            data, document_type, language_value, limits,
-        )
-        if metadata.get("structured_document") is True:
+        if identity.family in {"image", "audio", "video"}:
+            from osia.media_reader import MediaReadError, extract_media
+
+            try:
+                document, media_private_metadata = extract_media(
+                    data, identity, language_value, include_private=True,
+                )
+            except MediaReadError as exc:
+                print(
+                    "[WOR-188] media worker failed "
+                    f"family={media_family or 'media'} category={exc.category} "
+                    f"limit_kind={exc.limit_kind or 'none'} "
+                    f"stage={exc.stage or 'unknown'}",
+                    flush=True,
+                )
+                raise DocumentReadError(
+                    exc.category, limit_kind=exc.limit_kind,
+                ) from exc
+            document["warnings"] = sorted(set(
+                list(document.get("warnings") or []) + list(identity.warnings)
+            ))
+            metadata = {"structured_document": True}
+        else:
+            content, metadata = _run_worker(
+                data, document_type, language_value, limits,
+            )
+        if identity.family not in {"image", "audio", "video"} and metadata.get("structured_document") is True:
             try:
                 document = json.loads(content)
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -497,7 +522,7 @@ def read_document(
             document["warnings"] = sorted(set(
                 list(document.get("warnings") or []) + list(identity.warnings)
             ))
-        else:
+        elif identity.family not in {"image", "audio", "video"}:
             metadata["warnings"] = sorted(set(
                 list(metadata.get("warnings") or []) + list(identity.warnings)
             ))
@@ -509,11 +534,20 @@ def read_document(
             "source_hash": hashlib.sha256(data).hexdigest(),
             "source_identity": source_identity,
             "private_filename": private_filename,
-            "parser_version": "wor187_v2",
+            "parser_version": (
+                "wor188_media_v1"
+                if identity.family in {"image", "audio", "video"}
+                else "wor187_v2"
+            ),
             "dependency_versions": {
                 "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
             },
             "limits": limits.as_dict(),
+            "original_metadata": (
+                media_private_metadata
+                if identity.family in {"image", "audio", "video"}
+                else {}
+            ),
             "policy_epoch": policy_epoch,
         })
         if resolved_source_ref:
@@ -548,6 +582,12 @@ def read_document(
             _error_result(exc), sort_keys=True, separators=(",", ":"),
         )
     except document_artifacts.ArtifactStoreError as exc:
+        if media_family:
+            print(
+                "[WOR-188] media artifact failed "
+                f"family={media_family} category={exc.category}",
+                flush=True,
+            )
         error = DocumentReadError(
             "resource_limit_exceeded" if exc.category == "limit_exceeded" else exc.category,
             limit_kind="artifact_count" if exc.category == "limit_exceeded" else None,
@@ -560,6 +600,12 @@ def read_document(
             _error_result(error), sort_keys=True, separators=(",", ":"),
         )
     except Exception:
+        if media_family:
+            print(
+                "[WOR-188] media extraction failed "
+                f"family={media_family} category=extraction_failure",
+                flush=True,
+            )
         emit_document_progress(
             source_key, "failed", document_type=document_type,
             failure_category="extraction_failure",
@@ -605,6 +651,10 @@ def query_document(
     cell_range_ref: str | None = None,
     slide_id: str | None = None,
     embedded_artifact_id: str | None = None,
+    frame_id: str | None = None,
+    track_id: str | None = None,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
 ) -> str:
     """Run one bounded, owner-authorized structured artifact query."""
 
@@ -622,6 +672,10 @@ def query_document(
             cell_range_ref=cell_range_ref,
             slide_id=slide_id,
             embedded_artifact_id=embedded_artifact_id,
+            frame_id=frame_id,
+            track_id=track_id,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
         )
         reference = document_artifacts.get_store().inspect(document_id)
         document_artifacts.capture_reference(reference)

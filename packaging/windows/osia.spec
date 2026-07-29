@@ -38,13 +38,17 @@ hiddenimports = collect_submodules(
 for package in (
     "aiortc",
     "av",
+    "faster_whisper",
     "espeakng_loader",
     "en_core_web_sm",
     "kokoro",
     "mcp",
     "playwright",
     "pypdfium2",
+    "PIL",
+    "reportlab",
     "rapidocr",
+    "soundfile",
     "onnxruntime",
     "uiautomation",
 ):
@@ -57,6 +61,7 @@ datas += collect_data_files("misaki")
 datas += collect_data_files("openwakeword")
 datas += collect_data_files("language_tags")
 datas += copy_metadata("en_core_web_sm")
+datas += copy_metadata("reportlab")
 
 hiddenimports += [
     "comtypes.gen",

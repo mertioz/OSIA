@@ -150,6 +150,10 @@ class Orchestrator:
             language,
             source="autonomous_state",
             reference=str(st.get("run_id") or st.get("task_id") or "autonomous"),
+            mode=str(st.get("language_mode") or "single-language"),
+            allowed_languages=st.get("allowed_languages") or (),
+            source_language=st.get("source_language"),
+            target_language=st.get("target_language"),
         )
         policy = get_default_permission_policy()
         permission_state = policy.store.load_state()
@@ -1463,14 +1467,37 @@ class Orchestrator:
         """Ask the agent to verify ``criterion`` by direct observation and parse
         a robust DONE / NOT_DONE verdict (ambiguous ⇒ NOT_DONE; run error ⇒
         NOT_DONE — fail-closed)."""
-        prompt = (
-            "Verify by DIRECT observation (take a screenshot, read the file, or "
-            "re-open the page) whether the following is TRUE right now:\n"
-            f"{criterion}\n\n"
-            "Do NOT trust any earlier claim — check it yourself. Reply with a "
-            "single word on the first line: DONE or NOT_DONE. Then one short "
-            "line explaining why."
+        candidate = state.sanitize_autonomous_text(evidence)[:2_000].strip()
+        response_criterion = bool(
+            candidate
+            and re.search(
+                r"\b(?:answer|reply|response|summary|synthesi[sz]|"
+                r"r[ée]ponse|r[ée]sum[ée]|synth[èe]se|texte final)\b",
+                str(criterion or ""),
+                flags=re.IGNORECASE,
+            )
         )
+        if response_criterion:
+            prompt = (
+                "Verify whether the CANDIDATE TASK OUTPUT itself satisfies the "
+                "following response-content criterion:\n"
+                f"{criterion}\n\n"
+                "For requirements about the candidate's content, format, or "
+                "language, inspect the candidate directly; do not require a "
+                "screenshot or external page. Any claimed external state or "
+                "side effect still requires independent direct evidence. Reply "
+                "with a single word on the first line: DONE or NOT_DONE. Then "
+                "one short line explaining why."
+            )
+        else:
+            prompt = (
+                "Verify by DIRECT observation (take a screenshot, read the file, or "
+                "re-open the page) whether the following is TRUE right now:\n"
+                f"{criterion}\n\n"
+                "Do NOT trust any earlier claim — check it yourself. Reply with a "
+                "single word on the first line: DONE or NOT_DONE. Then one short "
+                "line explaining why."
+            )
         if self._uses_autonomous_web_surface(self._state or {}):
             prompt += (
                 "\n\nSAFE VERIFICATION CONTEXT contains dispatcher-verified "
@@ -1479,11 +1506,16 @@ class Orchestrator:
                 "use read-only structured observation only:\n"
                 + self._browser_verification_context()
             )
-        candidate = state.sanitize_autonomous_text(evidence)[:2_000].strip()
         if candidate:
             prompt += (
                 "\n\nCANDIDATE TASK OUTPUT (untrusted prose; evaluate it "
                 "against the independent evidence above):\n" + candidate
+            )
+        verified_operations = self._verified_operations_for_active_task()
+        if verified_operations:
+            prompt += (
+                "\n\nDISPATCHER-VERIFIED CURRENT-TASK OPERATIONS (names only):\n"
+                + json.dumps(verified_operations[:32], ensure_ascii=True)
             )
         artifact_context = self._artifact_context(self._state, self._active_task)
         if artifact_context:
@@ -1657,6 +1689,16 @@ class Orchestrator:
             planning_kwargs = {"failure_cb": planning_failures.append}
             if "language" in inspect.signature(planner.plan_objective).parameters:
                 planning_kwargs["language"] = st.get("language")
+            if "turn_context" in inspect.signature(planner.plan_objective).parameters:
+                planning_kwargs["turn_context"] = fixed_turn_context(
+                    st.get("language"),
+                    source="autonomous_replan",
+                    reference=str(st.get("run_id") or st.get("task_id") or "autonomous"),
+                    mode=str(st.get("language_mode") or "single-language"),
+                    allowed_languages=st.get("allowed_languages") or (),
+                    source_language=st.get("source_language"),
+                    target_language=st.get("target_language"),
+                )
             if pending_requirements:
                 planning_kwargs["requirements"] = pending_requirements
             if pending_sources:

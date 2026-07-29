@@ -208,10 +208,34 @@ def detect_language(text: str) -> str:
         return "en"
 
 
-def speak_kokoro(text: str, block: bool = True) -> bool:
+def _authoritative_tts_language(language: str | None, text: str) -> str:
+    if language is None:
+        return detect_language(text)
+    from osia.turn_context import normalize_locale
+
+    return normalize_locale(language) or ""
+
+
+def local_tts_supports(language: str | None) -> bool:
+    """Whether the packaged Kokoro voices have a true language match."""
+
+    from osia.turn_context import normalize_locale
+
+    return normalize_locale(language) in {"en", "fr"}
+
+
+def speak_kokoro(
+    text: str, block: bool = True, *, language: str | None = None,
+) -> bool:
     """Synthesize with Kokoro (local provider). Returns True on success."""
     try:
-        lang = detect_language(text)
+        lang = _authoritative_tts_language(language, text)
+        if lang not in {"en", "fr"}:
+            _debug(
+                f"kokoro: no packaged voice matches authoritative language "
+                f"{lang or 'unknown'!r}; spoken output unavailable"
+            )
+            return False
         lang_code = "f" if lang == "fr" else "a"
         voice = KOKORO_VOICE_FR if lang == "fr" else KOKORO_VOICE_EN
         pipeline = _get_kokoro_pipeline(lang_code)
@@ -449,7 +473,7 @@ def get_active_tts_provider() -> str:
     return get_setting("tts_provider", "local") or "local"
 
 
-def _speak_blocking(text: str):
+def _speak_blocking(text: str, language: str | None = None):
     """One synthesis pass through the dispatcher. Used by both the public
     ``speak`` entrypoint and the streaming worker."""
     if not _AUDIO_OK:
@@ -470,11 +494,11 @@ def _speak_blocking(text: str):
         _debug("_speak_blocking: google FAILED — falling back to kokoro")
 
     # Local provider — and the fallback when a cloud provider fails.
-    ok = speak_kokoro(text, block=True)
+    ok = speak_kokoro(text, block=True, language=language)
     _debug(f"_speak_blocking: dispatch done (kokoro, success={ok})")
 
 
-def speak(text: str, block: bool = True):
+def speak(text: str, block: bool = True, *, language: str | None = None):
     """Speak ``text`` through the configured TTS provider.
 
     Honors the ``tts_provider`` / ``tts_voice`` settings written by the
@@ -487,11 +511,11 @@ def speak(text: str, block: bool = True):
     _debug(f"speak() called (block={block}, {len(text)} chars)")
     print(f"🔊 Speaking: {text[:80]}{'...' if len(text) > 80 else ''}")
     if block:
-        _speak_blocking(text)
+        _speak_blocking(text, language)
         _debug("speak() returned")
     else:
         threading.Thread(
-            target=_speak_blocking, args=(text,), daemon=True,
+            target=_speak_blocking, args=(text, language), daemon=True,
         ).start()
 
 
@@ -725,7 +749,7 @@ def speak_greeting_cached(text: str) -> None:
 # epoch and are silently dropped by the worker. This is what makes wake-word
 # interrupts clean even when the agent thread is still streaming sentences.
 
-_stream_queue: "queue.Queue[tuple[int, str] | None]" = queue.Queue()
+_stream_queue: "queue.Queue[tuple[int, str, str | None] | None]" = queue.Queue()
 _stream_thread: "threading.Thread | None" = None
 _stream_lock = threading.Lock()
 _tts_epoch = 0
@@ -742,7 +766,7 @@ def _stream_worker():
         item = _stream_queue.get()
         if item is None:
             return
-        epoch, text = item
+        epoch, text, language = item
         if epoch != _current_epoch():
             # stale — a stop() happened after this was enqueued
             _debug(
@@ -754,7 +778,10 @@ def _stream_worker():
             print(f"[TTS] Speaking: {text[:80]}{'...' if len(text) > 80 else ''}")
             _stream_playback_context.epoch = epoch
             try:
-                _speak_blocking(text)
+                if language is None:
+                    _speak_blocking(text)
+                else:
+                    _speak_blocking(text, language)
             finally:
                 _stream_playback_context.epoch = None
         except Exception as e:
@@ -770,7 +797,12 @@ def start_streaming_session() -> int:
     return session_id
 
 
-def speak_streaming(text: str, session_id: int | None = None):
+def speak_streaming(
+    text: str,
+    session_id: int | None = None,
+    *,
+    language: str | None = None,
+):
     """Queue a sentence for sequential playback. Use this while a chat
     response is streaming in — each call appends to a single FIFO so
     sentences play in order without overlapping. ``session_id`` is the stable
@@ -796,7 +828,7 @@ def speak_streaming(text: str, session_id: int | None = None):
                 target=_stream_worker, daemon=True, name="osia-tts-stream",
             )
             _stream_thread.start()
-    _stream_queue.put((epoch, text))
+    _stream_queue.put((epoch, text, language))
 
 
 def stop() -> None:

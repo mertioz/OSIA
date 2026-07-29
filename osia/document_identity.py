@@ -20,7 +20,10 @@ from osia.document_containers import (
 
 
 SUPPORTED_FORMATS = frozenset({
-    "pdf", "png", "jpeg", "docx", "odt", "rtf", "txt", "markdown",
+    "pdf", "png", "jpeg", "webp", "gif", "tiff", "bmp",
+    "wav", "mp3", "m4a", "aac", "ogg", "flac",
+    "mp4", "mov", "webm", "mkv",
+    "docx", "odt", "rtf", "txt", "markdown",
     "html", "epub", "xlsx", "ods", "csv", "tsv", "pptx", "odp",
 })
 
@@ -31,10 +34,16 @@ _EXECUTABLE_PREFIXES = (
 _CFB = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 _PNG = b"\x89PNG\r\n\x1a\n"
 _JPEG = b"\xff\xd8\xff"
+_GIF = (b"GIF87a", b"GIF89a")
+_TIFF = (b"II*\x00", b"MM\x00*")
 _RTF_RE = re.compile(rb"^\s*\{\\rtf(?:1|\d+)\b", re.I)
 _REMOTE_SCHEMES = frozenset({"http", "https", "ftp", "ftps", "file", "smb", "data", "javascript"})
 _KNOWN_EXTENSIONS = {
     ".pdf": "pdf", ".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg",
+    ".webp": "webp", ".gif": "gif", ".tif": "tiff", ".tiff": "tiff",
+    ".bmp": "bmp", ".wav": "wav", ".mp3": "mp3", ".m4a": "m4a",
+    ".aac": "aac", ".ogg": "ogg", ".opus": "ogg", ".flac": "flac",
+    ".mp4": "mp4", ".mov": "mov", ".webm": "webm", ".mkv": "mkv",
     ".docx": "docx", ".docm": "docx", ".odt": "odt", ".rtf": "rtf",
     ".txt": "txt", ".md": "markdown", ".markdown": "markdown",
     ".html": "html", ".htm": "html", ".xhtml": "html", ".epub": "epub",
@@ -46,6 +55,20 @@ _FORMAT_MIMES = {
     "pdf": {"application/pdf"},
     "png": {"image/png"},
     "jpeg": {"image/jpeg"},
+    "webp": {"image/webp"},
+    "gif": {"image/gif"},
+    "tiff": {"image/tiff"},
+    "bmp": {"image/bmp", "image/x-ms-bmp"},
+    "wav": {"audio/wav", "audio/wave", "audio/x-wav"},
+    "mp3": {"audio/mpeg", "audio/mp3"},
+    "m4a": {"audio/mp4", "audio/aac", "audio/x-m4a"},
+    "aac": {"audio/aac", "audio/aacp"},
+    "ogg": {"audio/ogg", "audio/opus", "video/ogg"},
+    "flac": {"audio/flac", "audio/x-flac"},
+    "mp4": {"video/mp4"},
+    "mov": {"video/quicktime"},
+    "webm": {"video/webm", "audio/webm"},
+    "mkv": {"video/x-matroska", "audio/x-matroska"},
     "docx": {"application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
     "odt": {"application/vnd.oasis.opendocument.text"},
     "rtf": {"application/rtf", "text/rtf"},
@@ -61,7 +84,11 @@ _FORMAT_MIMES = {
     "odp": {"application/vnd.oasis.opendocument.presentation"},
 }
 _FAMILIES = {
-    "pdf": "document", "png": "image", "jpeg": "image", "docx": "document",
+    "pdf": "document", "png": "image", "jpeg": "image", "webp": "image",
+    "gif": "image", "tiff": "image", "bmp": "image",
+    "wav": "audio", "mp3": "audio", "m4a": "audio", "aac": "audio", "ogg": "audio",
+    "flac": "audio", "mp4": "video", "mov": "video", "webm": "video",
+    "mkv": "video", "docx": "document",
     "odt": "document", "rtf": "document", "txt": "document",
     "markdown": "document", "html": "document", "epub": "document",
     "xlsx": "spreadsheet", "ods": "spreadsheet", "csv": "spreadsheet",
@@ -411,6 +438,56 @@ def _mismatch_warnings(format_label: str, extension: str, declared_mime: str) ->
     return tuple(warnings)
 
 
+def _media_identity(
+    format_label: str,
+    extension: str,
+    declared_mime: str,
+) -> DocumentIdentity:
+    warnings = _mismatch_warnings(format_label, extension, declared_mime)
+    return DocumentIdentity(format_label, _FAMILIES[format_label], warnings)
+
+
+def _iso_bmff_identity(value: bytes) -> str | None:
+    """Identify bounded ISO-BMFF media without trusting its extension."""
+
+    if len(value) < 12 or value[4:8] != b"ftyp":
+        return None
+    first_box_size = int.from_bytes(value[:4], "big")
+    if first_box_size < 12 or first_box_size > len(value):
+        raise DocumentIdentityError("corrupted_media")
+    sample = value[: min(len(value), 2 * 1024 * 1024)]
+    if b"pssh" in sample:
+        raise DocumentIdentityError("drm_protected")
+    if any(marker in sample for marker in (b"encv", b"enca", b"sinf")):
+        raise DocumentIdentityError("encrypted_media")
+    brand = value[8:12]
+    if brand in {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1"}:
+        raise DocumentIdentityError("unsupported_media")
+    has_video = b"vide" in sample
+    has_audio = b"soun" in sample
+    if has_audio and not has_video:
+        return "m4a"
+    if brand in {b"qt  ", b"qt  \x00"[:4]}:
+        return "mov"
+    return "mp4"
+
+
+def _ebml_identity(value: bytes) -> str | None:
+    if not value.startswith(b"\x1aE\xdf\xa3"):
+        return None
+    sample = value[: min(len(value), 1024 * 1024)].lower()
+    if b"webm" in sample:
+        label = "webm"
+    elif b"matroska" in sample:
+        label = "mkv"
+    else:
+        raise DocumentIdentityError("corrupted_media")
+    # Matroska ContentEncodings / ContentEncryption element identifiers.
+    if b"\x50\x35" in sample or b"\x47\xe1" in sample:
+        raise DocumentIdentityError("encrypted_media")
+    return label
+
+
 def identify_document(
     data: bytes,
     *,
@@ -448,15 +525,53 @@ def identify_document(
             raise DocumentIdentityError("external_reference_detected")
         return DocumentIdentity("pdf", "document", _mismatch_warnings("pdf", extension, declared_mime))
     if value.startswith(_PNG):
-        return DocumentIdentity("png", "image", _mismatch_warnings("png", extension, declared_mime))
+        return _media_identity("png", extension, declared_mime)
     if value.startswith(_JPEG):
-        return DocumentIdentity("jpeg", "image", _mismatch_warnings("jpeg", extension, declared_mime))
+        return _media_identity("jpeg", extension, declared_mime)
+    if value.startswith(_GIF):
+        return _media_identity("gif", extension, declared_mime)
+    if value.startswith(_TIFF):
+        return _media_identity("tiff", extension, declared_mime)
+    if value.startswith(b"BM"):
+        if len(value) < 26 or int.from_bytes(value[2:6], "little") > len(value):
+            raise DocumentIdentityError("corrupted_media")
+        return _media_identity("bmp", extension, declared_mime)
+    if len(value) >= 12 and value[:4] == b"RIFF":
+        declared_size = int.from_bytes(value[4:8], "little") + 8
+        if declared_size > len(value) or declared_size < 12:
+            raise DocumentIdentityError("corrupted_media")
+        if value[8:12] == b"WEBP":
+            return _media_identity("webp", extension, declared_mime)
+        if value[8:12] == b"WAVE":
+            return _media_identity("wav", extension, declared_mime)
+        raise DocumentIdentityError("unsupported_media")
+    if value.startswith(b"fLaC"):
+        return _media_identity("flac", extension, declared_mime)
+    if value.startswith(b"OggS"):
+        return _media_identity("ogg", extension, declared_mime)
+    if len(value) >= 7 and value[0] == 0xFF and value[1] & 0xF6 == 0xF0:
+        return _media_identity("aac", extension, declared_mime)
+    if value.startswith(b"ID3") or (
+        len(value) >= 2 and value[0] == 0xFF
+        and value[1] & 0xE0 == 0xE0 and value[1] & 0x06 != 0
+    ):
+        return _media_identity("mp3", extension, declared_mime)
+    iso_label = _iso_bmff_identity(value)
+    if iso_label:
+        return _media_identity(iso_label, extension, declared_mime)
+    ebml_label = _ebml_identity(value)
+    if ebml_label:
+        return _media_identity(ebml_label, extension, declared_mime)
     if _RTF_RE.match(value[:64]):
         _inspect_rtf(value)
         return DocumentIdentity("rtf", "document", _mismatch_warnings("rtf", extension, declared_mime))
     label, text_warnings = _text_identity(value, extension)
     expected = _KNOWN_EXTENSIONS.get(extension)
-    if expected in {"docx", "odt", "epub", "xlsx", "ods", "pptx", "odp", "pdf", "png", "jpeg"}:
+    if expected in {
+        "docx", "odt", "epub", "xlsx", "ods", "pptx", "odp", "pdf",
+        "png", "jpeg", "webp", "gif", "tiff", "bmp", "wav", "mp3",
+        "m4a", "aac", "ogg", "flac", "mp4", "mov", "webm", "mkv",
+    }:
         raise DocumentIdentityError("file_identity_mismatch")
     warnings = list(text_warnings) + list(_mismatch_warnings(label, extension, declared_mime))
     return DocumentIdentity(label, _FAMILIES[label], tuple(dict.fromkeys(warnings)))

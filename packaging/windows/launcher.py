@@ -12,6 +12,8 @@ from osia.runtime import (
     DOCUMENT_WORKER_MODE,
     INSTALL_INTEGRATION_MODE,
     PACKAGE_SMOKE_MODE,
+    PDF_RENDER_WORKER_MODE,
+    MEDIA_WORKER_MODE,
     RELAUNCH_MODE,
     REMOVE_INTEGRATION_MODE,
     SERVER_MODE,
@@ -120,6 +122,13 @@ def _package_smoke() -> int:
         from osia.updater import load_app_metadata
         from osia.document_reader import verify_packaged_dependencies
         from osia.document_extractors.smoke import run_packaged_document_smoke
+        from osia.media_reader import (
+            run_packaged_media_smoke,
+            verify_packaged_dependencies as verify_media_dependencies,
+        )
+        from osia.pdf_renderer import (
+            verify_packaged_dependencies as verify_pdf_renderer_dependencies,
+        )
 
         step = "metadata"
         metadata = load_app_metadata()
@@ -145,6 +154,16 @@ def _package_smoke() -> int:
         step = "pdf_ocr_dependencies"
         if not verify_packaged_dependencies():
             raise RuntimeError("local PDF/OCR dependencies are incomplete")
+        step = "pdf_renderer_dependencies"
+        if not verify_pdf_renderer_dependencies():
+            raise RuntimeError("local PDF renderer dependencies are incomplete")
+        step = "media_dependencies"
+        if not verify_media_dependencies():
+            raise RuntimeError("local media dependencies are incomplete")
+        step = "media_workers"
+        with tempfile.TemporaryDirectory(prefix="osia-media-smoke-") as temporary:
+            if not run_packaged_media_smoke(Path(temporary)):
+                raise RuntimeError("offline image/audio/video smoke failed")
         step = "structured_documents"
         with tempfile.TemporaryDirectory(prefix="osia-document-smoke-") as temporary:
             if not run_packaged_document_smoke(Path(temporary)):
@@ -371,6 +390,18 @@ def main(args: list[str] | None = None) -> int:
         if len(argv) != 2:
             return 2
         from osia.document_reader import worker_main
+
+        return worker_main(argv[1])
+    if mode == MEDIA_WORKER_MODE:
+        if len(argv) != 2:
+            return 2
+        from osia.media_reader import worker_main
+
+        return worker_main(argv[1])
+    if mode == PDF_RENDER_WORKER_MODE:
+        if len(argv) != 2:
+            return 2
+        from osia.pdf_renderer import worker_main
 
         return worker_main(argv[1])
     if mode == SERVICE_MODE:

@@ -379,6 +379,7 @@ def default_callback():
     """
     from osia.voice.stt import listen_for_command
     from osia.agent import run_agent, clean_response
+    from osia.turn_context import resolve_turn_context
     from osia.voice.tts import speak
 
     print("\n🎤 Listening for command...")
@@ -393,7 +394,8 @@ def default_callback():
 
     # Only now — after a valid command — think and call agent
     print("🤔 Thinking...")
-    response = run_agent(user_text)
+    turn_context = resolve_turn_context(user_text)
+    response = run_agent(user_text, turn_context=turn_context)
 
     # PHASE 4: Clean response before speaking
     response = clean_response(response)
@@ -401,7 +403,7 @@ def default_callback():
     print(f"💬 OSIA: {response}")
 
     # Speak response
-    speak(response)
+    speak(response, language=turn_context.language)
 
 
 if __name__ == "__main__":

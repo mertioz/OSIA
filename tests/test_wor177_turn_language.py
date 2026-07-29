@@ -47,7 +47,7 @@ def test_current_request_then_conversation_then_client_then_saved(monkeypatch):
 def test_regional_and_malformed_locales_are_normalized_or_rejected():
     assert normalize_locale("fr_FR.UTF-8") == "fr"
     assert normalize_locale("ZH-hans-CN") == "zh"
-    assert normalize_locale("pt-BR") is None
+    assert normalize_locale("pt-BR") == "pt"
     assert normalize_locale("../../fr") is None
     assert normalize_locale(42) is None
 

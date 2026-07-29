@@ -33,7 +33,8 @@ MAX_EMBEDDED_BYTES = 64 * 1024 * 1024
 SUPPORTED_QUERY_OPERATIONS = (
     "summary", "search", "chunks", "sections", "headings", "table",
     "sheets", "range", "formula", "slides", "notes", "embedded",
-    "provenance",
+    "provenance", "metadata", "ocr", "frames", "pages", "transcript",
+    "time_range", "timeline", "tracks", "chapters",
 )
 
 _SAFE_WARNING_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -431,6 +432,10 @@ def document_counts(document: dict) -> dict:
     pages = int((document.get("metadata") or {}).get("page_count", 0) or 0)
     return {
         "page_count": max(0, pages),
+        "frame_count": len(document.get("frames") or []),
+        "track_count": len(document.get("tracks") or []),
+        "segment_count": len(document.get("transcript") or []),
+        "chapter_count": len(document.get("chapters") or []),
         "section_count": len(document.get("sections") or []),
         "table_count": len(document.get("tables") or []),
         "sheet_count": len(document.get("sheets") or []),

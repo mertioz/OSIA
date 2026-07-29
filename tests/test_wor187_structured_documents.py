@@ -457,7 +457,8 @@ def test_model_contract_advertises_only_opaque_source_and_complete_query():
     assert set(query_spec.input_schema["properties"]["operation"]["enum"]) == {
         "summary", "search", "chunks", "sections", "headings", "table",
         "sheets", "range", "formula", "slides", "notes", "embedded",
-        "provenance",
+        "provenance", "metadata", "ocr", "frames", "pages", "transcript",
+        "time_range", "timeline", "tracks", "chapters",
     }
 
 

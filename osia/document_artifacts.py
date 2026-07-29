@@ -49,10 +49,14 @@ _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PAGE_METHODS = frozenset({"native", "ocr"})
 _DOCUMENT_TYPES = frozenset({
-    "pdf", "png", "jpeg", "docx", "odt", "rtf", "txt", "markdown",
+    "pdf", "png", "jpeg", "webp", "gif", "tiff", "bmp",
+    "wav", "mp3", "m4a", "aac", "ogg", "flac", "mp4", "mov", "webm", "mkv",
+    "docx", "odt", "rtf", "txt", "markdown",
     "html", "epub", "xlsx", "ods", "csv", "tsv", "pptx", "odp",
 })
-_DOCUMENT_FAMILIES = frozenset({"document", "spreadsheet", "presentation", "image"})
+_DOCUMENT_FAMILIES = frozenset({
+    "document", "spreadsheet", "presentation", "image", "audio", "video",
+})
 _PROCESS_OWNER = secrets.token_hex(32)
 try:
     import psutil
@@ -174,7 +178,8 @@ def sanitize_reference(value) -> dict | None:
                 return None
             counts = {}
             for name in (
-                "page_count", "section_count", "table_count", "sheet_count",
+                "page_count", "frame_count", "track_count", "segment_count",
+                "chapter_count", "section_count", "table_count", "sheet_count",
                 "slide_count", "chunk_count", "embedded_count",
             ):
                 count = int(value.get(name, 0) or 0)
@@ -186,7 +191,7 @@ def sanitize_reference(value) -> dict | None:
                 code = str(operation or "")
                 if _SAFE_CODE_RE.fullmatch(code) and code not in operations:
                     operations.append(code)
-                if len(operations) >= 16:
+                if len(operations) >= 32:
                     break
             page_methods = [
                 str(item) for item in (value.get("page_methods") or [])
@@ -200,6 +205,13 @@ def sanitize_reference(value) -> dict | None:
                 confidence = round(float(confidence), 4)
                 if not math.isfinite(confidence) or not (0.0 <= confidence <= 1.0):
                     confidence = None
+            duration = value.get("duration_seconds")
+            if duration is not None:
+                duration = round(float(duration), 3)
+                if not math.isfinite(duration) or duration < 0 or duration > 3_600:
+                    duration = None
+            width = max(0, min(int(value.get("width", 0) or 0), 8_192))
+            height = max(0, min(int(value.get("height", 0) or 0), 8_192))
         except (TypeError, ValueError, OverflowError):
             return None
         return {
@@ -214,6 +226,9 @@ def sanitize_reference(value) -> dict | None:
             "page_methods": page_methods,
             "content_length": content_length,
             "confidence": confidence,
+            "duration_seconds": duration,
+            "width": width,
+            "height": height,
             "provenance_available": value.get("provenance_available") is True,
             "truncated": value.get("truncated") is True,
             "warnings": warnings,
@@ -666,6 +681,16 @@ class ArtifactStore:
                 "expires_at": created_at + ttl,
                 "provenance": "local_document",
             }
+            metadata = document.get("metadata") or {}
+            public["duration_seconds"] = metadata.get("duration_seconds")
+            public["width"] = metadata.get("width")
+            public["height"] = metadata.get("height")
+            requested_queries = document.get("supported_queries")
+            if isinstance(requested_queries, list):
+                public["supported_queries"] = [
+                    item for item in requested_queries
+                    if item in SUPPORTED_QUERY_OPERATIONS
+                ][:32]
             reference = sanitize_reference(public)
             if reference is None:
                 raise ArtifactStoreError("extraction_failure")
@@ -682,6 +707,9 @@ class ArtifactStore:
                 "parser_version": parser_version,
                 "dependency_versions": dict((private_metadata or {}).get("dependency_versions") or {}),
                 "limits": dict((private_metadata or {}).get("limits") or {}),
+                "original_metadata": dict(
+                    (private_metadata or {}).get("original_metadata") or {}
+                ),
                 "policy_epoch": int((private_metadata or {}).get("policy_epoch", 0) or 0),
                 "created_at": created_at,
                 "creator_pid": os.getpid(),
@@ -796,6 +824,10 @@ class ArtifactStore:
         cell_range_ref: str | None = None,
         slide_id: str | None = None,
         embedded_artifact_id: str | None = None,
+        frame_id: str | None = None,
+        track_id: str | None = None,
+        start_seconds: float | None = None,
+        end_seconds: float | None = None,
     ) -> dict:
         """Execute one centrally bounded deterministic structured query."""
 
@@ -859,6 +891,10 @@ class ArtifactStore:
                     "preview": preview,
                     "counts": {
                         "chunks": len(chunks),
+                        "frames": len(document.get("frames") or []),
+                        "tracks": len(document.get("tracks") or []),
+                        "segments": len(document.get("transcript") or []),
+                        "chapters": len(document.get("chapters") or []),
                         "sections": len(document.get("sections") or []),
                         "tables": len(document.get("tables") or []),
                         "sheets": len(document.get("sheets") or []),
@@ -984,6 +1020,64 @@ class ArtifactStore:
                     ]
                 total = len(source)
                 items = source[offset:offset + max_items]
+            elif operation == "metadata":
+                result["metadata"] = dict(document.get("metadata") or {})
+            elif operation in {"frames", "pages"}:
+                source = document.get("frames") or []
+                if operation == "pages":
+                    source = [item for item in source if item.get("kind") == "page"]
+                if frame_id:
+                    source = [item for item in source if item.get("frame_id") == frame_id]
+                total = len(source)
+                items = source[offset:offset + max_items]
+                result["not_found"] = bool(frame_id and not items)
+            elif operation == "ocr":
+                source = document.get("ocr_blocks") or []
+                if frame_id:
+                    source = [item for item in source if item.get("frame_id") == frame_id]
+                if query:
+                    needle = str(query).casefold()
+                    source = [
+                        item for item in source
+                        if needle in str(item.get("text") or "").casefold()
+                    ]
+                total = len(source)
+                items = source[offset:offset + max_items]
+                result["not_found"] = bool((frame_id or query) and not items)
+            elif operation == "transcript":
+                source = document.get("transcript") or []
+                if track_id:
+                    source = [item for item in source if item.get("track_id") == track_id]
+                total = len(source)
+                items = source[offset:offset + max_items]
+            elif operation in {"time_range", "timeline"}:
+                if start_seconds is None or end_seconds is None:
+                    raise ArtifactStoreError("invalid_query")
+                try:
+                    start = float(start_seconds)
+                    end = float(end_seconds)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ArtifactStoreError("invalid_query") from exc
+                if not (math.isfinite(start) and math.isfinite(end)) or start < 0 or end <= start:
+                    raise ArtifactStoreError("invalid_query")
+                duration = float((document.get("metadata") or {}).get("duration_seconds", 0) or 0)
+                if end > min(3_600.0, duration + 0.001):
+                    raise ArtifactStoreError("invalid_query")
+                key = "timeline" if operation == "timeline" else "transcript"
+                source = [
+                    item for item in document.get(key) or []
+                    if float(item.get("end_seconds", item.get("time_seconds", 0)) or 0) >= start
+                    and float(item.get("start_seconds", item.get("time_seconds", 0)) or 0) <= end
+                ]
+                total = len(source)
+                items = source[offset:offset + max_items]
+            elif operation in {"tracks", "chapters"}:
+                source = document.get(operation) or []
+                if operation == "tracks" and track_id:
+                    source = [item for item in source if item.get("track_id") == track_id]
+                total = len(source)
+                items = source[offset:offset + max_items]
+                result["not_found"] = bool(track_id and not items)
             if operation != "summary":
                 result["items"] = items
                 if total and offset + len(items) < total and not result.get("next_cursor"):

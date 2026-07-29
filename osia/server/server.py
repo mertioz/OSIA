@@ -86,6 +86,7 @@ Protocol (JSON over WebSocket, port 8765):
 
 import asyncio
 import base64
+import binascii
 import concurrent.futures
 import contextvars
 import hashlib
@@ -101,6 +102,7 @@ import tempfile
 import threading
 import time
 import traceback
+import wave
 from collections import OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
@@ -136,6 +138,7 @@ from osia.memory import (
 )
 from osia.server.text_coalescer import AssistantTextCoalescer
 from osia.turn_context import (
+    TurnContext,
     fixed_turn_context,
     localized_text,
     log_final,
@@ -377,12 +380,23 @@ _log_active_model()
 # ---------------------------------------------------------------------------
 # TTS → mp3 bytes (synthesis without playback)
 # ---------------------------------------------------------------------------
-def _kokoro_to_mp3_bytes(text: str) -> bytes:
+def _kokoro_to_mp3_bytes(text: str, language: str | None = None) -> bytes:
     """Synthesize text with Kokoro and return mp3 bytes."""
     from kokoro import KPipeline
-    from osia.voice.tts import detect_language, KOKORO_VOICE_FR, KOKORO_VOICE_EN, KOKORO_SPEED, KOKORO_SR
+    from osia.voice.tts import (
+        detect_language,
+        KOKORO_SR,
+        KOKORO_SPEED,
+        KOKORO_VOICE_EN,
+        KOKORO_VOICE_FR,
+        local_tts_supports,
+    )
 
-    lang = detect_language(text)
+    lang = normalize_locale(language) if language is not None else detect_language(text)
+    if not local_tts_supports(lang):
+        raise RuntimeError(
+            f"local TTS unavailable for authoritative language {lang or 'unknown'}"
+        )
     lang_code = "f" if lang == "fr" else "a"
     voice = KOKORO_VOICE_FR if lang == "fr" else KOKORO_VOICE_EN
     pipeline = KPipeline(lang_code=lang_code)
@@ -406,7 +420,7 @@ def _kokoro_to_mp3_bytes(text: str) -> bytes:
     return _wav_to_mp3(wav_buf.read())
 
 
-def _openai_to_mp3_bytes(text: str) -> bytes:
+def _openai_to_mp3_bytes(text: str, language: str | None = None) -> bytes:
     """Synthesize text with OpenAI TTS and return mp3 bytes.
 
     Rotates through the user's OpenAI key chain on a 429/5xx/auth/timeout error
@@ -414,6 +428,7 @@ def _openai_to_mp3_bytes(text: str) -> bytes:
     the caller falls back to Kokoro. WAV→MP3 conversion stays outside the
     rotation so an ffmpeg failure never burns API keys.
     """
+    del language  # OpenAI's multilingual voice reads the authoritative text verbatim.
     import requests
     from osia.config import get_setting
     from osia.voice.tts import OPENAI_VOICES, PROVIDER_DEFAULT_VOICE
@@ -446,7 +461,7 @@ def _openai_to_mp3_bytes(text: str) -> bytes:
     return _wav_to_mp3(content)
 
 
-def _google_to_mp3_bytes(text: str) -> bytes:
+def _google_to_mp3_bytes(text: str, language: str | None = None) -> bytes:
     """Synthesize text with Gemini TTS (REST generateContent) and return mp3 bytes.
 
     Mirrors ``osia.voice.tts.speak_google``: Google *Cloud* TTS rejects simple
@@ -455,6 +470,7 @@ def _google_to_mp3_bytes(text: str) -> bytes:
     Audio comes back as base64 24kHz 16-bit mono PCM, which we wrap as WAV and
     transcode to MP3 for the phone (the WebSocket protocol still ships mp3).
     """
+    del language  # Gemini TTS is instructed to preserve the text's language.
     import requests
     from osia.config import get_setting
     from osia.voice.tts import (
@@ -555,7 +571,7 @@ def _wav_to_mp3(wav_bytes: bytes, bitrate: str = "128k") -> bytes:
     return output.getvalue()
 
 
-def synthesize_to_mp3_bytes(text: str) -> bytes:
+def synthesize_to_mp3_bytes(text: str, language: str | None = None) -> bytes:
     """Synthesize text to MP3 bytes using the configured TTS provider.
 
     Follows the same provider chain as ``osia.voice.tts._speak_blocking``:
@@ -576,7 +592,7 @@ def synthesize_to_mp3_bytes(text: str) -> bytes:
     # we only reach Kokoro once every configured key is exhausted.
     if provider == "openai" and has_key("openai"):
         try:
-            mp3 = _openai_to_mp3_bytes(text)
+            mp3 = _openai_to_mp3_bytes(text, language)
             print(
                 f"[TTS] synthesize_to_mp3_bytes: done via openai ({len(mp3)} bytes)",
                 flush=True,
@@ -586,7 +602,7 @@ def synthesize_to_mp3_bytes(text: str) -> bytes:
             print(f"⚠️  OpenAI TTS failed, falling back to Kokoro: {e}")
     elif provider == "google" and has_key("google"):
         try:
-            mp3 = _google_to_mp3_bytes(text)
+            mp3 = _google_to_mp3_bytes(text, language)
             print(
                 f"[TTS] synthesize_to_mp3_bytes: done via google ({len(mp3)} bytes)",
                 flush=True,
@@ -595,7 +611,7 @@ def synthesize_to_mp3_bytes(text: str) -> bytes:
         except Exception as e:
             print(f"⚠️  Google TTS failed, falling back to Kokoro: {e}")
 
-    mp3 = _kokoro_to_mp3_bytes(text)
+    mp3 = _kokoro_to_mp3_bytes(text, language)
     print(
         f"[TTS] synthesize_to_mp3_bytes: done via kokoro ({len(mp3)} bytes)",
         flush=True,
@@ -606,12 +622,70 @@ def synthesize_to_mp3_bytes(text: str) -> bytes:
 # ---------------------------------------------------------------------------
 # Audio decoding (base64 WAV → numpy array)
 # ---------------------------------------------------------------------------
+MAX_MICROPHONE_WAV_BYTES = 16 * 1024 * 1024
+MAX_MICROPHONE_SECONDS = 60.0
+MAX_MICROPHONE_CHANNELS = 2
+MAX_MICROPHONE_SAMPLE_RATE = 192_000
+
+
 def decode_base64_wav(b64_data: str) -> tuple[np.ndarray, int]:
-    """Decode a base64-encoded WAV string into (samples, sample_rate)."""
-    raw = base64.b64decode(b64_data)
-    buf = io.BytesIO(raw)
-    audio, sr = sf.read(buf, dtype="float32", always_2d=False)
-    return audio, sr
+    """Strictly decode one bounded PCM WAV without libsndfile in this process."""
+
+    if not isinstance(b64_data, str):
+        raise ValueError("invalid_audio_encoding")
+    maximum_b64 = ((MAX_MICROPHONE_WAV_BYTES + 2) // 3) * 4
+    if not b64_data or len(b64_data) > maximum_b64:
+        raise ValueError("audio_size_limit")
+    try:
+        raw = base64.b64decode(b64_data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("invalid_audio_encoding") from exc
+    if not (44 <= len(raw) <= MAX_MICROPHONE_WAV_BYTES):
+        raise ValueError("audio_size_limit")
+    if raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        raise ValueError("invalid_wav")
+    if int.from_bytes(raw[4:8], "little") + 8 != len(raw):
+        raise ValueError("invalid_wav")
+    try:
+        with wave.open(io.BytesIO(raw), "rb") as reader:
+            channels = int(reader.getnchannels())
+            sample_rate = int(reader.getframerate())
+            sample_width = int(reader.getsampwidth())
+            frame_count = int(reader.getnframes())
+            if reader.getcomptype() != "NONE":
+                raise ValueError("unsupported_wav_codec")
+            if not (1 <= channels <= MAX_MICROPHONE_CHANNELS):
+                raise ValueError("audio_channel_limit")
+            if not (1 <= sample_rate <= MAX_MICROPHONE_SAMPLE_RATE):
+                raise ValueError("audio_sample_rate_limit")
+            if sample_width not in {1, 2, 3, 4}:
+                raise ValueError("unsupported_wav_codec")
+            if frame_count <= 0 or frame_count / sample_rate > MAX_MICROPHONE_SECONDS:
+                raise ValueError("audio_duration_limit")
+            payload = reader.readframes(frame_count)
+            if len(payload) != frame_count * channels * sample_width:
+                raise ValueError("invalid_wav")
+    except (wave.Error, EOFError) as exc:
+        raise ValueError("invalid_wav") from exc
+
+    if sample_width == 1:
+        samples = (np.frombuffer(payload, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif sample_width == 2:
+        samples = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        samples = np.frombuffer(payload, dtype="<i4").astype(np.float32) / 2147483648.0
+    else:
+        octets = np.frombuffer(payload, dtype=np.uint8).reshape(-1, 3)
+        signed = (
+            octets[:, 0].astype(np.int32)
+            | (octets[:, 1].astype(np.int32) << 8)
+            | (octets[:, 2].astype(np.int32) << 16)
+        )
+        signed = (signed ^ 0x800000) - 0x800000
+        samples = signed.astype(np.float32) / 8388608.0
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1, dtype=np.float32)
+    return np.ascontiguousarray(samples, dtype=np.float32), sample_rate
 
 
 # ---------------------------------------------------------------------------
@@ -4635,7 +4709,7 @@ def _autonomous_start_worker(
     objective: str,
     model: str,
     my_gen: int,
-    language: str,
+    turn_context: TurnContext,
     origin_ref: str = "mobile_legacy",
     document_inventory=(),
     document_session_owner: str = "",
@@ -4670,11 +4744,16 @@ def _autonomous_start_worker(
     then reopen the gate — exactly as the resume path does."""
     try:
         agent, orch = _ensure_autonomous_engine()
-        autonomous_context = fixed_turn_context(
-            language,
-            source="autonomous_start",
-            reference=f"autonomous-{my_gen}",
+        autonomous_context = (
+            turn_context
+            if isinstance(turn_context, TurnContext)
+            else fixed_turn_context(
+                str(turn_context or ""),
+                source="autonomous_start",
+                reference=f"autonomous-{my_gen}",
+            )
         )
+        language = autonomous_context.language
         agent.set_turn_context(autonomous_context)
 
         # ── DRAIN before spawning (never two loops on the shared agent) ──
@@ -4756,6 +4835,7 @@ def _autonomous_start_worker(
                     objective, provider, model, agent,
                     failure_cb=planning_failures.append,
                     language=language,
+                    turn_context=autonomous_context,
                     origin_ref=origin_ref,
                     run_id=planned_run_id,
                     document_sources=document_inventory,
@@ -5145,6 +5225,10 @@ def _autonomous_resume_worker(
             st.get("language"),
             source="autonomous_resume",
             reference=str(st.get("task_id") or "autonomous"),
+            mode=str(st.get("language_mode") or "single-language"),
+            allowed_languages=st.get("allowed_languages") or (),
+            source_language=st.get("source_language"),
+            target_language=st.get("target_language"),
         )
         agent.set_turn_context(resume_context)
         from osia.mobile_model_catalogue import (
@@ -5317,6 +5401,40 @@ def _internal_autonomous_origin(st: dict) -> str:
     return "desktop"
 
 
+def _apply_internal_autonomous_model(agent, st: dict) -> bool:
+    """Restore a persisted mobile run's model before local-PC execution."""
+
+    saved_provider = str(st.get("provider") or "").strip()
+    saved_model = str(st.get("model") or "").strip()
+    if not saved_provider or not saved_model:
+        # Compatibility for old checkpoints that predate the persisted pair.
+        return True
+    try:
+        from osia.mobile_model_catalogue import (
+            apply_autonomous_agent_model,
+            resolve_current_autonomous_selection,
+        )
+
+        resolution = resolve_current_autonomous_selection(
+            provider_id=saved_provider,
+            model_id=saved_model,
+            refresh_account=True,
+        )
+        provider = resolution.get("provider_id") or ""
+        model = resolution.get("model_id") or ""
+        if resolution.get("fallback_occurred"):
+            print(
+                "[WOR-188] Autonomous authorization model fallback: "
+                f"{resolution.get('reason') or 'unavailable'}"
+            )
+        if not provider or not model:
+            return False
+        apply_autonomous_agent_model(agent, provider, model)
+        return True
+    except Exception:
+        return False
+
+
 @app.get("/internal/autonomous_authorization_state")
 async def internal_autonomous_authorization_state(request: Request):
     """Expose the canonical mobile run only to the local PC review panel."""
@@ -5350,6 +5468,15 @@ async def internal_autonomous_authorization_action(request: Request):
     if not isinstance(st, dict):
         return {"ok": False, "error": "run_missing"}
     try:
+        prepared_engine = None
+        if action in {"authorize", "scope_approve"}:
+            prepared_engine = _ensure_autonomous_engine()
+            if not _apply_internal_autonomous_model(prepared_engine[0], st):
+                return {
+                    "ok": False,
+                    "error": "model_setup_failure",
+                    "state": _autonomous_pc_snapshot(st),
+                }
         if action == "authorize":
             origin_ref = _internal_autonomous_origin(st)
             response = _aauthorization.response_for_current_request(
@@ -5359,7 +5486,7 @@ async def internal_autonomous_authorization_action(request: Request):
                 st, response, origin_ref=origin_ref,
             )
             _astate.save_task_state(st)
-            _agent, orch = _ensure_autonomous_engine()
+            _agent, orch = prepared_engine
             orch.start(st)
             event = "running"
         elif action in {"scope_approve", "scope_deny"}:
@@ -5375,7 +5502,7 @@ async def internal_autonomous_authorization_action(request: Request):
             )
             _astate.save_task_state(st)
             if action == "scope_approve":
-                _agent, orch = _ensure_autonomous_engine()
+                _agent, orch = prepared_engine
                 orch.resume(st)
                 event = "running"
             else:
@@ -6646,7 +6773,7 @@ async def websocket_endpoint(ws: WebSocket):
                 threading.Thread(
                     target=_autonomous_start_worker,
                     args=(
-                        objective, model, _gen, autonomous_context.language,
+                        objective, model, _gen, autonomous_context,
                         authorization_origin_ref,
                         document_inventory,
                         document_owner,
@@ -8039,6 +8166,7 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "speak":
                 coordinated = _application_transport_coordination_enabled()
                 speak_meta = None
+                speak_language = None
                 if coordinated:
                     speak_conv_id = str(msg.get("conversation_id") or "").strip()
                     speak_request_id = _clean_client_request_id(
@@ -8073,6 +8201,7 @@ async def websocket_endpoint(ws: WebSocket):
                         print("[OSIA Server] speak rejected: correlation mismatch")
                         continue
                     speak_text = str(persisted["assistant_content"])
+                    speak_language = normalize_locale(persisted.get("language"))
                     speak_meta = {
                         "conversation_id": speak_conv_id,
                         "request_id": speak_request_id,
@@ -8095,7 +8224,7 @@ async def websocket_endpoint(ws: WebSocket):
                     # Off-thread so the event loop keeps serving while the
                     # TTS provider synthesizes.
                     mp3_bytes = await asyncio.to_thread(
-                        synthesize_to_mp3_bytes, speak_text,
+                        synthesize_to_mp3_bytes, speak_text, speak_language,
                     )
                     mp3_b64 = base64.b64encode(mp3_bytes).decode("ascii")
                     # source="speak" tells the client this audio was
@@ -8336,6 +8465,7 @@ async def websocket_endpoint(ws: WebSocket):
                                 permission_session.device_id
                             )
                             turn_meta["client_locale"] = msg.get("locale")
+                            turn_meta["_original_user_text"] = display_prompt
                             turn_meta["tts_enabled"] = (
                                 msg.get("tts_enabled", True) is not False
                             )
@@ -8544,6 +8674,7 @@ async def websocket_endpoint(ws: WebSocket):
                         permission_session.device_id
                     )
                     turn_meta["client_locale"] = msg.get("locale")
+                    turn_meta["_original_user_text"] = user_text
                     turn_meta["tts_enabled"] = (
                         msg.get("tts_enabled", True) is not False
                     )
@@ -9006,7 +9137,7 @@ def _consume_pending_files(
         for item in capabilities
     )
     return (
-        "[Document attachments available through read_document and "
+        "[Document/media attachments available through read_document and "
         f"query_document:\n{bullets}\n]\n\n{user_text}"
     )
 
@@ -9058,12 +9189,33 @@ class _ResponseTTSSession:
         t0: float,
         *,
         synthesize=None,
+        language: str | None = None,
         max_pending: int = _TTS_MAX_PENDING_SEGMENTS,
     ) -> None:
         self.ws = ws
         self.turn_meta = turn_meta
         self.t0 = t0
+        self._uses_default_synthesize = synthesize is None
         self._synthesize = synthesize or synthesize_to_mp3_bytes
+        synthesis_target = getattr(self._synthesize, "side_effect", None)
+        if not callable(synthesis_target):
+            synthesis_target = self._synthesize
+        try:
+            import inspect
+
+            parameters = inspect.signature(synthesis_target).parameters.values()
+            self._synthesize_accepts_language = any(
+                parameter.name == "language"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except Exception:
+            self._synthesize_accepts_language = False
+        self.language = (
+            normalize_locale(language)
+            or normalize_locale(turn_meta.get("language"))
+            or i18n.DEFAULT_LANG
+        )
         self._max_pending = max(1, int(max_pending))
         self._pending: deque[tuple[int, int, str]] = deque()
         self._wake = asyncio.Event()
@@ -9140,6 +9292,8 @@ class _ResponseTTSSession:
         elif current != self._settings_signature:
             raise _TTSSettingsChanged("TTS provider or voice changed")
         try:
+            if self._uses_default_synthesize and self._synthesize_accepts_language:
+                return self._synthesize(text, language=self.language)
             return self._synthesize(text)
         finally:
             if _tts_settings_signature() != self._settings_signature:
@@ -9385,6 +9539,35 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             "items": conversations.list_conversations(),
         })
 
+    # Resolve from the original user-authored turn before attachment manifests
+    # or other generated English metadata can enter the provider input. Keep
+    # persisted ``_language`` metadata visible for this one decision, then strip
+    # all transport metadata before the provider sees history.
+    original_user_text = (
+        turn_meta.get("_original_user_text")
+        if isinstance(turn_meta, dict) else None
+    )
+    if not isinstance(original_user_text, str):
+        original_user_text = (
+            turn_meta.get("persisted_user_content")
+            if isinstance(turn_meta, dict) else None
+        )
+    if not isinstance(original_user_text, str):
+        original_user_text = text
+    turn_context = resolve_turn_context(
+        original_user_text,
+        history=history,
+        client_locale=(turn_meta or {}).get("client_locale"),
+        saved_language=i18n.get_language(),
+        reference=(turn_meta or {}).get("turn_id"),
+    )
+    if isinstance(turn_meta, dict):
+        turn_meta["language"] = turn_context.language
+        turn_meta["language_source"] = turn_context.source
+        turn_meta["language_mode"] = turn_context.mode
+        turn_meta["allowed_languages"] = list(turn_context.allowed_languages)
+        turn_meta["turn_ref"] = turn_context.turn_ref
+
     # Correlation metadata belongs to persistence and transport only. Provider
     # message APIs must never receive those underscore-prefixed fields.
     history = [
@@ -9396,17 +9579,6 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         for item in history
         if isinstance(item, dict)
     ]
-    turn_context = resolve_turn_context(
-        text,
-        history=history,
-        client_locale=(turn_meta or {}).get("client_locale"),
-        saved_language=i18n.get_language(),
-        reference=(turn_meta or {}).get("turn_id"),
-    )
-    if isinstance(turn_meta, dict):
-        turn_meta["language"] = turn_context.language
-        turn_meta["language_source"] = turn_context.source
-        turn_meta["turn_ref"] = turn_context.turn_ref
     prev_len = len(history)
     persisted_user_content = (
         turn_meta.get("persisted_user_content", text)
@@ -10031,6 +10203,7 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
         )
 
         agent_input = transcript
+        turn_meta["_original_user_text"] = transcript
         if pending_files:
             agent_input = _consume_pending_files(
                 agent_input, pending_files, owner_id=active_conv_id,

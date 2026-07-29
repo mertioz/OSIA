@@ -19,6 +19,8 @@ REMOVE_INTEGRATION_MODE = "--osia-remove-integration"
 PACKAGE_SMOKE_MODE = "--osia-package-smoke"
 RELAUNCH_MODE = "--osia-relaunch"
 DOCUMENT_WORKER_MODE = "--osia-document-worker"
+MEDIA_WORKER_MODE = "--osia-media-worker"
+PDF_RENDER_WORKER_MODE = "--osia-pdf-render-worker"
 
 
 def is_frozen() -> bool:

@@ -64,6 +64,16 @@ _IMAGE_MIME = {
     ".png": "image/png",
     ".gif": "image/gif",
     ".webp": "image/webp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".bmp": "image/bmp",
+}
+_FORMAT_MIME = {
+    "png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp",
+    "gif": "image/gif", "tiff": "image/tiff", "bmp": "image/bmp",
+    "wav": "audio/wav", "mp3": "audio/mpeg", "m4a": "audio/mp4", "aac": "audio/aac",
+    "ogg": "audio/ogg", "flac": "audio/flac", "mp4": "video/mp4",
+    "mov": "video/quicktime", "webm": "video/webm", "mkv": "video/x-matroska",
 }
 
 
@@ -136,16 +146,24 @@ def safe_extension(display_name: str) -> str:
 
 
 def detect_type(path: Path, display_name: str) -> tuple[str, str]:
-    """Detect supported images by signature; all other files stay inert."""
+    """Project a byte-proved safe family/MIME; failures remain inert."""
 
     try:
         with path.open("rb") as handle:
-            prefix = handle.read(16)
+            data = handle.read(MAX_ATTACHMENT_BYTES + 1)
     except OSError as exc:
         raise AttachmentProtocolError("file_read_failed") from exc
-    mime = detect_image_mime(prefix)
-    if mime is not None:
-        return "image", mime
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        raise AttachmentProtocolError("file_too_large")
+    try:
+        from osia.document_identity import identify_document
+
+        identity = identify_document(data, display_name=display_name)
+        mime = _FORMAT_MIME.get(identity.format_label, "application/octet-stream")
+        category = identity.family if identity.family in {"image", "audio", "video"} else "file"
+        return category, mime
+    except Exception:
+        pass
     suffix = Path(display_name).suffix.lower()
     return "file", "application/octet-stream" if suffix not in _IMAGE_MIME else "application/octet-stream"
 
@@ -493,7 +511,9 @@ class AttachmentBatchManager:
                 if not declared_mime or len(declared_mime) > MAX_MIME_CHARS:
                     raise AttachmentProtocolError("invalid_mime")
                 declared_category = str(raw.get("detected_type_category") or "file")
-                if declared_category not in {"file", "image", "text", "document"}:
+                if declared_category not in {
+                    "file", "image", "audio", "video", "text", "document",
+                }:
                     raise AttachmentProtocolError("invalid_type_category")
                 declared_size = _require_int(
                     raw.get("declared_byte_size"), minimum=1,
@@ -1031,7 +1051,7 @@ def build_agent_input(
     *,
     owner_id: str | None = None,
 ) -> str | list[dict]:
-    """Create opaque sources before provider input plus existing image parts."""
+    """Create opaque local sources before any provider input."""
 
     ordered = sorted(attachments, key=lambda item: item.logical_order)
     sources = list(ordered)
@@ -1064,7 +1084,7 @@ def build_agent_input(
             for index, item in enumerate(capabilities, start=1)
         )
         text = (
-            "[Document attachments in original order. Use read_document with "
+            "[Document/media attachments in original order. Use read_document with "
             "each opaque source_ref, then query_document; never request or "
             "infer a local path:\n"
             f"{bullets}\n]\n\n{text}"

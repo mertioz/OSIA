@@ -64,6 +64,19 @@ class DecodedImage:
     data: bytes
 
 
+@dataclass(frozen=True)
+class MediaExportDecision:
+    """Fail-closed decision for an optional provider-side image description."""
+
+    provider_capable: bool
+    exact_source_authorized: bool
+    media_export_authorized: bool
+    canonical_reencoded: bool
+    same_provider: bool
+    usable: bool
+    reason: str
+
+
 def text_content(content) -> str:
     """Return only textual parts from one OpenAI-style message content value."""
 
@@ -257,6 +270,42 @@ def image_input_decision(
         formats_accepted=formats_ok,
         encoding=encoding,
         usable=usable,
+        reason=reason,
+    )
+
+
+def media_export_decision(
+    provider: str,
+    model: str,
+    mime_type: str,
+    *,
+    exact_source_authorized: bool,
+    media_export_authorized: bool,
+    canonical_reencoded: bool,
+    same_provider: bool,
+) -> MediaExportDecision:
+    """Require every WOR-188 export condition; local OCR needs none of them."""
+
+    capability = image_input_decision(provider, model, (mime_type,))
+    checks = (
+        (capability.usable, capability.reason),
+        (exact_source_authorized, "the exact image source is not authorized"),
+        (media_export_authorized, "media export permission is not authorized"),
+        (canonical_reencoded, "the image was not canonically metadata-stripped"),
+        (same_provider, "silent provider switching is forbidden"),
+    )
+    reason = "supported"
+    for allowed, failure in checks:
+        if not allowed:
+            reason = failure
+            break
+    return MediaExportDecision(
+        provider_capable=capability.usable,
+        exact_source_authorized=bool(exact_source_authorized),
+        media_export_authorized=bool(media_export_authorized),
+        canonical_reencoded=bool(canonical_reencoded),
+        same_provider=bool(same_provider),
+        usable=all(item[0] for item in checks),
         reason=reason,
     )
 

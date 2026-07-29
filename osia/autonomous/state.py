@@ -692,6 +692,10 @@ def _normalize_phase(phase, *, private_filenames=()) -> dict:
 
 def new_task_state(objective: str, provider: str, model: str, phases, *,
                    language: str | None = None,
+                   language_mode: str = "single-language",
+                   allowed_languages=(),
+                   source_language: str | None = None,
+                   target_language: str | None = None,
                    run_id: str | None = None) -> dict:
     """Build a fresh ``task_state`` dict (NOT persisted — caller saves).
 
@@ -725,6 +729,16 @@ def new_task_state(objective: str, provider: str, model: str, phases, *,
         if safe_text != raw_text:
             item["_runtime_criterion"] = raw_text
         checklist.append(item)
+    normalized_language = normalize_locale(language) or i18n.DEFAULT_LANG
+    normalized_mode = (
+        language_mode
+        if language_mode in {"single-language", "translation", "multilingual"}
+        else "single-language"
+    )
+    normalized_allowed = list(dict.fromkeys(
+        code for code in (normalize_locale(item) for item in allowed_languages)
+        if code
+    )) or [normalized_language]
     result = {
         "schema_version": SCHEMA_VERSION,
         "task_id": uuid.uuid4().hex,
@@ -756,7 +770,11 @@ def new_task_state(objective: str, provider: str, model: str, phases, *,
         "operation_records": [],
         "ambiguity_barriers": [],
         "browser_checkpoint": normalize_browser_checkpoint({}),
-        "language": normalize_locale(language) or i18n.DEFAULT_LANG,
+        "language": normalized_language,
+        "language_mode": normalized_mode,
+        "allowed_languages": normalized_allowed,
+        "source_language": normalize_locale(source_language) or "",
+        "target_language": normalize_locale(target_language) or "",
         "cursor": {"phase": 0, "task": 0},
         "budgets": {
             "max_attempts_per_task": DEFAULT_MAX_ATTEMPTS_PER_TASK,
@@ -1299,6 +1317,25 @@ def load_task_state() -> "dict | None":
         # language exactly once; process LANG never influences resume.
         loaded["language"] = (
             normalize_locale(loaded.get("language")) or i18n.DEFAULT_LANG
+        )
+        loaded["language_mode"] = (
+            loaded.get("language_mode")
+            if loaded.get("language_mode") in {
+                "single-language", "translation", "multilingual",
+            }
+            else "single-language"
+        )
+        loaded["allowed_languages"] = list(dict.fromkeys(
+            code for code in (
+                normalize_locale(item)
+                for item in (loaded.get("allowed_languages") or ())
+            ) if code
+        )) or [loaded["language"]]
+        loaded["source_language"] = (
+            normalize_locale(loaded.get("source_language")) or ""
+        )
+        loaded["target_language"] = (
+            normalize_locale(loaded.get("target_language")) or ""
         )
         loaded["document_sources"] = normalize_document_sources(
             loaded.get("document_sources")

@@ -420,6 +420,62 @@ SCHEDULE_SCHEMA = _object({
     },
 ])
 
+PDF_TEXT = _string(maximum=64_000)
+PDF_LIST = _array(_string(maximum=4_000), maximum=100)
+PDF_LIST["minItems"] = 1
+PDF_TABLE_ROW = _array(_string(maximum=4_000), maximum=12)
+PDF_TABLE_ROW["minItems"] = 1
+PDF_TABLE_ROWS = _array(PDF_TABLE_ROW, maximum=100)
+PDF_NODE = _object({
+    "id": _string(maximum=32, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$"),
+    "text": _string(maximum=500),
+}, required=("id", "text"))
+PDF_EDGE = _object({
+    "from": _string(maximum=32, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$"),
+    "to": _string(maximum=32, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$"),
+    "label": _nullable(_string(maximum=80)),
+}, required=("from", "to"))
+PDF_BLOCK_SCHEMA = {
+    "oneOf": [
+        _object({
+            "type": {"const": "heading"},
+            "text": PDF_TEXT,
+            "level": _integer(1, 3),
+        }, required=("type", "text")),
+        _object({
+            "type": {"const": "paragraph"},
+            "text": PDF_TEXT,
+        }, required=("type", "text")),
+        _object({
+            "type": {"const": "bullet_list"},
+            "items": PDF_LIST,
+        }, required=("type", "items")),
+        _object({
+            "type": {"const": "numbered_list"},
+            "items": PDF_LIST,
+        }, required=("type", "items")),
+        _object({
+            "type": {"const": "table"},
+            "headers": PDF_TABLE_ROW,
+            "rows": PDF_TABLE_ROWS,
+        }, required=("type", "headers", "rows")),
+        _object({"type": {"const": "page_break"}}, required=("type",)),
+        _object({
+            "type": {"const": "flow_diagram"},
+            "nodes": _array(PDF_NODE, maximum=12),
+            "edges": _array(PDF_EDGE, maximum=20),
+        }, required=("type", "nodes", "edges")),
+    ],
+}
+PDF_RENDER_SCHEMA = _object({
+    "title": _string(maximum=500),
+    "filename": _string(maximum=120, pattern=r'^[^<>:"/\\|?*\x00-\x1f]+$'),
+    "destination": _string(enum=("desktop",), maximum=16),
+    "page_size": _string(enum=("A4", "Letter"), maximum=16),
+    "blocks": _array(PDF_BLOCK_SCHEMA, maximum=200),
+}, required=("title", "filename", "destination", "page_size", "blocks"))
+PDF_RENDER_SCHEMA["properties"]["blocks"]["minItems"] = 1
+
 MODEL_SCHEMA = _object({
     "provider": _string(maximum=64),
     "id": _string(maximum=160),
@@ -585,7 +641,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
         _spec("open_uri", "Open an allowlisted URI through the OS",
               _object({"uri": URL}, required=("uri",)), RL, N, NC,
               preconditions=("allowlisted_uri_scheme",), real=RealValidationRequirement.USER_VISIBLE),
-        _spec("take_screenshot", "Capture the current desktop", _object(), R, I, NC,
+        _spec("take_screenshot", "Capture the desktop into a private local OCR artifact", _object(), R, I, NC,
               preconditions=("screen_capture_available",), timeout=30.0,
               result=ResultPolicy.BOUNDED_MODEL_AND_SCREENSHOT,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
@@ -600,7 +656,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
                        "max_pixels": _nullable(_integer(1, 16_000_000)),
                        "max_chars": _nullable(_integer(1, 2_000_000)),
                        "timeout_seconds": _nullable(_number(1.0, 25.0))}, required=("source_ref",)),
-              PL, C, NC, preconditions=("authorized_opaque_document_source",), timeout=40.0,
+              PL, C, NC, preconditions=("authorized_opaque_document_source",), timeout=195.0,
               result=ResultPolicy.PRIVATE_MODEL_ONLY,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               progress=ProgressEvidencePolicy.DOCUMENT_ARTIFACT, real=read_real,
@@ -619,9 +675,11 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
                       "summary", "search", "chunks", "sections", "headings",
                       "table", "sheets", "range", "formula", "slides",
                       "notes", "embedded", "provenance",
+                      "metadata", "ocr", "frames", "pages", "transcript",
+                      "time_range", "timeline", "tracks", "chapters",
                   ), maximum=32),
                   "query": _nullable(_string(maximum=1_000)),
-                  "cursor": _nullable(_string(maximum=64, pattern=r"^cursor_[a-z]+_[0-9a-f]{8}$")),
+                  "cursor": _nullable(_string(maximum=64, pattern=r"^cursor_[a-z_]+_[0-9a-f]{8}$")),
                   "max_items": _integer(1, 100),
                   "max_chars": _integer(1, 8_000),
                   "section_id": _nullable(_string(maximum=32, pattern=r"^section_[0-9]{6}$")),
@@ -630,6 +688,10 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
                   "cell_range_ref": _nullable(_string(maximum=32, pattern=r"^\$?[A-Za-z]{1,3}\$?[1-9][0-9]{0,6}(?::\$?[A-Za-z]{1,3}\$?[1-9][0-9]{0,6})?$")),
                   "slide_id": _nullable(_string(maximum=32, pattern=r"^slide_[0-9]{6}$")),
                   "embedded_artifact_id": _nullable(_string(maximum=40, pattern=r"^embedded_[0-9]{6}$")),
+                  "frame_id": _nullable(_string(maximum=32, pattern=r"^frame_[0-9]{6}$")),
+                  "track_id": _nullable(_string(maximum=32, pattern=r"^track_[0-9]{6}$")),
+                  "start_seconds": _nullable(_number(0.0, 3_600.0)),
+                  "end_seconds": _nullable(_number(0.001, 3_600.0)),
               }, required=("document_id", "operation"), allOf=[
                   {
                       "if": {"properties": {"operation": {"const": "search"}}, "required": ["operation"]},
@@ -638,6 +700,10 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
                   {
                       "if": {"properties": {"operation": {"const": "range"}}, "required": ["operation"]},
                       "then": {"required": ["sheet_id", "cell_range_ref"]},
+                  },
+                  {
+                      "if": {"properties": {"operation": {"enum": ["time_range", "timeline"]}}, "required": ["operation"]},
+                      "then": {"required": ["start_seconds", "end_seconds"]},
                   },
               ]),
               R, I, NC, preconditions=("authorized_live_artifact",), timeout=30.0,
@@ -648,6 +714,25 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
         _spec("write_file", "Write bounded local text", _object({"path": PATH, "content": LARGE_TEXT},
               required=("path", "content")), PL, C, NC, progress=effect, real=local_real, verified=True,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),
+        _spec(
+            "render_pdf",
+            "Authoritative operation to create/export a PDF, place it on the Desktop, or produce an illustrated PDF. Use destination exactly 'desktop' (never a path) and page_size 'A4' or 'Letter'. Every block is one flat object with a type field: {'type':'heading','text':'...','level':1}, {'type':'paragraph','text':'...'}, {'type':'bullet_list','items':['...']}, {'type':'numbered_list','items':['...']}, {'type':'table','headers':['...'],'rows':[['...']]}, {'type':'page_break'}, or {'type':'flow_diagram','nodes':[{'id':'n1','text':'...'}],'edges':[{'from':'n1','to':'n2','label':'...'}]}",
+            PDF_RENDER_SCHEMA,
+            PL,
+            N,
+            CR,
+            preconditions=("exact_authorized_desktop_destination",),
+            timeout=35.0,
+            progress=effect,
+            deterministic=EvidenceClassification.PROVED,
+            integration=EvidenceClassification.PROVED,
+            real=RealValidationRequirement.USER_VISIBLE,
+            verified=True,
+            permission_category="files_modify",
+            postcondition_required=True,
+            observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+            scheduled_eligible=False,
+        ),
         _spec("list_files", "List one local directory", _object({"path": PATH}, required=("path",)),
               R, I, NC, preconditions=("readable_directory",), progress=state, real=read_real,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),

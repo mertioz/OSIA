@@ -44,6 +44,7 @@ def test_external_data_filter_preserves_licenses_and_excludes_generated_cache():
     data_entries = [
         ("av-17.1.0.dist-info/licenses/LICENSE.txt", "license", "DATA"),
         ("av-17.1.0.dist-info/METADATA", "metadata", "DATA"),
+        ("reportlab-4.4.10.dist-info/direct_url.json", "build-origin", "DATA"),
         ("av-17.1.0.dist-info/licenses/__pycache__/AUTHORS.cpython-312.pyc", "cache", "DATA"),
         ("package/generated.pyc", "cache", "DATA"),
         ("package/generated.pyo", "cache", "DATA"),
@@ -62,6 +63,7 @@ def test_external_data_filter_preserves_licenses_and_excludes_generated_cache():
         "av-17.1.0.dist-info/licenses/__pycache__/AUTHORS.cpython-312.pyc",
         "package/generated.pyc",
         "package/generated.pyo",
+        "reportlab-4.4.10.dist-info/direct_url.json",
     )
     assert pure_modules == [("osia.runtime", "osia/runtime.py", "PYMODULE")]
 
@@ -72,6 +74,7 @@ def test_external_data_filter_preserves_licenses_and_excludes_generated_cache():
         "package/__pycache__/module.cpython-312.pyc",
         "package/generated.pyc",
         "package/generated.pyo",
+        "reportlab-4.4.10.dist-info/direct_url.json",
     ),
 )
 def test_release_gate_rejects_loose_generated_data(tmp_path, relative):

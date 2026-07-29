@@ -8,6 +8,7 @@ from typing import Iterable, Sequence, TypeVar
 
 
 _GENERATED_DATA_SUFFIXES = {".pyc", ".pyo"}
+_GENERATED_DATA_NAMES = {"direct_url.json"}
 _TocEntry = TypeVar("_TocEntry", bound=Sequence[object])
 
 
@@ -18,6 +19,7 @@ def is_generated_data_path(value: str | os.PathLike[str]) -> bool:
     path = PurePosixPath(normalized)
     return (
         any(part.casefold() == "__pycache__" for part in path.parts)
+        or path.name.casefold() in _GENERATED_DATA_NAMES
         or path.suffix.casefold() in _GENERATED_DATA_SUFFIXES
     )
 
