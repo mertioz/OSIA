@@ -67,5 +67,4 @@ packaging/windows/.build-venv/
 # install.bat; tunnel.log is written at runtime by the tunnel service) — never
 # commit these.
 windows/cloudflared.exe
-windows/ffmpeg.exe
 windows/tunnel.log

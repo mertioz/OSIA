@@ -3259,8 +3259,3 @@ def record_permission_journal_event(
 
 def reset_permissions_to_ask(*, policy: PermissionPolicy | None = None):
     return (policy or get_default_permission_policy()).store.reset_to_ask()
-
-
-# Descriptive compatibility name for callers that prefer the fully qualified
-# type; ``Grant`` remains the concise canonical schema name.
-PermissionGrant = Grant

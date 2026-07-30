@@ -352,6 +352,25 @@ def test_wav_to_mp3_uses_in_process_encoder():
     assert sum(frame.samples for frame in decoded.decode(audio=0)) >= len(samples)
 
 
+def test_source_installer_has_no_external_ffmpeg_requirement():
+    install = (ROOT / "install.bat").read_text("utf-8")
+    lowered = install.lower()
+    assert "ffmpeg.exe" not in lowered
+    assert "ffmpeg_url" not in lowered
+    assert "ffmpeg_dst" not in lowered
+    assert "ffmpeg-master" not in lowered
+
+
+def test_source_installer_keeps_server_only_service_and_coherent_steps():
+    install = (ROOT / "install.bat").read_text("utf-8")
+    assert "install_windows_services" in install
+    assert "install_tunnel.bat" not in install
+    assert "cloudflared" not in install.lower()
+    for step in range(1, 8):
+        assert f"[{step}/7]" in install
+    assert "/8]" not in install
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows path adapter")
 def test_espeak_adapter_handles_unicode_install_path(tmp_path):
     from osia.voice.tts import _patch_windows_espeak_data_path

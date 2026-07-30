@@ -1458,11 +1458,6 @@ class Orchestrator:
         }
         return json.dumps(context, sort_keys=True, separators=(",", ":"))
 
-    def _llm_judge(self, criterion):
-        """Compatibility wrapper returning the historical ``(ok, reason)`` pair."""
-        outcome = self._llm_judge_outcome(criterion)
-        return outcome.ok, outcome.reason_code
-
     def _llm_judge_outcome(self, criterion, evidence="") -> _VerificationOutcome:
         """Ask the agent to verify ``criterion`` by direct observation and parse
         a robust DONE / NOT_DONE verdict (ambiguous ⇒ NOT_DONE; run error ⇒

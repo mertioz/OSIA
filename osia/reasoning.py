@@ -309,11 +309,6 @@ def resolve_reasoning_option_id(provider, model, settings=None) -> str:
     return selected if selected in option_ids else "auto"
 
 
-def resolve_reasoning_level(provider, model, settings=None) -> str:
-    """Backward-compatible alias for the resolved reasoning option id."""
-    return resolve_reasoning_option_id(provider, model, settings)
-
-
 def get_selected_reasoning_label(provider, model, settings=None) -> str | None:
     """Return the selected non-default display label, or None for auto/unsupported."""
     options = get_reasoning_options(provider, model)

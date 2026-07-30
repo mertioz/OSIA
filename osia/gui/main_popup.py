@@ -115,10 +115,8 @@ POPUP_H = 560
 # MainPopup._animate_width (no tween — the old animation slid the settings nav
 # under the cursor and swallowed the first category click). The ~415px figure is
 # narrower than the pre-audit ~470px because the card is now inset by
-# SHADOW_MARGIN for the hand-painted drop shadow (see below). WIDTH_ANIM_MS is
-# retained only as a legacy constant; it no longer gates any code path.
+# SHADOW_MARGIN for the hand-painted drop shadow (see below).
 POPUP_W_WIDE = 640
-WIDTH_ANIM_MS = 280
 RADIUS = 16     # WOR-48 P3: 20 → 16, lightly-rounded rectangle (not pill-like)
 COMPOSER_BUTTON_SIZE = 34
 COMPOSER_BUTTON_RADIUS = 8
@@ -10538,7 +10536,7 @@ class MainPopup(QWidget):
     def _animate_width(self, target_w: int) -> None:
         """Resize the window to ``target_w`` (COMPACT or WIDE), instantly.
 
-        WOR-48 audit #2: this used to TWEEN the geometry over WIDTH_ANIM_MS, but
+        WOR-48 audit #2: this used to TWEEN the geometry over several frames, but
         while the 440↔640 tween was mid-flight the settings category nav slid
         under the cursor, so the first category click frequently missed (the
         ~50% settings "freeze"). The width now SNAPS to its final value in a

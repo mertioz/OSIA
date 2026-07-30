@@ -22,8 +22,7 @@ string in ``osia/gui/main_popup.py`` and ``osia/gui/dynamic_island.py``
 (chat page, conversations panel, model picker, settings sections, the
 startup section, and the bottom-nav tooltips) is routed through ``t()``.
 Proper nouns (the "OSIA" wordmark, "Kokoro", provider/product names) are
-shown verbatim by design. Any remaining legacy strings elsewhere are
-tracked for a follow-up pass in ``docs/i18n_backlog.md``.
+shown verbatim by design.
 """
 
 from typing import Callable
