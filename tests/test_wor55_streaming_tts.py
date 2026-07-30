@@ -565,6 +565,38 @@ class DesktopStreamingTTSTests(unittest.TestCase):
 
         self.assertEqual(played, [])
 
+    def test_wake_rearm_waits_for_streaming_playback_completion(self) -> None:
+        from osia.voice import tts
+
+        playback_started = threading.Event()
+        playback_release = threading.Event()
+        waiter_finished = threading.Event()
+        result: list[bool] = []
+
+        def blocking_playback(_text: str) -> None:
+            playback_started.set()
+            playback_release.wait(timeout=2)
+
+        with patch.object(tts, "_speak_blocking", side_effect=blocking_playback):
+            session = tts.start_streaming_session()
+            tts.speak_streaming("OSIA synthetic reply", session_id=session)
+            self.assertTrue(playback_started.wait(timeout=1))
+            self.assertTrue(tts.playback_active())
+
+            def wait_for_completion() -> None:
+                result.append(tts.wait_for_playback_complete(timeout=1.5))
+                waiter_finished.set()
+
+            waiter = threading.Thread(target=wait_for_completion, daemon=True)
+            waiter.start()
+            self.assertFalse(waiter_finished.wait(timeout=0.05))
+            playback_release.set()
+            self.assertTrue(waiter_finished.wait(timeout=1))
+            waiter.join(timeout=1)
+
+        self.assertEqual(result, [True])
+        self.assertFalse(tts.playback_active())
+
     def test_provider_switch_invalidates_active_desktop_session(self) -> None:
         from osia.gui import main_popup
         from osia.voice import tts

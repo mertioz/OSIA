@@ -30,7 +30,7 @@
   "liveapi_enabled": false,
   "liveapi_provider": "google",
   "liveapi_model": "gemini-3.1-flash-live",
-  "wake_word_enabled": true,
+  "wake_word_enabled": false,
   "wake_greeting_enabled": false,
   "wake_greeting_text": "",
   "cron_jobs": [],

@@ -371,6 +371,22 @@ def test_source_installer_keeps_server_only_service_and_coherent_steps():
     assert "/8]" not in install
 
 
+def test_release_package_excludes_retired_wake_verifier_and_keeps_normal_stt():
+    spec = (ROOT / "packaging" / "windows" / "osia.spec").read_text("utf-8")
+    build = (
+        ROOT / "packaging" / "windows" / "build_windows.py"
+    ).read_text("utf-8")
+    requirements = (ROOT / "requirements.txt").read_text("utf-8")
+    assert "osia_verifier.pkl" not in spec
+    assert not (ROOT / "osia" / "wake_training" / "osia_verifier.pkl").exists()
+    assert '(str(STAGE / "models"), "models")' in spec
+    assert '"faster-whisper-small"' in build
+    assert "collect_data_files(\"openwakeword\")" in spec
+    assert 'not name.startswith("osia.wake_training")' in spec
+    assert '"sklearn",' not in spec
+    assert "scikit-learn==1.8.0" in requirements
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows path adapter")
 def test_espeak_adapter_handles_unicode_install_path(tmp_path):
     from osia.voice.tts import _patch_windows_espeak_data_path

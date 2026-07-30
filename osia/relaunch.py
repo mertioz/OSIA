@@ -28,6 +28,8 @@ MUTEX_RELEASE_TIMEOUT = 30.0
 
 _request_lock = threading.Lock()
 _request_pending = False
+_desktop_mutex_lock = threading.Lock()
+_desktop_mutex_owned = None
 
 
 def coordinator_command(parent_pid: int, *, frozen: bool | None = None) -> list[str]:
@@ -203,6 +205,24 @@ def _release_windows_mutex(owned) -> None:
         kernel32.ReleaseMutex(handle)
     finally:
         kernel32.CloseHandle(handle)
+
+
+def acquire_desktop_instance_mutex():
+    """Acquire the one desktop mutex for both source and packaged entry points."""
+
+    global _desktop_mutex_owned
+    if sys.platform != "win32":
+        return None
+    with _desktop_mutex_lock:
+        if _desktop_mutex_owned is not None:
+            return _desktop_mutex_owned
+        owned = _acquire_windows_mutex(
+            DESKTOP_MUTEX_NAME, 0.0, initial_owner=True,
+        )
+        if owned is False:
+            return False
+        _desktop_mutex_owned = owned
+        return owned
 
 
 def run_coordinator(

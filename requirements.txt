@@ -18,7 +18,7 @@ faster-whisper>=1.0.0              # on-device Whisper (CTranslate2 backend)
 
 # ── Wake word ───────────────────────────────────────────────────────────────
 openwakeword>=0.6.0
-scikit-learn==1.8.0               # must match the serialized osia_verifier.pkl
+scikit-learn==1.8.0               # required by openwakeword's top-level verifier import
 
 # ── Audio I/O + DSP ─────────────────────────────────────────────────────────
 sounddevice>=0.4.6                 # PortAudio bindings (mic capture / playback)

@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 """
-OSIA Wake Word Detection using openWakeWord + custom trained verifier.
+Release-disabled acoustic wake compatibility layer.
 
-Architecture:
-  1. openWakeWord's AudioFeatures preprocessor extracts mel spectrogram features
-     from streaming audio (80ms chunks at 16kHz).
-  2. A custom logistic regression verifier (trained on "osia" samples)
-     classifies each feature window as "osia" or "not osia".
-  3. When the verifier score exceeds the threshold, the callback is triggered.
-
-This completely replaces the whisper-based wake word system, eliminating
-hallucinations of Chinese/Korean/Spanish.
-
-Fallback: If the verifier model is not found at startup, prints a warning
-and the caller (main.py) should use keyboard trigger (Ctrl+Space).
+WOR-211 intentionally disables acoustic activation because no packaged local
+verifier passed the lexical-safety gate. The legacy detector type remains as
+an inert compatibility surface; Ctrl+Space is the supported voice activation
+path until WOR-214 supplies and validates a replacement.
 """
 
 import threading
 import time
-import os
-import pickle
 from collections import deque
 import numpy as np
+
+from osia.config import (
+    ACOUSTIC_WAKE_AVAILABLE,
+    ACOUSTIC_WAKE_UNAVAILABLE_REASON,
+)
 
 # sounddevice loads PortAudio at import time and can fail when no audio backend
 # / drivers are present. Degrade gracefully: with ``sd = None`` the listen loop
@@ -32,10 +27,11 @@ try:
 except Exception as _audio_exc:  # PortAudio missing / no audio device
     sd = None
     _AUDIO_OK = False
-    print(
-        f"⚠️  [wake] audio backend unavailable ({_audio_exc}); wake-word "
-        "detection is disabled (use the capsule / Ctrl+Alt+O)."
-    )
+    if ACOUSTIC_WAKE_AVAILABLE:
+        print(
+            f"⚠️  [wake] audio backend unavailable ({_audio_exc}); wake-word "
+            "detection is disabled (use the capsule / Ctrl+Alt+O)."
+        )
 
 # openWakeWord provides the AudioFeatures mel-spectrogram preprocessor. It is an
 # optional dependency: degrade gracefully when it (or its onnxruntime/tflite
@@ -56,18 +52,11 @@ try:
     _WAKE_OK = _importlib_util.find_spec("openwakeword") is not None
 except Exception:
     _WAKE_OK = False
-if not _WAKE_OK:
+if not _WAKE_OK and ACOUSTIC_WAKE_AVAILABLE:
     print(
         "⚠️  [wake] openwakeword unavailable; wake-word "
         "detection is disabled (use the capsule / Ctrl+Alt+O)."
     )
-
-# === Paths ===
-_MODEL_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "wake_training",
-)
-VERIFIER_PATH = os.path.join(_MODEL_DIR, "osia_verifier.pkl")
 
 # === Audio settings ===
 SAMPLE_RATE = 16000
@@ -91,21 +80,24 @@ DIAGNOSTIC_SCORE_MARGIN = 0.03
 _verifier_model = None
 _verifier_n_frames = None
 _feature_extractor = None
+_vad_model = None
+
+# The verifier trails live audio, so use its bounded 0.40-0.72 second
+# VAD alignment instead of retaining the maximum from its full 1.28 second
+# context. RMS and VAD must agree inside the same six aligned chunks.
+VAD_THRESHOLD = 0.5
+VAD_ALIGNMENT_OLDER_FRAMES = 10
+VAD_ALIGNMENT_NEWER_FRAMES = 4
+QUIET_REARM_SECONDS = 0.48
+QUIET_REARM_CHUNKS = max(
+    1, round(QUIET_REARM_SECONDS / (CHUNK_SIZE / SAMPLE_RATE)),
+)
 
 
 def _get_verifier():
-    """Load the custom verifier model (lazy). Returns None if not found."""
-    global _verifier_model, _verifier_n_frames
-    if _verifier_model is None:
-        if os.path.exists(VERIFIER_PATH):
-            with open(VERIFIER_PATH, "rb") as f:
-                _verifier_model = pickle.load(f)
-            # Determine expected feature frame count from the model
-            n_features = _verifier_model.named_steps["standardscaler"].n_features_in_
-            _verifier_n_frames = n_features // 96
-        else:
-            return None
-    return _verifier_model
+    """The retired custom verifier is never loadable in this release."""
+
+    return None
 
 
 def _get_n_frames():
@@ -125,6 +117,8 @@ def _get_feature_extractor():
     cost never lands on the GUI startup path.
     """
     global _feature_extractor, AudioFeatures, _WAKE_OK
+    if not ACOUSTIC_WAKE_AVAILABLE:
+        return None
     if _feature_extractor is None:
         if AudioFeatures is None:
             try:
@@ -181,195 +175,537 @@ def _get_feature_extractor():
     return _feature_extractor
 
 
+def _get_vad():
+    """Lazy-load openWakeWord's bundled Silero VAD model."""
+
+    global _vad_model, _WAKE_OK
+    if not ACOUSTIC_WAKE_AVAILABLE:
+        return None
+    if _vad_model is not None:
+        return _vad_model
+    try:
+        from openwakeword.vad import VAD
+
+        _vad_model = VAD(n_threads=1)
+    except Exception as exc:
+        _WAKE_OK = False
+        print(
+            f"âš ï¸  [wake] bundled VAD unavailable ({exc}); wake-word "
+            "detection disabled (use the capsule / Ctrl+Alt+O)."
+        )
+        return None
+    return _vad_model
+
+
 def verifier_available() -> bool:
-    """Check if the custom verifier model exists."""
-    return os.path.exists(VERIFIER_PATH)
+    """Return the release contract, independent of settings and model files."""
+
+    return ACOUSTIC_WAKE_AVAILABLE
+
+
+def acoustic_wake_status() -> dict[str, object]:
+    """Return the truthful source/package acoustic-wake status."""
+
+    return {
+        "acoustic_wake_available": ACOUSTIC_WAKE_AVAILABLE,
+        "reason": ACOUSTIC_WAKE_UNAVAILABLE_REASON,
+    }
+
+
+class WakeAcceptanceGate:
+    """Reserve the voice handler before an activation event reaches Qt."""
+
+    def __init__(self, handler_lock, *, is_busy=None, is_tts_active=None):
+        self.handler_lock = handler_lock
+        self._is_busy = is_busy or (lambda: False)
+        self._is_tts_active = is_tts_active or (lambda: False)
+        self._reservation_lock = threading.Lock()
+        self._pending_generation = None
+
+    def reserve(self, generation: int) -> bool:
+        if self._is_busy() or self._is_tts_active():
+            return False
+        if not self.handler_lock.acquire(blocking=False):
+            return False
+        keep = False
+        try:
+            if self._is_busy() or self._is_tts_active():
+                return False
+            with self._reservation_lock:
+                if self._pending_generation is not None:
+                    return False
+                self._pending_generation = generation
+                keep = True
+            return True
+        finally:
+            if not keep:
+                self.handler_lock.release()
+
+    def consume(self, generation: int, *, is_current: bool) -> bool:
+        with self._reservation_lock:
+            if self._pending_generation != generation:
+                return False
+            self._pending_generation = None
+        if not is_current:
+            self.handler_lock.release()
+            return False
+        return True
+
+    def cancel(self, generation: int) -> None:
+        release = False
+        with self._reservation_lock:
+            if self._pending_generation == generation:
+                self._pending_generation = None
+                release = True
+        if release:
+            self.handler_lock.release()
+
+    def finish(self) -> None:
+        self.handler_lock.release()
 
 
 class WakeWordDetector:
-    """Continuously listens for 'osia' wake word using openWakeWord + custom verifier."""
+    """Legacy detector surface; :meth:`start` is inert in this release."""
 
-    def __init__(self, callback=None):
+    def __init__(
+        self,
+        callback=None,
+        *,
+        acceptance_gate=None,
+        acceptance_cancel=None,
+        _clock=None,
+        _feature_extractor_factory=None,
+        _verifier_factory=None,
+        _vad_factory=None,
+        _stream_factory=None,
+    ):
         self.callback = callback
+        self._acceptance_gate = acceptance_gate
+        self._acceptance_cancel = acceptance_cancel
+        self._clock = _clock or time.monotonic
+        self._feature_extractor_factory = (
+            _feature_extractor_factory or _get_feature_extractor
+        )
+        self._verifier_factory = _verifier_factory or _get_verifier
+        self._vad_factory = _vad_factory or _get_vad
+        self._stream_factory = _stream_factory
+
+        self._condition = threading.Condition(threading.RLock())
         self._running = False
         self._thread = None
-        self._last_detection = 0.0
+        self._generation = 0
+        self._armed = False
+        self._rearm_requested = False
+        self._last_detection = float("-inf")
+        self._last_event_generation = None
         self._positive_streak = 0
-        self._last_diag_log = 0.0
+        self._fresh_chunks = 0
+        self._quiet_chunks = 0
+        self._last_diag_log = float("-inf")
+        self._last_score = None
+        self._last_vad_score = None
+        self._last_rms = None
+        self._preprocessor = None
+        self._vad = None
+        self._device_logged = False
+
+    @property
+    def generation(self) -> int:
+        with self._condition:
+            return self._generation
+
+    @property
+    def last_event_generation(self):
+        with self._condition:
+            return self._last_event_generation
+
+    def is_generation_current(self, generation: int) -> bool:
+        with self._condition:
+            return self._running and generation == self._generation
+
+    def _reset_candidate_locked(self, *, reset_detection_time: bool = False) -> None:
+        self._positive_streak = 0
+        self._fresh_chunks = 0
+        self._quiet_chunks = 0
+        self._last_diag_log = float("-inf")
+        self._last_score = None
+        self._last_vad_score = None
+        self._last_rms = None
+        if reset_detection_time:
+            self._last_detection = float("-inf")
+
+    @staticmethod
+    def _reset_components(preprocessor, vad) -> None:
+        if preprocessor is not None:
+            preprocessor.reset()
+        if vad is not None:
+            vad.reset_states()
+            prediction_buffer = getattr(vad, "prediction_buffer", None)
+            if prediction_buffer is not None:
+                prediction_buffer.clear()
 
     def _log_diagnostic(self, now: float, message: str) -> None:
-        if now - self._last_diag_log < DIAGNOSTIC_LOG_INTERVAL_SECONDS:
-            return
-        self._last_diag_log = now
+        with self._condition:
+            if now - self._last_diag_log < DIAGNOSTIC_LOG_INTERVAL_SECONDS:
+                return
+            self._last_diag_log = now
         print(message, flush=True)
 
-    def _listen_loop(self):
-        """Main loop: stream audio, extract features, run verifier."""
-        if not _AUDIO_OK:
-            print("⚠️  [wake] no audio backend — wake-word detection disabled; "
-                  "use the capsule or Ctrl+Alt+O to reach OSIA.")
-            return
-        if not _WAKE_OK:
-            print("⚠️  [wake] openwakeword not installed — wake-word detection "
-                  "disabled; use the capsule or Ctrl+Alt+O to reach OSIA.")
-            return
-        preprocessor = _get_feature_extractor()
-        if preprocessor is None:
-            # openwakeword backend failed to load (see _get_feature_extractor) —
-            # bail cleanly; OSIA stays reachable via the capsule / Ctrl+Alt+O.
-            return
-        verifier = _get_verifier()
-        n_frames = _get_n_frames()
+    def _session_current(self, generation: int, *, quiet: bool) -> bool:
+        with self._condition:
+            if not self._running or generation != self._generation:
+                return False
+            return self._rearm_requested if quiet else self._armed
 
-        if verifier is None:
-            print("⚠️  No verifier model found. Wake word detection disabled.")
-            print("   Run osia/wake_training/train.py after recording samples.")
-            return
+    def _new_stream(self):
+        factory = self._stream_factory or sd.InputStream
+        return factory(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="int16",
+            blocksize=CHUNK_SIZE,
+        )
 
-        print(f"👂 Wake word detection active. Say 'osia' to wake me up...")
-        print(f"   Verifier: {n_frames} frames × 96 = {n_frames * 96} features")
-
-        # Rolling per-chunk RMS over the verifier's context window (one 80ms
-        # chunk per feature frame), so we can tell whether real speech occurred
-        # anywhere in the ~1.28s the verifier is scoring — see ENERGY_GATE_RMS.
-        energy_window = deque(maxlen=n_frames)
-
-        # Log the input device so a silent wake-word failure on Windows is
-        # diagnosable (no mic, wrong default device, or blocked by Windows
-        # microphone privacy settings). Never fatal — only informational.
-        try:
-            info = sd.query_devices(kind="input")
-            name = info.get("name", "?") if isinstance(info, dict) else "?"
-            print(f"🎙  [wake] using audio input device: {name}")
-        except Exception as exc:
-            print(
-                f"⚠️  [wake] no default audio input device ({exc}); wake-word "
-                "detection will not work. On Windows, connect a microphone and "
-                "allow microphone access in Settings ▸ Privacy & security ▸ "
-                "Microphone."
+    @staticmethod
+    def _read_chunk(stream) -> np.ndarray:
+        audio_chunk, _ = stream.read(CHUNK_SIZE)
+        audio_np = np.asarray(audio_chunk).flatten()
+        if audio_np.size != CHUNK_SIZE:
+            raise ValueError(
+                f"wake audio frame has {audio_np.size} samples; expected {CHUNK_SIZE}"
             )
+        if audio_np.dtype != np.int16:
+            audio_np = audio_np.astype(np.int16)
+        return audio_np
 
-        # Opening the stream is the step that fails on a fresh Windows box (no
-        # mic, mic blocked by privacy settings, or held exclusively by another
-        # app). Catch it here with a clear, actionable message instead of letting
-        # an uncaught PortAudioError kill the detector thread silently. (WOR-11)
-        try:
-            _stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype="int16",
-                blocksize=CHUNK_SIZE,
-            )
-        except Exception as exc:
-            print(
-                f"⚠️  [wake] could not open the microphone ({exc}); wake-word "
-                "detection disabled. On Windows, check Settings ▸ Privacy & "
-                "security ▸ Microphone (allow desktop apps to access the mic), "
-                "make sure a microphone is connected, and that no other app is "
-                "using it exclusively. Use the capsule / Ctrl+Alt+O to reach OSIA."
-            )
-            return
+    @staticmethod
+    def _speech_metrics(audio_np: np.ndarray, vad) -> tuple[float, float]:
+        rms = float(np.sqrt(np.mean(audio_np.astype(np.float64) ** 2)))
+        vad_score = float(vad.predict(audio_np, frame_size=640))
+        if not np.isfinite(vad_score):
+            raise ValueError("wake VAD returned a non-finite score")
+        return rms, vad_score
 
-        with _stream as stream:
-            while self._running:
-                try:
-                    audio_chunk, _ = stream.read(CHUNK_SIZE)
-                    audio_np = audio_chunk.flatten()
+    def _wait_for_quiet(self, generation: int, vad) -> bool:
+        self._reset_components(self._preprocessor, vad)
+        with self._condition:
+            self._reset_candidate_locked()
+        with self._new_stream() as stream:
+            while self._session_current(generation, quiet=True):
+                audio_np = self._read_chunk(stream)
+                rms, vad_score = self._speech_metrics(audio_np, vad)
+                with self._condition:
+                    if not self._session_current(generation, quiet=True):
+                        return False
+                    self._last_rms = rms
+                    self._last_vad_score = vad_score
+                    quiet_frame = (
+                        vad_score < VAD_THRESHOLD and rms < ENERGY_GATE_RMS
+                    )
+                    self._quiet_chunks = (
+                        self._quiet_chunks + 1 if quiet_frame else 0
+                    )
+                    if self._quiet_chunks >= QUIET_REARM_CHUNKS:
+                        return True
+        return False
 
-                    # Feed audio through the feature extractor. Always feed every
-                    # chunk so the streaming mel buffer stays continuous (gating
-                    # the audio here would corrupt the verifier's context).
-                    preprocessor(audio_np)
+    def _listen_armed_session(
+        self, generation: int, preprocessor, verifier, vad, n_frames: int,
+    ):
+        self._reset_components(preprocessor, vad)
+        with self._condition:
+            self._reset_candidate_locked()
+        speech_window = deque(maxlen=VAD_ALIGNMENT_OLDER_FRAMES)
+        with self._new_stream() as stream:
+            while self._session_current(generation, quiet=False):
+                audio_np = self._read_chunk(stream)
+                preprocessor(audio_np)
+                rms, vad_score = self._speech_metrics(audio_np, vad)
+                speech_window.append((rms, vad_score))
+                aligned = list(speech_window)[
+                    -VAD_ALIGNMENT_OLDER_FRAMES:-VAD_ALIGNMENT_NEWER_FRAMES
+                ]
+                speech_present = any(
+                    aligned_vad >= VAD_THRESHOLD
+                    and aligned_rms >= ENERGY_GATE_RMS
+                    for aligned_rms, aligned_vad in aligned
+                )
+                aligned_rms = max((item[0] for item in aligned), default=0.0)
+                aligned_vad = max((item[1] for item in aligned), default=0.0)
 
-                    # Track energy over the context window for the gate below.
-                    rms = float(np.sqrt(np.mean(audio_np.astype(np.float64) ** 2)))
-                    energy_window.append(rms)
+                with self._condition:
+                    if not self._session_current(generation, quiet=False):
+                        return None
+                    self._fresh_chunks += 1
+                    fresh_chunks = self._fresh_chunks
+                    self._last_rms = rms
+                    self._last_vad_score = vad_score
 
-                    # Get the latest feature window
-                    features = preprocessor.get_features(n_frames)
+                # AudioFeatures starts with random embeddings. Do not ask the
+                # verifier for a window until every one of its 16 positions came
+                # from the current microphone generation.
+                if fresh_chunks < n_frames:
+                    continue
 
-                    if features is None or features.size == 0:
-                        continue
+                features = np.asarray(preprocessor.get_features(n_frames))
+                expected_shape = (1, n_frames, 96)
+                if features.shape != expected_shape:
+                    raise ValueError(
+                        f"wake feature shape {features.shape}; expected {expected_shape}"
+                    )
+                features_flat = features.reshape(1, n_frames * 96)
+                probabilities = np.asarray(verifier.predict_proba(features_flat))
+                if probabilities.ndim != 2 or probabilities.shape[1] < 2:
+                    raise ValueError("wake verifier returned an invalid probability shape")
+                score = float(probabilities[0, 1])
+                if not np.isfinite(score):
+                    raise ValueError("wake verifier returned a non-finite score")
+                now = self._clock()
 
-                    # Reshape: (1, n_frames, 96) -> (1, n_frames*96)
-                    features_flat = features.squeeze(0).flatten().reshape(1, -1)
-
-                    # Run the verifier
-                    score = verifier.predict_proba(features_flat)[0, 1]
-
-                    now = time.time()
-
-                    # Voice-activity gate: a high score only counts when real
-                    # speech is present somewhere in the window. A quiet room
-                    # (verifier ~0.88 on silence) can never build a streak, so
-                    # startup stays silent/passive until "osia" is actually said.
-                    max_rms = max(energy_window) if energy_window else 0.0
-                    speech_present = max_rms >= ENERGY_GATE_RMS
-
-                    if score >= VERIFIER_THRESHOLD:
-                        if not speech_present:
-                            self._positive_streak = 0
-                            self._log_diagnostic(
-                                now,
-                                "[wake] rejected high verifier score: "
-                                f"score={score:.3f} threshold={VERIFIER_THRESHOLD:.2f} "
-                                f"max_rms={max_rms:.0f} gate={ENERGY_GATE_RMS} "
-                                "reason=energy",
-                            )
-                            continue
+                with self._condition:
+                    if not self._session_current(generation, quiet=False):
+                        return None
+                    self._last_score = score
+                    if score < VERIFIER_THRESHOLD or not speech_present:
+                        self._positive_streak = 0
+                        streak = 0
+                    else:
                         self._positive_streak += 1
+                        streak = self._positive_streak
+
+                if score >= VERIFIER_THRESHOLD and not speech_present:
+                    self._log_diagnostic(
+                        now,
+                        "[wake] rejected high verifier score: "
+                        f"score={score:.3f} vad={aligned_vad:.3f} "
+                        f"rms={aligned_rms:.0f} reason=speech_gate",
+                    )
+                    continue
+                if score < VERIFIER_THRESHOLD:
+                    if speech_present and score >= (
+                        VERIFIER_THRESHOLD - DIAGNOSTIC_SCORE_MARGIN
+                    ):
                         self._log_diagnostic(
                             now,
-                            "[wake] verifier candidate: "
-                            f"score={score:.3f} threshold={VERIFIER_THRESHOLD:.2f} "
-                            f"streak={self._positive_streak}/{PATIENCE_FRAMES} "
-                            f"max_rms={max_rms:.0f} gate={ENERGY_GATE_RMS}",
+                            "[wake] rejected near verifier threshold: "
+                            f"score={score:.3f} vad={aligned_vad:.3f} "
+                            f"rms={aligned_rms:.0f}",
                         )
-                        if self._positive_streak >= PATIENCE_FRAMES:
-                            if now - self._last_detection > COOLDOWN_SECONDS:
-                                print(f"✅ Wake word detected! score={score:.3f}")
-                                print(
-                                    "[wake] accepted verifier score: "
-                                    f"threshold={VERIFIER_THRESHOLD:.2f} "
-                                    f"max_rms={max_rms:.0f} gate={ENERGY_GATE_RMS}"
-                                )
-                                self._last_detection = now
-                                self._positive_streak = 0
-                                if self.callback:
-                                    self.callback()
-                            else:
-                                self._positive_streak = 0
-                    else:
-                        near_threshold = (
-                            score >= VERIFIER_THRESHOLD - DIAGNOSTIC_SCORE_MARGIN
-                        )
-                        if speech_present and near_threshold:
-                            self._log_diagnostic(
-                                now,
-                                "[wake] rejected near verifier threshold: "
-                                f"score={score:.3f} threshold={VERIFIER_THRESHOLD:.2f} "
-                                f"max_rms={max_rms:.0f} gate={ENERGY_GATE_RMS}",
-                            )
-                        self._positive_streak = max(0, self._positive_streak - 1)
+                    continue
 
-                except Exception as e:
-                    print(f"Wake word error: {e}")
+                self._log_diagnostic(
+                    now,
+                    "[wake] verifier candidate: "
+                    f"score={score:.3f} streak={streak}/{PATIENCE_FRAMES} "
+                    f"vad={aligned_vad:.3f} rms={aligned_rms:.0f}",
+                )
+                if streak < PATIENCE_FRAMES:
+                    continue
+
+                with self._condition:
+                    if not self._session_current(generation, quiet=False):
+                        return None
+                    if now - self._last_detection < COOLDOWN_SECONDS:
+                        self._positive_streak = 0
+                        continue
+                    if self._acceptance_gate is not None and not self._acceptance_gate(
+                        generation
+                    ):
+                        self._reset_candidate_locked()
+                        return "rejected"
+                    self._last_detection = now
+                    self._last_event_generation = generation
+                    self._armed = False
+                    self._positive_streak = 0
+                    print(f"âœ… Wake word detected! score={score:.3f}")
+                    print(
+                        "[wake] accepted verifier score: "
+                        f"threshold={VERIFIER_THRESHOLD:.2f} "
+                        f"vad={aligned_vad:.3f} rms={aligned_rms:.0f}"
+                    )
+                    return "accepted"
+        return None
+
+    def _deliver(self, generation: int) -> None:
+        with self._condition:
+            if not self._running or generation != self._generation:
+                if self._acceptance_cancel is not None:
+                    self._acceptance_cancel(generation)
+                return
+            try:
+                if self.callback is not None:
+                    self.callback(generation)
+                elif self._acceptance_cancel is not None:
+                    self._acceptance_cancel(generation)
+            except Exception as exc:
+                if self._acceptance_cancel is not None:
+                    self._acceptance_cancel(generation)
+                print(f"Wake word callback error: {exc}")
+
+    def _listen_loop(self):
+        """Run isolated microphone generations until stopped."""
+        try:
+            if not ACOUSTIC_WAKE_AVAILABLE:
+                return
+            if not _AUDIO_OK:
+                print("âš ï¸  [wake] no audio backend; detection disabled.")
+                return
+            if not _WAKE_OK:
+                print("âš ï¸  [wake] openwakeword unavailable; detection disabled.")
+                return
+            preprocessor = self._feature_extractor_factory()
+            verifier = self._verifier_factory()
+            vad = self._vad_factory()
+            n_frames = _get_n_frames()
+            self._preprocessor = preprocessor
+            self._vad = vad
+            if preprocessor is None or verifier is None or vad is None:
+                print("âš ï¸  Wake verifier/VAD unavailable. Detection disabled.")
+                return
+            if n_frames != 16:
+                print(
+                    f"âš ï¸  [wake] verifier expects {n_frames} frames; "
+                    "the supported OSIA feature shape is 16 Ã— 96."
+                )
+                return
+
+            print("ðŸ‘‚ Wake word detection active. Say 'osia' to wake me up...")
+            print(f"   Verifier: {n_frames} frames Ã— 96 = {n_frames * 96} features")
+            if not self._device_logged:
+                self._device_logged = True
+                try:
+                    info = sd.query_devices(kind="input")
+                    name = info.get("name", "?") if isinstance(info, dict) else "?"
+                    print(f"ðŸŽ™  [wake] using audio input device: {name}")
+                except Exception as exc:
+                    print(f"âš ï¸  [wake] input-device query failed ({exc}).")
+
+            while True:
+                with self._condition:
+                    while self._running and not (
+                        self._armed or self._rearm_requested
+                    ):
+                        self._condition.wait(timeout=0.25)
+                    if not self._running:
+                        return
+                    generation = self._generation
+                    quiet = self._rearm_requested
+                try:
+                    if quiet:
+                        if not self._wait_for_quiet(generation, vad):
+                            continue
+                        self._reset_components(preprocessor, vad)
+                        with self._condition:
+                            if not self._session_current(generation, quiet=True):
+                                continue
+                            self._rearm_requested = False
+                            self._armed = True
+                            self._reset_candidate_locked()
+                        continue
+
+                    result = self._listen_armed_session(
+                        generation, preprocessor, verifier, vad, n_frames,
+                    )
+                    if result == "accepted":
+                        # The stream closes before Qt can start STT, making the
+                        # command recorder the sole microphone owner.
+                        self._deliver(generation)
+                    elif result == "rejected":
+                        self._reset_components(preprocessor, vad)
+                except Exception as exc:
+                    with self._condition:
+                        self._reset_candidate_locked()
+                    try:
+                        self._reset_components(preprocessor, vad)
+                    except Exception:
+                        pass
+                    print(f"Wake word error: {exc}")
                     time.sleep(0.1)
+        finally:
+            try:
+                self._reset_components(self._preprocessor, self._vad)
+            except Exception:
+                pass
+            with self._condition:
+                self._reset_candidate_locked(reset_detection_time=True)
+                if self._thread is threading.current_thread():
+                    self._thread = None
+                    self._running = False
+                    self._armed = False
+                    self._rearm_requested = False
+                self._condition.notify_all()
 
     def start(self):
-        """Start the wake word detection thread."""
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
-        self._thread.start()
+        """Start one listener generation; never overlap listener threads."""
+        if not ACOUSTIC_WAKE_AVAILABLE:
+            print(
+                "[wake] acoustic activation unavailable: "
+                f"{ACOUSTIC_WAKE_UNAVAILABLE_REASON}"
+            )
+            return False
+        with self._condition:
+            if self._running:
+                return
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._generation += 1
+            self._running = True
+            self._armed = True
+            self._rearm_requested = False
+            self._last_event_generation = None
+            self._reset_candidate_locked(reset_detection_time=True)
+            thread = threading.Thread(
+                target=self._listen_loop,
+                daemon=True,
+                name="osia-wake-listener",
+            )
+            self._thread = thread
+            thread.start()
+        return True
+
+    def request_rearm(self, accepted_generation: int | None = None) -> bool:
+        """Request VAD-quiet rearm after the accepted turn fully finishes."""
+        with self._condition:
+            if not self._running or self._armed or self._rearm_requested:
+                return False
+            if (
+                accepted_generation is not None
+                and accepted_generation != self._generation
+            ):
+                return False
+            self._generation += 1
+            self._rearm_requested = True
+            self._last_event_generation = None
+            self._reset_candidate_locked()
+            self._condition.notify_all()
+            return True
 
     def stop(self):
-        """Stop the wake word detection thread."""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=2)
-        print("Wake word detection stopped.")
+        """Invalidate the active generation and reap its listener thread."""
+        with self._condition:
+            thread = self._thread
+            was_running = self._running or (
+                thread is not None and thread.is_alive()
+            )
+            self._running = False
+            self._generation += 1
+            self._armed = False
+            self._rearm_requested = False
+            self._last_event_generation = None
+            self._reset_candidate_locked(reset_detection_time=True)
+            self._condition.notify_all()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        with self._condition:
+            if thread is not None and not thread.is_alive() and self._thread is thread:
+                self._thread = None
+        if thread is None or not thread.is_alive():
+            try:
+                self._reset_components(self._preprocessor, self._vad)
+            except Exception:
+                pass
+        if was_running:
+            print("Wake word detection stopped.")
 
 
 def default_callback():
@@ -408,12 +744,14 @@ def default_callback():
 
 if __name__ == "__main__":
     if not verifier_available():
-        print("⚠️  No verifier model found. Please train the model first:")
-        print("   1. Run osia/wake_training/record_samples.py")
-        print("   2. Run osia/wake_training/record_negative.py")
-        print("   3. Run osia/wake_training/train.py")
+        print(
+            "Acoustic wake is unavailable in this release: "
+            f"{ACOUSTIC_WAKE_UNAVAILABLE_REASON}. Use Ctrl+Space."
+        )
     else:
-        detector = WakeWordDetector(callback=default_callback)
+        detector = WakeWordDetector(
+            callback=lambda _generation: default_callback(),
+        )
         detector.start()
         print("OSIA Wake Word Detector running. Press Ctrl+C to stop.")
         try:

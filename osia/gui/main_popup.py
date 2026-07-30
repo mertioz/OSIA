@@ -3747,16 +3747,18 @@ class _SettingsPanel(QWidget):
         self._wake_desc.setWordWrap(True)
         l.addWidget(self._wake_desc)
 
-        # Master switch for the always-on "OSIA" wake-word listener. When off,
-        # the detector loop is stopped (OSIA stays reachable via the capsule
-        # click / Ctrl+Alt+O window). Wired to the detector in
-        # osia.main.wake_mode via the wake_word_enabled_changed signal.
+        # Compatibility row for the retired acoustic listener. It stays visibly
+        # disabled and explains the supported Ctrl+Space release path.
         ww_row = QHBoxLayout()
         self._wake_word_label = QLabel(i18n.t("settings.wake_word_enabled"))
         self._wake_word_label.setObjectName("providerName")
         self._wake_word_label.setWordWrap(True)
         self._wake_word_toggle = QCheckBox()
         self._wake_word_toggle.setObjectName("smartToggle")
+        self._wake_word_toggle.setEnabled(False)
+        self._wake_word_toggle.setToolTip(
+            i18n.t("settings.wake_word_enabled")
+        )
         self._wake_word_toggle.stateChanged.connect(
             self._on_wake_word_enabled_changed
         )
@@ -3785,9 +3787,11 @@ class _SettingsPanel(QWidget):
         return wrap
 
     def _on_wake_word_enabled_changed(self, _state) -> None:
-        enabled = self._wake_word_toggle.isChecked()
-        set_setting("wake_word_enabled", enabled)
-        self.wake_word_enabled_changed.emit(enabled)
+        self._wake_word_toggle.blockSignals(True)
+        self._wake_word_toggle.setChecked(False)
+        self._wake_word_toggle.blockSignals(False)
+        set_setting("wake_word_enabled", False)
+        self.wake_word_enabled_changed.emit(False)
 
     def _on_wake_enabled_changed(self, _state) -> None:
         enabled = self._wake_enabled_toggle.isChecked()
@@ -8048,10 +8052,10 @@ class _SettingsPanel(QWidget):
         self._tts_provider_combo.blockSignals(False)
         self._populate_voice_combo(provider, voice)
 
-        # Wake-word listener master switch (defaults on when unset).
+        # Acoustic wake is intentionally unavailable in this release.
         self._wake_word_toggle.blockSignals(True)
-        self._wake_word_toggle.setChecked(
-            bool(settings.get("wake_word_enabled", True)))
+        self._wake_word_toggle.setChecked(False)
+        self._wake_word_toggle.setEnabled(False)
         self._wake_word_toggle.blockSignals(False)
 
         # Wake-word greeting — empty stored text shows the active language's
@@ -8490,6 +8494,9 @@ class _SettingsPanel(QWidget):
         self._wake_sub.setText(i18n.t("settings.wake_greeting_sub"))
         self._wake_desc.setText(i18n.t("settings.wake_greeting_desc"))
         self._wake_word_label.setText(i18n.t("settings.wake_word_enabled"))
+        self._wake_word_toggle.setToolTip(
+            i18n.t("settings.wake_word_enabled")
+        )
         self._wake_enabled_label.setText(i18n.t("wake.greeting_enabled"))
         self._wake_text_input.setPlaceholderText(i18n.t("wake.greeting_placeholder"))
         # If the greeting hasn't been customised, follow the UI language.
@@ -10084,8 +10091,8 @@ class MainPopup(QWidget):
     # Re-emitted from the settings panel: the floating-capsule visibility toggle
     # (WOR-22). The host wires it to the Dynamic Island's set_capsule_visible.
     capsule_visibility_changed = pyqtSignal(bool)
-    # Re-emitted from the settings panel: the "Enable wake word" toggle. The
-    # host wires it to the wake-word detector's start()/stop().
+    # Compatibility signal retained for older hosts; the disabled settings row
+    # can only emit False in this release.
     wake_word_enabled_changed = pyqtSignal(bool)
     # Re-emitted from the autonomous panel (WOR-45 Phase 4). The host wires these
     # to the dedicated Orchestrator: start (objective, provider, model), pause

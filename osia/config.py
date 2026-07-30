@@ -30,6 +30,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TRANSPORT_DEFAULTS_SCHEMA_VERSION = 1
 PRODUCTION_STUN_URL = "stun:stun.cloudflare.com:3478"
 
+# WOR-211 release contract. Acoustic wake remains unavailable until WOR-214
+# supplies a locally packaged verifier that passes the lexical-safety gate.
+# This is deliberately independent of persisted settings and model files.
+ACOUSTIC_WAKE_AVAILABLE = False
+ACOUSTIC_WAKE_UNAVAILABLE_REASON = "release_disabled_no_reliable_local_verifier"
+
 
 def _resolve_config_dir() -> str:
     """Resolve the config/data dir.
@@ -127,14 +133,11 @@ DEFAULT_SETTINGS = {
     "liveapi_enabled": False,                  # master switch
     "liveapi_provider": "google",              # "google", "openai", "claude"
     "liveapi_model": "gemini-3.1-flash-live",  # provider-specific live model id
-    # Wake-word listener master switch (settings UI toggle): when False OSIA
-    # does not start — and stops — the always-on "OSIA" wake-word detector.
-    # OSIA stays reachable via the capsule click and the Ctrl+Alt+O window.
-    # Wired in osia.main.wake_mode via MainPopup.wake_word_enabled_changed.
-    "wake_word_enabled": True,
-    # Wake-word greeting: when enabled, OSIA speaks ``wake_greeting_text`` right
-    # after the wake word is detected and BEFORE it starts listening for the
-    # command (see osia.main.wake_mode.handle_wake). Empty text = no greeting.
+    # Compatibility key retained for older settings/mobile clients. The
+    # release contract above forces its effective value to False.
+    "wake_word_enabled": False,
+    # Manual voice greeting: when enabled, OSIA speaks ``wake_greeting_text``
+    # after Ctrl+Space and before command listening. Empty text = no greeting.
     "wake_greeting_enabled": False,
     "wake_greeting_text": "",
     # Scheduled tasks (Bloc 5): list of cron entries. Each entry is
@@ -592,6 +595,8 @@ def load_settings() -> dict:
     base = dict(DEFAULT_SETTINGS)
     base.update(_read_settings_file())
     base.update(LEGACY_MCP_CONFIRMATION_SAFE_VALUES)
+    # A legacy persisted true value must never reactivate acoustic detection.
+    base["wake_word_enabled"] = ACOUSTIC_WAKE_AVAILABLE
     base["reasoning"] = normalize_reasoning_settings(base.get("reasoning"))
     return base
 
@@ -720,6 +725,8 @@ def set_setting(key: str, value) -> None:
     settings = load_settings()
     if key in LEGACY_MCP_CONFIRMATION_SAFE_VALUES:
         value = LEGACY_MCP_CONFIRMATION_SAFE_VALUES[key]
+    if key == "wake_word_enabled":
+        value = ACOUSTIC_WAKE_AVAILABLE
     if key == "reasoning":
         value = normalize_reasoning_settings(value)
     settings[key] = value

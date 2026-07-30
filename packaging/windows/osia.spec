@@ -18,7 +18,6 @@ GENERATED = STAGE / "generated"
 
 datas = [
     (str(ROOT / "assets"), "assets"),
-    (str(ROOT / "osia" / "wake_training" / "osia_verifier.pkl"), "osia/wake_training"),
     (str(ROOT / "windows" / "configure_lan_firewall.ps1"), "windows"),
     (str(STAGE / "models"), "models"),
     (str(STAGE / "runtimes"), "runtimes"),
@@ -33,7 +32,7 @@ hiddenimports = collect_submodules(
     filter=lambda name: not any(
         part.startswith("test_") or part == "_selftest"
         for part in name.split(".")
-    ),
+    ) and not name.startswith("osia.wake_training"),
 )
 for package in (
     "aiortc",

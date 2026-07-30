@@ -367,19 +367,10 @@ def _browser_smoke() -> int:
 
 
 def _acquire_gui_mutex():
-    """Keep one desktop instance per Windows login session."""
-    if sys.platform != "win32":
-        return None
-    import ctypes
+    """Keep one desktop instance across source and packaged entry points."""
+    from osia.relaunch import acquire_desktop_instance_mutex
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    handle = kernel32.CreateMutexW(None, False, "Local\\OSIA.Desktop")
-    if not handle:
-        return None
-    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
-        kernel32.CloseHandle(handle)
-        return False
-    return handle
+    return acquire_desktop_instance_mutex()
 
 
 def main(args: list[str] | None = None) -> int:

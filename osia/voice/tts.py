@@ -17,6 +17,8 @@ import os
 import queue
 import sys
 import threading
+import time
+from functools import wraps
 
 import numpy as np
 import soundfile as sf
@@ -117,6 +119,63 @@ _kokoro_pipelines = {}
 _kokoro_model = None
 _stream_playback_context = threading.local()
 _playback_start_lock = threading.Lock()
+_playback_condition = threading.Condition()
+_playback_activity = 0
+_stream_pending = 0
+
+
+def _begin_playback_activity() -> None:
+    global _playback_activity
+    with _playback_condition:
+        _playback_activity += 1
+        _playback_condition.notify_all()
+
+
+def _end_playback_activity() -> None:
+    global _playback_activity
+    with _playback_condition:
+        _playback_activity = max(0, _playback_activity - 1)
+        _playback_condition.notify_all()
+
+
+def _change_stream_pending(delta: int) -> None:
+    global _stream_pending
+    with _playback_condition:
+        _stream_pending = max(0, _stream_pending + delta)
+        _playback_condition.notify_all()
+
+
+def _tracked_playback(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        _begin_playback_activity()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _end_playback_activity()
+
+    return wrapped
+
+
+def playback_active() -> bool:
+    """Return whether synthesis/playback or queued streaming speech is active."""
+    with _playback_condition:
+        return _playback_activity > 0 or _stream_pending > 0
+
+
+def wait_for_playback_complete(timeout: float | None = None) -> bool:
+    """Wait for all desktop TTS work using monotonic timeout accounting."""
+    deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+    with _playback_condition:
+        while _playback_activity > 0 or _stream_pending > 0:
+            if deadline is None:
+                _playback_condition.wait()
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            _playback_condition.wait(timeout=remaining)
+        return True
 
 
 def _patch_windows_espeak_data_path() -> None:
@@ -473,6 +532,7 @@ def get_active_tts_provider() -> str:
     return get_setting("tts_provider", "local") or "local"
 
 
+@_tracked_playback
 def _speak_blocking(text: str, language: str | None = None):
     """One synthesis pass through the dispatcher. Used by both the public
     ``speak`` entrypoint and the streaming worker."""
@@ -644,6 +704,7 @@ def _play_buffer_blocking(samples, sr) -> None:
     sd.wait()
 
 
+@_tracked_playback
 def speak_greeting_cached(text: str) -> None:
     """Speak the wake greeting, replaying cached audio when possible.
 
@@ -767,14 +828,13 @@ def _stream_worker():
         if item is None:
             return
         epoch, text, language = item
-        if epoch != _current_epoch():
-            # stale — a stop() happened after this was enqueued
-            _debug(
-                f"stream worker: DROPPING stale sentence "
-                f"(epoch {epoch} != current {_current_epoch()}): {text[:60]!r}"
-            )
-            continue
         try:
+            if epoch != _current_epoch():
+                _debug(
+                    f"stream worker: DROPPING stale sentence "
+                    f"(epoch {epoch} != current {_current_epoch()}): {text[:60]!r}"
+                )
+                continue
             print(f"[TTS] Speaking: {text[:80]}{'...' if len(text) > 80 else ''}")
             _stream_playback_context.epoch = epoch
             try:
@@ -786,6 +846,8 @@ def _stream_worker():
                 _stream_playback_context.epoch = None
         except Exception as e:
             print(f"[TTS] stream error: {e}")
+        finally:
+            _change_stream_pending(-1)
 
 
 def start_streaming_session() -> int:
@@ -828,6 +890,7 @@ def speak_streaming(
                 target=_stream_worker, daemon=True, name="osia-tts-stream",
             )
             _stream_thread.start()
+    _change_stream_pending(1)
     _stream_queue.put((epoch, text, language))
 
 
@@ -850,7 +913,9 @@ def stop() -> None:
     drained = 0
     while True:
         try:
-            _stream_queue.get_nowait()
+            item = _stream_queue.get_nowait()
+            if item is not None:
+                _change_stream_pending(-1)
             drained += 1
         except queue.Empty:
             break

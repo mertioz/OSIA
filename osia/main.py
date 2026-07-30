@@ -534,7 +534,7 @@ def _persist_exchange(conv_id, user_text, assistant_text, turn_context=None):
 def _start_ctrl_space_listener(callback):
     """
     Start a global keyboard listener that triggers `callback` on Ctrl+Space.
-    Used as fallback when no openWakeWord verifier model is available.
+    This is the intentional release activation path while acoustic wake is off.
 
     Returns a stop function.
     """
@@ -550,8 +550,12 @@ def _start_ctrl_space_listener(callback):
             elif key == keyboard.Key.space and ctrl_pressed:
                 print("⌨️  Ctrl+Space pressed — triggering OSIA")
                 callback()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(
+                "[wake] Ctrl+Space callback failed: "
+                f"{type(exc).__name__}",
+                flush=True,
+            )
 
     def on_release(key):
         nonlocal ctrl_pressed
@@ -720,10 +724,7 @@ def voice_mode():
 
 
 def wake_mode():
-    """Wake word mode: continuous listening for wake word, driven by the
-    Dynamic Island GUI. Falls back to Ctrl+Space if no verifier model is
-    available.
-    """
+    """Desktop voice mode with intentional Ctrl+Space manual activation."""
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtCore import QObject, pyqtSignal, Qt, QTimer
     from PyQt6.QtGui import QGuiApplication, QIcon
@@ -734,7 +735,7 @@ def wake_mode():
     from osia.utils.assets import ICON_PATH, ensure_desktop_entry
     from osia.gui.dynamic_island import DynamicIsland
     from osia.gui.main_popup import MainPopup
-    from osia.voice.wake import WakeWordDetector, verifier_available
+    from osia.voice.wake import WakeAcceptanceGate
     # NOTE: osia.voice.stt (faster_whisper, ~4.3s to import on Windows) is NOT
     # imported here. listen_for_command is only used on the wake daemon thread —
     # it is imported lazily inside handle_wake()'s process() worker so the heavy
@@ -742,11 +743,13 @@ def wake_mode():
     from osia.voice.commands import is_new_chat_command
     from osia.voice.tts import (
         shutdown as tts_shutdown,
+        playback_active as tts_playback_active,
         speak,
         speak_greeting_cached,
         speak_streaming,
         start_streaming_session,
         stop as tts_stop,
+        wait_for_playback_complete,
     )
     from osia.agent import clean_response
     from osia import i18n
@@ -757,7 +760,12 @@ def wake_mode():
         resolve_turn_context,
     )
     from osia import scheduled_tasks
-    from osia.config import load_settings, set_setting
+    from osia.config import (
+        ACOUSTIC_WAKE_AVAILABLE,
+        ACOUSTIC_WAKE_UNAVAILABLE_REASON,
+        load_settings,
+        set_setting,
+    )
     from osia.models import discover_models_async
     from osia.mobile_model_catalogue import (
         apply_autonomous_agent_model,
@@ -782,7 +790,7 @@ def wake_mode():
     perf_mark("wake_mode: heavy imports done")
 
     class Bridge(QObject):
-        wake_detected = pyqtSignal()
+        wake_detected = pyqtSignal(int)
         remote_models_signal = pyqtSignal(list)
         # Update the chat with a (role, text) pair from a worker thread.
         chat_message = pyqtSignal(str, str)
@@ -968,23 +976,44 @@ def wake_mode():
     # WOR-22: honour the saved "show the floating capsule" preference at launch.
     island.set_capsule_visible(settings.get("show_capsule", True))
 
-    # --- Wake word / hotkey trigger ---
-    def on_wake():
-        bridge.wake_detected.emit()
-
-    detector = None
-    stop_hotkey = None
-    if verifier_available():
-        detector = WakeWordDetector(callback=on_wake)
-    else:
-        print("⚠️  No wake model found. Using Ctrl+Space to trigger OSIA.")
-        stop_hotkey = _start_ctrl_space_listener(on_wake)
-
     # Serialises voice/cron/audio side effects. Typed chat turns are gated per
     # conversation below so different conversations can run independently.
     handler_lock = threading.Lock()
     busy_conversations: set[str] = set()
     busy_lock = threading.Lock()
+
+    def _any_conversation_busy() -> bool:
+        with busy_lock:
+            return bool(busy_conversations)
+
+    wake_gate = WakeAcceptanceGate(
+        handler_lock,
+        is_busy=_any_conversation_busy,
+        is_tts_active=tts_playback_active,
+    )
+
+    # WOR-211 release contract: no detector is constructed and no idle
+    # microphone stream is opened. Ctrl+Space enters the same guarded voice
+    # workflow intentionally; this does not depend on a missing model file.
+    assert not ACOUSTIC_WAKE_AVAILABLE
+    print(
+        "[wake] acoustic activation unavailable: "
+        f"{ACOUSTIC_WAKE_UNAVAILABLE_REASON}. Use Ctrl+Space."
+    )
+    manual_activation_open = threading.Event()
+    manual_activation_open.set()
+
+    def _manual_wake() -> None:
+        if not manual_activation_open.is_set():
+            print("[wake] manual activation rejected: shutting_down", flush=True)
+            return
+        if not wake_gate.reserve(0):
+            print("[wake] manual activation rejected: busy", flush=True)
+            return
+        print("[wake] manual activation accepted", flush=True)
+        bridge.wake_detected.emit(0)
+
+    stop_hotkey = _start_ctrl_space_listener(_manual_wake)
 
     def _desktop_busy_message() -> str:
         return "OSIA is still working in this conversation."
@@ -1160,20 +1189,34 @@ def wake_mode():
                 active_conv["id"] if active_conv else ""
             )
 
-    # ── Wake handler (voice path) ────────────────────────────────────────
+    # ── Manual activation handler (voice path) ──────────────────────────
 
-    def handle_wake():
-        if not handler_lock.acquire(blocking=False):
-            print("⚠️  Wake fired while a handler is already running — ignored.")
+    def handle_wake(generation: int):
+        if not wake_gate.consume(
+            generation,
+            is_current=manual_activation_open.is_set() and generation == 0,
+        ):
+            print("⚠️  Stale or unreserved wake event — ignored.")
             return
-        tts_stop()
+
+        def _finish_wake_turn() -> None:
+            # Streaming TTS is asynchronous with respect to agent completion.
+            # Hold the handler reservation until every queued sentence finishes.
+            wait_for_playback_complete()
+            wake_gate.finish()
 
         # Bloc 4 — Live API voice-to-voice. When enabled, OSIA's local STT
         # (Whisper) transcription and TTS speak steps are bypassed entirely:
         # the provider's live/realtime endpoint streams audio in and speaks
         # back natively. The real WebSocket streaming is a separate task —
         # _connect_live_api() is currently a stub (see osia.voice.live_api).
-        live_settings = load_settings()
+        try:
+            live_settings = load_settings()
+        except Exception as exc:
+            print(f"[wake] could not load voice settings: {exc}")
+            bridge.island_state.emit("idle")
+            _finish_wake_turn()
+            return
         if live_settings.get("liveapi_enabled") and not LIVEAPI_AVAILABLE:
             print(
                 "[LIVE API] configured but not yet available; "
@@ -1194,7 +1237,7 @@ def wake_mode():
                     _connect_live_api(provider, model)
                 finally:
                     bridge.island_state.emit("idle")
-                    handler_lock.release()
+                    _finish_wake_turn()
 
             threading.Thread(target=live_process, daemon=True).start()
             return
@@ -1243,7 +1286,7 @@ def wake_mode():
                 bridge.chat_message_for_conversation.emit(conv_id, "user", user_text)
                 _run_agent(user_text, conv_id, history, voice_response=True)
             finally:
-                handler_lock.release()
+                _finish_wake_turn()
 
         threading.Thread(target=process, daemon=True).start()
 
@@ -1488,18 +1531,6 @@ def wake_mode():
     popup.chatgpt_status_changed.connect(handle_chatgpt_status_changed)
     # WOR-22: the "Show the floating capsule" toggle hides/shows the capsule.
     popup.capsule_visibility_changed.connect(island.set_capsule_visible)
-
-    # The "Enable wake word" settings toggle stops/restarts the always-on
-    # listener live. OSIA stays reachable via the capsule / Ctrl+Alt+O window
-    # while it's off. No-op when no detector exists (no wake model available).
-    def _set_wake_word_enabled(enabled: bool) -> None:
-        if not detector:
-            return
-        if enabled:
-            detector.start()
-        else:
-            detector.stop()
-    popup.wake_word_enabled_changed.connect(_set_wake_word_enabled)
 
     # Initial population — no active conversation yet; the panel shows the
     # stored list (or its "No conversations" placeholder when empty).
@@ -2214,17 +2245,7 @@ def wake_mode():
     mobile_authorization_timer.timeout.connect(_poll_server_mobile_authorization)
     mobile_authorization_timer.start()
 
-    # Honour the saved "Enable wake word" preference at launch: when off, the
-    # detector exists but isn't started (OSIA stays reachable via the capsule /
-    # Ctrl+Alt+O window). The settings toggle can start it again at runtime.
-    wake_word_on = settings.get("wake_word_enabled", True)
-    if detector and wake_word_on:
-        detector.start()
-        trigger_label = "Say 'osia' to activate"
-    elif detector:
-        trigger_label = "Wake word off — click the capsule or press Ctrl+Alt+O"
-    else:
-        trigger_label = "Press Ctrl+Space to activate"
+    trigger_label = "Press Ctrl+Space to activate"
 
     print("=" * 60)
     print("  OSIA — Wake Mode (Dynamic Island)")
@@ -2241,8 +2262,8 @@ def wake_mode():
         heartbeat_monitor.stop()
         # WOR-45 Phase 4 — stop the autonomous loop too (safe if never started).
         orchestrator.stop()
-        if detector:
-            detector.stop()
+        manual_activation_open.clear()
+        wake_gate.cancel(0)
         if stop_hotkey:
             stop_hotkey()
         if stop_popup_hotkey:
@@ -2519,6 +2540,18 @@ def wake_mode():
 
 
 def main():
+    wake_entry = "--text" not in sys.argv and "--voice" not in sys.argv
+    try:
+        from osia.relaunch import acquire_desktop_instance_mutex
+        if wake_entry:
+            desktop_mutex = acquire_desktop_instance_mutex()
+            if sys.platform == "win32" and desktop_mutex is False:
+                return 0
+    except Exception as exc:
+        if sys.platform == "win32" and wake_entry:
+            print(f"[OSIA] desktop singleton unavailable: {exc}")
+            return 1
+
     try:
         from osia.relaunch import clear_stale_restart_state
         clear_stale_restart_state()
