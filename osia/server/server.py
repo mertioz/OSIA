@@ -1818,29 +1818,34 @@ def _persist_completed_assistant_message(
     ):
         return False
     try:
+        metadata = {
+            "_conversation_id": conv_id,
+            "_request_id": request_id,
+            "_client_request_id": request_id,
+            "_turn_id": turn_id,
+            "_message_id": message_id,
+            "_response_event_id": response_event_id,
+            "_response_sequence": response_sequence,
+            "_terminal_event_id": event_id,
+            "_terminal_sequence": sequence,
+            "_terminal": True,
+            "_language": normalize_locale(turn_meta.get("language")) or "",
+            "_terminal_status": str(terminal_frame.get("status") or "done"),
+            "_stage": str(terminal_frame.get("stage") or ""),
+            "_error_category": str(
+                terminal_frame.get("error_category") or ""
+            ),
+            "_reason_code": str(terminal_frame.get("reason_code") or ""),
+        }
+        from osia.document_artifacts import normalize_references
+        artifact_refs = normalize_references(turn_meta.get("_artifact_refs"))
+        if artifact_refs:
+            metadata["_artifact_refs"] = artifact_refs
         updated = conversations.add_message(
             conv_id,
             "assistant",
             content,
-            metadata={
-                "_conversation_id": conv_id,
-                "_request_id": request_id,
-                "_client_request_id": request_id,
-                "_turn_id": turn_id,
-                "_message_id": message_id,
-                "_response_event_id": response_event_id,
-                "_response_sequence": response_sequence,
-                "_terminal_event_id": event_id,
-                "_terminal_sequence": sequence,
-                "_terminal": True,
-                "_language": normalize_locale(turn_meta.get("language")) or "",
-                "_terminal_status": str(terminal_frame.get("status") or "done"),
-                "_stage": str(terminal_frame.get("stage") or ""),
-                "_error_category": str(
-                    terminal_frame.get("error_category") or ""
-                ),
-                "_reason_code": str(terminal_frame.get("reason_code") or ""),
-            },
+            metadata=metadata,
         )
     except Exception as exc:
         print(f"[OSIA Server] failed to persist correlated assistant turn: {exc}")
@@ -9562,17 +9567,10 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         turn_meta["allowed_languages"] = list(turn_context.allowed_languages)
         turn_meta["turn_ref"] = turn_context.turn_ref
 
-    # Correlation metadata belongs to persistence and transport only. Provider
-    # message APIs must never receive those underscore-prefixed fields.
-    history = [
-        {
-            key: value
-            for key, value in item.items()
-            if not (isinstance(key, str) and key.startswith("_"))
-        }
-        for item in history
-        if isinstance(item, dict)
-    ]
+    # Keep correlation/artifact metadata until the agent's single provider
+    # boundary. It is required for conversation isolation, stable receipts and
+    # restart-safe document continuity; _wire_messages removes it from payloads.
+    history = [item for item in history if isinstance(item, dict)]
     prev_len = len(history)
     persisted_user_content = (
         turn_meta.get("persisted_user_content", text)
@@ -9962,6 +9960,12 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # at index 0 AND defensively filters any system-prompt-looking frame,
     # so the system prompt cannot leak into the conversation history.
     new_history = agent.exported_history()
+    from osia.document_artifacts import normalize_references
+    artifact_refs = normalize_references(
+        getattr(agent, "last_run_artifacts", None)
+    )
+    if artifact_refs:
+        turn_meta["_artifact_refs"] = artifact_refs
     run_diagnostic = getattr(agent, "last_run_diagnostic", None)
     if not isinstance(run_diagnostic, dict):
         run_diagnostic = None
@@ -10078,6 +10082,9 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         _ts(t0, "assistant persistence failed")
         return new_history, active_conv_id
     turn_meta["persisted"] = True
+    stored_conversation = conversations.get_conversation(active_conv_id)
+    if isinstance(stored_conversation, dict):
+        new_history = list(stored_conversation.get("messages") or [])
     terminal_frame["persisted"] = True
     _retire_document_scope(
         "chat", str(turn_meta.get("turn_id") or ""),

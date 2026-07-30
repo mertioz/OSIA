@@ -45,6 +45,7 @@ DEFAULT_CHUNK_CHARS = 4_000
 MAX_CHUNK_CHARS = 8_000
 
 _ARTIFACT_RE = re.compile(r"^doc_[0-9a-f]{32}$")
+_CONVERSATION_RE = re.compile(r"^[0-9a-f]{32}$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PAGE_METHODS = frozenset({"native", "ocr"})
@@ -1242,9 +1243,52 @@ def _checkpoint_references() -> set[str]:
     return ids
 
 
+def _conversation_references() -> set[str]:
+    """Return intact, unexpired artifacts owned by canonical conversations."""
+
+    from osia import conversations
+
+    store = get_store()
+    ids: set[str] = set()
+    try:
+        paths = list(conversations.CONVERSATIONS_DIR.glob("*.json"))
+    except OSError:
+        return ids
+    for path in paths:
+        try:
+            loaded = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(loaded, dict):
+            continue
+        conversation_id = str(loaded.get("id") or "")
+        if (
+            not _CONVERSATION_RE.fullmatch(conversation_id)
+            or path.stem != conversation_id
+        ):
+            continue
+        for message in loaded.get("messages") or ():
+            if not isinstance(message, dict):
+                continue
+            for reference in normalize_references(message.get("_artifact_refs")):
+                artifact_id = reference["artifact_id"]
+                if artifact_id in ids:
+                    continue
+                try:
+                    if store._clock() >= float(reference.get("expires_at", 0)):
+                        continue
+                    with artifact_access_scope(conversation_id, [artifact_id]):
+                        store.inspect(artifact_id)
+                except (ArtifactStoreError, TypeError, ValueError, OverflowError):
+                    continue
+                ids.add(artifact_id)
+    return ids
+
+
 def cleanup_startup() -> dict:
     return get_store().cleanup(
-        _checkpoint_references(), remove_unreferenced=True,
+        _checkpoint_references() | _conversation_references(),
+        remove_unreferenced=True,
     )
 
 

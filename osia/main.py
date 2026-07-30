@@ -412,7 +412,21 @@ def _persist_agent_delta(
     try:
         new_msgs = agent.messages[1:][prev_history_len:]
         pending_user_display = user_display_text
-        for m in new_msgs:
+        final_assistant_index = next(
+            (
+                index for index in range(len(new_msgs) - 1, -1, -1)
+                if isinstance(new_msgs[index], dict)
+                and new_msgs[index].get("role") == "assistant"
+                and not new_msgs[index].get("_internal")
+                and not new_msgs[index].get("_provisional")
+            ),
+            None,
+        )
+        from osia.document_artifacts import normalize_references
+        artifact_refs = normalize_references(
+            getattr(agent, "last_run_artifacts", None)
+        )
+        for index, m in enumerate(new_msgs):
             # WOR-83: internal model-steering frames (anti-loop / hallucination
             # / empty-response guards) carry an _internal marker and must NEVER
             # be persisted. add_message stores only role+content, so a stored
@@ -422,6 +436,18 @@ def _persist_agent_delta(
             # the server's exported_history() filter (the single persistence
             # boundary for the local app).
             clean = _sanitize_persisted_history_message(m)
+            if clean is None and isinstance(m, dict) and m.get("_document_private"):
+                if (
+                    m.get("role") == "user"
+                    and pending_user_display is not None
+                    and not m.get("_internal")
+                ):
+                    clean = {"role": "user", "content": pending_user_display}
+                    pending_user_display = None
+                elif m.get("role") == "assistant" and index == final_assistant_index:
+                    visible = dict(m)
+                    visible.pop("_document_private", None)
+                    clean = _sanitize_persisted_history_message(visible)
             if clean is None:
                 continue
             if pending_user_display is not None and clean.get("role") == "user":
@@ -436,9 +462,13 @@ def _persist_agent_delta(
                     "_language_mode": context.mode,
                     "_allowed_languages": list(context.allowed_languages),
                 }
+            if artifact_refs and index == final_assistant_index:
+                metadata = dict(metadata or {})
+                metadata["_artifact_refs"] = artifact_refs
+            persistence_kwargs = {"metadata": metadata} if metadata else {}
             conversations.add_message(
                 conv_id, clean.get("role"), clean.get("content", ""),
-                metadata=metadata,
+                **persistence_kwargs,
             )
     except Exception as e:
         print(f"[OSIA] failed to persist conversation: {e}")

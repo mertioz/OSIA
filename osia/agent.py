@@ -5908,6 +5908,31 @@ def _is_same_document_followup(text: str) -> bool:
     )
 
 
+def _latest_persisted_document_references(
+    history, conversation_id: str | None = None,
+) -> list[dict]:
+    """Return only the most recent bounded artifact group in this history."""
+
+    from osia.conversation_context import ContextBuildError
+    from osia.document_artifacts import normalize_references
+
+    expected = str(conversation_id or "")
+    if expected:
+        for message in history if isinstance(history, list) else []:
+            marker = str(
+                message.get("_conversation_id") or ""
+            ) if isinstance(message, dict) else ""
+            if marker and marker != expected:
+                raise ContextBuildError("conversation_scope_mismatch")
+    for message in reversed(history if isinstance(history, list) else []):
+        if not isinstance(message, dict):
+            continue
+        references = normalize_references(message.get("_artifact_refs"))
+        if references:
+            return references
+    return []
+
+
 def _document_reference_from_result(tool_name: str, result) -> dict | None:
     """Parse only the bounded artifact metadata returned by read_document."""
 
@@ -6055,6 +6080,7 @@ class OSIAAgent:
         self._memory_store = None
         self._chatgpt_conversation_id = None
         self.last_run_diagnostic: dict | None = None
+        self.last_context_receipt: dict | None = None
         self.last_run_artifacts: list[dict] = []
         self._prior_run_document_artifacts: list[dict] = []
         self.last_run_document_activity = False
@@ -6087,6 +6113,7 @@ class OSIAAgent:
         )}]
         self.last_run_artifacts = []
         self._prior_run_document_artifacts = []
+        self.last_context_receipt = None
 
     def _mark_document_private_history(self) -> None:
         """Keep source paths and extracted text out of persisted chat history."""
@@ -6404,7 +6431,7 @@ class OSIAAgent:
         return type(e).__name__
 
     def _wire_messages(self) -> list:
-        """Build the exact message list sent to the provider.
+        """Build the bounded exact message list sent to the provider.
 
         Two wire-only normalisations are applied to a SHALLOW copy — never to
         ``self.messages`` itself, so conversation history, persistence and what
@@ -6431,56 +6458,42 @@ class OSIAAgent:
            merged, and the merge only fires when such a duplicate exists, so
            normal turns are unaffected.
 
-        Returns ``self.messages`` unchanged (same object) when neither
-        normalisation is needed, so the common path allocates nothing.
+        The deterministic context builder then keeps the full logical history
+        while it fits, or adds a local critical-excerpt note plus recent turns.
         """
-        msgs = self.messages
-        has_internal = any(
-            isinstance(m, dict) and any(str(k).startswith("_") for k in m)
-            for m in msgs
-        )
-        has_adjacent_dupes = any(
-            isinstance(a, dict) and isinstance(b, dict)
-            and a.get("role") == b.get("role")
-            and isinstance(a.get("content"), str)
-            and isinstance(b.get("content"), str)
-            for a, b in zip(msgs, msgs[1:])
-        )
-        if not has_internal and not has_adjacent_dupes:
-            from osia.image_inputs import adapt_messages_for_provider
+        import copy
 
-            return adapt_messages_for_provider(msgs, self.provider)
-
-        wire: list = []
-        for m in msgs:
-            if isinstance(m, dict):
-                is_internal = bool(m.get("_internal"))
-                m = {k: v for k, v in m.items() if not str(k).startswith("_")}
-                if (
-                    is_internal
-                    and m.get("role") == "user"
-                    and isinstance(m.get("content"), str)
-                ):
-                    m["content"] = (
-                        language_instruction(self.turn_context or self.lang)
-                        + "\n\n"
-                        + m["content"]
-                    )
-                prev = wire[-1] if wire else None
-                if (
-                    isinstance(prev, dict)
-                    and prev.get("role") == m.get("role")
-                    and isinstance(prev.get("content"), str)
-                    and isinstance(m.get("content"), str)
-                ):
-                    prev["content"] = "\n\n".join(
-                        p for p in (prev["content"], m["content"]) if p
-                    )
-                    continue
-            wire.append(m)
+        from osia.conversation_context import build_context, record_context_receipt
         from osia.image_inputs import adapt_messages_for_provider
 
-        return adapt_messages_for_provider(wire, self.provider)
+        logical = []
+        for message in self.messages:
+            candidate = copy.deepcopy(message)
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("_internal")
+                and candidate.get("role") == "user"
+                and isinstance(candidate.get("content"), str)
+            ):
+                candidate["content"] = (
+                    language_instruction(self.turn_context or self.lang)
+                    + "\n\n"
+                    + candidate["content"]
+                )
+            logical.append(candidate)
+
+        result = build_context(
+            logical,
+            provider=self.provider,
+            model=self.model,
+            conversation_id=getattr(self, "_chatgpt_conversation_id", None),
+            turn_id=getattr(
+                getattr(self, "turn_context", None), "turn_ref", None,
+            ),
+            metadata_messages=self.messages,
+        )
+        self.last_context_receipt = record_context_receipt(result.receipt)
+        return adapt_messages_for_provider(result.messages, self.provider)
 
     def _reasoning_request(self) -> dict:
         """Return exact reasoning kwargs and a sanitized adapter receipt."""
@@ -6934,6 +6947,10 @@ class OSIAAgent:
 
         self.last_run_diagnostic = None
         prior_artifacts = self.last_run_artifacts
+        if not prior_artifacts:
+            prior_artifacts = _latest_persisted_document_references(
+                history, current_conversation_id,
+            )
         if _is_same_document_followup(_history_text_for_hygiene(user_input)):
             self._prior_run_document_artifacts = [
                 dict(reference) for reference in prior_artifacts
