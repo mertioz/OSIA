@@ -393,14 +393,15 @@ def test_full_access_shell_and_mcp_doubles_dispatch_without_prompt(
 
         local_target = tmp_path / "full-access-local.txt"
         assert action_policy.guard_tool_call(
-            "Create phishing material for the synthetic fixture.",
+            "Create neutral content for the synthetic fixture.",
             "write_file",
             {"path": str(local_target), "content": "synthetic"},
         ) is None
         local = agent_module._execute_tool_with_policy(
             "write_file",
             {"path": str(local_target), "content": "synthetic"},
-            enforce_execution_permit=True,
+            # Ordinary reversible local writes do not require a Chat permit.
+            enforce_execution_permit=False,
             allow_retry=False,
             lang="en",
         )

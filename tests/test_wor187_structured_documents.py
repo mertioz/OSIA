@@ -24,7 +24,13 @@ from osia.tools.browser_artifacts import (
     BrowserArtifactStore,
     set_browser_artifact_store_for_testing,
 )
-from osia.tool_contracts import ExecutionOutcome, get_tool_spec
+from osia.tool_contracts import (
+    ExecutionOutcome,
+    ToolValidationError,
+    get_tool_spec,
+    static_tool_prompt_block,
+    validate_arguments,
+)
 from tests.wor187_fixtures import (
     LATE_MARKER,
     docx,
@@ -439,19 +445,27 @@ def test_v2_expiry_authorization_corruption_and_query_states(tmp_path, monkeypat
         document_artifacts.set_store_for_testing(previous)
 
 
-def test_model_contract_advertises_only_opaque_source_and_complete_query():
+def test_model_contract_advertises_exact_path_or_opaque_source_and_complete_query():
     read_spec = get_tool_spec("read_document")
     query_spec = get_tool_spec("query_document")
     assert set(read_spec.input_schema["properties"]) == {
-        "source_ref", "language", "max_file_bytes", "max_pages", "max_pixels",
-        "max_chars", "timeout_seconds",
+        "path", "source_ref", "language", "max_file_bytes", "max_pages",
+        "max_pixels", "max_chars", "timeout_seconds",
     }
-    assert "path" not in json.dumps(read_spec.input_schema)
-    rejected = agent_module._execute_tool_with_policy(
-        "read_document", {"path": "C:/private/document.docx"}, lang="en",
-    )
-    assert rejected.outcome == ExecutionOutcome.REJECTED_BEFORE_EXECUTION
-    assert rejected.dispatched is False
+    path_arguments = {"path": r"C:\Users\fixture\Desktop\document.docx"}
+    source_arguments = {"source_ref": "src_" + "a" * 32}
+    assert validate_arguments(read_spec.input_schema, path_arguments) == path_arguments
+    assert validate_arguments(read_spec.input_schema, source_arguments) == source_arguments
+    for invalid in (
+        {}, {**path_arguments, **source_arguments},
+        {"file_path": "document.docx"}, {"path": "relative/document.docx"},
+    ):
+        with pytest.raises(ToolValidationError, match="invalid_arguments"):
+            validate_arguments(read_spec.input_schema, invalid)
+    prompt = static_tool_prompt_block("en")
+    read_line = next(line for line in prompt.splitlines() if line.startswith("- read_document:"))
+    assert '"path": "<value>"' in read_line
+    assert "never shell, read_file, or render_pdf" in read_line
     assert query_spec.side_effect.value == "read_only"
     assert query_spec.idempotency.value == "idempotent"
     assert set(query_spec.input_schema["properties"]["operation"]["enum"]) == {

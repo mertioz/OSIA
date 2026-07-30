@@ -1782,7 +1782,8 @@ def _resolve_uwp(name):
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command",
              "Get-StartApps | ConvertTo-Json -Compress"],
-            capture_output=True, text=True, timeout=5, creationflags=flags,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5, creationflags=flags,
         )
     except Exception:
         return None

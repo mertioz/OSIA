@@ -334,6 +334,9 @@ def _object(properties: Mapping[str, dict] | None = None, *,
 
 
 PATH = _string(maximum=4096)
+ABSOLUTE_DOCUMENT_PATH = _string(
+    maximum=4096, pattern=r"^(?:/|[A-Za-z]:[\\/]|\\\\)",
+)
 URL = _string(maximum=8192, pattern=r"^\S+$")
 IDENTIFIER = _string(maximum=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@+/-]*$")
 FIELD_REF = _string(maximum=28, pattern=r"^fld_[A-Za-z0-9_-]{24}$")
@@ -649,14 +652,23 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
         _spec("read_file", "Read bounded local text", _object({"path": PATH}, required=("path",)),
               R, I, NC, preconditions=("readable_file",), progress=state, real=read_real,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),
-        _spec("read_document", "Parse an opaque document source to a private structured artifact",
-              _object({"source_ref": DOCUMENT_SOURCE_REF, "language": _nullable(_string(maximum=24)),
+        _spec(
+              "read_document",
+              "Read an existing PDF or document with this dedicated tool, never shell, read_file, or render_pdf. Pass exactly one canonical source: path for an exact absolute local path, for example "
+              '{"path":"C:\\\\Users\\\\Example\\\\Desktop\\\\report.pdf"}, '
+              "or source_ref for an opaque attachment/browser artifact reference",
+              _object({"path": ABSOLUTE_DOCUMENT_PATH,
+                       "source_ref": DOCUMENT_SOURCE_REF,
+                       "language": _nullable(_string(maximum=24)),
                        "max_file_bytes": _nullable(_integer(1, 20 * 1024 * 1024)),
                        "max_pages": _nullable(_integer(1, 100)),
                        "max_pixels": _nullable(_integer(1, 16_000_000)),
                        "max_chars": _nullable(_integer(1, 2_000_000)),
-                       "timeout_seconds": _nullable(_number(1.0, 25.0))}, required=("source_ref",)),
-              PL, C, NC, preconditions=("authorized_opaque_document_source",), timeout=195.0,
+                       "timeout_seconds": _nullable(_number(1.0, 25.0))}, oneOf=[
+                           {"required": ["path"]},
+                           {"required": ["source_ref"]},
+                       ]),
+              PL, C, NC, preconditions=("authorized_document_source",), timeout=195.0,
               result=ResultPolicy.PRIVATE_MODEL_ONLY,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               progress=ProgressEvidencePolicy.DOCUMENT_ARTIFACT, real=read_real,
@@ -668,7 +680,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               R, I, NC, preconditions=("authorized_live_artifact",),
               result=ResultPolicy.PRIVATE_MODEL_ONLY,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY, real=read_real),
-        _spec("query_document", "Query one private structured document by opaque references",
+        _spec("query_document", "Query one private structured document by opaque reference. Omit max_chars for the safe 8000-character response default; larger requested budgets up to 32000 are accepted but safely capped to 8000 per response",
               _object({
                   "document_id": ARTIFACT_ID,
                   "operation": _string(enum=(
@@ -681,7 +693,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
                   "query": _nullable(_string(maximum=1_000)),
                   "cursor": _nullable(_string(maximum=64, pattern=r"^cursor_[a-z_]+_[0-9a-f]{8}$")),
                   "max_items": _integer(1, 100),
-                  "max_chars": _integer(1, 8_000),
+                  "max_chars": _integer(1, 32_000),
                   "section_id": _nullable(_string(maximum=32, pattern=r"^section_[0-9]{6}$")),
                   "table_id": _nullable(_string(maximum=32, pattern=r"^table_[0-9]{6}$")),
                   "sheet_id": _nullable(_string(maximum=32, pattern=r"^sheet_[0-9]{6}$")),
@@ -1655,6 +1667,17 @@ def static_tool_prompt_block(lang: str = "en") -> str:
         props = props if isinstance(props, dict) else {}
         required = schema.get("required") if isinstance(schema, dict) else []
         required = required if isinstance(required, list) else []
+        if not required and isinstance(schema, dict):
+            # A mutually-exclusive source contract (currently read_document)
+            # has no unconditional required field.  Show the first declared
+            # alternative so the generated Usage remains directly callable.
+            for branch in schema.get("oneOf") or []:
+                branch_required = (
+                    branch.get("required") if isinstance(branch, dict) else []
+                )
+                if isinstance(branch_required, list) and branch_required:
+                    required = branch_required
+                    break
         parts = [f'"tool": "{spec.name}"']
         for key in required:
             if key in props:

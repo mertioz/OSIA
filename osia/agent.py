@@ -9,6 +9,8 @@ import hashlib
 import contextvars
 import json
 import math
+import ntpath
+import posixpath
 import re
 import secrets
 import subprocess
@@ -19,9 +21,10 @@ import shutil
 import stat
 import fnmatch
 import signal
+import threading
 import time
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
 from pathlib import Path
 
@@ -912,13 +915,17 @@ def tool_bash(command: str, timeout=None) -> str:
                 )
             out = result.stdout.strip()
             err = result.stderr.strip()
+            suffix = (
+                f"\n\n[exit code {result.returncode}]"
+                if result.returncode else ""
+            )
             if out and err:
-                return f"STDOUT:\n{out}\n\nSTDERR:\n{err}"
+                return f"STDOUT:\n{out}\n\nSTDERR:\n{err}{suffix}"
             if out:
-                return out
+                return f"{out}{suffix}"
             if err:
-                return f"STDERR:\n{err}"
-            return "(no output)"
+                return f"STDERR:\n{err}{suffix}"
+            return f"(no output){suffix}"
         except subprocess.TimeoutExpired:
             return f"ERROR: command timed out after {_format_timeout_seconds(timeout_s)}s"
         except Exception as e:
@@ -1018,17 +1025,20 @@ def tool_read_document(source_ref: str | None = None, language: str | None = Non
                        max_file_bytes=None, max_pages=None, max_pixels=None,
                        max_chars=None, timeout_seconds=None,
                        path: str | None = None) -> str:
-    """Extract one opaque source into a private structured artifact."""
+    """Extract one exact path or opaque source into a private artifact."""
 
     from osia.document_reader import read_document
 
-    # ``path`` remains callable only for trusted legacy Python call sites.  It
-    # is intentionally absent from the model-facing ToolSpec.
-    legacy_path = path
-    if legacy_path and not os.path.isabs(legacy_path):
-        legacy_path = os.path.join(_PROJECT_DIR, legacy_path)
+    has_path = isinstance(path, str) and bool(path)
+    has_source_ref = isinstance(source_ref, str) and bool(source_ref)
+    if has_path == has_source_ref:
+        return 'ERROR: {"category":"invalid_document_source","ok":false}'
+    if has_path and not os.path.isabs(path):
+        # Never reinterpret a model-provided relative path against the project
+        # root: that would silently guess a different document.
+        return 'ERROR: {"category":"absolute_path_required","ok":false}'
     return read_document(
-        legacy_path,
+        path,
         source_ref=source_ref,
         language=language,
         max_file_bytes=max_file_bytes,
@@ -1068,17 +1078,22 @@ def tool_query_document(
     start_seconds: float | None = None,
     end_seconds: float | None = None,
 ) -> str:
-    """Query one private structured artifact through opaque references."""
+    """Query one private artifact with an explicitly bounded response."""
 
     from osia.document_reader import query_document
 
+    # Models sometimes request a larger reading budget (for example 12,000
+    # characters) even though the artifact store's safety boundary is 8,000.
+    # Accept that harmless preference at the model contract and normalize it
+    # here; the underlying store never receives or returns more than 8,000.
+    bounded_max_chars = min(max_chars, 8_000)
     return query_document(
         document_id,
         operation,
         query=query,
         cursor=cursor,
         max_items=max_items,
-        max_chars=max_chars,
+        max_chars=bounded_max_chars,
         section_id=section_id,
         table_id=table_id,
         sheet_id=sheet_id,
@@ -3846,8 +3861,131 @@ _SCHEDULED_TASK_TOOL_NAMES = frozenset({
     "delete_scheduled_task",
 })
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="osia-tool")
+_SAME_TURN_SINGLE_FLIGHT_DOCUMENT_TOOLS = frozenset({
+    "read_document", "query_document",
+})
 
 _ERROR_PREFIXES = ("ERROR", "ERREUR", "[ERROR]", "[ERREUR]")
+
+
+def _normalized_document_single_flight_arguments(
+    tool_name: str,
+    arguments: dict,
+) -> dict:
+    """Canonicalize already-validated document arguments for one dispatch."""
+
+    normalized = dict(arguments)
+    if tool_name == "read_document" and isinstance(normalized.get("path"), str):
+        path = normalized["path"]
+        if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", path):
+            normalized["path"] = ntpath.normpath(path)
+        else:
+            normalized["path"] = posixpath.normpath(path)
+    elif tool_name == "query_document" and isinstance(
+        normalized.get("max_chars"), int,
+    ):
+        normalized["max_chars"] = min(normalized["max_chars"], 8_000)
+    return normalized
+
+
+def _document_single_flight_key(tool_name: str, arguments: dict):
+    """Return the exact per-turn key for an eligible validated document call."""
+
+    if tool_name not in _SAME_TURN_SINGLE_FLIGHT_DOCUMENT_TOOLS:
+        return None, dict(arguments)
+    normalized = _normalized_document_single_flight_arguments(
+        tool_name, arguments,
+    )
+    canonical_arguments = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return (tool_name, canonical_arguments), normalized
+
+
+def _same_turn_reused_execution_record(record):
+    """Copy a safe payload while truthfully recording zero new dispatches."""
+
+    from osia.tool_contracts import ToolExecutionRecord
+
+    return ToolExecutionRecord(
+        record.result,
+        record.is_error,
+        record.outcome,
+        0,
+        False,
+        record.timed_out,
+        record.contract,
+    )
+
+
+def _document_single_flight_result_is_shareable(record) -> bool:
+    """Never cache or fan out an execution whose outcome is still unknown."""
+
+    from osia.tool_contracts import ExecutionOutcome
+
+    return bool(
+        getattr(record, "outcome", None) != ExecutionOutcome.OUTCOME_UNKNOWN
+        and not bool(getattr(record, "timed_out", False))
+    )
+
+
+class _SameTurnDocumentSingleFlight:
+    """Share eligible document executions within one model/user turn only."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._in_flight: dict[tuple[str, str], Future] = {}
+        self._completed: dict[tuple[str, str], object] = {}
+
+    def execute(self, tool_name: str, arguments: dict, dispatch):
+        """Return ``(record, reused, normalized_arguments)`` for one call."""
+
+        key, normalized = _document_single_flight_key(tool_name, arguments)
+        if key is None:
+            return dispatch(normalized), False, normalized
+
+        with self._lock:
+            completed = self._completed.get(key)
+            if completed is not None:
+                return (
+                    _same_turn_reused_execution_record(completed),
+                    True,
+                    normalized,
+                )
+            future = self._in_flight.get(key)
+            leader = future is None
+            if leader:
+                future = Future()
+                self._in_flight[key] = future
+
+        if not leader:
+            first_record = future.result()
+            if not _document_single_flight_result_is_shareable(first_record):
+                return dispatch(normalized), False, normalized
+            return (
+                _same_turn_reused_execution_record(first_record),
+                True,
+                normalized,
+            )
+
+        print(f"[OSIA Agent] document single-flight dispatch: {tool_name}")
+        try:
+            record = dispatch(normalized)
+        except BaseException as exc:
+            with self._lock:
+                self._in_flight.pop(key, None)
+                future.set_exception(exc)
+            raise
+        with self._lock:
+            self._in_flight.pop(key, None)
+            if _document_single_flight_result_is_shareable(record):
+                self._completed[key] = record
+            future.set_result(record)
+        return record, False, normalized
 
 
 def _result_text(result) -> str:
@@ -5760,6 +5898,16 @@ def _history_text_for_hygiene(content) -> str:
     return "" if content is None else str(content)
 
 
+def _is_same_document_followup(text: str) -> bool:
+    """Recognize an explicit reference to the immediately prior document."""
+
+    folded = str(text or "").casefold()
+    return bool(
+        re.search(r"\b(?:same|this|m[êe]me|ce|cet|cette)\b", folded)
+        and re.search(r"\b(?:pdf|document|file|fichier)\b", folded)
+    )
+
+
 def _document_reference_from_result(tool_name: str, result) -> dict | None:
     """Parse only the bounded artifact metadata returned by read_document."""
 
@@ -5908,6 +6056,7 @@ class OSIAAgent:
         self._chatgpt_conversation_id = None
         self.last_run_diagnostic: dict | None = None
         self.last_run_artifacts: list[dict] = []
+        self._prior_run_document_artifacts: list[dict] = []
         self.last_run_document_activity = False
         self.last_run_document_error: str | None = None
         self._document_scope_id = secrets.token_hex(32)
@@ -5936,6 +6085,8 @@ class OSIAAgent:
         self.messages = [{"role": "system", "content": get_system_prompt(
             self.lang, self.model, self.provider, self.turn_context,
         )}]
+        self.last_run_artifacts = []
+        self._prior_run_document_artifacts = []
 
     def _mark_document_private_history(self) -> None:
         """Keep source paths and extracted text out of persisted chat history."""
@@ -6748,6 +6899,18 @@ class OSIAAgent:
         from osia.utils.key_chain import task_scope
 
         self.last_run_diagnostic = None
+        prior_artifacts = self.last_run_artifacts
+        if _is_same_document_followup(_history_text_for_hygiene(user_input)):
+            self._prior_run_document_artifacts = [
+                dict(reference) for reference in prior_artifacts
+                if isinstance(reference, dict)
+                and re.fullmatch(
+                    r"doc_[0-9a-f]{32}",
+                    str(reference.get("document_id") or ""),
+                )
+            ]
+        else:
+            self._prior_run_document_artifacts = []
         self.last_run_artifacts = []
         self.last_run_document_activity = False
         self.last_run_document_error = None
@@ -6782,10 +6945,17 @@ class OSIAAgent:
             if _document_artifacts.has_artifact_access_scope():
                 return _run_scoped()
             owner_id = current_conversation_id or self._document_scope_id
-            with _document_artifacts.artifact_access_scope(owner_id):
+            prior_document_ids = [
+                reference["document_id"]
+                for reference in self._prior_run_document_artifacts
+            ]
+            with _document_artifacts.artifact_access_scope(
+                owner_id, prior_document_ids,
+            ):
                 return _run_scoped()
         finally:
             self._semantic_form_values = []
+            self._prior_run_document_artifacts = []
 
     def run_scheduled(
         self,
@@ -6960,6 +7130,33 @@ class OSIAAgent:
                 "_memory_context": True,
                 "content": memory_context,
             })
+        if self._prior_run_document_artifacts:
+            references = [
+                {
+                    key: reference.get(key)
+                    for key in (
+                        "document_id", "format_label", "page_count",
+                        "section_count", "table_count", "supported_queries",
+                        "expires_at",
+                    )
+                }
+                for reference in self._prior_run_document_artifacts
+            ]
+            self.messages.append({
+                "role": "user",
+                "_internal": True,
+                "_document_context": True,
+                "content": (
+                    "[Private references from the immediately preceding "
+                    "document turn. The user explicitly refers to the same "
+                    "document: call query_document exactly once for this "
+                    "follow-up with this document_id and do not call "
+                    "read_document again. Omit max_chars or keep "
+                    "it at 8000 or less. References: "
+                    + json.dumps(references, sort_keys=True, separators=(",", ":"))
+                    + "]"
+                ),
+            })
         self.messages.append({"role": "user", "content": user_input})
 
         # ── Task-hierarchy routing (Bloc 3) ──────────────────────────────
@@ -7075,6 +7272,7 @@ class OSIAAgent:
         # stopped when the guard says no progress is being made.
         guard = _AntiLoopGuard(lang=self.lang)
         unresolved_tool_timeout = False
+        document_single_flight = _SameTurnDocumentSingleFlight()
 
         # The chat path drives its OWN key rotation (the except block below +
         # _activate_next_api_key), so it never reaches with_key_rotation's
@@ -7470,6 +7668,7 @@ class OSIAAgent:
                     )
                     autonomous_policy_error = None
                     autonomous_execution_permit = False
+                    same_turn_result_reused = False
                     if tool_name == "save_memory" or tool_name in _SCHEDULED_TASK_TOOL_NAMES:
                         try:
                             from osia.action_policy import (
@@ -7623,28 +7822,48 @@ class OSIAAgent:
                                 effective,
                             )
                         else:
-                            execution_record = _execute_tool_with_policy(
+                            def _dispatch_validated_document_call(
+                                dispatch_kwargs,
+                            ):
+                                return _execute_tool_with_policy(
+                                    tool_name,
+                                    dispatch_kwargs,
+                                    hard_deadline=(
+                                        guard.started_at + guard.hard_limit
+                                    ),
+                                    allow_retry=not final_external_call,
+                                    user_request=user_text,
+                                    lang=self.lang,
+                                    enforce_execution_permit=(
+                                        (
+                                            effective.confirmation in {
+                                                ConfirmationPolicy.CONFIRMATION_REQUIRED,
+                                                ConfirmationPolicy.FINAL_COMMIT_CONFIRMATION,
+                                            }
+                                            or final_external_call
+                                            or explicit_execution_permit
+                                        )
+                                        and not tool_name.startswith("gmail_")
+                                        and not tool_name.startswith("mcp__")
+                                    ),
+                                )
+
+                            (
+                                execution_record,
+                                same_turn_result_reused,
+                                kwargs,
+                            ) = document_single_flight.execute(
                                 tool_name,
                                 kwargs,
-                                hard_deadline=guard.started_at + guard.hard_limit,
-                                allow_retry=not final_external_call,
-                                user_request=user_text,
-                                lang=self.lang,
-                                enforce_execution_permit=(
-                                    (
-                                        effective.confirmation in {
-                                            ConfirmationPolicy.CONFIRMATION_REQUIRED,
-                                            ConfirmationPolicy.FINAL_COMMIT_CONFIRMATION,
-                                        }
-                                        or final_external_call
-                                        or explicit_execution_permit
-                                    )
-                                    and not tool_name.startswith("gmail_")
-                                    and not tool_name.startswith("mcp__")
-                                ),
+                                _dispatch_validated_document_call,
                             )
                             result = execution_record.result
                             is_error = execution_record.is_error
+                    if same_turn_result_reused:
+                        print(
+                            "[OSIA Agent] same-turn document result reused: "
+                            f"{tool_name}"
+                        )
                     try:
                         from osia.autonomous.authorization import record_tool_execution
 
@@ -7743,6 +7962,11 @@ class OSIAAgent:
                     tool_results.append(result_entry)
                     if screenshot:
                         tool_screenshots.append(screenshot)
+                    if same_turn_result_reused:
+                        # The provider call still receives its own result entry,
+                        # but no second execution is reported to the anti-loop
+                        # guard or counted as useful progress.
+                        continue
                     # Anti-loop: record the executed call and run every
                     # detector (repetition, error streak, stall, time).
                     progress_before = guard.useful_progress_count
