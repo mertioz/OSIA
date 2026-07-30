@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import queue
 import re
@@ -60,6 +61,12 @@ class AccountProviderError(RuntimeError):
         self.output_started = error.output_started
         self.native_action = error.native_action
         self.controlled_refusal = error.controlled_refusal
+        self.native_tool_call = (
+            dict(error.native_tool_call)
+            if isinstance(error.native_tool_call, dict)
+            else None
+        )
+        self.reformulatable_native_action = error.reformulatable_native_action
         self.allow_fallback = error.allow_fallback
         self.category = error.category
         self.method = error.method
@@ -210,6 +217,29 @@ def _bounded_turn_timeout(value) -> float:
     if not math.isfinite(timeout) or timeout <= 0:
         return 300.0
     return min(timeout, 300.0)
+
+
+def _canonical_native_tool_text(error: AppServerError) -> str | None:
+    """Serialize one exact App Server handoff into OSIA's existing wire form."""
+
+    handoff = error.native_tool_call
+    if not isinstance(handoff, dict):
+        return None
+    tool = handoff.get("tool")
+    arguments = handoff.get("arguments")
+    call_id = handoff.get("call_id")
+    if not isinstance(tool, str) or not tool:
+        return None
+    if not isinstance(arguments, dict) or "tool" in arguments:
+        return None
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    payload = {"tool": tool, **arguments}
+    return (
+        "<tool_call>\n"
+        + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        + "\n</tool_call>"
+    )
 
 
 class ChatGPTAccountProvider:
@@ -367,6 +397,7 @@ class ChatGPTAccountProvider:
         on_delta=None,
         timeout: float = 300.0,
     ) -> TurnResult:
+        state = None
         try:
             state, delta_messages = self._prepare(conversation_id, model, messages)
             turn_input = _turn_input(delta_messages)
@@ -392,6 +423,35 @@ class ChatGPTAccountProvider:
                     ] + [{"role": "assistant", "content": result.text}]
             return result
         except AppServerError as exc:
+            native_tool_text = _canonical_native_tool_text(exc)
+            if native_tool_text is not None and state is not None:
+                if on_delta is not None:
+                    on_delta(native_tool_text)
+                result = TurnResult(
+                    text=native_tool_text,
+                    thread_id=state.thread_id,
+                    turn_id=None,
+                    status="interrupted",
+                    output_started=exc.output_started,
+                )
+                with self._lock:
+                    current = self._threads.get(conversation_id)
+                    if current is state:
+                        current.expected_messages = [
+                            _public_message(message)
+                            for message in messages
+                            if message.get("role") != "system"
+                        ] + [{"role": "assistant", "content": result.text}]
+                return result
+            if exc.native_action and state is not None:
+                with self._lock:
+                    current = self._threads.get(conversation_id)
+                    if current is state:
+                        current.expected_messages = [
+                            _public_message(message)
+                            for message in messages
+                            if message.get("role") != "system"
+                        ]
             if exc.category in {"thread_failed", "request_rejected", "process_crash"}:
                 with self._lock:
                     self._threads.pop(conversation_id, None)

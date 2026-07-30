@@ -7260,6 +7260,9 @@ class OSIAAgent:
         # Empty-response guard: whether the one allowed "your reply was
         # empty after stripping markup" retry has been spent.
         empty_retry_used = False
+        # An unsupported Codex-native action gets one same-provider chance to
+        # reformulate as an available canonical OSIA textual tool call.
+        native_action_reformulation_used = False
 
         # API endpoint fallback (Bloc 5): whether the one allowed "primary
         # endpoint failed → retry on the fallback base_url" switch has been
@@ -7338,6 +7341,38 @@ class OSIAAgent:
                         on_sentence=on_sentence,
                         on_first_token=on_first_token,
                     )
+                reformulatable_native_action = bool(
+                    self.provider == "chatgpt_account"
+                    and getattr(e, "native_action", False)
+                    and getattr(e, "reformulatable_native_action", False)
+                )
+                if (
+                    reformulatable_native_action
+                    and not native_action_reformulation_used
+                ):
+                    native_action_reformulation_used = True
+                    provisional_sentences.clear()
+                    self.messages.append({
+                        "role": "user",
+                        "_internal": True,
+                        "content": (
+                            "The previous ChatGPT Account turn attempted a "
+                            "Codex-native action that OSIA could not map exactly. "
+                            "No action occurred. This is the single allowed "
+                            "reformulation attempt: use an available canonical "
+                            "OSIA <tool_call> JSON block with its exact tool name "
+                            "and schema. Do not call a Codex-native tool. If no "
+                            "exact OSIA tool can perform the request, explain that "
+                            "once in plain text without attempting another action."
+                        ),
+                    })
+                    continue
+                if reformulatable_native_action:
+                    # Turn the second bounded refusal into the normal canonical
+                    # final path so desktop, Mobile and TTS all receive it once.
+                    provisional_sentences.clear()
+                    message = None
+                    content = str(e)
                 status = (
                     getattr(e, "status_code", None)
                     or getattr(getattr(e, "response", None), "status_code", None)
@@ -7458,7 +7493,8 @@ class OSIAAgent:
                         outcome_unknown=turn_has_unknown_outcome,
                         on_sentence=on_sentence,
                     )
-                raise
+                if not reformulatable_native_action:
+                    raise
 
             # Provider output, streamed text and chatter are not useful progress.
             # Re-check both deadlines before parsing or executing anything.

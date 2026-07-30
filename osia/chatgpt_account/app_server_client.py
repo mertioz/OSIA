@@ -2,8 +2,10 @@
 
 The process is deliberately isolated from the normal Codex installation and
 from OSIA's repository/configuration.  Only agent-message text is accepted as
-provider output; turn-scoped local images are input-only, and every native
-action item or approval request cancels the turn.
+provider output; turn-scoped local images are input-only.  A narrow set of
+exact canonical OSIA dynamic-tool requests may be handed back to OSIA's normal
+dispatcher, while every direct native action item or approval request still
+cancels the turn.
 """
 
 from __future__ import annotations
@@ -105,6 +107,60 @@ _SAFE_NOTIFICATIONS = frozenset(
     }
 )
 
+_CANONICAL_NATIVE_TOOL_NAMES = (
+    "read_file",
+    "write_file",
+    "navigate",
+    "open_browser",
+    "navigate_browser",
+    "read_document",
+    "query_document",
+)
+
+
+def _canonical_native_tools() -> list[dict]:
+    """Expose only exact OSIA identities backed by authoritative schemas."""
+
+    from osia.tool_contracts import get_static_registry
+
+    registry = get_static_registry()
+    tools = []
+    for name in _CANONICAL_NATIVE_TOOL_NAMES:
+        spec = registry.get(name)
+        if spec is None or not spec.chat_eligible:
+            continue
+        tools.append(
+            {
+                "type": "function",
+                "name": spec.name,
+                "description": spec.capability,
+                "inputSchema": deepcopy(spec.input_schema),
+            }
+        )
+    return tools
+
+
+def _exact_canonical_native_call(params: dict) -> dict | None:
+    """Return one value-only exact handoff; never infer from native commands."""
+
+    namespace = params.get("namespace")
+    tool = params.get("tool")
+    arguments = params.get("arguments")
+    call_id = params.get("callId") or params.get("call_id")
+    if namespace not in {None, ""}:
+        return None
+    if tool not in _CANONICAL_NATIVE_TOOL_NAMES:
+        return None
+    if not isinstance(arguments, dict) or "tool" in arguments:
+        return None
+    if not isinstance(call_id, str) or not call_id or len(call_id) > 256:
+        return None
+    return {
+        "tool": str(tool),
+        "arguments": deepcopy(arguments),
+        "call_id": call_id,
+    }
+
 
 class AppServerError(RuntimeError):
     """Sanitized App Server failure safe to cross the provider boundary."""
@@ -116,6 +172,8 @@ class AppServerError(RuntimeError):
         output_started: bool = False,
         native_action: bool = False,
         controlled_refusal: bool = False,
+        native_tool_call: dict | None = None,
+        reformulatable_native_action: bool = False,
         allow_fallback: bool = True,
         category: str = "app_server",
         method: str | None = None,
@@ -125,6 +183,10 @@ class AppServerError(RuntimeError):
         self.output_started = bool(output_started)
         self.native_action = bool(native_action)
         self.controlled_refusal = bool(controlled_refusal)
+        self.native_tool_call = (
+            deepcopy(native_tool_call) if isinstance(native_tool_call, dict) else None
+        )
+        self.reformulatable_native_action = bool(reformulatable_native_action)
         self.allow_fallback = bool(allow_fallback)
         self.category = category
         self.method = str(method) if method else None
@@ -199,6 +261,7 @@ class _TurnAttempt:
     text_parts: list[str] = field(default_factory=list)
     output_started: bool = False
     native_action: bool = False
+    native_tool_call: dict | None = None
     unsafe_category: str | None = None
     interrupt_sent: bool = False
 
@@ -551,7 +614,8 @@ class AppServerClient:
                             "name": "osia_pc",
                             "title": "OSIA",
                             "version": CLIENT_VERSION,
-                        }
+                        },
+                        "capabilities": {"experimentalApi": True},
                     },
                     timeout=self.startup_timeout,
                     ensure_started=False,
@@ -739,11 +803,22 @@ class AppServerClient:
                 return next(iter(self._attempts.values()))
         return None
 
-    def _mark_unsafe(self, params: dict, category: str) -> None:
+    def _mark_unsafe(
+        self,
+        params: dict,
+        category: str,
+        *,
+        native_tool_call: dict | None = None,
+    ) -> None:
         attempt = self._attempt_for(params)
         if attempt is None or attempt.native_action:
             return
         attempt.native_action = True
+        attempt.native_tool_call = (
+            deepcopy(native_tool_call)
+            if isinstance(native_tool_call, dict)
+            else None
+        )
         attempt.unsafe_category = category
         if params.get("turnId"):
             attempt.turn_id = str(params["turnId"])
@@ -770,7 +845,17 @@ class AppServerClient:
         elif method == "mcpServer/elicitation/request":
             result = {"action": "cancel", "content": None}
         elif method == "item/tool/call":
-            result = {"contentItems": [], "success": False}
+            native_tool_call = _exact_canonical_native_call(params)
+            result = {
+                "contentItems": [{
+                    "type": "inputText",
+                    "text": (
+                        "The request was not executed by Codex. OSIA will "
+                        "evaluate it through its canonical tool pipeline."
+                    ),
+                }],
+                "success": False,
+            }
         elif method == "item/tool/requestUserInput":
             result = {"answers": {}}
         else:
@@ -789,7 +874,14 @@ class AppServerClient:
             self._send({"id": request_id, "result": result})
         except AppServerError:
             pass
-        self._mark_unsafe(params, "native_request")
+        if method == "item/tool/call" and native_tool_call is not None:
+            self._mark_unsafe(
+                params,
+                f"canonical_tool:{native_tool_call['tool']}",
+                native_tool_call=native_tool_call,
+            )
+        else:
+            self._mark_unsafe(params, "native_request")
 
     def _dispatch_notification(self, method: str, params: dict) -> None:
         if method == "account/login/completed":
@@ -837,6 +929,19 @@ class AppServerClient:
         if method in {"item/started", "item/completed"}:
             item = params.get("item") if isinstance(params.get("item"), dict) else {}
             item_type = str(item.get("type") or "")
+            if item_type == "dynamicToolCall":
+                lifecycle_params = {**params, **item}
+                if not lifecycle_params.get("callId") and isinstance(item.get("id"), str):
+                    lifecycle_params["callId"] = item["id"]
+                native_tool_call = _exact_canonical_native_call(lifecycle_params)
+                if native_tool_call is not None:
+                    if method == "item/completed":
+                        self._mark_unsafe(
+                            params,
+                            f"canonical_tool:{native_tool_call['tool']}",
+                            native_tool_call=native_tool_call,
+                        )
+                    return
             if item_type in _FORBIDDEN_ITEM_TYPES or item_type not in _SAFE_ITEM_TYPES:
                 self._mark_unsafe(params, f"native_item:{item_type or 'unknown'}")
             return
@@ -1160,6 +1265,7 @@ class AppServerClient:
                 "serviceName": "osia_pc",
                 "baseInstructions": base_instructions,
                 "developerInstructions": developer_instructions,
+                "dynamicTools": _canonical_native_tools(),
             },
         )
         if result.get("instructionSources"):
@@ -1250,11 +1356,18 @@ class AppServerClient:
                     payload.allow_fallback = not attempt.output_started
                     raise payload
                 elif kind == "unsafe":
+                    native_tool_call = attempt.native_tool_call
                     raise AppServerError(
-                        _native_action_refusal(turn_content),
+                        (
+                            "ERROR: canonical OSIA tool handoff required."
+                            if native_tool_call is not None
+                            else _native_action_refusal(turn_content)
+                        ),
                         output_started=attempt.output_started,
                         native_action=True,
-                        controlled_refusal=True,
+                        controlled_refusal=native_tool_call is None,
+                        native_tool_call=native_tool_call,
+                        reformulatable_native_action=native_tool_call is None,
                         allow_fallback=False,
                         category=str(payload),
                     )
@@ -1262,11 +1375,18 @@ class AppServerClient:
                     status = str(payload.get("status") or "failed")
                     turn_id = payload.get("turnId") or attempt.turn_id
                     if attempt.native_action:
+                        native_tool_call = attempt.native_tool_call
                         raise AppServerError(
-                            _native_action_refusal(turn_content),
+                            (
+                                "ERROR: canonical OSIA tool handoff required."
+                                if native_tool_call is not None
+                                else _native_action_refusal(turn_content)
+                            ),
                             output_started=attempt.output_started,
                             native_action=True,
-                            controlled_refusal=True,
+                            controlled_refusal=native_tool_call is None,
+                            native_tool_call=native_tool_call,
+                            reformulatable_native_action=native_tool_call is None,
                             allow_fallback=False,
                             category=attempt.unsafe_category or "native_action",
                         )
