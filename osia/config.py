@@ -61,10 +61,6 @@ MOBILE_TOKEN_FILE = os.path.join(CONFIG_DIR, "mobile_token.txt")
 _API_KEY_CHANGE_LOCK = threading.Lock()
 _API_KEY_CHANGE_LISTENERS: set[Callable[[str], None]] = set()
 
-REASONING_LEVELS = ("auto", "off", "low", "medium", "high")
-REASONING_OPTION_IDS = (
-    "auto", "off", "minimal", "low", "medium", "high", "xhigh", "normal", "max",
-)
 _DEFAULT_REASONING_SETTINGS = {
     "default": "auto",
     "providers": {},
@@ -223,14 +219,24 @@ def _normalize_legacy_confirmation_settings(settings: dict) -> dict:
 
 
 def normalize_reasoning_level(value) -> str:
-    """Return a supported reasoning option id, defaulting invalid values to auto."""
+    """Normalize one canonical id without imposing a universal model list.
+
+    Exact acceptance is owned by :mod:`osia.reasoning` for the selected
+    provider/model pair.  Keeping this layer syntax-only lets authoritative
+    runtime metadata add an option (for example ``ultra``) without a second
+    allow-list silently rewriting it.
+    """
     if isinstance(value, str):
         level = value.strip().lower()
         if level == "default":
             return "auto"
         if level == "none":
             return "off"
-        if level in REASONING_OPTION_IDS:
+        if (
+            1 <= len(level) <= 32
+            and level[0].isalpha()
+            and all(char.isalnum() or char in {"_", "-"} for char in level)
+        ):
             return level
     return "auto"
 

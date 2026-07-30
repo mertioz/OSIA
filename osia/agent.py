@@ -6482,13 +6482,24 @@ class OSIAAgent:
 
         return adapt_messages_for_provider(wire, self.provider)
 
-    def _reasoning_request_kwargs(self) -> dict:
-        """Return provider reasoning kwargs for the current chat attempt."""
+    def _reasoning_request(self) -> dict:
+        """Return exact reasoning kwargs and a sanitized adapter receipt."""
         try:
-            from osia.reasoning import build_reasoning_kwargs
-            return build_reasoning_kwargs(self.provider, self.model)
+            from osia.reasoning import build_reasoning_request
+            return build_reasoning_request(self.provider, self.model)
         except Exception:
-            return {}
+            return {
+                "kwargs": {},
+                "diagnostic": {
+                    "provider_id": str(self.provider or "").strip().lower(),
+                    "model_id": str(self.model or "").strip(),
+                    "requested_reasoning": "auto",
+                    "effective_reasoning": "auto",
+                    "mapping_state": "accepted",
+                    "provider_parameter_name": None,
+                    "provider_parameter_value": None,
+                },
+            }
 
     def _bounded_provider_timeout(self, guard: _AntiLoopGuard):
         """Cap one provider round without extending its existing timeouts."""
@@ -6535,18 +6546,41 @@ class OSIAAgent:
         }
         if guard is not None:
             create_kwargs["timeout"] = self._bounded_provider_timeout(guard)
-        create_kwargs.update(self._reasoning_request_kwargs())
-        stream = self.client.chat.completions.create(**create_kwargs)
-        for chunk in stream:
-            if guard is not None and (
-                    guard.remaining_hard_budget() <= 0
-                    or guard.remaining_idle_budget() <= 0):
-                guard.check_time()
-                raise _TurnBudgetStop()
-            try:
-                yield chunk.choices[0].delta.content or ""
-            except (IndexError, AttributeError):
-                yield ""
+        reasoning_request = self._reasoning_request()
+        create_kwargs.update(reasoning_request.get("kwargs") or {})
+        outcome_recorded = False
+        try:
+            stream = self.client.chat.completions.create(**create_kwargs)
+            for chunk in stream:
+                if not outcome_recorded:
+                    from osia.reasoning import record_reasoning_outcome
+                    record_reasoning_outcome(
+                        reasoning_request.get("diagnostic") or {}, accepted=True
+                    )
+                    outcome_recorded = True
+                if guard is not None and (
+                        guard.remaining_hard_budget() <= 0
+                        or guard.remaining_idle_budget() <= 0):
+                    guard.check_time()
+                    raise _TurnBudgetStop()
+                try:
+                    yield chunk.choices[0].delta.content or ""
+                except (IndexError, AttributeError):
+                    yield ""
+            if not outcome_recorded:
+                from osia.reasoning import record_reasoning_outcome
+                record_reasoning_outcome(
+                    reasoning_request.get("diagnostic") or {}, accepted=True
+                )
+        except Exception as exc:
+            if not outcome_recorded:
+                from osia.reasoning import record_reasoning_outcome
+                record_reasoning_outcome(
+                    reasoning_request.get("diagnostic") or {},
+                    accepted=False,
+                    error=exc,
+                )
+            raise
 
     # Reasoning-block tag pairs (Qwen 3, DeepSeek-R1, …). Text between them
     # is internal chain-of-thought — kept in `full` but never spoken.
@@ -7294,6 +7328,8 @@ class OSIAAgent:
             self._mark_document_private_history()
             provisional_sentences.clear()
             schedule_guard_state["buffered_sentences"] = []
+            reasoning_request = None
+            reasoning_outcome_recorded = False
             if guard.check_time():
                 return self._finish_anti_loop_stop(
                     guard,
@@ -7321,8 +7357,14 @@ class OSIAAgent:
                         "messages": self._wire_messages(),
                         "timeout": self._bounded_provider_timeout(guard),
                     }
-                    create_kwargs.update(self._reasoning_request_kwargs())
+                    reasoning_request = self._reasoning_request()
+                    create_kwargs.update(reasoning_request.get("kwargs") or {})
                     response = self.client.chat.completions.create(**create_kwargs)
+                    from osia.reasoning import record_reasoning_outcome
+                    record_reasoning_outcome(
+                        reasoning_request.get("diagnostic") or {}, accepted=True
+                    )
+                    reasoning_outcome_recorded = True
                     # Keep the message object: native providers may return
                     # structured tool calls on it (message.tool_calls).
                     message = response.choices[0].message
@@ -7335,6 +7377,13 @@ class OSIAAgent:
                     on_first_token=on_first_token,
                 )
             except Exception as e:
+                if reasoning_request is not None and not reasoning_outcome_recorded:
+                    from osia.reasoning import record_reasoning_outcome
+                    record_reasoning_outcome(
+                        reasoning_request.get("diagnostic") or {},
+                        accepted=False,
+                        error=e,
+                    )
                 if guard.check_time():
                     return self._finish_anti_loop_stop(
                         guard,

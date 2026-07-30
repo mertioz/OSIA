@@ -1,59 +1,22 @@
 #!/usr/bin/env python3
-"""Provider-specific reasoning/thinking request parameters for OSIA chat calls."""
+"""Authoritative provider/model reasoning capabilities and request receipts."""
 
 from __future__ import annotations
 
 import copy
+import json
+import logging
 
 from osia.config import (
     get_reasoning_settings,
     normalize_reasoning_level,
     normalize_reasoning_settings,
+    set_reasoning_settings,
 )
-from osia.models import HARDCODED_MODELS, provider_for_model
+from osia.models import provider_for_model
 
 
-def _hardcoded_model_ids(provider: str) -> frozenset[str]:
-    return frozenset(
-        str(m.get("id") or "").strip()
-        for m in HARDCODED_MODELS
-        if str(m.get("provider") or "").strip().lower() == provider
-        and str(m.get("id") or "").strip()
-    )
-
-
-_GOOGLE_REASONING_MODELS = _hardcoded_model_ids("google")
-_GOOGLE_OFF_MODELS = frozenset(
-    model_id
-    for model_id in _GOOGLE_REASONING_MODELS
-    if model_id in {"gemini-2.5-flash", "gemini-2.5-flash-lite"}
-)
-_DEEPSEEK_REASONING_MODELS = _hardcoded_model_ids("deepseek")
-_GROQ_GPT_OSS_REASONING_MODELS = frozenset(
-    model_id
-    for model_id in _hardcoded_model_ids("groq")
-    if model_id.startswith("openai/gpt-oss-")
-)
-_MISTRAL_REASONING_MODELS = frozenset(
-    model_id
-    for model_id in _hardcoded_model_ids("mistral")
-    if model_id == "mistral-medium-3-5"
-)
-_OPENAI_REASONING_MODELS = frozenset(
-    model_id
-    for model_id in _hardcoded_model_ids("openai")
-    if model_id in {"gpt-5.5", "gpt-5.4", "gpt-5.4-mini"}
-)
-_ANTHROPIC_ADAPTIVE_XHIGH_MODELS = frozenset(
-    model_id
-    for model_id in _hardcoded_model_ids("anthropic")
-    if model_id in {"claude-opus-4-8", "claude-opus-4-7"}
-)
-_ANTHROPIC_ADAPTIVE_REASONING_MODELS = _ANTHROPIC_ADAPTIVE_XHIGH_MODELS | frozenset(
-    model_id
-    for model_id in _hardcoded_model_ids("anthropic")
-    if model_id in {"claude-opus-4-6", "claude-sonnet-4-6"}
-)
+_LOG = logging.getLogger(__name__)
 
 
 def _option(
@@ -67,13 +30,17 @@ def _option(
     return {
         "id": option_id,
         "label": label,
-        "label_key": label_key or f"reasoning.{option_id}",
+        "label_key": (
+            f"reasoning.{option_id}" if label_key is None else label_key
+        ),
         "kwargs": copy.deepcopy(kwargs or {}),
         "default": bool(default),
     }
 
 
-_AUTO_OPTION = _option("auto", "Default", default=True, label_key="reasoning.default")
+_AUTO_OPTION = _option(
+    "auto", "Default", default=True, label_key="reasoning.default"
+)
 
 
 def _anthropic_adaptive_kwargs(effort: str) -> dict:
@@ -85,8 +52,172 @@ def _anthropic_adaptive_kwargs(effort: str) -> dict:
     }
 
 
+def _deepseek_kwargs(effort: str) -> dict:
+    # ``extra_body`` is the OpenAI SDK escape hatch. Its children are emitted
+    # as top-level DeepSeek JSON fields on the wire.
+    return {
+        "extra_body": {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": effort,
+        }
+    }
+
+
+def _options(*values: dict) -> list[dict]:
+    return [copy.deepcopy(value) for value in values]
+
+
+def _register(
+    target: dict,
+    provider: str,
+    model_ids: tuple[str, ...],
+    options: list[dict],
+    evidence: str,
+) -> None:
+    for model_id in model_ids:
+        target[(provider, model_id)] = {
+            "options": _options(*options),
+            "evidence": evidence,
+        }
+
+
+# This exact-pair registry is the sole static capability authority. The PC UI,
+# Mobile catalogue, persistence resolver and provider adapter all consume it.
+# ChatGPT Account models are deliberately absent: App Server ``model/list``
+# metadata is authoritative for that provider at runtime.
+MODEL_REASONING_CAPABILITIES: dict[tuple[str, str], dict] = {}
+
+_register(
+    MODEL_REASONING_CAPABILITIES,
+    "anthropic",
+    ("claude-opus-4-8", "claude-opus-4-7"),
+    _options(
+        _AUTO_OPTION,
+        _option("off", "Off", {"extra_body": {"thinking": {"type": "disabled"}}}),
+        _option("low", "Low", _anthropic_adaptive_kwargs("low")),
+        _option("medium", "Medium", _anthropic_adaptive_kwargs("medium")),
+        _option("high", "High", _anthropic_adaptive_kwargs("high")),
+        _option("xhigh", "Extra high", _anthropic_adaptive_kwargs("xhigh")),
+        _option("max", "Max", _anthropic_adaptive_kwargs("max")),
+    ),
+    "https://platform.claude.com/docs/en/build-with-claude/effort",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES,
+    "anthropic",
+    ("claude-opus-4-6", "claude-sonnet-4-6"),
+    _options(
+        _AUTO_OPTION,
+        _option("off", "Off", {"extra_body": {"thinking": {"type": "disabled"}}}),
+        _option("low", "Low", _anthropic_adaptive_kwargs("low")),
+        _option("medium", "Medium", _anthropic_adaptive_kwargs("medium")),
+        _option("high", "High", _anthropic_adaptive_kwargs("high")),
+        _option("max", "Max", _anthropic_adaptive_kwargs("max")),
+    ),
+    "https://platform.claude.com/docs/en/build-with-claude/effort",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES,
+    "openai",
+    ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
+    _options(
+        _AUTO_OPTION,
+        _option("off", "Off", {"reasoning_effort": "none"}),
+        _option("low", "Low", {"reasoning_effort": "low"}),
+        _option("medium", "Medium", {"reasoning_effort": "medium"}),
+        _option("high", "High", {"reasoning_effort": "high"}),
+        _option("xhigh", "Extra high", {"reasoning_effort": "xhigh"}),
+    ),
+    "https://developers.openai.com/api/docs/models",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES,
+    "deepseek",
+    ("deepseek-v4-pro", "deepseek-v4-flash"),
+    _options(
+        _AUTO_OPTION,
+        _option("off", "Off", {"extra_body": {"thinking": {"type": "disabled"}}}),
+        _option("high", "High", _deepseek_kwargs("high")),
+        _option("max", "Max", _deepseek_kwargs("max")),
+    ),
+    "https://api-docs.deepseek.com/guides/thinking_mode",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES,
+    "google",
+    ("gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.1-flash-lite"),
+    _options(
+        _AUTO_OPTION,
+        _option("minimal", "Minimal", {"reasoning_effort": "minimal"}),
+        _option("low", "Low", {"reasoning_effort": "low"}),
+        _option("medium", "Medium", {"reasoning_effort": "medium"}),
+        _option("high", "High", {"reasoning_effort": "high"}),
+    ),
+    "https://ai.google.dev/gemini-api/docs/openai",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES,
+    "google",
+    ("gemini-3.1-pro-preview",),
+    _options(
+        _AUTO_OPTION,
+        _option("low", "Low", {"reasoning_effort": "low"}),
+        _option("medium", "Medium", {"reasoning_effort": "medium"}),
+        _option("high", "High", {"reasoning_effort": "high"}),
+    ),
+    "https://ai.google.dev/gemini-api/docs/thinking",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES,
+    "google",
+    ("gemini-2.5-flash", "gemini-2.5-flash-lite"),
+    _options(
+        _AUTO_OPTION,
+        _option("off", "Off", {"reasoning_effort": "none"}),
+        _option("minimal", "Minimal", {"reasoning_effort": "minimal"}),
+        _option("low", "Low", {"reasoning_effort": "low"}),
+        _option("medium", "Medium", {"reasoning_effort": "medium"}),
+        _option("high", "High", {"reasoning_effort": "high"}),
+    ),
+    "https://ai.google.dev/gemini-api/docs/openai",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES,
+    "groq",
+    ("openai/gpt-oss-120b", "openai/gpt-oss-20b"),
+    _options(
+        _AUTO_OPTION,
+        _option("low", "Low", {"reasoning_effort": "low"}),
+        _option("medium", "Medium", {"reasoning_effort": "medium"}),
+        _option("high", "High", {"reasoning_effort": "high"}),
+    ),
+    "https://console.groq.com/docs/reasoning",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES,
+    "groq",
+    ("qwen/qwen3.6-27b",),
+    _options(
+        _AUTO_OPTION,
+        _option("off", "Off", {"reasoning_effort": "none"}),
+    ),
+    "https://console.groq.com/docs/reasoning",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES,
+    "mistral",
+    ("mistral-medium-3-5",),
+    _options(
+        _AUTO_OPTION,
+        _option("off", "Off", {"reasoning_effort": "none"}),
+        _option("high", "High", {"reasoning_effort": "high"}),
+    ),
+    "https://docs.mistral.ai/studio-api/conversations/reasoning",
+)
+
+
 def normalize_level(value) -> str:
-    """Return a supported normalized reasoning option id."""
+    """Return a normalized canonical reasoning option id."""
     return normalize_reasoning_level(value)
 
 
@@ -148,165 +279,137 @@ def _option_kwargs(options: list[dict], option_id: str) -> dict:
     return copy.deepcopy(opt.get("kwargs") or {})
 
 
-def get_reasoning_options(provider, model) -> list[dict]:
-    """Return model-specific reasoning options safe for the current call path."""
+def _account_capability(model_id: str) -> dict | None:
+    try:
+        from osia.chatgpt_account.provider import get_cached_account_models
+
+        entry = next(
+            (
+                item
+                for item in get_cached_account_models()
+                if str(item.get("id") or "") == model_id
+            ),
+            None,
+        )
+    except Exception:
+        entry = None
+    if not entry:
+        return None
+
+    options = [_AUTO_OPTION]
+    for effort in entry.get("supportedReasoningEfforts") or []:
+        effort_id = normalize_level(effort.get("id"))
+        if effort_id == "auto":
+            continue
+        label = "Extra high" if effort_id == "xhigh" else effort_id.title()
+        options.append(
+            _option(
+                effort_id,
+                label,
+                {"effort": effort_id},
+                # Ultra has the same spelling in supported UI languages; an
+                # empty key deliberately uses the sanitized runtime label.
+                label_key="" if effort_id == "ultra" else None,
+            )
+        )
+    if len(options) == 1:
+        return None
+    return {
+        "options": _options(*options),
+        "evidence": "chatgpt_app_server:model/list",
+        "provider_default": normalize_level(entry.get("defaultReasoningEffort")),
+    }
+
+
+def get_reasoning_capability(provider, model) -> dict | None:
+    """Return one exact-pair capability, copied for safe caller mutation."""
     provider_id = _provider_id(provider, model)
     model_id = _model_id(model)
     if not provider_id or not model_id:
-        return []
-
+        return None
     if provider_id == "chatgpt_account":
-        # App Server model/list is the source of truth. Keep account reasoning
-        # separate from the OpenAI API model tables and request parameters.
-        try:
-            from osia.chatgpt_account.provider import get_cached_account_models
-            entry = next(
-                (item for item in get_cached_account_models()
-                 if str(item.get("id") or "") == model_id),
-                None,
-            )
-        except Exception:
-            entry = None
-        if not entry:
-            return []
-        options = [_AUTO_OPTION]
-        for effort in entry.get("supportedReasoningEfforts") or []:
-            effort_id = str(effort.get("id") or "").strip().lower()
-            if effort_id and effort_id != "auto":
-                label = "Extra high" if effort_id == "xhigh" else effort_id.title()
-                options.append(_option(effort_id, label, {"effort": effort_id}))
-        return [copy.deepcopy(opt) for opt in options]
-
-    if provider_id == "openai" and model_id in _OPENAI_REASONING_MODELS:
-        options = [
-            _AUTO_OPTION,
-            _option("off", "Off", {"reasoning_effort": "none"}),
-            _option("minimal", "Minimal", {"reasoning_effort": "minimal"}),
-            _option("low", "Low", {"reasoning_effort": "low"}),
-            _option("medium", "Medium", {"reasoning_effort": "medium"}),
-            _option("high", "High", {"reasoning_effort": "high"}),
-            _option("xhigh", "Extra high", {"reasoning_effort": "xhigh"}),
-        ]
-        return [copy.deepcopy(opt) for opt in options]
-
-    if (
-        provider_id == "anthropic"
-        and model_id in _ANTHROPIC_ADAPTIVE_REASONING_MODELS
-    ):
-        options = [
-            _AUTO_OPTION,
-            _option(
-                "off",
-                "Off",
-                {"extra_body": {"thinking": {"type": "disabled"}}},
-            ),
-            _option("low", "Low", _anthropic_adaptive_kwargs("low")),
-            _option("medium", "Medium", _anthropic_adaptive_kwargs("medium")),
-            _option("high", "High", _anthropic_adaptive_kwargs("high")),
-        ]
-        if model_id in _ANTHROPIC_ADAPTIVE_XHIGH_MODELS:
-            options.append(
-                _option("xhigh", "Extra high", _anthropic_adaptive_kwargs("xhigh"))
-            )
-        options.append(_option("max", "Max", _anthropic_adaptive_kwargs("max")))
-        return [copy.deepcopy(opt) for opt in options]
-
-    if provider_id == "google" and model_id in _GOOGLE_REASONING_MODELS:
-        options = [_AUTO_OPTION]
-        if model_id in _GOOGLE_OFF_MODELS:
-            options.append(_option("off", "Off", {"reasoning_effort": "none"}))
-        options.extend(
-            [
-                _option("minimal", "Minimal", {"reasoning_effort": "minimal"}),
-                _option("low", "Low", {"reasoning_effort": "low"}),
-                _option("medium", "Medium", {"reasoning_effort": "medium"}),
-                _option("high", "High", {"reasoning_effort": "high"}),
-            ]
-        )
-        return [copy.deepcopy(opt) for opt in options]
-
-    if provider_id == "deepseek" and model_id in _DEEPSEEK_REASONING_MODELS:
-        options = [
-            _AUTO_OPTION,
-            _option(
-                "off",
-                "Off",
-                {"extra_body": {"thinking": {"type": "disabled"}}},
-            ),
-            _option(
-                "normal",
-                "Normal",
-                {
-                    "extra_body": {
-                        "thinking": {"type": "enabled"},
-                        "reasoning_effort": "high",
-                    }
-                },
-            ),
-            _option(
-                "max",
-                "Max",
-                {
-                    "extra_body": {
-                        "thinking": {"type": "enabled"},
-                        "reasoning_effort": "max",
-                    }
-                },
-            ),
-        ]
-        return [copy.deepcopy(opt) for opt in options]
-
-    if provider_id == "groq" and model_id in _GROQ_GPT_OSS_REASONING_MODELS:
-        options = [
-            _AUTO_OPTION,
-            _option("low", "Low", {"reasoning_effort": "low"}),
-            _option("medium", "Medium", {"reasoning_effort": "medium"}),
-            _option("high", "High", {"reasoning_effort": "high"}),
-        ]
-        return [copy.deepcopy(opt) for opt in options]
-
-    if provider_id == "mistral" and model_id in _MISTRAL_REASONING_MODELS:
-        options = [
-            _AUTO_OPTION,
-            _option("off", "Off", {"reasoning_effort": "none"}),
-            _option("minimal", "Minimal", {"reasoning_effort": "minimal"}),
-            _option("low", "Low", {"reasoning_effort": "low"}),
-            _option("medium", "Medium", {"reasoning_effort": "medium"}),
-            _option("high", "High", {"reasoning_effort": "high"}),
-            _option("xhigh", "Extra high", {"reasoning_effort": "xhigh"}),
-        ]
-        return [copy.deepcopy(opt) for opt in options]
-
-    return []
+        capability = _account_capability(model_id)
+    else:
+        capability = MODEL_REASONING_CAPABILITIES.get((provider_id, model_id))
+    return copy.deepcopy(capability) if capability else None
 
 
-def resolve_reasoning_option_id(provider, model, settings=None) -> str:
-    """Resolve model override > provider default > global default."""
-    cfg = _reasoning_settings(settings)
-    provider_id = _provider_id(provider, model)
-    model_id = _model_id(model)
-    options = get_reasoning_options(provider_id, model_id)
-    option_ids = _known_option_ids(options)
+def get_reasoning_options(provider, model) -> list[dict]:
+    """Return only options with an exact provider/model mapping."""
+    capability = get_reasoning_capability(provider, model)
+    return list(capability.get("options") or []) if capability else []
 
-    model_levels = cfg.get("models") or {}
-    # Account and API catalogs can expose the same id. Namespace only account
-    # overrides so they can never collide with OpenAI API reasoning settings.
-    model_key = (
+
+def _model_settings_key(provider_id: str, model_id: str) -> str:
+    return (
         f"chatgpt_account:{model_id}"
         if provider_id == "chatgpt_account" and model_id
         else model_id
     )
+
+
+def _requested_level(provider_id: str, model_id: str, cfg: dict) -> tuple[str, str]:
+    model_key = _model_settings_key(provider_id, model_id)
+    model_levels = cfg.get("models") or {}
     if model_key and model_key in model_levels:
-        selected = normalize_level(model_levels.get(model_key))
-        return selected if selected in option_ids else "auto"
+        return normalize_level(model_levels.get(model_key)), "model"
 
     provider_levels = cfg.get("providers") or {}
     if provider_id and provider_id in provider_levels:
-        selected = normalize_level(provider_levels.get(provider_id))
-        return selected if selected in option_ids else "auto"
+        return normalize_level(provider_levels.get(provider_id)), "provider"
 
-    selected = normalize_level(cfg.get("default"))
-    return selected if selected in option_ids else "auto"
+    return normalize_level(cfg.get("default")), "default"
+
+
+def _migrate_invalid_to_default(
+    cfg: dict,
+    provider_id: str,
+    model_id: str,
+) -> None:
+    """Pin one invalid effective selection to canonical ``auto``."""
+    model_key = _model_settings_key(provider_id, model_id)
+    if not model_key:
+        return
+    migrated = copy.deepcopy(cfg)
+    models = dict(migrated.get("models") or {})
+    if models.get(model_key) == "auto":
+        return
+    models[model_key] = "auto"
+    migrated["models"] = models
+    set_reasoning_settings(migrated)
+
+
+def _resolve_selection(provider, model, settings=None) -> dict:
+    provider_id = _provider_id(provider, model)
+    model_id = _model_id(model)
+    cfg = _reasoning_settings(settings)
+    requested, source = _requested_level(provider_id, model_id, cfg)
+    capability = get_reasoning_capability(provider_id, model_id)
+    options = list(capability.get("options") or []) if capability else []
+    option_ids = _known_option_ids(options)
+    accepted = requested == "auto" or requested in option_ids
+    effective = requested if accepted else "auto"
+    if not accepted and settings is None:
+        try:
+            _migrate_invalid_to_default(cfg, provider_id, model_id)
+        except Exception:
+            pass
+    return {
+        "provider_id": provider_id,
+        "model_id": model_id,
+        "requested": requested,
+        "effective": effective,
+        "selection_source": source,
+        "mapping_state": "accepted" if accepted else "rejected",
+        "options": options,
+        "evidence": str((capability or {}).get("evidence") or ""),
+        "provider_default": str((capability or {}).get("provider_default") or ""),
+    }
+
+
+def resolve_reasoning_option_id(provider, model, settings=None) -> str:
+    """Resolve one exact option; persist invalid saved values as ``auto``."""
+    return str(_resolve_selection(provider, model, settings).get("effective") or "auto")
 
 
 def get_selected_reasoning_label(provider, model, settings=None) -> str | None:
@@ -322,21 +425,103 @@ def get_selected_reasoning_label(provider, model, settings=None) -> str | None:
 
 
 def provider_supports_reasoning(provider, model) -> bool:
-    """Return True only for verified current provider/model call paths."""
+    """Return True only for an authoritative exact-pair capability."""
     return bool(get_reasoning_options(provider, model))
 
 
-def build_reasoning_kwargs(provider, model, settings=None) -> dict:
-    """Build provider request kwargs for the current chat-completions path.
+def _provider_parameters(kwargs: dict) -> list[dict]:
+    parameters: list[dict] = []
 
-    Unsupported or unverified providers/models return an empty dict. "auto"
-    intentionally returns an empty dict so providers keep their native defaults.
+    def visit(value, prefix: str = "") -> None:
+        if not isinstance(value, dict):
+            if prefix and isinstance(value, (str, bool, int, float)):
+                parameters.append({"name": prefix, "value": value})
+            return
+        for key, child in value.items():
+            key_text = str(key)
+            # SDK-only wrapper; its children are the provider JSON fields.
+            child_prefix = prefix if not prefix and key_text == "extra_body" else (
+                f"{prefix}.{key_text}" if prefix else key_text
+            )
+            visit(child, child_prefix)
+
+    visit(kwargs)
+    return parameters
+
+
+def _primary_parameter(parameters: list[dict]) -> dict:
+    for wanted in (
+        "reasoning_effort",
+        "output_config.effort",
+        "effort",
+        "thinking.type",
+    ):
+        match = next((item for item in parameters if item.get("name") == wanted), None)
+        if match:
+            return dict(match)
+    return dict(parameters[0]) if parameters else {"name": None, "value": None}
+
+
+def build_reasoning_request(provider, model, settings=None) -> dict:
+    """Build provider kwargs plus a sanitized mapping receipt.
+
+    The receipt contains enums and exact pair identity only. It never includes
+    prompts, responses, keys, hidden reasoning, or chain-of-thought content.
     """
-    provider_id = _provider_id(provider, model)
-    model_id = _model_id(model)
-    options = get_reasoning_options(provider_id, model_id)
-    if not options:
-        return {}
+    resolved = _resolve_selection(provider, model, settings)
+    kwargs = (
+        _option_kwargs(resolved["options"], resolved["effective"])
+        if resolved["effective"] != "auto"
+        else {}
+    )
+    parameters = _provider_parameters(kwargs)
+    primary = _primary_parameter(parameters)
+    diagnostic = {
+        "provider_id": resolved["provider_id"],
+        "model_id": resolved["model_id"],
+        "requested_reasoning": resolved["requested"],
+        "effective_reasoning": resolved["effective"],
+        "selection_source": resolved["selection_source"],
+        "mapping_state": resolved["mapping_state"],
+        "provider_parameter_name": primary.get("name"),
+        "provider_parameter_value": primary.get("value"),
+        "provider_parameters": parameters,
+        "provider_default": resolved["provider_default"],
+        "evidence": resolved["evidence"],
+    }
+    return {"kwargs": copy.deepcopy(kwargs), "diagnostic": diagnostic}
 
-    selected = resolve_reasoning_option_id(provider_id, model_id, settings)
-    return _option_kwargs(options, selected)
+
+def build_reasoning_kwargs(provider, model, settings=None) -> dict:
+    """Compatibility helper returning only the exact provider request kwargs."""
+    return build_reasoning_request(provider, model, settings)["kwargs"]
+
+
+def record_reasoning_outcome(
+    diagnostic: dict,
+    *,
+    accepted: bool,
+    error: BaseException | None = None,
+) -> dict:
+    """Record a sanitized provider acceptance/rejection receipt."""
+    receipt = {
+        key: copy.deepcopy(diagnostic.get(key))
+        for key in (
+            "provider_id",
+            "model_id",
+            "requested_reasoning",
+            "effective_reasoning",
+            "selection_source",
+            "mapping_state",
+            "provider_parameter_name",
+            "provider_parameter_value",
+            "provider_parameters",
+            "provider_default",
+            "evidence",
+        )
+    }
+    receipt["state"] = "accepted" if accepted else "rejected"
+    if error is not None:
+        receipt["error_type"] = type(error).__name__
+    _LOG.info("reasoning_provider_payload %s", json.dumps(receipt, sort_keys=True))
+    return receipt
