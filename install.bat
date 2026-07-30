@@ -5,11 +5,11 @@ REM
 REM   * verifies Python 3.10+ is installed
 REM   * creates a venv in the project directory
 REM   * installs all dependencies from requirements.txt
-REM   * downloads cloudflared.exe and ffmpeg.exe to windows\
+REM   * downloads ffmpeg.exe to windows\
 REM   * migrates any existing config\ into %USERPROFILE%\.osia and ensures a
 REM     mobile pairing token exists
-REM   * registers the mobile server + Cloudflare tunnel as per-user Scheduled
-REM     Tasks (start at login, independent of the GUI) and starts them now
+REM   * registers the mobile server as a per-user Scheduled Task (start at
+REM     login, independent of the GUI) and starts it now
 REM   * registers the OSIA GUI to launch at login (per-user HKCU Run key)
 REM ===========================================================================
 chcp 65001 >nul
@@ -23,8 +23,6 @@ set "OSIA_HAD_STATE=0"
 if exist "%OSIA_HOME%" set "OSIA_HAD_STATE=1"
 if exist "%VENV_PY%" set "OSIA_HAD_STATE=1"
 set "WINDOWS_DIR=%PROJECT_DIR%windows"
-set "CLOUDFLARED=%WINDOWS_DIR%\cloudflared.exe"
-set "CF_URL=https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
 set "FFMPEG_DST=%WINDOWS_DIR%\ffmpeg.exe"
 set "FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
 
@@ -72,19 +70,8 @@ if errorlevel 1 (
     goto :fail
 )
 
-REM --- 4. Windows helper binaries (cloudflared + ffmpeg) --------------------
+REM --- 4. Windows helper binary (ffmpeg) ------------------------------------
 if not exist "%WINDOWS_DIR%" mkdir "%WINDOWS_DIR%"
-if exist "%CLOUDFLARED%" (
-    echo [4/8] cloudflared.exe deja present.
-) else (
-    echo [4/8] Telechargement de cloudflared.exe...
-    REM Paths/URL are passed via env vars so apostrophes in them cannot break
-    REM the single-quoted PowerShell string.
-    powershell -NoProfile -Command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri $env:CF_URL -OutFile $env:CLOUDFLARED } catch { Write-Host $_.Exception.Message; exit 1 }"
-    if errorlevel 1 (
-        echo [ATTENTION] Telechargement de cloudflared echoue - vous pourrez relancer windows\install_tunnel.bat plus tard.
-    )
-)
 REM ffmpeg.exe -- needed by the mobile server for WAV->MP3 TTS (server.py
 REM _wav_to_mp3 falls back to windows\ffmpeg.exe when none is on PATH). Static
 REM win64 build with libmp3lame. Idempotent and non-fatal: the server tries
@@ -132,17 +119,17 @@ if errorlevel 1 (
 )
 
 REM --- 7. Background services (Scheduled Tasks) ------------------------------
-REM Register the mobile server + Cloudflare tunnel as per-user Scheduled Tasks
-REM that start at login and run independently of the OSIA GUI (the Windows
-REM equivalent of the Linux osia-server / osia-tunnel systemd units). They are
-REM also started now so a fresh install works without a re-login. Needs no admin.
-echo [7/8] Enregistrement des services en arriere-plan ^(serveur mobile + tunnel^)...
+REM Register the mobile server as a per-user Scheduled Task that starts at login
+REM and runs independently of the OSIA GUI. Historical OSIA tunnel tasks are
+REM removed by the migration-safe service helper. The server is also started now
+REM so a fresh install works without a re-login. Needs no admin.
+echo [7/8] Enregistrement du service en arriere-plan ^(serveur mobile^)...
 "%VENV_PY%" -c "from osia.utils.systemd_manager import install_windows_services; print('Services:', 'OK' if install_windows_services() else 'partiel')"
 set "PYTHONPATH="
 
 REM --- 8. GUI autostart at login (per-user HKCU Run key) ---------------------
-REM Launch the OSIA interface automatically at login, after the server/tunnel
-REM tasks. Per-user (HKCU) so it needs no admin. The value is kept identical to
+REM Launch the OSIA interface automatically at login, after the server task.
+REM Per-user (HKCU) so it needs no admin. The value is kept identical to
 REM osia.utils.assets._windows_autostart_command() - the single source of truth
 REM the Settings toggle "Lancer OSIA au demarrage" reads via autostart_enabled()
 REM and writes via set_autostart() - so install.bat seeds it and the GUI toggle

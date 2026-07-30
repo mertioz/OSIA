@@ -5,21 +5,12 @@ Linux: a thin wrapper around ``systemctl``. Privileged operations
 session without a controlling terminal. Read-only queries (``is-enabled``,
 ``is-active``) don't need elevation.
 
-Windows: there is no systemd. The two units the GUI knows about map to per-user
-**Scheduled Tasks** that run independently of the OSIA GUI process — the Windows
-equivalent of the Linux units:
-
-  * ``osia-tunnel.service`` -> task "OSIA Tunnel"
-  * ``osia-server.service`` -> task "OSIA Server"
-
-Each task triggers AtLogOn and runs ``windows\\run_service.py {tunnel|server}``
-(a windowless supervisor that keeps the child alive, mirroring systemd
-``Restart=always``). The tasks are created by ``install.bat`` (which calls
-``install_windows_services``) and can be enabled/disabled/restarted from the GUI
-"Startup" toggles. Registration uses PowerShell (rich settings: run on battery,
-no time limit, restart-on-failure); lifecycle queries/run/stop/delete use
-``schtasks`` exit codes only — never its localized text output (the OS may be
-non-English). "Currently running" is probed natively (port 8765 / cloudflared).
+Windows: there is no systemd. ``osia-server.service`` maps to the per-user
+``OSIA Server`` Scheduled Task, which runs independently of the GUI and starts
+``windows\\run_service.py server`` at logon. Historical ``OSIA Tunnel`` task
+names and process detection remain here only so upgrades and uninstall can
+remove the retired quick-tunnel installation without touching unrelated
+cloudflared processes.
 
 The public function names/signatures are unchanged across platforms so the GUI
 (``osia/gui/main_popup.py``) and every other caller work without modification.
@@ -103,7 +94,7 @@ _TASK_DESC = {
 }
 
 _WAKE_TASK_NAME = "OSIA Wake Recovery"
-_WAKE_TASK_DESC = "OSIA Wake Recovery - restart server and tunnel after Windows resume"
+_WAKE_TASK_DESC = "OSIA Wake Recovery - restart server after Windows resume"
 
 # Display names used by earlier WOR-47 iterations. Removed on (re)registration so
 # an upgrade never leaves an orphaned AtLogOn task that would double-start the
@@ -716,7 +707,7 @@ def _win_task_running_for_barrier(task: str) -> bool:
 
 
 def _win_register_task(kind: str) -> bool:
-    """Create/overwrite the per-user Scheduled Task for ``kind`` (server|tunnel).
+    """Create/overwrite the per-user Scheduled Task for the server.
 
     AtLogOn trigger; runs the windowless ``run_service.py`` supervisor; no
     execution time limit, runs on battery, restart-on-failure — the closest
@@ -725,9 +716,7 @@ def _win_register_task(kind: str) -> bool:
     name + description make it legible in Task Scheduler / "Startup apps".
     """
     task = _TASK_NAME.get(kind)
-    if not task:
-        return False
-    if is_frozen() and kind != "server":
+    if not task or kind != "server":
         return False
     # Drop any pre-rename task with the old display name so an upgrade never
     # leaves an orphan that also fires AtLogOn (best-effort; no-op if absent).
@@ -775,9 +764,9 @@ def _win_register_task(kind: str) -> bool:
 def _win_register_wake_recovery_task() -> bool:
     """Create/overwrite the Windows resume recovery Scheduled Task.
 
-    This task is intentionally separate from "OSIA Server" and "OSIA Tunnel":
-    those keep their AtLogOn startup behavior, while this event trigger runs a
-    small idempotent recovery script after Windows resumes from low power.
+    This task is intentionally separate from "OSIA Server": the server keeps
+    its AtLogOn startup behavior, while this event trigger runs a small
+    idempotent recovery script after Windows resumes from low power.
     """
     user = _win_current_user()
     subscription = (
@@ -1002,7 +991,7 @@ def _win_enable(name: str) -> bool:
     if kind not in ("server", "tunnel"):
         print(f"[win-service] unknown unit: {name}")
         return False
-    if is_frozen() and kind == "tunnel":
+    if kind == "tunnel":
         return False
     if is_frozen() and kind == "server":
         try:
@@ -1037,42 +1026,33 @@ def _win_disable(name: str) -> bool:
 # ── Public API (cross-platform) ─────────────────────────────────────────────
 
 def install_windows_services() -> bool:
-    """Register (and start) both OSIA background services as per-user Scheduled
-    Tasks, plus the Windows resume recovery task. Called by ``install.bat``.
+    """Register and start the OSIA server and Windows resume recovery tasks.
+
+    Retires historical OSIA tunnel tasks/processes as an upgrade migration.
+    Called by ``install.bat``.
     Windows-only; a harmless no-op (returns True) elsewhere.
 
     Returns True only if all Windows tasks registered successfully.
     """
     if not _IS_WINDOWS:
         return True
-    if is_frozen():
-        # Retire the obsolete quick-tunnel task without touching unrelated
-        # cloudflared processes. Current connectivity is LAN -> WebRTC -> relay.
-        _win_end_task(_TASK_NAME["tunnel"])
-        _win_delete_task(_TASK_NAME["tunnel"])
-        for legacy in _LEGACY_TASK_NAMES["tunnel"]:
-            _win_delete_task(legacy)
-        _win_kill_tunnel()
-        if _SERVER_DISABLED_MARKER.exists():
-            _win_end_task(_TASK_NAME["server"])
-            _win_delete_task(_TASK_NAME["server"])
-            _win_delete_task(_WAKE_TASK_NAME)
-            return True
-        if not _win_register_task("server"):
-            return False
-        if _win_should_start("server"):
-            _win_run_task(_TASK_NAME["server"])
-        return _win_register_wake_recovery_task()
-    ok = True
-    for kind in ("server", "tunnel"):
-        if not _win_register_task(kind):
-            ok = False
-            continue
-        if _win_should_start(kind):
-            _win_run_task(_TASK_NAME[kind])
-    if not _win_register_wake_recovery_task():
-        ok = False
-    return ok
+    # Migration-only cleanup: target the old OSIA task names and the exact
+    # tunnel.log command-line signature, never personal cloudflared installs.
+    _win_end_task(_TASK_NAME["tunnel"])
+    _win_delete_task(_TASK_NAME["tunnel"])
+    for legacy in _LEGACY_TASK_NAMES["tunnel"]:
+        _win_delete_task(legacy)
+    _win_kill_tunnel()
+    if is_frozen() and _SERVER_DISABLED_MARKER.exists():
+        _win_end_task(_TASK_NAME["server"])
+        _win_delete_task(_TASK_NAME["server"])
+        _win_delete_task(_WAKE_TASK_NAME)
+        return True
+    if not _win_register_task("server"):
+        return False
+    if _win_should_start("server"):
+        _win_run_task(_TASK_NAME["server"])
+    return _win_register_wake_recovery_task()
 
 
 def remove_windows_services() -> bool:
@@ -1105,7 +1085,7 @@ def ensure_service_running(name: str) -> bool:
     kind = _UNIT_KIND.get(name)
     if kind not in ("server", "tunnel"):
         return False
-    if is_frozen() and kind == "tunnel":
+    if kind == "tunnel":
         return False
     if is_frozen() and kind == "server" and _SERVER_DISABLED_MARKER.exists():
         return True
@@ -1126,6 +1106,8 @@ def is_service_enabled(name: str) -> bool:
     if _IS_WINDOWS:
         kind = _UNIT_KIND.get(name)
         if kind not in ("server", "tunnel"):
+            return False
+        if kind == "tunnel":
             return False
         return _win_task_registered(_TASK_NAME[kind])
     try:
@@ -1216,6 +1198,8 @@ def restart_service(name: str) -> bool:
     if _IS_WINDOWS:
         kind = _UNIT_KIND.get(name)
         if kind not in ("server", "tunnel"):
+            return False
+        if kind == "tunnel":
             return False
         mutex = None
         try:

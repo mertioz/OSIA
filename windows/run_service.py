@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Windows-only supervisor for OSIA's background services (mobile server + tunnel).
+"""Windows-only supervisor for OSIA's background mobile server.
 
-This is the Windows equivalent of the Linux ``osia-server.service`` /
-``osia-tunnel.service`` systemd units. It is launched by the per-user Scheduled
-Tasks ("OSIA Server" / "OSIA Tunnel") that ``install.bat`` /
+This is the Windows equivalent of the Linux ``osia-server.service`` systemd
+unit. It is launched by the per-user Scheduled Task ("OSIA Server") that
+``install.bat`` /
 ``osia.utils.systemd_manager.install_windows_services`` register with an AtLogOn
 trigger. As a result the services:
 
@@ -15,7 +15,7 @@ trigger. As a result the services:
 
 Usage::
 
-    pythonw run_service.py {server|tunnel}
+    pythonw run_service.py server
 
 Why a loop instead of relying on Task Scheduler restart-on-failure: besides the
 faster restart, the loop stays compatible with the phone-triggered
@@ -57,10 +57,7 @@ from osia.utils.subprocess_policy import ProcessMode, process_kwargs
 
 # windows/run_service.py → <repo>/windows → <repo>
 _REPO = resource_root()
-_HERE = _REPO / "windows"
 _RUN_SERVER = _REPO / "osia" / "server" / "run_server.py"
-_CLOUDFLARED = _HERE / "cloudflared.exe"
-_TUNNEL_LOG = _HERE / "tunnel.log"
 
 _RESTART_SEC = 3.0      # delay before relaunching a crashed child (systemd RestartSec)
 _POLL_SEC = 2.0         # cadence for re-checking a live child / an external owner
@@ -326,31 +323,15 @@ def _open_log(path: Path, line_buffered: bool):
 
 def _child_command(kind: str):
     """(argv, cwd) for the supervised child."""
-    if kind == "server":
-        if is_frozen():
-            return [str(application_executable()), SERVER_MODE], str(application_dir())
-        # ``-u`` (unbuffered, exactly like the working console run
-        # ``python -u run_server.py``) makes the child's uvicorn startup lines
-        # and any crash traceback reach the child log *immediately* instead of
-        # dying block-buffered in the child's stdio when it exits.
-        return [_venv_python(), "-u", str(_RUN_SERVER)], str(_REPO)
-    # tunnel — Cloudflare *quick* tunnel for http://127.0.0.1:8765 (identical
-    # invocation to windows\start_tunnel.bat). The public trycloudflare.com URL
-    # it prints to _TUNNEL_LOG is what osia.rendezvous publishes (WOR-64).
-    #
-    # WOR-67/WOR-16: ``--config NUL`` forces cloudflared to SKIP any
-    # user-local ~/.cloudflared/config.yml. OSIA's Windows mobile path is this
-    # quick tunnel + rendezvous publisher; if cloudflared accidentally reads a
-    # fixed-host ingress config, the trycloudflare URL can 404 on every path. NUL
-    # is the Windows null device (the Linux wrapper must use ``/dev/null`` here,
-    # NOT NUL). Origin is 127.0.0.1 (not localhost) to force IPv4 — the server
-    # binds 0.0.0.0:8765 which is IPv4-only, so a localhost→::1 resolution would
-    # fail to connect.
-    return (
-        [str(_CLOUDFLARED), "tunnel", "--no-autoupdate", "--config", "NUL",
-         "--logfile", str(_TUNNEL_LOG), "--url", "http://127.0.0.1:8765"],
-        str(_HERE),
-    )
+    if kind != "server":
+        raise ValueError("unsupported service kind")
+    if is_frozen():
+        return [str(application_executable()), SERVER_MODE], str(application_dir())
+    # ``-u`` (unbuffered, exactly like the working console run
+    # ``python -u run_server.py``) makes the child's uvicorn startup lines
+    # and any crash traceback reach the child log *immediately* instead of
+    # dying block-buffered in the child's stdio when it exits.
+    return [_venv_python(), "-u", str(_RUN_SERVER)], str(_REPO)
 
 
 def _other_owner_running(kind: str, exclude_pid: int) -> bool:
@@ -370,22 +351,10 @@ def _other_owner_running(kind: str, exclude_pid: int) -> bool:
                 continue
             raw_cmdline = proc.info.get("cmdline") or []
             cmdline = " ".join(raw_cmdline)
-            if kind == "tunnel":
-                # Only OSIA's *own* quick tunnel counts as another owner — match
-                # the unique logfile path we always pass (windows\tunnel.log),
-                # NOT the bare image name (that would make us defer to any
-                # foreign/stale cloudflared the user runs for something else,
-                # forever). The quick tunnel has no named-tunnel arg, so the
-                # logfile path is the OSIA-specific signature (mirrors
-                # _win_kill_tunnel in osia/utils/systemd_manager.py).
-                if (proc.info.get("name") or "").lower() == "cloudflared.exe" \
-                        and _cmdline_has_path(cmdline, _TUNNEL_LOG):
-                    return True
-            else:
-                if _cmdline_has_path(cmdline, _RUN_SERVER) or (
-                    is_frozen() and cmdline_has_mode(raw_cmdline, SERVER_MODE)
-                ):
-                    return True
+            if _cmdline_has_path(cmdline, _RUN_SERVER) or (
+                is_frozen() and cmdline_has_mode(raw_cmdline, SERVER_MODE)
+            ):
+                return True
         except Exception:
             continue
     return False
@@ -568,9 +537,7 @@ def _supervise(kind: str, cmd, cwd: str, child_log, child_log_path: Path,
 def main(args: list[str] | None = None) -> int:
     values = sys.argv[1:] if args is None else args
     kind = (values[0] if values else "").strip().lower()
-    if kind not in ("server", "tunnel"):
-        return 2
-    if is_frozen() and kind == "tunnel":
+    if kind != "server":
         return 2
 
     # Two separate logs in the OS temp dir: the supervisor's own timestamped
@@ -597,24 +564,6 @@ def main(args: list[str] | None = None) -> int:
     _say(f"supervisor log: {log_path}")
     _say(f"child log:      {child_log_path}"
          + ("" if child_log is not None else "  (FAILED TO OPEN — child output lost)"))
-
-    if kind == "tunnel" and not _CLOUDFLARED.exists():
-        _say(f"cloudflared.exe not found at {_CLOUDFLARED}; exiting.")
-        return 1
-
-    # WOR-64: on the tunnel branch only, start the rendezvous publisher — a
-    # daemon thread that tails _TUNNEL_LOG for the quick tunnel's trycloudflare
-    # URL and POSTs {proof, url} to the rendezvous Worker so the phone can find
-    # this PC. Strictly best-effort and OUTSIDE the supervise loop below: it runs
-    # in a daemon thread, never blocks process exit, and cannot touch the WOR-47
-    # watchdog (which lives in the separate server process).
-    if kind == "tunnel":
-        try:
-            sys.path.insert(0, str(_REPO))  # windows/ is on sys.path, not the repo root
-            from osia.rendezvous import start_publisher
-            start_publisher(_TUNNEL_LOG)
-        except Exception as e:
-            _say(f"rendezvous publisher not started (best-effort): {e!r}")
 
     cmd, cwd = _child_command(kind)
     shutdown = None

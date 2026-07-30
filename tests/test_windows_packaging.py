@@ -38,6 +38,15 @@ def _load_windows_build():
     return module
 
 
+def _load_source_module(name: str, relative_path: str):
+    path = ROOT / relative_path
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_external_data_filter_preserves_licenses_and_excludes_generated_cache():
     from osia.windows_release_policy import filter_pyinstaller_data_toc
 
@@ -208,6 +217,117 @@ def test_packaged_task_action_uses_osia_executable(monkeypatch, tmp_path):
     assert captured["OSIA_ARG"] == "--osia-service server"
     assert captured["OSIA_REPO"] == str(app.parent)
     assert manager._win_register_task("tunnel") is False
+
+
+def test_source_task_registration_refuses_retired_tunnel(monkeypatch):
+    from osia.utils import systemd_manager as manager
+
+    monkeypatch.setattr(manager, "is_frozen", lambda: False)
+    monkeypatch.setattr(
+        manager,
+        "_ps",
+        lambda *_args, **_kwargs: pytest.fail("tunnel registration reached PowerShell"),
+    )
+    assert manager._win_register_task("tunnel") is False
+
+
+@pytest.mark.parametrize("frozen", (False, True))
+def test_windows_install_is_server_only_with_historical_cleanup(
+    monkeypatch, tmp_path, frozen
+):
+    from osia.utils import systemd_manager as manager
+
+    ended = []
+    deleted = []
+    registered = []
+    started = []
+    killed = []
+    monkeypatch.setattr(manager, "_IS_WINDOWS", True)
+    monkeypatch.setattr(manager, "is_frozen", lambda: frozen)
+    monkeypatch.setattr(manager, "_SERVER_DISABLED_MARKER", tmp_path / "disabled")
+    monkeypatch.setattr(manager, "_win_end_task", lambda name: ended.append(name) or True)
+    monkeypatch.setattr(
+        manager, "_win_delete_task", lambda name: deleted.append(name) or True
+    )
+    monkeypatch.setattr(manager, "_win_kill_tunnel", lambda: killed.append(True) or False)
+    monkeypatch.setattr(
+        manager, "_win_register_task", lambda kind: registered.append(kind) or True
+    )
+    monkeypatch.setattr(manager, "_win_should_start", lambda kind: kind == "server")
+    monkeypatch.setattr(
+        manager, "_win_run_task", lambda name: started.append(name) or True
+    )
+    monkeypatch.setattr(manager, "_win_register_wake_recovery_task", lambda: True)
+
+    assert manager.install_windows_services() is True
+    assert registered == ["server"]
+    assert started == [manager._TASK_NAME["server"]]
+    assert ended == [manager._TASK_NAME["tunnel"]]
+    assert manager._TASK_NAME["tunnel"] in deleted
+    assert set(manager._LEGACY_TASK_NAMES["tunnel"]).issubset(deleted)
+    assert killed == [True]
+
+
+def test_windows_retired_tunnel_cannot_be_started(monkeypatch):
+    from osia.utils import systemd_manager as manager
+
+    monkeypatch.setattr(manager, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        manager,
+        "_win_register_task",
+        lambda _kind: pytest.fail("retired tunnel reached registration"),
+    )
+    assert manager._win_enable("osia-tunnel.service") is False
+    assert manager.ensure_service_running("osia-tunnel.service") is False
+    assert manager.is_service_enabled("osia-tunnel.service") is False
+    assert manager.restart_service("osia-tunnel.service") is False
+
+
+@pytest.mark.parametrize("frozen", (False, True))
+def test_run_service_refuses_tunnel_mode_before_side_effects(monkeypatch, frozen):
+    supervisor = _load_source_module(
+        "osia_test_run_service_server_only", "windows/run_service.py"
+    )
+    monkeypatch.setattr(supervisor, "is_frozen", lambda: frozen)
+    monkeypatch.setattr(
+        supervisor,
+        "_open_log",
+        lambda *_args, **_kwargs: pytest.fail("refused mode opened a log"),
+    )
+    assert supervisor.main(["tunnel"]) == 2
+    with pytest.raises(ValueError, match="unsupported service kind"):
+        supervisor._child_command("tunnel")
+
+
+def test_wake_recovery_restarts_only_server(monkeypatch, tmp_path):
+    from osia.utils import systemd_manager as manager
+
+    wake = _load_source_module(
+        "osia_test_wake_recovery_server_only", "windows/wake_recovery.py"
+    )
+    restarted = []
+
+    class Lock:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(wake.sys, "platform", "win32")
+    monkeypatch.setattr(wake, "_LOG_PATH", tmp_path / "wake.log")
+    monkeypatch.setattr(wake, "_single_instance", lambda _log: Lock())
+    monkeypatch.setattr(wake, "_wait_for_port", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(wake, "_find_server_children", lambda: [])
+    monkeypatch.setattr(wake, "_port_listeners", lambda _port: [1234])
+    monkeypatch.setattr(
+        manager,
+        "restart_service",
+        lambda unit: restarted.append(unit) or True,
+    )
+
+    assert wake.main() == 0
+    assert restarted == ["osia-server.service"]
 
 
 def test_autostart_command_quotes_packaged_unicode_path(monkeypatch, tmp_path):

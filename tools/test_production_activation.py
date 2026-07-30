@@ -83,6 +83,30 @@ class ProductionDefaultsTests(unittest.TestCase):
         self.assertIn("install_windows_services", install)
         self.assertIn("-Action Install", install)
         self.assertNotIn("print('Mobile token:'", install)
+        self.assertNotIn("CLOUDFLARED", install)
+        self.assertNotIn("cloudflared-windows", install)
+        self.assertNotIn("install_tunnel.bat", install)
+
+        start = (root / "start.bat").read_text(encoding="utf-8")
+        self.assertNotIn("cloudflared", start.lower())
+        self.assertNotIn("start_tunnel.bat", start)
+        run_service = (root / "windows" / "run_service.py").read_text(
+            encoding="utf-8"
+        )
+        wake_recovery = (root / "windows" / "wake_recovery.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("cloudflared", run_service.lower())
+        self.assertNotIn("start_publisher", run_service)
+        self.assertNotIn("osia-tunnel.service", wake_recovery)
+        self.assertNotIn("cloudflared", wake_recovery.lower())
+        for script in (
+            "install_tunnel.bat",
+            "start_tunnel.bat",
+            "stop_tunnel.bat",
+        ):
+            self.assertFalse((root / "windows" / script).exists())
+        self.assertTrue((root / "osia" / "rendezvous.py").is_file())
 
         firewall = (root / "windows" / "configure_lan_firewall.ps1").read_text(
             encoding="utf-8"

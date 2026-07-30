@@ -18,6 +18,10 @@ or a network connection after download.
 - The background `OSIA Server` Scheduled Task is per-user and least-privileged.
   It supervises the current direct-first transport: LAN, then WebRTC, then the
   public relay. The old Cloudflare quick-tunnel task and binary are not shipped.
+- Source installs use the same server-only policy: `install.bat` neither
+  downloads cloudflared nor registers a tunnel task, and `start.bat` launches
+  only the GUI while the normal server task stays supervised. Upgrade and
+  uninstall retain targeted removal of historical OSIA tunnel tasks/processes.
 - Offline speech assets are pinned by immutable Hugging Face revisions and
   SHA-256 hashes: Kokoro-82M with the `af_sky`/`ff_siwis` voices, and
   faster-whisper-small. MP3 encoding is in-process through PyAV; no external

@@ -5,12 +5,11 @@ REM
 REM   * activates the venv
 REM   * launches the OSIA GUI in wake mode in a visible window (blocks here)
 REM
-REM The mobile server (http://localhost:8765) and the Cloudflare tunnel are NOT
-REM started here: each runs as its own per-user Scheduled Task (registered by
-REM install.bat) that starts at login and survives GUI restarts — the Windows
-REM equivalent of the Linux osia-server / osia-tunnel systemd units. The GUI also
-REM self-heals the server at launch (osia/main.py -> _ensure_mobile_server_
-REM windows). Manage both from OSIA Settings > Startup.
+REM The mobile server (http://localhost:8765) is NOT started here: it runs as a
+REM per-user Scheduled Task (registered by install.bat) that starts at login and
+REM survives GUI restarts. The GUI also self-heals the server at launch
+REM (osia/main.py -> _ensure_mobile_server_windows). Manage it from OSIA
+REM Settings > Startup.
 REM ===========================================================================
 chcp 65001 >nul
 setlocal
@@ -28,12 +27,10 @@ if not exist "%VENV_PY%" (
 REM --- Activate the venv for this shell --------------------------------------
 call "%VENV_DIR%\Scripts\activate.bat"
 
-REM --- Background services (mobile server + Cloudflare tunnel) ---------------
-REM Both run as independent per-user Scheduled Tasks created by install.bat
-REM ("OSIA Mobile Server" / "OSIA Cloudflare Tunnel"); they start at login and
-REM survive GUI restarts, so neither is started here. The GUI self-heals the
-REM server at launch (osia/main.py -> _ensure_mobile_server_windows). Toggle
-REM either one from OSIA Settings > Startup.
+REM --- Background service (mobile server) -----------------------------------
+REM It runs as the independent per-user Scheduled Task created by install.bat,
+REM starts at login, and survives GUI restarts, so it is not started here. The
+REM GUI self-heals it at launch (osia/main.py -> _ensure_mobile_server_windows).
 
 REM --- OSIA GUI - wake mode (visible window; blocks until OSIA exits) --------
 echo [start] Lancement d'OSIA en mode wake...

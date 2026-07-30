@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recover OSIA's Windows server and tunnel after system resume.
+"""Recover OSIA's Windows server after system resume.
 
 Launched by the "OSIA Wake Recovery" Scheduled Task. The script deliberately
 uses the existing service helpers so it preserves the normal Task Scheduler
@@ -24,15 +24,11 @@ if (_SOURCE_ROOT / "osia").is_dir() and str(_SOURCE_ROOT) not in sys.path:
 from osia.runtime import SERVER_MODE, cmdline_has_mode, is_frozen, resource_root
 
 _REPO = resource_root()
-_HERE = _REPO / "windows"
-_TUNNEL_LOG = _HERE / "tunnel.log"
 _LOG_PATH = Path(tempfile.gettempdir()) / "osia_wake_recovery.log"
 _LOCK_PATH = Path(tempfile.gettempdir()) / "osia_wake_recovery.lock"
 
 _SERVER_UNIT = "osia-server.service"
-_TUNNEL_UNIT = "osia-tunnel.service"
 _SERVER_PORT = 8765
-_TUNNEL_ORIGIN = "http://127.0.0.1:8765"
 
 
 def _ts() -> str:
@@ -181,28 +177,6 @@ def _find_server_children() -> list[tuple[int, str]]:
     return matches
 
 
-def _find_osia_cloudflared() -> list[tuple[int, str]]:
-    try:
-        import psutil
-    except Exception:
-        return []
-    matches: list[tuple[int, str]] = []
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            if (proc.info.get("name") or "").lower() != "cloudflared.exe":
-                continue
-            cmdline = " ".join(proc.info.get("cmdline") or [])
-            compact = " ".join(cmdline.split()).lower()
-            if not _cmdline_has_path(cmdline, _TUNNEL_LOG):
-                continue
-            if f"--url {_TUNNEL_ORIGIN}".lower() not in compact:
-                continue
-            matches.append((int(proc.info["pid"]), cmdline))
-        except Exception:
-            continue
-    return matches
-
-
 def _wait_for_port(log_fh, port: int, timeout: float = 90.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -212,28 +186,6 @@ def _wait_for_port(log_fh, port: int, timeout: float = 90.0) -> bool:
         time.sleep(2.0)
     _log(log_fh, f"port {port} timeout after {timeout:.0f}s: {_port_owner(port)}")
     return False
-
-
-def _wait_for_cloudflared(log_fh, timeout: float = 60.0) -> list[tuple[int, str]]:
-    deadline = time.time() + timeout
-    last_count = -1
-    matches: list[tuple[int, str]] = []
-    while time.time() < deadline:
-        matches = _find_osia_cloudflared()
-        if len(matches) == 1:
-            pid, cmdline = matches[0]
-            _log(log_fh, f"cloudflared match: pid={pid} cmdline={_clip(cmdline)}")
-            return matches
-        if len(matches) != last_count:
-            _log(log_fh, f"cloudflared matches while waiting: count={len(matches)}")
-            last_count = len(matches)
-        time.sleep(2.0)
-    if matches:
-        for pid, cmdline in matches:
-            _log(log_fh, f"cloudflared duplicate/stale match: pid={pid} cmdline={_clip(cmdline)}")
-    else:
-        _log(log_fh, "cloudflared timeout: no OSIA quick tunnel process matched")
-    return matches
 
 
 def _restart(log_fh, restart_service, unit: str, label: str) -> bool:
@@ -282,21 +234,8 @@ def main() -> int:
                 _log(log_fh, "failed: duplicate server port listeners detected")
                 return 1
 
-            if is_frozen():
-                if not server_restart_ok:
-                    _log(log_fh, "failed: server scheduled-task restart command failed")
-                    return 1
-                _log(log_fh, "wake recovery completed successfully")
-                return 0
-
-            tunnel_restart_ok = _restart(log_fh, restart_service, _TUNNEL_UNIT, "tunnel")
-            tunnel_matches = _wait_for_cloudflared(log_fh)
-            if len(tunnel_matches) != 1:
-                _log(log_fh, "failed: expected exactly one OSIA cloudflared process")
-                return 1
-
-            if not server_restart_ok or not tunnel_restart_ok:
-                _log(log_fh, "failed: a scheduled task restart command failed")
+            if not server_restart_ok:
+                _log(log_fh, "failed: server scheduled-task restart command failed")
                 return 1
             _log(log_fh, "wake recovery completed successfully")
             return 0
