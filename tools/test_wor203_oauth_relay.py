@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import logging
 import threading
 import time
 import unittest
@@ -581,6 +583,149 @@ class McpRelayIntegrationTests(unittest.TestCase):
     def test_desktop_loopback_transport_is_unchanged(self):
         self.assertEqual(mcp_oauth.OAUTH_REDIRECT_URI, "http://127.0.0.1:8975/callback")
         self.assertTrue(hasattr(mcp_oauth.OAuthCallbackServer, "callback_handler"))
+
+
+class McpTokenAuthenticationCompatibilityTests(unittest.TestCase):
+    class _Callback:
+        async def redirect_handler(self, _url):
+            return None
+
+        async def callback_handler(self):
+            return "synthetic-code", "synthetic-state"
+
+    @staticmethod
+    def _provider(auth_method: str, *, secret: str | None):
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        provider = mcp_oauth.build_oauth_provider(
+            "synthetic-connector",
+            "https://connector.example/mcp",
+            McpTokenAuthenticationCompatibilityTests._Callback(),
+            redirect_uris=[oauth_relay.OAUTH_RELAY_REDIRECT_URI],
+        )
+        provider.context.client_info = OAuthClientInformationFull(
+            client_id="synthetic-client",
+            client_secret=secret,
+            token_endpoint_auth_method=auth_method,
+            redirect_uris=[oauth_relay.OAUTH_RELAY_REDIRECT_URI],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+        )
+        return provider
+
+    def _send_once(self, request):
+        import httpx
+
+        seen = []
+
+        def handler(sent):
+            seen.append(sent)
+            return httpx.Response(200, json={"ok": True})
+
+        async def scenario():
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                response = await client.send(request)
+                self.assertEqual(response.status_code, 200)
+
+        asyncio.run(scenario())
+        self.assertEqual(len(seen), 1)
+        return seen[0]
+
+    @staticmethod
+    def _form(request):
+        return parse_qs(request.content.decode("ascii"), keep_blank_values=True)
+
+    def test_authorization_code_client_secret_basic_uses_header_only(self):
+        provider = self._provider("client_secret_basic", secret="synthetic-secret")
+
+        async def build_request():
+            return await provider._exchange_token_authorization_code(
+                "synthetic-code", "synthetic-verifier"
+            )
+
+        sent = self._send_once(asyncio.run(build_request()))
+        form = self._form(sent)
+        self.assertTrue(sent.headers["Authorization"].startswith("Basic "))
+        encoded = sent.headers["Authorization"].removeprefix("Basic ")
+        self.assertEqual(
+            base64.b64decode(encoded).decode("utf-8"),
+            "synthetic-client:synthetic-secret",
+        )
+        self.assertNotIn("client_id", form)
+        self.assertNotIn("client_secret", form)
+        self.assertEqual(form["grant_type"], ["authorization_code"])
+        self.assertEqual(form["code"], ["synthetic-code"])
+        self.assertEqual(
+            form["redirect_uri"], [oauth_relay.OAUTH_RELAY_REDIRECT_URI]
+        )
+        self.assertEqual(form["code_verifier"], ["synthetic-verifier"])
+
+    def test_refresh_client_secret_basic_uses_header_only(self):
+        from mcp.shared.auth import OAuthToken
+
+        provider = self._provider("client_secret_basic", secret="synthetic-secret")
+        provider.context.current_tokens = OAuthToken(
+            access_token="synthetic-access",
+            refresh_token="synthetic-refresh",
+        )
+
+        sent = self._send_once(asyncio.run(provider._refresh_token()))
+        form = self._form(sent)
+        self.assertTrue(sent.headers["Authorization"].startswith("Basic "))
+        self.assertNotIn("client_id", form)
+        self.assertNotIn("client_secret", form)
+        self.assertEqual(form["grant_type"], ["refresh_token"])
+        self.assertEqual(form["refresh_token"], ["synthetic-refresh"])
+
+    def test_post_and_public_auth_are_unchanged_and_credentials_are_not_logged(self):
+        captured = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                captured.append(record.getMessage())
+
+        handler = Capture()
+        root = logging.getLogger()
+        root.addHandler(handler)
+        try:
+            post = self._provider("client_secret_post", secret="synthetic-secret")
+            post_request = asyncio.run(
+                post._exchange_token_authorization_code(
+                    "synthetic-code", "synthetic-verifier"
+                )
+            )
+            post_sent = self._send_once(post_request)
+            post_form = self._form(post_sent)
+            self.assertNotIn("Authorization", post_sent.headers)
+            self.assertEqual(post_form["client_id"], ["synthetic-client"])
+            self.assertEqual(post_form["client_secret"], ["synthetic-secret"])
+
+            public = self._provider("none", secret=None)
+            public_request = asyncio.run(
+                public._exchange_token_authorization_code(
+                    "synthetic-public-code", "synthetic-public-verifier"
+                )
+            )
+            public_sent = self._send_once(public_request)
+            public_form = self._form(public_sent)
+            self.assertNotIn("Authorization", public_sent.headers)
+            self.assertEqual(public_form["client_id"], ["synthetic-client"])
+            self.assertNotIn("client_secret", public_form)
+        finally:
+            root.removeHandler(handler)
+
+        log_text = "\n".join(captured)
+        for private_value in (
+            "synthetic-secret",
+            "synthetic-code",
+            "synthetic-verifier",
+            "synthetic-public-code",
+            "synthetic-public-verifier",
+            "synthetic-state",
+        ):
+            self.assertNotIn(private_value, log_text)
 
 
 if __name__ == "__main__":

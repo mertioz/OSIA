@@ -849,6 +849,35 @@ def _with_forced_consent(redirect_handler: Any) -> Any:
     return _wrapped
 
 
+def _install_token_auth_compatibility(provider: Any) -> Any:
+    """Normalize MCP 1.28 token requests for ``client_secret_basic``.
+
+    MCP 1.28 adds HTTP Basic credentials but leaves ``client_id`` in the form
+    body for authorization-code and refresh exchanges. Strict authorization
+    servers reject that as multiple client-authentication methods. Wrap only
+    this provider instance's token-auth preparation so Basic remains the sole
+    client authentication method; every non-credential form field and every
+    other registered authentication method stay byte-for-byte unchanged.
+    """
+    prepare_token_auth = provider.context.prepare_token_auth
+
+    def _prepare(data: dict, headers: Optional[dict] = None):
+        prepared_data, prepared_headers = prepare_token_auth(data, headers)
+        client_info = provider.context.client_info
+        auth_method = getattr(client_info, "token_endpoint_auth_method", None)
+        authorization = str(prepared_headers.get("Authorization") or "")
+        if auth_method == "client_secret_basic" and authorization.startswith(
+            "Basic "
+        ):
+            prepared_data = dict(prepared_data)
+            prepared_data.pop("client_id", None)
+            prepared_data.pop("client_secret", None)
+        return prepared_data, prepared_headers
+
+    provider.context.prepare_token_auth = _prepare
+    return provider
+
+
 def build_oauth_provider(
     server_id: str,
     server_url: str,
@@ -929,7 +958,7 @@ def build_oauth_provider(
     if static_client is not None:
         redirect_handler = _with_forced_consent(redirect_handler)
 
-    return OAuthClientProvider(
+    provider = OAuthClientProvider(
         server_url=server_url,
         client_metadata=metadata,
         storage=OsiaTokenStorage(server_id),
@@ -937,6 +966,7 @@ def build_oauth_provider(
         callback_handler=callback.callback_handler,
         timeout=OAUTH_FLOW_TIMEOUT,
     )
+    return _install_token_auth_compatibility(provider)
 
 
 # How long to wait for the (post-redirect) token-exchange HTTP leg. The browser
