@@ -128,18 +128,12 @@ def test_manual_gate_shutdown_cancels_a_queued_event():
     assert gate.consume(0, is_current=True) is False
 
 
-def test_ctrl_space_listener_has_one_owner_and_gate_deduplicates(monkeypatch):
+def test_ctrl_alt_p_listener_has_one_owner_and_gate_deduplicates(monkeypatch):
     listeners = []
 
-    class Key:
-        ctrl_l = object()
-        ctrl_r = object()
-        space = object()
-
-    class Listener:
-        def __init__(self, *, on_press, on_release):
-            self.on_press = on_press
-            self.on_release = on_release
+    class GlobalHotKeys:
+        def __init__(self, mapping):
+            self.mapping = mapping
             self.daemon = False
             self.started = 0
             self.stopped = 0
@@ -151,7 +145,7 @@ def test_ctrl_space_listener_has_one_owner_and_gate_deduplicates(monkeypatch):
         def stop(self):
             self.stopped += 1
 
-    keyboard = SimpleNamespace(Key=Key, Listener=Listener)
+    keyboard = SimpleNamespace(GlobalHotKeys=GlobalHotKeys)
     monkeypatch.setitem(sys.modules, "pynput", SimpleNamespace(keyboard=keyboard))
 
     from osia import main
@@ -163,35 +157,33 @@ def test_ctrl_space_listener_has_one_owner_and_gate_deduplicates(monkeypatch):
         if gate.reserve(0):
             events.append(0)
 
-    stop = main._start_ctrl_space_listener(activate)
+    stop = main._start_ctrl_alt_p_listener(activate)
     assert len(listeners) == 1
     listener = listeners[0]
     assert listener.started == 1
-    listener.on_press(Key.ctrl_l)
-    listener.on_press(Key.space)
-    listener.on_press(Key.space)
+    assert set(listener.mapping) == {"<ctrl>+<alt>+p"}
+    assert "<ctrl>+<space>" not in listener.mapping
+    listener.mapping["<ctrl>+<alt>+p"]()
+    listener.mapping["<ctrl>+<alt>+p"]()
     assert events == [0]
     assert gate.consume(0, is_current=True) is True
     gate.finish()
-    listener.on_release(Key.ctrl_l)
+    listener.mapping["<ctrl>+<alt>+p"]()
+    assert events == [0, 0]
+    assert gate.consume(0, is_current=True) is True
+    gate.finish()
     stop()
     assert listener.stopped == 1
 
 
-def test_ctrl_space_listener_reports_callback_failure_without_sensitive_data(
+def test_ctrl_alt_p_listener_reports_callback_failure_without_sensitive_data(
     monkeypatch, capsys,
 ):
     listeners = []
 
-    class Key:
-        ctrl_l = object()
-        ctrl_r = object()
-        space = object()
-
-    class Listener:
-        def __init__(self, *, on_press, on_release):
-            self.on_press = on_press
-            self.on_release = on_release
+    class GlobalHotKeys:
+        def __init__(self, mapping):
+            self.mapping = mapping
             listeners.append(self)
 
         def start(self):
@@ -200,7 +192,7 @@ def test_ctrl_space_listener_reports_callback_failure_without_sensitive_data(
         def stop(self):
             pass
 
-    keyboard = SimpleNamespace(Key=Key, Listener=Listener)
+    keyboard = SimpleNamespace(GlobalHotKeys=GlobalHotKeys)
     monkeypatch.setitem(sys.modules, "pynput", SimpleNamespace(keyboard=keyboard))
 
     from osia import main
@@ -208,12 +200,40 @@ def test_ctrl_space_listener_reports_callback_failure_without_sensitive_data(
     def fail():
         raise RuntimeError("private callback detail")
 
-    main._start_ctrl_space_listener(fail)
-    listeners[0].on_press(Key.ctrl_l)
-    listeners[0].on_press(Key.space)
+    main._start_ctrl_alt_p_listener(fail)
+    listeners[0].mapping["<ctrl>+<alt>+p"]()
     output = capsys.readouterr().out
-    assert "[wake] Ctrl+Space callback failed: RuntimeError" in output
+    assert "[wake] Ctrl+Alt+P callback failed: RuntimeError" in output
     assert "private callback detail" not in output
+
+
+def test_popup_hotkey_remains_ctrl_alt_o_and_cleans_up(monkeypatch):
+    listeners = []
+
+    class GlobalHotKeys:
+        def __init__(self, mapping):
+            self.mapping = mapping
+            self.daemon = False
+            self.stopped = 0
+            listeners.append(self)
+
+        def start(self):
+            pass
+
+        def stop(self):
+            self.stopped += 1
+
+    keyboard = SimpleNamespace(GlobalHotKeys=GlobalHotKeys)
+    monkeypatch.setitem(sys.modules, "pynput", SimpleNamespace(keyboard=keyboard))
+
+    from osia import main
+
+    stop = main._start_popup_hotkey_listener(lambda: None)
+    assert len(listeners) == 1
+    assert set(listeners[0].mapping) == {"<ctrl>+<alt>+o"}
+    assert stop is not None
+    stop()
+    assert listeners[0].stopped == 1
 
 
 def test_main_uses_only_intentional_manual_activation_and_preserves_access_paths():
@@ -224,7 +244,7 @@ def test_main_uses_only_intentional_manual_activation_and_preserves_access_paths
     assert "verifier_available" not in source
     assert "No wake model found" not in source
     assert "ACOUSTIC_WAKE_UNAVAILABLE_REASON" in source
-    assert "_start_ctrl_space_listener(_manual_wake)" in source
+    assert "_start_ctrl_alt_p_listener(_manual_wake)" in source
     assert "if not manual_activation_open.is_set():" in source
     assert "if not wake_gate.reserve(0):" in source
     assert '"[wake] manual activation accepted"' in source
@@ -241,12 +261,10 @@ def test_settings_surface_is_disabled_and_truthful():
     assert "set_setting(\"wake_word_enabled\", False)" in popup_source
     assert 'self._wake_word_toggle.setChecked(False)' in popup_source
     assert i18n.TRANSLATIONS["settings.wake_word_enabled"]["en"] == (
-        "Voice activation is unavailable in this version. "
-        "Press Ctrl+Space to talk to OSIA."
+        "Press Ctrl+Alt+P to talk to OSIA."
     )
     assert i18n.TRANSLATIONS["settings.wake_word_enabled"]["fr"] == (
-        "Activation vocale indisponible dans cette version. "
-        "Utilisez Ctrl+Espace pour parler à OSIA."
+        "Pour parler à OSIA, appuyez sur Ctrl+Alt+P."
     )
 
 

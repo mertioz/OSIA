@@ -63,7 +63,7 @@ jsonschema>=4.23.0,<5.0
 
 # ── System / input / utilities ──────────────────────────────────────────────
 psutil>=5.9.0                      # heartbeat metrics + Windows service control
-pynput>=1.7.6                      # global hotkeys (Ctrl+Space, Ctrl+Alt+O)
+pynput>=1.7.6                      # global hotkeys (Ctrl+Alt+P, Ctrl+Alt+O)
 pyperclip>=1.8.0                   # clipboard backend on Windows (get/set_clipboard)
 pyautogui>=0.9.54                  # native mouse/keyboard control on Windows/Mac (WOR-42 desktop_* tools; Linux uses ydotool/xdotool)
 Pillow>=10.0                       # screenshots + image handling (agent.py ImageGrab, desktop_control.py)

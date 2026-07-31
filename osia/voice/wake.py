@@ -4,7 +4,7 @@ Release-disabled acoustic wake compatibility layer.
 
 WOR-211 intentionally disables acoustic activation because no packaged local
 verifier passed the lexical-safety gate. The legacy detector type remains as
-an inert compatibility surface; Ctrl+Space is the supported voice activation
+an inert compatibility surface; Ctrl+Alt+P is the supported voice activation
 path until WOR-214 supplies and validates a replacement.
 """
 
@@ -746,7 +746,7 @@ if __name__ == "__main__":
     if not verifier_available():
         print(
             "Acoustic wake is unavailable in this release: "
-            f"{ACOUSTIC_WAKE_UNAVAILABLE_REASON}. Use Ctrl+Space."
+            f"{ACOUSTIC_WAKE_UNAVAILABLE_REASON}. Use Ctrl+Alt+P."
         )
     else:
         detector = WakeWordDetector(

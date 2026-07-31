@@ -3748,7 +3748,7 @@ class _SettingsPanel(QWidget):
         l.addWidget(self._wake_desc)
 
         # Compatibility row for the retired acoustic listener. It stays visibly
-        # disabled and explains the supported Ctrl+Space release path.
+        # disabled and explains the supported Ctrl+Alt+P release path.
         ww_row = QHBoxLayout()
         self._wake_word_label = QLabel(i18n.t("settings.wake_word_enabled"))
         self._wake_word_label.setObjectName("providerName")
@@ -11157,6 +11157,7 @@ class MainPopup(QWidget):
             QPushButton#sendBtn:pressed {
                 background: rgba(196, 181, 245, 0.70);
                 border-color: rgba(196, 181, 245, 0.70);
+                color: #0d0b12;
             }
             QPushButton#iconBtn:focus, QPushButton#sendBtn:focus {
                 border: 2px solid rgba(196, 181, 245, 0.72);
@@ -11168,12 +11169,12 @@ class MainPopup(QWidget):
 
             /* Disabled composer controls stay visually inactive. */
             QPushButton#iconBtn:disabled, QPushButton#sendBtn:disabled {
-                background: rgba(119, 116, 128, 0.14);
-                border: 1px solid rgba(119, 116, 128, 0.32);
-                color: #777480;
+                background: rgba(133, 130, 145, 0.14);
+                border: 1px solid rgba(133, 130, 145, 0.32);
+                color: #858291;
             }
             QTextEdit#chatInput:disabled {
-                color: rgba(232, 230, 240, 0.46);
+                color: #858291;
             }
             QLabel#chatNotice {
                 color: rgba(232, 230, 240, 0.72);
@@ -11630,7 +11631,7 @@ class MainPopup(QWidget):
             QPushButton#memoryDangerAction:disabled {
                 background: transparent;
                 border: none;
-                color: rgba(232, 230, 240, 0.28);
+                color: #858291;
             }
 
             QPushButton#ghostBtn {
@@ -11673,8 +11674,8 @@ class MainPopup(QWidget):
             }
             QPushButton#destructiveSecondaryBtn:disabled {
                 background: transparent;
-                border-color: rgba(119, 116, 128, 0.24);
-                color: #777480;
+                border-color: rgba(133, 130, 145, 0.24);
+                color: #858291;
             }
             QPushButton#linkBtn {
                 background: transparent;

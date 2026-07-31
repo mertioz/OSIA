@@ -529,46 +529,32 @@ def _persist_exchange(conv_id, user_text, assistant_text, turn_context=None):
         print(f"[OSIA] failed to persist conversation: {e}")
 
 
-# ── Ctrl+Space hotkey fallback ──────────────────────────────────────────────
+# ── Ctrl+Alt+P manual voice shortcut ───────────────────────────────────────
 
-def _start_ctrl_space_listener(callback):
+def _start_ctrl_alt_p_listener(callback):
     """
-    Start a global keyboard listener that triggers `callback` on Ctrl+Space.
+    Start a global keyboard listener that triggers `callback` on Ctrl+Alt+P.
     This is the intentional release activation path while acoustic wake is off.
 
     Returns a stop function.
     """
     from pynput import keyboard
 
-    ctrl_pressed = False
-
-    def on_press(key):
-        nonlocal ctrl_pressed
+    def activate():
         try:
-            if key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
-                ctrl_pressed = True
-            elif key == keyboard.Key.space and ctrl_pressed:
-                print("⌨️  Ctrl+Space pressed — triggering OSIA")
-                callback()
+            print("⌨️  Ctrl+Alt+P pressed — triggering OSIA")
+            callback()
         except Exception as exc:
             print(
-                "[wake] Ctrl+Space callback failed: "
+                "[wake] Ctrl+Alt+P callback failed: "
                 f"{type(exc).__name__}",
                 flush=True,
             )
 
-    def on_release(key):
-        nonlocal ctrl_pressed
-        try:
-            if key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
-                ctrl_pressed = False
-        except Exception:
-            pass
-
-    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-    listener.daemon = True
-    listener.start()
-    return listener.stop
+    hotkeys = keyboard.GlobalHotKeys({"<ctrl>+<alt>+p": activate})
+    hotkeys.daemon = True
+    hotkeys.start()
+    return hotkeys.stop
 
 
 def _start_popup_hotkey_listener(callback):
@@ -724,7 +710,7 @@ def voice_mode():
 
 
 def wake_mode():
-    """Desktop voice mode with intentional Ctrl+Space manual activation."""
+    """Desktop voice mode with intentional Ctrl+Alt+P manual activation."""
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtCore import QObject, pyqtSignal, Qt, QTimer
     from PyQt6.QtGui import QGuiApplication, QIcon
@@ -993,12 +979,12 @@ def wake_mode():
     )
 
     # WOR-211 release contract: no detector is constructed and no idle
-    # microphone stream is opened. Ctrl+Space enters the same guarded voice
+    # microphone stream is opened. Ctrl+Alt+P enters the same guarded voice
     # workflow intentionally; this does not depend on a missing model file.
     assert not ACOUSTIC_WAKE_AVAILABLE
     print(
         "[wake] acoustic activation unavailable: "
-        f"{ACOUSTIC_WAKE_UNAVAILABLE_REASON}. Use Ctrl+Space."
+        f"{ACOUSTIC_WAKE_UNAVAILABLE_REASON}. Use Ctrl+Alt+P."
     )
     manual_activation_open = threading.Event()
     manual_activation_open.set()
@@ -1013,7 +999,7 @@ def wake_mode():
         print("[wake] manual activation accepted", flush=True)
         bridge.wake_detected.emit(0)
 
-    stop_hotkey = _start_ctrl_space_listener(_manual_wake)
+    stop_manual_hotkey = _start_ctrl_alt_p_listener(_manual_wake)
 
     def _desktop_busy_message() -> str:
         return "OSIA is still working in this conversation."
@@ -2245,7 +2231,7 @@ def wake_mode():
     mobile_authorization_timer.timeout.connect(_poll_server_mobile_authorization)
     mobile_authorization_timer.start()
 
-    trigger_label = "Press Ctrl+Space to activate"
+    trigger_label = "Press Ctrl+Alt+P to talk to OSIA"
 
     print("=" * 60)
     print("  OSIA — Wake Mode (Dynamic Island)")
@@ -2264,8 +2250,8 @@ def wake_mode():
         orchestrator.stop()
         manual_activation_open.clear()
         wake_gate.cancel(0)
-        if stop_hotkey:
-            stop_hotkey()
+        if stop_manual_hotkey:
+            stop_manual_hotkey()
         if stop_popup_hotkey:
             stop_popup_hotkey()
         try:

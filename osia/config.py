@@ -137,7 +137,7 @@ DEFAULT_SETTINGS = {
     # release contract above forces its effective value to False.
     "wake_word_enabled": False,
     # Manual voice greeting: when enabled, OSIA speaks ``wake_greeting_text``
-    # after Ctrl+Space and before command listening. Empty text = no greeting.
+    # after Ctrl+Alt+P and before command listening. Empty text = no greeting.
     "wake_greeting_enabled": False,
     "wake_greeting_text": "",
     # Scheduled tasks (Bloc 5): list of cron entries. Each entry is

@@ -179,6 +179,16 @@ class ComposerTests(unittest.TestCase):
             self.assertIsNotNone(inactive, f"{key}.composer.disabled")
             self.assertIn(disabled_rgb, inactive.group(1))
 
+            pressed = re.search(
+                r"QPushButton#sendBtn:pressed\s*\{([^}]+)\}",
+                stylesheet,
+            )
+            self.assertIsNotNone(pressed, f"{key}.sendBtn.pressed")
+            self.assertIn(
+                f"color: {palette.background}",
+                pressed.group(1).lower(),
+            )
+
             for button in (self.chat._file_btn, self.chat._send_btn):
                 button.setEnabled(True)
                 self.assertTrue(button._icon_color().isValid())

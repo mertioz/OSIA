@@ -55,6 +55,33 @@ from osia.gui.theme import (
 )
 
 
+def _relative_luminance(color: QColor) -> float:
+    channels = (color.redF(), color.greenF(), color.blueF())
+    linear = tuple(
+        value / 12.92
+        if value <= 0.04045
+        else ((value + 0.055) / 1.055) ** 2.4
+        for value in channels
+    )
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast_ratio(left: QColor, right: QColor) -> float:
+    lighter, darker = sorted(
+        (_relative_luminance(left), _relative_luminance(right)),
+        reverse=True,
+    )
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _blend(foreground: QColor, background: QColor, alpha: float) -> QColor:
+    return QColor.fromRgbF(
+        alpha * foreground.redF() + (1.0 - alpha) * background.redF(),
+        alpha * foreground.greenF() + (1.0 - alpha) * background.greenF(),
+        alpha * foreground.blueF() + (1.0 - alpha) * background.blueF(),
+    )
+
+
 class ThemeTests(unittest.TestCase):
     def test_default_palette_is_the_established_pc_palette(self):
         palette = PALETTES[DEFAULT_THEME_KEY]
@@ -72,6 +99,31 @@ class ThemeTests(unittest.TestCase):
                 value = getattr(palette, field)
                 self.assertTrue(value, f"{palette.key}.{field}")
                 self.assertTrue(QColor(value).isValid(), f"{palette.key}.{field}")
+
+    def test_targeted_text_and_pressed_send_contrast_meet_aa(self):
+        for palette in PALETTES.values():
+            surfaces = (
+                QColor(palette.background),
+                QColor(palette.surface),
+                QColor(palette.elevated_surface),
+            )
+            for field in ("text", "muted_text", "disabled", "error", "warning"):
+                foreground = QColor(getattr(palette, field))
+                for surface in surfaces:
+                    self.assertGreaterEqual(
+                        _contrast_ratio(foreground, surface),
+                        4.5,
+                        f"{palette.key}.{field} on {surface.name()}",
+                    )
+
+            pressed_background = _blend(
+                QColor(palette.primary), QColor(palette.background), 0.70,
+            )
+            self.assertGreaterEqual(
+                _contrast_ratio(QColor(palette.background), pressed_background),
+                4.5,
+                f"{palette.key}.send.pressed",
+            )
 
     def test_selection_persists_restores_and_emits_once(self):
         store: dict[str, object] = {}

@@ -119,6 +119,7 @@ PALETTES: dict[str, ThemePalette] = {
         background="#0d0b12", surface="#0f0d16", elevated="#13111a",
         glass="#1a1625", primary="#c4b5f5", secondary="#8c6edc",
         text="#e8e6f0", muted="#9d9aad", border="#2a2438",
+        disabled="#858291",
         user_bubble="#2a2440", assistant_bubble="#0f0d16",
     ),
     "azure": _palette(
@@ -126,6 +127,7 @@ PALETTES: dict[str, ThemePalette] = {
         background="#09111a", surface="#0e1a26", elevated="#132536",
         glass="#162c40", primary="#8ac7ff", secondary="#378fe5",
         text="#f1f7ff", muted="#8da0b3", border="#294057",
+        disabled="#8da0b3",
         user_bubble="#183b59", assistant_bubble="#0e1a26",
     ),
     "emerald": _palette(
@@ -133,6 +135,7 @@ PALETTES: dict[str, ThemePalette] = {
         background="#08130f", surface="#0d1d17", elevated="#132a21",
         glass="#173428", primary="#8ee6bd", secondary="#2ca875",
         text="#effcf6", muted="#88a598", border="#27483a",
+        disabled="#88a598",
         user_bubble="#174331", assistant_bubble="#0d1d17",
     ),
     "rose": _palette(
@@ -140,6 +143,7 @@ PALETTES: dict[str, ThemePalette] = {
         background="#120b0e", surface="#22161b", elevated="#2e1b22",
         glass="#2e1b22", primary="#f5b5c4", secondary="#ed4f87",
         text="#fff3f6", muted="#9c8b91", border="#3a2530",
+        disabled="#9c8b91",
         user_bubble="#38222a", assistant_bubble="#22161b",
     ),
     "amber": _palette(
@@ -147,6 +151,7 @@ PALETTES: dict[str, ThemePalette] = {
         background="#110e0a", surface="#1f1a12", elevated="#2b2419",
         glass="#2b2419", primary="#e6c97a", secondary="#c79d3e",
         text="#faf1dc", muted="#9c8c6e", border="#3a301f",
+        disabled="#9c8c6e",
         warning="#e6c97a", user_bubble="#2b2419",
         assistant_bubble="#1f1a12",
     ),
@@ -155,7 +160,7 @@ PALETTES: dict[str, ThemePalette] = {
         background="#000000", surface="#101010", elevated="#1a1a1a",
         glass="#1a1a1a", primary="#ededed", secondary="#6b6b6b",
         text="#ffffff", muted="#8a8a8a", border="#262626",
-        disabled="#6b6b6b", user_bubble="#1f1f1f",
+        disabled="#8a8a8a", user_bubble="#1f1f1f",
         assistant_bubble="#101010",
     ),
 }
@@ -193,7 +198,7 @@ def themed_stylesheet(template: str, palette: ThemePalette) -> str:
         "#e8e6f0": palette.text,
         "#9d9aad": palette.muted_text,
         "#8a8798": palette.muted_text,
-        "#777480": palette.disabled,
+        "#858291": palette.disabled,
         "#e0a3a3": palette.error,
         "#ff6b6b": palette.error,
         "#e0a23c": palette.warning,
@@ -210,7 +215,7 @@ def themed_stylesheet(template: str, palette: ThemePalette) -> str:
         ((13, 11, 18), "background"),
         ((15, 13, 22), "surface"),
         ((19, 17, 26), "elevated_surface"),
-        ((119, 116, 128), "disabled"),
+        ((133, 130, 145), "disabled"),
         ((220, 80, 80), "error"),
     )
     for (red, green, blue), field in rgb_fields:
