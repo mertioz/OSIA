@@ -8968,7 +8968,7 @@ class _OsiaPanel(QWidget):
         enable.setToolTip(i18n.t("osia.skill_toggle"))
         enable.stateChanged.connect(
             lambda _s, n=name, c=enable:
-                personality.set_skill_enabled(n, c.isChecked())
+                self._on_skill_toggle(n, c)
         )
         edit_btn = QPushButton("✎")
         edit_btn.setObjectName("ghostBtn")
@@ -9004,8 +9004,8 @@ class _OsiaPanel(QWidget):
         save_btn.setObjectName("saveBtn")
         save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         save_btn.clicked.connect(
-            lambda _=False, n=name, e=editor, b=save_btn:
-                self._on_skill_save(n, e, b)
+            lambda _=False, n=name, e=editor, b=save_btn, c=enable:
+                self._on_skill_save(n, e, b, c)
         )
         close_btn = QPushButton(i18n.t("osia.skill_close"))
         close_btn.setObjectName("ghostBtn")
@@ -9026,6 +9026,14 @@ class _OsiaPanel(QWidget):
         )
         return row
 
+    @staticmethod
+    def _on_skill_toggle(name: str, checkbox: QCheckBox) -> None:
+        effective = personality.set_skill_enabled(name, checkbox.isChecked())
+        if checkbox.isChecked() != effective:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(effective)
+            checkbox.blockSignals(False)
+
     def _toggle_skill_editor(self, wrap: QWidget, editor: QTextEdit,
                              name: str) -> None:
         if wrap.isVisible():
@@ -9036,8 +9044,11 @@ class _OsiaPanel(QWidget):
             wrap.setVisible(True)
 
     def _on_skill_save(self, name: str, editor: QTextEdit,
-                       btn: QPushButton) -> None:
+                       btn: QPushButton, checkbox: QCheckBox) -> None:
         personality.write_skill(name, editor.toPlainText())
+        checkbox.blockSignals(True)
+        checkbox.setChecked(personality.is_skill_enabled(name))
+        checkbox.blockSignals(False)
         self._flash_saved(btn)
 
     def _on_skill_add(self) -> None:

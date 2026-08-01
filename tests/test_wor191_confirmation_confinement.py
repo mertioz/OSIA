@@ -307,8 +307,14 @@ def test_legacy_setting_writes_and_mobile_snapshot_remain_safe(monkeypatch, tmp_
     from osia.server import server
 
     monkeypatch.setattr(server, "_gmail_rest_config_snapshot", lambda: {})
-    monkeypatch.setattr(personality, "load_personality", lambda: "")
-    monkeypatch.setattr(personality, "list_skills", lambda: [])
+    monkeypatch.setattr(
+        personality,
+        "resolve_personality",
+        lambda: personality.PersonalitySelection(
+            "default", "", "test", "missing", ""
+        ),
+    )
+    monkeypatch.setattr(personality, "discover_skills", lambda: [])
     snapshot = server._build_config_snapshot()
     assert snapshot["mcp_confirm_writes"] is True
     assert snapshot["mcp_allow_unattended_writes"] is False

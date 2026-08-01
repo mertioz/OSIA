@@ -441,9 +441,13 @@ class MobileGmailSnapshotTests(unittest.TestCase):
                 "message": "",
             },
         ), patched(
-            personality, "load_personality", lambda: ""
+            personality,
+            "resolve_personality",
+            lambda: personality.PersonalitySelection(
+                "default", "", "test", "missing", ""
+            ),
         ), patched(
-            personality, "list_skills", lambda: []
+            personality, "discover_skills", lambda: []
         ):
             cfg = server_mod._build_config_snapshot()
 

@@ -1528,18 +1528,17 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "es": "Personalidad",
     },
     "osia.personality_sub": {
-        "en": "Define how OSIA behaves and speaks. Prepended to the system "
-              "prompt at the start of every conversation.",
-        "fr": "Définissez le comportement et le ton d'OSIA. Ajouté au début de "
-              "l'invite système au démarrage de chaque conversation.",
-        "zh": "定义 OSIA 的行为和说话方式。在每次对话开始时添加到系统提示的开头。",
-        "ja": "OSIA の振る舞いと話し方を定義します。会話の開始時にシステム"
-              "プロンプトの先頭に追加されます。",
-        "de": "Legen Sie fest, wie sich OSIA verhält und spricht. Wird zu "
-              "Beginn jeder Unterhaltung an den Anfang des System-Prompts "
-              "gestellt.",
-        "es": "Define cómo se comporta y habla OSIA. Se añade al principio del "
-              "prompt del sistema al inicio de cada conversación.",
+        "en": "Define OSIA's tone and allowed preferences. Applied on every "
+              "turn without changing permissions or capabilities.",
+        "fr": "Définissez le ton et les préférences autorisées d'OSIA. Appliqué "
+              "à chaque tour sans modifier les autorisations ni les capacités.",
+        "zh": "定义 OSIA 的语气和允许的偏好。每轮都会应用，但不会更改权限或功能。",
+        "ja": "OSIA の話し方と許可された設定を定義します。各ターンに適用されますが、"
+              "権限や機能は変更しません。",
+        "de": "Definieren Sie OSIAs Ton und zulässige Präferenzen. Wird in "
+              "jedem Zug angewendet, ohne Berechtigungen oder Fähigkeiten zu ändern.",
+        "es": "Define el tono y las preferencias permitidas de OSIA. Se aplica "
+              "en cada turno sin cambiar permisos ni capacidades.",
     },
     "osia.reset_default": {
         "en": "Reset to default",
@@ -1558,17 +1557,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "es": "Habilidades",
     },
     "osia.skills_sub": {
-        "en": "Reusable instruction files. Enabled skills are appended to the "
-              "system prompt.",
-        "fr": "Fichiers d'instructions réutilisables. Les compétences activées "
-              "sont ajoutées à l'invite système.",
-        "zh": "可重复使用的指令文件。已启用的技能会附加到系统提示中。",
-        "ja": "再利用可能な指示ファイル。有効なスキルはシステムプロンプトに"
-              "追加されます。",
-        "de": "Wiederverwendbare Anweisungsdateien. Aktivierte Fähigkeiten "
-              "werden an den System-Prompt angehängt.",
-        "es": "Archivos de instrucciones reutilizables. Las habilidades "
-              "activadas se añaden al prompt del sistema.",
+        "en": "Reusable instructions only. They add no tools, permissions, or "
+              "capabilities.",
+        "fr": "Instructions réutilisables uniquement. Elles n'ajoutent aucun "
+              "outil, aucune autorisation ni capacité.",
+        "zh": "仅作为可复用指令；不会添加工具、权限或功能。",
+        "ja": "再利用可能な指示のみです。ツール・権限・機能は追加しません。",
+        "de": "Nur wiederverwendbare Anweisungen. Sie fügen keine Tools, "
+              "Berechtigungen oder Fähigkeiten hinzu.",
+        "es": "Solo instrucciones reutilizables. No añaden herramientas, "
+              "permisos ni capacidades.",
     },
     "osia.skills_empty": {
         "en": "No skills yet. Create one with +.",

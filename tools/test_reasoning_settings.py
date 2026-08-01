@@ -431,9 +431,13 @@ class ReasoningSettingsTests(unittest.TestCase):
         ), patched(
             server_mod, "_gmail_rest_config_snapshot", lambda: {}
         ), patched(
-            personality, "load_personality", lambda: ""
+            personality,
+            "resolve_personality",
+            lambda: personality.PersonalitySelection(
+                "default", "", "test", "missing", ""
+            ),
         ), patched(
-            personality, "list_skills", lambda: []
+            personality, "discover_skills", lambda: []
         ):
             cfg = server_mod._build_config_snapshot()
 

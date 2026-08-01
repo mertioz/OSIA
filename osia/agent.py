@@ -481,15 +481,17 @@ def get_system_prompt(
     # correct folder when the user says "desktop"/"bureau" (~/Bureau on
     # French systems, ~/Desktop on English ones).
     body = body + f"\n\n[DESKTOP PATH: {get_desktop_path()}]"
-    # Bloc 6 — prepend the user's custom personality (~/.osia/personality.md)
-    # and append any enabled skill files (~/.osia/skills/*.md). Both are
-    # optional Markdown the user edits from the "OSIA" tab; any failure here
-    # must never break prompt construction, so fall back silently.
+    # Bloc 6 — add the user's personality and only valid enabled skills inside
+    # explicit lower-priority boundaries. The system/tool contracts remain
+    # before them, while action policy and concrete guidance remain after them.
+    # Both sources are reread on every prompt build for hot changes.
     try:
         from osia import personality
         persona = personality.load_personality().strip()
         if persona:
-            body = persona + "\n\n" + body
+            body = body + "\n\n" + personality.render_personality_prompt_block(
+                persona
+            )
         skills = personality.load_enabled_skills_text().strip()
         if skills and not autonomous_web_surface:
             body = body + "\n\n" + skills

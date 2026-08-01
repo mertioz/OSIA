@@ -2481,14 +2481,21 @@ def _build_config_snapshot() -> dict:
     hierarchy = cfg.get("ai_hierarchy") or {}
     cfg["heavy_chain"] = list(hierarchy.get("heavy") or [])
     cfg["medium_chain"] = list(hierarchy.get("medium") or [])
-    cfg["personality"] = personality.load_personality()
+    personality_selection = personality.resolve_personality()
+    cfg["personality"] = personality_selection.text
+    cfg["personality_id"] = personality_selection.identifier
+    cfg["personality_status"] = (
+        "fallback" if personality_selection.fallback_reason else "ok"
+    )
     cfg["skills"] = [
         {
-            "name": n,
-            "enabled": personality.is_skill_enabled(n),
-            "text": personality.read_skill(n),
+            "name": skill.filename,
+            "enabled": skill.enabled,
+            "text": skill.text,
+            "available": skill.available,
+            "status": skill.status,
         }
-        for n in personality.list_skills()
+        for skill in personality.discover_skills()
     ]
     cfg["api_keys_set"] = {
         p: bool(k) for p, k in load_api_keys().items()
@@ -2539,6 +2546,18 @@ async def _broadcast_config(
             await client.send_json(frame)
         except Exception:
             _WS_CLIENTS.discard(client)
+
+
+async def _broadcast_personality_config() -> None:
+    """Push the existing full snapshot after a personality/skill mutation."""
+
+    try:
+        await _broadcast_config({
+            "type": "config",
+            "config": _build_config_snapshot(),
+        })
+    except Exception:
+        print("[OSIA Server] personality config broadcast failed (details withheld)")
 
 
 def _memory_store() -> MemoryStore:
@@ -8088,8 +8107,9 @@ async def websocket_endpoint(ws: WebSocket):
                         f"({len(persona_text)} chars)"
                     )
                     await out.send_json({"type": "status", "status": "done"})
-                except Exception as e:
-                    print(f"[OSIA Server] set_personality failed: {e}")
+                    await _broadcast_personality_config()
+                except Exception:
+                    print("[OSIA Server] set_personality failed (details withheld)")
                     await out.send_json({"type": "status", "status": "error"})
                 continue
 
@@ -8108,17 +8128,28 @@ async def websocket_endpoint(ws: WebSocket):
                     if "text" in msg:
                         personality.write_skill(skill_name, msg.get("text") or "")
                     if "enabled" in msg:
-                        personality.set_skill_enabled(
+                        effective_enabled = personality.set_skill_enabled(
                             skill_name, bool(msg.get("enabled"))
                         )
-                    print(
-                        f"[OSIA Server] set_skill name={skill_name!r} "
-                        f"text={'text' in msg} "
-                        f"enabled={msg.get('enabled') if 'enabled' in msg else '—'}"
+                    else:
+                        effective_enabled = personality.is_skill_enabled(skill_name)
+                    skill_record = personality.get_skill_definition(skill_name)
+                    skill_status = (
+                        skill_record.status if skill_record is not None else "missing"
                     )
-                    await out.send_json({"type": "status", "status": "done"})
-                except Exception as e:
-                    print(f"[OSIA Server] set_skill({skill_name!r}) failed: {e}")
+                    print(
+                        f"[OSIA Server] set_skill "
+                        f"text={'text' in msg} "
+                        f"enabled={effective_enabled} status={skill_status}"
+                    )
+                    await out.send_json({
+                        "type": "status",
+                        "status": "done",
+                        "skill_status": skill_status,
+                    })
+                    await _broadcast_personality_config()
+                except Exception:
+                    print("[OSIA Server] set_skill failed (details withheld)")
                     await out.send_json({"type": "status", "status": "error"})
                 continue
 
@@ -8133,12 +8164,13 @@ async def websocket_endpoint(ws: WebSocket):
                     if not created:
                         await out.send_json({"type": "status", "status": "error"})
                         continue
-                    print(f"[OSIA Server] create_skill -> {created!r}")
+                    print("[OSIA Server] create_skill completed")
                     await out.send_json({
                         "type": "status", "status": "done", "name": created,
                     })
-                except Exception as e:
-                    print(f"[OSIA Server] create_skill({skill_name!r}) failed: {e}")
+                    await _broadcast_personality_config()
+                except Exception:
+                    print("[OSIA Server] create_skill failed (details withheld)")
                     await out.send_json({"type": "status", "status": "error"})
                 continue
 
@@ -8150,10 +8182,11 @@ async def websocket_endpoint(ws: WebSocket):
                 try:
                     from osia import personality
                     personality.delete_skill(skill_name)
-                    print(f"[OSIA Server] delete_skill name={skill_name!r}")
+                    print("[OSIA Server] delete_skill completed")
                     await out.send_json({"type": "status", "status": "done"})
-                except Exception as e:
-                    print(f"[OSIA Server] delete_skill({skill_name!r}) failed: {e}")
+                    await _broadcast_personality_config()
+                except Exception:
+                    print("[OSIA Server] delete_skill failed (details withheld)")
                     await out.send_json({"type": "status", "status": "error"})
                 continue
 

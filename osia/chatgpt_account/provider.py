@@ -80,6 +80,7 @@ class _ConversationState:
     thread_id: str
     generation: int
     model: str
+    system_fingerprint: str
     expected_messages: list[dict]
 
 
@@ -356,6 +357,7 @@ class ChatGPTAccountProvider:
         public = [_public_message(message) for message in messages]
         system = next((m["content"] for m in public if m["role"] == "system"), "")
         system = _sanitized_system_prompt(system, public)
+        system_fingerprint = hashlib.sha256(system.encode("utf-8")).hexdigest()
         public_non_system = [m for m in public if m["role"] != "system"]
         non_system = [message for message in messages if message.get("role") != "system"]
         with self._lock:
@@ -364,6 +366,7 @@ class ChatGPTAccountProvider:
                 state
                 and state.generation == self.client.generation
                 and state.model == model
+                and state.system_fingerprint == system_fingerprint
                 and _same_messages(state.expected_messages, public_non_system)
             )
             delta = non_system[len(state.expected_messages):] if reusable and state else non_system
@@ -378,6 +381,7 @@ class ChatGPTAccountProvider:
                 thread_id=thread_id,
                 generation=self.client.generation,
                 model=model,
+                system_fingerprint=system_fingerprint,
                 expected_messages=[],
             )
             delta = non_system
