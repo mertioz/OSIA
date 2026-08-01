@@ -579,6 +579,52 @@ def _start_popup_hotkey_listener(callback):
         return None
 
 
+# ── Voice shutdown lifecycle ────────────────────────────────────────────────
+
+def _shutdown_voice_runtime(
+    *,
+    close_acceptance,
+    cancel_pending_activation,
+    signal_worker_cancel,
+    invalidate_tts,
+    get_active_worker,
+    stop_before_tts_shutdown=(),
+    shutdown_tts,
+    release_voice_gate,
+    join_timeout: float = 1.0,
+) -> bool:
+    """Cancel voice ownership before shutting down TTS, with a bounded join."""
+
+    close_acceptance()
+    cancel_pending_activation()
+    signal_worker_cancel()
+    invalidate_tts()
+
+    worker = get_active_worker()
+    if (
+        worker is not None
+        and worker is not threading.current_thread()
+        and worker.is_alive()
+    ):
+        worker.join(timeout=max(0.0, join_timeout))
+    worker_stopped = worker is None or not worker.is_alive()
+
+    for stop_callback in stop_before_tts_shutdown:
+        try:
+            stop_callback()
+        except Exception as exc:
+            print(
+                "[shutdown] owned service stop failed "
+                f"({type(exc).__name__})",
+                flush=True,
+            )
+    try:
+        shutdown_tts()
+    finally:
+        release_voice_gate()
+    return worker_stopped
+
+
 # ── Modes ───────────────────────────────────────────────────────────────────
 
 def text_mode():
@@ -672,7 +718,7 @@ def voice_mode():
             speak("I didn't catch that. Could you repeat?")
             continue
 
-        print(f"📝 You said: {user_text}")
+        print(f"[STT] accepted voice input ({len(user_text)} chars).")
 
         # First message — create the conversation now, never earlier.
         if active_conv is None:
@@ -699,7 +745,7 @@ def voice_mode():
             turn_context=turn_context,
         )
         response = clean_response(response)
-        print(f"💬 OSIA: {response}")
+        print(f"[voice] assistant response accepted ({len(response)} chars).")
 
         _persist_exchange(
             active_conv["id"], user_text, response, turn_context,
@@ -721,7 +767,7 @@ def wake_mode():
     from osia.utils.assets import ICON_PATH, ensure_desktop_entry
     from osia.gui.dynamic_island import DynamicIsland
     from osia.gui.main_popup import MainPopup
-    from osia.voice.wake import WakeAcceptanceGate
+    from osia.voice.wake import VoiceSessionLifecycle, WakeAcceptanceGate
     # NOTE: osia.voice.stt (faster_whisper, ~4.3s to import on Windows) is NOT
     # imported here. listen_for_command is only used on the wake daemon thread —
     # it is imported lazily inside handle_wake()'s process() worker so the heavy
@@ -733,6 +779,7 @@ def wake_mode():
         speak,
         speak_greeting_cached,
         speak_streaming,
+        start_tts_session,
         start_streaming_session,
         stop as tts_stop,
         wait_for_playback_complete,
@@ -977,6 +1024,7 @@ def wake_mode():
         is_busy=_any_conversation_busy,
         is_tts_active=tts_playback_active,
     )
+    voice_ui_lifecycle = VoiceSessionLifecycle()
 
     # WOR-211 release contract: no detector is constructed and no idle
     # microphone stream is opened. Ctrl+Alt+P enters the same guarded voice
@@ -988,6 +1036,28 @@ def wake_mode():
     )
     manual_activation_open = threading.Event()
     manual_activation_open.set()
+    voice_shutdown_requested = threading.Event()
+    voice_worker_lock = threading.Lock()
+    active_voice_worker = [None]
+
+    def _get_active_voice_worker():
+        with voice_worker_lock:
+            return active_voice_worker[0]
+
+    def _start_voice_worker(target, *, name: str) -> None:
+        def run() -> None:
+            try:
+                target()
+            finally:
+                current = threading.current_thread()
+                with voice_worker_lock:
+                    if active_voice_worker[0] is current:
+                        active_voice_worker[0] = None
+
+        worker = threading.Thread(target=run, daemon=True, name=name)
+        with voice_worker_lock:
+            active_voice_worker[0] = worker
+            worker.start()
 
     def _manual_wake() -> None:
         if not manual_activation_open.is_set():
@@ -1020,7 +1090,11 @@ def wake_mode():
                 busy_conversations.discard(conv_id)
             any_busy = bool(busy_conversations)
         bridge.conversation_busy_changed.emit(conv_id, busy)
-        bridge.island_state.emit("thinking" if any_busy else "idle")
+        voice_ui_lifecycle.emit_when_inactive(
+            lambda: bridge.island_state.emit(
+                "thinking" if any_busy else "idle"
+            )
+        )
 
     def _ensure_active_conversation(seed_text: str | None = None) -> dict:
         nonlocal active_conv
@@ -1049,6 +1123,9 @@ def wake_mode():
         user_display_text: str | None = None,
         language_text: str | None = None,
         lock_provider: bool = False,
+        tts_session_id: int | None = None,
+        voice_cancelled=None,
+        emit_voice_state=None,
     ) -> None:
         """Run the agent in the current thread, persist + mirror the result.
 
@@ -1062,7 +1139,8 @@ def wake_mode():
             # Attachment capability was preflighted against this selected path;
             # automatic hierarchy routing must not silently swap it mid-turn.
             turn_agent._disable_hierarchy_for_turn = True
-        tts_session_id = start_streaming_session() if voice_response else None
+        if voice_response and tts_session_id is None:
+            tts_session_id = start_streaming_session()
         settings = load_settings()
         selected_model = settings.get("selected_model")
         selected_provider = settings.get("selected_model_provider") or None
@@ -1088,13 +1166,21 @@ def wake_mode():
 
         prev_history_len = len(history)
 
+        def _voice_tts_allowed() -> bool:
+            return voice_response and not (
+                voice_cancelled is not None and voice_cancelled()
+            )
+
         def on_first_token(*_a, **_kw):
-            if voice_response:
-                bridge.island_state.emit("speaking")
+            if _voice_tts_allowed():
+                if emit_voice_state is not None:
+                    emit_voice_state("speaking")
+                else:
+                    bridge.island_state.emit("speaking")
 
         def on_stream_sentence(sentence: str) -> None:
             bridge.assistant_stream_chunk.emit(conv_id, sentence)
-            if voice_response:
+            if _voice_tts_allowed():
                 speak_streaming(
                     sentence,
                     session_id=tts_session_id,
@@ -1145,11 +1231,12 @@ def wake_mode():
                 user_display_text=user_display_text,
             )
             if refusal is not None:
-                if voice_response:
-                    refusal_tts_session = start_streaming_session()
+                if _voice_tts_allowed():
+                    if emit_voice_state is not None:
+                        emit_voice_state("speaking")
                     speak_streaming(
                         refusal,
-                        session_id=refusal_tts_session,
+                        session_id=tts_session_id,
                         language=turn_context.language,
                     )
             else:
@@ -1162,11 +1249,12 @@ def wake_mode():
                 )
                 conversations.add_message(conv_id, "assistant", err)
                 bridge.assistant_stream_error.emit(conv_id, err)
-                if voice_response:
-                    error_tts_session = start_streaming_session()
+                if _voice_tts_allowed():
+                    if emit_voice_state is not None:
+                        emit_voice_state("speaking")
                     speak_streaming(
                         err,
-                        session_id=error_tts_session,
+                        session_id=tts_session_id,
                         language=turn_context.language,
                     )
         finally:
@@ -1185,11 +1273,39 @@ def wake_mode():
             print("⚠️  Stale or unreserved wake event — ignored.")
             return
 
-        def _finish_wake_turn() -> None:
-            # Streaming TTS is asynchronous with respect to agent completion.
-            # Hold the handler reservation until every queued sentence finishes.
-            wait_for_playback_complete()
+        voice_session = object()
+        if not voice_ui_lifecycle.begin(voice_session):
             wake_gate.finish()
+            return
+        owned_tts_session = [None]
+
+        def _emit_voice_state(state: str) -> bool:
+            return voice_ui_lifecycle.emit_if_current(
+                voice_session,
+                lambda: bridge.island_state.emit(state),
+            )
+
+        _emit_voice_state("thinking")
+
+        def _finish_wake_turn() -> None:
+            def _wait_for_owned_playback() -> bool:
+                if owned_tts_session[0] is None:
+                    return True
+                return wait_for_playback_complete(
+                    session_id=owned_tts_session[0]
+                )
+
+            def _emit_post_voice_state() -> None:
+                bridge.island_state.emit(
+                    "thinking" if _any_conversation_busy() else "idle"
+                )
+
+            voice_ui_lifecycle.finalize(
+                voice_session,
+                wait_for_playback=_wait_for_owned_playback,
+                release_gate=wake_gate.finish,
+                emit_final_state=_emit_post_voice_state,
+            )
 
         # Bloc 4 — Live API voice-to-voice. When enabled, OSIA's local STT
         # (Whisper) transcription and TTS speak steps are bypassed entirely:
@@ -1200,7 +1316,6 @@ def wake_mode():
             live_settings = load_settings()
         except Exception as exc:
             print(f"[wake] could not load voice settings: {exc}")
-            bridge.island_state.emit("idle")
             _finish_wake_turn()
             return
         if live_settings.get("liveapi_enabled") and not LIVEAPI_AVAILABLE:
@@ -1219,22 +1334,31 @@ def wake_mode():
 
             def live_process():
                 try:
+                    if voice_shutdown_requested.is_set():
+                        return
                     from osia.voice.live_api import _connect_live_api
                     _connect_live_api(provider, model)
                 finally:
-                    bridge.island_state.emit("idle")
                     _finish_wake_turn()
 
-            threading.Thread(target=live_process, daemon=True).start()
+            _start_voice_worker(live_process, name="osia-live-voice")
             return
 
-        bridge.island_state.emit("listening")
+        if voice_shutdown_requested.is_set():
+            _finish_wake_turn()
+            return
+        voice_tts_session = start_tts_session(reopen_after_shutdown=False)
+        owned_tts_session[0] = voice_tts_session
 
         def process():
             try:
+                if voice_shutdown_requested.is_set():
+                    return
                 # Deferred heavy import (faster_whisper, ~4.3s on Windows). This
                 # runs on the wake daemon thread, never on the GUI startup path.
                 from osia.voice.stt import listen_for_command
+                if voice_shutdown_requested.is_set():
+                    return
                 # Optional spoken greeting before listening. When enabled, OSIA
                 # speaks the preconfigured text first, then starts capturing the
                 # command (speak() is synchronous, so the greeting finishes
@@ -1242,39 +1366,71 @@ def wake_mode():
                 if live_settings.get("wake_greeting_enabled"):
                     greeting = (live_settings.get("wake_greeting_text") or "").strip()
                     if greeting:
-                        bridge.island_state.emit("speaking")
-                        speak_greeting_cached(greeting)
-                        bridge.island_state.emit("listening")
-                user_text = listen_for_command(max_retries=3)
-                if not user_text:
-                    bridge.island_state.emit("idle")
-                    speak("Je n'ai pas compris, répétez.")
+                        _emit_voice_state("speaking")
+                        speak_greeting_cached(
+                            greeting, session_id=voice_tts_session,
+                        )
+                if voice_shutdown_requested.is_set():
                     return
-                print(f"📝 You said: {user_text}")
+
+                def _mark_listening_ready() -> None:
+                    if not voice_shutdown_requested.is_set():
+                        voice_ui_lifecycle.emit_if_current(
+                            voice_session,
+                            lambda: bridge.island_state.emit("listening"),
+                        )
+
+                user_text = listen_for_command(
+                    max_retries=3,
+                    on_ready=_mark_listening_ready,
+                )
+                if voice_shutdown_requested.is_set():
+                    return
+                if not user_text:
+                    _emit_voice_state("speaking")
+                    speak(
+                        "Je n'ai pas compris, répétez.",
+                        session_id=voice_tts_session,
+                    )
+                    return
+                print(f"[STT] accepted voice input ({len(user_text)} chars).")
                 # WOR-10 — intercept "nouveau chat" / "new chat" before the LLM.
                 if is_new_chat_command(user_text):
-                    print("🆕 Voice command recognised: new chat")
+                    print(
+                        "[voice] local command accepted "
+                        "(action=new_conversation)."
+                    )
                     bridge.new_chat.emit()        # reset agent + GUI (Qt thread)
                     _notify_mobile_new_chat()      # push {"type":"new_chat"} to mobile
-                    bridge.island_state.emit("speaking")
-                    speak(i18n.t("conversations.new_chat_confirm"))
-                    bridge.island_state.emit("idle")
+                    _emit_voice_state("speaking")
+                    speak(
+                        i18n.t("conversations.new_chat_confirm"),
+                        session_id=voice_tts_session,
+                    )
                     return
                 conv = _ensure_active_conversation(user_text)
                 conv_id = conv["id"]
                 if _is_conversation_busy(conv_id):
-                    bridge.island_state.emit("speaking")
-                    speak(_desktop_busy_message())
-                    bridge.island_state.emit("idle")
+                    _emit_voice_state("speaking")
+                    speak(
+                        _desktop_busy_message(),
+                        session_id=voice_tts_session,
+                    )
                     return
                 history = _history_for_conversation(conv_id)
                 _set_conversation_busy(conv_id, True)
+                _emit_voice_state("thinking")
                 bridge.chat_message_for_conversation.emit(conv_id, "user", user_text)
-                _run_agent(user_text, conv_id, history, voice_response=True)
+                _run_agent(user_text, conv_id, history,
+                    voice_response=True,
+                    tts_session_id=voice_tts_session,
+                    voice_cancelled=voice_shutdown_requested.is_set,
+                    emit_voice_state=_emit_voice_state,
+                )
             finally:
                 _finish_wake_turn()
 
-        threading.Thread(target=process, daemon=True).start()
+        _start_voice_worker(process, name="osia-voice-turn")
 
     # ── Text handler (typed message in popup) ────────────────────────────
 
@@ -1360,14 +1516,13 @@ def wake_mode():
     def handle_voice_new_chat():
         # GUI-thread reset for the "nouveau chat" voice command (WOR-10).
         # Same effect as clicking "Nouveau chat": clear agent history, start a
-        # fresh conversation, and reset the chat view + Dynamic Island.
+        # fresh conversation, and reset the chat view. The voice-session
+        # finalizer remains the sole owner of the Dynamic Island ready state.
         nonlocal active_conv
-        tts_stop()
         agent.reset()
         active_conv = conversations.create_conversation()
         popup.reset_conversation()
         popup.refresh_conversations(active_conv["id"])
-        island.set_state("idle")
         print(f"🆕 New conversation (voice): {active_conv['id']}")
 
     def handle_open_conversation(conv_id: str):
@@ -1642,7 +1797,10 @@ def wake_mode():
         # Wait briefly for any active turn to finish so the alert isn't spoken
         # over it; if still busy, log rather than drop it silently.
         if not handler_lock.acquire(timeout=20):
-            print(f"[HEARTBEAT] busy — alert not spoken: {message}")
+            print(
+                f"[HEARTBEAT] busy — alert not spoken "
+                f"({len(message)} chars)"
+            )
             return
         try:
             bridge.chat_message.emit("assistant", f"💓 {message}")
@@ -2241,19 +2399,35 @@ def wake_mode():
     print("=" * 60)
 
     def on_quit():
-        # Stop the Bloc 5 background threads cleanly before the app tears down.
-        tts_shutdown()
-        cron_manager.stop()
-        unsubscribe_cron_wake()
-        heartbeat_monitor.stop()
-        # WOR-45 Phase 4 — stop the autonomous loop too (safe if never started).
-        orchestrator.stop()
-        manual_activation_open.clear()
-        wake_gate.cancel(0)
+        voice_ui_lifecycle.close()
+        owned_stops = [
+            cron_manager.stop,
+            unsubscribe_cron_wake,
+            heartbeat_monitor.stop,
+            # WOR-45 Phase 4 — safe if the autonomous loop never started.
+            orchestrator.stop,
+        ]
         if stop_manual_hotkey:
-            stop_manual_hotkey()
+            owned_stops.append(stop_manual_hotkey)
         if stop_popup_hotkey:
-            stop_popup_hotkey()
+            owned_stops.append(stop_popup_hotkey)
+        worker_stopped = _shutdown_voice_runtime(
+            close_acceptance=manual_activation_open.clear,
+            cancel_pending_activation=lambda: wake_gate.cancel(0),
+            signal_worker_cancel=voice_shutdown_requested.set,
+            invalidate_tts=tts_stop,
+            get_active_worker=_get_active_voice_worker,
+            stop_before_tts_shutdown=tuple(owned_stops),
+            shutdown_tts=tts_shutdown,
+            release_voice_gate=wake_gate.close,
+            join_timeout=1.0,
+        )
+        if not worker_stopped:
+            print(
+                "[shutdown] voice worker exceeded bounded join; "
+                "its obsolete TTS session remains invalidated",
+                flush=True,
+            )
         try:
             from osia.chatgpt_account.provider import get_account_provider
             get_account_provider().shutdown()

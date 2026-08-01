@@ -3,12 +3,15 @@
 OSIA Speech-to-Text — records from microphone and transcribes using faster-whisper.
 Phase 1: language=None for auto-detection (supports fr + en).
 Phase 3: listen_for_command() with retry loop — keeps listening until
-         a meaningful command (3+ words) is received.
+         a quality-accepted command is received.
 """
 
 import io
+import math
 import re
 import threading
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.signal import resample as scipy_resample
@@ -59,6 +62,7 @@ VAD_CALIBRATION_SECONDS = 1.0
 VAD_CALIBRATION_MULTIPLIER = 1.5
 VAD_THRESHOLD_CEILING = 0.05   # never let calibrated threshold exceed this
 _calibrated_silence_rms: float | None = None  # set by calibrate_ambient_threshold()
+_calibration_lock = threading.Lock()
 
 # Lazy-loaded model (rebuilt when the configured local size changes)
 _model = None
@@ -72,6 +76,41 @@ _model_lock = threading.Lock()
 GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_WHISPER_MODELS = ("whisper-large-v3", "whisper-large-v3-turbo")
 GROQ_DEFAULT_MODEL = "whisper-large-v3-turbo"
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionResult:
+    """Narrow, non-audio result used by the voice-command quality gate."""
+
+    text: str
+    language: str | None
+    language_probability: float | None
+    segment_count: int
+    average_log_probability: float | None
+    minimum_average_log_probability: float | None
+    maximum_no_speech_probability: float | None
+    maximum_compression_ratio: float | None
+    classification: str
+    rejection_reasons: tuple[str, ...]
+
+    @property
+    def accepted(self) -> bool:
+        return self.classification.startswith("accepted")
+
+
+def _empty_transcription_result(reason: str) -> TranscriptionResult:
+    return TranscriptionResult(
+        text="",
+        language=None,
+        language_probability=None,
+        segment_count=0,
+        average_log_probability=None,
+        minimum_average_log_probability=None,
+        maximum_no_speech_probability=None,
+        maximum_compression_ratio=None,
+        classification="rejected",
+        rejection_reasons=(reason,),
+    )
 
 
 def _get_model(model_size: str = None):
@@ -137,13 +176,21 @@ def record_audio(duration: int = RECORD_SECONDS, sample_rate: int = DEVICE_SAMPL
     return audio.flatten()
 
 
+def _bounded_vad_threshold(value: float) -> float:
+    """Keep the effective RMS threshold finite, positive, and capped."""
+    if not math.isfinite(value):
+        value = VAD_SILENCE_RMS
+    return min(max(value, VAD_SILENCE_RMS), VAD_THRESHOLD_CEILING)
+
+
 def calibrate_ambient_threshold(
     duration: float = VAD_CALIBRATION_SECONDS,
     multiplier: float = VAD_CALIBRATION_MULTIPLIER,
     sample_rate: int = VAD_SAMPLE_RATE,
 ) -> float:
     """Record `duration` seconds of ambient noise and derive a VAD silence
-    threshold from it: `threshold = ambient_rms * multiplier`.
+    threshold from `ambient_rms * multiplier`, bounded by the existing VAD
+    floor and ceiling.
 
     Result is cached in `_calibrated_silence_rms` so subsequent calls to
     `record_audio_vad()` pick it up automatically.
@@ -158,10 +205,33 @@ def calibrate_ambient_threshold(
     sd.wait()
     samples = audio.flatten()
     ambient_rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
-    threshold = min(ambient_rms * multiplier, VAD_THRESHOLD_CEILING)
+    threshold = _bounded_vad_threshold(ambient_rms * multiplier)
     print(f"🎙️ Ambient RMS: {ambient_rms:.4f}, threshold set to {threshold:.4f}")
     _calibrated_silence_rms = threshold
     return threshold
+
+
+def _get_ambient_threshold(sample_rate: int) -> float:
+    """Return the cached ambient threshold, calibrating once if necessary."""
+    global _calibrated_silence_rms
+    if _calibrated_silence_rms is None:
+        with _calibration_lock:
+            if _calibrated_silence_rms is None:
+                try:
+                    _calibrated_silence_rms = calibrate_ambient_threshold(
+                        sample_rate=sample_rate,
+                    )
+                except Exception as exc:
+                    try:
+                        sd.stop()
+                    except Exception:
+                        pass
+                    _calibrated_silence_rms = VAD_SILENCE_RMS
+                    print(
+                        "⚠️  [STT] ambient calibration failed "
+                        f"({type(exc).__name__}); using fallback threshold."
+                    )
+    return _calibrated_silence_rms
 
 
 def record_audio_vad(
@@ -171,18 +241,22 @@ def record_audio_vad(
     silence_seconds: float = VAD_SILENCE_SECONDS,
     max_seconds: float = VAD_MAX_SECONDS,
     min_seconds: float = VAD_MIN_SECONDS,
+    on_ready: Callable[[], None] | None = None,
 ) -> np.ndarray:
     """Record from the mic until the user stops talking, using a simple
     RMS-based Voice Activity Detection.
 
-    The stream is consumed in `chunk_seconds`-sized blocks. Recording ends as
-    soon as we've heard at least `min_seconds` of audio AND we've seen
-    `silence_seconds` of consecutive sub-threshold chunks. A hard cap of
-    `max_seconds` always applies.
+    The stream is consumed in `chunk_seconds`-sized blocks. Before speech
+    starts, `min_seconds` is the bounded no-speech window. After speech starts,
+    recording ends only after at least `silence_seconds` of consecutive
+    sub-threshold samples. A hard cap of `max_seconds` always applies.
 
     `silence_rms` defaults to the value produced by
     `calibrate_ambient_threshold()`. If calibration hasn't run yet, it is
     triggered automatically on the first call.
+
+    `on_ready`, when provided, runs after calibration and stream opening but
+    immediately before the first retained command sample is read.
 
     Returns mono float32 samples at `sample_rate` — feed straight to
     `transcribe(audio, sample_rate=sample_rate)`.
@@ -191,19 +265,20 @@ def record_audio_vad(
         print("⚠️  [STT] no audio backend — cannot record (VAD).")
         return np.zeros(0, dtype=np.float32)
     if silence_rms is None:
-        if _calibrated_silence_rms is None:
-            calibrate_ambient_threshold(sample_rate=sample_rate)
-        silence_rms = _calibrated_silence_rms if _calibrated_silence_rms is not None else VAD_SILENCE_RMS
+        silence_rms = _get_ambient_threshold(sample_rate)
+    silence_rms = _bounded_vad_threshold(silence_rms)
 
     chunk_size = int(chunk_seconds * sample_rate)
-    silence_chunks_needed = max(1, int(round(silence_seconds / chunk_seconds)))
     max_chunks = max(1, int(round(max_seconds / chunk_seconds)))
-    min_chunks = max(1, int(round(min_seconds / chunk_seconds)))
 
     print(f"🎤 Listening (VAD)... speak now, silence ends recording.")
 
+    WAITING_FOR_SPEECH = "waiting_for_speech"
+    IN_SPEECH = "in_speech"
+    state = WAITING_FOR_SPEECH
     chunks: list[np.ndarray] = []
-    silent_run = 0
+    recorded_seconds = 0.0
+    trailing_silence_seconds = 0.0
 
     with sd.InputStream(
         samplerate=sample_rate,
@@ -211,24 +286,35 @@ def record_audio_vad(
         dtype="float32",
         blocksize=chunk_size,
     ) as stream:
+        if on_ready is not None:
+            on_ready()
         for i in range(max_chunks):
             data, _ = stream.read(chunk_size)
             chunk = data.flatten()
             chunks.append(chunk)
+            chunk_duration = chunk.size / float(sample_rate)
+            recorded_seconds += chunk_duration
 
             rms = float(np.sqrt(np.mean(chunk * chunk)))
 
-            if (i + 1) < min_chunks:
+            if state == WAITING_FOR_SPEECH:
+                if rms >= silence_rms:
+                    state = IN_SPEECH
+                elif recorded_seconds >= min_seconds:
+                    break
                 continue
 
             if rms < silence_rms:
-                silent_run += 1
-                if silent_run >= silence_chunks_needed:
+                trailing_silence_seconds += chunk_duration
+                if trailing_silence_seconds >= silence_seconds:
                     break
             else:
-                silent_run = 0
+                trailing_silence_seconds = 0.0
 
-    audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+    if state == WAITING_FOR_SPEECH:
+        audio = np.zeros(0, dtype=np.float32)
+    else:
+        audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
     print(f"✅ Recording complete ({len(audio) / sample_rate:.1f}s).")
     return audio
 
@@ -370,9 +456,13 @@ def _transcribe_groq(audio_path_or_bytes, sample_rate: int = WHISPER_SAMPLE_RATE
     return text
 
 
-def _transcribe_local(audio: np.ndarray, sample_rate: int = DEVICE_SAMPLE_RATE,
-                      language: str = None, model_size: str = None) -> str:
-    """Transcribe with on-device faster-whisper (``stt_local_model``)."""
+def _transcribe_local_result(
+    audio: np.ndarray,
+    sample_rate: int = DEVICE_SAMPLE_RATE,
+    language: str = None,
+    model_size: str = None,
+) -> TranscriptionResult:
+    """Transcribe locally and classify using faster-whisper's own thresholds."""
     model, size = _get_model(model_size)
     print(f"[STT] transcribed via local (faster-whisper {size})")
     # Resample to 16kHz for Whisper
@@ -394,25 +484,199 @@ def _transcribe_local(audio: np.ndarray, sample_rate: int = DEVICE_SAMPLE_RATE,
         audio_16k, beam_size=5, best_of=5, language=language,
         initial_prompt=initial_prompt,
     )
-    text = " ".join(segment.text for segment in segments).strip()
+    segment_list = list(segments)
+    text = " ".join(segment.text for segment in segment_list).strip()
     if getattr(info, "language", None) == "fr":
         text = _apply_french_corrections(text)
-    return text
+
+    if not text or not segment_list:
+        return TranscriptionResult(
+            text="",
+            language=getattr(info, "language", None),
+            language_probability=getattr(info, "language_probability", None),
+            segment_count=len(segment_list),
+            average_log_probability=None,
+            minimum_average_log_probability=None,
+            maximum_no_speech_probability=None,
+            maximum_compression_ratio=None,
+            classification="rejected",
+            rejection_reasons=("empty_or_no_speech",),
+        )
+
+    options = getattr(info, "transcription_options", None)
+    try:
+        avg_logprobs = [
+            float(getattr(segment, "avg_logprob")) for segment in segment_list
+        ]
+        no_speech_probs = [
+            float(getattr(segment, "no_speech_prob")) for segment in segment_list
+        ]
+        compression_ratios = [
+            float(getattr(segment, "compression_ratio")) for segment in segment_list
+        ]
+        log_prob_threshold = float(getattr(options, "log_prob_threshold"))
+        no_speech_threshold = float(getattr(options, "no_speech_threshold"))
+        compression_ratio_threshold = float(
+            getattr(options, "compression_ratio_threshold")
+        )
+        thresholds = [
+            log_prob_threshold,
+            no_speech_threshold,
+            compression_ratio_threshold,
+        ]
+    except (AttributeError, TypeError, ValueError):
+        avg_logprobs = []
+        no_speech_probs = []
+        compression_ratios = []
+        thresholds = []
+
+    metrics = avg_logprobs + no_speech_probs + compression_ratios
+    if options is None or not metrics or not thresholds or any(
+        not math.isfinite(value) for value in metrics + thresholds
+    ):
+        return TranscriptionResult(
+            text=text,
+            language=getattr(info, "language", None),
+            language_probability=getattr(info, "language_probability", None),
+            segment_count=len(segment_list),
+            average_log_probability=None,
+            minimum_average_log_probability=None,
+            maximum_no_speech_probability=None,
+            maximum_compression_ratio=None,
+            classification="rejected",
+            rejection_reasons=("quality_metadata_unavailable",),
+        )
+
+    reasons: list[str] = []
+    if any(value < log_prob_threshold for value in avg_logprobs):
+        reasons.append("low_average_log_probability")
+    if any(
+        no_speech > no_speech_threshold and logprob < log_prob_threshold
+        for no_speech, logprob in zip(no_speech_probs, avg_logprobs)
+    ):
+        reasons.append("probable_no_speech")
+    if any(
+        value > compression_ratio_threshold for value in compression_ratios
+    ):
+        reasons.append("degenerate_compression_ratio")
+
+    return TranscriptionResult(
+        text=text,
+        language=getattr(info, "language", None),
+        language_probability=getattr(info, "language_probability", None),
+        segment_count=len(segment_list),
+        average_log_probability=sum(avg_logprobs) / len(avg_logprobs),
+        minimum_average_log_probability=min(avg_logprobs),
+        maximum_no_speech_probability=max(no_speech_probs),
+        maximum_compression_ratio=max(compression_ratios),
+        classification="rejected" if reasons else "accepted",
+        rejection_reasons=tuple(reasons),
+    )
 
 
-def _transcribe_with(provider: str, audio: np.ndarray, sample_rate: int,
-                     language: str, model_size: str) -> str:
+def _transcribe_local(audio: np.ndarray, sample_rate: int = DEVICE_SAMPLE_RATE,
+                      language: str = None, model_size: str = None) -> str:
+    """Compatibility wrapper returning only accepted local text."""
+    result = _transcribe_local_result(
+        audio,
+        sample_rate=sample_rate,
+        language=language,
+        model_size=model_size,
+    )
+    return result.text if result.accepted else ""
+
+
+def _transcribe_with_result(
+    provider: str,
+    audio: np.ndarray,
+    sample_rate: int,
+    language: str,
+    model_size: str,
+) -> TranscriptionResult:
     """Dispatch to a single STT engine. Raises on any failure so the caller
     can decide whether to fall back."""
     if provider == "groq":
         # _transcribe_groq raises if no key is configured.
-        return _transcribe_groq(audio, sample_rate=sample_rate, language=language)
-    return _transcribe_local(audio, sample_rate=sample_rate, language=language,
-                             model_size=model_size)
+        text = _transcribe_groq(
+            audio,
+            sample_rate=sample_rate,
+            language=language,
+        )
+        if not text:
+            return _empty_transcription_result("empty_or_no_speech")
+        return TranscriptionResult(
+            text=text,
+            language=language,
+            language_probability=None,
+            segment_count=1,
+            average_log_probability=None,
+            minimum_average_log_probability=None,
+            maximum_no_speech_probability=None,
+            maximum_compression_ratio=None,
+            classification="accepted_unverified_provider",
+            rejection_reasons=(),
+        )
+    return _transcribe_local_result(
+        audio,
+        sample_rate=sample_rate,
+        language=language,
+        model_size=model_size,
+    )
 
 
-def transcribe(audio: np.ndarray, sample_rate: int = DEVICE_SAMPLE_RATE,
-               language: str = None, model_size: str = None) -> str:
+def _transcribe_result(
+    audio: np.ndarray,
+    sample_rate: int,
+    language: str,
+    model_size: str,
+) -> TranscriptionResult:
+    """Run provider fallback while preserving a structured quality result."""
+    provider = get_setting("stt_provider", "local") or "local"
+    fallback = get_setting("stt_fallback_provider", "local") or "local"
+
+    try:
+        return _transcribe_with_result(
+            provider,
+            audio,
+            sample_rate,
+            language,
+            model_size,
+        )
+    except Exception as exc:
+        if fallback == "none" or fallback == provider:
+            print(
+                f"⚠️  [STT] primary {provider} failed "
+                f"({type(exc).__name__}) — no usable fallback; returning empty."
+            )
+            return _empty_transcription_result("transcription_error")
+        print(
+            f"[STT] primary {provider} failed ({type(exc).__name__}), "
+            f"falling back to {fallback}."
+        )
+        try:
+            return _transcribe_with_result(
+                fallback,
+                audio,
+                sample_rate,
+                language,
+                model_size,
+            )
+        except Exception as fallback_exc:
+            print(
+                f"⚠️  [STT] fallback {fallback} also failed "
+                f"({type(fallback_exc).__name__}); returning empty."
+            )
+            return _empty_transcription_result("transcription_error")
+
+
+def transcribe(
+    audio: np.ndarray,
+    sample_rate: int = DEVICE_SAMPLE_RATE,
+    language: str = None,
+    model_size: str = None,
+    *,
+    return_result: bool = False,
+) -> str | TranscriptionResult:
     """Transcribe audio samples to text.
 
     The active engine is chosen fresh on every call from the ``stt_provider``
@@ -434,23 +698,20 @@ def transcribe(audio: np.ndarray, sample_rate: int = DEVICE_SAMPLE_RATE,
     engine detects French, a post-correction pass fixes common Whisper /ʒ/
     confusions (j'ai vs gai/gay, je vs ge, …). The French corrections are
     specific to faster-whisper-small and are not applied to Groq output.
-    """
-    provider = get_setting("stt_provider", "local") or "local"
-    fallback = get_setting("stt_fallback_provider", "local") or "local"
 
-    try:
-        return _transcribe_with(provider, audio, sample_rate, language, model_size)
-    except Exception as e:
-        if fallback == "none" or fallback == provider:
-            print(f"⚠️  [STT] primary {provider} failed ({e}) — no usable fallback "
-                  f"(stt_fallback_provider={fallback}); returning empty.")
-            return ""
-        print(f"[STT] primary {provider} failed ({e}), falling back to {fallback}.")
-        try:
-            return _transcribe_with(fallback, audio, sample_rate, language, model_size)
-        except Exception as e2:
-            print(f"⚠️  [STT] fallback {fallback} also failed ({e2}); returning empty.")
-            return ""
+    By default this compatibility wrapper returns accepted text or ``""``.
+    ``return_result=True`` exposes the narrow internal quality result used by
+    voice-command callers; it never exposes audio, tokens, or word timestamps.
+    """
+    result = _transcribe_result(
+        audio,
+        sample_rate,
+        language,
+        model_size,
+    )
+    if return_result:
+        return result
+    return result.text if result.accepted else ""
 
 
 def listen(duration: int = RECORD_SECONDS) -> str:
@@ -467,40 +728,73 @@ def listen(duration: int = RECORD_SECONDS) -> str:
 
 # ── PHASE 3: Listening loop with retries ────────────────────────────────────
 
-def listen_for_command(max_retries: int = 3) -> str:
+def listen_for_command(
+    max_retries: int = 3,
+    on_ready: Callable[[], None] | None = None,
+) -> str:
     """Keep recording (via VAD) until a valid command is received.
 
-    Each attempt records until the user stops talking, then transcribes.
-    A valid command is at least 3 words. We retry up to `max_retries` times,
-    then give up and return an empty string.
+    Each attempt records until the user stops talking, then transcribes. Only a
+    quality-accepted result is returned; rejected results stay inside this
+    sequential retry loop. `on_ready` is emitted at most once, immediately
+    before the first retained capture begins.
     """
+    ready_emitted = False
+
+    def emit_ready_once() -> None:
+        nonlocal ready_emitted
+        if ready_emitted:
+            return
+        ready_emitted = True
+        if on_ready is not None:
+            on_ready()
+
     for attempt in range(1, max_retries + 1):
         print(f"👂 Listening... (attempt {attempt}/{max_retries})")
-        audio = record_audio_vad()
+        audio = record_audio_vad(on_ready=emit_ready_once)
 
         if audio.size == 0 or float(np.max(np.abs(audio))) < 0.01:
             print("   ⚠️  Silent chunk, retrying...")
             continue
 
-        text = transcribe(audio, sample_rate=VAD_SAMPLE_RATE)
-        if not text:
-            print("   ⚠️  Nothing transcribed, retrying...")
+        raw_result = transcribe(
+            audio,
+            sample_rate=VAD_SAMPLE_RATE,
+            return_result=True,
+        )
+        if isinstance(raw_result, TranscriptionResult):
+            result = raw_result
+        else:
+            # Keep deterministic callers that inject the historical string
+            # result compatible; production engines return structured results.
+            text = (raw_result or "").strip()
+            legacy_valid = bool(text) and (
+                is_new_chat_command(text) or len(text.split()) >= 3
+            )
+            result = TranscriptionResult(
+                text=text,
+                language=None,
+                language_probability=None,
+                segment_count=1 if text else 0,
+                average_log_probability=None,
+                minimum_average_log_probability=None,
+                maximum_no_speech_probability=None,
+                maximum_compression_ratio=None,
+                classification="accepted_legacy" if legacy_valid else "rejected",
+                rejection_reasons=() if legacy_valid else ("legacy_text_invalid",),
+            )
+
+        if not result.accepted:
+            reasons = ",".join(result.rejection_reasons) or "quality_rejected"
+            print(f"   ⚠️  Transcript rejected ({reasons}); retrying...")
             continue
 
-        # Control commands like "nouveau chat" / "new chat" are short (1-2
-        # words) and would otherwise be dropped by the word-count gate below.
-        # Let them through so the caller can intercept them.
-        if is_new_chat_command(text):
-            print(f"   ✅ New-chat command: '{text}'")
-            return text
-
-        words = text.strip().split()
-        if len(words) < 3:
-            print(f"   ⚠️  Too few words: '{text}' ({len(words)} word(s)), retrying...")
-            continue
-
-        print(f"   ✅ Valid command: '{text}'")
-        return text
+        print(
+            "   ✅ Transcript accepted "
+            f"(language={result.language or 'unknown'}, "
+            f"segments={result.segment_count})."
+        )
+        return result.text
 
     print("   ❌ Max retries reached, no valid command.")
     return ""
@@ -510,6 +804,6 @@ if __name__ == "__main__":
     print("Testing listen_for_command with VAD (max 3 retries)...")
     result = listen_for_command(max_retries=3)
     if result:
-        print(f"Command received: {result}")
+        print(f"Command received ({len(result)} chars).")
     else:
         print("No command received.")

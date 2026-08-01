@@ -221,8 +221,13 @@ class WakeAcceptanceGate:
         self._is_tts_active = is_tts_active or (lambda: False)
         self._reservation_lock = threading.Lock()
         self._pending_generation = None
+        self._active = False
+        self._closed = False
 
     def reserve(self, generation: int) -> bool:
+        with self._reservation_lock:
+            if self._closed:
+                return False
         if self._is_busy() or self._is_tts_active():
             return False
         if not self.handler_lock.acquire(blocking=False):
@@ -232,7 +237,7 @@ class WakeAcceptanceGate:
             if self._is_busy() or self._is_tts_active():
                 return False
             with self._reservation_lock:
-                if self._pending_generation is not None:
+                if self._closed or self._pending_generation is not None:
                     return False
                 self._pending_generation = generation
                 keep = True
@@ -246,7 +251,10 @@ class WakeAcceptanceGate:
             if self._pending_generation != generation:
                 return False
             self._pending_generation = None
-        if not is_current:
+            accepted = is_current and not self._closed
+            if accepted:
+                self._active = True
+        if not accepted:
             self.handler_lock.release()
             return False
         return True
@@ -261,7 +269,92 @@ class WakeAcceptanceGate:
             self.handler_lock.release()
 
     def finish(self) -> None:
+        with self._reservation_lock:
+            if not self._active:
+                return
+            self._active = False
         self.handler_lock.release()
+
+    def close(self) -> None:
+        """Permanently close acceptance and release any pending/active owner."""
+
+        release = False
+        with self._reservation_lock:
+            self._closed = True
+            if self._pending_generation is not None:
+                self._pending_generation = None
+                release = True
+            elif self._active:
+                self._active = False
+                release = True
+        if release:
+            self.handler_lock.release()
+
+
+class VoiceSessionLifecycle:
+    """Keep visible voice state and gate release owned by one session."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._current_session = None
+        self._closed = False
+
+    def begin(self, session_id) -> bool:
+        """Make ``session_id`` authoritative, obsoleting any older finalizer."""
+
+        with self._lock:
+            if self._closed:
+                return False
+            self._current_session = session_id
+            return True
+
+    def emit_if_current(self, session_id, emit_state) -> bool:
+        """Run a state emission only while ``session_id`` still owns the UI."""
+
+        with self._lock:
+            if self._closed or self._current_session is not session_id:
+                return False
+            emit_state()
+            return True
+
+    def emit_when_inactive(self, emit_state) -> bool:
+        """Let non-voice state updates through only when voice owns no UI."""
+
+        with self._lock:
+            if self._closed or self._current_session is not None:
+                return False
+            emit_state()
+            return True
+
+    def finalize(
+        self,
+        session_id,
+        *,
+        wait_for_playback,
+        release_gate,
+        emit_final_state,
+    ) -> bool:
+        """Finalize only after playback and only for the authoritative session."""
+
+        with self._lock:
+            if self._closed or self._current_session is not session_id:
+                return False
+        if wait_for_playback() is False:
+            return False
+        with self._lock:
+            if self._closed or self._current_session is not session_id:
+                return False
+            self._current_session = None
+            release_gate()
+            emit_final_state()
+            return True
+
+    def close(self) -> None:
+        """Suppress every later state emission or gate release from a session."""
+
+        with self._lock:
+            self._closed = True
+            self._current_session = None
 
 
 class WakeWordDetector:
@@ -540,7 +633,7 @@ class WakeWordDetector:
             except Exception as exc:
                 if self._acceptance_cancel is not None:
                     self._acceptance_cancel(generation)
-                print(f"Wake word callback error: {exc}")
+                print(f"Wake word callback error ({type(exc).__name__})")
 
     def _listen_loop(self):
         """Run isolated microphone generations until stopped."""
@@ -619,7 +712,7 @@ class WakeWordDetector:
                         self._reset_components(preprocessor, vad)
                     except Exception:
                         pass
-                    print(f"Wake word error: {exc}")
+                    print(f"Wake word error ({type(exc).__name__})")
                     time.sleep(0.1)
         finally:
             try:
@@ -711,7 +804,7 @@ class WakeWordDetector:
 def default_callback():
     """Default callback when wake word is detected.
     PHASE 3: Uses listen_for_command() with retry loop — only proceeds
-    to agent after a valid command (3+ words) is received.
+    to agent after a quality-accepted command is received.
     """
     from osia.voice.stt import listen_for_command
     from osia.agent import run_agent, clean_response
@@ -726,7 +819,7 @@ def default_callback():
         speak("Je n'ai pas compris, répétez.")
         return
 
-    print(f"📝 You said: {user_text}")
+    print(f"[STT] accepted voice input ({len(user_text)} chars).")
 
     # Only now — after a valid command — think and call agent
     print("🤔 Thinking...")
@@ -736,7 +829,7 @@ def default_callback():
     # PHASE 4: Clean response before speaking
     response = clean_response(response)
 
-    print(f"💬 OSIA: {response}")
+    print(f"[voice] assistant response accepted ({len(response)} chars).")
 
     # Speak response
     speak(response, language=turn_context.language)
