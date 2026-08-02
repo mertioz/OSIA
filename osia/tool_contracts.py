@@ -734,7 +734,6 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
             N,
             CR,
             preconditions=("exact_authorized_desktop_destination",),
-            timeout=35.0,
             progress=effect,
             deterministic=EvidenceClassification.PROVED,
             integration=EvidenceClassification.PROVED,

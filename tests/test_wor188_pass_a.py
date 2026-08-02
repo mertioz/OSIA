@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import json
 from pathlib import Path
 import secrets
@@ -70,7 +71,7 @@ def test_render_pdf_contract_is_static_bounded_and_authoritative():
     assert spec.chat_eligible is True
     assert spec.autonomous_eligible is True
     assert spec.scheduled_eligible is False
-    assert spec.timeout_seconds == 35.0
+    assert spec.timeout_seconds == agent_module.TOOL_TIMEOUT_SECONDS == 30.0
     assert agent_module.TOOL_MAP["render_pdf"] is agent_module.tool_render_pdf
     without_optional_level = json.loads(json.dumps(VALID_PDF_ARGUMENTS))
     without_optional_level["blocks"][0].pop("level")
@@ -190,6 +191,90 @@ def test_worker_removes_partial_output_after_renderer_failure(tmp_path, monkeypa
         for child in job.iterdir():
             child.unlink()
         job.rmdir()
+
+
+def test_render_pdf_timeout_contract_is_effective_and_never_retried(monkeypatch):
+    observed_timeouts = []
+    dispatches = []
+
+    class TimedOutFuture:
+        def result(self, *, timeout):
+            observed_timeouts.append(timeout)
+            raise FutureTimeoutError()
+
+    class TimedOutExecutor:
+        def submit(self, *args, **kwargs):
+            dispatches.append((args, kwargs))
+            return TimedOutFuture()
+
+    monkeypatch.setattr(agent_module, "_TOOL_EXECUTOR", TimedOutExecutor())
+    record = agent_module._execute_tool_with_policy(
+        "render_pdf", VALID_PDF_ARGUMENTS, allow_retry=True, lang="en",
+    )
+
+    spec = get_tool_spec("render_pdf")
+    assert observed_timeouts == [spec.timeout_seconds]
+    assert spec.timeout_seconds == agent_module._tool_timeout_seconds(
+        "render_pdf", VALID_PDF_ARGUMENTS,
+    ) == 30.0
+    assert len(dispatches) == 1
+    assert record.outcome == ExecutionOutcome.OUTCOME_UNKNOWN
+    assert record.attempts == 1
+    assert record.dispatched is True
+    assert record.timed_out is True
+    assert record.result == (
+        "ERROR: tool execution timed out; outcome uncertain. "
+        "The tool may still complete and will not be retried."
+    )
+
+
+def test_render_pdf_worker_timeout_cleans_private_job_and_partial_output(
+    tmp_path, monkeypatch,
+):
+    destination = tmp_path / "Desktop"
+    destination.mkdir()
+
+    class TimedOutWorker:
+        pid = -1
+        stopped = False
+
+        def poll(self):
+            return 0 if self.stopped else None
+
+    worker = TimedOutWorker()
+    stopped = []
+
+    def fake_popen(command, **_kwargs):
+        request = json.loads(
+            (Path(command[-1]) / "request.json").read_text(encoding="utf-8")
+        )
+        partial = Path(request["destination_path"]) / request["temporary_name"]
+        partial.write_bytes(b"%PDF-private-partial")
+        return worker
+
+    def stop_worker(process):
+        stopped.append(process)
+        process.stopped = True
+        return True
+
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(pdf_renderer.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(pdf_renderer, "_stop_worker", stop_worker)
+    monkeypatch.setattr(pdf_renderer, "MAX_RENDER_SECONDS", 0.0)
+    monkeypatch.setattr(
+        pdf_renderer, "resolve_destination", lambda _label: ("Desktop", destination),
+    )
+
+    result = pdf_renderer.render_pdf(**VALID_PDF_ARGUMENTS)
+
+    assert result == (
+        'ERROR: {"reason_code":"execution_time_limit","status":"failure"}'
+    )
+    assert stopped == [worker]
+    assert not (destination / VALID_PDF_ARGUMENTS["filename"]).exists()
+    assert list(destination.glob("*.tmp")) == []
+    assert list(tmp_path.glob("osia-pdf-job-*")) == []
+    assert "Verified local PDF" not in result
 
 
 def test_reportlab_package_gate_and_offline_metadata_are_present():
