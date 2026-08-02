@@ -1163,6 +1163,7 @@ class PermissionStore:
         updates: Mapping[str, bool],
         *,
         force_ask: bool = False,
+        expected_policy_epoch: int | None = None,
     ) -> PermissionState:
         """Persist category switches and invalidate every loaded permit."""
 
@@ -1177,6 +1178,11 @@ class PermissionStore:
             raise PersistentPermissionUnavailable("secure_storage_required")
         with self._lock, self._cross_process_mutation_lock():
             state = self.load_state()
+            if (
+                expected_policy_epoch is not None
+                and state.policy_epoch != expected_policy_epoch
+            ):
+                raise PermissionStoreError("stale_policy_epoch")
             if self._corrupt:
                 raise PermissionStoreCorrupt("corrupt_store_requires_explicit_reset")
             settings = _full_access_settings_for_update(state)
@@ -1217,13 +1223,16 @@ class PermissionStore:
         self._notify_epoch(epoch)
         return new_state
 
-    def apply_default_access(self) -> PermissionState:
+    def apply_default_access(
+        self, *, expected_policy_epoch: int | None = None,
+    ) -> PermissionState:
         return self.update_automatic_permissions(
             {
                 category: False
                 for category in AUTOMATIC_PERMISSION_CATEGORIES
             },
             force_ask=True,
+            expected_policy_epoch=expected_policy_epoch,
         )
 
     def update_full_access_constraints(
@@ -1877,9 +1886,16 @@ class PermissionStore:
         self._notify_epoch(epoch)
         return RevocationResult(True, epoch, "one_grant", grant_ref)
 
-    def revoke_all_grants(self) -> RevocationResult:
+    def revoke_all_grants(
+        self, *, expected_policy_epoch: int | None = None,
+    ) -> RevocationResult:
         with self._lock, self._cross_process_mutation_lock():
             state = self.load_state()
+            if (
+                expected_policy_epoch is not None
+                and state.policy_epoch != expected_policy_epoch
+            ):
+                raise PermissionStoreError("stale_policy_epoch")
             changed = bool(state.grants or self._session_grants)
             if not changed:
                 return RevocationResult(False, state.policy_epoch, "all_grants")

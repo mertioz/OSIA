@@ -7,7 +7,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
-from PyQt6.QtCore import QEvent, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -28,18 +28,12 @@ from PyQt6.QtWidgets import (
 
 from osia import action_policy, i18n
 from osia.local_reauth import issue_full_access_activation_proof
+from osia.permission_contract import PERMISSION_CATEGORY_CONTRACT
 
 
 _SWITCH_KEYS = {
-    "files_modify": "permissions.switch.files_modify",
-    "files_delete": "permissions.switch.files_delete",
-    "commands": "permissions.switch.commands",
-    "browser_account": "permissions.switch.browser_account",
-    "connectors": "permissions.switch.connectors",
-    "send_publish_submit": "permissions.switch.send_publish_submit",
-    "purchases_payments": "permissions.switch.purchases_payments",
-    "autonomous_actions": "permissions.switch.autonomous_actions",
-    "scheduled_actions": "permissions.switch.scheduled_actions",
+    item.identifier: item.description_key
+    for item in PERMISSION_CATEGORY_CONTRACT
 }
 
 _TEMPORARY_ACTION_KEYS = {
@@ -215,6 +209,24 @@ class PermissionsPage(QWidget):
         self.destroyed.connect(lambda: i18n.remove_listener(self.retranslate))
         self.retranslate()
         self.refresh()
+        self._canonical_refresh_timer = QTimer(self)
+        self._canonical_refresh_timer.setInterval(500)
+        self._canonical_refresh_timer.timeout.connect(
+            self._poll_external_epoch
+        )
+        self._canonical_refresh_timer.start()
+
+    def _poll_external_epoch(self) -> None:
+        if self.isVisible():
+            self._refresh_external_epoch()
+
+    def _refresh_external_epoch(self) -> None:
+        try:
+            epoch = self.policy.store.load_state().policy_epoch
+        except Exception:
+            return
+        if epoch != self._snapshot.get("policy_epoch"):
+            self.refresh(emit=True)
 
     def _build_presets(self) -> QHBoxLayout:
         row = QHBoxLayout()

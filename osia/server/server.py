@@ -719,10 +719,21 @@ _PERMISSION_REVOCATION_OPERATIONS = {
     "revoke_all_delegated_authority",
     "disable_full_access",
 }
+_PERMISSION_CHANGE_OPERATIONS = {
+    "set_category",
+    "apply_default_access",
+    "request_full_access",
+    "revoke_all_temporary_permissions",
+}
 _PERMISSION_REQUEST_FIELDS = {
     "type", "schema_version", "request_id", "device_id", "session_id",
     "expected_policy_epoch", "expected_snapshot_sequence", "operation",
     "target_id", "expires_at",
+}
+_PERMISSION_CHANGE_FIELDS = {
+    "schema_version", "contract_schema_version", "request_id", "session_id",
+    "expected_policy_epoch", "expected_snapshot_sequence", "operation",
+    "category_id", "enabled", "expires_at",
 }
 
 
@@ -1075,6 +1086,140 @@ class _PermissionMobileSession:
         )
         await self.send_snapshot((request_id,))
         return ack
+
+    async def handle_change_request(self, message) -> None:
+        """Apply one snapshot-bound Mobile request without optimistic grants."""
+
+        async def reject() -> None:
+            if self.device_id:
+                await self.send_snapshot()
+
+        if not isinstance(message, dict) or set(message) != _PERMISSION_CHANGE_FIELDS:
+            await reject()
+            return
+        if (
+            message.get("schema_version") != 1
+            or message.get("contract_schema_version") != 1
+        ):
+            await reject()
+            return
+        request_id = _permission_safe_id(message.get("request_id"))
+        operation = str(message.get("operation") or "")
+        category_id = str(message.get("category_id") or "")
+        enabled = message.get("enabled")
+        base_epoch = message.get("expected_policy_epoch")
+        base_sequence = message.get("expected_snapshot_sequence")
+        expires_at = message.get("expires_at")
+        if (
+            not request_id
+            or not self.device_id
+            or message.get("session_id") != self.session_id
+            or operation not in _PERMISSION_CHANGE_OPERATIONS
+            or type(base_epoch) is not int
+            or type(base_sequence) is not int
+            or isinstance(expires_at, bool)
+            or not isinstance(expires_at, (int, float))
+            or not math.isfinite(float(expires_at))
+            or float(expires_at) <= time.time()
+            or float(expires_at) > time.time() + 120.0
+            or base_sequence != self.sequence
+        ):
+            await reject()
+            return
+        state = self.store.load_state()
+        if base_epoch != state.policy_epoch:
+            await reject()
+            return
+
+        from osia.action_policy import AUTOMATIC_PERMISSION_CATEGORIES
+
+        category_request = operation == "set_category"
+        if (
+            category_request
+            and (
+                category_id not in AUTOMATIC_PERMISSION_CATEGORIES
+                or not isinstance(enabled, bool)
+            )
+        ) or (
+            not category_request and (category_id or enabled is not False)
+        ):
+            await reject()
+            return
+
+        _purge_permission_requests(time.time())
+        with _PERMISSION_REQUESTS_LOCK:
+            duplicate = _PERMISSION_REQUESTS.get(request_id)
+        if duplicate is not None:
+            await reject()
+            return
+
+        record = {
+            "device_id": self.device_id,
+            "operation": operation,
+            "target_id": category_id,
+            "enabled": enabled,
+            "status": "pending",
+            "reason": "pending",
+            "policy_epoch": state.policy_epoch,
+            "retain_until": time.time() + _PERMISSION_REQUEST_RETENTION_SECONDS,
+        }
+        with _PERMISSION_REQUESTS_LOCK:
+            _PERMISSION_REQUESTS[request_id] = record
+            _PERMISSION_REQUESTS.move_to_end(request_id)
+
+        if operation == "request_full_access":
+            record["reason"] = "pc_confirmation_required"
+            await self.send_snapshot()
+            return
+
+        try:
+            self._suppress_epoch_snapshot = True
+            if operation == "set_category":
+                result = self.store.update_automatic_permissions(
+                    {category_id: enabled},
+                    expected_policy_epoch=base_epoch,
+                )
+                result_epoch = result.policy_epoch
+            elif operation == "apply_default_access":
+                result = self.store.apply_default_access(
+                    expected_policy_epoch=base_epoch,
+                )
+                result_epoch = result.policy_epoch
+            else:
+                result = self.store.revoke_all_grants(
+                    expected_policy_epoch=base_epoch,
+                )
+                result_epoch = result.policy_epoch
+        except Exception as exc:
+            from osia.permission_store import (
+                PermissionStoreCorrupt,
+                PermissionStoreError,
+                PersistentPermissionUnavailable,
+            )
+
+            if isinstance(exc, (PersistentPermissionUnavailable, PermissionStoreCorrupt)):
+                reason = "changes_unavailable"
+            elif isinstance(exc, PermissionStoreError):
+                reason = exc.code
+            else:
+                reason = "internal_failure"
+            record.update({
+                "status": "rejected",
+                "reason": reason,
+                "policy_epoch": self.store.load_state().policy_epoch,
+            })
+            await reject()
+            return
+        finally:
+            self._suppress_epoch_snapshot = False
+
+        changed = result_epoch != base_epoch
+        record.update({
+            "status": "applied" if changed else "idempotent",
+            "reason": "applied" if changed else "already_applied",
+            "policy_epoch": result_epoch,
+        })
+        await self.send_snapshot()
 
 _CRON_NOTIFICATION_MAX = 30
 _CRON_NOTIFICATIONS: "deque[dict]" = deque(maxlen=_CRON_NOTIFICATION_MAX)
@@ -2548,7 +2693,9 @@ def _build_config_snapshot() -> dict:
     callers handle (``get_config`` already wraps it)."""
     from osia.config import load_settings, load_api_keys, get_setting
     from osia import personality
+    from osia.permission_contract import mobile_permission_contract
     cfg = load_settings()
+    cfg["permission_contract"] = mobile_permission_contract()
     try:
         from osia import scheduled_tasks
 
@@ -2651,6 +2798,21 @@ async def _broadcast_personality_config() -> None:
         print("[OSIA Server] personality config broadcast failed (details withheld)")
 
 
+async def _broadcast_permission_snapshots() -> int:
+    """Push fresh PC-canonical state to every bound Mobile session."""
+
+    sent = 0
+    for session in list(_PERMISSION_SESSIONS):
+        if not session.active or not session.device_id:
+            continue
+        try:
+            if await session.send_snapshot() is not None:
+                sent += 1
+        except Exception:
+            continue
+    return sent
+
+
 def _memory_store() -> MemoryStore:
     return MemoryStore()
 
@@ -2749,6 +2911,17 @@ async def internal_chatgpt_account_changed(request: Request):
         refresh_account=True, include_account_state=True
     )
     return {"ok": True, "clients": len(_WS_CLIENTS)}
+
+
+@app.post("/internal/permission_changed")
+async def internal_permission_changed(request: Request):
+    """Loopback-only invalidation after a canonical PC permission change."""
+
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    sent = await _broadcast_permission_snapshots()
+    return {"ok": True, "sessions": sent}
 
 
 @app.post("/internal/new_chat")
@@ -7594,6 +7767,9 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "set_setting":
                 setting_key = (msg.get("key") or "").strip()
                 setting_value = msg.get("value")
+                if setting_key == "permission_change_request":
+                    await permission_session.handle_change_request(setting_value)
+                    continue
                 # Whitelist: only these settings.json keys are writable from the
                 # mobile app. Anything else is rejected so a client can't poke
                 # arbitrary server state.

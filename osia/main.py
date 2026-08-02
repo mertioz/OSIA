@@ -95,6 +95,9 @@ _SERVER_MOBILE_CATALOGUE_URL = (
 _SERVER_CHATGPT_ACCOUNT_URL = (
     "http://127.0.0.1:8765/internal/chatgpt_account_changed"
 )
+_SERVER_PERMISSION_CHANGED_URL = (
+    "http://127.0.0.1:8765/internal/permission_changed"
+)
 LIVEAPI_AVAILABLE = False
 # Desktop→server MCP state mirror (Phase 1, direction A). The desktop pings this
 # after a local MCP connect/disconnect so the mobile server reconciles its OWN
@@ -198,6 +201,12 @@ def _notify_mobile_state_changed(url: str, label: str) -> None:
         name=f"osia-mobile-{label}-notify",
         daemon=True,
     ).start()
+
+
+def _notify_mobile_permission_changed(_epoch: int) -> None:
+    _notify_mobile_state_changed(
+        _SERVER_PERMISSION_CHANGED_URL, "permission-changed",
+    )
 
 
 def _notify_mobile_conversation_changed(
@@ -1134,6 +1143,18 @@ def wake_mode():
 
     island = DynamicIsland()
     popup = MainPopup()
+    try:
+        from osia.action_policy import get_default_permission_policy
+
+        permission_store = get_default_permission_policy().store
+        permission_store.add_epoch_listener(_notify_mobile_permission_changed)
+        app.aboutToQuit.connect(
+            lambda: permission_store.remove_epoch_listener(
+                _notify_mobile_permission_changed
+            )
+        )
+    except Exception:
+        pass
     perf_mark("wake_mode: GUI constructed (island + popup)")
 
     # Release-only legal gate. The bundled documents are currently review
