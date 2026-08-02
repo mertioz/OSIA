@@ -19,6 +19,15 @@
 #ifndef SignedBuild
   #error SignedBuild must be supplied by build_windows.py
 #endif
+#ifndef MajorUpdate
+  #error MajorUpdate must be supplied by build_windows.py
+#endif
+#ifndef ReleaseNotesEn
+  #error ReleaseNotesEn must be supplied by build_windows.py
+#endif
+#ifndef ReleaseNotesFr
+  #error ReleaseNotesFr must be supplied by build_windows.py
+#endif
 #ifndef RepoRoot
   #define RepoRoot "..\.."
 #endif
@@ -101,6 +110,8 @@ english.VersionArchitecture=Version %s  ·  Windows
 english.PreviewState=Internal preview  ·  Not signed
 english.StableState=Stable release
 english.UpdateState=In-place update  ·  Your data stays in your profile
+english.MajorUpdateBadge=MAJOR UPDATE
+english.MajorUpdateNotes=Complete release notes
 english.UpdateHeading=Update OSIA
 english.UpdateDescription=A secure update, without reconfiguring OSIA.
 english.UpdateVersions=OSIA %s → OSIA %s
@@ -169,6 +180,8 @@ french.VersionArchitecture=Version %s  ·  Windows
 french.PreviewState=Aperçu interne  ·  Non signé
 french.StableState=Version stable
 french.UpdateState=Mise à jour sur place  ·  Vos données restent dans votre profil
+french.MajorUpdateBadge=MISE À JOUR MAJEURE
+french.MajorUpdateNotes=Notes de version complètes
 french.UpdateHeading=Mise à jour d’OSIA
 french.UpdateDescription=Une mise à jour sûre, sans reconfigurer OSIA.
 french.UpdateVersions=OSIA %s → OSIA %s
@@ -226,6 +239,9 @@ Name: "firewall"; Description: "{cm:FirewallTask}"; GroupDescription: "{cm:Mobil
 [Files]
 Source: "{#RepoRoot}\dist\OSIA\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#RepoRoot}\windows\configure_lan_firewall.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "{#ReleaseNotesEn}"; DestName: "release-notes-en.txt"; Flags: dontcopy
+Source: "{#ReleaseNotesFr}"; DestName: "release-notes-fr.txt"; Flags: dontcopy
+Source: "{#BuildRoot}\generated\major-update-band.png"; DestName: "major-update-band.png"; Flags: dontcopy
 
 [InstallDelete]
 Type: filesandordirs; Name: "{app}\_internal"; Check: IsUpdateMode
@@ -261,6 +277,14 @@ const
   OSIA_SUCCESS_TEXT = $00C8E6B2;
   OSIA_ERROR_TEXT = $00B5B4F4;
   OSIA_WARNING_TEXT = $0089C9F2;
+  OSIA_MAJOR_PURPLE = $00FF5C8B;
+  OSIA_MAJOR_CYAN = $00FFD834;
+
+function SetTimer(hWnd, nIDEvent, uElapse, lpTimerFunc: LongWord): LongWord;
+external 'SetTimer@user32.dll stdcall';
+
+function KillTimer(hWnd, nIDEvent: LongWord): Boolean;
+external 'KillTimer@user32.dll stdcall';
 
 var
   StageLabel: TNewStaticText;
@@ -271,6 +295,10 @@ var
   WelcomeMetaLabel: TNewStaticText;
   WelcomePreviewLabel: TNewStaticText;
   UpdatePage: TWizardPage;
+  UpdateMajorBand: TBitmapImage;
+  UpdateMajorBadge: TNewStaticText;
+  UpdateNotesTitle: TNewStaticText;
+  UpdateNotesMemo: TNewMemo;
   UpdateLogo: TBitmapImage;
   UpdateVersionsLabel: TNewStaticText;
   UpdatePreservedLabel: TNewStaticText;
@@ -296,6 +324,8 @@ var
   UpdateBackupFailure: String;
   FreshInstallOnboardingEligible: Boolean;
   OsiaProfileDirectory: String;
+  MajorAnimationTimer: LongWord;
+  MajorAnimationStep: Integer;
 
 function HasExactUpdateSwitch: Boolean;
 var
@@ -448,6 +478,64 @@ begin
   Control.MinItemHeight := ScaleY(24);
 end;
 
+function BlendColor(FirstColor, SecondColor: TColor;
+  Position: Integer): TColor;
+var
+  FirstValue, SecondValue: LongWord;
+  RedValue, GreenValue, BlueValue: Integer;
+begin
+  if Position < 0 then
+    Position := 0
+  else if Position > 100 then
+    Position := 100;
+  FirstValue := LongWord(FirstColor);
+  SecondValue := LongWord(SecondColor);
+  RedValue := (((FirstValue and $FF) * (100 - Position)) +
+    ((SecondValue and $FF) * Position)) div 100;
+  GreenValue := ((((FirstValue shr 8) and $FF) * (100 - Position)) +
+    (((SecondValue shr 8) and $FF) * Position)) div 100;
+  BlueValue := ((((FirstValue shr 16) and $FF) * (100 - Position)) +
+    (((SecondValue shr 16) and $FF) * Position)) div 100;
+  Result := TColor(RedValue or (GreenValue shl 8) or (BlueValue shl 16));
+end;
+
+function ReducedAnimationsRequested: Boolean;
+var
+  MinAnimate: String;
+begin
+  Result := RegQueryStringValue(HKCU,
+    'Control Panel\Desktop\WindowMetrics', 'MinAnimate', MinAnimate) and
+    (Trim(MinAnimate) = '0');
+end;
+
+procedure AnimateMajorUpdate(Sender: TObject);
+var
+  Position: Integer;
+  AccentColor: TColor;
+begin
+  if MajorAnimationStep <= 100 then
+    Position := MajorAnimationStep
+  else
+    Position := 200 - MajorAnimationStep;
+  AccentColor := BlendColor(TColor(OSIA_MAJOR_PURPLE),
+    TColor(OSIA_MAJOR_CYAN), Position);
+  if Assigned(UpdateMajorBadge) then
+    UpdateMajorBadge.Font.Color := AccentColor;
+  if Assigned(HeaderStepLabel) then
+    HeaderStepLabel.Font.Color := AccentColor;
+  if Assigned(StageLabel) and IsUpdateMode then
+    StageLabel.Font.Color := AccentColor;
+  if Assigned(FinishedStateLabel) and IsUpdateMode then
+    FinishedStateLabel.Font.Color := AccentColor;
+  MajorAnimationStep := (MajorAnimationStep + 1) mod 201;
+end;
+
+procedure MajorAnimationTimerProc(
+  Arg1, Arg2, Arg3, Arg4: LongWord);
+begin
+  AnimateMajorUpdate(nil);
+end;
+
 procedure InitializeWizard;
 var
   ContentLeft: Integer;
@@ -509,10 +597,40 @@ begin
     UpdatePage := CreateCustomPage(wpWelcome, CustomMessage('UpdateHeading'),
       CustomMessage('UpdateDescription'));
     StylePage(UpdatePage.Surface);
+    if {#MajorUpdate} = 1 then
+    begin
+      ExtractTemporaryFile('major-update-band.png');
+      ExtractTemporaryFile('release-notes-en.txt');
+      ExtractTemporaryFile('release-notes-fr.txt');
+      UpdateMajorBand := TBitmapImage.Create(WizardForm);
+      UpdateMajorBand.Parent := UpdatePage.Surface;
+      UpdateMajorBand.SetBounds(ContentLeft, ScaleY(8),
+        ContentWidth, ScaleY(70));
+      UpdateMajorBand.BackColor := TColor(OSIA_MAIN_BACKGROUND);
+      UpdateMajorBand.PngImage.LoadFromFile(
+        ExpandConstant('{tmp}\major-update-band.png'));
+      UpdateMajorBand.Stretch := True;
+
+      UpdateMajorBadge := TNewStaticText.Create(WizardForm);
+      UpdateMajorBadge.Parent := UpdatePage.Surface;
+      UpdateMajorBadge.AutoSize := False;
+      UpdateMajorBadge.SetBounds(ContentLeft + ScaleX(64), ScaleY(30),
+        ContentWidth - ScaleX(128), ScaleY(24));
+      UpdateMajorBadge.Caption := CustomMessage('MajorUpdateBadge');
+      UpdateMajorBadge.Alignment := taCenter;
+      StyleLabel(UpdateMajorBadge, TColor(OSIA_MAJOR_PURPLE),
+        TColor(OSIA_MAIN_BACKGROUND));
+      UpdateMajorBadge.Font.Size := 10;
+      UpdateMajorBadge.Font.Style := [fsBold];
+    end;
     UpdateLogo := TBitmapImage.Create(WizardForm);
     UpdateLogo.Parent := UpdatePage.Surface;
-    UpdateLogo.SetBounds((UpdatePage.Surface.ClientWidth - ScaleX(82)) div 2,
-      ScaleY(24), ScaleX(82), ScaleY(82));
+    if {#MajorUpdate} = 1 then
+      UpdateLogo.SetBounds(ContentLeft + ScaleX(12), ScaleY(18),
+        ScaleX(48), ScaleY(48))
+    else
+      UpdateLogo.SetBounds((UpdatePage.Surface.ClientWidth - ScaleX(82)) div 2,
+        ScaleY(24), ScaleX(82), ScaleY(82));
     UpdateLogo.BackColor := TColor(OSIA_MAIN_BACKGROUND);
     UpdateLogo.PngImage.Assign(WizardForm.WizardSmallBitmapImage.PngImage);
     UpdateLogo.Center := True;
@@ -521,8 +639,12 @@ begin
     UpdateVersionsLabel := TNewStaticText.Create(WizardForm);
     UpdateVersionsLabel.Parent := UpdatePage.Surface;
     UpdateVersionsLabel.AutoSize := False;
-    UpdateVersionsLabel.SetBounds(ContentLeft, ScaleY(126),
-      ContentWidth, ScaleY(34));
+    if {#MajorUpdate} = 1 then
+      UpdateVersionsLabel.SetBounds(ContentLeft, ScaleY(88),
+        ContentWidth, ScaleY(30))
+    else
+      UpdateVersionsLabel.SetBounds(ContentLeft, ScaleY(126),
+        ContentWidth, ScaleY(34));
     UpdateVersionsLabel.Caption := Format(CustomMessage('UpdateVersions'), [
       ExistingVersionText, ProductVersionText]);
     UpdateVersionsLabel.WordWrap := False;
@@ -535,8 +657,12 @@ begin
     UpdatePreservedLabel := TNewStaticText.Create(WizardForm);
     UpdatePreservedLabel.Parent := UpdatePage.Surface;
     UpdatePreservedLabel.AutoSize := False;
-    UpdatePreservedLabel.SetBounds(ContentLeft + ScaleX(18), ScaleY(171),
-      ContentWidth - ScaleX(36), ScaleY(48));
+    if {#MajorUpdate} = 1 then
+      UpdatePreservedLabel.SetBounds(ContentLeft + ScaleX(18), ScaleY(122),
+        ContentWidth - ScaleX(36), ScaleY(40))
+    else
+      UpdatePreservedLabel.SetBounds(ContentLeft + ScaleX(18), ScaleY(171),
+        ContentWidth - ScaleX(36), ScaleY(48));
     UpdatePreservedLabel.Caption := CustomMessage('UpdatePreserved');
     UpdatePreservedLabel.WordWrap := True;
     UpdatePreservedLabel.Alignment := taCenter;
@@ -555,6 +681,34 @@ begin
       TColor(OSIA_MAIN_BACKGROUND));
     UpdateUnsignedLabel.Alignment := taCenter;
     UpdateUnsignedLabel.Font.Style := [fsBold];
+
+    if {#MajorUpdate} = 1 then
+    begin
+      UpdateNotesTitle := TNewStaticText.Create(WizardForm);
+      UpdateNotesTitle.Parent := UpdatePage.Surface;
+      UpdateNotesTitle.AutoSize := False;
+      UpdateNotesTitle.SetBounds(ContentLeft, ScaleY(170),
+        ContentWidth, ScaleY(20));
+      UpdateNotesTitle.Caption := CustomMessage('MajorUpdateNotes');
+      StyleLabel(UpdateNotesTitle, TColor(OSIA_MAJOR_CYAN),
+        TColor(OSIA_MAIN_BACKGROUND));
+      UpdateNotesTitle.Font.Style := [fsBold];
+
+      UpdateNotesMemo := TNewMemo.Create(WizardForm);
+      UpdateNotesMemo.Parent := UpdatePage.Surface;
+      UpdateNotesMemo.SetBounds(ContentLeft, ScaleY(194), ContentWidth,
+        UpdatePage.Surface.ClientHeight - ScaleY(202));
+      UpdateNotesMemo.ReadOnly := True;
+      UpdateNotesMemo.ScrollBars := ssVertical;
+      UpdateNotesMemo.WordWrap := True;
+      StyleDarkMemo(UpdateNotesMemo);
+      if CompareText(ActiveLanguage, 'french') = 0 then
+        UpdateNotesMemo.Lines.LoadFromFile(
+          ExpandConstant('{tmp}\release-notes-fr.txt'))
+      else
+        UpdateNotesMemo.Lines.LoadFromFile(
+          ExpandConstant('{tmp}\release-notes-en.txt'));
+    end;
   end;
 
   WelcomeLogo := TBitmapImage.Create(WizardForm);
@@ -727,6 +881,14 @@ begin
     HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'OSIA', PreviousRunValue);
   IntegrationSuppressed :=
     CompareText(ExpandConstant('{param:NOINTEGRATION|0}'), '1') = 0;
+  if IsUpdateMode and ({#MajorUpdate} = 1) then
+  begin
+    MajorAnimationStep := 36;
+    AnimateMajorUpdate(nil);
+    if not ReducedAnimationsRequested then
+      MajorAnimationTimer := SetTimer(
+        0, 0, 80, CreateCallback(@MajorAnimationTimerProc));
+  end;
 end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
@@ -920,7 +1082,10 @@ begin
     WizardForm.FinishedLabel.Caption :=
       Format(CustomMessage('UpdateFinishedVersion'), [ProductVersionText]) + #13#10 +
       CustomMessage('UpdateFinishedPreserved');
-    FinishedStateLabel.Caption := CustomMessage('UpdatePhaseRelaunch');
+    if {#MajorUpdate} = 1 then
+      FinishedStateLabel.Caption := CustomMessage('MajorUpdateBadge')
+    else
+      FinishedStateLabel.Caption := CustomMessage('UpdatePhaseRelaunch');
     WizardForm.RunList.Visible := False;
   end
   else if CurPageID = wpSelectDir then
@@ -1091,6 +1256,11 @@ var
   AppExe: String;
   FirewallScript: String;
 begin
+  if MajorAnimationTimer <> 0 then
+  begin
+    KillTimer(0, MajorAnimationTimer);
+    MajorAnimationTimer := 0;
+  end;
   if InstallSucceeded then
     exit;
   { InitializeSetup can reject a requested update before the app path exists. No

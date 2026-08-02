@@ -22,7 +22,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from osia.version import PRODUCT_VERSION, parse_product_version
-from osia.release_notes import manifest_release_notes
+from osia.release_notes import (
+    installer_release_notes,
+    is_major_update,
+    manifest_release_notes,
+)
 from osia.windows_release_policy import scan_release_payload
 
 
@@ -52,6 +56,7 @@ _APPROVED_INNO_RUNTIME_CONSTANTS = frozenset({
     "localappdata",
     "src",
     "sys",
+    "tmp",
     "uninstallexe",
 })
 _APPROVED_INNO_RUNTIME_PREFIXES = ("cm:", "param:")
@@ -382,6 +387,36 @@ def _generate_branding(version: str) -> None:
     )
     transparent_logo.save(GENERATED / "wizard-small.png", optimize=True)
 
+    # Updater-only major release token. The alpha mask keeps the treatment
+    # inside one rounded card instead of recolouring the full installer.
+    band_size = (960, 132)
+    band = Image.new("RGBA", band_size, (0, 0, 0, 0))
+    gradient = Image.new("RGBA", band_size, (0, 0, 0, 0))
+    gradient_draw = ImageDraw.Draw(gradient)
+    left = (139, 92, 255)
+    right = (52, 216, 255)
+    for x in range(band_size[0]):
+        mix = x / max(1, band_size[0] - 1)
+        colour = tuple(
+            round(left[index] * (1.0 - mix) + right[index] * mix)
+            for index in range(3)
+        )
+        gradient_draw.line((x, 0, x, band_size[1]), fill=(*colour, 72))
+    mask = Image.new("L", band_size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (2, 2, band_size[0] - 3, band_size[1] - 3), radius=28, fill=255
+    )
+    gradient.putalpha(Image.eval(mask, lambda value: round(value * 0.34)))
+    band.alpha_composite(gradient)
+    band_draw = ImageDraw.Draw(band)
+    band_draw.rounded_rectangle(
+        (2, 2, band_size[0] - 3, band_size[1] - 3),
+        radius=28,
+        outline=(102, 205, 255, 150),
+        width=3,
+    )
+    band.save(GENERATED / "major-update-band.png", optimize=True)
+
     version_parts = list(parse_product_version(version))
     version_parts.extend([0] * (4 - len(version_parts)))
     version_tuple = tuple(version_parts)
@@ -480,6 +515,20 @@ def _write_app_metadata(identity: dict) -> Path:
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
     )
     return path
+
+
+def _write_installer_release_notes(version: str) -> tuple[Path, Path]:
+    """Create complete localized changelogs for the visible update wizard."""
+
+    GENERATED.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for language in ("en", "fr"):
+        path = GENERATED / f"release-notes-{language}.txt"
+        path.write_text(
+            installer_release_notes(version, language), encoding="utf-8-sig"
+        )
+        paths.append(path)
+    return paths[0], paths[1]
 
 
 def _write_manifest(
@@ -701,6 +750,7 @@ def build(
             raise RuntimeError("stable builds require Authenticode signing")
         return None
 
+    release_notes_en, release_notes_fr = _write_installer_release_notes(version)
     iscc = _find_iscc()
     _run([
         str(iscc),
@@ -711,6 +761,9 @@ def build(
         f"/DBuildChannel={channel}",
         f"/DInternalBuild={1 if channel == 'internal-preview' else 0}",
         f"/DSignedBuild={1 if signed_app else 0}",
+        f"/DMajorUpdate={1 if is_major_update(version) else 0}",
+        f"/DReleaseNotesEn={release_notes_en}",
+        f"/DReleaseNotesFr={release_notes_fr}",
         f"/DRepoRoot={ROOT}",
         f"/DBuildRoot={STAGE}",
         f"/DReleaseRoot={RELEASE}",
@@ -727,6 +780,8 @@ def build(
     (installer.with_suffix(installer.suffix + ".sha256")).write_text(
         f"{checksum}  {installer.name}\n", encoding="ascii",
     )
+    shutil.copy2(release_notes_en, RELEASE / "release-notes-en.txt")
+    shutil.copy2(release_notes_fr, RELEASE / "release-notes-fr.txt")
     release_manifest = {
         "schemaVersion": UPDATER_SCHEMA_VERSION,
         "product": "OSIA",

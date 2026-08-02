@@ -170,8 +170,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     },
     "updates.version": {"en": "OSIA {version}", "fr": "OSIA {version}"},
     "updates.current": {"en": "Current", "fr": "Actuelle"},
+    "updates.current_major": {
+        "en": "Current · Major update",
+        "fr": "Actuelle · Mise à jour majeure",
+    },
     "updates.internal": {"en": "Internal", "fr": "Interne"},
     "updates.available_badge": {"en": "Available", "fr": "Disponible"},
+    "updates.major_update": {
+        "en": "Major update",
+        "fr": "Mise à jour majeure",
+    },
     "updates.release_date": {
         "en": "Released {date}",
         "fr": "Publiée le {date}",

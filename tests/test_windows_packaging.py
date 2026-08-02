@@ -521,7 +521,10 @@ def test_inno_constant_inventory_and_release_gate_are_deterministic(tmp_path):
         "{#AppVersionPatch}",
         "{#BuildRoot}",
         "{#InternalBuild}",
+        "{#MajorUpdate}",
         "{#ReleaseRoot}",
+        "{#ReleaseNotesEn}",
+        "{#ReleaseNotesFr}",
         "{#RepoRoot}",
         "{#SignedBuild}",
     }
@@ -541,6 +544,7 @@ def test_inno_constant_inventory_and_release_gate_are_deterministic(tmp_path):
         "{param:NOINTEGRATION|0}",
         "{src}",
         "{sys}",
+        "{tmp}",
         "{uninstallexe}",
     }
     assert inventory["custom_code"] == ()
@@ -706,6 +710,13 @@ def test_inno_script_compiles_with_a_non_installing_minimal_payload(tmp_path):
     Image.new("RGBA", (64, 64), "#c4b5f5").save(generated / "osia.ico")
     Image.new("RGB", (410, 790), "#0d0b12").save(generated / "wizard-large.png")
     Image.new("RGB", (164, 164), "#171221").save(generated / "wizard-small.png")
+    Image.new("RGBA", (600, 100), "#6c36e8").save(
+        generated / "major-update-band.png"
+    )
+    notes_en = tmp_path / "release-notes-en.txt"
+    notes_fr = tmp_path / "release-notes-fr.txt"
+    notes_en.write_text("Release notes fixture\n", "utf-8")
+    notes_fr.write_text("Notes de version fixture\n", "utf-8")
 
     completed = subprocess.run(
         [
@@ -718,6 +729,9 @@ def test_inno_script_compiles_with_a_non_installing_minimal_payload(tmp_path):
             "/DBuildChannel=internal-preview",
             "/DInternalBuild=1",
             "/DSignedBuild=0",
+            "/DMajorUpdate=0",
+            f"/DReleaseNotesEn={notes_en}",
+            f"/DReleaseNotesFr={notes_fr}",
             f"/DRepoRoot={source}",
             f"/DBuildRoot={tmp_path / 'build'}",
             f"/DReleaseRoot={output}",
@@ -877,7 +891,7 @@ def test_build_uses_product_version_and_exact_installer_name():
     build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
     assert "from osia.version import PRODUCT_VERSION, parse_product_version" in build
     assert "SOURCE_VERSION = PRODUCT_VERSION" in build
-    assert 'PRODUCT_VERSION = "1.0.6"' in (ROOT / "osia" / "version.py").read_text("utf-8")
+    assert 'PRODUCT_VERSION = "1.1.0"' in (ROOT / "osia" / "version.py").read_text("utf-8")
     assert 'installer = RELEASE / "OSIA-Setup.exe"' in build
     assert "def _write_bundle_file_manifest" in build
     assert 'CODEX_RUNTIME_VERSION = "0.144.1"' in build
@@ -898,14 +912,14 @@ def test_build_identity_metadata_and_internal_override(monkeypatch, tmp_path):
     baseline = module._resolve_build_identity("internal-preview", "1.0.1")
     assert baseline["version"] == "1.0.1"
     assert baseline["override"] == {
-        "sourceVersion": "1.0.6", "version": "1.0.1", "channel": "internal-preview",
+        "sourceVersion": "1.1.0", "version": "1.0.1", "channel": "internal-preview",
     }
     metadata_path = module._write_app_metadata(baseline)
     embedded = __import__("osia.updater", fromlist=["parse_app_metadata"]).parse_app_metadata(
         metadata_path.read_bytes()
     )
     assert embedded.version == "1.0.1"
-    assert embedded.build_override["sourceVersion"] == "1.0.6"
+    assert embedded.build_override["sourceVersion"] == "1.1.0"
     with pytest.raises(ValueError, match="forbidden"):
         module._resolve_build_identity("stable", "1.0.1")
 
@@ -1015,6 +1029,30 @@ def test_wor149_update_copy_progress_and_dark_controls_are_explicit():
         "Welcome to OSIA", "first-install",
     ):
         assert forbidden not in update_messages
+
+
+def test_wor183_major_update_is_explicit_localized_and_motion_safe():
+    script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
+    build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
+    for required in (
+        "#ifndef MajorUpdate",
+        "english.MajorUpdateBadge=MAJOR UPDATE",
+        "french.MajorUpdateBadge=",
+        "ExtractTemporaryFile('major-update-band.png')",
+        "ExtractTemporaryFile('release-notes-en.txt')",
+        "ExtractTemporaryFile('release-notes-fr.txt')",
+        "UpdateNotesMemo.ScrollBars := ssVertical",
+        "UpdateNotesMemo.Lines.LoadFromFile",
+        "function ReducedAnimationsRequested: Boolean",
+        "AnimateMajorUpdate(nil)",
+        "MajorAnimationTimer := SetTimer",
+    ):
+        assert required in script
+    assert "if not ReducedAnimationsRequested then" in script
+    assert "KillTimer(0, MajorAnimationTimer)" in script
+    assert 'f"/DMajorUpdate={1 if is_major_update(version) else 0}"' in build
+    assert 'shutil.copy2(release_notes_en, RELEASE / "release-notes-en.txt")' in build
+    assert 'shutil.copy2(release_notes_fr, RELEASE / "release-notes-fr.txt")' in build
 
 
 def test_wor149_update_is_in_place_idempotent_and_rollback_safe():

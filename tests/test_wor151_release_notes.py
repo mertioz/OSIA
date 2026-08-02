@@ -16,6 +16,8 @@ from osia import i18n, updater
 from osia.gui import update_ui
 from osia.release_notes import (
     RELEASE_HISTORY,
+    installer_release_notes,
+    is_major_update,
     manifest_release_notes,
     normalize_remote_notes,
     release_for_version,
@@ -80,8 +82,14 @@ def _controller(monkeypatch, tmp_path, *, cached=False):
 
 def test_embedded_notes_load_offline_and_are_newest_first():
     assert [entry.version for entry in RELEASE_HISTORY] == [
-        "1.0.6", "1.0.5", "1.0.4", "1.0.3",
+        "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
     ]
+    major = release_for_version("1.1.0")
+    assert major is not None and major.public
+    assert is_major_update(major.version)
+    assert len(major.summary("en")) == len(major.summary("fr")) == 5
+    assert len(major.changes("en")) == len(major.changes("fr")) >= 80
+    assert len(major.sections) >= 20
     current = release_for_version("1.0.6")
     assert current is not None and not current.public
     previous = release_for_version("1.0.5")
@@ -91,6 +99,55 @@ def test_embedded_notes_load_offline_and_are_newest_first():
     assert internal is not None and not internal.public
     assert "superseded" in " ".join(internal.changes("en")).lower()
     assert manifest_release_notes("1.0.6") == list(current.changes_en)
+
+
+def test_110_notes_are_exhaustive_bilingual_and_manifest_compatible():
+    major = release_for_version("1.1.0")
+    assert major is not None
+    assert manifest_release_notes("1.1.0") == list(major.summary_en)
+    assert all(len(note) <= 240 for note in manifest_release_notes("1.1.0"))
+
+    section_titles = " ".join(section.title_en for section in major.sections).lower()
+    for subject in (
+        "core chat",
+        "pc/mobile",
+        "permissions",
+        "deletion",
+        "autonomous",
+        "browser",
+        "documents",
+        "pdf",
+        "image",
+        "audio",
+        "video",
+        "voice",
+        "provider",
+        "chatgpt",
+        "personality",
+        "skills",
+        "packaging",
+        "android",
+        "known limitations",
+    ):
+        assert subject in section_titles
+
+    english = installer_release_notes("1.1.0", "en").lower()
+    french = installer_release_notes("1.1.0", "fr").lower()
+    assert "windows 1.1.0" in english
+    assert "android 1.0.2" in english
+    assert "worker tooling" in english
+    assert "not deployed" in english
+    assert "windows 1.1.0" in french
+    assert "android 1.0.2" in french
+    assert "limites connues" in french
+
+
+def test_generated_110_manifest_is_accepted_as_an_update_from_106():
+    raw = _manifest(version="1.1.0")
+    raw["releaseNotes"] = manifest_release_notes("1.1.0")
+    parsed = updater.parse_manifest(json.dumps(raw), _metadata("1.0.6"))
+    assert parsed.version == "1.1.0"
+    assert parsed.release_notes == tuple(manifest_release_notes("1.1.0"))
 
 
 def test_106_notes_are_bilingual_bounded_and_keep_internal_release_semantics():
@@ -276,6 +333,43 @@ def test_english_french_copy_and_long_text_stay_bounded(monkeypatch, tmp_path):
         assert section.available_card.width() <= section.width()
     finally:
         i18n.set_language("en", persist=False)
+        section.close()
+        section.deleteLater()
+        _QT_APP.processEvents()
+
+
+def test_major_update_card_is_distinct_scrollable_and_reduced_motion_safe(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("OSIA_REDUCED_MOTION", "1")
+    controller = _controller(monkeypatch, tmp_path)
+    section = update_ui.UpdateSettingsSection(controller)
+    section.resize(420, 900)
+    state = controller.state
+    state.update(
+        status="downloading",
+        installedVersion="1.0.6",
+        availableVersion="1.1.0",
+        availablePublishedAt="2026-08-02T10:00:00Z",
+        releaseNotes=manifest_release_notes("1.1.0"),
+        majorUpdate=True,
+        progressReceived=3,
+        progressTotal=4,
+    )
+    try:
+        section.apply_state(state)
+        section.show()
+        _QT_APP.processEvents()
+        assert section.available_card.objectName() == "majorUpdateCard"
+        assert section.available_card.badge.text() == "Major update"
+        assert "KNOWN LIMITATIONS" in section.available_card.notes.text()
+        assert section.available_card.notes_scroll.height() <= 390
+        assert section.available_card._reduced_motion
+        assert section.available_card._animation.state().value == 0
+        assert section.progress._major_update
+        assert section.progress._reduced_motion
+        assert section.progress.value() == 750
+    finally:
         section.close()
         section.deleteLater()
         _QT_APP.processEvents()

@@ -11041,6 +11041,14 @@ class MainPopup(QWidget):
                 border: 1px solid rgba(196, 181, 245, 0.34);
                 border-radius: 10px;
             }
+            QFrame#majorUpdateBanner {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(139, 92, 255, 0.22),
+                    stop:0.52 rgba(88, 86, 170, 0.13),
+                    stop:1 rgba(52, 216, 255, 0.18));
+                border: 1px solid rgba(88, 205, 255, 0.52);
+                border-radius: 10px;
+            }
             QLabel#updateBannerText {
                 color: #f8f6ff;
                 font-size: 11px;
@@ -11419,6 +11427,17 @@ class MainPopup(QWidget):
                 background: #13111a;
                 border: 1px solid rgba(196, 181, 245, 0.16);
                 border-radius: 10px;
+            }
+            QFrame#majorUpdateCard {
+                background: transparent;
+                border: none;
+                border-radius: 11px;
+            }
+            QScrollArea#releaseNotesScroll,
+            QScrollArea#releaseNotesScroll > QWidget,
+            QScrollArea#releaseNotesScroll > QWidget > QWidget {
+                background: transparent;
+                border: none;
             }
             QLabel#releaseVersion {
                 color: #e8e6f0;

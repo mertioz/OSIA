@@ -3,10 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    QEasingCurve,
+    QPointF,
+    QRectF,
+    QObject,
+    Qt,
+    QTimer,
+    QVariantAnimation,
+    pyqtSignal,
+)
+from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -15,11 +27,13 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
 from osia import i18n
+from osia.gui.theme import get_theme_manager
 from osia.updater import (
     DownloadCancelled,
     UpdateScheduler,
@@ -37,10 +51,45 @@ from osia.updater import (
 )
 from osia.release_notes import (
     RELEASE_HISTORY,
+    is_major_update,
     normalize_remote_notes,
     release_for_version,
 )
 from osia.version import PRODUCT_VERSION
+
+
+def _system_reduced_motion() -> bool:
+    """Honor the Windows animation preference, with a deterministic QA override."""
+
+    if os.environ.get("OSIA_REDUCED_MOTION", "").strip() == "1":
+        return True
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        enabled = ctypes.c_int(1)
+        # SPI_GETCLIENTAREAANIMATION is the documented system-wide preference
+        # used for client-area transition and breathing effects.
+        if ctypes.windll.user32.SystemParametersInfoW(
+            0x1042, 0, ctypes.byref(enabled), 0
+        ):
+            return not bool(enabled.value)
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    return False
+
+
+def _major_animation(parent: QObject, callback) -> QVariantAnimation:
+    animation = QVariantAnimation(parent)
+    animation.setDuration(6400)
+    animation.setStartValue(0.0)
+    animation.setKeyValueAt(0.5, 1.0)
+    animation.setEndValue(0.0)
+    animation.setEasingCurve(QEasingCurve.Type.InOutSine)
+    animation.setLoopCount(-1)
+    animation.valueChanged.connect(callback)
+    return animation
 
 
 class UpdateController(QObject):
@@ -93,6 +142,7 @@ class UpdateController(QObject):
             "progressTotal": 0,
             "error": None,
             "internalUnsigned": False,
+            "majorUpdate": False,
             "bannerVisible": False,
         }
 
@@ -117,6 +167,7 @@ class UpdateController(QObject):
             availableVersion=manifest.version,
             availablePublishedAt=manifest.published_at,
             releaseNotes=manifest.release_notes,
+            majorUpdate=is_major_update(manifest.version),
             internalUnsigned=(
                 manifest.channel == "internal-preview"
                 and not manifest.installer.signed
@@ -165,6 +216,7 @@ class UpdateController(QObject):
                 self._publish(
                     status="no_update", availableVersion=None,
                     availablePublishedAt=None, releaseNotes=(),
+                    majorUpdate=False,
                     error=None, bannerVisible=False,
                 )
                 return
@@ -181,7 +233,7 @@ class UpdateController(QObject):
             self._publish(
                 status="paused" if manifest is not None else "no_update",
                 availableVersion=None, availablePublishedAt=None,
-                releaseNotes=(),
+                releaseNotes=(), majorUpdate=False,
                 bannerVisible=False,
                 error=None,
             )
@@ -195,6 +247,7 @@ class UpdateController(QObject):
             availableVersion=manifest.version,
             availablePublishedAt=manifest.published_at,
             releaseNotes=manifest.release_notes,
+            majorUpdate=is_major_update(manifest.version),
             internalUnsigned=(manifest.channel == "internal-preview" and not manifest.installer.signed),
             bannerVisible=visible,
             error=None,
@@ -323,6 +376,10 @@ class UpdateBanner(QFrame):
 
     def apply_state(self, state: dict) -> None:
         self._version = state.get("availableVersion") or ""
+        major = bool(state.get("majorUpdate") and self._version)
+        self.setObjectName("majorUpdateBanner" if major else "updateBanner")
+        self.style().unpolish(self)
+        self.style().polish(self)
         self._retranslate()
         self.setVisible(bool(state.get("bannerVisible") and self._version))
 
@@ -346,14 +403,100 @@ class _ReleaseCard(QFrame):
         heading.addWidget(self.badge)
         self.date = QLabel()
         self.date.setObjectName("sectionSub")
+        self.notes_scroll = QScrollArea()
+        self.notes_scroll.setObjectName("releaseNotesScroll")
+        self.notes_scroll.setWidgetResizable(True)
+        self.notes_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.notes_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.notes = QLabel()
         self.notes.setObjectName("sectionDesc")
         self.notes.setTextFormat(Qt.TextFormat.PlainText)
         self.notes.setWordWrap(True)
-        self.notes.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        self.notes.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByKeyboard
+            | Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.notes.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.notes_scroll.setWidget(self.notes)
+        self._major_update = False
+        self._breath = 0.45
+        self._reduced_motion = _system_reduced_motion()
+        self._animation = _major_animation(self, self._set_breath)
         layout.addLayout(heading)
         layout.addWidget(self.date)
-        layout.addWidget(self.notes)
+        layout.addWidget(self.notes_scroll)
+
+    def _set_breath(self, value) -> None:
+        self._breath = float(value)
+        self.update()
+
+    def _set_major_update(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._major_update == enabled:
+            return
+        self._major_update = enabled
+        self.setObjectName("majorUpdateCard" if enabled else "releaseCard")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        if enabled and not self._reduced_motion and self.isVisible():
+            self._animation.start()
+        else:
+            self._animation.stop()
+            self._breath = 0.45
+        self.update()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._major_update and not self._reduced_motion:
+            self._animation.start()
+
+    def hideEvent(self, event) -> None:
+        self._animation.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self._major_update:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bounds = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        theme = get_theme_manager().palette
+        dark = QColor(theme.background).lightnessF() < 0.5
+        base = QColor(theme.elevated_surface if dark else theme.surface)
+        purple = QColor("#8b5cff" if dark else "#6c36e8")
+        cyan = QColor("#34d8ff" if dark else "#007f9c")
+        glow_alpha = round((34 if dark else 24) + self._breath * 32)
+        purple.setAlpha(glow_alpha)
+        cyan.setAlpha(glow_alpha)
+        gradient = QLinearGradient(
+            QPointF(bounds.left(), bounds.top()),
+            QPointF(bounds.right(), bounds.bottom()),
+        )
+        gradient.setColorAt(0.0, purple)
+        gradient.setColorAt(0.48 + (self._breath - 0.5) * 0.08, base)
+        gradient.setColorAt(1.0, cyan)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(gradient)
+        painter.drawRoundedRect(bounds, 11.0, 11.0)
+        border = QColor("#a979ff" if dark else "#7442dc")
+        border.setAlpha(round(120 + self._breath * 70))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(border, 1.2))
+        painter.drawRoundedRect(bounds, 11.0, 11.0)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._resize_notes)
+
+    def _resize_notes(self) -> None:
+        width = max(1, self.notes_scroll.viewport().width() - 4)
+        self.notes.setFixedWidth(width)
+        self.notes.adjustSize()
+        wanted = max(34, self.notes.sizeHint().height() + 6)
+        self.notes_scroll.setFixedHeight(min(wanted, 390))
 
     def apply(
         self,
@@ -362,7 +505,10 @@ class _ReleaseCard(QFrame):
         released_on: str | None,
         notes: tuple[str, ...],
         badge: str = "",
+        sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
+        major_update: bool = False,
     ) -> None:
+        self._set_major_update(major_update)
         self.version.setText(i18n.t("updates.version", version=version))
         self.badge.setText(badge)
         self.badge.setVisible(bool(badge))
@@ -370,8 +516,94 @@ class _ReleaseCard(QFrame):
             i18n.t("updates.release_date", date=released_on)
             if released_on else i18n.t("updates.date_unavailable")
         )
-        shown = notes or (i18n.t("updates.notes_unavailable"),)
-        self.notes.setText("\n".join(f"• {note}" for note in shown))
+        if sections:
+            groups: list[str] = []
+            for title, changes in sections:
+                block = [title.upper()] if title else []
+                block.extend(f"• {note}" for note in changes)
+                groups.append("\n".join(block))
+            text = "\n\n".join(groups)
+        else:
+            shown = notes or (i18n.t("updates.notes_unavailable"),)
+            text = "\n".join(f"• {note}" for note in shown)
+        self.notes.setText(text)
+        QTimer.singleShot(0, self._resize_notes)
+
+
+class _MajorProgressBar(QProgressBar):
+    """Updater-only gradient progress with a restrained breathing treatment."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._major_update = False
+        self._breath = 0.45
+        self._reduced_motion = _system_reduced_motion()
+        self._animation = _major_animation(self, self._set_breath)
+
+    def _set_breath(self, value) -> None:
+        self._breath = float(value)
+        self.update()
+
+    def set_major_update(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._major_update == enabled:
+            return
+        self._major_update = enabled
+        if enabled and not self._reduced_motion and self.isVisible():
+            self._animation.start()
+        else:
+            self._animation.stop()
+            self._breath = 0.45
+        self.update()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._major_update and not self._reduced_motion:
+            self._animation.start()
+
+    def hideEvent(self, event) -> None:
+        self._animation.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, event) -> None:
+        if not self._major_update:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bounds = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        theme = get_theme_manager().palette
+        dark = QColor(theme.background).lightnessF() < 0.5
+        track = QColor(theme.surface if dark else theme.elevated_surface)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(track)
+        painter.drawRoundedRect(bounds, 7.0, 7.0)
+        span = self.maximum() - self.minimum()
+        fraction = (self.value() - self.minimum()) / span if span > 0 else 0.0
+        fill = QRectF(bounds)
+        fill.setWidth(max(0.0, bounds.width() * max(0.0, min(1.0, fraction))))
+        if fill.width() > 0:
+            purple = QColor("#8b5cff" if dark else "#6c36e8")
+            cyan = QColor("#34d8ff" if dark else "#007f9c")
+            pulse = round(self._breath * 22)
+            purple = purple.lighter(100 + pulse)
+            cyan = cyan.lighter(100 + pulse)
+            gradient = QLinearGradient(fill.topLeft(), fill.topRight())
+            gradient.setColorAt(0.0, purple)
+            gradient.setColorAt(1.0, cyan)
+            path = QPainterPath()
+            path.addRoundedRect(bounds, 7.0, 7.0)
+            painter.save()
+            painter.setClipPath(path)
+            painter.fillRect(fill, gradient)
+            painter.restore()
+        border = QColor("#a979ff" if dark else "#7442dc")
+        border.setAlpha(round(125 + self._breath * 65))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(border, 1.0))
+        painter.drawRoundedRect(bounds, 7.0, 7.0)
+        painter.setPen(QColor(theme.text))
+        painter.drawText(bounds, Qt.AlignmentFlag.AlignCenter, self.text())
 
 
 class UpdateSettingsSection(QFrame):
@@ -403,7 +635,7 @@ class UpdateSettingsSection(QFrame):
         self.history_layout.setContentsMargins(0, 0, 0, 0)
         self.history_layout.setSpacing(7)
         self.history_host.hide()
-        self.progress = QProgressBar()
+        self.progress = _MajorProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.hide()
         actions = QHBoxLayout()
@@ -447,6 +679,7 @@ class UpdateSettingsSection(QFrame):
         self._state = dict(state)
         status = state.get("status", "idle")
         installed = state.get("installedVersion", "—")
+        language = i18n.get_language()
         self.title.setText(i18n.t("updates.title"))
         self.summary.setText(i18n.t(
             "updates.installed_summary",
@@ -458,12 +691,21 @@ class UpdateSettingsSection(QFrame):
         self.current_card.apply(
             version=installed,
             released_on=current.released_on if current else None,
-            notes=current.changes(i18n.get_language()) if current else (),
-            badge=i18n.t("updates.current"),
+            notes=current.changes(language) if current else (),
+            sections=current.note_sections(language) if current else (),
+            badge=(
+                i18n.t("updates.current_major")
+                if is_major_update(installed) else i18n.t("updates.current")
+            ),
+            major_update=is_major_update(installed),
         )
 
         available = state.get("availableVersion")
         notes = list(normalize_remote_notes(state.get("releaseNotes") or ()))
+        available_entry = release_for_version(str(available)) if available else None
+        major_available = bool(
+            state.get("majorUpdate") or is_major_update(str(available))
+        ) if available else False
         if state.get("internalUnsigned"):
             notes.insert(0, i18n.t("updates.internal_unsigned"))
         self.available_card.setVisible(bool(available))
@@ -472,8 +714,19 @@ class UpdateSettingsSection(QFrame):
             self.available_card.apply(
                 version=str(available),
                 released_on=str(published)[:10] if published else None,
-                notes=tuple(notes),
-                badge=i18n.t("updates.available_badge"),
+                notes=(
+                    available_entry.changes(language)
+                    if available_entry is not None else tuple(notes)
+                ),
+                sections=(
+                    available_entry.note_sections(language)
+                    if available_entry is not None else ()
+                ),
+                badge=(
+                    i18n.t("updates.major_update")
+                    if major_available else i18n.t("updates.available_badge")
+                ),
+                major_update=major_available,
             )
 
         if status == "offline":
@@ -497,11 +750,15 @@ class UpdateSettingsSection(QFrame):
             card.apply(
                 version=entry.version,
                 released_on=entry.released_on,
-                notes=entry.changes(i18n.get_language()),
+                notes=entry.changes(language),
+                sections=entry.note_sections(language),
                 badge=(
-                    i18n.t("updates.current") if entry.version == installed
+                    i18n.t("updates.current_major")
+                    if entry.version == installed and is_major_update(entry.version)
+                    else i18n.t("updates.current") if entry.version == installed
                     else i18n.t("updates.internal") if not entry.public else ""
                 ),
+                major_update=is_major_update(entry.version),
             )
             self.history_layout.addWidget(card)
         self.history_button.setText(
@@ -511,6 +768,7 @@ class UpdateSettingsSection(QFrame):
         self.history_button.setAccessibleName(self.history_button.text())
         total = int(state.get("progressTotal") or 0)
         received = int(state.get("progressReceived") or 0)
+        self.progress.set_major_update(major_available)
         self.progress.setVisible(status in {"downloading", "verifying"})
         self.progress.setValue(round(received * 1000 / total) if total else 0)
         self.check_button.setText(
