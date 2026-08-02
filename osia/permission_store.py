@@ -64,7 +64,7 @@ _JOURNAL_EVENT_CODES = {
 }
 _LOCAL_AUTH_METHODS = {
     "windows_hello", "unavailable", "deterministic_test", "legacy_local_api",
-    "settings_ceremony",
+    "settings_ceremony", "mobile_osia_confirmation",
 }
 _SAFE_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_EXECUTION_TYPES = {"", "chat", "autonomous", "scheduled"}
@@ -1116,8 +1116,9 @@ class PermissionStore:
         *,
         activation_proof,
         activated_at: float | None = None,
+        expected_policy_epoch: int | None = None,
     ) -> PermissionState:
-        """Persist permanent Full Access after the PC-only activation ceremony."""
+        """Persist Full Access after a trusted single-use activation ceremony."""
 
         from osia.local_reauth import consume_full_access_activation_proof
 
@@ -1128,6 +1129,11 @@ class PermissionStore:
             state = self.load_state()
             if self._corrupt:
                 raise PermissionStoreCorrupt("corrupt_store_requires_explicit_reset")
+            if (
+                expected_policy_epoch is not None
+                and state.policy_epoch != expected_policy_epoch
+            ):
+                raise PermissionStoreError("stale_policy_epoch")
             if state.permission_mode == PermissionMode.FULL_ACCESS:
                 return state
             settings = _full_access_settings_for_update(state)

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from osia.action_policy import AUTOMATIC_PERMISSION_CATEGORIES
 
 
-MOBILE_PERMISSION_CONTRACT_SCHEMA_VERSION = 1
+MOBILE_PERMISSION_CONTRACT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -92,7 +92,7 @@ def mobile_permission_contract() -> dict[str, object]:
     return {
         "schema_version": MOBILE_PERMISSION_CONTRACT_SCHEMA_VERSION,
         "custom_access": "derived",
-        "full_access_activation": "local_pc_ceremony",
+        "full_access_activation": "mobile_osia_confirmation",
         "mobile_changes": "canonical_requests",
         "categories": [
             item.mobile_projection() for item in PERMISSION_CATEGORY_CONTRACT

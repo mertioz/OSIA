@@ -708,6 +708,7 @@ _LAST_BROADCAST_REVISIONS: dict[str, int] = {}
 
 _PERMISSION_REQUEST_CACHE_MAX = 512
 _PERMISSION_REQUEST_RETENTION_SECONDS = 600.0
+_MOBILE_FULL_ACCESS_REQUEST_TTL_SECONDS = 30.0
 _PERMISSION_REQUESTS: "OrderedDict[str, dict]" = OrderedDict()
 _PERMISSION_REQUESTS_LOCK = threading.Lock()
 _PERMISSION_SESSIONS: set["_PermissionMobileSession"] = set()
@@ -733,7 +734,7 @@ _PERMISSION_REQUEST_FIELDS = {
 _PERMISSION_CHANGE_FIELDS = {
     "schema_version", "contract_schema_version", "request_id", "session_id",
     "expected_policy_epoch", "expected_snapshot_sequence", "operation",
-    "category_id", "enabled", "expires_at",
+    "category_id", "enabled", "auth_method", "auth_nonce", "expires_at",
 }
 
 
@@ -1099,7 +1100,7 @@ class _PermissionMobileSession:
             return
         if (
             message.get("schema_version") != 1
-            or message.get("contract_schema_version") != 1
+            or message.get("contract_schema_version") != 2
         ):
             await reject()
             return
@@ -1107,6 +1108,8 @@ class _PermissionMobileSession:
         operation = str(message.get("operation") or "")
         category_id = str(message.get("category_id") or "")
         enabled = message.get("enabled")
+        auth_method = str(message.get("auth_method") or "")
+        auth_nonce = _permission_safe_id(message.get("auth_nonce"))
         base_epoch = message.get("expected_policy_epoch")
         base_sequence = message.get("expected_snapshot_sequence")
         expires_at = message.get("expires_at")
@@ -1134,6 +1137,7 @@ class _PermissionMobileSession:
         from osia.action_policy import AUTOMATIC_PERMISSION_CATEGORIES
 
         category_request = operation == "set_category"
+        full_access_request = operation == "request_full_access"
         if (
             category_request
             and (
@@ -1142,6 +1146,15 @@ class _PermissionMobileSession:
             )
         ) or (
             not category_request and (category_id or enabled is not False)
+        ) or (
+            full_access_request
+            and (
+                auth_method != "osia_confirmation"
+                or not auth_nonce
+                or float(expires_at) > time.time() + _MOBILE_FULL_ACCESS_REQUEST_TTL_SECONDS
+            )
+        ) or (
+            not full_access_request and (auth_method or message.get("auth_nonce"))
         ):
             await reject()
             return
@@ -1149,7 +1162,11 @@ class _PermissionMobileSession:
         _purge_permission_requests(time.time())
         with _PERMISSION_REQUESTS_LOCK:
             duplicate = _PERMISSION_REQUESTS.get(request_id)
-        if duplicate is not None:
+            replayed_auth = full_access_request and any(
+                item.get("auth_nonce") == auth_nonce
+                for item in _PERMISSION_REQUESTS.values()
+            )
+        if duplicate is not None or replayed_auth:
             await reject()
             return
 
@@ -1158,6 +1175,7 @@ class _PermissionMobileSession:
             "operation": operation,
             "target_id": category_id,
             "enabled": enabled,
+            "auth_nonce": auth_nonce,
             "status": "pending",
             "reason": "pending",
             "policy_epoch": state.policy_epoch,
@@ -1167,14 +1185,19 @@ class _PermissionMobileSession:
             _PERMISSION_REQUESTS[request_id] = record
             _PERMISSION_REQUESTS.move_to_end(request_id)
 
-        if operation == "request_full_access":
-            record["reason"] = "pc_confirmation_required"
-            await self.send_snapshot()
-            return
-
         try:
             self._suppress_epoch_snapshot = True
-            if operation == "set_category":
+            if operation == "request_full_access":
+                from osia.local_reauth import (
+                    issue_mobile_full_access_activation_proof,
+                )
+
+                result = self.store.activate_full_access(
+                    activation_proof=issue_mobile_full_access_activation_proof(),
+                    expected_policy_epoch=base_epoch,
+                )
+                result_epoch = result.policy_epoch
+            elif operation == "set_category":
                 result = self.store.update_automatic_permissions(
                     {category_id: enabled},
                     expected_policy_epoch=base_epoch,

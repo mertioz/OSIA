@@ -50,18 +50,27 @@ class FullAccessActivationProof:
             raise ValueError("untrusted_activation_proof")
 
 
-def issue_full_access_activation_proof() -> FullAccessActivationProof:
-    """Seal one explicit Settings ceremony for single-use store activation."""
+def _issue_full_access_activation_proof(method: str) -> FullAccessActivationProof:
     nonce = secrets.token_urlsafe(32)
     with _ACTIVATION_PROOF_LOCK:
         _ACTIVATION_PROOFS.add(nonce)
     return FullAccessActivationProof(
-        method="settings_ceremony",
+        method=method,
         ceremony_confirmed=True,
         issued_at=time.time(),
         _nonce=nonce,
         _seal=_ACTIVATION_SEAL,
     )
+
+
+def issue_full_access_activation_proof() -> FullAccessActivationProof:
+    """Seal one explicit PC Settings ceremony for single-use activation."""
+    return _issue_full_access_activation_proof("settings_ceremony")
+
+
+def issue_mobile_full_access_activation_proof() -> FullAccessActivationProof:
+    """Seal one server-validated Mobile OSIA confirmation for activation."""
+    return _issue_full_access_activation_proof("mobile_osia_confirmation")
 
 
 def consume_full_access_activation_proof(
@@ -72,7 +81,10 @@ def consume_full_access_activation_proof(
     if proof._seal is not _ACTIVATION_SEAL:
         raise ValueError("untrusted_activation_proof")
     if (
-        proof.method != "settings_ceremony"
+        proof.method not in {
+            "settings_ceremony",
+            "mobile_osia_confirmation",
+        }
         or proof.ceremony_confirmed is not True
     ):
         raise ValueError("invalid_activation_proof_ceremony")
@@ -376,4 +388,5 @@ __all__ = [
     "ReauthStatus", "consume_full_access_activation_proof",
     "UnavailableLocalReauthProvider", "WindowsHelloReauthProvider",
     "default_local_reauth_provider", "issue_full_access_activation_proof",
+    "issue_mobile_full_access_activation_proof",
 ]

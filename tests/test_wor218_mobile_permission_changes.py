@@ -88,9 +88,9 @@ def test_contract_is_canonical_complete_and_value_free():
     contract = mobile_permission_contract()
     categories = contract["categories"]
 
-    assert contract["schema_version"] == 1
+    assert contract["schema_version"] == 2
     assert contract["custom_access"] == "derived"
-    assert contract["full_access_activation"] == "local_pc_ceremony"
+    assert contract["full_access_activation"] == "mobile_osia_confirmation"
     assert [item["id"] for item in categories] == list(
         action_policy.AUTOMATIC_PERMISSION_CATEGORIES
     )
@@ -161,10 +161,13 @@ async def _exercise_session_change_contract(tmp_path):
     with server._PERMISSION_REQUESTS_LOCK:
         server._PERMISSION_REQUESTS.clear()
 
-    def envelope(snapshot, *, request_id, operation, category="", enabled=False):
+    def envelope(
+        snapshot, *, request_id, operation, category="", enabled=False,
+        auth_nonce="",
+    ):
         return {
             "schema_version": 1,
-            "contract_schema_version": 1,
+            "contract_schema_version": 2,
             "request_id": request_id,
             "session_id": session.session_id,
             "expected_policy_epoch": snapshot["policy_epoch"],
@@ -172,6 +175,12 @@ async def _exercise_session_change_contract(tmp_path):
             "operation": operation,
             "category_id": category,
             "enabled": enabled,
+            "auth_method": (
+                "osia_confirmation"
+                if operation == "request_full_access"
+                else ""
+            ),
+            "auth_nonce": auth_nonce,
             "expires_at": time.time() + 30,
         }
 
@@ -205,11 +214,15 @@ async def _exercise_session_change_contract(tmp_path):
             rejected,
             request_id="permission-change:full",
             operation="request_full_access",
+            auth_nonce="auth:wor218",
         ))
-        pending = channel.frames[-1]
-        assert pending["full_access_active"] is False
-        assert pending["policy_epoch"] == rejected["policy_epoch"]
-        assert store.load_state().permission_mode is action_policy.PermissionMode.ASK
+        activated = channel.frames[-1]
+        assert activated["full_access_active"] is True
+        assert activated["policy_epoch"] == rejected["policy_epoch"] + 1
+        assert (
+            store.load_state().permission_mode
+            is action_policy.PermissionMode.FULL_ACCESS
+        )
 
         session._suppress_epoch_snapshot = True
         try:
