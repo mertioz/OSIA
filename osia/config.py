@@ -188,6 +188,10 @@ DEFAULT_SETTINGS = {
     # recorded flag defaults to enabled. Enabled skills are appended to the
     # system prompt — see osia.personality and osia.agent.get_system_prompt.
     "skills_enabled": {},
+    # Monotonic ordering for canonical skill snapshots. Mobile uses this only
+    # to reject an older config frame after a confirmed skill mutation; the PC
+    # remains the sole authority for the requested/effective enabled state.
+    "skills_state_revision": 0,
     # MCP / Connectors (WOR-44): list of Model-Context-Protocol servers OSIA can
     # use as ADDITIONAL agent tools. Each entry is non-secret config only —
     # ``{"id", "name", "transport", "url", "command", "args", "env",
@@ -737,6 +741,26 @@ def set_setting(key: str, value) -> None:
         # provider immediately after writing the model id.
         settings["selected_model_provider"] = None
     save_settings(settings)
+
+
+def set_skill_enabled_state(name: str, enabled: bool) -> int:
+    """Atomically persist one skill flag and its next snapshot revision."""
+
+    settings = load_settings()
+    raw_enabled = settings.get("skills_enabled", {}) or {}
+    skills_enabled = dict(raw_enabled) if isinstance(raw_enabled, dict) else {}
+    skills_enabled[str(name)] = bool(enabled)
+    raw_revision = settings.get("skills_state_revision", 0)
+    revision = (
+        raw_revision
+        if isinstance(raw_revision, int) and not isinstance(raw_revision, bool)
+        else 0
+    )
+    revision = max(0, revision) + 1
+    settings["skills_enabled"] = skills_enabled
+    settings["skills_state_revision"] = revision
+    save_settings(settings)
+    return revision
 
 
 def get_reasoning_settings() -> dict:

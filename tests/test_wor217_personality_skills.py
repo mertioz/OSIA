@@ -55,6 +55,20 @@ def isolated_registry(tmp_path, monkeypatch):
         "set_setting",
         lambda key, value: settings.__setitem__(key, copy.deepcopy(value)),
     )
+
+    def set_skill_enabled_state(name, enabled):
+        flags = dict(settings.get("skills_enabled", {}))
+        flags[name] = bool(enabled)
+        revision = int(settings.get("skills_state_revision", 0)) + 1
+        settings["skills_enabled"] = flags
+        settings["skills_state_revision"] = revision
+        return revision
+
+    monkeypatch.setattr(
+        personality,
+        "set_skill_enabled_state",
+        set_skill_enabled_state,
+    )
     return root, skills, settings
 
 

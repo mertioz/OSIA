@@ -20,7 +20,12 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from osia.config import PRIVATE_DATA_DIR, get_setting, set_setting
+from osia.config import (
+    PRIVATE_DATA_DIR,
+    get_setting,
+    set_setting,
+    set_skill_enabled_state,
+)
 
 
 # PRIVATE_DATA_DIR remains ~/.osia in source and packaged operation.  Importing
@@ -54,6 +59,7 @@ _SKILL_HEADER = re.compile(
 )
 _SECTION_HEADER = re.compile(r"(?m)^##\s+(.+?)\s*$")
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_SKILLS_STATE_REVISION_KEY = "skills_state_revision"
 
 
 @dataclass(frozen=True)
@@ -232,6 +238,20 @@ def _requested_skill_enabled(name: str) -> bool:
     if not isinstance(enabled, dict):
         return True
     return bool(enabled.get(name, True))
+
+
+def _bump_skills_state_revision() -> int:
+    """Persist the next canonical skill-state ordering value."""
+
+    raw_revision = get_setting(_SKILLS_STATE_REVISION_KEY, 0)
+    revision = (
+        raw_revision
+        if isinstance(raw_revision, int) and not isinstance(raw_revision, bool)
+        else 0
+    )
+    revision = max(0, revision) + 1
+    set_setting(_SKILLS_STATE_REVISION_KEY, revision)
+    return revision
 
 
 def _parse_sections(text: str) -> tuple[dict[str, str], str | None]:
@@ -430,6 +450,7 @@ def write_skill(name: str, text: str) -> None:
     if path.is_symlink():
         raise ValueError("unsafe_skill_source")
     path.write_text(str(text or ""), encoding="utf-8")
+    _bump_skills_state_revision()
 
 
 def create_skill(name: str) -> str:
@@ -464,6 +485,7 @@ def delete_skill(name: str) -> None:
     if name in enabled:
         enabled.pop(name, None)
         set_setting("skills_enabled", enabled)
+    _bump_skills_state_revision()
 
 
 def is_skill_enabled(name: str) -> bool:
@@ -484,10 +506,7 @@ def set_skill_enabled(name: str, enabled: bool) -> bool:
     name = _safe_skill_name(name)
     if not name:
         return False
-    raw_current = get_setting("skills_enabled", {}) or {}
-    current = dict(raw_current) if isinstance(raw_current, dict) else {}
-    current[name] = bool(enabled)
-    set_setting("skills_enabled", current)
+    set_skill_enabled_state(name, enabled)
     return is_skill_enabled(name)
 
 
