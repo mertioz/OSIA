@@ -502,7 +502,6 @@ def get_system_prompt(
         body = body + "\n\n" + action_policy_prompt_block(lang)
     except Exception:
         pass
-    body = body + "\n\n" + language_instruction(turn_context or lang)
     from osia.tool_contracts import assert_prompt_tool_examples_compatible
     if not autonomous_web_surface:
         for tool_guidance in (
@@ -545,7 +544,11 @@ def get_system_prompt(
                 body = body + "\n\n" + mcp_block
         except Exception:
             pass
-    return body
+    # Keep the per-turn contract last. Connected-tool descriptions and user
+    # personality/skill text may contain another language, but they are evidence
+    # and lower-priority context; the final instruction owns every provider
+    # round, including a provider fallback later in the same turn.
+    return body + "\n\n" + language_instruction(turn_context or lang)
 
 
 # Default system prompt
@@ -6478,9 +6481,9 @@ class OSIAAgent:
                 and isinstance(candidate.get("content"), str)
             ):
                 candidate["content"] = (
-                    language_instruction(self.turn_context or self.lang)
+                    candidate["content"]
                     + "\n\n"
-                    + candidate["content"]
+                    + language_instruction(self.turn_context or self.lang)
                 )
             logical.append(candidate)
 
@@ -6842,6 +6845,7 @@ class OSIAAgent:
         *,
         outcome_unknown: bool,
         timed_out: bool = False,
+        tool_name: str = "",
         on_sentence=None,
     ) -> str:
         """Produce one canonical safe final without replaying a committed turn."""
@@ -6859,24 +6863,17 @@ class OSIAAgent:
             "error_category": reason_code,
             "reason_code": reason_code,
         }
-        if self.lang == "fr":
-            content = (
-                "Le résultat de l'action est incertain : elle a été lancée mais "
-                "peut encore se terminer. Je ne l'ai ni relancée ni rejouée sur "
-                "un autre fournisseur. Vérifiez son effet avant toute nouvelle tentative."
-                if outcome_unknown else
-                "Une action avec effet a déjà été lancée. Le fournisseur a ensuite "
-                "échoué ; je n'ai pas rejoué le tour afin d'éviter de dupliquer l'action."
-            )
-        else:
-            content = (
-                "The action outcome is uncertain: it was dispatched and may still "
-                "complete. I did not retry it or replay it on another provider. "
-                "Check its effect before trying again."
-                if outcome_unknown else
-                "A side-effecting action was already dispatched. The provider then "
-                "failed, and I did not replay the turn to avoid duplicating the action."
-            )
+        safe_tool_name = (
+            str(tool_name)
+            if re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", str(tool_name or ""))
+            else "requested_action"
+        )
+        action = f"`{safe_tool_name}`"
+        content = localized_text(
+            "outcome_unknown" if outcome_unknown else "effect_provider_failure",
+            self.lang,
+            action=action,
+        )
         content = clean_response(content)
         if on_sentence is not None:
             try:
@@ -7316,6 +7313,7 @@ class OSIAAgent:
         # An unsupported Codex-native action gets one same-provider chance to
         # reformulate as an available canonical OSIA textual tool call.
         native_action_reformulation_used = False
+        attempted_model_tool_name = ""
 
         # API endpoint fallback (Bloc 5): whether the one allowed "primary
         # endpoint failed → retry on the fallback base_url" switch has been
@@ -7440,7 +7438,16 @@ class OSIAAgent:
                     # final path so desktop, Mobile and TTS all receive it once.
                     provisional_sentences.clear()
                     message = None
-                    content = str(e)
+                    content = (
+                        str(e)
+                        if (
+                            self.lang == "en"
+                            and getattr(e, "controlled_refusal", False)
+                        )
+                        else localized_text(
+                            "chatgpt_account.native_action_refused", self.lang,
+                        )
+                    )
                 status = (
                     getattr(e, "status_code", None)
                     or getattr(getattr(e, "response", None), "status_code", None)
@@ -7559,6 +7566,7 @@ class OSIAAgent:
                 if tool_execution_barrier_committed:
                     return self._finish_execution_barrier_stop(
                         outcome_unknown=turn_has_unknown_outcome,
+                        tool_name=attempted_model_tool_name,
                         on_sentence=on_sentence,
                     )
                 if not reformulatable_native_action:
@@ -7693,17 +7701,27 @@ class OSIAAgent:
                             f"{safe_tool_name!r} "
                             f"(known tools: {len(TOOL_MAP)})"
                         )
+                        unknown_payload = localized_text(
+                            "unknown_tool_error", self.lang,
+                            tool=safe_tool_name,
+                        )
                         tool_results.append(
-                            f"Tool {safe_tool_name} result:\n"
-                            "⚠️ TOOL FAILED — the action did NOT happen: "
-                            f"[ERREUR] outil inconnu: {safe_tool_name}"
+                            localized_text(
+                                "tool_result_header", self.lang,
+                                tool=safe_tool_name,
+                            )
+                            + "\n"
+                            + localized_text(
+                                "tool_failed_banner", self.lang,
+                                payload=unknown_payload,
+                            )
                         )
                         # Unknown-tool requests count toward the anti-loop
                         # detectors too (repetition / error streak).
                         guard.record(
                             tool_name,
                             {k: v for k, v in tc.items() if k != "tool"},
-                            f"[ERREUR] outil inconnu: {safe_tool_name}",
+                            unknown_payload,
                             True,
                         )
                         # Treat unknown tool as a hard error: stop the batch.
@@ -7735,7 +7753,9 @@ class OSIAAgent:
                     except ToolValidationError:
                         validation_text = validation_error_text(self.lang)
                         tool_results.append(
-                            f"Tool {tool_name} result:\n{validation_text}"
+                            localized_text(
+                                "tool_result_header", self.lang, tool=tool_name,
+                            ) + f"\n{validation_text}"
                         )
                         guard.record(tool_name, kwargs, "", True)
                         break
@@ -8042,21 +8062,22 @@ class OSIAAgent:
                     # model-facing feedback — text_part stays clean for the
                     # anti-loop guard's failure log below.
                     if execution_record.outcome == ExecutionOutcome.OUTCOME_UNKNOWN:
-                        display_text = (
-                            "⚠️ RÉSULTAT INCERTAIN — ne suppose ni succès ni "
-                            f"échec et ne relance pas automatiquement : {text_part}"
-                            if self.lang == "fr" else
-                            "⚠️ OUTCOME UNCERTAIN — do not assume success or "
-                            f"failure and do not retry automatically: {text_part}"
+                        display_text = localized_text(
+                            "outcome_uncertain_banner", self.lang,
+                            payload=text_part,
                         )
                     elif is_error:
-                        display_text = (
-                            "⚠️ TOOL FAILED — the action did NOT happen: "
-                            f"{text_part}"
+                        display_text = localized_text(
+                            "tool_failed_banner", self.lang, payload=text_part,
                         )
                     else:
                         display_text = text_part
-                    result_entry = f"Tool {tool_name} result:\n{display_text}"
+                    result_entry = (
+                        localized_text(
+                            "tool_result_header", self.lang, tool=tool_name,
+                        )
+                        + f"\n{display_text}"
+                    )
                     # Force screenshot analysis: navigation tool results
                     # (navigate, click, find_and_click) carrying a screenshot
                     # the model will actually see get a mandatory
@@ -8153,9 +8174,16 @@ class OSIAAgent:
                     ) else ""
                 )
                 if scheduled_block_state:
-                    return (
-                        "ERROR: scheduled authorization suspended before dispatch: "
-                        f"{scheduled_block_state}"
+                    safe_block_state = (
+                        scheduled_block_state
+                        if re.fullmatch(
+                            r"[A-Za-z0-9_.:-]{1,80}", scheduled_block_state,
+                        )
+                        else "authorization_suspended"
+                    )
+                    return localized_text(
+                        "scheduled_authorization_suspended", self.lang,
+                        reason=safe_block_state,
                     )
                 if autonomous_run_state in {
                     "suspended_scope_extension",
@@ -8168,11 +8196,15 @@ class OSIAAgent:
                         attempted_model_tool_name,
                         attempted_model_kwargs,
                     )
-                    return "ERROR: autonomous authorization suspended before dispatch"
+                    return localized_text(
+                        "autonomous_authorization_suspended", self.lang,
+                        reason=autonomous_run_state,
+                    )
                 if autonomous_run_state == "blocked_outcome_unknown":
                     return self._finish_execution_barrier_stop(
                         outcome_unknown=True,
                         timed_out=turn_has_tool_timeout,
+                        tool_name=attempted_model_tool_name,
                         on_sentence=on_sentence,
                     )
 
@@ -8183,6 +8215,7 @@ class OSIAAgent:
                     return self._finish_execution_barrier_stop(
                         outcome_unknown=True,
                         timed_out=turn_has_tool_timeout,
+                        tool_name=attempted_model_tool_name,
                         on_sentence=on_sentence,
                     )
 
@@ -8200,35 +8233,17 @@ class OSIAAgent:
                 # write its complete final answer — never end the turn with
                 # nothing (the "je n'ai pas réussi à formuler une réponse
                 # finale" fallback).
-                if self.lang == "fr":
-                    synthesis_instruction = (
-                        "Tous les outils ont terminé. Écris maintenant ta "
-                        "réponse finale complète en te basant sur tout ce que "
-                        "tu as trouvé. (Si tu as encore besoin d'informations "
-                        "pour terminer la tâche, appelle un autre outil à la "
-                        "place — sinon, réponds en texte simple, sans aucune "
-                        "balise <tool_call>.)"
-                    )
-                else:
-                    synthesis_instruction = (
-                        "All tools are done. Write your complete final answer "
-                        "now based on everything you found. (If you still need "
-                        "more information to finish the task, call another tool "
-                        "instead — otherwise answer in plain text, with no "
-                        "<tool_call> tags.)"
-                    )
+                synthesis_instruction = localized_text(
+                    "tools_complete_instruction", self.lang,
+                )
                 if schedule_guard_state["ignored_unrelated_tool"]:
-                    synthesis_instruction = (
-                        "A model-selected scheduled-task tool call was ignored "
-                        "because the current user turn contains no explicit "
-                        "scheduling intent. Do not mention scheduling or a "
-                        "scheduling failure. Continue the immediate request and "
-                        "write one complete final answer from the valid tool "
-                        "results."
+                    synthesis_instruction = localized_text(
+                        "schedule_ignored_instruction", self.lang,
                     )
                 feedback_text = (
                     f"<tool_result>\n{feedback}\n</tool_result>\n"
-                    f"{synthesis_instruction}"
+                    f"{synthesis_instruction}\n\n"
+                    f"{language_instruction(self.turn_context or self.lang)}"
                 )
                 # Anti-loop stop: replace the "please continue" instruction
                 # with the stop instruction (detector notice + action log +

@@ -249,11 +249,21 @@ def detect_request_language(
     previous = normalize_locale(previous_language)
     short = len(words) <= 4
     if short:
+        # One- and two-word replies are usually acknowledgements, commands or
+        # shared technical terms ("OK", "continue", "do it", "encore").
+        # ``langdetect`` is confidently wrong on several of these and used to
+        # flip an otherwise stable conversation.  They are not a clear language
+        # change: keep the previous turn when one exists, and otherwise prefer a
+        # lexical signal/client locale over a guessed language.
+        if len(words) <= 2:
+            if previous:
+                return previous if lexical_language == previous else None
+            return lexical_language
         if lexical_language:
             return lexical_language
-        if previous and detected != previous and confidence < 0.98:
+        if previous and detected != previous and confidence < 0.80:
             return None
-        return detected if confidence >= 0.70 else None
+        return detected if confidence >= 0.80 else None
     if detected and confidence >= 0.80:
         return detected
     return lexical_language
@@ -487,13 +497,109 @@ _LOCALIZED = {
         "de": "Das Speichern im Gedächtnis ist fehlgeschlagen.",
         "es": "No se pudo guardar en la memoria.",
     },
+    "outcome_unknown": {
+        "en": "The outcome of {action} is uncertain: it was dispatched and may still complete. I did not retry it or replay it on another provider. Check its effect before trying again.",
+        "fr": "Le résultat de {action} est incertain : l’action a été lancée et peut encore se terminer. Je ne l’ai ni relancée ni rejouée sur un autre fournisseur. Vérifiez son effet avant toute nouvelle tentative.",
+        "zh": "我无法确认{action}是否已完成。该操作已发出，仍可能完成。我没有重试，也没有通过其他提供商重放。再次尝试前，请先检查其效果。",
+        "ja": "{action}が完了したことを確認できませんでした。この操作は送信済みで、まだ完了する可能性があります。再試行も別のプロバイダーでの再実行もしていません。もう一度試す前に結果を確認してください。",
+        "de": "Ich konnte nicht bestätigen, dass {action} abgeschlossen wurde. Die Aktion wurde ausgelöst und kann noch abgeschlossen werden. Ich habe sie weder wiederholt noch über einen anderen Anbieter erneut ausgeführt. Prüfen Sie die Wirkung, bevor Sie es erneut versuchen.",
+        "es": "No pude confirmar que {action} terminara. La acción se envió y aún podría completarse. No la reintenté ni la repetí con otro proveedor. Comprueba su efecto antes de volver a intentarlo.",
+    },
+    "effect_provider_failure": {
+        "en": "{action} was already dispatched. The response provider then failed, and I did not replay the turn to avoid duplicating the action.",
+        "fr": "{action} avait déjà été lancée. Le fournisseur de réponse a ensuite échoué ; je n’ai pas rejoué le tour afin d’éviter de dupliquer l’action.",
+        "zh": "{action}已发出。随后响应提供商失败；为避免重复执行该操作，我没有重放本轮请求。",
+        "ja": "{action}はすでに送信されていました。その後、応答プロバイダーでエラーが発生しました。操作の重複を避けるため、このターンは再実行していません。",
+        "de": "{action} war bereits ausgelöst worden. Danach ist der Antwortanbieter fehlgeschlagen; ich habe den Durchlauf nicht wiederholt, um die Aktion nicht zu duplizieren.",
+        "es": "{action} ya se había enviado. Después falló el proveedor de respuesta; no repetí el turno para evitar duplicar la acción.",
+    },
+    "stt_not_understood": {
+        "en": "I didn't understand. Please repeat.",
+        "fr": "Je n’ai pas compris. Répétez, s’il vous plaît.",
+        "zh": "我没有听懂。请再说一遍。",
+        "ja": "聞き取れませんでした。もう一度話してください。",
+        "de": "Ich habe Sie nicht verstanden. Bitte wiederholen Sie es.",
+        "es": "No he entendido. Repítelo, por favor.",
+    },
+    "scheduled_authorization_suspended": {
+        "en": "ERROR: Scheduled-task authorization was suspended before dispatch ({reason}). No action was executed.",
+        "fr": "ERROR: l’autorisation de la tâche planifiée a été suspendue avant l’exécution ({reason}). Aucune action n’a été effectuée.",
+        "zh": "ERROR: 计划任务授权在执行前已暂停（{reason}）。未执行任何操作。",
+        "ja": "ERROR: スケジュール済みタスクの承認は実行前に停止されました（{reason}）。操作は実行されていません。",
+        "de": "ERROR: Die Autorisierung der geplanten Aufgabe wurde vor der Ausführung ausgesetzt ({reason}). Es wurde keine Aktion ausgeführt.",
+        "es": "ERROR: La autorización de la tarea programada se suspendió antes de la ejecución ({reason}). No se realizó ninguna acción.",
+    },
+    "autonomous_authorization_suspended": {
+        "en": "ERROR: Autonomous authorization was suspended before dispatch ({reason}). No action was executed.",
+        "fr": "ERROR: l’autorisation autonome a été suspendue avant l’exécution ({reason}). Aucune action n’a été effectuée.",
+        "zh": "ERROR: 自主授权在执行前已暂停（{reason}）。未执行任何操作。",
+        "ja": "ERROR: 自律実行の承認は実行前に停止されました（{reason}）。操作は実行されていません。",
+        "de": "ERROR: Die autonome Autorisierung wurde vor der Ausführung ausgesetzt ({reason}). Es wurde keine Aktion ausgeführt.",
+        "es": "ERROR: La autorización autónoma se suspendió antes de la ejecución ({reason}). No se realizó ninguna acción.",
+    },
+    "outcome_uncertain_banner": {
+        "en": "⚠️ OUTCOME UNCERTAIN — do not assume success or failure and do not retry automatically: {payload}",
+        "fr": "⚠️ RÉSULTAT INCERTAIN — ne suppose ni succès ni échec et ne relance pas automatiquement : {payload}",
+        "zh": "⚠️ 结果不确定 — 不要假定成功或失败，也不要自动重试：{payload}",
+        "ja": "⚠️ 結果不明 — 成功または失敗と決めつけず、自動で再試行しないでください：{payload}",
+        "de": "⚠️ ERGEBNIS UNGEWISS — weder Erfolg noch Fehlschlag annehmen und nicht automatisch wiederholen: {payload}",
+        "es": "⚠️ RESULTADO INCIERTO — no supongas éxito ni fracaso y no reintentes automáticamente: {payload}",
+    },
+    "tool_failed_banner": {
+        "en": "⚠️ TOOL FAILED — the action did NOT happen: {payload}",
+        "fr": "⚠️ ÉCHEC DE L’OUTIL — l’action n’a PAS eu lieu : {payload}",
+        "zh": "⚠️ 工具失败 — 操作未执行：{payload}",
+        "ja": "⚠️ ツール失敗 — 操作は実行されませんでした：{payload}",
+        "de": "⚠️ WERKZEUG FEHLGESCHLAGEN — die Aktion wurde NICHT ausgeführt: {payload}",
+        "es": "⚠️ LA HERRAMIENTA FALLÓ — la acción NO se realizó: {payload}",
+    },
+    "tool_result_header": {
+        "en": "Tool {tool} result:",
+        "fr": "Résultat de l’outil {tool} :",
+        "zh": "工具 {tool} 的结果：",
+        "ja": "ツール {tool} の結果：",
+        "de": "Ergebnis des Werkzeugs {tool}:",
+        "es": "Resultado de la herramienta {tool}:",
+    },
+    "unknown_tool_error": {
+        "en": "ERROR: unknown tool: {tool}",
+        "fr": "ERROR: outil inconnu : {tool}",
+        "zh": "ERROR: 未知工具：{tool}",
+        "ja": "ERROR: 不明なツール：{tool}",
+        "de": "ERROR: unbekanntes Werkzeug: {tool}",
+        "es": "ERROR: herramienta desconocida: {tool}",
+    },
+    "tools_complete_instruction": {
+        "en": "All tools are done. Write your complete final answer now based on everything you found. If you still need more information, call another tool instead; otherwise answer in plain text with no <tool_call> tags.",
+        "fr": "Tous les outils ont terminé. Écris maintenant ta réponse finale complète en te basant sur tout ce que tu as trouvé. Si tu as encore besoin d’informations, appelle un autre outil ; sinon, réponds en texte simple, sans balise <tool_call>.",
+        "zh": "所有工具都已完成。请根据已获得的全部信息写出完整的最终答复。如果仍需更多信息，请调用另一个工具；否则请用纯文本回答，不要包含 <tool_call> 标签。",
+        "ja": "すべてのツールが完了しました。得られた情報に基づいて、完全な最終回答を書いてください。さらに情報が必要なら別のツールを呼び出し、不要なら <tool_call> タグを使わずプレーンテキストで回答してください。",
+        "de": "Alle Werkzeuge sind abgeschlossen. Verfasse jetzt anhand aller Ergebnisse die vollständige endgültige Antwort. Falls noch Informationen fehlen, rufe ein weiteres Werkzeug auf; antworte andernfalls als Klartext ohne <tool_call>-Tags.",
+        "es": "Todas las herramientas han terminado. Escribe ahora la respuesta final completa basándote en todo lo encontrado. Si aún necesitas información, llama a otra herramienta; de lo contrario, responde en texto sin etiquetas <tool_call>.",
+    },
+    "schedule_ignored_instruction": {
+        "en": "A scheduled-task tool call was ignored because this turn contains no explicit scheduling request. Do not mention scheduling or a scheduling failure. Answer the immediate request from the valid tool results.",
+        "fr": "Un appel d’outil de tâche planifiée a été ignoré, car ce tour ne contient aucune demande explicite de planification. Ne mentionne ni planification ni échec de planification. Réponds à la demande immédiate à partir des résultats d’outils valides.",
+        "zh": "由于本轮没有明确的计划任务请求，一次计划任务工具调用已被忽略。不要提及计划任务或计划失败。请根据有效的工具结果回答当前请求。",
+        "ja": "このターンに明示的なスケジュール要求がないため、スケジュール済みタスクのツール呼び出しは無視されました。スケジュールやその失敗には触れず、有効なツール結果から現在の依頼に回答してください。",
+        "de": "Ein Aufruf des Werkzeugs für geplante Aufgaben wurde ignoriert, weil dieser Durchlauf keine ausdrückliche Planungsanfrage enthält. Erwähne weder Planung noch einen Planungsfehler. Beantworte die aktuelle Anfrage anhand der gültigen Werkzeugergebnisse.",
+        "es": "Se ignoró una llamada a la herramienta de tareas programadas porque este turno no contiene una solicitud explícita de programación. No menciones la programación ni un fallo de programación. Responde a la solicitud inmediata con los resultados válidos de las herramientas.",
+    },
 }
 
 
-def localized_text(key: str, language: str) -> str:
+def localized_text(key: str, language: str, **values) -> str:
     code = normalize_locale(language) or i18n.DEFAULT_LANG
-    values = _LOCALIZED.get(key, {})
-    return values.get(code) or values.get(i18n.DEFAULT_LANG) or key
+    translations = _LOCALIZED.get(key) or i18n.TRANSLATIONS.get(key, {})
+    rendered = (
+        translations.get(code)
+        or translations.get(i18n.DEFAULT_LANG)
+        or key
+    )
+    try:
+        return rendered.format(**values)
+    except (KeyError, ValueError):
+        return rendered
 
 
 def content_hash(text) -> str:

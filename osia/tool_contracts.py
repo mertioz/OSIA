@@ -1393,9 +1393,16 @@ def validate_arguments(schema: dict, arguments: Any) -> dict:
 
 
 def validation_error_text(lang: str = "en") -> str:
-    if str(lang or "").lower().startswith("fr"):
-        return "ERROR: arguments d'outil invalides ; l'outil n'a pas été exécuté"
-    return "ERROR: invalid tool arguments; the tool was not executed"
+    code = str(lang or "").lower().split("-", 1)[0].split("_", 1)[0]
+    messages = {
+        "en": "ERROR: invalid tool arguments; the tool was not executed",
+        "fr": "ERROR: arguments d'outil invalides ; l'outil n'a pas été exécuté",
+        "zh": "ERROR: 工具参数无效；工具未执行",
+        "ja": "ERROR: ツールの引数が無効です。ツールは実行されませんでした",
+        "de": "ERROR: ungültige Werkzeugargumente; das Werkzeug wurde nicht ausgeführt",
+        "es": "ERROR: argumentos de herramienta no válidos; la herramienta no se ejecutó",
+    }
+    return messages.get(code, messages["en"])
 
 
 _SHELL_META_RE = re.compile(r"[\r\n;&|<>`$(){}\[\]]")

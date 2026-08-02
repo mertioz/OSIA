@@ -884,7 +884,8 @@ def text_mode():
 def voice_mode():
     """Single-shot voice mode: listen → agent → speak."""
     from osia import i18n
-    from osia.turn_context import resolve_turn_context
+    from osia.config import load_settings
+    from osia.turn_context import localized_text, resolve_turn_context
     from osia.voice.stt import listen
     from osia.voice.tts import speak
     from osia.agent import clean_response
@@ -912,7 +913,21 @@ def voice_mode():
         user_text = listen(duration=5)
         if not user_text:
             print("❌ Nothing heard.")
-            speak("I didn't catch that. Could you repeat?")
+            stored = (
+                conversations.get_conversation(active_conv["id"])
+                if active_conv is not None else None
+            )
+            history = list((stored or {}).get("messages") or [])
+            fallback_context = resolve_turn_context(
+                "",
+                history=history,
+                saved_language=i18n.get_language(),
+                reference=(active_conv or {}).get("id"),
+            )
+            speak(
+                localized_text("stt_not_understood", fallback_context.language),
+                language=fallback_context.language,
+            )
             continue
 
         print(f"[STT] accepted voice input ({len(user_text)} chars).")
@@ -936,8 +951,11 @@ def voice_mode():
                 selected_model,
                 provider=settings.get("selected_model_provider") or None,
             )
+        stored = conversations.get_conversation(active_conv["id"])
+        history = list((stored or {}).get("messages") or [])
         turn_context = resolve_turn_context(
             user_text,
+            history=history,
             saved_language=i18n.get_language(),
             reference=active_conv["id"],
         )
@@ -948,10 +966,16 @@ def voice_mode():
                 user_text,
                 lambda _meta: turn_agent.run(
                     user_text,
+                    history=history,
                     current_conversation_id=active_conv["id"],
                     turn_context=turn_context,
                 ),
                 turn_meta=turn_meta,
+                metadata={
+                    "_language": turn_context.language,
+                    "_language_mode": turn_context.mode,
+                    "_allowed_languages": list(turn_context.allowed_languages),
+                },
             )
         except Exception as exc:
             print(f"[voice] turn failed: {type(exc).__name__}")
@@ -962,7 +986,7 @@ def voice_mode():
         _persist_agent_delta(
             active_conv["id"],
             turn_agent,
-            0,
+            len(history),
             user_display_text=user_text,
             turn_meta=turn_meta,
         )
@@ -1615,10 +1639,23 @@ def wake_mode():
                 if voice_shutdown_requested.is_set():
                     return
                 if not user_text:
+                    fallback_history = (
+                        _history_for_conversation(active_conv["id"])
+                        if active_conv is not None else []
+                    )
+                    fallback_context = resolve_turn_context(
+                        "",
+                        history=fallback_history,
+                        saved_language=i18n.get_language(),
+                        reference=(active_conv or {}).get("id"),
+                    )
                     _emit_voice_state("speaking")
                     speak(
-                        "Je n'ai pas compris, répétez.",
+                        localized_text(
+                            "stt_not_understood", fallback_context.language,
+                        ),
                         session_id=voice_tts_session,
+                        language=fallback_context.language,
                     )
                     return
                 print(f"[STT] accepted voice input ({len(user_text)} chars).")
