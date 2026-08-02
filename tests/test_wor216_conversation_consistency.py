@@ -143,6 +143,14 @@ def test_physical_command_is_official_release_build_only():
     assert "test" not in command
 
 
+def test_physical_gate_sibling_repo_defaults_are_cross_platform():
+    args = physical_gate._parser().parse_args([])
+    workspace_root = Path(physical_gate.__file__).resolve().parents[2]
+
+    assert Path(args.mobile_repo) == workspace_root / "osia-mobile"
+    assert Path(args.worker_repo) == workspace_root / "osia-worker"
+
+
 def test_android_power_guard_restores_stay_awake_and_screen_timeout(monkeypatch):
     settings = {
         ("global", "stay_on_while_plugged_in"): "0",

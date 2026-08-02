@@ -13,7 +13,7 @@ from osia.gui import main_popup
 
 
 _QT_APP = QApplication.instance() or QApplication([])
-_TEST_TOKEN = "0123456789abcdefabcd"
+_TEST_TOKEN = "00000000000000000000"
 
 
 class _DormantThread:

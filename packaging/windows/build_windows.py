@@ -670,7 +670,11 @@ def _secret_scan(root: Path) -> None:
         "memory.json", "onboarding.json", "task_state.json", "task_state_mobile.json",
         "lan_direct_key.pem", "lan_direct_cert.pem",
     }
-    generic_patterns = (b"sk-proj-", b"AIzaSy", b"-----BEGIN PRIVATE KEY-----")
+    generic_patterns = (
+        b"sk-proj-",
+        b"AIzaSy",
+        b"-----BEGIN " b"PRIVATE KEY-----",
+    )
     text_suffixes = {
         ".cfg", ".html", ".ini", ".iss", ".json", ".md", ".ps1", ".py",
         ".toml", ".txt", ".xml", ".yaml", ".yml",

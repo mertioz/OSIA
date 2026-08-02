@@ -1484,6 +1484,7 @@ def _run_gate(args: argparse.Namespace) -> int:
 
 
 def _parser() -> argparse.ArgumentParser:
+    workspace_root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
@@ -1503,8 +1504,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pc-repo", default=str(Path(__file__).resolve().parent.parent)
     )
-    parser.add_argument("--mobile-repo", default=r"C:\Users\vertu\osia-mobile")
-    parser.add_argument("--worker-repo", default=r"C:\Users\vertu\osia-worker")
+    parser.add_argument("--mobile-repo", default=str(workspace_root / "osia-mobile"))
+    parser.add_argument("--worker-repo", default=str(workspace_root / "osia-worker"))
     return parser
 
 

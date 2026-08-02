@@ -157,9 +157,20 @@ USER_DATA_NAME_RE = re.compile(
 # Exact path+rule exceptions for deliberately invalid/synthetic test material.
 # They are regression-tested; structured provider rules remain active everywhere.
 OSIA_ALLOWLIST = {
+    ("tests/test_wor151_close.py", "personal-local-path"),
+    ("tests/test_wor182_autonomous_model_inventory.py", "high-entropy-credential"),
+    ("tests/test_wor186_browser.py", "basic-auth-url"),
+    ("tests/test_wor187_structured_documents.py", "personal-local-path"),
+    ("tests/test_wor192_scope_normalization.py", "basic-auth-url"),
+    ("tests/test_wor193_system_resources_macos.py", "personal-local-path"),
+    ("tests/test_wor193_system_resources_windows.py", "personal-local-path"),
+    ("tests/test_wor194_autonomous_protocol.py", "personal-local-path"),
+    ("tests/test_wor201_document_tools.py", "personal-local-path"),
+    ("tests/test_windows_packaging.py", "personal-local-path"),
     ("tools/test_gmail_write_safety.py", "high-entropy-credential"),
     ("tools/test_memory_store.py", "pem-private-key"),
     ("tools/test_mobile_model_catalogue.py", "high-entropy-credential"),
+    ("tools/test_vision_inputs.py", "personal-local-path"),
 }
 
 

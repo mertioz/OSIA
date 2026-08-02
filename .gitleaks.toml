@@ -20,3 +20,19 @@ condition = "AND"
 paths = ['''(^|[\/])osia[\/]gui[\/]main_popup\.py$''']
 regexTarget = "line"
 regexes = ['''(?i)(example|placeholder|dummy|fake|test|redacted|<[a-z0-9_-]+>)''']
+
+[[allowlists]]
+description = "Public SHA-256 pins for bundled model files, constrained to the release model inventory."
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|[\/])packaging[\/]windows[\/]build_windows\.py$''']
+regexTarget = "line"
+regexes = ['''^\s*"(config\.json|model\.bin|tokenizer\.json|vocabulary\.txt|card_sha256)": "[0-9a-f]{64}",?$''']
+
+[[allowlists]]
+description = "Synthetic redaction sentinels used only by the tool-safety regression."
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|[\/])tests[\/]test_wor178_tool_safety\.py$''']
+regexTarget = "line"
+regexes = ['''^\s*secret = "WOR178_(EXCEPTION|RESULT|BARRIER)_SECRET"$''']
