@@ -391,11 +391,12 @@ def test_update_check_is_off_gui_thread_and_manual_offline_is_visible(monkeypatc
     monkeypatch.setattr(update_ui, "load_app_metadata", lambda: current)
     monkeypatch.setattr(update_ui, "updater_enabled", lambda _metadata: True)
 
-    def slow_offline(_metadata, _store):
+    def slow_offline(_metadata, _store, *, preview_opt_in):
+        assert preview_opt_in is False
         time.sleep(0.15)
         raise updater.ManifestError("offline")
 
-    monkeypatch.setattr(update_ui, "fetch_channel_manifest", slow_offline)
+    monkeypatch.setattr(update_ui, "fetch_eligible_manifest", slow_offline)
     controller = update_ui.UpdateController(
         store=updater.UpdateStateStore(tmp_path / "state.json"),
         scheduler=updater.UpdateScheduler(rng=lambda low, high: (low + high) / 2),

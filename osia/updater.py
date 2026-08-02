@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping
@@ -171,6 +171,7 @@ class UpdateManifest:
 class ManifestFetchResult:
     status: str
     manifest: UpdateManifest | None
+    channel_statuses: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -509,6 +510,8 @@ def serialize_manifest(manifest: UpdateManifest) -> str:
 def _default_state() -> dict:
     return {
         "schemaVersion": 1,
+        "preview_opt_in": None,
+        "channelCaches": {},
         "etag": None,
         "lastModified": None,
         "cachedManifest": None,
@@ -571,6 +574,111 @@ class UpdateStateStore:
             state.update(changes)
             self.save(state)
             return state
+
+
+_CHANNEL_CACHE_FIELDS = (
+    "etag",
+    "lastModified",
+    "cachedManifest",
+    "lastCheckedAt",
+    "lastError",
+)
+
+
+class _ChannelStateStore:
+    """Adapt one shared updater state file to one isolated channel cache."""
+
+    def __init__(self, store: UpdateStateStore, channel: str):
+        self._store = store
+        self._channel = channel
+
+    def load(self) -> dict:
+        parent = self._store.load()
+        clean = _default_state()
+        caches = parent.get("channelCaches")
+        entry = caches.get(self._channel) if isinstance(caches, dict) else None
+        if isinstance(entry, dict):
+            for key in _CHANNEL_CACHE_FIELDS:
+                if key in entry:
+                    clean[key] = entry[key]
+            return clean
+
+        # One-time compatibility with the pre-WOR-170 single-channel cache.
+        cached = parent.get("cachedManifest")
+        if isinstance(cached, dict) and cached.get("channel") == self._channel:
+            for key in _CHANNEL_CACHE_FIELDS:
+                clean[key] = parent.get(key)
+        return clean
+
+    def update(self, **changes) -> dict:
+        with self._store._lock:
+            parent = self._store.load()
+            caches = parent.get("channelCaches")
+            caches = dict(caches) if isinstance(caches, dict) else {}
+            current = caches.get(self._channel)
+            entry = dict(current) if isinstance(current, dict) else {}
+            if not entry:
+                cached = parent.get("cachedManifest")
+                if isinstance(cached, dict) and cached.get("channel") == self._channel:
+                    for key in _CHANNEL_CACHE_FIELDS:
+                        entry[key] = parent.get(key)
+            for key in _CHANNEL_CACHE_FIELDS:
+                if key in changes:
+                    entry[key] = changes[key]
+            caches[self._channel] = entry
+            parent["channelCaches"] = caches
+            self._store.save(parent)
+            clean = _default_state()
+            clean.update(entry)
+            return clean
+
+
+def initialize_preview_opt_in(
+    metadata: AppMetadata | None,
+    store: UpdateStateStore,
+) -> bool:
+    """Resolve and persist the one-time Stable/Preview preference migration."""
+
+    legacy_state_exists = store.path.is_file()
+    state = store.load()
+    current = state.get("preview_opt_in")
+    if type(current) is bool:
+        return current
+
+    if current is not None or not legacy_state_exists:
+        enabled = False
+    else:
+        cached = state.get("cachedManifest")
+        cached_channel = cached.get("channel") if isinstance(cached, dict) else None
+        legacy_channel = (
+            cached_channel
+            if cached_channel in ALLOWED_CHANNELS
+            else metadata.channel if metadata is not None else None
+        )
+        enabled = legacy_channel == "internal-preview"
+    store.update(preview_opt_in=enabled)
+    return enabled
+
+
+def set_preview_opt_in(store: UpdateStateStore, enabled: bool) -> None:
+    """Persist an explicit preference without touching pending installations."""
+
+    if type(enabled) is not bool:
+        raise ValueError("invalid_preview_opt_in")
+    with store._lock:
+        state = store.load()
+        state["preview_opt_in"] = enabled
+        cached = state.get("cachedManifest")
+        if (
+            not enabled
+            and isinstance(cached, dict)
+            and cached.get("channel") == "internal-preview"
+        ):
+            state["cachedManifest"] = None
+            state["notifiedVersion"] = None
+            state["dismissedVersion"] = None
+            state["dismissedUntil"] = None
+        store.save(state)
 
 
 def _jitter(delay: float, rng: Callable[[float, float], float]) -> float:
@@ -773,6 +881,80 @@ def fetch_channel_manifest(
         raise
     except (OSError, TimeoutError, http.client.HTTPException) as exc:
         raise ManifestError("offline") from exc
+
+
+def fetch_eligible_manifest(
+    metadata: AppMetadata,
+    store: UpdateStateStore,
+    *,
+    preview_opt_in: bool,
+    open_response: Callable = _open_https,
+) -> ManifestFetchResult:
+    """Fetch eligible channels independently and select the newest release."""
+
+    if type(preview_opt_in) is not bool:
+        raise ManifestError("invalid_preview_opt_in")
+    channels = (
+        ("stable", "internal-preview")
+        if preview_opt_in
+        else ("stable",)
+    )
+    results: dict[str, ManifestFetchResult] = {}
+    errors: dict[str, ManifestError] = {}
+    statuses: list[tuple[str, str]] = []
+
+    for channel in channels:
+        channel_metadata = replace(metadata, channel=channel)
+        try:
+            result = fetch_channel_manifest(
+                channel_metadata,
+                _ChannelStateStore(store, channel),
+                open_response=open_response,
+            )
+            results[channel] = result
+            statuses.append((channel, result.status))
+        except ManifestError as exc:
+            errors[channel] = exc
+            statuses.append((channel, exc.code))
+
+    candidates = [
+        result.manifest
+        for result in results.values()
+        if result.manifest is not None
+        and result.manifest.rollout_state == "enabled"
+    ]
+    if candidates:
+        selected = candidates[0]
+        for candidate in candidates[1:]:
+            if compare_versions(candidate.version, selected.version) > 0:
+                selected = candidate
+        store.update(
+            cachedManifest=selected.as_dict(),
+            lastCheckedAt=int(time.time()),
+            lastError=None,
+        )
+        return ManifestFetchResult("available", selected, tuple(statuses))
+
+    stable_error = errors.get("stable")
+    if (
+        stable_error is not None
+        and stable_error.code not in {"equal_version", "downgrade"}
+    ):
+        raise stable_error
+
+    stable_result = results.get("stable")
+    store.update(
+        cachedManifest=None,
+        lastCheckedAt=int(time.time()),
+        lastError=None,
+    )
+    if (
+        stable_result is not None
+        and stable_result.manifest is not None
+        and stable_result.manifest.rollout_state == "paused"
+    ):
+        return ManifestFetchResult("paused", stable_result.manifest, tuple(statuses))
+    return ManifestFetchResult("no_update", None, tuple(statuses))
 
 
 def _hash_file(path: Path) -> str:
@@ -1051,6 +1233,8 @@ __all__ = [
     "dismiss_update",
     "download_installer",
     "fetch_channel_manifest",
+    "fetch_eligible_manifest",
+    "initialize_preview_opt_in",
     "installer_path",
     "launch_update_installer",
     "load_app_metadata",
@@ -1062,5 +1246,6 @@ __all__ = [
     "reconcile_pending_update",
     "safe_error_code",
     "serialize_manifest",
+    "set_preview_opt_in",
     "updater_enabled",
 ]

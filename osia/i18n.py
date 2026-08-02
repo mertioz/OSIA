@@ -164,6 +164,34 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "updates.check": {"en": "Check for updates", "fr": "Rechercher les mises à jour"},
     "updates.retry": {"en": "Retry", "fr": "Réessayer"},
     "updates.none": {"en": "None", "fr": "Aucune"},
+    "updates.preview.label": {
+        "en": "Receive Preview updates",
+        "fr": "Recevoir les mises à jour Preview",
+    },
+    "updates.preview.mode.stable": {
+        "en": "Stable only",
+        "fr": "Stable uniquement",
+    },
+    "updates.preview.mode.enabled": {
+        "en": "Stable + Preview",
+        "fr": "Stable + Preview",
+    },
+    "updates.preview.help.stable": {
+        "en": "OSIA checks only stable releases.",
+        "fr": "OSIA recherche uniquement les versions stables.",
+    },
+    "updates.preview.help.enabled": {
+        "en": "OSIA checks early Preview releases and stable releases.",
+        "fr": "OSIA recherche les versions Preview en avance et les versions stables.",
+    },
+    "updates.preview.confirm_title": {
+        "en": "Enable OSIA Preview updates?",
+        "fr": "Activer les mises à jour Preview OSIA ?",
+    },
+    "updates.preview.confirm_text": {
+        "en": "Preview releases arrive before stable releases and may contain bugs, regressions, or incomplete behavior. They are intended for users who accept that risk. Stable releases remain eligible, and OSIA never downgrades automatically.\n\nEnable Stable + Preview?",
+        "fr": "Les versions Preview arrivent avant les versions stables et peuvent contenir des bugs, des régressions ou des comportements incomplets. Elles s'adressent aux utilisateurs qui acceptent ce risque. Les versions stables restent éligibles et OSIA n'effectue jamais de retour automatique vers une version antérieure.\n\nActiver Stable + Preview ?",
+    },
     "updates.installed_summary": {
         "en": "Installed version: {version} · {status}",
         "fr": "Version installée : {version} · {status}",

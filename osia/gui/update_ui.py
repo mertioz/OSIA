@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 from PyQt6.QtCore import (
@@ -21,6 +22,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -41,12 +43,15 @@ from osia.updater import (
     dismiss_update,
     download_installer,
     fetch_channel_manifest,
+    fetch_eligible_manifest,
+    initialize_preview_opt_in,
     launch_update_installer,
     load_app_metadata,
     parse_manifest,
     prepare_notification_state,
     reconcile_pending_update,
     safe_error_code,
+    set_preview_opt_in as persist_preview_opt_in,
     updater_enabled,
 )
 from osia.release_notes import (
@@ -96,7 +101,7 @@ class UpdateController(QObject):
     """Schedule updater work without ever blocking Qt's event loop."""
 
     state_changed = pyqtSignal(dict)
-    _check_finished = pyqtSignal(object, bool, object)
+    _check_finished = pyqtSignal(object, bool, object, bool)
     _download_progress = pyqtSignal(int, int)
     _download_finished = pyqtSignal(object, object)
     _launch_finished = pyqtSignal(object)
@@ -108,6 +113,7 @@ class UpdateController(QObject):
         self.metadata = None
         self.manifest = None
         self.installer: Path | None = None
+        self.preview_opt_in = False
         self._confirmation_parent: QWidget | None = None
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -123,11 +129,16 @@ class UpdateController(QObject):
         self.enabled = bool(candidate is not None and updater_enabled(candidate))
         if self.enabled:
             self.metadata = candidate
+            self.preview_opt_in = initialize_preview_opt_in(candidate, self.store)
             reconcile_pending_update(candidate, self.store)
             self._state = self._new_state("idle")
             self._restore_cached_manifest()
             self._timer.start(max(1, round(self.scheduler.first_delay() * 1000)))
         else:
+            stored_preference = self.store.load().get("preview_opt_in")
+            self.preview_opt_in = (
+                stored_preference if type(stored_preference) is bool else False
+            )
             self._state = self._new_state("disabled")
 
     def _new_state(self, status: str) -> dict:
@@ -135,6 +146,8 @@ class UpdateController(QObject):
             "status": status,
             "installedVersion": self.metadata.version if self.metadata else PRODUCT_VERSION,
             "channel": self.metadata.channel if self.metadata else "disabled",
+            "previewOptIn": self.preview_opt_in,
+            "availableChannel": None,
             "availableVersion": None,
             "availablePublishedAt": None,
             "releaseNotes": (),
@@ -153,9 +166,14 @@ class UpdateController(QObject):
         if not isinstance(cached, dict) or self.metadata is None:
             return
         try:
+            cached_channel = cached.get("channel")
+            if cached_channel not in {"stable", "internal-preview"}:
+                return
+            if cached_channel == "internal-preview" and not self.preview_opt_in:
+                return
             manifest = parse_manifest(
                 json.dumps(cached, ensure_ascii=False, allow_nan=False),
-                self.metadata,
+                replace(self.metadata, channel=cached_channel),
             )
         except Exception:
             return
@@ -165,6 +183,7 @@ class UpdateController(QObject):
         self._state.update(
             status="available",
             availableVersion=manifest.version,
+            availableChannel=manifest.channel,
             availablePublishedAt=manifest.published_at,
             releaseNotes=manifest.release_notes,
             majorUpdate=is_major_update(manifest.version),
@@ -195,28 +214,43 @@ class UpdateController(QObject):
         self._publish(status="checking", error=None, bannerVisible=False)
 
         def worker() -> None:
+            checked_preview = self.preview_opt_in
             try:
-                result = fetch_channel_manifest(self.metadata, self.store)
-                self._check_finished.emit(result, manual, None)
+                result = fetch_eligible_manifest(
+                    self.metadata,
+                    self.store,
+                    preview_opt_in=checked_preview,
+                )
+                self._check_finished.emit(result, manual, None, checked_preview)
             except Exception as exc:
-                self._check_finished.emit(None, manual, exc)
+                self._check_finished.emit(None, manual, exc, checked_preview)
 
         threading.Thread(target=worker, name="osia-update-check", daemon=True).start()
         return True
 
-    def _on_check_finished(self, result, manual: bool, error) -> None:
+    def _on_check_finished(
+        self,
+        result,
+        manual: bool,
+        error,
+        checked_preview: bool,
+    ) -> None:
         code = safe_error_code(error) if error is not None else None
         success = error is None or code in {"equal_version", "downgrade"}
         delay = self.scheduler.complete(success)
         self._timer.start(max(1, round(delay * 1000)))
+        if checked_preview != self.preview_opt_in:
+            self._timer.stop()
+            self.check(manual=manual)
+            return
         if error is not None:
             if code in {"equal_version", "downgrade"}:
                 self.manifest = None
                 self.store.update(lastError=None)
                 self._publish(
                     status="no_update", availableVersion=None,
-                    availablePublishedAt=None, releaseNotes=(),
-                    majorUpdate=False,
+                    availableChannel=None, availablePublishedAt=None,
+                    releaseNotes=(), majorUpdate=False, internalUnsigned=False,
                     error=None, bannerVisible=False,
                 )
                 return
@@ -232,8 +266,9 @@ class UpdateController(QObject):
             self.manifest = None
             self._publish(
                 status="paused" if manifest is not None else "no_update",
-                availableVersion=None, availablePublishedAt=None,
-                releaseNotes=(), majorUpdate=False,
+                availableVersion=None, availableChannel=None,
+                availablePublishedAt=None, releaseNotes=(), majorUpdate=False,
+                internalUnsigned=False,
                 bannerVisible=False,
                 error=None,
             )
@@ -245,6 +280,7 @@ class UpdateController(QObject):
         self._publish(
             status="available",
             availableVersion=manifest.version,
+            availableChannel=manifest.channel,
             availablePublishedAt=manifest.published_at,
             releaseNotes=manifest.release_notes,
             majorUpdate=is_major_update(manifest.version),
@@ -252,6 +288,37 @@ class UpdateController(QObject):
             bannerVisible=visible,
             error=None,
         )
+
+    def set_preview_opt_in(self, enabled: bool) -> bool:
+        enabled = bool(enabled)
+        if enabled == self.preview_opt_in:
+            return False
+        persist_preview_opt_in(self.store, enabled)
+        self.preview_opt_in = enabled
+        if (
+            not enabled
+            and self.manifest is not None
+            and self.manifest.channel == "internal-preview"
+        ):
+            self.manifest = None
+            self.installer = None
+            self._publish(
+                status="idle",
+                previewOptIn=False,
+                availableVersion=None,
+                availableChannel=None,
+                availablePublishedAt=None,
+                releaseNotes=(),
+                majorUpdate=False,
+                internalUnsigned=False,
+                bannerVisible=False,
+                error=None,
+            )
+        else:
+            self._publish(previewOptIn=enabled, bannerVisible=False, error=None)
+        if self.enabled:
+            self.check(manual=True)
+        return True
 
     def dismiss(self) -> None:
         if self.manifest is None:
@@ -619,6 +686,29 @@ class UpdateSettingsSection(QFrame):
         self.summary = QLabel()
         self.summary.setObjectName("sectionSub")
         self.summary.setWordWrap(True)
+        self.preference_card = QFrame()
+        self.preference_card.setObjectName("releaseCard")
+        preference_layout = QVBoxLayout(self.preference_card)
+        preference_layout.setContentsMargins(11, 9, 11, 9)
+        preference_layout.setSpacing(5)
+        preference_row = QHBoxLayout()
+        preference_row.setSpacing(8)
+        self.preview_label = QLabel()
+        self.preview_label.setObjectName("releaseVersion")
+        self.preview_label.setWordWrap(True)
+        self.preview_mode = QLabel()
+        self.preview_mode.setObjectName("releaseBadge")
+        self.preview_toggle = QCheckBox()
+        self.preview_toggle.setObjectName("smartToggle")
+        self.preview_label.setBuddy(self.preview_toggle)
+        preference_row.addWidget(self.preview_label, 1)
+        preference_row.addWidget(self.preview_mode)
+        preference_row.addWidget(self.preview_toggle)
+        self.preview_help = QLabel()
+        self.preview_help.setObjectName("sectionDesc")
+        self.preview_help.setWordWrap(True)
+        preference_layout.addLayout(preference_row)
+        preference_layout.addWidget(self.preview_help)
         self.current_card = _ReleaseCard()
         self.available_card = _ReleaseCard()
         self.available_card.hide()
@@ -649,6 +739,7 @@ class UpdateSettingsSection(QFrame):
         actions.addStretch(1)
         layout.addWidget(self.title)
         layout.addWidget(self.summary)
+        layout.addWidget(self.preference_card)
         layout.addWidget(self.current_card)
         layout.addWidget(self.available_card)
         layout.addWidget(self.empty_state)
@@ -657,6 +748,7 @@ class UpdateSettingsSection(QFrame):
         layout.addWidget(self.progress)
         layout.addLayout(actions)
         self.history_button.toggled.connect(self._on_history_toggled)
+        self.preview_toggle.stateChanged.connect(self._on_preview_toggled)
         self.check_button.clicked.connect(lambda: controller.check(manual=True))
         self.install_button.clicked.connect(lambda: controller.install(self))
         controller.state_changed.connect(self.apply_state)
@@ -675,6 +767,25 @@ class UpdateSettingsSection(QFrame):
         )
         self.history_button.setAccessibleName(self.history_button.text())
 
+    def _on_preview_toggled(self, _state: int) -> None:
+        requested = self.preview_toggle.isChecked()
+        if requested == self.controller.preview_opt_in:
+            return
+        if requested:
+            answer = QMessageBox.question(
+                self,
+                i18n.t("updates.preview.confirm_title"),
+                i18n.t("updates.preview.confirm_text"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self.preview_toggle.blockSignals(True)
+                self.preview_toggle.setChecked(False)
+                self.preview_toggle.blockSignals(False)
+                return
+        self.controller.set_preview_opt_in(requested)
+
     def apply_state(self, state: dict) -> None:
         self._state = dict(state)
         status = state.get("status", "idle")
@@ -686,6 +797,25 @@ class UpdateSettingsSection(QFrame):
             version=installed,
             status=i18n.t(f"updates.status.{status}"),
         ))
+        preview_enabled = bool(state.get("previewOptIn", False))
+        self.preview_label.setText(i18n.t("updates.preview.label"))
+        self.preview_mode.setText(i18n.t(
+            "updates.preview.mode.enabled"
+            if preview_enabled else "updates.preview.mode.stable"
+        ))
+        self.preview_help.setText(i18n.t(
+            "updates.preview.help.enabled"
+            if preview_enabled else "updates.preview.help.stable"
+        ))
+        self.preview_toggle.setAccessibleName(self.preview_label.text())
+        self.preview_toggle.setAccessibleDescription(self.preview_help.text())
+        self.preview_toggle.setToolTip(self.preview_help.text())
+        self.preview_toggle.blockSignals(True)
+        self.preview_toggle.setChecked(preview_enabled)
+        self.preview_toggle.blockSignals(False)
+        self.preview_toggle.setEnabled(
+            status not in {"downloading", "verifying", "pending"}
+        )
 
         current = release_for_version(installed)
         self.current_card.apply(
