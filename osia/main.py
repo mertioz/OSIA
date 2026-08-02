@@ -68,6 +68,7 @@ import sys
 import os
 import threading
 import time
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -85,6 +86,9 @@ from osia.tools import verify_tools
 # a {"type": "new_chat"} reset to every connected device. The endpoint is
 # localhost-only on the server side.
 _SERVER_NEW_CHAT_URL = "http://127.0.0.1:8765/internal/new_chat"
+_SERVER_CONVERSATION_CHANGED_URL = (
+    "http://127.0.0.1:8765/internal/conversation_changed"
+)
 _SERVER_MOBILE_CATALOGUE_URL = (
     "http://127.0.0.1:8765/internal/mobile_catalogue_changed"
 )
@@ -194,6 +198,126 @@ def _notify_mobile_state_changed(url: str, label: str) -> None:
         name=f"osia-mobile-{label}-notify",
         daemon=True,
     ).start()
+
+
+def _notify_mobile_conversation_changed(
+    conv_id: str,
+    *,
+    revision: int = 0,
+    operation_id: str = "",
+    action: str = "upsert",
+) -> None:
+    """Best-effort canonical-store invalidation; carries no chat content."""
+
+    import json
+    import urllib.request
+
+    payload = json.dumps({
+        "conversation_id": str(conv_id or ""),
+        "revision": max(0, int(revision or 0)),
+        "operation_id": str(operation_id or ""),
+        "action": str(action or "upsert"),
+    }).encode("utf-8")
+
+    def worker() -> None:
+        try:
+            request = urllib.request.Request(
+                _SERVER_CONVERSATION_CHANGED_URL,
+                data=payload,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(request, timeout=1.5).close()
+        except Exception as exc:
+            print(
+                "[OSIA] mobile conversation notify skipped: "
+                f"{type(exc).__name__}"
+            )
+
+    threading.Thread(
+        target=worker,
+        name="osia-mobile-conversation-notify",
+        daemon=True,
+    ).start()
+
+
+def _new_desktop_turn_meta(conv_id: str) -> dict:
+    request_id = f"desktop_req_{uuid.uuid4().hex}"
+    turn_id = f"desktop_turn_{uuid.uuid4().hex}"
+    return {
+        "conversation_id": conv_id,
+        "request_id": request_id,
+        "client_request_id": request_id,
+        "turn_id": turn_id,
+        "user_message_id": f"desktop_msg_{uuid.uuid4().hex}",
+        "assistant_message_id": f"desktop_msg_{uuid.uuid4().hex}",
+    }
+
+
+def _turn_persistence_metadata(
+    turn_meta: dict,
+    *,
+    role: str,
+    extra: dict | None = None,
+) -> dict:
+    message_key = "user_message_id" if role == "user" else "assistant_message_id"
+    metadata = dict(extra or {})
+    metadata.update({
+        "_conversation_id": str(turn_meta.get("conversation_id") or ""),
+        "_request_id": str(turn_meta.get("request_id") or ""),
+        "_client_request_id": str(turn_meta.get("request_id") or ""),
+        "_turn_id": str(turn_meta.get("turn_id") or ""),
+        "_message_id": str(turn_meta.get(message_key) or ""),
+        "_operation_id": str(turn_meta.get(message_key) or ""),
+    })
+    return metadata
+
+
+def _persist_desktop_user_turn(
+    conv_id: str,
+    content: str,
+    *,
+    turn_meta: dict | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Durably accept a desktop user turn before any agent/tool callback."""
+
+    meta = turn_meta or _new_desktop_turn_meta(conv_id)
+    receipt = conversations.commit_message(
+        conv_id,
+        "user",
+        content,
+        metadata=_turn_persistence_metadata(meta, role="user", extra=metadata),
+    )
+    if receipt is None:
+        raise RuntimeError("conversation persistence unavailable")
+    meta["_user_commit"] = receipt
+    if receipt.get("committed"):
+        _notify_mobile_conversation_changed(
+            conv_id,
+            revision=receipt.get("revision", 0),
+            operation_id=receipt.get("operation_id", ""),
+        )
+    return meta
+
+
+def _dispatch_after_persisted_user(
+    conv_id: str,
+    content: str,
+    effect,
+    *,
+    turn_meta: dict | None = None,
+    metadata: dict | None = None,
+):
+    """Testable persist-before-effect boundary used by desktop entry points."""
+
+    meta = _persist_desktop_user_turn(
+        conv_id,
+        content,
+        turn_meta=turn_meta,
+        metadata=metadata,
+    )
+    return effect(meta)
 
 
 def _notify_mobile_mcp_sync(server_id: str, action: str) -> None:
@@ -398,7 +522,12 @@ def _ensure_mobile_server_windows() -> None:
 
 
 def _persist_agent_delta(
-    conv_id, agent, prev_history_len, *, user_display_text: str | None = None,
+    conv_id,
+    agent,
+    prev_history_len,
+    *,
+    user_display_text: str | None = None,
+    turn_meta: dict | None = None,
 ):
     """Persist messages added to ``agent.messages`` during the most recent
     ``agent.run()`` call. ``prev_history_len`` is the length of the
@@ -450,6 +579,16 @@ def _persist_agent_delta(
                     clean = _sanitize_persisted_history_message(visible)
             if clean is None:
                 continue
+            if turn_meta is not None and clean.get("role") == "user":
+                # The desktop entry points durably accepted this user turn
+                # before agent.run(); never append it a second time here.
+                continue
+            if (
+                turn_meta is not None
+                and clean.get("role") == "assistant"
+                and index != final_assistant_index
+            ):
+                continue
             if pending_user_display is not None and clean.get("role") == "user":
                 clean = dict(clean)
                 clean["content"] = pending_user_display
@@ -465,13 +604,41 @@ def _persist_agent_delta(
             if artifact_refs and index == final_assistant_index:
                 metadata = dict(metadata or {})
                 metadata["_artifact_refs"] = artifact_refs
+            if turn_meta is not None and clean.get("role") == "assistant":
+                metadata = _turn_persistence_metadata(
+                    turn_meta,
+                    role="assistant",
+                    extra=metadata,
+                )
             persistence_kwargs = {"metadata": metadata} if metadata else {}
-            conversations.add_message(
-                conv_id, clean.get("role"), clean.get("content", ""),
-                **persistence_kwargs,
-            )
+            if turn_meta is None:
+                updated = conversations.add_message(
+                    conv_id, clean.get("role"), clean.get("content", ""),
+                    **persistence_kwargs,
+                )
+                receipt = ({
+                    "committed": True,
+                    "revision": int((updated or {}).get("revision") or 0),
+                    "operation_id": str(
+                        (updated or {}).get("last_operation_id") or ""
+                    ),
+                } if updated else None)
+            else:
+                receipt = conversations.commit_message(
+                    conv_id, clean.get("role"), clean.get("content", ""),
+                    **persistence_kwargs,
+                )
+            if receipt and receipt.get("committed"):
+                _notify_mobile_conversation_changed(
+                    conv_id,
+                    revision=receipt.get("revision", 0),
+                    operation_id=receipt.get("operation_id", ""),
+                )
     except Exception as e:
-        print(f"[OSIA] failed to persist conversation: {e}")
+        print(
+            "[OSIA] failed to persist conversation: "
+            f"{type(e).__name__}"
+        )
 
 
 def _finalize_controlled_refusal(
@@ -482,6 +649,7 @@ def _finalize_controlled_refusal(
     emit_final,
     *,
     user_display_text: str | None = None,
+    turn_meta: dict | None = None,
 ) -> str | None:
     """Persist and emit one explicitly classified refusal as assistant text."""
 
@@ -492,11 +660,14 @@ def _finalize_controlled_refusal(
         return None
     text = str(error)
     agent.messages.append({"role": "assistant", "content": text})
+    persistence_kwargs = {"user_display_text": user_display_text}
+    if turn_meta is not None:
+        persistence_kwargs["turn_meta"] = turn_meta
     _persist_agent_delta(
         conv_id,
         agent,
         prev_history_len,
-        user_display_text=user_display_text,
+        **persistence_kwargs,
     )
     from osia.agent import clean_response
 
@@ -519,14 +690,24 @@ def _persist_exchange(conv_id, user_text, assistant_text, turn_context=None):
                 "_language_mode": turn_context.mode,
                 "_allowed_languages": list(turn_context.allowed_languages),
             }
-        conversations.add_message(
+        user_receipt = conversations.commit_message(
             conv_id, "user", user_text, metadata=metadata,
         )
-        conversations.add_message(
+        assistant_receipt = conversations.commit_message(
             conv_id, "assistant", assistant_text or "", metadata=metadata,
         )
+        for receipt in (user_receipt, assistant_receipt):
+            if receipt and receipt.get("committed"):
+                _notify_mobile_conversation_changed(
+                    conv_id,
+                    revision=receipt.get("revision", 0),
+                    operation_id=receipt.get("operation_id", ""),
+                )
     except Exception as e:
-        print(f"[OSIA] failed to persist conversation: {e}")
+        print(
+            "[OSIA] failed to persist conversation: "
+            f"{type(e).__name__}"
+        )
 
 
 # ── Ctrl+Alt+P manual voice shortcut ───────────────────────────────────────
@@ -669,19 +850,35 @@ def text_mode():
         # First message of this conversation — create it now, never earlier.
         if active_conv is None:
             active_conv = conversations.create_conversation()
+            _notify_mobile_conversation_changed(
+                active_conv["id"],
+                revision=active_conv.get("revision", 0),
+                operation_id=active_conv.get("last_operation_id", ""),
+            )
             print(f"[New conversation: {active_conv['id']}]")
 
         prev_history_len = len(agent.messages) - 1  # skip system prompt
+        turn_meta = _new_desktop_turn_meta(active_conv["id"])
         print("\nOSIA is thinking...", flush=True)
         try:
-            response = agent.run(
+            response = _dispatch_after_persisted_user(
+                active_conv["id"],
                 user_input,
-                current_conversation_id=active_conv["id"],
+                lambda _meta: agent.run(
+                    user_input,
+                    current_conversation_id=active_conv["id"],
+                ),
+                turn_meta=turn_meta,
             )
             print(f"\nOSIA: {response}")
-            _persist_agent_delta(active_conv["id"], agent, prev_history_len)
+            _persist_agent_delta(
+                active_conv["id"],
+                agent,
+                prev_history_len,
+                turn_meta=turn_meta,
+            )
         except Exception as e:
-            print(f"\n[ERROR] {e}")
+            print(f"\n[ERROR] {type(e).__name__}")
 
 
 def voice_mode():
@@ -723,6 +920,11 @@ def voice_mode():
         # First message — create the conversation now, never earlier.
         if active_conv is None:
             active_conv = conversations.create_conversation()
+            _notify_mobile_conversation_changed(
+                active_conv["id"],
+                revision=active_conv.get("revision", 0),
+                operation_id=active_conv.get("last_operation_id", ""),
+            )
             print(f"[New conversation: {active_conv['id']}]")
 
         print("🤔 Thinking...")
@@ -739,16 +941,30 @@ def voice_mode():
             saved_language=i18n.get_language(),
             reference=active_conv["id"],
         )
-        response = turn_agent.run(
-            user_text,
-            current_conversation_id=active_conv["id"],
-            turn_context=turn_context,
-        )
+        turn_meta = _new_desktop_turn_meta(active_conv["id"])
+        try:
+            response = _dispatch_after_persisted_user(
+                active_conv["id"],
+                user_text,
+                lambda _meta: turn_agent.run(
+                    user_text,
+                    current_conversation_id=active_conv["id"],
+                    turn_context=turn_context,
+                ),
+                turn_meta=turn_meta,
+            )
+        except Exception as exc:
+            print(f"[voice] turn failed: {type(exc).__name__}")
+            continue
         response = clean_response(response)
         print(f"[voice] assistant response accepted ({len(response)} chars).")
 
-        _persist_exchange(
-            active_conv["id"], user_text, response, turn_context,
+        _persist_agent_delta(
+            active_conv["id"],
+            turn_agent,
+            0,
+            user_display_text=user_text,
+            turn_meta=turn_meta,
         )
         print(f"[TTS] main.voice_mode: calling speak() ({len(response)} chars)", flush=True)
         speak(response, language=turn_context.language)
@@ -1104,6 +1320,11 @@ def wake_mode():
                  if isinstance(seed_text, str) and seed_text.strip()
                  else None)
         active_conv = conversations.create_conversation(title=title)
+        _notify_mobile_conversation_changed(
+            active_conv["id"],
+            revision=active_conv.get("revision", 0),
+            operation_id=active_conv.get("last_operation_id", ""),
+        )
         bridge.conversations_changed.emit(active_conv["id"])
         print(f"New conversation: {active_conv['id']}")
         return active_conv
@@ -1119,6 +1340,7 @@ def wake_mode():
         conv_id: str,
         history: list[dict],
         *,
+        turn_meta: dict,
         voice_response: bool,
         user_display_text: str | None = None,
         language_text: str | None = None,
@@ -1218,6 +1440,7 @@ def wake_mode():
                 turn_agent,
                 prev_history_len,
                 user_display_text=user_display_text,
+                turn_meta=turn_meta,
             )
             display = clean_response(reply or "")
             bridge.assistant_stream_final.emit(conv_id, display)
@@ -1229,6 +1452,7 @@ def wake_mode():
                 prev_history_len,
                 bridge.assistant_stream_final.emit,
                 user_display_text=user_display_text,
+                turn_meta=turn_meta,
             )
             if refusal is not None:
                 if _voice_tts_allowed():
@@ -1241,13 +1465,17 @@ def wake_mode():
                     )
             else:
                 err = localized_text("provider_failure", turn_agent.lang)
+                turn_agent.messages.append({
+                    "role": "assistant",
+                    "content": err,
+                })
                 _persist_agent_delta(
                     conv_id,
                     turn_agent,
                     prev_history_len,
                     user_display_text=user_display_text,
+                    turn_meta=turn_meta,
                 )
-                conversations.add_message(conv_id, "assistant", err)
                 bridge.assistant_stream_error.emit(conv_id, err)
                 if _voice_tts_allowed():
                     if emit_voice_state is not None:
@@ -1418,10 +1646,22 @@ def wake_mode():
                     )
                     return
                 history = _history_for_conversation(conv_id)
+                try:
+                    turn_meta = _persist_desktop_user_turn(
+                        conv_id,
+                        user_text,
+                    )
+                except Exception as exc:
+                    print(
+                        "[OSIA] desktop voice turn rejected before dispatch: "
+                        f"{type(exc).__name__}"
+                    )
+                    return
                 _set_conversation_busy(conv_id, True)
                 _emit_voice_state("thinking")
                 bridge.chat_message_for_conversation.emit(conv_id, "user", user_text)
                 _run_agent(user_text, conv_id, history,
+                    turn_meta=turn_meta,
                     voice_response=True,
                     tts_session_id=voice_tts_session,
                     voice_cancelled=voice_shutdown_requested.is_set,
@@ -1451,6 +1691,17 @@ def wake_mode():
             return False
         tts_stop()
         history = _history_for_conversation(conv_id)
+        try:
+            turn_meta = _persist_desktop_user_turn(
+                conv_id,
+                display_text,
+            )
+        except Exception as exc:
+            print(
+                "[OSIA] desktop text turn rejected before dispatch: "
+                f"{type(exc).__name__}"
+            )
+            return False
         _set_conversation_busy(conv_id, True)
         bridge.chat_message_for_conversation.emit(conv_id, "user", display_text)
 
@@ -1459,6 +1710,7 @@ def wake_mode():
                 user_input,
                 conv_id,
                 history,
+                turn_meta=turn_meta,
                 voice_response=False,
                 user_display_text=display_text,
                 language_text=language_text,
@@ -1509,6 +1761,11 @@ def wake_mode():
         tts_stop()
         agent.reset()
         active_conv = conversations.create_conversation()
+        _notify_mobile_conversation_changed(
+            active_conv["id"],
+            revision=active_conv.get("revision", 0),
+            operation_id=active_conv.get("last_operation_id", ""),
+        )
         popup.set_messages([])
         popup.refresh_conversations(active_conv["id"])
         print(f"🆕 New conversation: {active_conv['id']}")
@@ -1521,6 +1778,11 @@ def wake_mode():
         nonlocal active_conv
         agent.reset()
         active_conv = conversations.create_conversation()
+        _notify_mobile_conversation_changed(
+            active_conv["id"],
+            revision=active_conv.get("revision", 0),
+            operation_id=active_conv.get("last_operation_id", ""),
+        )
         popup.reset_conversation()
         popup.refresh_conversations(active_conv["id"])
         print(f"🆕 New conversation (voice): {active_conv['id']}")
@@ -1551,6 +1813,7 @@ def wake_mode():
             tts_stop()
         ok = conversations.delete_conversation(conv_id)
         if ok:
+            _notify_mobile_conversation_changed(conv_id, action="delete")
             popup.discard_conversation_draft(conv_id)
         print(f"🗑  Deleted conversation {conv_id}: {'ok' if ok else 'not found'}")
         if active_conv and conv_id == active_conv.get("id"):
@@ -1574,6 +1837,14 @@ def wake_mode():
         # on the next add_message, so active_conv's stale in-memory title is
         # harmless (only its id is ever consumed).
         ok = conversations.rename_conversation(conv_id, title)
+        if ok:
+            updated = conversations.get_conversation(conv_id) or {}
+            _notify_mobile_conversation_changed(
+                conv_id,
+                revision=updated.get("revision", 0),
+                operation_id=updated.get("last_operation_id", ""),
+                action="rename",
+            )
         print(f"✏️  Renamed conversation {conv_id}: {'ok' if ok else 'rejected'}")
         popup.refresh_conversations(active_conv["id"] if active_conv else None)
 

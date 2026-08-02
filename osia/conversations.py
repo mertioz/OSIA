@@ -23,6 +23,7 @@ import re
 import threading
 import unicodedata
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -145,6 +146,36 @@ def _ensure_dir() -> None:
     CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+@contextmanager
+def _store_lock():
+    """Serialize mutations across desktop/server processes on every OS."""
+
+    _ensure_dir()
+    lock_path = CONVERSATIONS_DIR / ".store.lock"
+    with _lock, lock_path.open("a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            lock_file.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -157,9 +188,53 @@ def _write_atomic(path: Path, data: dict) -> None:
     """Write JSON atomically — temp file + rename so a crashed write
     never leaves a half-finished file behind.
     """
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        if os.name != "nt":
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _next_revision(conv: dict) -> int:
+    try:
+        current = int(conv.get("revision") or 0)
+    except (TypeError, ValueError):
+        current = 0
+    return max(0, current) + 1
+
+
+def _commit_receipt(
+    conv: dict,
+    *,
+    committed: bool,
+    operation_id: str,
+    message_id: str = "",
+) -> dict:
+    return {
+        "conversation": conv,
+        "committed": committed,
+        "revision": int(conv.get("revision") or 0),
+        "operation_id": operation_id,
+        "message_id": message_id,
+    }
 
 
 def _is_tool_envelope(content) -> bool:
@@ -299,15 +374,17 @@ def resolve_conversation_reference(
 
 def create_conversation(title: str | None = None) -> dict:
     """Create and persist a new conversation. Returns the full dict."""
-    _ensure_dir()
-    with _lock:
+    with _store_lock():
         conv_id = uuid.uuid4().hex
         now = _now_iso()
+        operation_id = f"op_{uuid.uuid4().hex}"
         conv = {
             "id": conv_id,
             "title": title or DEFAULT_TITLE,
             "created_at": now,
             "updated_at": now,
+            "revision": 1,
+            "last_operation_id": operation_id,
             "messages": [],
         }
         _write_atomic(_path_for(conv_id), conv)
@@ -349,12 +426,14 @@ def list_conversations() -> list[dict]:
             "created_at": data.get("created_at"),
             "updated_at": data.get("updated_at"),
             "message_count": len(data.get("messages") or []),
+            "revision": int(data.get("revision") or 0),
+            "operation_id": str(data.get("last_operation_id") or ""),
         })
     items.sort(key=lambda c: c.get("updated_at") or "", reverse=True)
     return items
 
 
-def add_message(
+def commit_message(
     conv_id: str,
     role: str,
     content: str,
@@ -365,10 +444,10 @@ def add_message(
     auto-set the title from the first non-tool user message (if the
     title is still the default).
 
-    Returns the updated conversation dict, or ``None`` if the
-    conversation doesn't exist.
+    Returns a durable commit receipt, or ``None`` if the conversation doesn't
+    exist. Replaying the same message id is a successful no-op receipt.
     """
-    with _lock:
+    with _store_lock():
         conv = get_conversation(conv_id)
         if conv is None:
             return None
@@ -384,10 +463,18 @@ def add_message(
             or correlation.get("_client_request_id")
             or ""
         )
+        operation_id = str(correlation.get("_operation_id") or message_id or "")
+        if not message_id:
+            message_id = f"msg_{uuid.uuid4().hex}"
+            correlation["_message_id"] = message_id
+        if not operation_id:
+            operation_id = message_id
+        correlation["_operation_id"] = operation_id
         if message_id or turn_id or request_id:
-            if role not in {"user", "assistant"}:
+            is_correlated_turn = bool(turn_id or request_id)
+            if is_correlated_turn and role not in {"user", "assistant"}:
                 raise ValueError("correlated messages must be user or assistant")
-            if not message_id or not turn_id or not request_id:
+            if is_correlated_turn and (not turn_id or not request_id):
                 raise ValueError("correlated messages require request, turn, and message ids")
             messages = conv.setdefault("messages", [])
             for existing in messages:
@@ -400,18 +487,35 @@ def add_message(
                     or existing.get("_client_request_id")
                     or ""
                 )
+                existing_operation_id = str(
+                    existing.get("_operation_id")
+                    or existing_message_id
+                    or ""
+                )
                 if existing_message_id == message_id:
                     if (
                         existing.get("role") != role
                         or existing_turn_id != turn_id
                         or existing_request_id != request_id
+                        or existing_operation_id != operation_id
                         or existing.get("content") != content
                     ):
                         raise ValueError("message id correlation conflict")
-                    return conv
-                if existing_turn_id == turn_id and existing.get("role") == role:
+                    return _commit_receipt(
+                        conv,
+                        committed=False,
+                        operation_id=operation_id,
+                        message_id=message_id,
+                    )
+                if existing_operation_id == operation_id:
+                    raise ValueError("operation id correlation conflict")
+                if (
+                    is_correlated_turn
+                    and existing_turn_id == turn_id
+                    and existing.get("role") == role
+                ):
                     raise ValueError("one correlated message per role and turn")
-            if role == "assistant":
+            if is_correlated_turn and role == "assistant":
                 accepted_user = next(
                     (
                         item
@@ -430,6 +534,13 @@ def add_message(
                 )
                 if accepted_user is None:
                     raise ValueError("assistant message has no accepted user turn")
+                accepted_operation_id = str(
+                    accepted_user.get("_operation_id")
+                    or accepted_user.get("_message_id")
+                    or ""
+                )
+                if accepted_operation_id and accepted_operation_id == operation_id:
+                    raise ValueError("assistant operation id must differ from user operation id")
                 visible_tail = next(
                     (
                         item
@@ -441,21 +552,48 @@ def add_message(
                     None,
                 )
                 if visible_tail is not accepted_user:
-                    raise ValueError("assistant-to-assistant persistence rejected")
+                    raise ValueError("stale assistant persistence rejected")
         entry = {
             "role": role,
             "content": content,
         }
         entry.update(correlation)
+        revision = _next_revision(conv)
+        entry["_sequence"] = revision
         conv.setdefault("messages", []).append(entry)
         conv["updated_at"] = _now_iso()
+        conv["revision"] = revision
+        conv["last_operation_id"] = operation_id
         if (conv.get("title") in (None, "", DEFAULT_TITLE)
                 and not conv.get("manual_title")
                 and role == "user"
                 and not _is_tool_envelope(content)):
             conv["title"] = _make_title(content)
         _write_atomic(_path_for(conv_id), conv)
-        return conv
+        return _commit_receipt(
+            conv,
+            committed=True,
+            operation_id=operation_id,
+            message_id=message_id,
+        )
+
+
+def add_message(
+    conv_id: str,
+    role: str,
+    content: str,
+    *,
+    metadata: dict | None = None,
+) -> dict | None:
+    """Backward-compatible wrapper returning the updated conversation."""
+
+    receipt = commit_message(
+        conv_id,
+        role,
+        content,
+        metadata=metadata,
+    )
+    return receipt.get("conversation") if receipt else None
 
 
 def find_correlated_turn(conv_id: str, request_id: str) -> dict | None:
@@ -545,7 +683,7 @@ def delete_conversation(conv_id: str) -> bool:
     """
     if not conv_id:
         return False
-    with _lock:
+    with _store_lock():
         path = _path_for(conv_id)
         if not path.exists():
             return False
@@ -569,15 +707,19 @@ def rename_conversation(conv_id: str, title: str) -> bool:
     """
     if not conv_id or not isinstance(title, str):
         return False
-    with _lock:
+    with _store_lock():
         conv = get_conversation(conv_id)
         if conv is None:
             return False
         title = title.strip()[:TITLE_MAX_LEN]
         if not title:
             return False
+        if conv.get("title") == title and conv.get("manual_title") is True:
+            return True
         conv["title"] = title
         conv["manual_title"] = True
         conv["updated_at"] = _now_iso()
+        conv["revision"] = _next_revision(conv)
+        conv["last_operation_id"] = f"op_{uuid.uuid4().hex}"
         _write_atomic(_path_for(conv_id), conv)
         return True

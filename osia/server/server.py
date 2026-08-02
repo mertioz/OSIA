@@ -703,6 +703,8 @@ app = FastAPI(title="OSIA Mobile Server", version=current_product_version())
 # disconnect.
 _WS_CLIENTS: set["_OutboundChannel"] = set()
 _MOBILE_CATALOGUE_BROADCAST_LOCK: asyncio.Lock | None = None
+_CONVERSATION_BROADCAST_LOCK: asyncio.Lock | None = None
+_LAST_BROADCAST_REVISIONS: dict[str, int] = {}
 
 _PERMISSION_REQUEST_CACHE_MAX = 512
 _PERMISSION_REQUEST_RETENTION_SECONDS = 600.0
@@ -1344,24 +1346,105 @@ async def _send_pending_cron_notifications(channel: "_OutboundChannel") -> None:
             return
 
 
+def _conversation_history_frame(conv: dict) -> dict:
+    conv_id = str(conv.get("id") or "")
+    return {
+        "type": "conversation_history",
+        "id": conv_id,
+        "conversation_id": conv_id,
+        "title": conv.get("title"),
+        "revision": int(conv.get("revision") or 0),
+        "operation_id": str(conv.get("last_operation_id") or ""),
+        "messages": _displayable_history(list(conv.get("messages") or [])),
+    }
+
+
+async def _send_conversation_frame(
+    frame: dict,
+    *,
+    exclude: "_OutboundChannel | None" = None,
+) -> None:
+    for client in list(_WS_CLIENTS):
+        if client is exclude:
+            continue
+        try:
+            await client.send_json(frame)
+        except Exception:
+            _WS_CLIENTS.discard(client)
+
+
 async def _broadcast_conversation_history(conv_id: str | None) -> None:
     if not conv_id:
         return
     conv = conversations.get_conversation(conv_id)
     if not conv:
         return
-    frame = {
-        "type": "conversation_history",
-        "id": conv_id,
-        "conversation_id": conv_id,
-        "title": conv.get("title"),
-        "messages": _displayable_history(list(conv.get("messages") or [])),
-    }
-    for client in list(_WS_CLIENTS):
-        try:
-            await client.send_json(frame)
-        except Exception:
-            _WS_CLIENTS.discard(client)
+    await _send_conversation_frame(_conversation_history_frame(conv))
+
+
+async def _broadcast_canonical_conversation_change(
+    conv_id: str | None,
+    *,
+    revision: int = 0,
+    operation_id: str = "",
+    action: str = "upsert",
+    exclude: "_OutboundChannel | None" = None,
+) -> bool:
+    """Broadcast one newest durable canonical state, coalescing stale signals."""
+
+    global _CONVERSATION_BROADCAST_LOCK
+    if not conv_id:
+        return False
+    if _CONVERSATION_BROADCAST_LOCK is None:
+        _CONVERSATION_BROADCAST_LOCK = asyncio.Lock()
+    async with _CONVERSATION_BROADCAST_LOCK:
+        if action == "delete":
+            if conversations.get_conversation(conv_id) is not None:
+                return False
+            _LAST_BROADCAST_REVISIONS.pop(conv_id, None)
+            await _send_conversation_frame(
+                {
+                    "type": "conversation_deleted",
+                    "id": conv_id,
+                    "success": True,
+                    "operation_id": str(operation_id or ""),
+                },
+                exclude=exclude,
+            )
+            await _broadcast_conversations(exclude=exclude)
+            return True
+
+        conv = conversations.get_conversation(conv_id)
+        if conv is None:
+            return False
+        current_revision = int(conv.get("revision") or 0)
+        last_revision = _LAST_BROADCAST_REVISIONS.get(conv_id, -1)
+        if current_revision <= last_revision:
+            return False
+        # A delayed desktop notification must never regress clients: its hint is
+        # advisory, while the durable file is authoritative.
+        if revision and int(revision) > current_revision:
+            return False
+        _LAST_BROADCAST_REVISIONS[conv_id] = current_revision
+        await _send_conversation_frame(
+            _conversation_history_frame(conv),
+            exclude=exclude,
+        )
+        await _broadcast_conversations(exclude=exclude)
+        return True
+
+
+async def _broadcast_committed_receipt(
+    conv_id: str | None,
+    receipt: dict | None,
+) -> bool:
+    if not receipt or not receipt.get("committed"):
+        return False
+    return await _broadcast_canonical_conversation_change(
+        conv_id,
+        revision=int(receipt.get("revision") or 0),
+        operation_id=str(receipt.get("operation_id") or ""),
+    )
 
 
 def _conversation_busy_frame(conv_id: str) -> dict:
@@ -1771,16 +1854,20 @@ def _persist_accepted_user_message(
         attachment_metadata = turn_meta.get("attachment_metadata")
         if isinstance(attachment_metadata, list) and attachment_metadata:
             metadata["_attachments"] = attachment_metadata
-        updated = conversations.add_message(
+        receipt = conversations.commit_message(
             conv_id,
             "user",
             content,
             metadata=metadata,
         )
     except Exception as e:
-        print(f"[OSIA Server] failed to persist accepted user turn: {e}")
+        print(
+            "[OSIA Server] failed to persist accepted user turn: "
+            f"{type(e).__name__}"
+        )
         return False
-    return updated is not None
+    turn_meta["_user_commit"] = receipt
+    return receipt is not None
 
 
 def _persist_completed_assistant_message(
@@ -1841,16 +1928,20 @@ def _persist_completed_assistant_message(
         artifact_refs = normalize_references(turn_meta.get("_artifact_refs"))
         if artifact_refs:
             metadata["_artifact_refs"] = artifact_refs
-        updated = conversations.add_message(
+        receipt = conversations.commit_message(
             conv_id,
             "assistant",
             content,
             metadata=metadata,
         )
     except Exception as exc:
-        print(f"[OSIA Server] failed to persist correlated assistant turn: {exc}")
+        print(
+            "[OSIA Server] failed to persist correlated assistant turn: "
+            f"{type(exc).__name__}"
+        )
         return False
-    return updated is not None
+    turn_meta["_assistant_commit"] = receipt
+    return receipt is not None
 
 
 def _claim_conversation_turn(
@@ -2670,6 +2761,40 @@ async def internal_new_chat(request: Request):
         return {"ok": False, "error": "forbidden"}
     await _broadcast_new_chat()
     return {"ok": True, "clients": len(_WS_CLIENTS)}
+
+
+@app.post("/internal/conversation_changed")
+async def internal_conversation_changed(request: Request):
+    """Loopback-only invalidation from the desktop canonical writer."""
+
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    conv_id = str(body.get("conversation_id") or "").strip()
+    action = str(body.get("action") or "upsert").strip().lower()
+    if action not in {"upsert", "rename", "delete"}:
+        action = "upsert"
+    try:
+        revision = max(0, int(body.get("revision") or 0))
+    except (TypeError, ValueError):
+        revision = 0
+    broadcast = await _broadcast_canonical_conversation_change(
+        conv_id,
+        revision=revision,
+        operation_id=str(body.get("operation_id") or ""),
+        action=action,
+    )
+    return {
+        "ok": bool(conv_id),
+        "broadcast": broadcast,
+        "clients": len(_WS_CLIENTS),
+    }
 
 
 @app.post("/internal/cron_notification")
@@ -3857,16 +3982,26 @@ def _server_run_cron_task(
                     current_conversation_id=conversation_id,
                 )
             display = clean_response(reply or "")
-            conversations.add_message(
+            conversations.commit_message(
                 conversation_id,
                 "user",
                 "Scheduled task" if scheduled_execution is not None else task_text,
             )
-            conversations.add_message(conversation_id, "assistant", display)
+            assistant_receipt = conversations.commit_message(
+                conversation_id,
+                "assistant",
+                display,
+            )
             try:
                 loop = _SERVER_CRON_LOOP
                 if loop is not None:
-                    asyncio.run_coroutine_threadsafe(_broadcast_conversations(), loop)
+                    asyncio.run_coroutine_threadsafe(
+                        _broadcast_committed_receipt(
+                            conversation_id,
+                            assistant_receipt,
+                        ),
+                        loop,
+                    )
             except Exception:
                 pass
         else:
@@ -5949,12 +6084,20 @@ async def websocket_endpoint(ws: WebSocket):
                           if isinstance(seed_text, str) else None)
             conv = conversations.create_conversation(title=seed_title)
         except Exception as e:
-            print(f"[OSIA Server] create_conversation failed: {e}")
-            traceback.print_exc()
+            print(
+                "[OSIA Server] create_conversation failed: "
+                f"{type(e).__name__}"
+            )
             await out.send_json({"type": "status", "content": "error"})
             return None
         active_conv_id = conv["id"]
         session_history = []
+        await _broadcast_canonical_conversation_change(
+            active_conv_id,
+            revision=int(conv.get("revision") or 0),
+            operation_id=str(conv.get("last_operation_id") or ""),
+            exclude=out,
+        )
         await out.send_json({
             "type": "active_conversation",
             "id": conv["id"],
@@ -6118,13 +6261,7 @@ async def websocket_endpoint(ws: WebSocket):
             # while viewing another conversation (WOR-53 per-conv routing). Send
             # the disk ``messages`` (not session_history, which may now be
             # another conversation's).
-            await out.send_json({
-                "type": "conversation_history",
-                "id": conv_id,
-                "conversation_id": conv_id,
-                "title": conv.get("title"),
-                "messages": _displayable_history(messages),
-            })
+            await out.send_json(_conversation_history_frame(conv))
         except Exception:
             # Best-effort background recovery: never surface an error here as an
             # unretrieved-task warning. The turn already persisted; a later
@@ -6336,6 +6473,12 @@ async def websocket_endpoint(ws: WebSocket):
                 session_history = []
                 conv = conversations.create_conversation()
                 active_conv_id = conv["id"]
+                await _broadcast_canonical_conversation_change(
+                    active_conv_id,
+                    revision=int(conv.get("revision") or 0),
+                    operation_id=str(conv.get("last_operation_id") or ""),
+                    exclude=out,
+                )
                 print(
                     f"[OSIA Server] New conversation: {active_conv_id} "
                     f"(title={conv['title']!r})"
@@ -6359,6 +6502,12 @@ async def websocket_endpoint(ws: WebSocket):
                 session_history = []
                 conv = conversations.create_conversation()
                 active_conv_id = conv["id"]
+                await _broadcast_canonical_conversation_change(
+                    active_conv_id,
+                    revision=int(conv.get("revision") or 0),
+                    operation_id=str(conv.get("last_operation_id") or ""),
+                    exclude=out,
+                )
                 print(
                     f"[OSIA Server] new_chat from mobile → reset, "
                     f"new conv {active_conv_id}"
@@ -6469,17 +6618,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # mid-stream because the receive loop is no longer blocked.
                 active_conv_id = conv_id
                 session_history = list(conv.get("messages") or [])
-                await out.send_json({
-                    "type": "conversation_history",
-                    "id": conv_id,
-                    # Additive routing field (mirrors response_chunk/done) so a
-                    # client can match this history to a conversation tab even
-                    # while another conversation is streaming. Old clients that
-                    # only read "id" keep working.
-                    "conversation_id": conv_id,
-                    "title": conv.get("title"),
-                    "messages": _displayable_history(session_history),
-                })
+                await out.send_json(_conversation_history_frame(conv))
                 continue
 
             if msg_type == "delete_conversation":
@@ -6512,6 +6651,12 @@ async def websocket_endpoint(ws: WebSocket):
                     "id": conv_id,
                     "success": ok,
                 })
+                if ok:
+                    await _broadcast_canonical_conversation_change(
+                        conv_id,
+                        action="delete",
+                        exclude=out,
+                    )
                 continue
 
             if msg_type == "rename_conversation":
@@ -6535,7 +6680,19 @@ async def websocket_endpoint(ws: WebSocket):
                     "type": "conversations",
                     "items": conversations.list_conversations(),
                 })
-                await _broadcast_conversations(exclude=out)
+                if ok:
+                    updated = conversations.get_conversation(conv_id) or {}
+                    await _broadcast_canonical_conversation_change(
+                        conv_id,
+                        revision=int(updated.get("revision") or 0),
+                        operation_id=str(
+                            updated.get("last_operation_id") or ""
+                        ),
+                        action="rename",
+                        exclude=out,
+                    )
+                else:
+                    await _broadcast_conversations(exclude=out)
                 continue
 
             # --- Models ---
@@ -9561,6 +9718,11 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         seed_title = conversations.smart_title(text)
         conv = conversations.create_conversation(title=seed_title)
         active_conv_id = conv["id"]
+        await _broadcast_canonical_conversation_change(
+            active_conv_id,
+            revision=int(conv.get("revision") or 0),
+            operation_id=str(conv.get("last_operation_id") or ""),
+        )
         await ws.send_json({
             "type": "active_conversation",
             "id": conv["id"],
@@ -9614,6 +9776,11 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         persisted_user_content,
         turn_meta,
     )
+    if accepted_user_persisted and isinstance(turn_meta, dict):
+        await _broadcast_committed_receipt(
+            active_conv_id,
+            turn_meta.get("_user_commit"),
+        )
     if isinstance(turn_meta, dict):
         turn_meta["persisted"] = accepted_user_persisted
         if "_accepted_frame" not in turn_meta:
@@ -9897,6 +10064,10 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 response_frame,
                 terminal_frame,
             ):
+                await _broadcast_committed_receipt(
+                    active_conv_id,
+                    turn_meta.get("_assistant_commit"),
+                )
                 turn_meta["persisted"] = True
                 terminal_frame["persisted"] = True
                 await ws.send_json(response_frame)
@@ -10114,6 +10285,10 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             )
         _ts(t0, "assistant persistence failed")
         return new_history, active_conv_id
+    await _broadcast_committed_receipt(
+        active_conv_id,
+        turn_meta.get("_assistant_commit"),
+    )
     turn_meta["persisted"] = True
     stored_conversation = conversations.get_conversation(active_conv_id)
     if isinstance(stored_conversation, dict):

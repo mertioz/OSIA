@@ -286,7 +286,10 @@ class LanCorrelationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(returned_conv, conv["id"])
-        self.assertGreater(len(new_history), 2)
+        # WOR-216: the returned session context is rebuilt from the durable PC
+        # canonical history, so provider-internal planning/tool rounds cannot
+        # survive only in one server process.
+        self.assertEqual(len(new_history), 2)
         stored = server.conversations.get_conversation(conv["id"])["messages"]
         self.assertEqual(
             [(item["role"], item["content"]) for item in stored],
