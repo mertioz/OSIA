@@ -140,6 +140,12 @@ def test_110_notes_are_exhaustive_bilingual_and_manifest_compatible():
     assert "windows 1.1.0" in french
     assert "android 1.0.2" in french
     assert "limites connues" in french
+    assert "unknown publisher" in english
+    assert "smartscreen" in english
+    assert "more info" in english and "run anyway" in english
+    assert "éditeur inconnu" in french
+    assert "informations complémentaires" in french
+    assert "exécuter quand même" in french
 
 
 def test_generated_110_manifest_is_accepted_as_an_update_from_106():

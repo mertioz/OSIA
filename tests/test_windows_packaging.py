@@ -1055,6 +1055,16 @@ def test_wor183_major_update_is_explicit_localized_and_motion_safe():
     assert 'shutil.copy2(release_notes_fr, RELEASE / "release-notes-fr.txt")' in build
 
 
+def test_wor183_unsigned_stable_exception_is_explicit_and_version_scoped():
+    script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
+    build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
+    assert 'UNSIGNED_STABLE_RELEASES = frozenset({"1.1.0"})' in build
+    assert "version not in UNSIGNED_STABLE_RELEASES" in build
+    assert "english.UpdateUnsigned=Unsigned installer" in script
+    assert "french.UpdateUnsigned=Installateur non signé" in script
+    assert "UpdateUnsignedLabel.Visible := ({#SignedBuild} = 0);" in script
+
+
 def test_wor149_update_is_in_place_idempotent_and_rollback_safe():
     script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
     assert "UsePreviousAppDir=yes" in script

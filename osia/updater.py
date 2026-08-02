@@ -36,6 +36,7 @@ PRODUCT = "OSIA"
 PLATFORM = "windows"
 ARCHITECTURE = "x86_64"
 ALLOWED_CHANNELS = frozenset({"internal-preview", "stable"})
+UNSIGNED_STABLE_RELEASES = frozenset({"1.1.0"})
 ALLOWED_INSTALLER_HOST = "download.osia.space"
 CHANNEL_URLS = {
     "internal-preview": (
@@ -451,7 +452,11 @@ def parse_manifest(payload: bytes | str, metadata: AppMetadata) -> UpdateManifes
                 raise ValueError("invalid_signature_publisher")
         elif publisher is not None:
             raise ValueError("invalid_signature_publisher")
-        if metadata.channel == "stable" and not signed:
+        if (
+            metadata.channel == "stable"
+            and not signed
+            and version not in UNSIGNED_STABLE_RELEASES
+        ):
             raise ValueError("stable_unsigned")
 
         mandatory = raw["mandatory"]
@@ -820,8 +825,16 @@ def cleanup_updates(
 
 def _require_installable_channel(manifest: UpdateManifest) -> None:
     if manifest.channel == "stable":
-        # Stable remains intentionally closed until Authenticode verification is
-        # implemented in-process. A manifest assertion alone is not trust.
+        # WOR-183 has one explicit product-approved unsigned exception. HTTPS,
+        # the immutable path, exact byte count, and SHA-256 remain mandatory.
+        if (
+            manifest.version in UNSIGNED_STABLE_RELEASES
+            and not manifest.installer.signed
+        ):
+            return
+        # Other stable releases remain closed until WOR-220 implements
+        # in-process Authenticode verification. A manifest assertion alone is
+        # not trust.
         raise DownloadError("stable_authenticode_unavailable")
     if manifest.channel != "internal-preview":
         raise DownloadError("unsupported_channel")

@@ -164,10 +164,23 @@ def test_duplicate_keys_and_non_finite_json_are_rejected():
         updater.parse_manifest(raw, metadata())
 
 
-def test_stable_unsigned_is_rejected_and_stable_install_fails_closed():
-    raw = manifest_dict(channel="stable")
+def test_only_wor183_stable_unsigned_release_is_installable(tmp_path):
+    raw = manifest_dict(version="1.1.0", channel="stable")
+    parsed = updater.parse_manifest(
+        json.dumps(raw), metadata(version="1.0.6", channel="stable")
+    )
+    path = updater.installer_path(parsed.version, tmp_path)
+    path.write_bytes(b"installer")
+    plan = updater.prepare_installer_plan(parsed, path)
+    assert plan.executable == path
+    assert updater.UNSIGNED_STABLE_RELEASES == frozenset({"1.1.0"})
+
+    future = manifest_dict(version="1.1.1", channel="stable")
     with pytest.raises(updater.ManifestError, match="stable_unsigned"):
-        updater.parse_manifest(json.dumps(raw), metadata(channel="stable"))
+        updater.parse_manifest(
+            json.dumps(future), metadata(version="1.1.0", channel="stable")
+        )
+
     internal = parse_manifest()
     signed = replace(internal, channel="stable", installer=replace(
         internal.installer, signed=True, signature_publisher="OSIA"

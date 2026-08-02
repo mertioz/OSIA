@@ -376,6 +376,22 @@ _RELEASES = (
                 ),
             ),
             ReleaseSection(
+                "Unsigned Windows installer",
+                "Installateur Windows non signé",
+                (
+                    "Windows 1.1.0 is distributed without an Authenticode signature, so Windows may show Unknown publisher or a Microsoft Defender SmartScreen warning.",
+                    "The installer is distributed from the official OSIA HTTPS domain at download.osia.space.",
+                    "Verify the installer against the SHA-256 published on osia.space before running it.",
+                    "When you trust the official download, SmartScreen offers More info, then Run anyway; do not disable Windows security protections.",
+                ),
+                (
+                    "Windows 1.1.0 est distribué sans signature Authenticode ; Windows peut donc afficher Éditeur inconnu ou un avertissement Microsoft Defender SmartScreen.",
+                    "L’installateur est distribué depuis le domaine HTTPS officiel d’OSIA, download.osia.space.",
+                    "Vérifiez l’installateur avec le SHA-256 publié sur osia.space avant de l’exécuter.",
+                    "Si vous faites confiance au téléchargement officiel, SmartScreen propose Informations complémentaires puis Exécuter quand même ; ne désactivez pas les protections de sécurité Windows.",
+                ),
+            ),
+            ReleaseSection(
                 "Android UX and reliability",
                 "UX et fiabilité Android",
                 (

@@ -116,7 +116,7 @@ english.UpdateHeading=Update OSIA
 english.UpdateDescription=A secure update, without reconfiguring OSIA.
 english.UpdateVersions=OSIA %s → OSIA %s
 english.UpdatePreserved=Your settings, memory, and connections will be preserved.
-english.UpdateUnsigned=Internal preview  ·  Not signed
+english.UpdateUnsigned=Unsigned installer  ·  Verify the published SHA-256
 english.UpdateButton=Update
 english.UpdateMissingInstall=OSIA Update could not find an existing OSIA installation for this user.
 english.UpdateInvalidDir=OSIA Update found an invalid existing installation directory. Reinstall OSIA before retrying the update.
@@ -186,7 +186,7 @@ french.UpdateHeading=Mise à jour d’OSIA
 french.UpdateDescription=Une mise à jour sûre, sans reconfigurer OSIA.
 french.UpdateVersions=OSIA %s → OSIA %s
 french.UpdatePreserved=Vos réglages, votre mémoire et vos connexions seront conservés.
-french.UpdateUnsigned=Aperçu interne  ·  Non signé
+french.UpdateUnsigned=Installateur non signé  ·  Vérifiez le SHA-256 publié
 french.UpdateButton=Mettre à jour
 french.UpdateMissingInstall=OSIA Update n’a trouvé aucune installation OSIA existante pour cet utilisateur.
 french.UpdateInvalidDir=OSIA Update a trouvé un dossier d’installation existant invalide. Réinstallez OSIA avant de relancer la mise à jour.
@@ -676,7 +676,7 @@ begin
     UpdateUnsignedLabel.SetBounds(ContentLeft, ScaleY(232),
       ContentWidth, ScaleY(24));
     UpdateUnsignedLabel.Caption := CustomMessage('UpdateUnsigned');
-    UpdateUnsignedLabel.Visible := ({#InternalBuild} = 1) and ({#SignedBuild} = 0);
+    UpdateUnsignedLabel.Visible := ({#SignedBuild} = 0);
     StyleLabel(UpdateUnsignedLabel, TColor(OSIA_WARNING_TEXT),
       TColor(OSIA_MAIN_BACKGROUND));
     UpdateUnsignedLabel.Alignment := taCenter;

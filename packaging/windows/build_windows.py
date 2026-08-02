@@ -47,6 +47,7 @@ CODEX_RUNTIME_URL = (
 SOURCE_VERSION = PRODUCT_VERSION
 DEFAULT_BUILD_CHANNEL = "internal-preview"
 ALLOWED_BUILD_CHANNELS = {"internal-preview", "stable"}
+UNSIGNED_STABLE_RELEASES = frozenset({"1.1.0"})
 UPDATER_SCHEMA_VERSION = 1
 
 _APPROVED_INNO_RUNTIME_CONSTANTS = frozenset({
@@ -750,7 +751,11 @@ def build(
     _run_package_smoke(DIST / "OSIA.exe")
     signed_app = _sign(DIST / "OSIA.exe")
     if skip_installer:
-        if channel == "stable" and not signed_app:
+        if (
+            channel == "stable"
+            and not signed_app
+            and version not in UNSIGNED_STABLE_RELEASES
+        ):
             raise RuntimeError("stable builds require Authenticode signing")
         return None
 
@@ -777,7 +782,11 @@ def build(
     if not installer.is_file():
         raise FileNotFoundError(installer)
     signed_installer = _sign(installer)
-    if channel == "stable" and not (signed_app and signed_installer):
+    if (
+        channel == "stable"
+        and not (signed_app and signed_installer)
+        and version not in UNSIGNED_STABLE_RELEASES
+    ):
         installer.unlink(missing_ok=True)
         raise RuntimeError("stable builds require signed application and installer artifacts")
     checksum = _sha256(installer)

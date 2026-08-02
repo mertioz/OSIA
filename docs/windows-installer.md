@@ -62,15 +62,21 @@ Outputs are ignored by Git:
 The build signs `OSIA.exe` before installer compilation and signs the final
 installer when `OSIA_SIGN_SHA1` contains the SHA-1 thumbprint of an accessible
 Authenticode certificate. The signing stage uses SHA-256 and an RFC 3161
-timestamp, then verifies the signature. Without a certificate the internal
-artifact is still built, but it is explicitly reported as unsigned and should
-not be advertised as a public release because Windows SmartScreen reputation
-cannot be established.
+timestamp, then verifies the signature.
 
-The stock PyAV wheel and bundled eSpeak NG runtime also create a public
-distribution gate: their native payloads are GPL. See the installed
-`THIRD_PARTY_NOTICES.md`. Public distribution requires a completed GPL source
-and notice process, or an approved replacement build, in addition to signing.
+WOR-183 has one explicit product-approved exception for the public Windows
+1.1.0 stable release. That installer is intentionally unsigned and its manifest
+records `signed: false` with no publisher claim. Windows may show **Unknown
+publisher** / **Éditeur inconnu** or a Microsoft Defender SmartScreen warning.
+Users should download only from the official OSIA HTTPS domain, verify the
+published SHA-256, and may choose **More info** / **Informations
+complémentaires**, then **Run anyway** / **Exécuter quand même** when they trust
+that official download. They must not be told to disable SmartScreen, Microsoft
+Defender, antivirus software, or other Windows security protections. WOR-220
+owns Authenticode signing for future public releases.
+
+The stock PyAV wheel and bundled eSpeak NG runtime require the documented GPL
+source and notice process. See the installed `THIRD_PARTY_NOTICES.md`.
 
 ## Installer behavior and switches
 
