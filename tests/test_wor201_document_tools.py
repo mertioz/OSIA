@@ -274,6 +274,38 @@ def test_document_single_flight_excludes_other_and_preserves_unknown(monkeypatch
         assert reused is False
     assert len(unknown_calls) == 2
 
+    terminal_calls = []
+    terminal_error = (
+        'ERROR: {"category":"resource_limit_exceeded",'
+        '"limit_kind":"page_count","ok":false}'
+    )
+    monkeypatch.setitem(
+        agent_module.TOOL_MAP,
+        "read_document",
+        lambda **kwargs: terminal_calls.append(dict(kwargs)) or terminal_error,
+    )
+    terminal_single_flight = agent_module._SameTurnDocumentSingleFlight()
+    terminal_records = [
+        _single_flight_policy_call(
+            terminal_single_flight,
+            "read_document",
+            {"path": r"C:\Synthetic\two-pages.pdf", "max_pages": 1},
+        )
+        for _ in range(2)
+    ]
+    assert len(terminal_calls) == 1
+    assert [reused for _record, reused, _normalized in terminal_records] == [
+        False, True,
+    ]
+    for record, _reused, _normalized in terminal_records:
+        assert record.result == terminal_error
+        assert record.outcome == ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
+        assert record.timed_out is False
+    assert terminal_records[0][0].dispatched is True
+    assert terminal_records[0][0].attempts == 1
+    assert terminal_records[1][0].dispatched is False
+    assert terminal_records[1][0].attempts == 0
+
     rejected = agent_module._execute_tool_with_policy(
         "read_document", {"path": "relative.pdf"}, lang="en",
     )
@@ -598,6 +630,7 @@ def test_dedicated_document_routing_has_one_final_and_no_shell_fallback(monkeypa
     windows_example = r'{"path":"C:\\Users\\Example\\Desktop\\report.pdf"}'
     assert windows_example in description
     assert '"path":"<value>"' not in description
+    assert "max_pages is only a whole-document safety ceiling" in description
 
     prompt = static_tool_prompt_block("en")
     read_line = next(
@@ -605,6 +638,14 @@ def test_dedicated_document_routing_has_one_final_and_no_shell_fallback(monkeypa
     )
     assert '"path": "<value>"' in read_line
     assert "never shell, read_file, or render_pdf" in read_line
+    assert "whole-document safety ceiling" in read_line
+
+    query_description = get_tool_spec("query_document").capability
+    assert "pages lists rendered page-frame metadata" in query_description
+    query_line = next(
+        line for line in prompt.splitlines() if line.startswith("- query_document:")
+    )
+    assert "search with the user's semantic target" in query_line
 
     calls = []
     monkeypatch.setitem(

@@ -491,7 +491,11 @@ def read_document(
 
             try:
                 document, media_private_metadata = extract_media(
-                    data, identity, language_value, include_private=True,
+                    data,
+                    identity,
+                    language_value,
+                    include_private=True,
+                    max_image_pixels=limits.max_pixels,
                 )
             except MediaReadError as exc:
                 print(

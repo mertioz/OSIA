@@ -188,6 +188,7 @@ def extract_media(
     language: str = "",
     *,
     include_private: bool = False,
+    max_image_pixels: int | None = None,
 ) -> dict | tuple[dict, dict]:
     """Extract one already-identified media source in an isolated process."""
 
@@ -198,6 +199,16 @@ def extract_media(
         raise MediaReadError("resource_limit_exceeded", limit_kind="file_size")
     if identity.family not in {"image", "audio", "video"}:
         raise MediaReadError("unsupported_media")
+    image_pixel_limit = (
+        MAX_IMAGE_PIXELS
+        if max_image_pixels is None
+        else max_image_pixels
+    )
+    if (
+        type(image_pixel_limit) is not int
+        or not 1 <= image_pixel_limit <= MAX_IMAGE_PIXELS
+    ):
+        raise MediaReadError("extraction_failure")
     cleanup_orphan_jobs()
     directory = _job_directory()
     process: subprocess.Popen | None = None
@@ -208,6 +219,7 @@ def extract_media(
             "format_label": identity.format_label,
             "family": identity.family,
             "language": str(language or "")[:24],
+            "max_image_pixels": image_pixel_limit,
             "warnings": [
                 code for code in identity.warnings
                 if _SAFE_CODE_RE.fullmatch(str(code or ""))
@@ -419,6 +431,12 @@ def _extract_image(path: Path, request: dict) -> dict:
     try:
         from PIL import Image, ImageOps, UnidentifiedImageError
 
+        image_pixel_limit = request.get("max_image_pixels", MAX_IMAGE_PIXELS)
+        if (
+            type(image_pixel_limit) is not int
+            or not 1 <= image_pixel_limit <= MAX_IMAGE_PIXELS
+        ):
+            raise MediaReadError("extraction_failure")
         with Image.open(path) as source:
             total = int(getattr(source, "n_frames", 1) or 1)
             if total <= 0:
@@ -444,7 +462,7 @@ def _extract_image(path: Path, request: dict) -> dict:
                         "resource_limit_exceeded", limit_kind="image_dimensions",
                     )
                 pixels = width * height
-                if pixels > MAX_IMAGE_PIXELS:
+                if pixels > image_pixel_limit:
                     raise MediaReadError(
                         "resource_limit_exceeded", limit_kind="image_pixels",
                     )

@@ -656,7 +656,9 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               "read_document",
               "Read an existing PDF or document with this dedicated tool, never shell, read_file, or render_pdf. Pass exactly one canonical source: path for an exact absolute local path, for example "
               '{"path":"C:\\\\Users\\\\Example\\\\Desktop\\\\report.pdf"}, '
-              "or source_ref for an opaque attachment/browser artifact reference",
+              "or source_ref for an opaque attachment/browser artifact reference. "
+              "max_pages is only a whole-document safety ceiling: omit it for "
+              "selected-page questions and query the resulting document_id instead",
               _object({"path": ABSOLUTE_DOCUMENT_PATH,
                        "source_ref": DOCUMENT_SOURCE_REF,
                        "language": _nullable(_string(maximum=24)),
@@ -680,7 +682,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               R, I, NC, preconditions=("authorized_live_artifact",),
               result=ResultPolicy.PRIVATE_MODEL_ONLY,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY, real=read_real),
-        _spec("query_document", "Query one private structured document by opaque reference. Omit max_chars for the safe 8000-character response default; larger requested budgets up to 32000 are accepted but safely capped to 8000 per response",
+        _spec("query_document", "Query one private structured document by opaque reference. For text on a requested PDF page, use search with the user's semantic target or chunks with provenance; pages lists rendered page-frame metadata and can be empty for native PDF text. Omit max_chars for the safe 8000-character response default; larger requested budgets up to 32000 are accepted but safely capped to 8000 per response",
               _object({
                   "document_id": ARTIFACT_ID,
                   "operation": _string(enum=(
