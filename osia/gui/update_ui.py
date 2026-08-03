@@ -37,7 +37,9 @@ from osia import i18n
 from osia.gui.switch import OsiaSwitch
 from osia.gui.theme import get_theme_manager
 from osia.updater import (
+    CHANNEL_URLS,
     DownloadCancelled,
+    LEGACY_UNSIGNED_STABLE_BRIDGE,
     UpdateScheduler,
     UpdateStateStore,
     dismiss_update,
@@ -61,6 +63,27 @@ from osia.release_notes import (
     release_for_version,
 )
 from osia.version import PRODUCT_VERSION
+
+
+_LEGACY_UNSIGNED_STABLE_ERRORS = frozenset({"stable_unsigned", "stable_notsigned"})
+
+
+def update_error_text(code: str) -> str:
+    """Render actionable updater diagnostics without exposing only raw codes."""
+
+    if code in _LEGACY_UNSIGNED_STABLE_ERRORS:
+        bridge = LEGACY_UNSIGNED_STABLE_BRIDGE
+        size = f"{bridge.size_bytes:,}"
+        if i18n.get_language() == "fr":
+            size = size.replace(",", "\u202f")
+        return i18n.t(
+            "updates.error.legacy_unsigned_stable",
+            version=bridge.version,
+            url=bridge.url,
+            size=size,
+            sha256=bridge.sha256,
+        )
+    return i18n.t("updates.error", code=code)
 
 
 def _system_reduced_motion() -> bool:
@@ -155,6 +178,7 @@ class UpdateController(QObject):
             "progressTotal": 0,
             "error": None,
             "internalUnsigned": False,
+            "stableUnsigned": False,
             "majorUpdate": False,
             "bannerVisible": False,
         }
@@ -174,6 +198,7 @@ class UpdateController(QObject):
             manifest = parse_manifest(
                 json.dumps(cached, ensure_ascii=False, allow_nan=False),
                 replace(self.metadata, channel=cached_channel),
+                source_url=CHANNEL_URLS[cached_channel],
             )
         except Exception:
             return
@@ -190,6 +215,9 @@ class UpdateController(QObject):
             internalUnsigned=(
                 manifest.channel == "internal-preview"
                 and not manifest.installer.signed
+            ),
+            stableUnsigned=(
+                manifest.channel == "stable" and not manifest.installer.signed
             ),
         )
 
@@ -251,6 +279,7 @@ class UpdateController(QObject):
                     status="no_update", availableVersion=None,
                     availableChannel=None, availablePublishedAt=None,
                     releaseNotes=(), majorUpdate=False, internalUnsigned=False,
+                    stableUnsigned=False,
                     error=None, bannerVisible=False,
                 )
                 return
@@ -269,6 +298,7 @@ class UpdateController(QObject):
                 availableVersion=None, availableChannel=None,
                 availablePublishedAt=None, releaseNotes=(), majorUpdate=False,
                 internalUnsigned=False,
+                stableUnsigned=False,
                 bannerVisible=False,
                 error=None,
             )
@@ -285,6 +315,7 @@ class UpdateController(QObject):
             releaseNotes=manifest.release_notes,
             majorUpdate=is_major_update(manifest.version),
             internalUnsigned=(manifest.channel == "internal-preview" and not manifest.installer.signed),
+            stableUnsigned=(manifest.channel == "stable" and not manifest.installer.signed),
             bannerVisible=visible,
             error=None,
         )
@@ -311,6 +342,7 @@ class UpdateController(QObject):
                 releaseNotes=(),
                 majorUpdate=False,
                 internalUnsigned=False,
+                stableUnsigned=False,
                 bannerVisible=False,
                 error=None,
             )
@@ -372,10 +404,16 @@ class UpdateController(QObject):
     def _confirm_and_launch(self) -> None:
         if self.manifest is None or self.installer is None:
             return
+        confirmation_key = (
+            "updates.confirm_unsigned_stable_text"
+            if self.manifest.channel == "stable"
+            and not self.manifest.installer.signed
+            else "updates.confirm_text"
+        )
         answer = QMessageBox.question(
             self._confirmation_parent,
             i18n.t("updates.confirm_title"),
-            i18n.t("updates.confirm_text", version=self.manifest.version),
+            i18n.t(confirmation_key, version=self.manifest.version),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -714,6 +752,10 @@ class UpdateSettingsSection(QFrame):
         self.empty_state = QLabel()
         self.empty_state.setObjectName("sectionDesc")
         self.empty_state.setWordWrap(True)
+        self.empty_state.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByKeyboard
+            | Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         self.history_button = QPushButton()
         self.history_button.setObjectName("ghostBtn")
         self.history_button.setCheckable(True)
@@ -832,25 +874,38 @@ class UpdateSettingsSection(QFrame):
         available = state.get("availableVersion")
         notes = list(normalize_remote_notes(state.get("releaseNotes") or ()))
         available_entry = release_for_version(str(available)) if available else None
+        card_notes = list(
+            available_entry.changes(language)
+            if available_entry is not None else notes
+        )
+        sections = (
+            available_entry.note_sections(language)
+            if available_entry is not None else ()
+        )
         major_available = bool(
             state.get("majorUpdate") or is_major_update(str(available))
         ) if available else False
+        disclosure = ""
         if state.get("internalUnsigned"):
-            notes.insert(0, i18n.t("updates.internal_unsigned"))
+            disclosure = i18n.t("updates.internal_unsigned")
+        elif state.get("stableUnsigned"):
+            disclosure = i18n.t("updates.stable_unsigned")
+        if disclosure:
+            if sections:
+                sections = (
+                    (i18n.t("updates.unsigned_notice_title"), (disclosure,)),
+                    *sections,
+                )
+            else:
+                card_notes.insert(0, disclosure)
         self.available_card.setVisible(bool(available))
         if available:
             published = state.get("availablePublishedAt")
             self.available_card.apply(
                 version=str(available),
                 released_on=str(published)[:10] if published else None,
-                notes=(
-                    available_entry.changes(language)
-                    if available_entry is not None else tuple(notes)
-                ),
-                sections=(
-                    available_entry.note_sections(language)
-                    if available_entry is not None else ()
-                ),
+                notes=tuple(card_notes),
+                sections=sections,
                 badge=(
                     i18n.t("updates.major_update")
                     if major_available else i18n.t("updates.available_badge")
@@ -861,7 +916,7 @@ class UpdateSettingsSection(QFrame):
         if status == "offline":
             empty = i18n.t("updates.offline_installed_available")
         elif state.get("error"):
-            empty = i18n.t("updates.error", code=state["error"])
+            empty = update_error_text(str(state["error"]))
         elif not available:
             empty = i18n.t("updates.no_newer")
         else:

@@ -64,9 +64,16 @@ installer when `OSIA_SIGN_SHA1` contains the SHA-1 thumbprint of an accessible
 Authenticode certificate. The signing stage uses SHA-256 and an RFC 3161
 timestamp, then verifies the signature.
 
-WOR-183 has an explicit product-approved exception for the public Windows
-1.1.0 and 1.1.1 stable releases. Those installers are intentionally unsigned
-and their manifests record `signed: false` with no publisher claim. Windows may show **Unknown
+WOR-183 has an explicit product-approved exception for stable releases made
+before WOR-220. `TEMPORARY_UNSIGNED_STABLE_POLICY` bounds that exception to the
+exact official stable manifest endpoint, OSIA product/platform/architecture,
+`download.osia.space`, and the exact versioned installer path. The manifest's
+byte size and SHA-256 remain mandatory, and the complete download is rehashed
+before execution. An arbitrary `signed: false` manifest is not trusted. Remove
+this isolated policy when WOR-220 introduces recognized Authenticode signing.
+
+The public Windows 1.1.0 and 1.1.1 installers are intentionally unsigned and
+their manifests record `signed: false` with no publisher claim. Windows may show **Unknown
 publisher** / **Éditeur inconnu** or a Microsoft Defender SmartScreen warning.
 Users should download only from the official OSIA HTTPS domain, verify the
 published SHA-256, and may choose **More info** / **Informations
@@ -74,6 +81,18 @@ complémentaires**, then **Run anyway** / **Exécuter quand même** when they tr
 that official download. They must not be told to disable SmartScreen, Microsoft
 Defender, antivirus software, or other Windows security protections. WOR-220
 owns Authenticode signing for future public releases.
+
+Windows 1.1.0 and older binaries cannot receive this source correction before
+their manifest check. If they reject 1.1.1 with `stable_unsigned` (sometimes
+reported as `stable_notsigned`), use the official immutable installer directly:
+
+- `https://download.osia.space/windows/1.1.1/OSIA-Setup.exe`
+- 1,185,800,867 bytes
+- SHA-256 `519c64d75eb4d793f6bf1c50bba64a3b7d3c8c2e81092df230da7724d6fd1e10`
+
+Verify both values, close OSIA, and run the installer in place. Do not uninstall
+first, clear `%USERPROFILE%\.osia`, or disable SmartScreen, Defender, antivirus,
+or any other Windows protection.
 
 The stock PyAV wheel and bundled eSpeak NG runtime require the documented GPL
 source and notice process. See the installed `THIRD_PARTY_NOTICES.md`.

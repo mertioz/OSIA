@@ -164,30 +164,96 @@ def test_duplicate_keys_and_non_finite_json_are_rejected():
         updater.parse_manifest(raw, metadata())
 
 
-def test_only_wor183_stable_unsigned_releases_are_installable(tmp_path):
-    for version, installed in (("1.1.0", "1.0.6"), ("1.1.1", "1.1.0")):
-        raw = manifest_dict(version=version, channel="stable")
-        parsed = updater.parse_manifest(
-            json.dumps(raw), metadata(version=installed, channel="stable")
-        )
-        path = updater.installer_path(parsed.version, tmp_path)
-        path.write_bytes(b"installer")
-        plan = updater.prepare_installer_plan(parsed, path)
-        assert plan.executable == path
-    assert updater.UNSIGNED_STABLE_RELEASES == frozenset({"1.1.0", "1.1.1"})
-
-    future = manifest_dict(version="1.1.2", channel="stable")
+def test_temporary_unsigned_stable_policy_is_official_source_bound(
+    monkeypatch, tmp_path,
+):
+    raw = manifest_dict(version="1.1.2", channel="stable")
+    installed = metadata(version="1.1.1", channel="stable")
+    with pytest.raises(updater.ManifestError, match="stable_unsigned"):
+        updater.parse_manifest(json.dumps(raw), installed)
     with pytest.raises(updater.ManifestError, match="stable_unsigned"):
         updater.parse_manifest(
-            json.dumps(future), metadata(version="1.1.1", channel="stable")
+            json.dumps(raw), installed,
+            source_url="https://download.osia.space/channels/internal-preview/windows-x64.json",
         )
 
+    parsed = updater.parse_manifest(
+        json.dumps(raw), installed,
+        source_url=updater.CHANNEL_URLS["stable"],
+    )
+    assert parsed.temporary_unsigned_stable is True
+    path = updater.installer_path(parsed.version, tmp_path)
+    path.write_bytes(b"installer")
+    assert updater.prepare_installer_plan(parsed, path).executable == path
+
+    policy = updater.TEMPORARY_UNSIGNED_STABLE_POLICY
+    assert policy.enabled is True
+    assert policy.authority_issue == "WOR-183"
+    assert policy.removal_issue == "WOR-220"
+    assert policy.manifest_url == updater.CHANNEL_URLS["stable"]
+    assert policy.installer_host == "download.osia.space"
+    monkeypatch.setattr(
+        updater, "TEMPORARY_UNSIGNED_STABLE_POLICY",
+        replace(policy, enabled=False),
+    )
+    with pytest.raises(updater.ManifestError, match="stable_unsigned"):
+        updater.parse_manifest(
+            json.dumps(raw), installed,
+            source_url=updater.CHANNEL_URLS["stable"],
+        )
+
+    bridge = updater.LEGACY_UNSIGNED_STABLE_BRIDGE
+    assert bridge.version == "1.1.1"
+    assert bridge.size_bytes == 1_185_800_867
+    assert bridge.sha256 == "519c64d75eb4d793f6bf1c50bba64a3b7d3c8c2e81092df230da7724d6fd1e10"
+
     internal = parse_manifest()
+    assert internal.temporary_unsigned_stable is False
     signed = replace(internal, channel="stable", installer=replace(
         internal.installer, signed=True, signature_publisher="OSIA"
     ))
     with pytest.raises(updater.DownloadError, match="stable_authenticode_unavailable"):
         updater.prepare_installer_plan(signed, Path("missing.exe"))
+
+
+def test_public_111_manifest_contract_and_conflicting_artifact_fail_closed(tmp_path):
+    raw = manifest_dict(version="1.1.1", channel="stable")
+    raw["publishedAt"] = "2026-08-03T10:49:23Z"
+    raw["installer"] = {
+        "url": "https://download.osia.space/windows/1.1.1/OSIA-Setup.exe",
+        "sizeBytes": 1_185_800_867,
+        "sha256": "519c64d75eb4d793f6bf1c50bba64a3b7d3c8c2e81092df230da7724d6fd1e10",
+        "signed": False,
+        "signaturePublisher": None,
+    }
+    current = metadata(version="1.1.0", channel="stable")
+    parsed = updater.parse_manifest(
+        json.dumps(raw), current, source_url=updater.CHANNEL_URLS["stable"]
+    )
+    assert parsed.version == "1.1.1"
+    assert parsed.installer.size_bytes == 1_185_800_867
+    assert parsed.installer.sha256 == raw["installer"]["sha256"]
+    assert parsed.temporary_unsigned_stable is True
+
+    store = updater.UpdateStateStore(tmp_path / "stable-state.json")
+    fetched = updater.fetch_channel_manifest(
+        current, store,
+        open_response=opener(FakeResponse(200, json.dumps(raw).encode())),
+    )
+    assert fetched.manifest is not None
+    assert fetched.manifest.temporary_unsigned_stable is True
+
+    conflict = manifest_dict(b"approved", version="1.1.2", channel="stable")
+    conflicting_manifest = updater.parse_manifest(
+        json.dumps(conflict), metadata(version="1.1.1", channel="stable"),
+        source_url=updater.CHANNEL_URLS["stable"],
+    )
+    response = FakeResponse(200, b"tampered", {"Content-Length": "8"})
+    with pytest.raises(updater.DownloadError, match="sha256_mismatch"):
+        updater.download_installer(
+            conflicting_manifest, updates_dir=tmp_path,
+            open_response=opener(response),
+        )
 
 
 def test_fetch_uses_validators_and_304_cache(tmp_path):
@@ -380,6 +446,72 @@ def test_update_widgets_render_all_key_states(monkeypatch, tmp_path):
         app.processEvents()
         assert status.replace("_", " ").split()[0].lower() in section.summary.text().lower() or section.summary.text()
     assert banner.label.text()
+
+
+def test_unsigned_stable_diagnostic_disclosure_and_consent(monkeypatch, tmp_path):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+    from osia import i18n
+    from osia.gui import update_ui
+
+    app = QApplication.instance() or QApplication([])
+    original_language = i18n.get_language()
+    try:
+        i18n.set_language("en", persist=False)
+        for code in ("stable_unsigned", "stable_notsigned"):
+            diagnostic = update_ui.update_error_text(code)
+            assert "too old" in diagnostic
+            assert updater.LEGACY_UNSIGNED_STABLE_BRIDGE.url in diagnostic
+            assert updater.LEGACY_UNSIGNED_STABLE_BRIDGE.sha256 in diagnostic
+            assert "Unknown Publisher" in diagnostic
+            assert "do not disable" in diagnostic
+            assert code not in diagnostic
+
+        raw = manifest_dict(version="1.1.1", channel="stable")
+        stable_manifest = updater.parse_manifest(
+            json.dumps(raw), metadata(version="1.1.0", channel="stable"),
+            source_url=updater.CHANNEL_URLS["stable"],
+        )
+        current = metadata(version="1.1.0", channel="stable")
+        monkeypatch.setattr(update_ui, "load_app_metadata", lambda: current)
+        monkeypatch.setattr(update_ui, "updater_enabled", lambda _metadata: True)
+        controller = update_ui.UpdateController(
+            store=updater.UpdateStateStore(tmp_path / "state.json")
+        )
+        controller._timer.stop()
+        controller._on_check_finished(
+            updater.ManifestFetchResult("available", stable_manifest),
+            True, None, False,
+        )
+        assert controller.state["stableUnsigned"] is True
+        assert controller.state["internalUnsigned"] is False
+
+        disclosure = i18n.t("updates.stable_unsigned")
+        assert "NotSigned" in disclosure
+        assert "Unknown Publisher" in disclosure
+
+        captured = {}
+
+        def cancel(_parent, title, message, *_args):
+            captured.update(title=title, message=message)
+            return QMessageBox.StandardButton.Cancel
+
+        monkeypatch.setattr(QMessageBox, "question", cancel)
+        controller.manifest = stable_manifest
+        controller.installer = tmp_path / "verified-installer.exe"
+        controller._confirm_and_launch()
+        assert "fully verified" in captured["message"]
+        assert "NotSigned" in captured["message"]
+        assert "Unknown Publisher" in captured["message"]
+        assert "protections enabled" in captured["message"]
+
+        i18n.set_language("fr", persist=False)
+        french = update_ui.update_error_text("stable_notsigned")
+        assert "trop ancien" in french
+        assert "Éditeur inconnu" in french
+        assert "ne les désactivez pas" in french
+    finally:
+        i18n.set_language(original_language, persist=False)
 
 
 def test_update_check_is_off_gui_thread_and_manual_offline_is_visible(monkeypatch, tmp_path):

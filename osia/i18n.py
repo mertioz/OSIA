@@ -238,14 +238,30 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Internal preview build; the installer is unsigned.",
         "fr": "Build d’aperçu interne ; l’installateur n’est pas signé.",
     },
+    "updates.stable_unsigned": {
+        "en": "NotSigned installer: Windows will show Unknown Publisher and may show Microsoft Defender SmartScreen.",
+        "fr": "Installateur NotSigned : Windows affichera Éditeur inconnu et peut afficher Microsoft Defender SmartScreen.",
+    },
+    "updates.unsigned_notice_title": {
+        "en": "Windows security notice",
+        "fr": "Information de sécurité Windows",
+    },
     "updates.error": {
         "en": "Last error: {code}",
         "fr": "Dernière erreur : {code}",
+    },
+    "updates.error.legacy_unsigned_stable": {
+        "en": "This installed updater is too old to install the current unsigned stable release automatically.\n\nUse the official manual in-place update:\n{url}\nVersion: {version}\nSize: {size} bytes\nSHA-256: {sha256}\n\nThe installer is NotSigned. Windows will show Unknown Publisher and may show Microsoft Defender SmartScreen. Keep Windows protections enabled; do not disable them.",
+        "fr": "Le programme de mise à jour installé est trop ancien pour installer automatiquement la version stable non signée actuelle.\n\nUtilisez la mise à jour manuelle officielle sur place :\n{url}\nVersion : {version}\nTaille : {size} octets\nSHA-256 : {sha256}\n\nL’installateur est NotSigned. Windows affichera Éditeur inconnu et peut afficher Microsoft Defender SmartScreen. Gardez les protections Windows activées ; ne les désactivez pas.",
     },
     "updates.confirm_title": {"en": "Install OSIA update", "fr": "Installer la mise à jour OSIA"},
     "updates.confirm_text": {
         "en": "The verified {version} installer is ready. OSIA will close and the visible installer will open. Continue?",
         "fr": "L’installateur vérifié {version} est prêt. OSIA va se fermer et l’installateur visible va s’ouvrir. Continuer ?",
+    },
+    "updates.confirm_unsigned_stable_text": {
+        "en": "The official {version} installer was downloaded from download.osia.space and fully verified against the manifest size and SHA-256. It is NotSigned: Windows will show Unknown Publisher and may show Microsoft Defender SmartScreen. OSIA will keep Windows protections enabled. Close OSIA and open the visible installer?",
+        "fr": "L’installateur officiel {version} a été téléchargé depuis download.osia.space et entièrement vérifié avec la taille et le SHA-256 du manifeste. Il est NotSigned : Windows affichera Éditeur inconnu et peut afficher Microsoft Defender SmartScreen. OSIA gardera les protections Windows activées. Fermer OSIA et ouvrir l’installateur visible ?",
     },
     "updates.status.disabled": {"en": "Disabled in source mode", "fr": "Désactivée en mode source"},
     "updates.status.idle": {"en": "Ready", "fr": "Prête"},

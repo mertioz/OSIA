@@ -36,7 +36,6 @@ PRODUCT = "OSIA"
 PLATFORM = "windows"
 ARCHITECTURE = "x86_64"
 ALLOWED_CHANNELS = frozenset({"internal-preview", "stable"})
-UNSIGNED_STABLE_RELEASES = frozenset({"1.1.0", "1.1.1"})
 ALLOWED_INSTALLER_HOST = "download.osia.space"
 CHANNEL_URLS = {
     "internal-preview": (
@@ -126,6 +125,47 @@ class InstallerSpec:
 
 
 @dataclass(frozen=True)
+class TemporaryUnsignedStablePolicy:
+    """Explicit pre-WOR-220 trust boundary for official stable manifests."""
+
+    enabled: bool
+    authority_issue: str
+    removal_issue: str
+    channel: str
+    manifest_url: str
+    minimum_version: str
+    installer_host: str
+
+
+@dataclass(frozen=True)
+class ManualUpdateBridge:
+    """Exact immutable installer offered to clients with the legacy policy."""
+
+    version: str
+    url: str
+    size_bytes: int
+    sha256: str
+
+
+TEMPORARY_UNSIGNED_STABLE_POLICY = TemporaryUnsignedStablePolicy(
+    enabled=True,
+    authority_issue="WOR-183",
+    removal_issue="WOR-220",
+    channel="stable",
+    manifest_url=CHANNEL_URLS["stable"],
+    minimum_version="1.1.0",
+    installer_host=ALLOWED_INSTALLER_HOST,
+)
+
+LEGACY_UNSIGNED_STABLE_BRIDGE = ManualUpdateBridge(
+    version="1.1.1",
+    url="https://download.osia.space/windows/1.1.1/OSIA-Setup.exe",
+    size_bytes=1_185_800_867,
+    sha256="519c64d75eb4d793f6bf1c50bba64a3b7d3c8c2e81092df230da7724d6fd1e10",
+)
+
+
+@dataclass(frozen=True)
 class UpdateManifest:
     schema_version: int
     product: str
@@ -141,6 +181,7 @@ class UpdateManifest:
     release_notes: tuple[str, ...]
     release_notes_url: None
     rollout_state: str
+    temporary_unsigned_stable: bool = False
 
     def as_dict(self) -> dict:
         return {
@@ -386,7 +427,40 @@ def _validate_installer_url(value: object, version: str) -> str:
     return value
 
 
-def parse_manifest(payload: bytes | str, metadata: AppMetadata) -> UpdateManifest:
+def _temporary_unsigned_stable_allowed(
+    metadata: AppMetadata,
+    *,
+    source_url: str | None,
+    version: str,
+    installer_url: str,
+    signed: bool,
+    signature_publisher: str | None,
+) -> bool:
+    """Authorize only the official stable release configuration pre-WOR-220."""
+
+    policy = TEMPORARY_UNSIGNED_STABLE_POLICY
+    parsed_installer = urlsplit(installer_url)
+    return (
+        policy.enabled
+        and metadata.product == PRODUCT
+        and metadata.platform == PLATFORM
+        and metadata.architecture == ARCHITECTURE
+        and metadata.channel == policy.channel
+        and source_url == policy.manifest_url
+        and compare_versions(version, policy.minimum_version) >= 0
+        and parsed_installer.hostname == policy.installer_host
+        and parsed_installer.path == f"/windows/{version}/OSIA-Setup.exe"
+        and signed is False
+        and signature_publisher is None
+    )
+
+
+def parse_manifest(
+    payload: bytes | str,
+    metadata: AppMetadata,
+    *,
+    source_url: str | None = None,
+) -> UpdateManifest:
     try:
         raw = _require_object(
             _load_json_strict(payload, maximum=MANIFEST_MAX_BYTES),
@@ -453,12 +527,18 @@ def parse_manifest(payload: bytes | str, metadata: AppMetadata) -> UpdateManifes
                 raise ValueError("invalid_signature_publisher")
         elif publisher is not None:
             raise ValueError("invalid_signature_publisher")
-        if (
-            metadata.channel == "stable"
-            and not signed
-            and version not in UNSIGNED_STABLE_RELEASES
-        ):
-            raise ValueError("stable_unsigned")
+        temporary_unsigned_stable = False
+        if metadata.channel == "stable" and not signed:
+            temporary_unsigned_stable = _temporary_unsigned_stable_allowed(
+                metadata,
+                source_url=source_url,
+                version=version,
+                installer_url=url,
+                signed=signed,
+                signature_publisher=publisher,
+            )
+            if not temporary_unsigned_stable:
+                raise ValueError("stable_unsigned")
 
         mandatory = raw["mandatory"]
         if type(mandatory) is not bool:
@@ -498,6 +578,7 @@ def parse_manifest(payload: bytes | str, metadata: AppMetadata) -> UpdateManifes
             release_notes=notes,
             release_notes_url=None,
             rollout_state=rollout_state,
+            temporary_unsigned_stable=temporary_unsigned_stable,
         )
     except ValueError as exc:
         raise ManifestError(str(exc)) from exc
@@ -826,6 +907,7 @@ def fetch_channel_manifest(
     if metadata.channel not in CHANNEL_URLS:
         raise ManifestError("invalid_metadata_channel")
     state = store.load()
+    channel_url = CHANNEL_URLS[metadata.channel]
     headers = {
         "Accept": "application/json",
         "User-Agent": f"OSIA-Updater/{metadata.version}",
@@ -837,7 +919,7 @@ def fetch_channel_manifest(
         headers["If-Modified-Since"] = state["lastModified"]
     try:
         with open_response(
-            CHANNEL_URLS[metadata.channel],
+            channel_url,
             headers,
             CONNECT_TIMEOUT_SECONDS,
             READ_TIMEOUT_SECONDS,
@@ -847,7 +929,9 @@ def fetch_channel_manifest(
                 if not isinstance(cached, dict):
                     raise ManifestError("not_modified_without_cache")
                 manifest = parse_manifest(
-                    json.dumps(cached, ensure_ascii=False, allow_nan=False), metadata
+                    json.dumps(cached, ensure_ascii=False, allow_nan=False),
+                    metadata,
+                    source_url=channel_url,
                 )
                 store.update(lastCheckedAt=int(time.time()), lastError=None)
                 return ManifestFetchResult("not_modified", manifest)
@@ -866,7 +950,7 @@ def fetch_channel_manifest(
                 if total > MANIFEST_MAX_BYTES:
                     raise ManifestError("manifest_too_large")
             payload = b"".join(chunks)
-            manifest = parse_manifest(payload, metadata)
+            manifest = parse_manifest(payload, metadata, source_url=channel_url)
             etag = response.headers.get("ETag")
             modified = response.headers.get("Last-Modified")
             store.update(
@@ -1007,11 +1091,12 @@ def cleanup_updates(
 
 def _require_installable_channel(manifest: UpdateManifest) -> None:
     if manifest.channel == "stable":
-        # WOR-183 has one explicit product-approved unsigned exception. HTTPS,
-        # the immutable path, exact byte count, and SHA-256 remain mandatory.
+        # Temporary pre-WOR-220 authorization is stamped only by parse_manifest
+        # after the exact official stable source and release shape are checked.
         if (
-            manifest.version in UNSIGNED_STABLE_RELEASES
+            manifest.temporary_unsigned_stable
             and not manifest.installer.signed
+            and manifest.installer.signature_publisher is None
         ):
             return
         # Other stable releases remain closed until WOR-220 implements
@@ -1221,11 +1306,13 @@ __all__ = [
     "INSTALLER_MAX_BYTES",
     "InstallerPlan",
     "InstallerSpec",
+    "LEGACY_UNSIGNED_STABLE_BRIDGE",
     "MANIFEST_MAX_BYTES",
     "ManifestError",
     "ManifestFetchResult",
     "MetadataError",
     "UpdateManifest",
+    "TEMPORARY_UNSIGNED_STABLE_POLICY",
     "UpdateScheduler",
     "UpdateStateStore",
     "cleanup_updates",
