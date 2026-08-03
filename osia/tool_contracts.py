@@ -601,6 +601,33 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
         "source": _string(maximum=32),
     })
     specs = [
+        _spec(
+            "start_autonomous_mission",
+            "Route one current chat request into the canonical Autonomous runner",
+            _object({
+                "reason_code": _string(
+                    enum=(
+                        "dependent_phases", "extended_research",
+                        "iterative_artifact", "sustained_computer_work",
+                        "bounded_turn_infeasible",
+                    ),
+                    maximum=48,
+                ),
+                "confidence": _number(0.0, 1.0),
+                "explicit_request": _boolean(),
+            }, required=("reason_code", "confidence", "explicit_request")),
+            PL,
+            N,
+            NC,
+            preconditions=("chat_routing_context_available",),
+            timeout=240.0,
+            retry=RetryPolicy.NEVER_AFTER_DISPATCH,
+            progress=effect,
+            real=local_real,
+            verified=True,
+            autonomous_eligible=False,
+            scheduled_eligible=False,
+        ),
         _spec("save_memory", "Persist one validated local memory", _object({
             "type": _string(enum=("route", "preference", "fact", "workflow", "contact", "shortcut"), maximum=32),
             "category": _string(enum=("app", "site", "deep_link", "folder", "file", "game", "user", "workflow", "contact", "other"), maximum=32),

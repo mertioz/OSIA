@@ -4322,6 +4322,8 @@ _autonomous: dict = {
 # thread and the orchestrator/worker daemon threads. Non-reentrant — the helpers
 # below NEVER nest acquisitions of it.
 _autonomous_lock = threading.Lock()
+_CHAT_ROUTE_REQUESTS_LOCK = threading.Lock()
+_CHAT_ROUTE_REQUESTS: OrderedDict[str, dict] = OrderedDict()
 
 # Sentinel so _autonomous_frame() can tell "snapshot the current run" (default)
 # apart from an explicit "no run → empty snapshot" (st=None).
@@ -5064,6 +5066,8 @@ def _autonomous_start_worker(
     document_session_owner: str = "",
     document_permission_epoch: int = 0,
     document_owner_device: str = "",
+    strict_provider: str = "",
+    chat_route: dict | None = None,
 ) -> None:
     """Plan + launch OFF the event loop (planning blocks on an LLM run). The
     single-runner slot (generation ``my_gen``) was already acquired by the
@@ -5142,8 +5146,11 @@ def _autonomous_start_worker(
             resolve_current_autonomous_selection,
         )
         resolution = resolve_current_autonomous_selection(
-            wire_value=model,
+            provider_id=strict_provider if strict_provider else "",
+            model_id=model if strict_provider else "",
+            wire_value=None if strict_provider else model,
             refresh_account=True,
+            strict=bool(strict_provider),
         )
         provider = resolution.get("provider_id") or ""
         model = resolution.get("model_id") or ""
@@ -5221,6 +5228,22 @@ def _autonomous_start_worker(
                 )
             _release_single_runner_if_gen(my_gen)
             return
+
+        if isinstance(chat_route, dict):
+            request_id = str(chat_route.get("request_id") or "")[:160]
+            reason_code = str(chat_route.get("reason_code") or "")[:48]
+            if request_id:
+                st["chat_route_request_id"] = request_id
+            if reason_code:
+                st["chat_route_reason_code"] = reason_code
+            confidence = chat_route.get("confidence")
+            if isinstance(confidence, (int, float)) and not isinstance(
+                confidence, bool
+            ):
+                st["chat_route_confidence"] = max(
+                    0.0, min(1.0, float(confidence))
+                )
+            st["chat_route_type"] = "autonomous"
 
         # ── Establish the run atomically — only if our slot is still current ──
         established = False
@@ -5331,6 +5354,201 @@ def _autonomous_start_worker(
         # the interrupt backstop / next drain reopens it once the orphan dies).
         if not _orch_loop_alive():
             _autonomous["interrupting"] = False
+
+
+def _chat_route_result_from_state(st: dict | None, *, active: bool) -> dict:
+    if not isinstance(st, dict):
+        return {"status": "failed", "error_code": "start_state_unavailable"}
+    base = {
+        "task_id": str(st.get("task_id") or "")[:160],
+        "run_id": str(st.get("run_id") or "")[:160],
+    }
+    run_state = str(st.get("run_state") or "")
+    status = str(st.get("status") or "")
+    if status in {"failed", "aborted"} or st.get("failure_diagnostic"):
+        diagnostic = st.get("failure_diagnostic")
+        code = (
+            str(diagnostic.get("reason_code") or "")[:80]
+            if isinstance(diagnostic, dict) else "start_failed"
+        )
+        return {**base, "status": "failed", "error_code": code or "start_failed"}
+    if run_state == "blocked_outcome_unknown":
+        return {**base, "status": "outcome_unknown"}
+    if run_state in {
+        "authorization_pending",
+        "suspended_scope_extension",
+        "suspended_authorization_revoked",
+    }:
+        return {**base, "status": "authorization_pending"}
+    if active:
+        return {**base, "status": "running"}
+    if status == "in_progress":
+        return {**base, "status": "outcome_unknown"}
+    return {**base, "status": "failed", "error_code": "start_not_active"}
+
+
+def _remember_chat_route_result(
+    request_id: str,
+    fingerprint: str,
+    result: dict,
+) -> dict:
+    safe = dict(result)
+    with _CHAT_ROUTE_REQUESTS_LOCK:
+        _CHAT_ROUTE_REQUESTS[request_id] = {
+            "fingerprint": fingerprint,
+            "result": safe,
+        }
+        _CHAT_ROUTE_REQUESTS.move_to_end(request_id)
+        while len(_CHAT_ROUTE_REQUESTS) > 256:
+            _CHAT_ROUTE_REQUESTS.popitem(last=False)
+    return safe
+
+
+def _launch_autonomous_from_chat(request: dict) -> dict:
+    """Synchronously launch one validated chat handoff on the canonical runner."""
+
+    if not isinstance(request, dict):
+        return {"status": "failed", "error_code": "invalid_request"}
+    objective = str(request.get("objective") or "").strip()
+    request_id = str(request.get("request_id") or "").strip()
+    conversation_id = str(request.get("conversation_id") or "").strip()
+    origin_ref = str(request.get("origin_ref") or "desktop").strip()[:160]
+    device_id = str(request.get("device_id") or "").strip()[:128]
+    source_refs = request.get("source_refs") or []
+    if (
+        not objective
+        or len(objective) > 16_000
+        or not re.fullmatch(r"[A-Za-z0-9_.:-]{8,160}", request_id)
+        or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", conversation_id)
+        or not isinstance(source_refs, list)
+        or len(source_refs) > 10
+        or any(
+            not isinstance(ref, str)
+            or not re.fullmatch(r"(?:src|doc|web)_[0-9a-f]{32}", ref)
+            for ref in source_refs
+        )
+    ):
+        return {"status": "failed", "error_code": "invalid_request"}
+    fingerprint = hashlib.sha256(
+        (conversation_id + "\0" + objective).encode("utf-8")
+    ).hexdigest()
+    with _CHAT_ROUTE_REQUESTS_LOCK:
+        existing = _CHAT_ROUTE_REQUESTS.get(request_id)
+        if isinstance(existing, dict):
+            if existing.get("fingerprint") != fingerprint:
+                return {
+                    "status": "failed",
+                    "error_code": "duplicate_request_conflict",
+                }
+            result = existing.get("result")
+            return dict(result) if isinstance(result, dict) else {
+                "status": "starting",
+            }
+        _CHAT_ROUTE_REQUESTS[request_id] = {
+            "fingerprint": fingerprint,
+            "result": {"status": "starting"},
+        }
+
+    # Restart/reconnect idempotency: never create a second mission for a chat
+    # request already bound into the persisted Autonomous state.
+    with _autonomous_lock:
+        current_state = _autonomous.get("st")
+        current_active = bool(_autonomous.get("active"))
+    if not isinstance(current_state, dict):
+        try:
+            current_state = _astate.load_task_state()
+        except Exception:
+            current_state = None
+    if (
+        isinstance(current_state, dict)
+        and current_state.get("chat_route_request_id") == request_id
+    ):
+        return _remember_chat_route_result(
+            request_id,
+            fingerprint,
+            _chat_route_result_from_state(current_state, active=current_active),
+        )
+
+    from osia.mobile_model_catalogue import resolve_current_autonomous_selection
+
+    resolution = resolve_current_autonomous_selection(
+        refresh_account=True,
+        strict=True,
+    )
+    provider = str(resolution.get("provider_id") or "")
+    model = str(resolution.get("model_id") or "")
+    if not provider or not model:
+        return _remember_chat_route_result(request_id, fingerprint, {
+            "status": "unavailable",
+            "error_code": str(resolution.get("reason") or "model_unavailable")[:80],
+        })
+
+    try:
+        from osia.action_policy import get_default_permission_policy
+
+        permission_epoch = int(
+            get_default_permission_policy().store.load_state().policy_epoch
+        )
+        document_inventory = (
+            document_sources.get_source_store().inspect_for_binding(
+                source_refs,
+                owner_id=conversation_id,
+                permission_epoch=permission_epoch,
+            )
+            if source_refs else []
+        )
+    except document_sources.DocumentSourceError:
+        return _remember_chat_route_result(request_id, fingerprint, {
+            "status": "failed",
+            "error_code": "invalid_document_sources",
+        })
+
+    autonomous_context = request.get("turn_context")
+    if not isinstance(autonomous_context, TurnContext):
+        autonomous_context = resolve_turn_context(
+            objective,
+            client_locale=request.get("language"),
+            saved_language=i18n.get_language(),
+            reference=request_id,
+        )
+    generation = _acquire_single_runner()
+    if generation is None:
+        return _remember_chat_route_result(request_id, fingerprint, {
+            "status": "busy",
+            "error_code": "single_runner_busy",
+        })
+
+    _autonomous["origin_ref"] = origin_ref or "desktop"
+    _autonomous["document_owner_device"] = device_id
+    try:
+        _autonomous_start_worker(
+            objective,
+            model,
+            generation,
+            autonomous_context,
+            origin_ref or "desktop",
+            document_inventory,
+            conversation_id,
+            permission_epoch,
+            device_id,
+            provider,
+            {
+                "request_id": request_id,
+                "reason_code": str(request.get("reason_code") or "")[:48],
+                "confidence": request.get("confidence"),
+            },
+        )
+    except Exception:
+        _release_single_runner_if_gen(generation)
+        return _remember_chat_route_result(request_id, fingerprint, {
+            "status": "failed",
+            "error_code": "start_worker_failure",
+        })
+    with _autonomous_lock:
+        state = _autonomous.get("st")
+        active = bool(_autonomous.get("active"))
+    result = _chat_route_result_from_state(state, active=active)
+    return _remember_chat_route_result(request_id, fingerprint, result)
 
 
 def _orch_loop_alive() -> bool:
@@ -5782,6 +6000,32 @@ def _apply_internal_autonomous_model(agent, st: dict) -> bool:
         return True
     except Exception:
         return False
+
+
+@app.post("/internal/chat_autonomous_start")
+async def internal_chat_autonomous_start(request: Request):
+    """Loopback-only PC handoff into the canonical server-owned runner."""
+
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"status": "failed", "error_code": "forbidden"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return {"status": "failed", "error_code": "invalid_request"}
+    allowed = {
+        "objective", "source_refs", "request_id", "conversation_id",
+        "reason_code", "confidence", "explicit_request", "language",
+    }
+    if set(body) - allowed:
+        return {"status": "failed", "error_code": "invalid_request"}
+    payload = {key: body.get(key) for key in allowed}
+    payload["origin_ref"] = "desktop"
+    payload["device_id"] = ""
+    _autonomous["loop"] = asyncio.get_running_loop()
+    return await asyncio.to_thread(_launch_autonomous_from_chat, payload)
 
 
 @app.get("/internal/autonomous_authorization_state")
@@ -8852,6 +9096,9 @@ async def websocket_endpoint(ws: WebSocket):
                             turn_meta["_document_owner_device"] = (
                                 permission_session.device_id
                             )
+                            turn_meta["_autonomous_origin_ref"] = (
+                                authorization_origin_ref
+                            )
                             turn_meta["client_locale"] = msg.get("locale")
                             turn_meta["_original_user_text"] = display_prompt
                             turn_meta["tts_enabled"] = (
@@ -9061,6 +9308,9 @@ async def websocket_endpoint(ws: WebSocket):
                     turn_meta["_document_owner_device"] = (
                         permission_session.device_id
                     )
+                    turn_meta["_autonomous_origin_ref"] = (
+                        authorization_origin_ref
+                    )
                     turn_meta["client_locale"] = msg.get("locale")
                     turn_meta["_original_user_text"] = user_text
                     turn_meta["tts_enabled"] = (
@@ -9185,6 +9435,9 @@ async def websocket_endpoint(ws: WebSocket):
                     turn_meta = _new_turn_meta(_conv, client_request_id)
                     turn_meta["_document_owner_device"] = (
                         permission_session.device_id
+                    )
+                    turn_meta["_autonomous_origin_ref"] = (
+                        authorization_origin_ref
                     )
                     turn_meta["client_locale"] = msg.get("locale")
                     turn_meta["tts_enabled"] = (
@@ -10163,6 +10416,23 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             if len(document_progress_futures) < 128:
                 document_progress_futures.append(future)
 
+        _autonomous["loop"] = document_loop
+        agent._chat_autonomous_context = {
+            "launcher": _launch_autonomous_from_chat,
+            "original_user_text": str(original_user_text or ""),
+            "provider_input": text,
+            "history": history,
+            "conversation_id": active_conv_id,
+            "request_id": str((turn_meta or {}).get("turn_id") or ""),
+            "origin_ref": str(
+                (turn_meta or {}).get("_autonomous_origin_ref") or "desktop"
+            ),
+            "device_id": str(
+                (turn_meta or {}).get("_document_owner_device") or ""
+            ),
+            "turn_context": turn_context,
+        }
+
         def _run_agent_busy_tracked():
             try:
                 with document_progress_scope(
@@ -10180,6 +10450,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     )
             finally:
                 agent._in_use = False
+                agent._chat_autonomous_context = None
 
         # Off-thread so the event loop stays free to flush response_chunks.
         response_text = await asyncio.to_thread(_run_agent_busy_tracked)

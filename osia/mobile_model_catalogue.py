@@ -538,6 +538,7 @@ def resolve_current_autonomous_selection(
     model_id: str = "",
     wire_value: str | None = None,
     refresh_account: bool = True,
+    strict: bool = False,
 ) -> dict:
     """Validate immediately against current configured state off the UI thread."""
     catalogue = build_catalogue(
@@ -560,6 +561,16 @@ def resolve_current_autonomous_selection(
         main_model=settings.get("selected_model") or "",
         wire_value=wire_value,
     )
+    if strict and resolution.get("fallback_occurred"):
+        return {
+            **resolution,
+            "provider_id": "",
+            "model_id": "",
+            "stable_key": "",
+            "reason": "strict_" + str(
+                resolution.get("reason") or "selection_unavailable"
+            ),
+        }
     persist_autonomous_selection(resolution)
     return resolution
 

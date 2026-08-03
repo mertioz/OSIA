@@ -63,6 +63,10 @@ _SCHEDULED_EXECUTION_CONTEXT = contextvars.ContextVar(
     "osia_scheduled_execution_context",
     default=None,
 )
+_CHAT_ROUTING_CONTEXT = contextvars.ContextVar(
+    "osia_chat_routing_context",
+    default=None,
+)
 
 
 def _scheduled_execution_prompt(context: dict) -> str:
@@ -514,6 +518,10 @@ def get_system_prompt(
         ):
             assert_prompt_tool_examples_compatible(tool_guidance)
             body = body + "\n\n" + tool_guidance
+    if current_tool_surface() == "":
+        from osia.chat_routing import routing_prompt
+
+        body = body + "\n\n" + routing_prompt(lang)
     # WOR-44 Phase 2 — list the tools exposed by connected MCP servers so the
     # model can see and call them like native tools. Built FRESH on every
     # get_system_prompt() call. On the SERVER path run(history=...) rebuilds the
@@ -3623,6 +3631,25 @@ def tool_save_memory(
     return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
 
+def tool_start_autonomous_mission(
+    reason_code: str = None,
+    confidence: float = None,
+    explicit_request: bool = None,
+    **_extra,
+) -> str:
+    """Validate and launch one canonical Chat-to-Autonomous handoff."""
+
+    from osia.chat_routing import execute_route_request
+
+    result = execute_route_request(
+        _CHAT_ROUTING_CONTEXT.get(),
+        reason_code=reason_code,
+        confidence=confidence,
+        explicit_request=explicit_request,
+    )
+    return json.dumps(result, ensure_ascii=False, sort_keys=True)
+
+
 def tool_create_scheduled_task(
     title: str = None,
     instruction: str = None,
@@ -3720,6 +3747,8 @@ def tool_delete_scheduled_task(task_id: str = None, **_extra) -> str:
 
 
 TOOL_MAP = {
+    # Chat routing
+    "start_autonomous_mission": tool_start_autonomous_mission,
     # Local memory
     "save_memory": tool_save_memory,
     # Scheduled tasks
@@ -6124,6 +6153,7 @@ class OSIAAgent:
         self._document_private_run = False
         self._document_turn_start = 1
         self._semantic_form_values: list[str] = []
+        self._chat_autonomous_context: dict | None = None
 
     def set_turn_context(self, context: TurnContext) -> None:
         """Apply one already-resolved language decision to subsequent model calls."""
@@ -7066,6 +7096,11 @@ class OSIAAgent:
                     canonical_output=canonical_output,
                 )
 
+        routing_token = _CHAT_ROUTING_CONTEXT.set(
+            dict(self._chat_autonomous_context)
+            if isinstance(self._chat_autonomous_context, dict)
+            else None
+        )
         try:
             if _document_artifacts.has_artifact_access_scope():
                 return _run_scoped()
@@ -7079,6 +7114,7 @@ class OSIAAgent:
             ):
                 return _run_scoped()
         finally:
+            _CHAT_ROUTING_CONTEXT.reset(routing_token)
             self._semantic_form_values = []
             self._prior_run_document_artifacts = []
 
@@ -7242,6 +7278,19 @@ class OSIAAgent:
 
         from osia import memory_runtime as _memory_runtime
         from osia import scheduled_tasks as _scheduled_tasks
+        from osia import chat_routing as _chat_routing
+
+        chat_routing_context = _CHAT_ROUTING_CONTEXT.get()
+        chat_routing_enabled = (
+            scheduled_execution is None
+            and isinstance(chat_routing_context, dict)
+            and callable(chat_routing_context.get("launcher"))
+        )
+        explicit_autonomous_turn = (
+            chat_routing_enabled
+            and not _chat_routing.looks_like_schedule_route(user_text)
+            and _chat_routing.explicit_autonomous_request(user_text)
+        )
 
         memory_store = getattr(self, "_memory_store", None)
         memory_context = _memory_runtime.build_memory_context(
@@ -7373,6 +7422,10 @@ class OSIAAgent:
         scheduled_task_tool_succeeded = False
         scheduled_task_request_retry_used = False
         scheduled_task_claim_retry_used = False
+        chat_handoff_tool_seen = False
+        chat_handoff_retry_used = False
+        chat_route_redirect = ""
+        chat_scheduled_route_confirmed = False
         language_consistency_retry_used = False
         # Once an account response emits an OSIA textual tool call, the attempt
         # is committed. A later tool-result turn must never replay via an API.
@@ -7390,6 +7443,22 @@ class OSIAAgent:
         # reformulate as an available canonical OSIA textual tool call.
         native_action_reformulation_used = False
         attempted_model_tool_name = ""
+
+        def _finish_chat_handoff(payload: dict, round_number: int) -> str:
+            content = _chat_routing.handoff_response_text(payload, self.lang)
+            content = self._redact_semantic_form_values(content)
+            if canonical_output:
+                content = clean_response(content)
+            if on_sentence is not None:
+                try:
+                    on_sentence(content)
+                except Exception:
+                    pass
+            self.messages.append({"role": "assistant", "content": content})
+            if self.turn_context is not None:
+                log_round(self.turn_context, round_number, "chat_autonomous_handoff")
+                log_final(self.turn_context, content)
+            return content
 
         # API endpoint fallback (Bloc 5): whether the one allowed "primary
         # endpoint failed → retry on the fallback base_url" switch has been
@@ -7694,6 +7763,44 @@ class OSIAAgent:
                 content, message=message, provider=self.provider,
             )
             tool_calls = _apply_exact_autonomous_resume_call(self, tool_calls)
+            if chat_routing_enabled and tool_calls:
+                handoff_calls = [
+                    call for call in tool_calls
+                    if isinstance(call, dict)
+                    and call.get("tool") == _chat_routing.ROUTING_TOOL_NAME
+                ]
+                if handoff_calls:
+                    # The route decision precedes every normal side effect. One
+                    # handoff call wins the batch; all siblings are discarded.
+                    tool_calls = [handoff_calls[0]]
+                    chat_handoff_tool_seen = True
+                elif explicit_autonomous_turn:
+                    # An explicit natural-language Autonomous request may never
+                    # leak into normal tool execution. Give the provider one
+                    # bounded schema correction, then fail closed.
+                    if not chat_handoff_retry_used:
+                        chat_handoff_retry_used = True
+                        self.messages.append({
+                            "role": "assistant",
+                            "_internal": True,
+                            "content": content,
+                        })
+                        self.messages.append({
+                            "role": "user",
+                            "_internal": True,
+                            "content": (
+                                "The user explicitly requested Autonomous. No "
+                                "normal tool may run first. Call "
+                                "start_autonomous_mission now with only "
+                                "reason_code, confidence, and explicit_request. "
+                                "If the essential objective is missing, ask one "
+                                "clarifying question without calling any tool."
+                            ),
+                        })
+                        continue
+                    return _finish_chat_handoff(
+                        {"status": "failed"}, round_number,
+                    )
             if tool_calls and language_consistency_retry_used:
                 # The bounded consistency retry is synthesis-only. A provider
                 # must not turn it into another dispatch or replay an earlier
@@ -7820,6 +7927,13 @@ class OSIAAgent:
                     # Validate against the authoritative schema before any
                     # intent/confirmation gate, worker submission or I/O.
                     kwargs = {k: v for k, v in tc.items() if k != "tool"}
+                    if (
+                        chat_routing_enabled
+                        and tool_name == _chat_routing.ROUTING_TOOL_NAME
+                    ):
+                        kwargs = _chat_routing.canonicalize_handoff_arguments(
+                            kwargs, user_text,
+                        )
                     spec, effective = _tool_spec_and_contract(
                         tool_name, kwargs, user_text,
                     )
@@ -7846,9 +7960,39 @@ class OSIAAgent:
                     attempted_model_tool_name = tool_name
                     attempted_model_kwargs = dict(kwargs)
 
+                    if tool_name == _chat_routing.ROUTING_TOOL_NAME:
+                        # Starting the planner is the routing boundary itself,
+                        # not a normal tool side effect. Execute it synchronously
+                        # so a timeout wrapper can never leave a background start
+                        # with an incorrectly reported failure or trigger replay.
+                        raw_handoff = tool_start_autonomous_mission(**kwargs)
+                        try:
+                            handoff = json.loads(raw_handoff)
+                        except (TypeError, ValueError):
+                            handoff = {
+                                "ok": False,
+                                "route": "autonomous",
+                                "status": "failed",
+                            }
+                        route = str(handoff.get("route") or "autonomous")
+                        if route in {"normal", "scheduled"}:
+                            chat_route_redirect = route
+                            if route == "scheduled":
+                                chat_scheduled_route_confirmed = True
+                            tool_results.append(
+                                localized_text(
+                                    "tool_result_header", self.lang,
+                                    tool=tool_name,
+                                ) + "\n" + raw_handoff
+                            )
+                            guard.record(tool_name, kwargs, "", False)
+                            break
+                        return _finish_chat_handoff(handoff, round_number)
+
                     if (
                         tool_name in _SCHEDULED_TASK_TOOL_NAMES
                         and scheduled_execution is None
+                        and not chat_scheduled_route_confirmed
                         and not _scheduled_tasks.allows_scheduled_task_tool(
                             user_text,
                             tool_name,
@@ -8324,6 +8468,18 @@ class OSIAAgent:
                     synthesis_instruction = localized_text(
                         "schedule_ignored_instruction", self.lang,
                     )
+                if chat_route_redirect == "scheduled":
+                    synthesis_instruction = (
+                        "The route is Scheduled Tasks, not Autonomous. Call the "
+                        "appropriate scheduled-task tool now. If date or time is "
+                        "ambiguous, ask one clarification question."
+                    )
+                elif chat_route_redirect == "normal":
+                    synthesis_instruction = (
+                        "The Autonomous route was rejected by the bounded routing "
+                        "contract. Continue the current request in normal chat. "
+                        "Do not call start_autonomous_mission again this turn."
+                    )
                 feedback_text = (
                     f"<tool_result>\n{feedback}\n</tool_result>\n"
                     f"{synthesis_instruction}\n\n"
@@ -8368,9 +8524,39 @@ class OSIAAgent:
                         guard, on_sentence=on_sentence,
                         on_first_token=on_first_token,
                     )
+                chat_route_redirect = ""
                 continue
 
             # No tool call in any format — candidate final response.
+            if (
+                explicit_autonomous_turn
+                and not chat_handoff_tool_seen
+                and not any_tool_executed
+            ):
+                if not chat_handoff_retry_used:
+                    chat_handoff_retry_used = True
+                    self.messages.append({
+                        "role": "assistant",
+                        "_internal": True,
+                        "content": content,
+                    })
+                    self.messages.append({
+                        "role": "user",
+                        "_internal": True,
+                        "content": (
+                            "The user explicitly requested Autonomous. Call "
+                            "start_autonomous_mission now with only reason_code, "
+                            "confidence, and explicit_request. If the exact "
+                            "objective is missing, ask one concise clarifying "
+                            "question and do not claim that anything started."
+                        ),
+                    })
+                    continue
+                if "?" not in content:
+                    return _finish_chat_handoff(
+                        {"status": "failed"}, round_number,
+                    )
+
             #
             # STEP 4 — fallback honesty. Nothing was executed this round.
             # If the model nevertheless emitted unparseable tool markup

@@ -126,6 +126,50 @@ _SERVER_AUTONOMOUS_PC_STATE_URL = (
 _SERVER_AUTONOMOUS_PC_ACTION_URL = (
     "http://127.0.0.1:8765/internal/autonomous_authorization_action"
 )
+_SERVER_CHAT_AUTONOMOUS_START_URL = (
+    "http://127.0.0.1:8765/internal/chat_autonomous_start"
+)
+
+
+def _launch_server_autonomous_from_chat(request: dict) -> dict:
+    """Launch one desktop-chat handoff through the canonical server runner."""
+
+    import json
+    import socket
+    import urllib.error
+    import urllib.request
+
+    turn_context = request.get("turn_context")
+    payload = {
+        key: request.get(key)
+        for key in (
+            "objective", "source_refs", "request_id", "conversation_id",
+            "reason_code", "confidence", "explicit_request",
+        )
+    }
+    payload["language"] = str(getattr(turn_context, "language", "") or "")
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    try:
+        http_request = urllib.request.Request(
+            _SERVER_CHAT_AUTONOMOUS_START_URL,
+            data=encoded,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(http_request, timeout=250.0) as response:
+            decoded = json.loads(response.read().decode("utf-8"))
+    except (socket.timeout, TimeoutError):
+        return {"status": "outcome_unknown", "error_code": "start_timeout"}
+    except urllib.error.URLError as exc:
+        if isinstance(getattr(exc, "reason", None), (socket.timeout, TimeoutError)):
+            return {"status": "outcome_unknown", "error_code": "start_timeout"}
+        return {"status": "unavailable", "error_code": "server_unavailable"}
+    except Exception:
+        return {"status": "unavailable", "error_code": "server_unavailable"}
+    return decoded if isinstance(decoded, dict) else {
+        "status": "failed",
+        "error_code": "invalid_server_response",
+    }
 
 
 def _load_server_autonomous_pc_state() -> dict | None:
@@ -1430,6 +1474,17 @@ def wake_mode():
             saved_language=i18n.get_language(),
             reference=conv_id,
         )
+        turn_agent._chat_autonomous_context = {
+            "launcher": _launch_server_autonomous_from_chat,
+            "original_user_text": str(authoritative_text or ""),
+            "provider_input": user_input,
+            "history": history,
+            "conversation_id": conv_id,
+            "request_id": str(turn_meta.get("turn_id") or ""),
+            "origin_ref": "desktop",
+            "device_id": "",
+            "turn_context": turn_context,
+        }
 
         prev_history_len = len(history)
 
