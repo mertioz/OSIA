@@ -63,6 +63,73 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="1.1.2",
+        released_on="2026-08-03",
+        public=True,
+        changes_en=(),
+        changes_fr=(),
+        summary_en=(
+            "The updater now accepts future explicitly authorized unsigned Stable releases without a hardcoded future-version allowlist.",
+            "Legacy stable_unsigned and stable_notsigned failures now explain that the installed updater is too old and provide a safe official bridge.",
+            "Strict HTTPS, exact official endpoint, Windows x64 identity, versioned path, Content-Length, size, SHA-256, streaming, and full rehash protections remain mandatory.",
+            "Windows 1.1.2 remains NotSigned with no publisher claim; explicit consent and truthful Unknown Publisher and SmartScreen disclosure are unchanged.",
+            "Windows 1.1.1 and older Stable clients need a one-time Preview or verified manual in-place bridge before they gain the corrected updater policy.",
+        ),
+        summary_fr=(
+            "L’updater accepte désormais les futures versions Stable non signées explicitement autorisées, sans allowlist codée en dur des versions futures.",
+            "Les erreurs historiques stable_unsigned et stable_notsigned expliquent maintenant que l’updater installé est trop ancien et proposent un bridge officiel sûr.",
+            "HTTPS strict, endpoint officiel exact, identité Windows x64, chemin versionné, Content-Length, taille, SHA-256, streaming et rehash complet restent obligatoires.",
+            "Windows 1.1.2 reste NotSigned sans éditeur revendiqué ; le consentement explicite et la divulgation Éditeur inconnu et SmartScreen restent inchangés.",
+            "Les clients Stable Windows 1.1.1 et antérieurs nécessitent un bridge unique via Preview ou une installation manuelle in-place vérifiée avant de bénéficier de la politique corrigée.",
+        ),
+        sections=(
+            ReleaseSection(
+                "Durable Stable compatibility",
+                "Compatibilité Stable durable",
+                (
+                    "The temporary pre-WOR-220 policy now authorizes a newer unsigned Stable release only when it comes from the exact official Stable endpoint and matches OSIA Windows x64 on download.osia.space with its exact versioned installer path.",
+                    "Authorization is no longer tied to a hardcoded list of future versions, so a corrected 1.1.2 client can evaluate a later explicitly authorized unsigned Stable release without reproducing this compatibility failure.",
+                    "Disabling the isolated temporary policy restores fail-closed unsigned Stable behavior cleanly when recognized Authenticode signing arrives through WOR-220.",
+                ),
+                (
+                    "La politique temporaire pré-WOR-220 n’autorise une nouvelle version Stable non signée que si elle provient de l’endpoint Stable officiel exact et correspond à OSIA Windows x64 sur download.osia.space avec son chemin d’installateur versionné exact.",
+                    "L’autorisation n’est plus liée à une liste codée en dur des versions futures ; un client 1.1.2 corrigé peut donc évaluer une future Stable non signée explicitement autorisée sans reproduire cette incompatibilité.",
+                    "La désactivation de cette politique temporaire isolée rétablit proprement le refus des Stable non signées lorsque WOR-220 apportera une signature Authenticode reconnue.",
+                ),
+            ),
+            ReleaseSection(
+                "Integrity and consent remain strict",
+                "Intégrité et consentement toujours stricts",
+                (
+                    "The updater still requires strict HTTPS, the exact official Stable manifest endpoint, OSIA/windows/x86_64 identity, download.osia.space, and /windows/<version>/OSIA-Setup.exe without redirects or conflicting fields.",
+                    "Content-Length and manifest size must match exactly, the streamed payload must match the exact SHA-256, and the completed installer is fully rehashed again before execution.",
+                    "Installation still requires explicit user consent, uses shell=False with fixed arguments, and has no silent fallback for malformed manifests, alternate hosts, paths, sizes, or hashes.",
+                ),
+                (
+                    "L’updater exige toujours HTTPS strict, l’endpoint de manifeste Stable officiel exact, l’identité OSIA/windows/x86_64, download.osia.space et /windows/<version>/OSIA-Setup.exe, sans redirection ni champs conflictuels.",
+                    "Content-Length et la taille du manifeste doivent correspondre exactement, le flux doit avoir le SHA-256 exact et l’installateur terminé est entièrement rehashé avant exécution.",
+                    "L’installation exige toujours un consentement explicite, utilise shell=False avec des arguments fixes et n’applique aucun fallback silencieux pour un manifeste, hôte, chemin, taille ou hash invalide.",
+                ),
+            ),
+            ReleaseSection(
+                "Truthful unsigned release and legacy bridge",
+                "Version non signée transparente et bridge historique",
+                (
+                    "Windows 1.1.2 is intentionally distributed as NotSigned with no publisher claim; Windows may show Unknown Publisher or Microsoft Defender SmartScreen, and no Windows protection should be disabled.",
+                    "The localized stable_unsigned and stable_notsigned diagnostics now explain that the installed updater is too old and direct users only to the official verified manual-update path.",
+                    "Windows 1.1.1 and older Stable binaries cannot be repaired retroactively and do not automatically install 1.1.2 through Stable; use Preview from 1.1.1 where already supported, or install the verified official 1.1.2 installer in place once.",
+                    "The in-place bridge preserves OSIA settings, conversations, personality, skills, and pairing; Windows 1.1.1 remains the validated rollback artifact.",
+                ),
+                (
+                    "Windows 1.1.2 est volontairement distribué avec le statut NotSigned et sans éditeur revendiqué ; Windows peut afficher Éditeur inconnu ou Microsoft Defender SmartScreen, sans qu’aucune protection Windows doive être désactivée.",
+                    "Les diagnostics localisés stable_unsigned et stable_notsigned expliquent désormais que l’updater installé est trop ancien et orientent uniquement vers le parcours officiel de mise à jour manuelle vérifiée.",
+                    "Les binaires Stable Windows 1.1.1 et antérieurs ne peuvent pas être corrigés rétroactivement et n’installent pas automatiquement 1.1.2 via Stable ; utilisez Preview depuis 1.1.1 s’il est déjà pris en charge, ou installez une fois l’installateur officiel 1.1.2 vérifié in-place.",
+                    "Le bridge in-place préserve réglages OSIA, conversations, personnalité, skills et association ; Windows 1.1.1 reste l’artefact de rollback validé.",
+                ),
+            ),
+        ),
+    ),
+    ReleaseEntry(
         version="1.1.1",
         released_on="2026-08-03",
         public=True,

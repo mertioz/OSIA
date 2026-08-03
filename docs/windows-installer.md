@@ -72,7 +72,7 @@ byte size and SHA-256 remain mandatory, and the complete download is rehashed
 before execution. An arbitrary `signed: false` manifest is not trusted. Remove
 this isolated policy when WOR-220 introduces recognized Authenticode signing.
 
-The public Windows 1.1.0 and 1.1.1 installers are intentionally unsigned and
+The public Windows 1.1.0, 1.1.1, and 1.1.2 installers are intentionally unsigned and
 their manifests record `signed: false` with no publisher claim. Windows may show **Unknown
 publisher** / **Éditeur inconnu** or a Microsoft Defender SmartScreen warning.
 Users should download only from the official OSIA HTTPS domain, verify the
@@ -82,9 +82,12 @@ that official download. They must not be told to disable SmartScreen, Microsoft
 Defender, antivirus software, or other Windows security protections. WOR-220
 owns Authenticode signing for future public releases.
 
-Windows 1.1.0 and older binaries cannot receive this source correction before
-their manifest check. If they reject 1.1.1 with `stable_unsigned` (sometimes
-reported as `stable_notsigned`), use the official immutable installer directly:
+Windows 1.1.1 and older Stable binaries cannot receive the WOR-226 source
+correction before their manifest check. They may reject the next unsigned
+Stable release with `stable_unsigned` (sometimes reported as
+`stable_notsigned`). A Windows 1.1.1 installation with Preview explicitly
+enabled can use the existing unsigned-preview path; otherwise use the official
+immutable installer directly. The validated rollback bridge remains:
 
 - `https://download.osia.space/windows/1.1.1/OSIA-Setup.exe`
 - 1,185,800,867 bytes

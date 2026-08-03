@@ -107,7 +107,7 @@ def test_app_metadata_is_strict_and_records_only_internal_override():
         "buildTimestamp": "2026-07-20T10:00:00Z", "commitSha": None,
         "updaterSchemaVersion": 1,
         "buildOverride": {
-            "sourceVersion": "1.1.1", "version": "1.0.1",
+            "sourceVersion": "1.1.2", "version": "1.0.1",
             "channel": "internal-preview",
         },
     }
@@ -214,6 +214,33 @@ def test_temporary_unsigned_stable_policy_is_official_source_bound(
     ))
     with pytest.raises(updater.DownloadError, match="stable_authenticode_unavailable"):
         updater.prepare_installer_plan(signed, Path("missing.exe"))
+
+
+def test_112_accepts_synthetic_future_authorized_unsigned_stable():
+    raw = manifest_dict(version="1.1.3", channel="stable")
+    installed = metadata(version="1.1.2", channel="stable")
+    parsed = updater.parse_manifest(
+        json.dumps(raw), installed, source_url=updater.CHANNEL_URLS["stable"],
+    )
+    assert parsed.version == "1.1.3"
+    assert parsed.temporary_unsigned_stable is True
+
+    for invalid_url in (
+        "https://example.com/windows/1.1.3/OSIA-Setup.exe",
+        "https://download.osia.space/windows/OSIA-Setup.exe",
+        "https://download.osia.space/windows/1.1.2/OSIA-Setup.exe",
+    ):
+        conflicting = manifest_dict(version="1.1.3", channel="stable")
+        conflicting["installer"]["url"] = invalid_url
+        with pytest.raises(updater.ManifestError, match="invalid_installer_url"):
+            updater.parse_manifest(
+                json.dumps(conflicting), installed,
+                source_url=updater.CHANNEL_URLS["stable"],
+            )
+
+    policy = updater.TEMPORARY_UNSIGNED_STABLE_POLICY
+    assert policy.minimum_version == "1.1.0"
+    assert not hasattr(updater, "UNSIGNED_STABLE_RELEASES")
 
 
 def test_public_111_manifest_contract_and_conflicting_artifact_fail_closed(tmp_path):

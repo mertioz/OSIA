@@ -47,7 +47,9 @@ CODEX_RUNTIME_URL = (
 SOURCE_VERSION = PRODUCT_VERSION
 DEFAULT_BUILD_CHANNEL = "internal-preview"
 ALLOWED_BUILD_CHANNELS = {"internal-preview", "stable"}
-UNSIGNED_STABLE_RELEASES = frozenset({"1.1.0", "1.1.1"})
+# Build-time release authorization only. This is not embedded as updater trust;
+# runtime acceptance is governed by TEMPORARY_UNSIGNED_STABLE_POLICY.
+UNSIGNED_STABLE_RELEASES = frozenset({"1.1.0", "1.1.1", "1.1.2"})
 UPDATER_SCHEMA_VERSION = 1
 
 _APPROVED_INNO_RUNTIME_CONSTANTS = frozenset({

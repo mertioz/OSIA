@@ -82,9 +82,9 @@ def _controller(monkeypatch, tmp_path, *, cached=False):
 
 def test_embedded_notes_load_offline_and_are_newest_first():
     assert [entry.version for entry in RELEASE_HISTORY] == [
-        "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
+        "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
     ]
-    current = release_for_version("1.1.1")
+    current = release_for_version("1.1.2")
     assert current is not None and current.public
     assert not is_major_update(current.version)
     major = release_for_version("1.1.0")
@@ -102,6 +102,52 @@ def test_embedded_notes_load_offline_and_are_newest_first():
     assert internal is not None and not internal.public
     assert "superseded" in " ".join(internal.changes("en")).lower()
     assert manifest_release_notes("1.0.6") == list(internal_current.changes_en)
+
+
+def test_112_hotfix_notes_are_complete_bilingual_and_manifest_compatible():
+    current = release_for_version("1.1.2")
+    assert current is not None and current.public
+    assert manifest_release_notes("1.1.2") == list(current.summary_en)
+    assert len(current.summary("en")) == len(current.summary("fr")) == 5
+    assert all(len(note) <= 240 for note in manifest_release_notes("1.1.2"))
+    assert len(current.sections) == 3
+    assert len(current.changes("en")) == len(current.changes("fr")) == 10
+
+    english = installer_release_notes("1.1.2", "en").lower()
+    french = installer_release_notes("1.1.2", "fr").lower()
+    for subject in (
+        "exact official stable endpoint",
+        "download.osia.space",
+        "/windows/<version>/osia-setup.exe",
+        "content-length",
+        "sha-256",
+        "fully rehashed",
+        "shell=false",
+        "stable_notsigned",
+        "unknown publisher",
+        "do not automatically install 1.1.2",
+        "windows 1.1.1 remains the validated rollback",
+    ):
+        assert subject in english
+    for subject in (
+        "endpoint stable officiel exact",
+        "download.osia.space",
+        "content-length",
+        "sha-256",
+        "entièrement rehashé",
+        "shell=false",
+        "stable_notsigned",
+        "éditeur inconnu",
+        "n’installent pas automatiquement 1.1.2",
+        "windows 1.1.1 reste l’artefact de rollback validé",
+    ):
+        assert subject in french
+
+    raw = _manifest(version="1.1.2")
+    raw["releaseNotes"] = manifest_release_notes("1.1.2")
+    parsed = updater.parse_manifest(json.dumps(raw), _metadata("1.1.1"))
+    assert parsed.version == "1.1.2"
+    assert parsed.release_notes == tuple(manifest_release_notes("1.1.2"))
 
 
 def test_111_notes_are_complete_bilingual_and_manifest_compatible():
