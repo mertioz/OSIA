@@ -4574,6 +4574,8 @@ def _autonomous_snapshot(st) -> dict:
         "phase_name": "",
         "objective": "",
         "status": st.get("status", "") or "",
+        "provider": str(st.get("provider") or ""),
+        "model": str(st.get("model") or ""),
         "language": normalize_locale(st.get("language")) or i18n.DEFAULT_LANG,
         "plan_summary": [
             {
@@ -5047,6 +5049,9 @@ def _ensure_autonomous_engine():
         if _autonomous.get("orch") is None:
             from osia.agent import OSIAAgent
             agent = OSIAAgent()
+            # A persisted Autonomous run owns one exact provider/model pair.
+            # Normal chat hierarchy routing must never replace it mid-run.
+            agent._disable_hierarchy_for_turn = True
             _autonomous["agent"] = agent
             _autonomous["orch"] = _Orchestrator(
                 agent,
@@ -5151,6 +5156,7 @@ def _autonomous_start_worker(
             wire_value=None if strict_provider else model,
             refresh_account=True,
             strict=bool(strict_provider),
+            persist=not bool(strict_provider),
         )
         provider = resolution.get("provider_id") or ""
         model = resolution.get("model_id") or ""
@@ -5363,6 +5369,10 @@ def _chat_route_result_from_state(st: dict | None, *, active: bool) -> dict:
         "task_id": str(st.get("task_id") or "")[:160],
         "run_id": str(st.get("run_id") or "")[:160],
     }
+    provider = str(st.get("provider") or "")[:48]
+    model = str(st.get("model") or "")[:160]
+    if provider and model:
+        base.update({"provider_id": provider, "model_id": model})
     run_state = str(st.get("run_state") or "")
     status = str(st.get("status") or "")
     if status in {"failed", "aborted"} or st.get("failure_diagnostic"):
@@ -5414,12 +5424,21 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
     conversation_id = str(request.get("conversation_id") or "").strip()
     origin_ref = str(request.get("origin_ref") or "desktop").strip()[:160]
     device_id = str(request.get("device_id") or "").strip()[:128]
+    provider = str(request.get("provider_id") or "").strip().lower()
+    model = str(request.get("model_id") or "").strip()
     source_refs = request.get("source_refs") or []
+    if not provider or not model:
+        return {
+            "status": "failed",
+            "error_code": "chat_model_identity_missing",
+        }
     if (
         not objective
         or len(objective) > 16_000
         or not re.fullmatch(r"[A-Za-z0-9_.:-]{8,160}", request_id)
         or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", conversation_id)
+        or not re.fullmatch(r"[a-z0-9_-]{1,48}", provider)
+        or len(model) > 160
         or not isinstance(source_refs, list)
         or len(source_refs) > 10
         or any(
@@ -5429,9 +5448,18 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
         )
     ):
         return {"status": "failed", "error_code": "invalid_request"}
-    fingerprint = hashlib.sha256(
-        (conversation_id + "\0" + objective).encode("utf-8")
-    ).hexdigest()
+    fingerprint = hashlib.sha256(json.dumps(
+        {
+            "conversation_id": conversation_id,
+            "objective": objective,
+            "provider_id": provider,
+            "model_id": model,
+            "source_refs": source_refs,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")).hexdigest()
     with _CHAT_ROUTE_REQUESTS_LOCK:
         existing = _CHAT_ROUTE_REQUESTS.get(request_id)
         if isinstance(existing, dict):
@@ -5472,15 +5500,18 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
     from osia.mobile_model_catalogue import resolve_current_autonomous_selection
 
     resolution = resolve_current_autonomous_selection(
+        provider_id=provider,
+        model_id=model,
         refresh_account=True,
         strict=True,
+        persist=False,
     )
     provider = str(resolution.get("provider_id") or "")
     model = str(resolution.get("model_id") or "")
     if not provider or not model:
         return _remember_chat_route_result(request_id, fingerprint, {
-            "status": "unavailable",
-            "error_code": str(resolution.get("reason") or "model_unavailable")[:80],
+            "status": "failed",
+            "error_code": "chat_model_unavailable",
         })
 
     try:
@@ -5806,6 +5837,8 @@ def _autonomous_resume_worker(
             provider_id=st.get("provider", ""),
             model_id=st.get("model", ""),
             refresh_account=True,
+            strict=True,
+            persist=False,
         )
         provider = resolution.get("provider_id") or ""
         model = resolution.get("model_id") or ""
@@ -5986,6 +6019,8 @@ def _apply_internal_autonomous_model(agent, st: dict) -> bool:
             provider_id=saved_provider,
             model_id=saved_model,
             refresh_account=True,
+            strict=True,
+            persist=False,
         )
         provider = resolution.get("provider_id") or ""
         model = resolution.get("model_id") or ""
@@ -6017,7 +6052,8 @@ async def internal_chat_autonomous_start(request: Request):
         return {"status": "failed", "error_code": "invalid_request"}
     allowed = {
         "objective", "source_refs", "request_id", "conversation_id",
-        "reason_code", "confidence", "explicit_request", "language",
+        "provider_id", "model_id", "reason_code", "confidence",
+        "explicit_request", "language",
     }
     if set(body) - allowed:
         return {"status": "failed", "error_code": "invalid_request"}
@@ -9075,6 +9111,9 @@ async def websocket_endpoint(ws: WebSocket):
                                 source_kind="legacy_mobile_attachment",
                                 display_name=safe_name,
                                 declared_mime=image_mime,
+                                permission_epoch=int(
+                                    permission_session.store.load_state().policy_epoch
+                                ),
                             )
                             document_content = (
                                 "[Document image available through read_document: "
@@ -9288,6 +9327,9 @@ async def websocket_endpoint(ws: WebSocket):
                             user_text,
                             committed_attachments,
                             owner_id=_conv,
+                            permission_epoch=int(
+                                permission_session.store.load_state().policy_epoch
+                            ),
                         )
                         display_names = ", ".join(
                             item.display_name for item in committed_attachments
@@ -9301,7 +9343,12 @@ async def websocket_endpoint(ws: WebSocket):
                         # so a handler exception before spawn is still covered
                         # by connection teardown.
                         agent_input = _consume_pending_files(
-                            user_text, list(pending_files), owner_id=_conv,
+                            user_text,
+                            list(pending_files),
+                            owner_id=_conv,
+                            permission_epoch=int(
+                                permission_session.store.load_state().policy_epoch
+                            ),
                         )
                         persisted_user_content = user_text
                     turn_meta = _new_turn_meta(_conv, client_request_id)
@@ -9454,6 +9501,9 @@ async def websocket_endpoint(ws: WebSocket):
                         _c=_conv,
                         _files=_pf,
                         _m=turn_meta,
+                        _epoch=int(
+                            permission_session.store.load_state().policy_epoch
+                        ),
                     ):
                         async def _operation():
                             return await _handle_audio(
@@ -9465,6 +9515,7 @@ async def websocket_endpoint(ws: WebSocket):
                                 pending_files=_files,
                                 get_agent=_get_conn_agent,
                                 turn_meta=_m,
+                                permission_epoch=_epoch,
                             )
 
                         return await run_with_legacy_cleanup(
@@ -9748,6 +9799,7 @@ def _consume_pending_files(
     pending_files: list[str],
     *,
     owner_id: str | None = None,
+    permission_epoch: int | None = None,
 ) -> str:
     """Replace legacy pending paths with opaque sources before model access."""
     if not pending_files:
@@ -9764,12 +9816,14 @@ def _consume_pending_files(
                 owner_id=owner_id,
                 source_kind="legacy_mobile_attachment",
                 display_name=Path(path).name,
+                permission_epoch=permission_epoch,
             )
         else:
             capability = get_source_store().create_for_current_owner(
                 path,
                 source_kind="legacy_mobile_attachment",
                 display_name=Path(path).name,
+                permission_epoch=permission_epoch,
             )
         capabilities.append(capability)
     bullets = "\n".join(
@@ -10800,7 +10854,8 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
                         active_conv_id: str | None,
                         *, pending_files: list[str] | None = None,
                         get_agent=None,
-                        turn_meta: dict | None = None) -> tuple[list, str | None]:
+                        turn_meta: dict | None = None,
+                        permission_epoch: int | None = None) -> tuple[list, str | None]:
     """Process an audio command: transcribe, then run the agent on the
     transcript using the SAME path as text commands (so tools execute
     identically and the transcript ends up in the same conversation).
@@ -10885,7 +10940,10 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
         turn_meta["_original_user_text"] = transcript
         if pending_files:
             agent_input = _consume_pending_files(
-                agent_input, pending_files, owner_id=active_conv_id,
+                agent_input,
+                pending_files,
+                owner_id=active_conv_id,
+                permission_epoch=permission_epoch,
             )
 
         try:

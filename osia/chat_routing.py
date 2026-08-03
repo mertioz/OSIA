@@ -320,10 +320,13 @@ def execute_route_request(
             **{key: decision[key] for key in ("route", "reason_code", "confidence")},
             "ok": False,
             "status": "unavailable",
+            "error_code": "runner_transport_unavailable",
         }
     request = {
         "objective": decision["objective"],
         "source_refs": decision["source_refs"],
+        "provider_id": str(ctx.get("provider_id") or "").strip().lower()[:48],
+        "model_id": str(ctx.get("model_id") or "").strip()[:160],
         "request_id": str(ctx.get("request_id") or "")[:160],
         "conversation_id": str(ctx.get("conversation_id") or "")[:160],
         "origin_ref": str(ctx.get("origin_ref") or "desktop")[:160],
@@ -337,7 +340,10 @@ def execute_route_request(
     try:
         result = launcher(request)
     except Exception:
-        result = None
+        result = {
+            "status": "unavailable",
+            "error_code": "runner_transport_unavailable",
+        }
     if not isinstance(result, Mapping):
         return {
             "ok": False,
@@ -345,6 +351,7 @@ def execute_route_request(
             "status": "unavailable",
             "reason_code": decision["reason_code"],
             "confidence": decision["confidence"],
+            "error_code": "runner_transport_unavailable",
         }
     status = str(result.get("status") or "failed")
     if status not in {
@@ -361,6 +368,10 @@ def execute_route_request(
         "task_id": str(result.get("task_id") or "")[:160],
         "run_id": str(result.get("run_id") or "")[:160],
         "error_code": str(result.get("error_code") or "")[:80],
+        "provider_id": str(
+            result.get("provider_id") or request["provider_id"]
+        )[:48],
+        "model_id": str(result.get("model_id") or request["model_id"])[:160],
     }
 
 
@@ -371,6 +382,8 @@ _RESPONSES = {
         "authorization_pending": "I prepared the Autonomous mission, but it is waiting for your authorization before it can run.",
         "busy": "I could not start this mission because another Autonomous mission is already active. I did not run it in normal chat.",
         "unavailable": "I could not reach the canonical Autonomous runner, so I did not start or execute the mission in normal chat.",
+        "transport_unavailable": "I could not reach the canonical Autonomous runner, so I did not start or execute the mission in normal chat.",
+        "chat_model_unavailable": "The model used for this chat turn is not available for Autonomous, so I did not start the mission or run it in normal chat.",
         "failed": "The Autonomous mission could not be started. I did not execute it in normal chat.",
         "outcome_unknown": "The Autonomous start outcome could not be confirmed. Check Autonomous before retrying; I did not execute it in normal chat.",
         "objective_required": "What exact objective should I run in Autonomous mode?",
@@ -381,6 +394,8 @@ _RESPONSES = {
         "authorization_pending": "J’ai préparé la mission Autonomous, mais elle attend votre autorisation avant de pouvoir s’exécuter.",
         "busy": "Je n’ai pas pu lancer cette mission, car une autre mission Autonomous est déjà active. Je ne l’ai pas exécutée dans le chat normal.",
         "unavailable": "Je n’ai pas pu joindre le runner Autonomous canonique ; la mission n’a été ni lancée ni exécutée dans le chat normal.",
+        "transport_unavailable": "Je n’ai pas pu joindre le runner Autonomous canonique ; la mission n’a été ni lancée ni exécutée dans le chat normal.",
+        "chat_model_unavailable": "Le modèle utilisé pour ce tour de chat n’est pas disponible pour Autonomous ; la mission n’a été ni lancée ni exécutée dans le chat normal.",
         "failed": "La mission Autonomous n’a pas pu démarrer. Je ne l’ai pas exécutée dans le chat normal.",
         "outcome_unknown": "Le résultat du démarrage Autonomous n’a pas pu être confirmé. Vérifiez Autonomous avant de réessayer ; je ne l’ai pas exécutée dans le chat normal.",
         "objective_required": "Quel objectif exact dois-je exécuter en mode Autonomous ?",
@@ -391,6 +406,8 @@ _RESPONSES = {
         "authorization_pending": "He preparado la misión Autonomous, pero espera tu autorización antes de ejecutarse.",
         "busy": "No pude iniciar esta misión porque ya hay otra misión Autonomous activa. No la ejecuté en el chat normal.",
         "unavailable": "No pude acceder al ejecutor Autonomous canónico, así que no inicié ni ejecuté la misión en el chat normal.",
+        "transport_unavailable": "No pude acceder al ejecutor Autonomous canónico, así que no inicié ni ejecuté la misión en el chat normal.",
+        "chat_model_unavailable": "El modelo usado en este turno de chat no está disponible para Autonomous, así que no inicié ni ejecuté la misión en el chat normal.",
         "failed": "No se pudo iniciar la misión Autonomous. No la ejecuté en el chat normal.",
         "outcome_unknown": "No se pudo confirmar el inicio de Autonomous. Comprueba Autonomous antes de reintentar; no lo ejecuté en el chat normal.",
         "objective_required": "¿Qué objetivo exacto debo ejecutar en modo Autonomous?",
@@ -401,6 +418,8 @@ _RESPONSES = {
         "authorization_pending": "Ich habe die Autonomous-Mission vorbereitet; sie wartet vor der Ausführung auf deine Autorisierung.",
         "busy": "Ich konnte die Mission nicht starten, weil bereits eine Autonomous-Mission aktiv ist. Im normalen Chat wurde sie nicht ausgeführt.",
         "unavailable": "Der kanonische Autonomous-Runner war nicht erreichbar; die Mission wurde weder gestartet noch im normalen Chat ausgeführt.",
+        "transport_unavailable": "Der kanonische Autonomous-Runner war nicht erreichbar; die Mission wurde weder gestartet noch im normalen Chat ausgeführt.",
+        "chat_model_unavailable": "Das in diesem Chat verwendete Modell ist für Autonomous nicht verfügbar; die Mission wurde weder gestartet noch im normalen Chat ausgeführt.",
         "failed": "Die Autonomous-Mission konnte nicht gestartet werden. Im normalen Chat wurde sie nicht ausgeführt.",
         "outcome_unknown": "Der Autonomous-Start konnte nicht bestätigt werden. Prüfe Autonomous vor einem neuen Versuch; im normalen Chat wurde nichts ausgeführt.",
         "objective_required": "Welches genaue Ziel soll ich im Autonomous-Modus ausführen?",
@@ -411,6 +430,8 @@ _RESPONSES = {
         "authorization_pending": "Autonomous 任务已准备好，但需要你的授权才能运行。",
         "busy": "当前已有一个 Autonomous 任务在运行，因此无法启动此任务。我没有在普通聊天中执行它。",
         "unavailable": "无法连接规范的 Autonomous 运行器，因此任务未启动，也没有在普通聊天中执行。",
+        "transport_unavailable": "无法连接规范的 Autonomous 运行器，因此任务未启动，也没有在普通聊天中执行。",
+        "chat_model_unavailable": "此聊天轮次使用的模型无法用于 Autonomous，因此任务未启动，也没有在普通聊天中执行。",
         "failed": "Autonomous 任务无法启动。我没有在普通聊天中执行它。",
         "outcome_unknown": "无法确认 Autonomous 是否启动。重试前请先检查 Autonomous；我没有在普通聊天中执行它。",
         "objective_required": "你希望 Autonomous 模式执行的确切目标是什么？",
@@ -421,6 +442,8 @@ _RESPONSES = {
         "authorization_pending": "Autonomous ミッションを準備しましたが、実行前に承認が必要です。",
         "busy": "別の Autonomous ミッションが実行中のため開始できませんでした。通常チャットでは実行していません。",
         "unavailable": "正規の Autonomous ランナーに接続できなかったため、ミッションは開始せず、通常チャットでも実行していません。",
+        "transport_unavailable": "正規の Autonomous ランナーに接続できなかったため、ミッションは開始せず、通常チャットでも実行していません。",
+        "chat_model_unavailable": "このチャットターンで使用したモデルは Autonomous では利用できないため、ミッションは開始せず、通常チャットでも実行していません。",
         "failed": "Autonomous ミッションを開始できませんでした。通常チャットでは実行していません。",
         "outcome_unknown": "Autonomous の開始結果を確認できませんでした。再試行前に Autonomous を確認してください。通常チャットでは実行していません。",
         "objective_required": "Autonomous モードで実行する正確な目的を教えてください。",
@@ -428,10 +451,28 @@ _RESPONSES = {
 }
 
 
+_CHAT_MODEL_ERROR_CODES = frozenset({
+    "chat_model_identity_missing",
+    "chat_model_unavailable",
+    "model_setup_failure",
+    "no_configured_model",
+    "strict_saved_selection_unavailable",
+})
+_TRANSPORT_ERROR_CODES = frozenset({
+    "runner_transport_unavailable",
+    "server_unavailable",
+})
+
+
 def handoff_response_text(result: Mapping[str, Any], language: str = "en") -> str:
     lang = str(language or "en").lower()
     if lang not in _RESPONSES:
         lang = "en"
+    error_code = str(result.get("error_code") or "")
+    if error_code in _CHAT_MODEL_ERROR_CODES:
+        return _RESPONSES[lang]["chat_model_unavailable"]
+    if error_code in _TRANSPORT_ERROR_CODES:
+        return _RESPONSES[lang]["transport_unavailable"]
     status = str(result.get("status") or "failed")
     return _RESPONSES[lang].get(status, _RESPONSES[lang]["failed"])
 

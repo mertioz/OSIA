@@ -144,7 +144,8 @@ def _launch_server_autonomous_from_chat(request: dict) -> dict:
         key: request.get(key)
         for key in (
             "objective", "source_refs", "request_id", "conversation_id",
-            "reason_code", "confidence", "explicit_request",
+            "provider_id", "model_id", "reason_code", "confidence",
+            "explicit_request",
         )
     }
     payload["language"] = str(getattr(turn_context, "language", "") or "")
@@ -163,9 +164,15 @@ def _launch_server_autonomous_from_chat(request: dict) -> dict:
     except urllib.error.URLError as exc:
         if isinstance(getattr(exc, "reason", None), (socket.timeout, TimeoutError)):
             return {"status": "outcome_unknown", "error_code": "start_timeout"}
-        return {"status": "unavailable", "error_code": "server_unavailable"}
+        return {
+            "status": "unavailable",
+            "error_code": "runner_transport_unavailable",
+        }
     except Exception:
-        return {"status": "unavailable", "error_code": "server_unavailable"}
+        return {
+            "status": "unavailable",
+            "error_code": "runner_transport_unavailable",
+        }
     return decoded if isinstance(decoded, dict) else {
         "status": "failed",
         "error_code": "invalid_server_response",
@@ -2000,6 +2007,7 @@ def wake_mode():
         popup.set_remote_models(remote)
 
     def handle_submit_draft(prompt: str, attachments) -> None:
+        from osia.action_policy import get_default_permission_policy
         from osia.desktop_attachments import (
             DesktopAttachmentError,
             prepare_desktop_turn,
@@ -2013,6 +2021,9 @@ def wake_mode():
                 provider=agent.provider,
                 model=agent.model,
                 owner_id=conv["id"],
+                permission_epoch=int(
+                    get_default_permission_policy().store.load_state().policy_epoch
+                ),
             )
         except DesktopAttachmentError as error:
             popup.show_attachment_error(error)
@@ -2229,6 +2240,9 @@ def wake_mode():
     # which are bound in this same scope before the Qt event loop starts, so the
     # handlers (only ever invoked via signals after app.exec()) resolve them.
     autonomous_agent = OSIAAgent()
+    # Autonomous owns one immutable run-scoped provider/model identity. Normal
+    # chat hierarchy routing must never replace it during planning or execution.
+    autonomous_agent._disable_hierarchy_for_turn = True
     # Mutable holder for the live task_state dict so the progress closure (run on
     # the orchestrator's daemon thread) and the abort/interrupt workers can read
     # the same reference the orchestrator mutates in place.
@@ -2267,6 +2281,8 @@ def wake_mode():
             "phase_name": phase_name,
             "objective": st.get("objective", "") or "",
             "status": st.get("status", "") or "",
+            "provider": str(st.get("provider") or ""),
+            "model": str(st.get("model") or ""),
             "language": normalize_locale(st.get("language")) or i18n.DEFAULT_LANG,
             "plan_summary": [
                 {
@@ -2937,6 +2953,8 @@ def wake_mode():
                     provider_id=state.get("provider", ""),
                     model_id=state.get("model", ""),
                     refresh_account=True,
+                    strict=True,
+                    persist=False,
                 )
                 resume_provider = resume_resolution.get("provider_id") or ""
                 resume_model = resume_resolution.get("model_id") or ""

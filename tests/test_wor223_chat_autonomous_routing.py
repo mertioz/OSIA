@@ -19,6 +19,8 @@ def _context(text, *, launcher=lambda _request: {"status": "running"}, history=(
         "request_id": "turn_fixture_1234",
         "origin_ref": "mobile_fixture",
         "device_id": "device_fixture",
+        "provider_id": "chatgpt_account",
+        "model_id": "gpt-5.6-luna",
         "turn_context": fixed_turn_context("en", source="test"),
     }
 
@@ -353,6 +355,8 @@ def test_server_handoff_is_idempotent_and_keeps_exact_model(monkeypatch):
         "conversation_id": "conv_server_fixture",
         "origin_ref": "mobile_fixture",
         "device_id": "device_fixture",
+        "provider_id": "chatgpt_account",
+        "model_id": "gpt-5.6-terra",
         "reason_code": "dependent_phases",
         "confidence": 0.95,
         "turn_context": fixed_turn_context("en", source="test"),
@@ -376,6 +380,8 @@ def test_server_handoff_is_idempotent_and_keeps_exact_model(monkeypatch):
             "run_id": "run_fixture",
             "status": "in_progress",
             "run_state": "ready",
+            "provider": "chatgpt_account",
+            "model": "gpt-5.6-terra",
             "chat_route_request_id": request["request_id"],
         }
 
@@ -387,6 +393,9 @@ def test_server_handoff_is_idempotent_and_keeps_exact_model(monkeypatch):
     first = server._launch_autonomous_from_chat(dict(request))
     second = server._launch_autonomous_from_chat(dict(request))
     assert first["status"] == "running"
+    assert (first["provider_id"], first["model_id"]) == (
+        "chatgpt_account", "gpt-5.6-terra",
+    )
     assert second == first
     assert len(calls) == 1
     assert calls[0][0] == request["objective"]
@@ -400,6 +409,8 @@ def test_server_strict_model_failure_does_not_acquire_or_fallback(monkeypatch):
         "source_refs": [],
         "request_id": "turn_model_fixture",
         "conversation_id": "conv_model_fixture",
+        "provider_id": "chatgpt_account",
+        "model_id": "missing-model",
         "reason_code": "dependent_phases",
         "confidence": 0.95,
     }
@@ -423,7 +434,10 @@ def test_server_strict_model_failure_does_not_acquire_or_fallback(monkeypatch):
     server._autonomous["active"] = False
     server._autonomous["st"] = None
     result = server._launch_autonomous_from_chat(request)
-    assert result["status"] == "unavailable"
+    assert result == {
+        "status": "failed",
+        "error_code": "chat_model_unavailable",
+    }
     assert acquired == []
 
 

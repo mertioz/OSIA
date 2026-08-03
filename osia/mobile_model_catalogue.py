@@ -539,6 +539,7 @@ def resolve_current_autonomous_selection(
     wire_value: str | None = None,
     refresh_account: bool = True,
     strict: bool = False,
+    persist: bool = True,
 ) -> dict:
     """Validate immediately against current configured state off the UI thread."""
     catalogue = build_catalogue(
@@ -571,7 +572,8 @@ def resolve_current_autonomous_selection(
                 resolution.get("reason") or "selection_unavailable"
             ),
         }
-    persist_autonomous_selection(resolution)
+    if persist:
+        persist_autonomous_selection(resolution)
     return resolution
 
 

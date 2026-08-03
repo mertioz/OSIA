@@ -9130,6 +9130,8 @@ class _AutonomousPanel(QWidget):
         self._planning = False
         self._inventory: list[dict] = []
         self._fallback_reason = ""
+        self._run_provider = ""
+        self._run_model = ""
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 12, 14, 12)
@@ -9313,6 +9315,11 @@ class _AutonomousPanel(QWidget):
         self._prog_objective.setObjectName("sectionSub")
         self._prog_objective.setWordWrap(True)
         l.addWidget(self._prog_objective)
+
+        self._prog_model = QLabel("")
+        self._prog_model.setObjectName("sectionSub")
+        self._prog_model.hide()
+        l.addWidget(self._prog_model)
 
         self._prog_phase = QLabel("")
         self._prog_phase.setObjectName("sectionSub")
@@ -9591,6 +9598,12 @@ class _AutonomousPanel(QWidget):
         objective = payload.get("objective")
         if objective:
             self._prog_objective.setText(objective)
+        provider = str(payload.get("provider") or "").strip()
+        model = str(payload.get("model") or "").strip()
+        if provider and model:
+            self._run_provider = provider
+            self._run_model = model
+            self._render_run_model()
         phase_name = payload.get("phase_name")
         if (payload.get("error_category")
                 or payload.get("event") in {"task_failed", "failed", "plan_failed"}):
@@ -9707,6 +9720,8 @@ class _AutonomousPanel(QWidget):
             phase_name = phases[p].get("name", "") or ""
         return {
             "objective": state.get("objective", "") or "",
+            "provider": str(state.get("provider") or ""),
+            "model": str(state.get("model") or ""),
             "phase_name": phase_name,
             "done": done,
             "total": total,
@@ -9787,12 +9802,26 @@ class _AutonomousPanel(QWidget):
 
     def _reset_progress(self) -> None:
         self._prog_objective.setText("—")
+        self._run_provider = ""
+        self._run_model = ""
+        self._render_run_model()
         self._prog_phase.setText("")
         self._prog_counter.setText("")
         self._set_status(i18n.t("autonomous.status_idle"))
 
     def _set_status(self, text: str) -> None:
         self._prog_status.setText(text)
+
+    def _render_run_model(self) -> None:
+        if self._run_provider and self._run_model:
+            self._prog_model.setText(
+                f"{i18n.t('autonomous.model')}: "
+                f"{self._run_provider} — {self._run_model}"
+            )
+            self._prog_model.show()
+        else:
+            self._prog_model.clear()
+            self._prog_model.hide()
 
     @staticmethod
     def _short(text, limit: int = 120) -> str:
@@ -9806,6 +9835,7 @@ class _AutonomousPanel(QWidget):
             i18n.t("autonomous.objective_placeholder")
         )
         self._model_label.setText(i18n.t("autonomous.model"))
+        self._render_run_model()
         self._progress_title.setText(i18n.t("autonomous.progress_title"))
         self._scope_title.setText(i18n.t("autonomous.scope_extension_title"))
         self._authorize_btn.setText(i18n.t("autonomous.authorize_and_start"))

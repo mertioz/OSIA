@@ -7965,6 +7965,18 @@ class OSIAAgent:
                         # not a normal tool side effect. Execute it synchronously
                         # so a timeout wrapper can never leave a background start
                         # with an incorrectly reported failure or trigger replay.
+                        routing_context = _CHAT_ROUTING_CONTEXT.get()
+                        if isinstance(routing_context, dict):
+                            # Snapshot the exact provider/model that produced
+                            # this routing tool call. This runs after hierarchy
+                            # selection/fallback, so the handoff inherits the
+                            # effective chat turn rather than either UI selector.
+                            routing_context["provider_id"] = str(
+                                self.provider or ""
+                            ).strip().lower()
+                            routing_context["model_id"] = str(
+                                self.model or ""
+                            ).strip()
                         raw_handoff = tool_start_autonomous_mission(**kwargs)
                         try:
                             handoff = json.loads(raw_handoff)

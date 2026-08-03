@@ -498,7 +498,7 @@ class MobileServerAutonomousRuntimeTests(unittest.TestCase):
                     catalogue,
                     "resolve_current_autonomous_selection",
                     return_value=self._resolution(),
-                ),
+                ) as resolve_model,
                 patch.object(
                     server._aplanner, "create_plan_state", return_value=state
                 ) as create_plan,
@@ -514,6 +514,8 @@ class MobileServerAutonomousRuntimeTests(unittest.TestCase):
             server._autonomous.clear()
             server._autonomous.update(original)
         self.assertEqual(agent.calls, [("deepseek", "shared")])
+        self.assertTrue(resolve_model.call_args.kwargs["persist"])
+        self.assertFalse(resolve_model.call_args.kwargs["strict"])
         self.assertEqual(create_plan.call_args.args[1:3], ("deepseek", "shared"))
         self.assertEqual(orchestrator.started, [])
         self.assertEqual(create_plan.call_args.kwargs["origin_ref"], "mobile_test")
@@ -559,7 +561,7 @@ class MobileServerAutonomousRuntimeTests(unittest.TestCase):
                     catalogue,
                     "resolve_current_autonomous_selection",
                     return_value=self._resolution("openai", "shared"),
-                ),
+                ) as resolve_model,
                 patch.object(server, "_write_autonomous_lock"),
                 patch.object(server, "_broadcast_autonomous"),
             ):
@@ -568,6 +570,8 @@ class MobileServerAutonomousRuntimeTests(unittest.TestCase):
             server._autonomous.clear()
             server._autonomous.update(original)
         self.assertEqual(agent.calls, [("openai", "shared")])
+        self.assertTrue(resolve_model.call_args.kwargs["strict"])
+        self.assertFalse(resolve_model.call_args.kwargs["persist"])
         self.assertEqual(orchestrator.resumed, [state])
         self.assertEqual((state["provider"], state["model"]), ("openai", "shared"))
 

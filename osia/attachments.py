@@ -1050,6 +1050,7 @@ def build_agent_input(
     attachments: list[CommittedAttachment],
     *,
     owner_id: str | None = None,
+    permission_epoch: int | None = None,
 ) -> str | list[dict]:
     """Create opaque local sources before any provider input."""
 
@@ -1068,6 +1069,7 @@ def build_agent_input(
                     source_kind="mobile_attachment",
                     display_name=item.display_name,
                     declared_mime=item.detected_mime,
+                    permission_epoch=permission_epoch,
                 )
             else:
                 capability = get_source_store().create_for_current_owner(
@@ -1075,6 +1077,7 @@ def build_agent_input(
                     source_kind="mobile_attachment",
                     display_name=item.display_name,
                     declared_mime=item.detected_mime,
+                    permission_epoch=permission_epoch,
                 )
             capabilities.append(capability)
         bullets = "\n".join(

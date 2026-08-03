@@ -352,6 +352,7 @@ def prepare_desktop_turn(
     provider: str,
     model: str,
     owner_id: str | None = None,
+    permission_epoch: int | None = None,
 ) -> PreparedDesktopTurn:
     """Validate and prepare every item before any provider execution begins."""
 
@@ -378,6 +379,7 @@ def prepare_desktop_turn(
                         source_kind="desktop_attachment",
                         display_name=item.display_name,
                         declared_mime=item.detected_mime,
+                        permission_epoch=permission_epoch,
                     )
                 else:
                     capability = get_source_store().create_for_current_owner(
@@ -385,6 +387,7 @@ def prepare_desktop_turn(
                         source_kind="desktop_attachment",
                         display_name=item.display_name,
                         declared_mime=item.detected_mime,
+                        permission_epoch=permission_epoch,
                     )
                 document_capabilities.append(capability)
         except DocumentSourceError as exc:
