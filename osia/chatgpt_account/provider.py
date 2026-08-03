@@ -46,6 +46,8 @@ _DEVELOPER_INSTRUCTIONS = (
     "requires an OSIA tool. Follow the action-risk policy in the base instructions."
 )
 
+_LANGUAGE_MARKER = "\n\n[AUTHORITATIVE TURN LANGUAGE]\n"
+
 
 class AccountProviderError(RuntimeError):
     """Provider error carrying the no-duplicate-fallback boundary."""
@@ -184,6 +186,24 @@ def _turn_input(messages: list[dict]) -> str | list[dict]:
     return parts
 
 
+def _insert_before_turn_language(text: str, addition: str) -> str:
+    """Keep provider-owned additions below the authoritative turn contract."""
+
+    block = str(addition or "").strip()
+    if not block:
+        return str(text or "").strip()
+    if _LANGUAGE_MARKER in text:
+        before, after = text.rsplit(_LANGUAGE_MARKER, 1)
+        return (
+            before.rstrip()
+            + "\n\n"
+            + block
+            + _LANGUAGE_MARKER
+            + after
+        ).strip()
+    return (str(text or "").rstrip() + "\n\n" + block).strip()
+
+
 def _sanitized_system_prompt(system: str, messages: list[dict]) -> str:
     """Remove eager local paths; re-add Desktop only when this request needs it."""
     desktop_match = re.search(r"(?m)^\[DESKTOP PATH: (.+?)\]\s*$", system or "")
@@ -205,7 +225,9 @@ def _sanitized_system_prompt(system: str, messages: list[dict]) -> str:
         "",
     )
     if desktop_path and re.search(r"\b(desktop|bureau)\b", latest_user, re.IGNORECASE):
-        cleaned = cleaned.rstrip() + f"\n\n[DESKTOP PATH: {desktop_path}]"
+        cleaned = _insert_before_turn_language(
+            cleaned, f"[DESKTOP PATH: {desktop_path}]",
+        )
     return cleaned.strip()
 
 
@@ -357,6 +379,9 @@ class ChatGPTAccountProvider:
         public = [_public_message(message) for message in messages]
         system = next((m["content"] for m in public if m["role"] == "system"), "")
         system = _sanitized_system_prompt(system, public)
+        base_instructions = _insert_before_turn_language(
+            system, _CONTAINMENT_INSTRUCTIONS,
+        )
         system_fingerprint = hashlib.sha256(system.encode("utf-8")).hexdigest()
         public_non_system = [m for m in public if m["role"] != "system"]
         non_system = [message for message in messages if message.get("role") != "system"]
@@ -374,7 +399,7 @@ class ChatGPTAccountProvider:
             thread_id = self.client.start_or_resume_conversation(
                 thread_id=None,
                 model=model,
-                base_instructions=(system + _CONTAINMENT_INSTRUCTIONS).strip(),
+                base_instructions=base_instructions,
                 developer_instructions=_DEVELOPER_INSTRUCTIONS,
             )
             state = _ConversationState(

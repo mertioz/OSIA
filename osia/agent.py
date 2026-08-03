@@ -34,11 +34,14 @@ from openai import OpenAI
 from osia import i18n
 from osia.turn_context import (
     TurnContext,
+    language_consistency_failure_text,
+    language_consistency_retry_text,
     language_instruction,
     localized_text,
     log_final,
     log_round,
     normalize_locale,
+    response_language_drift,
     resolve_turn_context,
 )
 
@@ -6498,21 +6501,37 @@ class OSIAAgent:
         from osia.conversation_context import build_context, record_context_receipt
         from osia.image_inputs import adapt_messages_for_provider
 
-        logical = []
-        for message in self.messages:
-            candidate = copy.deepcopy(message)
-            if (
-                isinstance(candidate, dict)
-                and candidate.get("_internal")
-                and candidate.get("role") == "user"
-                and isinstance(candidate.get("content"), str)
-            ):
-                candidate["content"] = (
-                    candidate["content"]
-                    + "\n\n"
-                    + language_instruction(self.turn_context or self.lang)
-                )
-            logical.append(candidate)
+        logical = [copy.deepcopy(message) for message in self.messages]
+
+        # Restate the current turn's soft-authoritative language preference at
+        # the end of the latest user/provider-continuation payload. This is a
+        # wire-only copy: persisted user text and external evidence remain
+        # byte-for-byte unchanged. Putting the contract here covers the first
+        # request, tool-result reinjection, provider retries and account-thread
+        # continuations even when their cached system context is stale.
+        instruction = language_instruction(self.turn_context or self.lang)
+        latest_user = next((
+            index for index in range(len(logical) - 1, -1, -1)
+            if isinstance(logical[index], dict)
+            and logical[index].get("role") == "user"
+        ), None)
+        if latest_user is not None:
+            content = logical[latest_user].get("content")
+            if isinstance(content, str):
+                if not content.rstrip().endswith(instruction):
+                    logical[latest_user]["content"] = (
+                        content.rstrip() + "\n\n" + instruction
+                    )
+            elif isinstance(content, list):
+                parts = list(content)
+                last_text = next((
+                    str(part.get("text") or "")
+                    for part in reversed(parts)
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ), "")
+                if not last_text.rstrip().endswith(instruction):
+                    parts.append({"type": "text", "text": instruction})
+                logical[latest_user]["content"] = parts
 
         result = build_context(
             logical,
@@ -6853,6 +6872,35 @@ class OSIAAgent:
             message["_document_private"] = True
         self.messages.append(message)
         if self.turn_context is not None:
+            log_final(self.turn_context, content)
+        return content
+
+    def _finish_language_consistency_failure(
+        self, *, on_sentence=None, round_number: int,
+    ) -> str:
+        """Finish canonically when the one bounded regeneration also drifts."""
+
+        self.last_run_diagnostic = {
+            "stage": "response_generation",
+            "error_category": "language_consistency_failure",
+            "reason_code": "language_consistency_failure",
+        }
+        content = clean_response(
+            self._redact_semantic_form_values(
+                language_consistency_failure_text(self.lang)
+            )
+        )
+        if on_sentence is not None:
+            try:
+                on_sentence(content)
+            except Exception:
+                pass
+        final_message = {"role": "assistant", "content": content}
+        if self._document_private_run:
+            final_message["_document_private"] = True
+        self.messages.append(final_message)
+        if self.turn_context is not None:
+            log_round(self.turn_context, round_number, "canonical_final")
             log_final(self.turn_context, content)
         return content
 
@@ -7325,6 +7373,7 @@ class OSIAAgent:
         scheduled_task_tool_succeeded = False
         scheduled_task_request_retry_used = False
         scheduled_task_claim_retry_used = False
+        language_consistency_retry_used = False
         # Once an account response emits an OSIA textual tool call, the attempt
         # is committed. A later tool-result turn must never replay via an API.
         _account_attempt_committed = False
@@ -7645,6 +7694,14 @@ class OSIAAgent:
                 content, message=message, provider=self.provider,
             )
             tool_calls = _apply_exact_autonomous_resume_call(self, tool_calls)
+            if tool_calls and language_consistency_retry_used:
+                # The bounded consistency retry is synthesis-only. A provider
+                # must not turn it into another dispatch or replay an earlier
+                # tool after OSIA has rejected the candidate final.
+                return self._finish_language_consistency_failure(
+                    on_sentence=on_sentence,
+                    round_number=round_number,
+                )
             if tool_calls and self.provider == "chatgpt_account":
                 _account_attempt_committed = True
 
@@ -8577,6 +8634,26 @@ class OSIAAgent:
                 # fallback so the user always gets a reply and TTS always
                 # has one canonical text to speak.
                 content = self._empty_response_fallback(guard)
+            drift_language = response_language_drift(content, self.turn_context)
+            if drift_language:
+                if not language_consistency_retry_used:
+                    language_consistency_retry_used = True
+                    if self.turn_context is not None:
+                        log_round(
+                            self.turn_context,
+                            round_number,
+                            "language_drift_rejected",
+                        )
+                    self.messages.append({
+                        "role": "user",
+                        "_internal": True,
+                        "content": language_consistency_retry_text(self.lang),
+                    })
+                    continue
+                return self._finish_language_consistency_failure(
+                    on_sentence=on_sentence,
+                    round_number=round_number,
+                )
             if unresolved_tool_timeout and self.last_run_diagnostic is None:
                 self.last_run_diagnostic = {
                     "stage": "task_execution",

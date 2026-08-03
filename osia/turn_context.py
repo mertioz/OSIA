@@ -439,6 +439,80 @@ def language_instruction(language: str | TurnContext) -> str:
     )
 
 
+_SOURCE_VALUE_LINE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:source|original|quotation|quote|citation|"
+    r"extrait|valeur(?:\s+source)?|texte\s+source|fuente|texto\s+original|"
+    r"cita|valor(?:\s+de\s+origen)?)\s*:",
+    re.IGNORECASE,
+)
+
+
+def _assistant_prose_for_language_check(text) -> str:
+    """Return probable assistant prose without quoted or labelled source data."""
+
+    visible = _without_foreign_evidence(_display_text(text))
+    visible = re.sub(
+        r"\u201c[^\u201d\n]*\u201d|\u00ab[^\u00bb\n]*\u00bb",
+        " ",
+        visible,
+    )
+    kept: list[str] = []
+    for line in visible.splitlines():
+        stripped = line.strip()
+        if (
+            not stripped
+            or stripped.startswith(">")
+            or _SOURCE_VALUE_LINE.match(stripped)
+        ):
+            continue
+        if stripped.startswith("|") and stripped.endswith("|"):
+            # Markdown tables commonly carry exact external field values.
+            continue
+        stripped = re.sub(r"^\s*(?:#{1,6}|[-*+]\s+|\d+[.)]\s+)", "", stripped)
+        kept.append(stripped)
+    return "\n".join(kept)
+
+
+def _strong_prose_language(text: str) -> str | None:
+    words = re.findall(r"[^\W\d_]+", str(text or ""), flags=re.UNICODE)
+    if len(words) < 5 or sum(len(word) for word in words) < 20:
+        return None
+    try:
+        candidates = detect_langs(text)
+        best = candidates[0] if candidates else None
+        language = normalize_locale(getattr(best, "lang", None))
+        confidence = float(getattr(best, "prob", 0.0))
+    except Exception:
+        return None
+    return language if language and confidence >= 0.92 else None
+
+
+def response_language_drift(text, context: TurnContext | None) -> str | None:
+    """Return a clearly foreign assistant-prose language, if one is present.
+
+    This is deliberately a narrow final-boundary check, not translation. It is
+    disabled for explicit translation/multilingual turns and ignores quotations,
+    code, URLs, labelled source values and Markdown tables so external evidence
+    remains untouched.
+    """
+
+    if not isinstance(context, TurnContext) or context.mode != "single-language":
+        return None
+    target = normalize_locale(context.language)
+    if not target:
+        return None
+    visible = _assistant_prose_for_language_check(text)
+    if not visible.strip():
+        return None
+    segments = re.split(r"(?<=[.!?;:])\s+|[\r\n]+", visible)
+    for segment in segments:
+        detected = _strong_prose_language(segment)
+        if detected and detected != target:
+            return detected
+    detected = _strong_prose_language(visible)
+    return detected if detected and detected != target else None
+
+
 _LOCALIZED = {
     "empty_completion": {
         "en": "I couldn't produce a reliable final response. Please try again or rephrase your request.",
@@ -600,6 +674,60 @@ def localized_text(key: str, language: str, **values) -> str:
         return rendered.format(**values)
     except (KeyError, ValueError):
         return rendered
+
+
+_LANGUAGE_CONSISTENCY_RETRY = {
+    "en": (
+        "The previous candidate changed the language of OSIA-authored prose. "
+        "Regenerate the final answer in the authoritative turn language. Preserve "
+        "proper nouns, exact source values and direct quotations unchanged. Do not "
+        "call another tool or mention this correction."
+    ),
+    "fr": (
+        "La r\u00e9ponse pr\u00e9c\u00e9dente a chang\u00e9 la langue du texte r\u00e9dig\u00e9 "
+        "par OSIA. R\u00e9g\u00e9n\u00e8re la r\u00e9ponse finale dans la langue autoritative du "
+        "tour. Conserve les noms propres, les valeurs sources exactes et les citations "
+        "directes sans les modifier. N'appelle aucun autre outil et ne mentionne pas "
+        "cette correction."
+    ),
+    "es": (
+        "La respuesta anterior cambi\u00f3 el idioma del texto redactado por OSIA. "
+        "Regenera la respuesta final en el idioma autoritativo del turno. Conserva "
+        "sin cambios los nombres propios, los valores exactos de la fuente y las "
+        "citas directas. No llames a otra herramienta ni menciones esta correcci\u00f3n."
+    ),
+}
+
+_LANGUAGE_CONSISTENCY_FAILURE = {
+    "en": (
+        "I couldn't produce a response that stayed coherent in the language of "
+        "this request. Please try again."
+    ),
+    "fr": (
+        "Je n\u2019ai pas pu produire une r\u00e9ponse qui reste coh\u00e9rente dans la "
+        "langue de cette demande. R\u00e9essayez."
+    ),
+    "es": (
+        "No pude producir una respuesta que mantuviera de forma coherente el "
+        "idioma de esta solicitud. Int\u00e9ntalo de nuevo."
+    ),
+}
+
+
+def language_consistency_retry_text(language: str) -> str:
+    code = normalize_locale(language) or i18n.DEFAULT_LANG
+    return (
+        _LANGUAGE_CONSISTENCY_RETRY.get(code)
+        or _LANGUAGE_CONSISTENCY_RETRY["en"]
+    )
+
+
+def language_consistency_failure_text(language: str) -> str:
+    code = normalize_locale(language) or i18n.DEFAULT_LANG
+    return (
+        _LANGUAGE_CONSISTENCY_FAILURE.get(code)
+        or _LANGUAGE_CONSISTENCY_FAILURE["en"]
+    )
 
 
 def content_hash(text) -> str:
