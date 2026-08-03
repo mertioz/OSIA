@@ -229,6 +229,8 @@ def _agent_with_capture(completions):
     agent.provider = "deepseek"
     agent.model = "deepseek-v4-pro"
     agent.messages = [{"role": "user", "content": "harmless"}]
+    agent.turn_context = None
+    agent.lang = "en"
     agent.client = SimpleNamespace(
         chat=SimpleNamespace(completions=completions),
         timeout=30.0,

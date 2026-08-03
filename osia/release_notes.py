@@ -63,6 +63,137 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="1.1.1",
+        released_on="2026-08-03",
+        public=True,
+        changes_en=(),
+        changes_fr=(),
+        summary_en=(
+            "Stable/Preview update preferences are now explicit, persistent, safely migrated, and isolated so Preview failures never block Stable.",
+            "Skill activation now survives stale Mobile snapshots, navigation, editing, reconnects, and restarts while invalid skills remain fail-closed.",
+            "Each turn keeps its chosen language across skills, tools, provider continuations, retries, finalization, Mobile projection, and TTS.",
+            "Long or explicit chat requests can start one canonical Autonomous mission while simple, scheduled, ambiguous, or blocked work stays on its proper path.",
+            "Chat-started missions inherit the exact active model and supported attachments; Windows gains animated switches and Android 1.1.0 mirrors the run accurately.",
+        ),
+        summary_fr=(
+            "Les préférences Stable/Preview sont explicites, persistantes, migrées sûrement et isolées afin qu’un échec Preview ne bloque jamais Stable.",
+            "L’activation des skills résiste aux anciens snapshots Mobile, à la navigation, à l’édition, aux reconnexions et redémarrages, avec repli sûr si invalide.",
+            "Chaque tour conserve sa langue à travers skills, outils, continuations fournisseur, reprises, finalisation, projection Mobile et TTS.",
+            "Une demande longue ou explicite du chat peut lancer une unique mission Autonomous ; les demandes simples, planifiées, ambiguës ou bloquées gardent leur voie.",
+            "Les missions issues du chat héritent du modèle et des pièces jointes exacts ; Windows reçoit des interrupteurs animés et Android 1.1.0 reflète le run fidèlement.",
+        ),
+        sections=(
+            ReleaseSection(
+                "Stable and Preview updates",
+                "Mises à jour Stable et Preview",
+                (
+                    "Settings now offers an explicit, confirmed opt-in to receive internal-preview builds in addition to Stable releases.",
+                    "Existing internal-preview installations migrate to opted in, while Stable and new installations remain Stable-only by default.",
+                    "Stable and Preview use independent caches and validators; a missing, paused, invalid, or offline Preview channel cannot block a valid Stable update.",
+                    "Disabling Preview takes effect immediately without downgrading the installed build, and equal versions continue to prefer Stable.",
+                ),
+                (
+                    "Les paramètres proposent désormais un opt-in explicite et confirmé pour recevoir les builds internal-preview en plus des versions Stable.",
+                    "Les installations internal-preview existantes migrent vers l’opt-in, tandis que Stable et les nouvelles installations restent en Stable uniquement par défaut.",
+                    "Stable et Preview utilisent des caches et validateurs indépendants ; un canal Preview absent, suspendu, invalide ou hors ligne ne bloque jamais une mise à jour Stable valide.",
+                    "La désactivation de Preview est immédiate sans rétrograder la version installée, et une égalité de version continue de privilégier Stable.",
+                ),
+            ),
+            ReleaseSection(
+                "Skill activation reliability",
+                "Fiabilité de l’activation des skills",
+                (
+                    "Skill enablement is persisted together with a canonical revision so a delayed Mobile snapshot can no longer switch a newly enabled skill back off.",
+                    "Enabled skills remain enabled after refresh, navigation, content edits, reconnects, and restarts, and are injected into agent context exactly once.",
+                    "Invalid or unavailable skills still remain disabled with a sanitized reason instead of reporting a false success.",
+                ),
+                (
+                    "L’activation d’un skill est persistée avec une révision canonique afin qu’un snapshot Mobile retardé ne puisse plus le remettre immédiatement sur OFF.",
+                    "Les skills actifs le restent après rafraîchissement, navigation, édition, reconnexion et redémarrage, et ne sont injectés qu’une fois dans le contexte agent.",
+                    "Un skill invalide ou indisponible reste désactivé avec une raison sanitizée au lieu d’afficher un faux succès.",
+                ),
+            ),
+            ReleaseSection(
+                "Per-turn language continuity",
+                "Continuité de langue par tour",
+                (
+                    "The language selected from the latest clear user message is restated at every initial and continuation provider boundary without changing stored conversation history.",
+                    "Skills, multilingual tool results, provider-thread reuse, retry, replan, and resume can no longer silently replace the authoritative language mid-turn.",
+                    "A bounded consistency check protects the canonical final response while preserving quotations, source values, code, URLs, tables, and explicit translation requests.",
+                ),
+                (
+                    "La langue choisie depuis le dernier message utilisateur clair est réaffirmée à chaque frontière fournisseur initiale ou de continuation sans modifier l’historique stocké.",
+                    "Skills, résultats d’outils multilingues, réutilisation de thread fournisseur, retry, replan et resume ne peuvent plus remplacer silencieusement la langue autoritaire en cours de tour.",
+                    "Un contrôle borné protège la réponse finale canonique tout en préservant citations, valeurs sources, code, URL, tableaux et demandes explicites de traduction.",
+                ),
+            ),
+            ReleaseSection(
+                "Chat to Autonomous routing",
+                "Routage Chat vers Autonomous",
+                (
+                    "Clearly long, sustained, multi-step work can now be handed from Chat to the existing canonical Autonomous engine automatically, and explicit requests can select the same path.",
+                    "Simple questions and quick tools stay in Chat, future or recurring requests stay in Scheduled Tasks, and ambiguous requests ask for clarification.",
+                    "A successful backend start is required before confirmation, with one mission per message, no duplicate normal-chat execution, and existing permissions, idempotency, and single-runner guards preserved.",
+                    "Pause, resume, abort, checkpoint, restart, and reconnect continue through the existing Autonomous state rather than a parallel store or orchestrator.",
+                ),
+                (
+                    "Les travaux clairement longs, soutenus et multi-étapes peuvent être confiés automatiquement depuis Chat au moteur Autonomous canonique existant ; une demande explicite emprunte la même voie.",
+                    "Les questions simples et outils rapides restent dans Chat, les demandes futures ou récurrentes restent dans Scheduled Tasks et les demandes ambiguës déclenchent une clarification.",
+                    "Le démarrage backend doit réussir avant confirmation, avec une mission au plus par message, aucune double exécution Chat et le maintien des permissions, de l’idempotence et du verrou single-runner.",
+                    "Pause, reprise, abandon, checkpoint, redémarrage et reconnexion continuent via l’état Autonomous existant, sans store ni orchestrateur parallèle.",
+                ),
+            ),
+            ReleaseSection(
+                "Exact model and attachment handoff",
+                "Transmission exacte du modèle et des pièces jointes",
+                (
+                    "A mission started from Chat snapshots the exact effective provider and model from that turn and keeps the pair through planner, runner, verifier, retry, replan, reconnect, and resume.",
+                    "Manual Autonomous launches keep their independent selector, and chat handoff never overwrites the global Autonomous preference.",
+                    "Unavailable or incompatible chat models and genuine runner transport failures now produce distinct, localized diagnostics without silent fallback.",
+                    "Supported opaque PNG, PDF, and DOCX references retain their permission epoch and remain readable after the handoff without copying unrelated private context.",
+                ),
+                (
+                    "Une mission lancée depuis Chat capture le fournisseur et le modèle effectifs exacts du tour et conserve cette paire dans planner, runner, verifier, retry, replan, reconnexion et resume.",
+                    "Les lancements Autonomous manuels gardent leur sélecteur indépendant et le handoff du chat n’écrase jamais la préférence Autonomous globale.",
+                    "Un modèle de chat indisponible ou incompatible et une véritable erreur de transport runner produisent désormais des diagnostics distincts et localisés, sans fallback silencieux.",
+                    "Les références opaques PNG, PDF et DOCX prises en charge conservent leur epoch d’autorisation et restent lisibles après le handoff sans copier de contexte privé inutile.",
+                ),
+            ),
+            ReleaseSection(
+                "Windows controls and Android companion",
+                "Contrôles Windows et compagnon Android",
+                (
+                    "Windows binary settings now share one accessible sliding-switch component with a 180 ms animation, keyboard operation, clear focus, disabled state, light and dark themes, accent palettes, high-DPI support, and reduced motion.",
+                    "Existing business bindings remain unchanged for permissions, Full Access, skills, providers, voice, Stable/Preview, Autonomous, Scheduled Tasks, and dynamically generated settings.",
+                    "Android 1.1.0 rejects stale skill revisions, mirrors the inherited Autonomous run model, and hides only the non-actionable browser snapshot refresh card while preserving useful browser progress.",
+                    "The protected Mobile WebSocket service and public message protocol remain unchanged.",
+                ),
+                (
+                    "Les réglages binaires Windows partagent désormais un interrupteur coulissant accessible avec animation de 180 ms, clavier, focus clair, état disabled, thèmes clair/sombre, palettes d’accent, haute résolution et animations réduites.",
+                    "Les bindings métier restent inchangés pour permissions, Full Access, skills, fournisseurs, voix, Stable/Preview, Autonomous, Scheduled Tasks et réglages générés dynamiquement.",
+                    "Android 1.1.0 rejette les anciennes révisions de skills, reflète le modèle hérité du run Autonomous et masque uniquement la carte inutile de rafraîchissement du snapshot navigateur en conservant les progrès utiles.",
+                    "Le service WebSocket Mobile protégé et le protocole public de messages restent inchangés.",
+                ),
+            ),
+            ReleaseSection(
+                "Distribution and known limits",
+                "Distribution et limites connues",
+                (
+                    "Windows 1.1.1 is distributed without an Authenticode signature, so Windows may show Unknown publisher or a Microsoft Defender SmartScreen warning.",
+                    "Download only from the official OSIA HTTPS domain, verify the published SHA-256, and use More info then Run anyway only when that verified official download is trusted; do not disable Windows protections.",
+                    "Autonomous handoff remains subject to the active model’s real compatibility, configured access, permissions, and the single active-run limit; it never silently falls back or elevates privileges.",
+                    "Google Play availability for Android 1.1.0 is reported separately on osia.space and must not be inferred from the Windows release.",
+                ),
+                (
+                    "Windows 1.1.1 est distribué sans signature Authenticode ; Windows peut donc afficher Éditeur inconnu ou un avertissement Microsoft Defender SmartScreen.",
+                    "Téléchargez uniquement depuis le domaine HTTPS officiel OSIA, vérifiez le SHA-256 publié et utilisez Informations complémentaires puis Exécuter quand même seulement si ce téléchargement officiel vérifié est digne de confiance ; ne désactivez aucune protection Windows.",
+                    "Le handoff Autonomous reste soumis à la compatibilité réelle du modèle actif, aux accès configurés, aux permissions et à la limite d’un run actif ; il n’effectue aucun fallback silencieux ni élévation de privilèges.",
+                    "La disponibilité Google Play d’Android 1.1.0 est indiquée séparément sur osia.space et ne doit pas être déduite de la release Windows.",
+                ),
+            ),
+        ),
+    ),
+    ReleaseEntry(
         version="1.1.0",
         released_on="2026-08-02",
         public=True,

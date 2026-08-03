@@ -82,23 +82,82 @@ def _controller(monkeypatch, tmp_path, *, cached=False):
 
 def test_embedded_notes_load_offline_and_are_newest_first():
     assert [entry.version for entry in RELEASE_HISTORY] == [
-        "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
+        "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
     ]
+    current = release_for_version("1.1.1")
+    assert current is not None and current.public
+    assert not is_major_update(current.version)
     major = release_for_version("1.1.0")
     assert major is not None and major.public
     assert is_major_update(major.version)
     assert len(major.summary("en")) == len(major.summary("fr")) == 5
     assert len(major.changes("en")) == len(major.changes("fr")) >= 80
     assert len(major.sections) >= 20
-    current = release_for_version("1.0.6")
-    assert current is not None and not current.public
+    internal_current = release_for_version("1.0.6")
+    assert internal_current is not None and not internal_current.public
     previous = release_for_version("1.0.5")
     assert previous is not None and previous.public
     assert "getting started" in " ".join(previous.changes("en")).lower()
     internal = release_for_version("1.0.3")
     assert internal is not None and not internal.public
     assert "superseded" in " ".join(internal.changes("en")).lower()
-    assert manifest_release_notes("1.0.6") == list(current.changes_en)
+    assert manifest_release_notes("1.0.6") == list(internal_current.changes_en)
+
+
+def test_111_notes_are_complete_bilingual_and_manifest_compatible():
+    current = release_for_version("1.1.1")
+    assert current is not None
+    assert manifest_release_notes("1.1.1") == list(current.summary_en)
+    assert len(current.summary("en")) == len(current.summary("fr")) == 5
+    assert all(len(note) <= 240 for note in manifest_release_notes("1.1.1"))
+    assert len(current.sections) == 7
+    assert len(current.changes("en")) == len(current.changes("fr")) == 26
+
+    section_titles = " ".join(section.title_en for section in current.sections).lower()
+    for subject in (
+        "stable and preview",
+        "skill activation",
+        "language continuity",
+        "chat to autonomous",
+        "model and attachment",
+        "windows controls",
+        "distribution",
+    ):
+        assert subject in section_titles
+
+    english = installer_release_notes("1.1.1", "en").lower()
+    french = installer_release_notes("1.1.1", "fr").lower()
+    for subject in (
+        "internal-preview",
+        "canonical revision",
+        "per-turn language",
+        "scheduled tasks",
+        "planner, runner, verifier",
+        "png, pdf, and docx",
+        "android 1.1.0",
+        "unknown publisher",
+        "more info",
+        "run anyway",
+    ):
+        assert subject in english
+    for subject in (
+        "stable et preview",
+        "révision canonique",
+        "continuité de langue",
+        "scheduled tasks",
+        "png, pdf et docx",
+        "android 1.1.0",
+        "éditeur inconnu",
+        "informations complémentaires",
+        "exécuter quand même",
+    ):
+        assert subject in french
+
+    raw = _manifest(version="1.1.1")
+    raw["releaseNotes"] = manifest_release_notes("1.1.1")
+    parsed = updater.parse_manifest(json.dumps(raw), _metadata("1.1.0"))
+    assert parsed.version == "1.1.1"
+    assert parsed.release_notes == tuple(manifest_release_notes("1.1.1"))
 
 
 def test_110_notes_are_exhaustive_bilingual_and_manifest_compatible():

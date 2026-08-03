@@ -253,18 +253,18 @@ def test_disabling_preview_keeps_installed_version_and_checks_stable_only(tmp_pa
     store = updater.UpdateStateStore(tmp_path / "state.json")
     store.update(
         preview_opt_in=True,
-        cachedManifest=_manifest("1.2.0", "internal-preview"),
-        pending={"version": "1.2.1"},
+        cachedManifest=_manifest("9.0.0", "internal-preview"),
+        pending={"version": "9.0.1"},
     )
     updater.set_preview_opt_in(store, False)
     state = store.load()
     assert state["preview_opt_in"] is False
     assert state["cachedManifest"] is None
-    assert state["pending"] == {"version": "1.2.1"}
+    assert state["pending"] == {"version": "9.0.1"}
 
-    routes = _Routes(stable=[_ok(_manifest("1.1.9", "stable"))])
+    routes = _Routes(stable=[_ok(_manifest("8.9.9", "stable"))])
     result = updater.fetch_eligible_manifest(
-        _metadata("1.2.0", "internal-preview"),
+        _metadata("9.0.0", "internal-preview"),
         store,
         preview_opt_in=False,
         open_response=routes,
@@ -366,7 +366,7 @@ def test_controller_disable_preview_manual_check_reports_no_newer_stable(
     from osia.gui import update_ui
 
     app = QApplication.instance() or QApplication([])
-    current = _metadata("1.2.0", "internal-preview")
+    current = _metadata("9.0.0", "internal-preview")
     store = updater.UpdateStateStore(tmp_path / "state.json")
     store.update(preview_opt_in=True)
     checked = []

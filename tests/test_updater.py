@@ -107,7 +107,7 @@ def test_app_metadata_is_strict_and_records_only_internal_override():
         "buildTimestamp": "2026-07-20T10:00:00Z", "commitSha": None,
         "updaterSchemaVersion": 1,
         "buildOverride": {
-            "sourceVersion": "1.1.0", "version": "1.0.1",
+            "sourceVersion": "1.1.1", "version": "1.0.1",
             "channel": "internal-preview",
         },
     }
@@ -164,21 +164,22 @@ def test_duplicate_keys_and_non_finite_json_are_rejected():
         updater.parse_manifest(raw, metadata())
 
 
-def test_only_wor183_stable_unsigned_release_is_installable(tmp_path):
-    raw = manifest_dict(version="1.1.0", channel="stable")
-    parsed = updater.parse_manifest(
-        json.dumps(raw), metadata(version="1.0.6", channel="stable")
-    )
-    path = updater.installer_path(parsed.version, tmp_path)
-    path.write_bytes(b"installer")
-    plan = updater.prepare_installer_plan(parsed, path)
-    assert plan.executable == path
-    assert updater.UNSIGNED_STABLE_RELEASES == frozenset({"1.1.0"})
+def test_only_wor183_stable_unsigned_releases_are_installable(tmp_path):
+    for version, installed in (("1.1.0", "1.0.6"), ("1.1.1", "1.1.0")):
+        raw = manifest_dict(version=version, channel="stable")
+        parsed = updater.parse_manifest(
+            json.dumps(raw), metadata(version=installed, channel="stable")
+        )
+        path = updater.installer_path(parsed.version, tmp_path)
+        path.write_bytes(b"installer")
+        plan = updater.prepare_installer_plan(parsed, path)
+        assert plan.executable == path
+    assert updater.UNSIGNED_STABLE_RELEASES == frozenset({"1.1.0", "1.1.1"})
 
-    future = manifest_dict(version="1.1.1", channel="stable")
+    future = manifest_dict(version="1.1.2", channel="stable")
     with pytest.raises(updater.ManifestError, match="stable_unsigned"):
         updater.parse_manifest(
-            json.dumps(future), metadata(version="1.1.0", channel="stable")
+            json.dumps(future), metadata(version="1.1.1", channel="stable")
         )
 
     internal = parse_manifest()

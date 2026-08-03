@@ -64,9 +64,9 @@ installer when `OSIA_SIGN_SHA1` contains the SHA-1 thumbprint of an accessible
 Authenticode certificate. The signing stage uses SHA-256 and an RFC 3161
 timestamp, then verifies the signature.
 
-WOR-183 has one explicit product-approved exception for the public Windows
-1.1.0 stable release. That installer is intentionally unsigned and its manifest
-records `signed: false` with no publisher claim. Windows may show **Unknown
+WOR-183 has an explicit product-approved exception for the public Windows
+1.1.0 and 1.1.1 stable releases. Those installers are intentionally unsigned
+and their manifests record `signed: false` with no publisher claim. Windows may show **Unknown
 publisher** / **Éditeur inconnu** or a Microsoft Defender SmartScreen warning.
 Users should download only from the official OSIA HTTPS domain, verify the
 published SHA-256, and may choose **More info** / **Informations

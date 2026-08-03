@@ -36,7 +36,7 @@ PRODUCT = "OSIA"
 PLATFORM = "windows"
 ARCHITECTURE = "x86_64"
 ALLOWED_CHANNELS = frozenset({"internal-preview", "stable"})
-UNSIGNED_STABLE_RELEASES = frozenset({"1.1.0"})
+UNSIGNED_STABLE_RELEASES = frozenset({"1.1.0", "1.1.1"})
 ALLOWED_INSTALLER_HOST = "download.osia.space"
 CHANNEL_URLS = {
     "internal-preview": (
