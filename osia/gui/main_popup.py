@@ -41,7 +41,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QStackedWidget, QListWidget, QAbstractItemView, QFrame,
-    QSizePolicy, QFileDialog, QCheckBox, QComboBox,
+    QSizePolicy, QFileDialog, QComboBox,
     QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog, QLayout, QMenu,
     QToolTip, QMessageBox, QTextBrowser,
 )
@@ -81,6 +81,7 @@ from osia.perf import perf_timer
 from osia.gui.motion import (
     MOTION, MotionController, reduced_motion_requested,
 )
+from osia.gui.switch import OsiaSwitch
 from osia.gui.streaming import DesktopTextStreamController
 from osia.gui.theme import PALETTES, get_theme_manager, themed_stylesheet
 from osia.gui.update_ui import UpdateBanner, UpdateController, UpdateSettingsSection
@@ -2941,7 +2942,7 @@ class _SettingsPanel(QWidget):
             self._on_chatgpt_auth_storage_changed
         )
         self._configure_chatgpt_file_watcher()
-        self._startup_rows: list[tuple[str, QLabel, QCheckBox]] = []
+        self._startup_rows: list[tuple[str, QLabel, OsiaSwitch]] = []
         # Guards the autostart toggle against re-entrant stateChanged while it is
         # being reverted (e.g. on an unsupported platform). See WOR-22.
         self._autostart_guard = False
@@ -3339,8 +3340,7 @@ class _SettingsPanel(QWidget):
         self._show_capsule_label = QLabel(i18n.t("settings.show_capsule"))
         self._show_capsule_label.setObjectName("providerName")
         self._show_capsule_label.setWordWrap(True)
-        self._show_capsule_toggle = QCheckBox()
-        self._show_capsule_toggle.setObjectName("smartToggle")
+        self._show_capsule_toggle = OsiaSwitch()
         self._show_capsule_toggle.stateChanged.connect(
             self._on_show_capsule_changed
         )
@@ -3354,8 +3354,7 @@ class _SettingsPanel(QWidget):
         self._autostart_label = QLabel(i18n.t("settings.autostart_gui"))
         self._autostart_label.setObjectName("providerName")
         self._autostart_label.setWordWrap(True)
-        self._autostart_toggle = QCheckBox()
-        self._autostart_toggle.setObjectName("smartToggle")
+        self._autostart_toggle = OsiaSwitch()
         self._autostart_toggle.stateChanged.connect(self._on_autostart_changed)
         auto_row.addWidget(self._autostart_label)
         auto_row.addStretch()
@@ -3612,8 +3611,7 @@ class _SettingsPanel(QWidget):
             dot.setWordWrap(True)
             dot.setFixedSize(10, 10)
             dot.setProperty("state", "stopped")
-            toggle = QCheckBox()
-            toggle.setObjectName("smartToggle")
+            toggle = OsiaSwitch()
             toggle.stateChanged.connect(
                 lambda _s, u=unit, t=toggle: self._on_startup_toggle_changed(u, t)
             )
@@ -3753,8 +3751,7 @@ class _SettingsPanel(QWidget):
         self._wake_word_label = QLabel(i18n.t("settings.wake_word_enabled"))
         self._wake_word_label.setObjectName("providerName")
         self._wake_word_label.setWordWrap(True)
-        self._wake_word_toggle = QCheckBox()
-        self._wake_word_toggle.setObjectName("smartToggle")
+        self._wake_word_toggle = OsiaSwitch()
         self._wake_word_toggle.setEnabled(False)
         self._wake_word_toggle.setToolTip(
             i18n.t("settings.wake_word_enabled")
@@ -3771,8 +3768,7 @@ class _SettingsPanel(QWidget):
         self._wake_enabled_label = QLabel(i18n.t("wake.greeting_enabled"))
         self._wake_enabled_label.setObjectName("providerName")
         self._wake_enabled_label.setWordWrap(True)
-        self._wake_enabled_toggle = QCheckBox()
-        self._wake_enabled_toggle.setObjectName("smartToggle")
+        self._wake_enabled_toggle = OsiaSwitch()
         self._wake_enabled_toggle.stateChanged.connect(self._on_wake_enabled_changed)
         enable_row.addWidget(self._wake_enabled_label)
         enable_row.addStretch()
@@ -3945,8 +3941,7 @@ class _SettingsPanel(QWidget):
         self._liveapi_soon = QLabel(i18n.t("liveapi.coming_soon"))
         self._liveapi_soon.setObjectName("comingSoonPill")
         self._liveapi_soon.setWordWrap(True)
-        self._liveapi_enabled_toggle = QCheckBox()
-        self._liveapi_enabled_toggle.setObjectName("smartToggle")
+        self._liveapi_enabled_toggle = OsiaSwitch()
         self._liveapi_enabled_toggle.setEnabled(self._LIVEAPI_AVAILABLE)
         self._liveapi_enabled_toggle.stateChanged.connect(
             self._on_liveapi_enabled_changed
@@ -4140,8 +4135,7 @@ class _SettingsPanel(QWidget):
         self._hier_enabled_label = QLabel(i18n.t("hierarchy.enabled"))
         self._hier_enabled_label.setObjectName("providerName")
         self._hier_enabled_label.setWordWrap(True)
-        self._hier_enabled_toggle = QCheckBox()
-        self._hier_enabled_toggle.setObjectName("smartToggle")
+        self._hier_enabled_toggle = OsiaSwitch()
         self._hier_enabled_toggle.stateChanged.connect(self._on_hier_enabled_changed)
         enable_row.addWidget(self._hier_enabled_label)
         enable_row.addStretch()
@@ -4433,8 +4427,7 @@ class _SettingsPanel(QWidget):
         bubble.clicked.connect(
             lambda _=False, i=index, b=bubble: self._on_cron_pick_conversation(i, b)
         )
-        enable = QCheckBox()
-        enable.setObjectName("smartToggle")
+        enable = OsiaSwitch()
         enable.setChecked(bool(job.get("enabled", False)))
         enable.stateChanged.connect(
             lambda _s, i=index, c=enable: self._on_cron_field(i, "enabled", c.isChecked())
@@ -5047,8 +5040,7 @@ class _SettingsPanel(QWidget):
         self._hb_enabled_label = QLabel(i18n.t("heartbeat.enabled"))
         self._hb_enabled_label.setObjectName("providerName")
         self._hb_enabled_label.setWordWrap(True)
-        self._hb_enabled_toggle = QCheckBox()
-        self._hb_enabled_toggle.setObjectName("smartToggle")
+        self._hb_enabled_toggle = OsiaSwitch()
         self._hb_enabled_toggle.stateChanged.connect(self._on_hb_enabled_changed)
         enable_row.addWidget(self._hb_enabled_label)
         enable_row.addStretch()
@@ -5075,7 +5067,7 @@ class _SettingsPanel(QWidget):
         body.addLayout(interval_row)
 
         # Per-metric rows.
-        self._hb_check_toggles: dict[str, QCheckBox] = {}
+        self._hb_check_toggles: dict[str, OsiaSwitch] = {}
         self._hb_threshold_inputs: dict[str, QLineEdit] = {}
         self._hb_metric_labels: dict[str, QLabel] = {}
         self._hb_metric_hints: dict[str, QLabel] = {}
@@ -5097,8 +5089,7 @@ class _SettingsPanel(QWidget):
 
         top = QHBoxLayout()
         top.setSpacing(6)
-        toggle = QCheckBox()
-        toggle.setObjectName("smartToggle")
+        toggle = OsiaSwitch()
         toggle.stateChanged.connect(self._persist_heartbeat_checks)
         label = QLabel(i18n.t(label_key))
         label.setObjectName("providerName")
@@ -8631,7 +8622,7 @@ class _SettingsPanel(QWidget):
             if item is not None:
                 item.setText(i18n.t(_key))
 
-    def _on_startup_toggle_changed(self, unit: str, toggle: QCheckBox) -> None:
+    def _on_startup_toggle_changed(self, unit: str, toggle: OsiaSwitch) -> None:
         if self._startup_refresh_guard:
             return
         checked = toggle.isChecked()
@@ -8962,8 +8953,7 @@ class _OsiaPanel(QWidget):
         top.setSpacing(6)
         label = QLabel(name)
         label.setObjectName("providerName")
-        enable = QCheckBox()
-        enable.setObjectName("smartToggle")
+        enable = OsiaSwitch()
         enable.setChecked(personality.is_skill_enabled(name))
         enable.setToolTip(i18n.t("osia.skill_toggle"))
         enable.stateChanged.connect(
@@ -9027,7 +9017,7 @@ class _OsiaPanel(QWidget):
         return row
 
     @staticmethod
-    def _on_skill_toggle(name: str, checkbox: QCheckBox) -> None:
+    def _on_skill_toggle(name: str, checkbox: OsiaSwitch) -> None:
         effective = personality.set_skill_enabled(name, checkbox.isChecked())
         if checkbox.isChecked() != effective:
             checkbox.blockSignals(True)
@@ -9044,7 +9034,7 @@ class _OsiaPanel(QWidget):
             wrap.setVisible(True)
 
     def _on_skill_save(self, name: str, editor: QTextEdit,
-                       btn: QPushButton, checkbox: QCheckBox) -> None:
+                       btn: QPushButton, checkbox: OsiaSwitch) -> None:
         personality.write_skill(name, editor.toPlainText())
         checkbox.blockSignals(True)
         checkbox.setChecked(personality.is_skill_enabled(name))
@@ -11818,23 +11808,6 @@ class MainPopup(QWidget):
                 border-radius: 10px;
                 selection-background-color: rgba(196, 181, 245, 0.30);
                 font-size: 12px;
-            }
-
-            /* Smart-toggle ──────────────────────────────────────────── */
-            QCheckBox#smartToggle::indicator {
-                width: 36px;
-                height: 20px;
-                border-radius: 10px;
-                background: rgba(196, 181, 245, 0.15);
-                border: 1px solid rgba(196, 181, 245, 0.12);
-            }
-            QCheckBox#smartToggle::indicator:checked {
-                background: rgba(196, 181, 245, 0.85);
-                border: 1px solid rgba(196, 181, 245, 1.0);
-            }
-            QCheckBox#smartToggle::indicator:disabled {
-                background: rgba(232, 230, 240, 0.07);
-                border: 1px solid rgba(232, 230, 240, 0.12);
             }
 
             /* WOR-48: scrollbars are fully hidden everywhere (the per-area

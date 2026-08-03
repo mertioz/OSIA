@@ -22,7 +22,6 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -35,6 +34,7 @@ from PyQt6.QtWidgets import (
 )
 
 from osia import i18n
+from osia.gui.switch import OsiaSwitch
 from osia.gui.theme import get_theme_manager
 from osia.updater import (
     DownloadCancelled,
@@ -698,8 +698,7 @@ class UpdateSettingsSection(QFrame):
         self.preview_label.setWordWrap(True)
         self.preview_mode = QLabel()
         self.preview_mode.setObjectName("releaseBadge")
-        self.preview_toggle = QCheckBox()
-        self.preview_toggle.setObjectName("smartToggle")
+        self.preview_toggle = OsiaSwitch()
         self.preview_label.setBuddy(self.preview_toggle)
         preference_row.addWidget(self.preview_label, 1)
         preference_row.addWidget(self.preview_mode)

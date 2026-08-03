@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 from osia import action_policy, i18n
+from osia.gui.switch import OsiaSwitch
 from osia.local_reauth import issue_full_access_activation_proof
 from osia.permission_contract import PERMISSION_CATEGORY_CONTRACT
 
@@ -175,10 +176,9 @@ class PermissionsPage(QWidget):
         self._ceremony.hide()
         root.addWidget(self._ceremony)
 
-        self._switches: dict[str, QCheckBox] = {}
+        self._switches: dict[str, OsiaSwitch] = {}
         for category in action_policy.AUTOMATIC_PERMISSION_CATEGORIES:
-            toggle = QCheckBox(i18n.t(_SWITCH_KEYS[category]))
-            toggle.setObjectName("smartToggle")
+            toggle = OsiaSwitch(i18n.t(_SWITCH_KEYS[category]))
             toggle.setSizePolicy(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed,
             )
@@ -317,7 +317,7 @@ class PermissionsPage(QWidget):
         limits_layout.setSpacing(8)
         self._limits_title = QLabel()
         self._limits_title.setObjectName("sectionTitle")
-        self._payment_enabled = QCheckBox()
+        self._payment_enabled = OsiaSwitch()
         payment_row = QHBoxLayout()
         self._payment_max = QDoubleSpinBox()
         self._payment_max.setObjectName("permissionsAmount")
@@ -335,7 +335,7 @@ class PermissionsPage(QWidget):
         self._payment_example = QLabel()
         self._payment_example.setObjectName("sectionSub")
         self._payment_example.setWordWrap(True)
-        self._destinations_enabled = QCheckBox()
+        self._destinations_enabled = OsiaSwitch()
         self._destinations = QTextEdit()
         self._destinations.setObjectName("mdEditor")
         self._destinations.setMaximumHeight(72)
