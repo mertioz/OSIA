@@ -328,6 +328,12 @@ def execute_route_request(
         "provider_id": str(ctx.get("provider_id") or "").strip().lower()[:48],
         "model_id": str(ctx.get("model_id") or "").strip()[:160],
         "request_id": str(ctx.get("request_id") or "")[:160],
+        "source_request_id": str(
+            ctx.get("source_request_id") or ctx.get("request_id") or ""
+        )[:160],
+        "source_turn_id": str(
+            ctx.get("source_turn_id") or ctx.get("request_id") or ""
+        )[:160],
         "conversation_id": str(ctx.get("conversation_id") or "")[:160],
         "origin_ref": str(ctx.get("origin_ref") or "desktop")[:160],
         "device_id": str(ctx.get("device_id") or "")[:128],

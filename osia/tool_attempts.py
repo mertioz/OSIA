@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 import uuid
@@ -149,6 +150,41 @@ _TRANSITIONS = {
 
 def _now() -> float:
     return time.time()
+
+
+def _pid_alive(value: Any) -> bool:
+    """Best-effort live-owner check for restart-safe durable claims."""
+
+    try:
+        pid = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            handle = kernel32.OpenProcess(
+                0x1000,  # PROCESS_QUERY_LIMITED_INFORMATION
+                False,
+                pid,
+            )
+            if handle:
+                kernel32.CloseHandle(ctypes.c_void_p(handle))
+                return True
+            return ctypes.get_last_error() == 5  # access denied still means alive
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _safe_token(value: Any, *, field: str, allow_empty: bool = False) -> str:
@@ -340,6 +376,28 @@ class ToolAttemptStore:
         browser_state = record.get("browser_state_ref")
         if browser_state is not None and _safe_browser_state(browser_state) is None:
             raise CorruptAttemptError("invalid_browser_state_ref")
+        owner_scope = str(record.get("owner_scope") or "chat")
+        if owner_scope not in {"chat", "autonomous"}:
+            raise CorruptAttemptError("invalid_owner_scope")
+        record["owner_scope"] = owner_scope
+        for field in (
+            "autonomous_run_id", "autonomous_task_id",
+            "autonomous_operation_id",
+        ):
+            try:
+                record[field] = _safe_token(
+                    record.get(field), field=field, allow_empty=True,
+                )
+            except ValueError as exc:
+                raise CorruptAttemptError(str(exc)) from exc
+        for field in ("operation_revision", "permission_epoch"):
+            value = record.get(field, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise CorruptAttemptError("invalid_autonomous_revision")
+            record[field] = value
+        record.setdefault("continuation_claimed_at", None)
+        record.setdefault("continuation_claimed_pid", None)
+        record.setdefault("reconciliation_claimed_pid", None)
         return dict(record)
 
     def _read_unlocked(self, attempt_id: str) -> dict[str, Any]:
@@ -390,6 +448,12 @@ class ToolAttemptStore:
         browser_state_ref: Mapping[str, Any] | None = None,
         repair_count: int = 0,
         final_response_message_id: str = "",
+        owner_scope: str = "chat",
+        autonomous_run_id: str = "",
+        autonomous_task_id: str = "",
+        autonomous_operation_id: str = "",
+        operation_revision: int = 0,
+        permission_epoch: int = 0,
     ) -> dict[str, Any]:
         conversation_id = _safe_token(conversation_id, field="conversation_id")
         turn_id = _safe_token(turn_id, field="turn_id")
@@ -402,6 +466,24 @@ class ToolAttemptStore:
             raise ValueError("invalid_argument_fingerprint")
         if repair_count not in {0, 1}:
             raise ValueError("invalid_repair_count")
+        owner_scope = str(owner_scope or "chat")
+        if owner_scope not in {"chat", "autonomous"}:
+            raise ValueError("invalid_owner_scope")
+        for name, value in (
+            ("autonomous_run_id", autonomous_run_id),
+            ("autonomous_task_id", autonomous_task_id),
+            ("autonomous_operation_id", autonomous_operation_id),
+        ):
+            _safe_token(value, field=name, allow_empty=True)
+        if (
+            isinstance(operation_revision, bool)
+            or not isinstance(operation_revision, int)
+            or operation_revision < 0
+            or isinstance(permission_epoch, bool)
+            or not isinstance(permission_epoch, int)
+            or permission_epoch < 0
+        ):
+            raise ValueError("invalid_autonomous_revision")
         now = _now()
         attempt_id = "attempt_" + secrets.token_urlsafe(24)
         record = {
@@ -444,8 +526,17 @@ class ToolAttemptStore:
                 allow_empty=True,
             ),
             "continuation_state": "not_claimed",
+            "continuation_claimed_at": None,
+            "continuation_claimed_pid": None,
             "reconciliation_claim": "",
             "reconciliation_claimed_at": None,
+            "reconciliation_claimed_pid": None,
+            "owner_scope": owner_scope,
+            "autonomous_run_id": str(autonomous_run_id or ""),
+            "autonomous_task_id": str(autonomous_task_id or ""),
+            "autonomous_operation_id": str(autonomous_operation_id or ""),
+            "operation_revision": operation_revision,
+            "permission_epoch": permission_epoch,
         }
         with self._store_lock():
             if self._active_for_conversation_unlocked(conversation_id) is not None:
@@ -489,12 +580,39 @@ class ToolAttemptStore:
         )
 
     def mark_running(self, attempt_id: str, *, expected_revision: int | None = None) -> dict:
-        return self._transition(
-            attempt_id, ToolAttemptStatus.RUNNING,
-            expected_revision=expected_revision,
-            updates={"started_at": _now(), "last_progress_at": _now(),
-                     "dispatch_state": "dispatch_started"},
-        )
+        # Dispatch and a pre-dispatch cancellation race on this boundary.  Keep
+        # the decision under the store lock so a proven cancellation can never
+        # be overwritten by a later RUNNING transition.
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            current = ToolAttemptStatus(record["status"])
+            if (
+                current is ToolAttemptStatus.CANCELLED_PROVEN
+                and record.get("dispatch_state") == "cancelled_before_effect"
+            ):
+                return record
+            if current in TERMINAL_STATUSES:
+                raise IllegalTransition("terminal_tool_attempt_is_immutable")
+            if expected_revision is not None and int(record["revision"]) != int(expected_revision):
+                raise RevisionConflict("stale_tool_attempt_revision")
+            if (
+                current is not ToolAttemptStatus.RUNNING
+                and ToolAttemptStatus.RUNNING not in _TRANSITIONS.get(current, set())
+            ):
+                raise IllegalTransition(
+                    f"illegal_transition:{current.value}:{ToolAttemptStatus.RUNNING.value}"
+                )
+            now = _now()
+            record.update({
+                "status": ToolAttemptStatus.RUNNING.value,
+                "started_at": now,
+                "last_progress_at": now,
+                "dispatch_state": "dispatch_started",
+                "updated_at": now,
+                "revision": int(record["revision"]) + 1,
+            })
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
 
     def mark_pending(
         self, attempt_id: str, *, next_check_at: float, deadline_at: float,
@@ -572,15 +690,48 @@ class ToolAttemptStore:
             return dict(record), True
 
     def request_cancellation(self, attempt_id: str) -> dict:
-        record = self.get_attempt(attempt_id)
-        if record is None:
-            raise KeyError(attempt_id)
-        if ToolAttemptStatus(record["status"]) in TERMINAL_STATUSES:
-            return record
-        return self._transition(
-            attempt_id, ToolAttemptStatus.CANCELLATION_REQUESTED,
-            updates={"reason_code": "cancellation_requested"},
-        )
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            current = ToolAttemptStatus(record["status"])
+            if current in TERMINAL_STATUSES:
+                return record
+            now = _now()
+            if (
+                current in {
+                    ToolAttemptStatus.NOT_STARTED,
+                    ToolAttemptStatus.ACCEPTED,
+                }
+                and record.get("dispatch_state") == "not_dispatched"
+            ):
+                record.update({
+                    "status": ToolAttemptStatus.CANCELLED_PROVEN.value,
+                    "terminal_outcome": "cancelled_proven",
+                    "dispatch_state": "cancelled_before_effect",
+                    "reason_code": "cancellation_acknowledged_before_effect",
+                    "completed_at": now,
+                    "next_check_at": None,
+                    "updated_at": now,
+                    "revision": int(record["revision"]) + 1,
+                })
+            else:
+                if (
+                    current is not ToolAttemptStatus.CANCELLATION_REQUESTED
+                    and ToolAttemptStatus.CANCELLATION_REQUESTED
+                    not in _TRANSITIONS.get(current, set())
+                ):
+                    raise IllegalTransition(
+                        "illegal_transition:"
+                        f"{current.value}:"
+                        f"{ToolAttemptStatus.CANCELLATION_REQUESTED.value}"
+                    )
+                record.update({
+                    "status": ToolAttemptStatus.CANCELLATION_REQUESTED.value,
+                    "reason_code": "cancellation_requested",
+                    "updated_at": now,
+                    "revision": int(record["revision"]) + 1,
+                })
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
 
     def mark_cancellation_proven(self, attempt_id: str) -> tuple[dict, bool]:
         return self.record_terminal_result(
@@ -617,7 +768,11 @@ class ToolAttemptStore:
                     continue
                 if (
                     ToolAttemptStatus(record["status"]) in TERMINAL_STATUSES
-                    and record.get("continuation_state") == "not_claimed"
+                    and record.get("continuation_state") != "complete"
+                    and (
+                        record.get("continuation_state") == "not_claimed"
+                        or not _pid_alive(record.get("continuation_claimed_pid"))
+                    )
                 ):
                     unfinished.append(record)
         return sorted(unfinished, key=lambda item: float(item.get("created_at") or 0))
@@ -627,11 +782,13 @@ class ToolAttemptStore:
             record = self._read_unlocked(attempt_id)
             if ToolAttemptStatus(record["status"]) in TERMINAL_STATUSES:
                 return None
-            if record.get("reconciliation_claim"):
+            claim_pid = record.get("reconciliation_claimed_pid")
+            if record.get("reconciliation_claim") and _pid_alive(claim_pid):
                 return None
             claim = "reconcile_" + secrets.token_urlsafe(18)
             record["reconciliation_claim"] = claim
             record["reconciliation_claimed_at"] = _now()
+            record["reconciliation_claimed_pid"] = os.getpid()
             record["revision"] = int(record["revision"]) + 1
             record["updated_at"] = _now()
             self._write_atomic(self._path(attempt_id), record)
@@ -646,6 +803,7 @@ class ToolAttemptStore:
                 return False
             record["reconciliation_claim"] = ""
             record["reconciliation_claimed_at"] = None
+            record["reconciliation_claimed_pid"] = None
             record["revision"] = int(record["revision"]) + 1
             record["updated_at"] = _now()
             self._write_atomic(self._path(attempt_id), record)
@@ -656,10 +814,18 @@ class ToolAttemptStore:
             record = self._read_unlocked(attempt_id)
             if ToolAttemptStatus(record["status"]) not in TERMINAL_STATUSES:
                 return None
-            if record.get("continuation_state") != "not_claimed":
+            continuation = str(record.get("continuation_state") or "")
+            if continuation == "complete":
+                return None
+            if (
+                continuation != "not_claimed"
+                and _pid_alive(record.get("continuation_claimed_pid"))
+            ):
                 return None
             claim = "continue_" + secrets.token_urlsafe(18)
             record["continuation_state"] = claim
+            record["continuation_claimed_at"] = _now()
+            record["continuation_claimed_pid"] = os.getpid()
             record["revision"] = int(record["revision"]) + 1
             record["updated_at"] = _now()
             self._write_atomic(self._path(attempt_id), record)
@@ -679,6 +845,8 @@ class ToolAttemptStore:
             if not claim or record.get("continuation_state") != claim:
                 return False
             record["continuation_state"] = "complete"
+            record["continuation_claimed_at"] = None
+            record["continuation_claimed_pid"] = None
             record["final_response_message_id"] = final_id
             record["revision"] = int(record["revision"]) + 1
             record["updated_at"] = _now()
@@ -693,6 +861,8 @@ class ToolAttemptStore:
             if not claim or record.get("continuation_state") != claim:
                 return False
             record["continuation_state"] = "not_claimed"
+            record["continuation_claimed_at"] = None
+            record["continuation_claimed_pid"] = None
             record["revision"] = int(record["revision"]) + 1
             record["updated_at"] = _now()
             self._write_atomic(self._path(attempt_id), record)
@@ -702,6 +872,68 @@ class ToolAttemptStore:
         conversation_id = _safe_token(conversation_id, field="conversation_id")
         with self._store_lock():
             return self._active_for_conversation_unlocked(conversation_id)
+
+    def bind_autonomous(
+        self,
+        attempt_id: str,
+        *,
+        run_id: str,
+        task_id: str,
+        operation_id: str,
+        operation_revision: int,
+        permission_epoch: int,
+    ) -> dict:
+        """Attach one mission checkpoint to an existing common attempt.
+
+        The binding is value-free and immutable once established.  It never
+        claims the external action and therefore cannot authorize a redispatch.
+        """
+
+        values = {
+            "autonomous_run_id": _safe_token(
+                run_id, field="autonomous_run_id",
+            ),
+            "autonomous_task_id": _safe_token(
+                task_id, field="autonomous_task_id",
+            ),
+            "autonomous_operation_id": _safe_token(
+                operation_id, field="autonomous_operation_id",
+            ),
+        }
+        if (
+            isinstance(operation_revision, bool)
+            or not isinstance(operation_revision, int)
+            or operation_revision < 0
+            or isinstance(permission_epoch, bool)
+            or not isinstance(permission_epoch, int)
+            or permission_epoch < 0
+        ):
+            raise ValueError("invalid_autonomous_revision")
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            already_bound = bool(
+                record.get("owner_scope") == "autonomous"
+                or any(record.get(key) for key in values)
+            )
+            for key, value in values.items():
+                existing = str(record.get(key) or "")
+                if existing and existing != value:
+                    raise IllegalTransition("tool_attempt_already_bound")
+            if already_bound and (
+                int(record.get("operation_revision") or 0)
+                != operation_revision
+                or int(record.get("permission_epoch") or 0)
+                != permission_epoch
+            ):
+                raise IllegalTransition("tool_attempt_already_bound")
+            record.update(values)
+            record["owner_scope"] = "autonomous"
+            record["operation_revision"] = operation_revision
+            record["permission_epoch"] = permission_epoch
+            record["revision"] = int(record["revision"]) + 1
+            record["updated_at"] = _now()
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
 
     def has_terminal_barrier(
         self, *, conversation_id: str, turn_id: str, tool_name: str,
@@ -796,6 +1028,11 @@ class ToolAttemptCoordinator:
         self._lock = threading.RLock()
         self._runtimes: dict[str, _SuspendedRuntime] = {}
         self._early_terminal: dict[str, Any] = {}
+        self._terminal_observers: dict[
+            str, dict[str, Callable[[str, Any], None]]
+        ] = {}
+        self._last_lifecycle_wall = _now()
+        self._last_lifecycle_monotonic = time.monotonic()
 
     @staticmethod
     def _emit(runtime: _SuspendedRuntime, attempt_id: str, status: str) -> None:
@@ -824,6 +1061,55 @@ class ToolAttemptCoordinator:
             runtime.terminal_payload = self._early_terminal.pop(attempt_id, None)
             self._runtimes[attempt_id] = runtime
 
+    def register_terminal_observer(
+        self,
+        attempt_id: str,
+        observer_key: str,
+        callback: Callable[[str, Any], None],
+    ) -> bool:
+        """Observe one common attempt without owning or repeating its action."""
+
+        observer_key = _safe_token(observer_key, field="observer_key")
+        try:
+            record = self.store.get_attempt(attempt_id)
+        except CorruptAttemptError:
+            return False
+        if not record:
+            return False
+        with self._lock:
+            observers = self._terminal_observers.setdefault(attempt_id, {})
+            observers.setdefault(observer_key, callback)
+        # Close the read/register race: if terminalization happened before or
+        # during registration, either notify_terminal already consumed this
+        # observer or this second read consumes it exactly once.
+        try:
+            latest = self.store.get_attempt(attempt_id)
+        except CorruptAttemptError:
+            latest = None
+        if latest and ToolAttemptStatus(latest["status"]) in TERMINAL_STATUSES:
+            with self._lock:
+                observers = self._terminal_observers.get(attempt_id, {})
+                terminal_observer = observers.pop(observer_key, None)
+                if not observers:
+                    self._terminal_observers.pop(attempt_id, None)
+            if terminal_observer is not None:
+                self._invoke_observer(terminal_observer, attempt_id, latest)
+        return True
+
+    @staticmethod
+    def _invoke_observer(callback, attempt_id: str, payload: Any) -> None:
+        def _notify() -> None:
+            try:
+                callback(attempt_id, payload)
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=_notify,
+            name=f"osia-tool-observer-{attempt_id[-8:]}",
+            daemon=True,
+        ).start()
+
     def activate(self, attempt_id: str) -> bool:
         with self._lock:
             runtime = self._runtimes.get(attempt_id)
@@ -841,6 +1127,9 @@ class ToolAttemptCoordinator:
     def notify_terminal(self, attempt_id: str, payload: Any) -> None:
         with self._lock:
             runtime = self._runtimes.get(attempt_id)
+            observers = list(
+                self._terminal_observers.pop(attempt_id, {}).values()
+            )
             if runtime is None:
                 try:
                     record = self.store.get_attempt(attempt_id)
@@ -851,13 +1140,16 @@ class ToolAttemptCoordinator:
                 # after continuation was claimed/completed are stale.
                 if record and record.get("continuation_state") == "not_claimed":
                     self._early_terminal[attempt_id] = payload
-                return
-            if runtime.terminal_payload is None:
-                runtime.terminal_payload = payload
-            if runtime.timer is not None:
-                runtime.timer.cancel()
-                runtime.timer = None
-            activated = runtime.activated
+                activated = False
+            else:
+                if runtime.terminal_payload is None:
+                    runtime.terminal_payload = payload
+                if runtime.timer is not None:
+                    runtime.timer.cancel()
+                    runtime.timer = None
+                activated = runtime.activated
+        for observer in observers:
+            self._invoke_observer(observer, attempt_id, payload)
         if activated:
             self._start_continuation(attempt_id)
 
@@ -899,58 +1191,70 @@ class ToolAttemptCoordinator:
         if ToolAttemptStatus(record["status"]) in TERMINAL_STATUSES:
             self.notify_terminal(attempt_id, record)
             return
-        self._emit(runtime, attempt_id, "verifying_tool_result")
-        if runtime.verify is not None:
-            try:
-                payload = runtime.verify(attempt_id)
-            except Exception:
-                payload = None
-            if payload is not None:
-                self.notify_terminal(attempt_id, payload)
-                return
-        now = _now()
-        deadline = float(record.get("deadline_at") or now)
-        if now >= deadline:
-            terminal, created = self.store.record_terminal_result(
-                attempt_id,
-                status=ToolAttemptStatus.UNKNOWN_AFTER_START,
-                terminal_outcome="outcome_unknown",
-                dispatch_state="effect_unknown",
-                reason_code="verification_deadline_expired",
-            )
-            if created:
-                self.notify_terminal(attempt_id, terminal)
-            else:
-                self.notify_terminal(attempt_id, terminal)
+        claim = self.store.claim_reconciliation(attempt_id)
+        if claim is None:
             return
-        # Bounded low-frequency fallback; delivery of an owner callback still
-        # cancels this timer and claims continuation first.
-        next_check = min(deadline, now + 5.0 + secrets.randbelow(1000) / 1000.0)
         try:
-            current = ToolAttemptStatus(record["status"])
-            if current == ToolAttemptStatus.PENDING:
-                self.store.mark_pending(
+            self._emit(runtime, attempt_id, "verifying_tool_result")
+            if runtime.verify is not None:
+                try:
+                    payload = runtime.verify(attempt_id)
+                except Exception:
+                    payload = None
+                if payload is not None:
+                    self.notify_terminal(attempt_id, payload)
+                    return
+            now = _now()
+            deadline = float(record.get("deadline_at") or now)
+            if now >= deadline:
+                terminal, _created = self.store.record_terminal_result(
                     attempt_id,
-                    next_check_at=next_check,
-                    deadline_at=deadline,
-                    reason_code="owner_still_running",
+                    status=ToolAttemptStatus.UNKNOWN_AFTER_START,
+                    terminal_outcome="outcome_unknown",
+                    dispatch_state="effect_unknown",
+                    reason_code="verification_deadline_expired",
                 )
-            elif current == ToolAttemptStatus.CANCELLATION_REQUESTED:
-                self.store.record_progress(
-                    attempt_id,
-                    phase="cancellation_requested",
-                    next_check_at=next_check,
-                )
-            else:
-                self.store.mark_waiting_verification(
-                    attempt_id,
-                    next_check_at=next_check,
-                    deadline_at=deadline,
-                    reason_code="postcondition_not_observed",
-                )
-        except (IllegalTransition, CorruptAttemptError):
-            return
-        self._schedule_timer(attempt_id)
+                self.notify_terminal(attempt_id, terminal)
+                return
+            # Bounded low-frequency fallback; delivery of an owner callback
+            # still cancels this timer and claims continuation first.
+            next_check = min(
+                deadline, now + 5.0 + secrets.randbelow(1000) / 1000.0,
+            )
+            try:
+                current_record = self.store.get_attempt(attempt_id) or record
+                current = ToolAttemptStatus(current_record["status"])
+                if current == ToolAttemptStatus.PENDING:
+                    self.store.mark_pending(
+                        attempt_id,
+                        next_check_at=next_check,
+                        deadline_at=deadline,
+                        reason_code="owner_still_running",
+                    )
+                elif current == ToolAttemptStatus.CANCELLATION_REQUESTED:
+                    self.store.record_progress(
+                        attempt_id,
+                        phase="cancellation_requested",
+                        next_check_at=next_check,
+                    )
+                elif current in RECOVERABLE_STATUSES:
+                    self.store.mark_waiting_verification(
+                        attempt_id,
+                        next_check_at=next_check,
+                        deadline_at=deadline,
+                        reason_code="postcondition_not_observed",
+                    )
+                else:
+                    self.notify_terminal(attempt_id, current_record)
+                    return
+            except (IllegalTransition, CorruptAttemptError):
+                return
+            self._schedule_timer(attempt_id)
+        finally:
+            try:
+                self.store.release_reconciliation(attempt_id, claim)
+            except (IllegalTransition, CorruptAttemptError):
+                pass
 
     def _start_continuation(self, attempt_id: str) -> None:
         with self._lock:
@@ -964,7 +1268,23 @@ class ToolAttemptCoordinator:
             if claim is None:
                 return
             runtime.running = True
-        self._emit(runtime, attempt_id, "resuming_tool_turn")
+        try:
+            terminal_record = self.store.get_attempt(attempt_id) or {}
+            terminal_status = ToolAttemptStatus(terminal_record.get("status"))
+        except (CorruptAttemptError, TypeError, ValueError):
+            terminal_status = ToolAttemptStatus.UNKNOWN_AFTER_START
+        self._emit(
+            runtime,
+            attempt_id,
+            (
+                "blocked_unknown_effect"
+                if terminal_status in {
+                    ToolAttemptStatus.FAILED_AFTER_EFFECT,
+                    ToolAttemptStatus.UNKNOWN_AFTER_START,
+                }
+                else "resuming_tool_turn"
+            ),
+        )
 
         def _continue() -> None:
             error: BaseException | None = None
@@ -1028,6 +1348,65 @@ class ToolAttemptCoordinator:
         if runtime is not None:
             self._emit(runtime, record["tool_attempt_id"], "cancellation_requested")
         return True
+
+    def trigger_recovery(
+        self,
+        *,
+        reason: str,
+        now: float | None = None,
+        overdue_only: bool = True,
+    ) -> list[str]:
+        """Wake due read-only reconciliation paths, never original dispatch."""
+
+        del reason  # safe trigger category is intentionally not persisted
+        now = _now() if now is None else float(now)
+        triggered: list[str] = []
+        for record in self.store.list_recoverable_attempts(now=now):
+            attempt_id = str(record.get("tool_attempt_id") or "")
+            next_check = float(record.get("next_check_at") or 0.0)
+            if overdue_only and next_check > now:
+                continue
+            with self._lock:
+                runtime = self._runtimes.get(attempt_id)
+                usable = bool(
+                    runtime is not None
+                    and runtime.activated
+                    and not runtime.running
+                )
+            if not usable:
+                continue
+            self._schedule_timer(attempt_id, immediate=True)
+            triggered.append(attempt_id)
+        return triggered
+
+    def observe_lifecycle_tick(
+        self,
+        *,
+        expected_interval: float,
+        gap_multiplier: float = 3.0,
+    ) -> bool:
+        """Detect a suspend/resume-sized gap inside an existing lifecycle loop."""
+
+        wall = _now()
+        monotonic = time.monotonic()
+        with self._lock:
+            wall_delta = max(0.0, wall - self._last_lifecycle_wall)
+            monotonic_delta = max(
+                0.0, monotonic - self._last_lifecycle_monotonic,
+            )
+            self._last_lifecycle_wall = wall
+            self._last_lifecycle_monotonic = monotonic
+        threshold = max(15.0, float(expected_interval) * gap_multiplier)
+        discontinuity = (
+            monotonic_delta >= threshold
+            or wall_delta >= threshold
+            or abs(wall_delta - monotonic_delta) >= threshold
+        )
+        if discontinuity:
+            self.trigger_recovery(
+                reason="lifecycle_gap", now=wall, overdue_only=True,
+            )
+        return discontinuity
 
     def startup_fail_closed(self) -> list[dict]:
         """Finalize orphaned attempts without replaying their external action."""
@@ -1139,6 +1518,10 @@ def recover_orphaned_tool_attempts() -> list[dict]:
     from osia import conversations
 
     for record in recovered:
+        if record.get("owner_scope") == "autonomous":
+            # The Autonomous checkpoint owns its exact task continuation.  A
+            # normal-chat assistant message here would duplicate that mission.
+            continue
         language = str((record.get("turn_context") or {}).get("language") or "en")
         status = ToolAttemptStatus(record["status"])
         unknown = status == ToolAttemptStatus.UNKNOWN_AFTER_START

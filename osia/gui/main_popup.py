@@ -619,10 +619,16 @@ class _ChatPage(QWidget):
     # Kept as a compatibility signal. Selecting a file no longer emits it.
     pick_file = pyqtSignal(str, str)
     _BUSY_TEXT = "OSIA is still working in this conversation."
+    _TOOL_WAITING_STATUSES = frozenset({
+        "action_starting", "action_in_progress", "waiting_tool_result",
+        "waiting_verification", "verifying", "resuming",
+        "cancellation_requested", "blocked_unknown_effect",
+    })
 
     def __init__(self):
         super().__init__()
         self._busy = False
+        self._tool_status = ""
         self._draft_context: str | None = None
         self._drafts: dict[str | None, _ComposerDraft] = {}
         self._pending_attachments: list[DraftAttachment] = []
@@ -753,9 +759,7 @@ class _ChatPage(QWidget):
     def _retranslate(self) -> None:
         self._file_btn.setToolTip(i18n.t("chat.attach_file"))
         self._file_btn.setAccessibleName(i18n.t("chat.attach_file"))
-        self._input.setPlaceholderText(
-            self._BUSY_TEXT if self._busy else i18n.t("chat.input_placeholder")
-        )
+        self._apply_composer_state()
         self._input.setAccessibleName(i18n.t("chat.input_placeholder"))
         self._send_btn.setToolTip(i18n.t("chat.send"))
         self._send_btn.setAccessibleName(i18n.t("chat.send"))
@@ -981,15 +985,57 @@ class _ChatPage(QWidget):
 
     def set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
-        self._input.setEnabled(not self._busy)
+        if not self._busy:
+            self._tool_status = ""
+        self._apply_composer_state()
         self._sync_send_state()
-        self._input.setPlaceholderText(
-            self._BUSY_TEXT if self._busy else i18n.t("chat.input_placeholder")
+
+    def set_tool_status(self, status: str) -> None:
+        safe = str(status or "")
+        self._tool_status = (
+            safe if safe in self._TOOL_WAITING_STATUSES else ""
         )
+        if self._tool_status:
+            self._busy = True
+        self._apply_composer_state()
+        self._sync_send_state()
+
+    def _apply_composer_state(self) -> None:
+        waiting = bool(
+            self._busy and self._tool_status in self._TOOL_WAITING_STATUSES
+        )
+        self._input.setEnabled(not self._busy or waiting)
+        self._file_btn.setEnabled(not self._busy)
+        key = {
+            "action_starting": "chat.tool_action_starting",
+            "action_in_progress": "chat.tool_action_in_progress",
+            "waiting_tool_result": "chat.tool_waiting",
+            "waiting_verification": "chat.tool_waiting",
+            "verifying": "chat.tool_verifying",
+            "resuming": "chat.tool_resuming",
+            "cancellation_requested": "chat.tool_cancelling",
+            "blocked_unknown_effect": "chat.tool_blocked",
+        }.get(self._tool_status)
+        if key:
+            label = i18n.t(key)
+            self._input.setPlaceholderText(label)
+            self._notice.setText(label)
+            self._notice.show()
+        else:
+            self._input.setPlaceholderText(
+                self._BUSY_TEXT if self._busy else i18n.t("chat.input_placeholder")
+            )
+            if not self._busy:
+                self._notice.hide()
 
     def _sync_send_state(self, _text: str | None = None) -> None:
-        enabled = not self._busy and bool(
-            self._input.toPlainText().strip() or self._pending_attachments
+        text = self._input.toPlainText().strip()
+        waiting = bool(
+            self._busy and self._tool_status in self._TOOL_WAITING_STATUSES
+        )
+        enabled = (
+            (not self._busy and bool(text or self._pending_attachments))
+            or (waiting and bool(text) and len(text) <= 160)
         )
         self._send_btn.setEnabled(enabled)
         self._send_btn.setCursor(
@@ -1125,12 +1171,26 @@ class _ChatPage(QWidget):
         bar.setValue(bar.maximum())
 
     def _on_send(self) -> None:
-        if self._busy:
+        waiting = bool(
+            self._busy and self._tool_status in self._TOOL_WAITING_STATUSES
+        )
+        if self._busy and not waiting:
             self.show_notice(self._BUSY_TEXT)
             return
         text = self._input.toPlainText().strip()
+        if waiting and (not text or len(text) > 160):
+            self.show_notice(i18n.t("chat.tool_command_limit"))
+            self._sync_send_state()
+            return
         if not text and not self._pending_attachments:
             self._sync_send_state()
+            return
+        if waiting:
+            # A waiting-turn command is text-only.  Preserve any draft files
+            # for the next normal turn, but never attach them to lifecycle
+            # controls such as status/resume/cancel.
+            self._input.clear()
+            self.send_text.emit(text)
             return
         if self._pending_attachments:
             for item in self._pending_attachments:
@@ -9466,6 +9526,43 @@ class _AutonomousPanel(QWidget):
             self._scope_frame.hide()
             self._set_status(i18n.t("autonomous.status_running"))
         elif event in {
+            "action_starting", "action_in_progress", "waiting_tool",
+            "verifying_tool", "resuming", "cancellation_requested",
+        }:
+            self._set_running(True)
+            self._authorize_btn.hide()
+            self._revoke_btn.show()
+            self._scope_frame.hide()
+            if event == "cancellation_requested":
+                self._interrupt_btn.setEnabled(False)
+                self._abort_btn.setEnabled(False)
+            self._set_status(i18n.t({
+                "action_starting": "autonomous.status_action_starting",
+                "action_in_progress": "autonomous.status_action_in_progress",
+                "waiting_tool": "autonomous.status_waiting_tool",
+                "verifying_tool": "autonomous.status_verifying_tool",
+                "resuming": "autonomous.status_resuming",
+                "cancellation_requested": (
+                    "autonomous.status_cancellation_requested"
+                ),
+            }[event]))
+        elif event == "blocked_unknown_effect":
+            self._set_running(True)
+            self._interrupt_btn.setEnabled(False)
+            self._abort_btn.setEnabled(True)
+            self._authorize_btn.hide()
+            self._revoke_btn.hide()
+            self._scope_frame.hide()
+            self._set_status(
+                i18n.t("autonomous.status_blocked_unknown_effect")
+            )
+        elif event == "cancelled_proven":
+            self._set_running(False)
+            self._authorize_btn.hide()
+            self._revoke_btn.hide()
+            self._scope_frame.hide()
+            self._set_status(i18n.t("autonomous.status_cancelled_proven"))
+        elif event in {
             "autonomous_scope_extension_request", "suspended_scope_extension",
             "scope_extension_denied",
         }:
@@ -9556,6 +9653,12 @@ class _AutonomousPanel(QWidget):
             "authorization_pending": "autonomous_plan_ready",
             "ready": "authorization_pending",
             "running": "running",
+            "waiting_tool": "waiting_tool",
+            "verifying_tool": "verifying_tool",
+            "resuming": "resuming",
+            "blocked_unknown_effect": "blocked_unknown_effect",
+            "cancellation_requested": "cancellation_requested",
+            "cancelled_proven": "cancelled_proven",
             "suspended_scope_extension": "suspended_scope_extension",
             "suspended_authorization_revoked": "suspended_authorization_revoked",
             "blocked_outcome_unknown": "blocked_outcome_unknown",
@@ -10401,6 +10504,7 @@ class MainPopup(QWidget):
         outer.addWidget(self._stack, 1)
         self._active_conversation_id: str | None = None
         self._busy_conversation_ids: set[str] = set()
+        self._tool_status_by_conversation: dict[str, str] = {}
         self._onboarding_dialog = None
 
         # Bottom nav
@@ -10730,6 +10834,14 @@ class MainPopup(QWidget):
             self._busy_conversation_ids.add(conv_id)
         else:
             self._busy_conversation_ids.discard(conv_id)
+            self._tool_status_by_conversation.pop(conv_id, None)
+        self._apply_current_busy()
+
+    def set_conversation_tool_status(self, conv_id: str, status: str) -> None:
+        if not conv_id:
+            return
+        self._tool_status_by_conversation[conv_id] = str(status or "")
+        self._busy_conversation_ids.add(conv_id)
         self._apply_current_busy()
 
     def show_conversation_busy_notice(self) -> None:
@@ -10855,6 +10967,10 @@ class MainPopup(QWidget):
         self._chat.set_busy(
             bool(active_id and active_id in self._busy_conversation_ids)
         )
+        if active_id:
+            self._chat.set_tool_status(
+                self._tool_status_by_conversation.get(active_id, "")
+            )
 
     def _on_nav_clicked(self, page_idx: int) -> None:
         with perf_timer(f"nav -> page {page_idx}"):

@@ -94,6 +94,12 @@ RUN_STATES = frozenset({
     "cancelled",
     "suspended_browser_intervention",
     "suspended_browser_state",
+    "waiting_tool",
+    "verifying_tool",
+    "resuming",
+    "blocked_unknown_effect",
+    "cancellation_requested",
+    "cancelled_proven",
 })
 AUTHORIZATION_STATUSES = frozenset({
     "pending", "authorized", "scope_extension_required", "revoked",
@@ -104,6 +110,13 @@ OPERATION_STATUSES = frozenset({
     "success_unverified", "cancelled_proven", "partial_effect_verified",
     "outcome_unknown", "suspended_scope_extension",
     "blocked_authorization", "failed_before_dispatch",
+    "waiting_tool", "verifying_tool", "resuming",
+    "cancellation_requested",
+})
+TASK_STATUSES = frozenset({
+    "pending", "in_progress", "waiting_tool", "verifying_tool", "resuming",
+    "blocked_unknown_effect", "done", "failed", "cancellation_requested",
+    "cancelled_proven",
 })
 BROWSER_SUSPENSION_REASONS = frozenset({
     "manual_login_required", "captcha_required", "two_factor_required",
@@ -580,6 +593,31 @@ def _normalize_task(index: int, task, *, private_filenames=()) -> dict:
     requirement_id = str(task.get("requirement_id") or "")
     if not re.fullmatch(r"req_\d{3,4}", requirement_id):
         requirement_id = ""
+    raw_status = str(task.get("status") or "pending")
+    status = raw_status if raw_status in TASK_STATUSES else "pending"
+    tool_attempt_id = str(task.get("tool_attempt_id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{0,160}", tool_attempt_id):
+        tool_attempt_id = ""
+    tool_operation_id = str(task.get("tool_operation_id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{0,160}", tool_operation_id):
+        tool_operation_id = ""
+    tool_reason = str(task.get("tool_terminal_reason") or "")
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,95}", tool_reason):
+        tool_reason = ""
+    next_reconciliation = task.get("tool_next_reconciliation_at")
+    if (
+        isinstance(next_reconciliation, bool)
+        or not isinstance(next_reconciliation, (int, float))
+        or not math.isfinite(float(next_reconciliation))
+        or next_reconciliation < 0
+    ):
+        next_reconciliation = None
+    try:
+        tool_revision = max(
+            0, int(task.get("tool_operation_revision", 0) or 0),
+        )
+    except (TypeError, ValueError, OverflowError):
+        tool_revision = 0
     normalized = {
         "id": str(task.get("id") or f"t{index}"),
         "objective": sanitize_autonomous_text(
@@ -589,11 +627,24 @@ def _normalize_task(index: int, task, *, private_filenames=()) -> dict:
             raw_criterion, private_filenames=private_filenames,
         ),
         "requirement_id": requirement_id,
-        "status": task.get("status") or "pending",
+        "status": status,
         "attempts": int(task.get("attempts", 0) or 0),
         "distilled_summary": task.get("distilled_summary", "") or "",
         "last_error": task.get("last_error", None),
         "artifact_ids": _normalize_artifact_ids(task.get("artifact_ids")),
+        "tool_attempt_id": tool_attempt_id,
+        "tool_operation_id": tool_operation_id,
+        "tool_operation_revision": tool_revision,
+        "tool_durable_state": (
+            str(task.get("tool_durable_state") or "")
+            if str(task.get("tool_durable_state") or "") in TASK_STATUSES
+            else ""
+        ),
+        "tool_next_reconciliation_at": next_reconciliation,
+        "tool_terminal_reason": tool_reason,
+        "tool_continuation_claimed": bool(
+            task.get("tool_continuation_claimed", False)
+        ),
     }
     if normalized["objective"] != raw_objective:
         normalized["_runtime_objective"] = raw_objective
@@ -770,6 +821,11 @@ def new_task_state(objective: str, provider: str, model: str, phases, *,
         "operation_records": [],
         "ambiguity_barriers": [],
         "browser_checkpoint": normalize_browser_checkpoint({}),
+        "source_conversation_id": "",
+        "source_turn_id": "",
+        "source_request_id": "",
+        "source_permission_epoch": 0,
+        "attached_tool_attempt_id": "",
         "language": normalized_language,
         "language_mode": normalized_mode,
         "allowed_languages": normalized_allowed,
@@ -1014,6 +1070,8 @@ def set_task_status(state: dict, phase_idx: int, task_idx: int, status: str,
         tasks = phases[phase_idx].get("tasks") or []
         if 0 <= task_idx < len(tasks):
             task = tasks[task_idx]
+            if status not in TASK_STATUSES:
+                raise ValueError("invalid_autonomous_task_status")
             task["status"] = status
             for key, value in fields.items():
                 task[key] = value
@@ -1046,14 +1104,96 @@ def set_task_status(state: dict, phase_idx: int, task_idx: int, status: str,
                         )[:96],
                         "retry_eligible": attempts < max_attempts,
                     })
-                elif status == "in_progress":
+                elif status in {
+                    "in_progress", "waiting_tool", "verifying_tool",
+                    "resuming", "cancellation_requested",
+                }:
                     checklist_item.update({
                         "status": "active",
                         "evidence_ref": "",
                         "failure_reason": str(task.get("last_error") or "")[:96],
-                        "retry_eligible": attempts < max_attempts,
+                        "retry_eligible": status == "in_progress" and attempts < max_attempts,
+                    })
+                elif status == "blocked_unknown_effect":
+                    checklist_item.update({
+                        "status": "blocked",
+                        "evidence_ref": "",
+                        "failure_reason": "blocked_unknown_effect",
+                        "retry_eligible": False,
+                    })
+                elif status == "cancelled_proven":
+                    checklist_item.update({
+                        "status": "blocked",
+                        "evidence_ref": "",
+                        "failure_reason": "cancelled_proven",
+                        "retry_eligible": False,
                     })
     return state
+
+
+def current_task(state: dict) -> tuple[int, int, dict | None]:
+    """Return the exact cursor task without advancing or repairing the plan."""
+
+    cursor = state.get("cursor") or {}
+    try:
+        phase_index = int(cursor.get("phase", 0) or 0)
+        task_index = int(cursor.get("task", 0) or 0)
+        task = (state.get("phases") or [])[phase_index]["tasks"][task_index]
+    except (IndexError, KeyError, TypeError, ValueError, OverflowError):
+        return 0, 0, None
+    return phase_index, task_index, task if isinstance(task, dict) else None
+
+
+def bind_tool_attempt(
+    state: dict,
+    *,
+    attempt_id: str,
+    operation_id: str,
+    operation_revision: int,
+    next_reconciliation_at: float | None,
+) -> dict:
+    """Persist only safe common-attempt correlation on the current task."""
+
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", str(attempt_id or "")):
+        raise ValueError("invalid_tool_attempt_id")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", str(operation_id or "")):
+        raise ValueError("invalid_tool_operation_id")
+    if (
+        isinstance(operation_revision, bool)
+        or not isinstance(operation_revision, int)
+        or operation_revision < 0
+    ):
+        raise ValueError("invalid_tool_operation_revision")
+    if next_reconciliation_at is not None and (
+        isinstance(next_reconciliation_at, bool)
+        or not isinstance(next_reconciliation_at, (int, float))
+        or not math.isfinite(float(next_reconciliation_at))
+        or next_reconciliation_at < 0
+    ):
+        raise ValueError("invalid_tool_reconciliation_time")
+    phase_index, task_index, task = current_task(state)
+    if task is None:
+        raise ValueError("autonomous_task_unavailable")
+    existing = str(task.get("tool_attempt_id") or "")
+    if existing and existing != attempt_id:
+        raise ValueError("autonomous_task_attempt_conflict")
+    return set_task_status(
+        state,
+        phase_index,
+        task_index,
+        "waiting_tool",
+        tool_attempt_id=attempt_id,
+        tool_operation_id=operation_id,
+        tool_operation_revision=operation_revision,
+        tool_durable_state="waiting_tool",
+        tool_next_reconciliation_at=(
+            float(next_reconciliation_at)
+            if next_reconciliation_at is not None else None
+        ),
+        tool_terminal_reason="",
+        tool_continuation_claimed=False,
+        last_error=None,
+    )
 
 
 def checklist_remaining(state: dict) -> list[dict]:
@@ -1093,6 +1233,9 @@ def resume_state_is_valid(st) -> bool:
         "ready", "running", "suspended_scope_extension",
         "suspended_authorization_revoked", "blocked_outcome_unknown",
         "suspended_browser_intervention", "suspended_browser_state",
+        "waiting_tool", "verifying_tool", "resuming",
+        "blocked_unknown_effect", "cancellation_requested",
+        "cancelled_proven",
     }:
         return False
     if st.get("authorization_status") not in AUTHORIZATION_STATUSES:
@@ -1136,6 +1279,19 @@ def execution_state_is_valid(st) -> bool:
     for name in ("plan_revision", "authorization_revision", "policy_epoch"):
         if type(st.get(name)) is not int or st[name] < 0:
             return False
+    for name in (
+        "source_conversation_id", "source_turn_id", "source_request_id",
+        "attached_tool_attempt_id",
+    ):
+        if not isinstance(st.get(name, ""), str) or not re.fullmatch(
+            r"[A-Za-z0-9_.:-]{0,160}", st.get(name, ""),
+        ):
+            return False
+    if (
+        type(st.get("source_permission_epoch", 0)) is not int
+        or st.get("source_permission_epoch", 0) < 0
+    ):
+        return False
     refs = st.get("grant_refs")
     if not isinstance(refs, list) or any(
         not isinstance(ref, str)
@@ -1157,6 +1313,20 @@ def execution_state_is_valid(st) -> bool:
             return False
         if not isinstance(record.get("operation_id"), str):
             return False
+        attempt_id = str(record.get("tool_attempt_id") or "")
+        if attempt_id and not re.fullmatch(
+            r"[A-Za-z0-9_.:-]{1,160}", attempt_id,
+        ):
+            return False
+    for _phase in st.get("phases") or []:
+        for task in _phase.get("tasks") or []:
+            if task.get("status") not in TASK_STATUSES:
+                return False
+            attempt_id = str(task.get("tool_attempt_id") or "")
+            if attempt_id and not re.fullmatch(
+                r"[A-Za-z0-9_.:-]{1,160}", attempt_id,
+            ):
+                return False
     return True
 
 
@@ -1237,6 +1407,11 @@ def _migrate_loaded_state(loaded: dict) -> dict:
         "operation_records": [],
         "ambiguity_barriers": [],
         "browser_checkpoint": normalize_browser_checkpoint({}),
+        "source_conversation_id": "",
+        "source_turn_id": "",
+        "source_request_id": "",
+        "source_permission_epoch": 0,
+        "attached_tool_attempt_id": "",
     }
     for key, value in defaults.items():
         loaded.setdefault(key, value)
@@ -1351,6 +1526,13 @@ def load_task_state() -> "dict | None":
                 continue
             for task in phase.get("tasks") or []:
                 if isinstance(task, dict):
+                    task.setdefault("tool_attempt_id", "")
+                    task.setdefault("tool_operation_id", "")
+                    task.setdefault("tool_operation_revision", 0)
+                    task.setdefault("tool_durable_state", "")
+                    task.setdefault("tool_next_reconciliation_at", None)
+                    task.setdefault("tool_terminal_reason", "")
+                    task.setdefault("tool_continuation_claimed", False)
                     task["artifact_ids"] = [
                         artifact_id
                         for artifact_id in _normalize_artifact_ids(

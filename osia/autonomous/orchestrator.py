@@ -48,6 +48,7 @@ from osia.autonomous import authorization, diagnostics, planner
 # stays a single black box — and so a test can monkeypatch state.save_task_state.
 from osia.autonomous import state
 from osia import i18n
+from osia.tool_attempts import ToolAttemptStatus
 from osia.turn_context import fixed_turn_context, normalize_locale
 
 # ── Tunables (module constants) ──────────────────────────────────────────────
@@ -133,11 +134,512 @@ class Orchestrator:
         self._resume_scope_tool = ""
         self._active_task = None
         self._origin_ref = str(origin_ref or "desktop")
+        self._tool_resume_lock = threading.RLock()
+        self._pending_tool_completion = None
+        self._resumed_tool_attempts: set[str] = set()
+        self._tool_cancel_lock = threading.RLock()
+        self._cancel_before_dispatch_requested = False
+        self._starting_tool_attempt_id = ""
+
+    def _tool_attempt_binding(self, tool_identity: str, arguments: dict) -> dict:
+        st = self._state if isinstance(self._state, dict) else {}
+        from osia.tool_contracts import normalized_call_hash
+
+        call_hash = normalized_call_hash(tool_identity, arguments)
+        operation_id = authorization.operation_id_for_call(
+            st, tool_identity, call_hash,
+        )
+        _, _, task = state.current_task(st)
+        return {
+            "run_id": str(st.get("run_id") or ""),
+            "task_id": str((task or {}).get("id") or ""),
+            "operation_id": operation_id,
+            "operation_revision": int(
+                st.get("authorization_revision", 0) or 0
+            ),
+            "permission_epoch": int(
+                st.get("source_permission_epoch")
+                or st.get("policy_epoch", 0)
+                or 0
+            ),
+        }
+
+    def _configure_common_tool_attempts(self, st: dict) -> None:
+        configure = getattr(self.agent, "configure_tool_attempts", None)
+        if not callable(configure):
+            return
+        _, _, task = state.current_task(st)
+        if task is None:
+            return
+        run_id = str(st.get("run_id") or "")
+        task_id = str(task.get("id") or "")
+        source_conversation = str(st.get("source_conversation_id") or "")
+        conversation_id = source_conversation or f"autonomous.{run_id}"
+        turn_id = str(st.get("source_turn_id") or task_id or run_id)
+        request_id = str(st.get("source_request_id") or run_id)
+        existing_attempt_id = str(
+            st.get("attached_tool_attempt_id") or ""
+        ) if not task.get("tool_attempt_id") else ""
+        configure(
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            request_id=request_id,
+            final_response_message_id=(
+                f"autonomous.{run_id}.{task_id}"[:160]
+            ),
+            status_callback=self._on_common_tool_status,
+            final_callback=self._on_common_tool_final,
+            owner_scope="autonomous",
+            autonomous_binding=self._tool_attempt_binding,
+            existing_attempt_id=existing_attempt_id,
+            observer_key=f"autonomous.{run_id}.{task_id}"[:160],
+        )
+
+    def attach_existing_tool_attempt(self, st: dict, attempt_id: str) -> bool:
+        """Bind one validated Chat receipt before any mission tool dispatch."""
+
+        if not isinstance(st, dict) or str(
+            st.get("attached_tool_attempt_id") or ""
+        ) != str(attempt_id or ""):
+            return False
+        _, _, planned_task = state.current_task(st)
+        if (
+            planned_task is None
+            or planned_task.get("tool_attempt_id")
+            or st.get("operation_records")
+            or st.get("ambiguity_barriers")
+        ):
+            return False
+        try:
+            from osia.tool_attempts import (
+                RECOVERABLE_STATUSES,
+                TERMINAL_STATUSES,
+                ToolAttemptStatus,
+                get_tool_attempt_coordinator,
+                get_tool_attempt_store,
+            )
+
+            store = get_tool_attempt_store()
+            attempt = store.get_attempt(attempt_id)
+            status = ToolAttemptStatus((attempt or {}).get("status"))
+        except Exception:
+            return False
+        if (
+            not attempt
+            or status not in RECOVERABLE_STATUSES | TERMINAL_STATUSES
+            or attempt.get("dispatch_state") == "not_dispatched"
+            or attempt.get("conversation_id")
+            != str(st.get("source_conversation_id") or "")
+            or attempt.get("turn_id") != str(st.get("source_turn_id") or "")
+            or attempt.get("request_id")
+            != str(st.get("source_request_id") or "")
+            or attempt.get("provider_id") != str(st.get("provider") or "")
+            or attempt.get("model_id") != str(st.get("model") or "")
+        ):
+            return False
+        operation_revision = int(st.get("authorization_revision", 0) or 0)
+        permission_epoch = int(
+            st.get("source_permission_epoch") or st.get("policy_epoch", 0) or 0
+        )
+        operation_id = authorization.operation_id_for_call(
+            st,
+            str(attempt.get("tool_name") or ""),
+            str(attempt.get("argument_fingerprint") or ""),
+        )
+        # The external action already belongs to the common receipt.  Replace
+        # the unexecuted planner expansion with one value-free continuation
+        # task so a later planned step can never redispatch the same effect.
+        st["phases"] = [{
+            "name": "Continue source tool attempt",
+            "status": "in_progress",
+            "tasks": [{
+                "id": "0.0",
+                "objective": (
+                    "Continue the exact suspended source tool attempt without "
+                    "redispatch."
+                ),
+                "success_criterion": (
+                    "The common durable tool receipt reaches one terminal outcome."
+                ),
+                "requirement_id": "",
+                "status": "pending",
+                "attempts": 0,
+                "distilled_summary": "",
+                "last_error": None,
+                "artifact_ids": [],
+                "tool_attempt_id": "",
+                "tool_operation_id": "",
+                "tool_operation_revision": 0,
+                "tool_durable_state": "",
+                "tool_next_reconciliation_at": None,
+                "tool_terminal_reason": "",
+                "tool_continuation_claimed": False,
+            }],
+        }]
+        st["cursor"] = {"phase": 0, "task": 0}
+        st["checklist"] = []
+        _, _, task = state.current_task(st)
+        if task is None:
+            return False
+        try:
+            bound = store.bind_autonomous(
+                attempt_id,
+                run_id=str(st.get("run_id") or ""),
+                task_id=str(task.get("id") or ""),
+                operation_id=operation_id,
+                operation_revision=operation_revision,
+                permission_epoch=permission_epoch,
+            )
+            state.bind_tool_attempt(
+                st,
+                attempt_id=attempt_id,
+                operation_id=operation_id,
+                operation_revision=operation_revision,
+                next_reconciliation_at=bound.get("next_check_at"),
+            )
+        except Exception:
+            return False
+        self._state = st
+        st["run_state"] = (
+            "cancellation_requested"
+            if status is ToolAttemptStatus.CANCELLATION_REQUESTED
+            else "waiting_tool"
+        )
+        self._safe_save(st)
+        self._emit({"event": st["run_state"]})
+        observer_key = f"autonomous.{st.get('run_id')}.{task.get('id')}"[:160]
+
+        def _observe(callback_attempt_id, _payload):
+            self._on_common_tool_final(callback_attempt_id, "", None)
+
+        coordinator = get_tool_attempt_coordinator()
+        if not coordinator.register_terminal_observer(
+            attempt_id, observer_key, _observe,
+        ):
+            return False
+        coordinator.trigger_recovery(
+            reason="chat_autonomous_handoff", overdue_only=False,
+        )
+        return True
+
+    def _on_common_tool_status(self, status: str, attempt_id: str) -> None:
+        event = {
+            "action_starting": "action_starting",
+            "action_in_progress": "action_in_progress",
+            "waiting_tool_result": "waiting_tool",
+            "verifying_tool_result": "verifying_tool",
+            "resuming_tool_turn": "resuming",
+            "blocked_unknown_effect": "blocked_unknown_effect",
+            "cancellation_requested": "cancellation_requested",
+        }.get(str(status), "action_in_progress")
+        should_cancel = False
+        if event == "action_starting" and attempt_id:
+            with self._tool_cancel_lock:
+                self._starting_tool_attempt_id = str(attempt_id)
+                should_cancel = self._cancel_before_dispatch_requested
+        self._emit({"event": event})
+        if should_cancel:
+            self.request_tool_cancellation()
+
+    def _on_common_tool_final(
+        self, attempt_id: str, final_text: str, error,
+    ) -> bool:
+        del final_text  # provider output remains ephemeral and is never checkpointed
+        del error  # the durable common receipt is the action-outcome authority
+        st = self._state if isinstance(self._state, dict) else None
+        if st is None:
+            return False
+        phase_index, task_index, task = state.current_task(st)
+        if task is None or str(task.get("tool_attempt_id") or "") != attempt_id:
+            return False
+        with self._tool_resume_lock:
+            if attempt_id in self._resumed_tool_attempts:
+                return True
+            self._resumed_tool_attempts.add(attempt_id)
+            try:
+                from osia.tool_attempts import get_tool_attempt_store
+
+                attempt = get_tool_attempt_store().get_attempt(attempt_id)
+                status = ToolAttemptStatus((attempt or {}).get("status"))
+            except Exception:
+                attempt = None
+                status = ToolAttemptStatus.UNKNOWN_AFTER_START
+            task["tool_continuation_claimed"] = True
+            task["tool_terminal_reason"] = str(
+                (attempt or {}).get("reason_code") or "tool_result_unavailable"
+            )[:96]
+            if status in {
+                ToolAttemptStatus.FAILED_AFTER_EFFECT,
+                ToolAttemptStatus.UNKNOWN_AFTER_START,
+            }:
+                self._block_unknown_tool_effect(
+                    st, phase_index, task_index, task,
+                    task["tool_terminal_reason"],
+                )
+                return True
+            self._pending_tool_completion = (attempt_id, status.value)
+            task["tool_durable_state"] = "resuming"
+            state.set_task_status(
+                st, phase_index, task_index, "resuming",
+                tool_continuation_claimed=True,
+            )
+            st["run_state"] = "resuming"
+            self._safe_save(st)
+            self._emit({"event": "resuming"})
+            # An explicit mission pause may race the terminal callback.  Keep
+            # the terminal checkpoint, but do not restart the mission until the
+            # user invokes the existing resume path.
+            if not self._stop.is_set():
+                self._start_tool_resume_loop()
+            return True
+
+    @staticmethod
+    def _common_attempt_identity_error(
+        st: dict, task: dict, attempt: dict,
+    ) -> str:
+        """Return a safe reason when a receipt is not this exact task's."""
+
+        if (
+            str(attempt.get("provider_id") or "")
+            != str(st.get("provider") or "")
+            or str(attempt.get("model_id") or "")
+            != str(st.get("model") or "")
+        ):
+            return "tool_recovery_model_mismatch"
+        expected = {
+            "autonomous_run_id": str(st.get("run_id") or ""),
+            "autonomous_task_id": str(task.get("id") or ""),
+            "autonomous_operation_id": str(task.get("tool_operation_id") or ""),
+            "operation_revision": int(
+                task.get("tool_operation_revision", 0) or 0
+            ),
+            "permission_epoch": int(
+                st.get("source_permission_epoch")
+                or st.get("policy_epoch", 0)
+                or 0
+            ),
+        }
+        if attempt.get("owner_scope") != "autonomous" or any(
+            attempt.get(key) != value for key, value in expected.items()
+        ):
+            return "common_tool_attempt_identity_mismatch"
+        source_conversation = str(st.get("source_conversation_id") or "")
+        source_turn = str(st.get("source_turn_id") or "")
+        source_request = str(st.get("source_request_id") or "")
+        if (
+            source_conversation
+            and attempt.get("conversation_id") != source_conversation
+        ) or (source_turn and attempt.get("turn_id") != source_turn) or (
+            source_request and attempt.get("request_id") != source_request
+        ):
+            return "common_tool_attempt_identity_mismatch"
+        return ""
+
+    def _start_tool_resume_loop(self) -> None:
+        with self._tool_resume_lock:
+            if self._thread is not None and self._thread.is_alive():
+                previous = self._thread
+
+                def _after_previous() -> None:
+                    previous.join(timeout=5.0)
+                    with self._tool_resume_lock:
+                        if previous.is_alive() or self._pending_tool_completion is None:
+                            return
+                        self._stop.clear()
+                        self._thread = threading.Thread(
+                            target=self._run_loop,
+                            name="osia-orchestrator",
+                            daemon=True,
+                        )
+                        self._thread.start()
+
+                threading.Thread(
+                    target=_after_previous,
+                    name="osia-tool-resume-gate",
+                    daemon=True,
+                ).start()
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run_loop,
+                name="osia-orchestrator",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _block_unknown_tool_effect(
+        self, st: dict, phase_index: int, task_index: int,
+        task: dict, reason_code: str,
+    ) -> None:
+        safe_reason = (
+            reason_code
+            if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", reason_code or "")
+            else "blocked_unknown_effect"
+        )
+        state.set_task_status(
+            st, phase_index, task_index, "blocked_unknown_effect",
+            last_error=safe_reason,
+            tool_durable_state="blocked_unknown_effect",
+            tool_terminal_reason=safe_reason,
+            tool_continuation_claimed=True,
+        )
+        operation_id = str(task.get("tool_operation_id") or "")
+        record = state.operation_record(st, operation_id) if operation_id else None
+        if record is not None:
+            record.update({
+                "status": "outcome_unknown",
+                "execution_outcome": "outcome_unknown",
+                "safe_reason_code": safe_reason,
+            })
+            state.upsert_operation_record(st, record)
+            state.add_ambiguity_barrier(st, record)
+        st["run_state"] = "blocked_unknown_effect"
+        st["authorization_status"] = "outcome_unknown"
+        self._safe_save(st)
+        self._emit({"event": "blocked_unknown_effect", "reason": safe_reason})
+
+    def request_tool_cancellation(self) -> bool:
+        st = self._state if isinstance(self._state, dict) else None
+        if st is None:
+            return False
+        phase_index, task_index, task = state.current_task(st)
+        if task is None:
+            return False
+        with self._tool_cancel_lock:
+            attempt_id = str(
+                task.get("tool_attempt_id")
+                or self._starting_tool_attempt_id
+                or ""
+            )
+            if not attempt_id:
+                self._cancel_before_dispatch_requested = True
+                state.set_task_status(
+                    st,
+                    phase_index,
+                    task_index,
+                    "cancellation_requested",
+                    tool_durable_state="cancellation_requested",
+                    last_error="cancellation_requested",
+                )
+                st["run_state"] = "cancellation_requested"
+                self._safe_save(st)
+                self._emit({"event": "cancellation_requested"})
+                return True
+        if not attempt_id:
+            return False
+        try:
+            from osia.tool_attempts import (
+                TERMINAL_STATUSES,
+                ToolAttemptStatus,
+                get_tool_attempt_store,
+            )
+
+            store = get_tool_attempt_store()
+            attempt = store.get_attempt(attempt_id) or {}
+            if (
+                attempt.get("owner_scope") != "autonomous"
+                or attempt.get("autonomous_run_id")
+                != str(st.get("run_id") or "")
+                or attempt.get("autonomous_task_id")
+                != str(task.get("id") or "")
+            ):
+                return False
+            current_status = ToolAttemptStatus(attempt.get("status"))
+            if (
+                current_status in TERMINAL_STATUSES
+                and current_status is not ToolAttemptStatus.CANCELLED_PROVEN
+            ):
+                if current_status in {
+                    ToolAttemptStatus.FAILED_AFTER_EFFECT,
+                    ToolAttemptStatus.UNKNOWN_AFTER_START,
+                }:
+                    self._block_unknown_tool_effect(
+                        st,
+                        phase_index,
+                        task_index,
+                        task,
+                        str(
+                            attempt.get("reason_code")
+                            or "blocked_unknown_effect"
+                        ),
+                    )
+                    return True
+                # The last receipt completed before the abort raced in. Keep a
+                # bounded intent for the current provider boundary instead of
+                # mislabelling that terminal receipt or continuing to a retry.
+                with self._tool_cancel_lock:
+                    self._cancel_before_dispatch_requested = True
+                    self._starting_tool_attempt_id = ""
+                state.set_task_status(
+                    st,
+                    phase_index,
+                    task_index,
+                    "cancellation_requested",
+                    tool_durable_state="cancellation_requested",
+                    last_error="cancellation_requested",
+                )
+                st["run_state"] = "cancellation_requested"
+                self._safe_save(st)
+                self._emit({"event": "cancellation_requested"})
+                return True
+            if not task.get("tool_attempt_id"):
+                state.bind_tool_attempt(
+                    st,
+                    attempt_id=attempt_id,
+                    operation_id=str(
+                        attempt.get("autonomous_operation_id") or ""
+                    ),
+                    operation_revision=int(
+                        attempt.get("operation_revision") or 0
+                    ),
+                    next_reconciliation_at=attempt.get("next_check_at"),
+                )
+            requested = store.request_cancellation(attempt_id)
+        except Exception:
+            return False
+        with self._tool_cancel_lock:
+            self._cancel_before_dispatch_requested = False
+        state.set_task_status(
+            st, phase_index, task_index, "cancellation_requested",
+            tool_durable_state="cancellation_requested",
+            last_error="cancellation_requested",
+        )
+        st["run_state"] = "cancellation_requested"
+        self._safe_save(st)
+        self._emit({"event": "cancellation_requested"})
+        if ToolAttemptStatus(requested["status"]) is ToolAttemptStatus.CANCELLED_PROVEN:
+            self._stop.set()
+            phase = (st.get("phases") or [])[phase_index]
+            self._continue_after_common_tool(
+                st,
+                phase_index,
+                task_index,
+                phase,
+                task,
+                attempt_id,
+                ToolAttemptStatus.CANCELLED_PROVEN.value,
+            )
+        return True
+
+    def block_tool_recovery(self, st: dict, reason_code: str) -> bool:
+        """Fail closed when an exact durable recovery cannot be reconstructed."""
+
+        if not isinstance(st, dict):
+            return False
+        phase_index, task_index, task = state.current_task(st)
+        if task is None or not task.get("tool_attempt_id"):
+            return False
+        self._state = st
+        self._block_unknown_tool_effect(
+            st, phase_index, task_index, task, reason_code,
+        )
+        return True
 
     def _agent_run(self, message: str, *, verification: bool = False):
         """Run one autonomous provider turn under the checkpoint language."""
 
         st = self._state if isinstance(self._state, dict) else {}
+        self._configure_common_tool_attempts(st)
         language = normalize_locale(st.get("language")) or i18n.DEFAULT_LANG
         from osia.action_policy import (
             ExecutionType,
@@ -314,6 +816,22 @@ class Orchestrator:
             # checkpoints.  Resume re-enters through the same ready gate; every
             # dispatch still revalidates the protected epoch/grant.
             st["run_state"] = "ready"
+        durable_tool_states = {
+            "waiting_tool", "verifying_tool", "resuming",
+            "cancellation_requested",
+        }
+        if resume and st.get("run_state") in durable_tool_states:
+            self._state = st
+            self._stop.clear()
+            if st.get("run_state") == "resuming":
+                _, _, durable_task = state.current_task(st)
+                durable_attempt_id = str(
+                    (durable_task or {}).get("tool_attempt_id") or ""
+                )
+                with self._tool_resume_lock:
+                    self._resumed_tool_attempts.discard(durable_attempt_id)
+            self._recover_waiting_tool_checkpoint(st)
+            return
         if st.get("run_state") != "ready":
             self._state = st
             self._safe_save(st)
@@ -407,6 +925,57 @@ class Orchestrator:
         )
         self._thread.start()
 
+    def _recover_waiting_tool_checkpoint(self, st: dict) -> None:
+        """Reconnect a mission to its common attempt without any redispatch."""
+
+        phase_index, task_index, task = state.current_task(st)
+        attempt_id = str((task or {}).get("tool_attempt_id") or "")
+        if task is None or not attempt_id:
+            if task is not None:
+                self._block_unknown_tool_effect(
+                    st, phase_index, task_index, task,
+                    "common_tool_attempt_missing",
+                )
+            return
+        try:
+            from osia.tool_attempts import (
+                RECOVERABLE_STATUSES,
+                ToolAttemptStatus,
+                get_tool_attempt_coordinator,
+                get_tool_attempt_store,
+            )
+
+            attempt = get_tool_attempt_store().get_attempt(attempt_id)
+            status = ToolAttemptStatus((attempt or {}).get("status"))
+        except Exception:
+            attempt = None
+            status = ToolAttemptStatus.UNKNOWN_AFTER_START
+        if not attempt:
+            self._block_unknown_tool_effect(
+                st, phase_index, task_index, task,
+                "common_tool_attempt_unavailable",
+            )
+            return
+        identity_error = self._common_attempt_identity_error(st, task, attempt)
+        if identity_error:
+            self._block_unknown_tool_effect(
+                st, phase_index, task_index, task, identity_error,
+            )
+            return
+        if status in RECOVERABLE_STATUSES:
+            st["run_state"] = (
+                "cancellation_requested"
+                if status is ToolAttemptStatus.CANCELLATION_REQUESTED
+                else "waiting_tool"
+            )
+            self._safe_save(st)
+            self._emit({"event": st["run_state"]})
+            get_tool_attempt_coordinator().trigger_recovery(
+                reason="autonomous_resume", overdue_only=False,
+            )
+            return
+        self._on_common_tool_final(attempt_id, "", None)
+
     def stop(self, timeout: float = 2.0):
         """Signal the loop to stop and wait briefly for the thread to exit."""
         self._stop.set()
@@ -473,6 +1042,28 @@ class Orchestrator:
 
     def _step(self, st) -> bool:
         """Run ONE task-cycle. Returns whether the loop should continue."""
+        with self._tool_cancel_lock:
+            queued_cancel = self._cancel_before_dispatch_requested
+        if queued_cancel and st.get("run_state") == "cancellation_requested":
+            phase_index, task_index, task = state.current_task(st)
+            if task is not None:
+                with self._tool_cancel_lock:
+                    self._cancel_before_dispatch_requested = False
+                    self._starting_tool_attempt_id = ""
+                state.set_task_status(
+                    st,
+                    phase_index,
+                    task_index,
+                    "cancelled_proven",
+                    last_error="cancelled_proven",
+                    tool_durable_state="cancelled_proven",
+                )
+                st["status"] = "aborted"
+                st["run_state"] = "cancelled_proven"
+                self._stop.set()
+                self._safe_save(st)
+                self._emit({"event": "cancelled_proven"})
+                return False
         cursor = st.get("cursor") or {"phase": 0, "task": 0}
         p = int(cursor.get("phase", 0) or 0)
         t = int(cursor.get("task", 0) or 0)
@@ -593,6 +1184,20 @@ class Orchestrator:
             self._safe_save(st)
             return True
 
+        with self._tool_resume_lock:
+            completion = self._pending_tool_completion
+            if (
+                completion is not None
+                and completion[0] == str(task.get("tool_attempt_id") or "")
+            ):
+                self._pending_tool_completion = None
+            else:
+                completion = None
+        if completion is not None:
+            return self._continue_after_common_tool(
+                st, p, t, phase, task, completion[0], completion[1],
+            )
+
         digest = st.get("context_digest", "") or ""
         budgets = st.get("budgets") or {}
         max_attempts = int(budgets.get("max_attempts_per_task",
@@ -690,6 +1295,38 @@ class Orchestrator:
                 result = self._agent_run(execution_prompt)
             if not isinstance(result, str):
                 result = "" if result is None else str(result)
+            from osia.tool_attempts import WAITING_TOOL_RESULT
+
+            if result == WAITING_TOOL_RESULT:
+                if st.get("run_state") not in {
+                    "waiting_tool", "cancellation_requested",
+                }:
+                    self._block_unknown_tool_effect(
+                        st, p, t, task, "common_tool_attempt_not_checkpointed",
+                    )
+                    return False
+                # A durable wait is neither a failed try nor a retry.  Keep the
+                # pre-dispatch task budget unchanged while this exact external
+                # operation is reconciled by the common attempt engine.
+                attempts = max(0, attempts - 1)
+                waiting_status = (
+                    "cancellation_requested"
+                    if st.get("run_state") == "cancellation_requested"
+                    else "waiting_tool"
+                )
+                state.set_task_status(
+                    st, p, t, waiting_status, attempts=attempts,
+                )
+                self._safe_save(st)
+                self._emit({"event": waiting_status})
+                if not self.agent.activate_pending_tool_attempt():
+                    self._block_unknown_tool_effect(
+                        st, p, t, task, "common_tool_attempt_not_activated",
+                    )
+                return False
+            clear_attempts = getattr(self.agent, "clear_tool_attempts", None)
+            if callable(clear_attempts):
+                clear_attempts()
             agent_failure = self._agent_run_failure()
         except Exception as exc:
             result = ""
@@ -724,6 +1361,41 @@ class Orchestrator:
             self.agent._autonomous_resume_exact_call = (
                 previous_exact_resume_call
             )
+
+        with self._tool_cancel_lock:
+            queued_cancel = self._cancel_before_dispatch_requested
+            starting_attempt = self._starting_tool_attempt_id
+            if not queued_cancel:
+                self._starting_tool_attempt_id = ""
+        if queued_cancel and starting_attempt:
+            if not self.request_tool_cancellation():
+                self._block_unknown_tool_effect(
+                    st, p, t, task, "cancellation_attempt_unavailable",
+                )
+                return False
+            with self._tool_cancel_lock:
+                queued_cancel = self._cancel_before_dispatch_requested
+        if queued_cancel:
+            # The bounded abort intent survived the whole provider turn without
+            # any accepted tool boundary.  No external action was dispatched,
+            # so cancellation is proven rather than merely requested.
+            with self._tool_cancel_lock:
+                self._cancel_before_dispatch_requested = False
+                self._starting_tool_attempt_id = ""
+            state.set_task_status(
+                st,
+                p,
+                t,
+                "cancelled_proven",
+                last_error="cancelled_proven",
+                tool_durable_state="cancelled_proven",
+            )
+            st["status"] = "aborted"
+            st["run_state"] = "cancelled_proven"
+            self._stop.set()
+            self._safe_save(st)
+            self._emit({"event": "cancelled_proven"})
+            return False
 
         barrier = st.get("run_state")
         if barrier in {
@@ -903,6 +1575,117 @@ class Orchestrator:
         self._append_log(st, "retry", ref=task.get("id"), note=last_error)
         self._safe_save(st)
         return True
+
+    def _continue_after_common_tool(
+        self,
+        st: dict,
+        phase_index: int,
+        task_index: int,
+        phase: dict,
+        task: dict,
+        attempt_id: str,
+        terminal_status: str,
+    ) -> bool:
+        """Continue the exact checkpoint once from a common terminal receipt."""
+
+        from osia.tool_attempts import ToolAttemptStatus, get_tool_attempt_store
+
+        try:
+            attempt = get_tool_attempt_store().get_attempt(attempt_id) or {}
+            status = ToolAttemptStatus(attempt.get("status") or terminal_status)
+        except Exception:
+            self._block_unknown_tool_effect(
+                st, phase_index, task_index, task,
+                "common_tool_attempt_unavailable",
+            )
+            return False
+        identity_error = self._common_attempt_identity_error(st, task, attempt)
+        if identity_error:
+            self._block_unknown_tool_effect(
+                st, phase_index, task_index, task,
+                identity_error,
+            )
+            return False
+        state.set_task_status(
+            st, phase_index, task_index, "verifying_tool",
+            tool_durable_state="verifying_tool",
+        )
+        st["run_state"] = "verifying_tool"
+        self._safe_save(st)
+        self._emit({"event": "verifying_tool"})
+        operation_id = str(task.get("tool_operation_id") or "")
+        operation = state.operation_record(st, operation_id) if operation_id else None
+        if status is ToolAttemptStatus.SUCCEEDED:
+            if operation is not None:
+                operation.update({
+                    "status": "success_verified",
+                    "execution_outcome": str(
+                        attempt.get("terminal_outcome") or "success_verified"
+                    ),
+                    "safe_reason_code": str(
+                        attempt.get("reason_code") or "tool_result_verified"
+                    )[:96],
+                    "tool_attempt_id": attempt_id,
+                })
+                state.upsert_operation_record(st, operation)
+            state.set_task_status(
+                st, phase_index, task_index, "done",
+                distilled_summary="Durable tool result verified.",
+                last_error=None,
+                tool_durable_state="",
+                tool_next_reconciliation_at=None,
+            )
+            if task_index + 1 >= len(phase.get("tasks") or []):
+                phase["status"] = "done"
+            self._advance(st)
+            st["run_state"] = "running"
+            self._append_log(
+                st, "task_done", ref=task.get("id"),
+                note="common_tool_attempt_verified",
+            )
+            self._safe_save(st)
+            self._emit({
+                "event": "task_done",
+                "task_id": task.get("id"),
+                "reason": "common_tool_attempt_verified",
+            })
+            return True
+        if status is ToolAttemptStatus.FAILED_BEFORE_EFFECT:
+            if operation is not None:
+                operation.update({
+                    "status": "failed_before_dispatch",
+                    "execution_outcome": "confirmed_failure_before_effect",
+                    "safe_reason_code": str(
+                        attempt.get("reason_code") or "failed_before_effect"
+                    )[:96],
+                    "tool_attempt_id": attempt_id,
+                })
+                state.upsert_operation_record(st, operation)
+            state.set_task_status(
+                st, phase_index, task_index, "in_progress",
+                last_error="failed_before_effect",
+                tool_durable_state="",
+                tool_next_reconciliation_at=None,
+            )
+            st["run_state"] = "running"
+            self._safe_save(st)
+            return True
+        if status is ToolAttemptStatus.CANCELLED_PROVEN:
+            state.set_task_status(
+                st, phase_index, task_index, "cancelled_proven",
+                last_error="cancelled_proven",
+                tool_durable_state="cancelled_proven",
+            )
+            st["status"] = "aborted"
+            st["run_state"] = "cancelled_proven"
+            self._safe_save(st)
+            self._emit({"event": "cancelled_proven"})
+            return False
+        self._block_unknown_tool_effect(
+            st, phase_index, task_index, task,
+            str(attempt.get("reason_code") or "blocked_unknown_effect"),
+        )
+        return False
 
     # ── Subtask prompt + verification ────────────────────────────────────────
 

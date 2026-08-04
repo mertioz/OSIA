@@ -6,6 +6,7 @@ with a manual tool-calling loop that works with any model (llama3, etc.).
 
 import ast
 import hashlib
+import hmac
 import contextvars
 import json
 import math
@@ -4536,6 +4537,7 @@ def _execute_tool_once_record(
     attempt_id: str = "",
     attempt_store=None,
     terminal_callback=None,
+    status_callback=None,
 ):
     """Dispatch once and preserve truthful timeout/outcome semantics."""
     from osia.tool_contracts import (
@@ -4552,7 +4554,29 @@ def _execute_tool_once_record(
 
     fn = TOOL_MAP[tool_name]
     if attempt_id and attempt_store is not None:
-        attempt_store.mark_running(attempt_id)
+        dispatch_record = attempt_store.mark_running(attempt_id)
+        if dispatch_record.get("status") == "cancelled_proven":
+            text = (
+                "ERROR: action annulee avant execution ; aucun effet produit"
+                if str(lang or "").lower().startswith("fr") else
+                "ERROR: action cancelled before dispatch; no effect occurred"
+            )
+            return ToolExecutionRecord(
+                text,
+                True,
+                ExecutionOutcome.CANCELLED_PROVEN,
+                0,
+                False,
+                False,
+                contract,
+                attempt_id,
+                False,
+            )
+        if callable(status_callback):
+            try:
+                status_callback("action_in_progress", attempt_id)
+            except Exception:
+                pass
 
     def _attempt_event(event):
         if attempt_store is not None:
@@ -4747,6 +4771,7 @@ def _execute_tool_with_policy(
     from osia.tool_contracts import (
         ExecutionOutcome,
         RetryPolicy,
+        SideEffectClass,
         ToolExecutionRecord,
         ToolValidationError,
         validate_tool_arguments,
@@ -4798,15 +4823,84 @@ def _execute_tool_with_policy(
     attempt_id = ""
     attempt_store = None
     terminal_callback = None
+    status_callback = None
     if isinstance(attempt_context, dict) and attempt_context.get("enabled") is True:
         from osia.tool_attempts import (
             IllegalTransition,
+            RECOVERABLE_STATUSES,
+            ToolAttemptStatus,
             get_tool_attempt_store,
         )
 
         attempt_store = attempt_context.get("store") or get_tool_attempt_store()
         fingerprint = attempt_store.fingerprint_arguments(kwargs)
         conversation_id = str(attempt_context.get("conversation_id") or "")
+        binding = {}
+        binding_factory = attempt_context.get("autonomous_binding")
+        if callable(binding_factory):
+            candidate = binding_factory(tool_name, kwargs)
+            if isinstance(candidate, dict):
+                binding = candidate
+        existing_attempt_id = str(
+            attempt_context.get("existing_attempt_id") or ""
+        )
+        if existing_attempt_id:
+            try:
+                existing = attempt_store.get_attempt(existing_attempt_id)
+                compatible = bool(
+                    existing
+                    and ToolAttemptStatus(existing.get("status"))
+                    in RECOVERABLE_STATUSES
+                    and existing.get("conversation_id") == conversation_id
+                    and existing.get("turn_id")
+                    == str(attempt_context.get("turn_id") or "")
+                    and existing.get("tool_name") == tool_name
+                    and hmac.compare_digest(
+                        str(existing.get("argument_fingerprint") or ""),
+                        fingerprint,
+                    )
+                    and existing.get("provider_id")
+                    == str(attempt_context.get("provider_id") or "")
+                    and existing.get("model_id")
+                    == str(attempt_context.get("model_id") or "")
+                )
+            except (TypeError, ValueError):
+                existing = None
+                compatible = False
+            if not compatible:
+                return ToolExecutionRecord(
+                    "ERROR: suspended tool attempt attachment is not compatible",
+                    True, ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+                    0, False, False, contract,
+                )
+            try:
+                attempt_store.bind_autonomous(
+                    existing_attempt_id,
+                    run_id=str(binding.get("run_id") or ""),
+                    task_id=str(binding.get("task_id") or ""),
+                    operation_id=str(binding.get("operation_id") or ""),
+                    operation_revision=int(
+                        binding.get("operation_revision") or 0
+                    ),
+                    permission_epoch=int(binding.get("permission_epoch") or 0),
+                )
+            except (IllegalTransition, TypeError, ValueError):
+                return ToolExecutionRecord(
+                    "ERROR: suspended tool attempt attachment was rejected",
+                    True, ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+                    0, False, False, contract,
+                )
+            attempt_context["tool_attempt_id"] = existing_attempt_id
+            attempt_context["argument_fingerprint"] = fingerprint
+            attached_callback = attempt_context.get("attached_callback")
+            if callable(attached_callback):
+                attached_callback(existing_attempt_id)
+            return ToolExecutionRecord(
+                "PENDING: existing durable tool attempt attached",
+                True, ExecutionOutcome.PENDING,
+                0, True, False, contract,
+                existing_attempt_id, True,
+            )
         if (
             contract.commits_fallback_barrier
             and attempt_store.has_terminal_barrier(
@@ -4867,6 +4961,14 @@ def _execute_tool_with_policy(
                 final_response_message_id=str(
                     attempt_context.get("final_response_message_id") or ""
                 ),
+                owner_scope=str(attempt_context.get("owner_scope") or "chat"),
+                autonomous_run_id=str(binding.get("run_id") or ""),
+                autonomous_task_id=str(binding.get("task_id") or ""),
+                autonomous_operation_id=str(
+                    binding.get("operation_id") or ""
+                ),
+                operation_revision=int(binding.get("operation_revision") or 0),
+                permission_epoch=int(binding.get("permission_epoch") or 0),
             )
             attempt = attempt_store.mark_accepted(
                 attempt["tool_attempt_id"],
@@ -4876,6 +4978,12 @@ def _execute_tool_with_policy(
             terminal_callback = attempt_context.get("terminal_callback")
             attempt_context["tool_attempt_id"] = attempt_id
             attempt_context["argument_fingerprint"] = fingerprint
+            status_callback = attempt_context.get("status_callback")
+            if callable(status_callback):
+                try:
+                    status_callback("action_starting", attempt_id)
+                except Exception:
+                    pass
         except IllegalTransition:
             return ToolExecutionRecord(
                 "ERROR: another tool result is still pending for this conversation",
@@ -4889,6 +4997,7 @@ def _execute_tool_with_policy(
         attempt_id=attempt_id,
         attempt_store=attempt_store,
         terminal_callback=terminal_callback,
+        status_callback=status_callback,
     )
     retry_allowed = (
         allow_retry
@@ -4942,6 +5051,7 @@ def _execute_tool_with_policy(
         attempt_id=attempt_id,
         attempt_store=attempt_store,
         terminal_callback=terminal_callback,
+        status_callback=status_callback,
     )
     final_record = ToolExecutionRecord(
         retried.result, retried.is_error, retried.outcome, 2,
@@ -6544,6 +6654,7 @@ class OSIAAgent:
         self._tool_attempt_metadata: dict | None = None
         self._pending_tool_runtime: dict | None = None
         self.last_pending_tool_attempt_id = ""
+        self._pending_tool_attached_existing = False
         self._resume_effect_barrier = False
         self._resume_unknown_effect = False
 
@@ -6574,8 +6685,12 @@ class OSIAAgent:
         final_callback=None,
         on_sentence=None,
         on_first_token=None,
+        owner_scope: str = "chat",
+        autonomous_binding=None,
+        existing_attempt_id: str = "",
+        observer_key: str = "",
     ) -> None:
-        """Enable durable normal-chat attempts for one already-accepted turn."""
+        """Enable common durable attempts for one accepted chat/mission turn."""
 
         self._tool_attempt_metadata = {
             "conversation_id": str(conversation_id or ""),
@@ -6586,14 +6701,20 @@ class OSIAAgent:
             "final_callback": final_callback,
             "on_sentence": on_sentence,
             "on_first_token": on_first_token,
+            "owner_scope": str(owner_scope or "chat"),
+            "autonomous_binding": autonomous_binding,
+            "existing_attempt_id": str(existing_attempt_id or ""),
+            "observer_key": str(observer_key or ""),
         }
         self._pending_tool_runtime = None
         self.last_pending_tool_attempt_id = ""
+        self._pending_tool_attached_existing = False
 
     def clear_tool_attempts(self) -> None:
         self._tool_attempt_metadata = None
         self._pending_tool_runtime = None
         self.last_pending_tool_attempt_id = ""
+        self._pending_tool_attached_existing = False
 
     def activate_pending_tool_attempt(self) -> bool:
         from osia.tool_attempts import get_tool_attempt_coordinator
@@ -6626,7 +6747,15 @@ class OSIAAgent:
             "terminal_callback": (
                 get_tool_attempt_coordinator().notify_terminal
             ),
+            "status_callback": metadata.get("status_callback"),
+            "owner_scope": metadata.get("owner_scope", "chat"),
+            "autonomous_binding": metadata.get("autonomous_binding"),
+            "existing_attempt_id": metadata.get("existing_attempt_id", ""),
+            "attached_callback": self._mark_existing_attempt_attached,
         }
+
+    def _mark_existing_attempt_attached(self, attempt_id: str) -> None:
+        self._pending_tool_attached_existing = bool(attempt_id)
 
     def _verify_suspended_tool(self, attempt_id: str):
         """Run only a read-only browser postcondition; never replay the action."""
@@ -6760,6 +6889,7 @@ class OSIAAgent:
             ),
             "worker_may_be_active": bool(record.worker_may_be_active),
             "record": record,
+            "attached_existing": self._pending_tool_attached_existing,
         }
         final_callback = metadata.get("final_callback")
         status_callback = metadata.get("status_callback")
@@ -6769,13 +6899,25 @@ class OSIAAgent:
                 return final_callback(callback_attempt_id, final_text, error)
             return False
 
-        get_tool_attempt_coordinator().register_suspended(
-            attempt_id,
-            resume=self._resume_suspended_tool,
-            finalize=_finalize,
-            status=status_callback if callable(status_callback) else None,
-            verify=self._verify_suspended_tool,
-        )
+        coordinator = get_tool_attempt_coordinator()
+        if self._pending_tool_attached_existing:
+            observer_key = str(metadata.get("observer_key") or "")
+
+            def _observe(callback_attempt_id, _payload):
+                _finalize(callback_attempt_id, "", None)
+
+            if not observer_key or not coordinator.register_terminal_observer(
+                attempt_id, observer_key, _observe,
+            ):
+                return ""
+        else:
+            coordinator.register_suspended(
+                attempt_id,
+                resume=self._resume_suspended_tool,
+                finalize=_finalize,
+                status=status_callback if callable(status_callback) else None,
+                verify=self._verify_suspended_tool,
+            )
         return WAITING_TOOL_RESULT
 
     def reset(self):
@@ -7587,6 +7729,25 @@ class OSIAAgent:
             action=action,
         )
         content = clean_response(content)
+        if on_sentence is not None:
+            try:
+                on_sentence(content)
+            except Exception:
+                pass
+        self._mark_document_private_history()
+        final_message = {"role": "assistant", "content": content}
+        if self._document_private_run:
+            final_message["_document_private"] = True
+        self.messages.append(final_message)
+        if self.turn_context is not None:
+            log_final(self.turn_context, content)
+        return content
+
+    def _finish_cancelled_tool_stop(self, *, on_sentence=None) -> str:
+        """Return one canonical final after a proven pre-effect cancellation."""
+        content = clean_response(localized_text(
+            "autonomous.status_cancelled_proven", self.lang,
+        ))
         if on_sentence is not None:
             try:
                 on_sentence(content)
@@ -8966,6 +9127,11 @@ class OSIAAgent:
                         # The Scheduled facade already fails closed before any
                         # gated dispatch; outcome persistence cannot broaden it.
                         pass
+                    if execution_record.outcome == ExecutionOutcome.CANCELLED_PROVEN:
+                        tool_execution_barrier_committed = True
+                        return self._finish_cancelled_tool_stop(
+                            on_sentence=on_sentence,
+                        )
                     if (
                         execution_record.outcome == ExecutionOutcome.PENDING
                         and self._tool_attempt_metadata is not None

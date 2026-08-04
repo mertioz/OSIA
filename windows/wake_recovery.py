@@ -13,6 +13,8 @@ import socket
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -29,6 +31,7 @@ _LOCK_PATH = Path(tempfile.gettempdir()) / "osia_wake_recovery.lock"
 
 _SERVER_UNIT = "osia-server.service"
 _SERVER_PORT = 8765
+_RECONCILE_URL = f"http://127.0.0.1:{_SERVER_PORT}/internal/tool_attempt_reconcile"
 
 
 def _ts() -> str:
@@ -188,6 +191,25 @@ def _wait_for_port(log_fh, port: int, timeout: float = 90.0) -> bool:
     return False
 
 
+def _trigger_live_reconciliation(log_fh) -> bool:
+    """Nudge the live server; the endpoint can only schedule read-only checks."""
+
+    request = urllib.request.Request(
+        _RECONCILE_URL,
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=4.0) as response:
+            ok = int(getattr(response, "status", 0) or 0) == 200
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        _log(log_fh, f"live reconciliation unavailable: {type(exc).__name__}")
+        return False
+    _log(log_fh, f"live reconciliation trigger: {'accepted' if ok else 'rejected'}")
+    return ok
+
+
 def _restart(log_fh, restart_service, unit: str, label: str) -> bool:
     try:
         ok = bool(restart_service(unit))
@@ -218,6 +240,13 @@ def main() -> int:
             except Exception as e:
                 _log(log_fh, f"failed to import service helpers: {e!r}")
                 return 1
+
+            if _port_listening(_SERVER_PORT) and _trigger_live_reconciliation(log_fh):
+                _log(
+                    log_fh,
+                    "live server reconciled after resume; restart not required",
+                )
+                return 0
 
             server_restart_ok = _restart(log_fh, restart_service, _SERVER_UNIT, "server")
             port_ok = _wait_for_port(log_fh, _SERVER_PORT)

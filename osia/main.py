@@ -68,6 +68,8 @@ import sys
 import os
 import threading
 import time
+import re
+import unicodedata
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -144,6 +146,7 @@ def _launch_server_autonomous_from_chat(request: dict) -> dict:
         key: request.get(key)
         for key in (
             "objective", "source_refs", "request_id", "conversation_id",
+            "source_request_id", "source_turn_id",
             "provider_id", "model_id", "reason_code", "confidence",
             "explicit_request",
         )
@@ -1138,6 +1141,7 @@ def wake_mode():
         island_state = pyqtSignal(str)
         # Per-conversation desktop busy state for the popup input controls.
         conversation_busy_changed = pyqtSignal(str, bool)
+        tool_attempt_status = pyqtSignal(str, str)
         # Refresh the conversations panel (new active id) from a worker thread.
         conversations_changed = pyqtSignal(str)
         # Reset chat (agent + GUI) from a worker thread — "nouveau chat" voice
@@ -1387,22 +1391,58 @@ def wake_mode():
         return "OSIA is still working in this conversation."
 
     def _handle_waiting_tool_command(conv_id: str, text: str) -> bool:
-        normalized = re.sub(r"\s+", " ", str(text or "").strip().casefold())
-        if not normalized:
+        raw = str(text or "").strip()
+        if not raw or len(raw) > 160:
+            return False
+        folded = unicodedata.normalize("NFKD", raw.casefold())
+        ascii_text = "".join(
+            char for char in folded if not unicodedata.combining(char)
+        )
+        normalized = re.sub(r"[^a-z0-9]+", " ", ascii_text).strip()
+        tokens = tuple(normalized.split())
+        if not tokens or len(tokens) > 8:
             return False
         from osia.tool_attempts import get_tool_attempt_coordinator
 
         coordinator = get_tool_attempt_coordinator()
+        if coordinator.store.find_compatible_suspended_turn(conv_id) is None:
+            return False
         if normalized in {
             "cancel", "cancel action", "stop action", "annule", "annuler",
-            "annule l'action", "arr\u00eate l'action",
+            "annule l action", "arrete l action",
         }:
             return coordinator.request_cancellation(conv_id)
-        if normalized in {
-            "continue", "resume", "relaunch", "continue action",
-            "reprends", "reprendre", "relance", "continuer",
-        }:
+        resume_verbs = {
+            "continue", "continuer", "relaunch", "relance", "relancer",
+            "reprendre", "reprends", "resume",
+        }
+        resume_suffixes = {
+            (), ("action",), ("and", "verify"),
+            ("and", "verify", "current", "action"),
+            ("and", "verify", "the", "current", "action"),
+            ("checking", "current", "action"),
+            ("checking", "the", "current", "action"),
+            ("et", "verifie"), ("et", "verifier"),
+            ("et", "verifie", "l", "action", "en", "cours"),
+            ("et", "verifier", "l", "action", "en", "cours"),
+            ("la", "verification", "de", "l", "action", "en", "cours"),
+        }
+        if tokens[0] in resume_verbs and tokens[1:] in resume_suffixes:
             return coordinator.request_reconciliation(conv_id)
+        if tokens in {
+            ("check",), ("check", "action"),
+            ("check", "current", "action"), ("check", "status"),
+            ("check", "current", "status"), ("status",),
+            ("action", "status"), ("statut",),
+            ("verifie", "le", "statut"),
+            ("verifier", "le", "statut"),
+            ("verifie", "l", "action", "en", "cours"),
+            ("verifier", "l", "action", "en", "cours"),
+        }:
+            bridge.tool_attempt_status.emit(
+                conv_id, "waiting_tool_result",
+            )
+            return True
         return False
 
     def _is_conversation_busy(conv_id: str | None) -> bool:
@@ -1507,6 +1547,8 @@ def wake_mode():
             "history": history,
             "conversation_id": conv_id,
             "request_id": str(turn_meta.get("turn_id") or ""),
+            "source_request_id": str(turn_meta.get("request_id") or ""),
+            "source_turn_id": str(turn_meta.get("turn_id") or ""),
             "origin_ref": "desktop",
             "device_id": "",
             "turn_context": turn_context,
@@ -1539,6 +1581,16 @@ def wake_mode():
         def on_tool_attempt_status(status: str, attempt_id: str) -> None:
             del attempt_id
             print(f"[OSIA] normal chat tool status: {status}")
+            safe_status = {
+                "action_starting": "action_starting",
+                "action_in_progress": "action_in_progress",
+                "waiting_tool_result": "waiting_tool_result",
+                "verifying_tool_result": "verifying",
+                "resuming_tool_turn": "resuming",
+                "cancellation_requested": "cancellation_requested",
+                "blocked_unknown_effect": "blocked_unknown_effect",
+            }.get(str(status), "action_in_progress")
+            bridge.tool_attempt_status.emit(conv_id, safe_status)
             bridge.island_state.emit("thinking")
 
         def on_tool_attempt_final(
@@ -1961,6 +2013,9 @@ def wake_mode():
     def handle_conversation_busy_changed(conv_id: str, busy: bool):
         popup.set_conversation_busy(conv_id, busy)
 
+    def handle_tool_attempt_status(conv_id: str, status: str):
+        popup.set_conversation_tool_status(conv_id, status)
+
     def handle_island_state(state: str):
         island.set_state(state)
 
@@ -2140,6 +2195,7 @@ def wake_mode():
     bridge.assistant_stream_error.connect(handle_assistant_stream_error)
     bridge.island_state.connect(handle_island_state)
     bridge.conversation_busy_changed.connect(handle_conversation_busy_changed)
+    bridge.tool_attempt_status.connect(handle_tool_attempt_status)
     bridge.autonomous_progress.connect(handle_autonomous_progress)
     bridge.autonomous_resume_ready.connect(popup.show_autonomous)
     bridge.remote_models_signal.connect(handle_remote_models)
@@ -2321,7 +2377,20 @@ def wake_mode():
 
     cron_manager = CronManager(run_cron_task, notify_task=notify_cron_task)
     unsubscribe_cron_wake = scheduled_tasks.add_change_callback(cron_manager.wake)
-    heartbeat_monitor = HeartbeatMonitor(heartbeat_alert)
+    def _tool_attempt_lifecycle_tick(expected_interval: float) -> None:
+        try:
+            from osia.tool_attempts import get_tool_attempt_coordinator
+
+            get_tool_attempt_coordinator().observe_lifecycle_tick(
+                expected_interval=expected_interval,
+            )
+        except Exception:
+            pass
+
+    heartbeat_monitor = HeartbeatMonitor(
+        heartbeat_alert,
+        lifecycle_tick=_tool_attempt_lifecycle_tick,
+    )
     cron_manager.start()
     heartbeat_monitor.start()
 
@@ -2375,6 +2444,7 @@ def wake_mode():
             "phase_name": phase_name,
             "objective": st.get("objective", "") or "",
             "status": st.get("status", "") or "",
+            "run_state": str(st.get("run_state") or ""),
             "provider": str(st.get("provider") or ""),
             "model": str(st.get("model") or ""),
             "language": normalize_locale(st.get("language")) or i18n.DEFAULT_LANG,
@@ -2781,6 +2851,19 @@ def wake_mode():
                         **st,
                     })
                 return
+            if (
+                isinstance(st, dict)
+                and st.get("run_state") in {
+                    "waiting_tool", "verifying_tool",
+                    "cancellation_requested",
+                }
+                and orchestrator.request_tool_cancellation()
+            ):
+                bridge.autonomous_progress.emit({
+                    "event": "cancellation_requested",
+                    **_orch_snapshot(st),
+                })
+                return
             if isinstance(st, dict):
                 st["status"] = "aborted"
                 st["run_state"] = "cancelled"
@@ -2856,6 +2939,12 @@ def wake_mode():
             "authorization_pending": "autonomous_plan_ready",
             "ready": "running",
             "running": "running",
+            "waiting_tool": "waiting_tool",
+            "verifying_tool": "verifying_tool",
+            "resuming": "resuming",
+            "blocked_unknown_effect": "blocked_unknown_effect",
+            "cancellation_requested": "cancellation_requested",
+            "cancelled_proven": "cancelled_proven",
             "suspended_scope_extension": "suspended_scope_extension",
             "suspended_authorization_revoked": "suspended_authorization_revoked",
             "blocked_outcome_unknown": "blocked_outcome_unknown",
@@ -2982,6 +3071,51 @@ def wake_mode():
                     if state.get("run_state") == "authorization_pending"
                     else state.get("run_state")
                 ),
+                **_orch_snapshot(state),
+            })
+            return
+        if state.get("run_state") in {
+            "waiting_tool", "verifying_tool", "resuming",
+            "cancellation_requested",
+        }:
+            autonomous_state["st"] = state
+            popup.show_autonomous(state)
+            bridge.autonomous_progress.emit({
+                "event": state.get("run_state"),
+                **_orch_snapshot(state),
+            })
+
+            def _resume_durable_tool() -> None:
+                resume_context = fixed_turn_context(
+                    state.get("language"),
+                    source="autonomous_tool_recovery",
+                    reference=str(state.get("task_id") or "autonomous"),
+                    mode=str(state.get("language_mode") or "single-language"),
+                    allowed_languages=state.get("allowed_languages") or (),
+                    source_language=state.get("source_language"),
+                    target_language=state.get("target_language"),
+                )
+                autonomous_agent.set_turn_context(resume_context)
+                if not _ensure_autonomous_agent_for_state(state):
+                    orchestrator.block_tool_recovery(
+                        state, "tool_recovery_model_mismatch",
+                    )
+                    return
+                orchestrator.resume(state)
+
+            threading.Thread(
+                target=_resume_durable_tool,
+                name="osia-autonomous-tool-recovery",
+                daemon=True,
+            ).start()
+            return
+        if state.get("run_state") in {
+            "blocked_unknown_effect", "cancelled_proven",
+        }:
+            autonomous_state["st"] = state
+            popup.show_autonomous(state)
+            bridge.autonomous_progress.emit({
+                "event": state.get("run_state"),
                 **_orch_snapshot(state),
             })
             return

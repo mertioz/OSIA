@@ -58,8 +58,13 @@ class HeartbeatMonitor:
         by it are logged, never propagated.
     """
 
-    def __init__(self, alert: Callable[[str], None]):
+    def __init__(
+        self,
+        alert: Callable[[str], None],
+        lifecycle_tick: Callable[[float], None] | None = None,
+    ):
         self._alert = alert
+        self._lifecycle_tick = lifecycle_tick
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._last_check = 0.0
@@ -93,6 +98,8 @@ class HeartbeatMonitor:
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
+                if self._lifecycle_tick is not None:
+                    self._lifecycle_tick(_POLL_SECONDS)
                 if get_setting("heartbeat_enabled", False):
                     interval = self._interval_seconds()
                     now = time.monotonic()

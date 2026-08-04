@@ -1233,6 +1233,49 @@ def record_tool_execution(tool_identity: str, arguments: Mapping[str, Any], exec
             _emit(runtime, "autonomous_authorization_revoked")
             return
     outcome = execution_record.outcome
+    if outcome is ExecutionOutcome.PENDING:
+        attempt_id = str(getattr(execution_record, "tool_attempt_id", "") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", attempt_id):
+            record.update({
+                "status": "blocked_authorization",
+                "completed_at": _now_iso(),
+                "execution_outcome": "rejected_before_execution",
+                "safe_reason_code": "common_tool_attempt_missing",
+            })
+            state.upsert_operation_record(st, record)
+            st["run_state"] = "blocked_unknown_effect"
+            _checkpoint(runtime)
+            _emit(runtime, "blocked_unknown_effect")
+            return
+        try:
+            from osia.tool_attempts import get_tool_attempt_store
+
+            common = get_tool_attempt_store().get_attempt(attempt_id) or {}
+        except Exception:
+            common = {}
+        if not common:
+            st["run_state"] = "blocked_unknown_effect"
+            _checkpoint(runtime)
+            _emit(runtime, "blocked_unknown_effect")
+            return
+        record.update({
+            "status": "waiting_tool",
+            "execution_outcome": "pending",
+            "safe_reason_code": "waiting_tool_result",
+            "tool_attempt_id": attempt_id,
+        })
+        state.upsert_operation_record(st, record)
+        state.bind_tool_attempt(
+            st,
+            attempt_id=attempt_id,
+            operation_id=operation_id,
+            operation_revision=int(st.get("authorization_revision", 0) or 0),
+            next_reconciliation_at=common.get("next_check_at"),
+        )
+        st["run_state"] = "waiting_tool"
+        _checkpoint(runtime)
+        _emit(runtime, "waiting_tool")
+        return
     status = {
         ExecutionOutcome.SUCCESS_VERIFIED: "success_verified",
         # A dispatched side effect that the contract cannot verify is not safe
@@ -1496,6 +1539,8 @@ def revalidate_loaded_authorization(
             st["authorization_status"] = "revoked"
         elif st.get("run_state") not in {
             "completed", "failed", "cancelled", "blocked_outcome_unknown",
+            "waiting_tool", "verifying_tool", "resuming",
+            "cancellation_requested",
         }:
             st["run_state"] = "ready"
             st["authorization_status"] = "not_required_full_access"

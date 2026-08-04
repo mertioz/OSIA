@@ -111,7 +111,7 @@ from pathlib import Path
 import numpy as np
 import psutil
 import soundfile as sf
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 
 from osia import conversations, document_sources, i18n
 from osia.attachments import (
@@ -1955,14 +1955,19 @@ def _active_turn_working_status(conv_id: str) -> str:
         status = str(attempt.get("status") or "")
         if status == "waiting_verification":
             return "waiting_verification"
-        if status in {"accepted", "running", "pending"}:
-            return "action_running"
+        if status == "accepted":
+            return "action_starting"
+        if status == "running":
+            return "action_in_progress"
+        if status == "pending":
+            return "waiting_tool_result"
         if status == "cancellation_requested":
             return "cancellation_requested"
     if remembered in {
         "waiting_tool_result", "waiting_verification", "verifying",
         "resuming", "cancellation_requested", "action_in_progress",
         "action_running",
+        "action_starting", "blocked_unknown_effect",
     }:
         return remembered
     return "working"
@@ -2032,15 +2037,30 @@ async def _handle_waiting_tool_command(
 
     from osia.tool_attempts import get_tool_attempt_coordinator
 
-    coordinator = get_tool_attempt_coordinator()
-    if coordinator.store.find_compatible_suspended_turn(conv_id) is None:
-        return False
     tokens = _normalized_waiting_command_tokens(text)
     normalized = " ".join(tokens)
-    if normalized in {
+    cancel_requested = normalized in {
         "cancel", "cancel action", "stop action", "annule", "annuler",
         "annule l action", "arrete l action",
-    }:
+    }
+    coordinator = get_tool_attempt_coordinator()
+    if coordinator.store.find_compatible_suspended_turn(conv_id) is None:
+        meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
+        if (
+            cancel_requested
+            and isinstance(meta, dict)
+            and _is_conversation_busy(conv_id)
+        ):
+            # The provider is still planning and no tool receipt exists yet.
+            # Carry one bounded intent to the first accepted tool boundary;
+            # this never creates a second turn or dispatches an action.
+            meta["_tool_cancel_requested"] = True
+            await channel.send_json(
+                _turn_status_frame(meta, "cancellation_requested")
+            )
+            return True
+        return False
+    if cancel_requested:
         handled = coordinator.request_cancellation(conv_id)
         status = "cancellation_requested"
     elif _is_resume_reconciliation_command(text):
@@ -2065,6 +2085,36 @@ async def _handle_waiting_tool_command(
         if isinstance(meta, dict):
             await channel.send_json(_turn_status_frame(meta, status))
     return handled
+
+
+def _request_exact_tool_attempt_cancellation(attempt_id: str) -> bool:
+    """Cancel the accepted receipt named by the tool-start callback."""
+
+    if not attempt_id:
+        return False
+    try:
+        from osia.tool_attempts import (
+            ToolAttemptStatus,
+            get_tool_attempt_store,
+        )
+
+        requested = get_tool_attempt_store().request_cancellation(attempt_id)
+        return ToolAttemptStatus(requested["status"]) in {
+            ToolAttemptStatus.CANCELLATION_REQUESTED,
+            ToolAttemptStatus.CANCELLED_PROVEN,
+        }
+    except Exception:
+        return False
+
+
+def _apply_queued_tool_cancellation(turn_meta: dict, attempt_id: str) -> bool:
+    """Apply one turn-scoped cancellation intent without consuming it."""
+
+    return bool(
+        isinstance(turn_meta, dict)
+        and turn_meta.get("_tool_cancel_requested") is True
+        and _request_exact_tool_attempt_cancellation(attempt_id)
+    )
 
 
 async def _send_persisted_turn_for_request(
@@ -3994,6 +4044,54 @@ async def _recover_tool_attempts_at_startup() -> None:
 
 
 @app.on_event("startup")
+async def _recover_autonomous_checkpoint_at_startup() -> None:
+    """Reconnect a durable mobile tool checkpoint after attempt reconciliation."""
+
+    try:
+        st = _astate.load_task_state()
+    except Exception:
+        st = None
+    if not isinstance(st, dict):
+        return
+    loop = asyncio.get_running_loop()
+    scheduled = _schedule_durable_autonomous_recovery(
+        st,
+        origin_ref=str(st.get("authorization_origin_ref") or "mobile_legacy"),
+        loop=loop,
+    )
+    if not scheduled and (
+        st.get("status") == "in_progress"
+        and st.get("run_state") in _DURABLE_AUTONOMOUS_RECOVERY_STATES
+    ):
+        asyncio.create_task(_retry_durable_autonomous_recovery(loop))
+
+
+async def _retry_durable_autonomous_recovery(loop) -> None:
+    """Wait boundedly for an outgoing server owner to release its live lock."""
+
+    for _ in range(30):
+        await asyncio.sleep(1.0)
+        try:
+            st = _astate.load_task_state()
+        except Exception:
+            return
+        if (
+            not isinstance(st, dict)
+            or st.get("status") != "in_progress"
+            or st.get("run_state") not in _DURABLE_AUTONOMOUS_RECOVERY_STATES
+        ):
+            return
+        if _schedule_durable_autonomous_recovery(
+            st,
+            origin_ref=str(
+                st.get("authorization_origin_ref") or "mobile_legacy"
+            ),
+            loop=loop,
+        ):
+            return
+
+
+@app.on_event("startup")
 async def _start_server_cron_manager() -> None:
     """Start the server-side cron owner when this process holds the cron lock."""
 
@@ -4243,6 +4341,14 @@ async def _heartbeat_push_loop(channel: "_OutboundChannel") -> None:
                 interval = 5.0
             if interval <= 0:
                 interval = 5.0
+            try:
+                from osia.tool_attempts import get_tool_attempt_coordinator
+
+                get_tool_attempt_coordinator().observe_lifecycle_tick(
+                    expected_interval=interval,
+                )
+            except Exception:
+                pass
             if settings.get("heartbeat_enabled", False):
                 await channel.send_json(_collect_heartbeat_data())
             await asyncio.sleep(interval)
@@ -4253,6 +4359,23 @@ async def _heartbeat_push_loop(channel: "_OutboundChannel") -> None:
             # main read loop owns disconnect detection and cancellation.
             print(f"[OSIA Server] heartbeat push error: {e}")
             await asyncio.sleep(5)
+
+
+@app.post("/internal/tool_attempt_reconcile")
+async def _internal_tool_attempt_reconcile(request: Request) -> dict:
+    """Windows resume hook: trigger due read-only checks on the live owner."""
+
+    host = str(getattr(request.client, "host", "") or "")
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(status_code=403, detail="loopback_required")
+    from osia.tool_attempts import get_tool_attempt_coordinator
+
+    triggered = await asyncio.to_thread(
+        get_tool_attempt_coordinator().trigger_recovery,
+        reason="windows_resume_event",
+        overdue_only=True,
+    )
+    return {"ok": True, "triggered": len(triggered)}
 
 
 # ---------------------------------------------------------------------------
@@ -4546,13 +4669,21 @@ _DOCUMENT_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,31}$")
 _BROWSER_PROTOCOL_SESSION_ID = "browser-session:" + secrets.token_urlsafe(24)
 _BROWSER_PROTOCOL_SEQUENCE = 0
 _AUTONOMOUS_SAFE_EVENTS = frozenset({
+    "action_in_progress", "action_starting",
     "aborted", "authorization_denied", "authorization_pending",
-    "blocked_outcome_unknown", "busy", "cancelled", "done", "failed", "idle",
+    "blocked_outcome_unknown", "blocked_unknown_effect", "busy", "cancelled",
+    "cancelled_proven", "cancellation_requested", "done", "failed", "idle",
     "interrupted", "plan_failed", "running", "salvaged",
+    "resuming", "verifying_tool", "waiting_tool",
     "scope_extension_denied", "state_updated",
     "suspended_authorization_revoked", "suspended_browser_intervention",
     "suspended_browser_state", "suspended_scope_extension",
     "task_done", "task_failed",
+})
+_AUTONOMOUS_DURABLE_TOOL_EVENTS = frozenset({
+    "action_starting", "action_in_progress", "waiting_tool",
+    "verifying_tool", "resuming", "cancellation_requested",
+    "blocked_unknown_effect", "cancelled_proven",
 })
 
 
@@ -4762,6 +4893,7 @@ def _autonomous_snapshot(st) -> dict:
         "phase_name": "",
         "objective": "",
         "status": st.get("status", "") or "",
+        "run_state": str(st.get("run_state") or "")[:64],
         "provider": str(st.get("provider") or ""),
         "model": str(st.get("model") or ""),
         "language": normalize_locale(st.get("language")) or i18n.DEFAULT_LANG,
@@ -4851,16 +4983,38 @@ def _autonomous_frame(payload: dict, st=_AUTO_UNSET) -> dict:
     if st is _AUTO_UNSET:
         st = _autonomous.get("st")
     snapshot = _autonomous_snapshot(st)
-    event = str(payload.get("event") or "idle")[:64]
-    if event not in _AUTONOMOUS_SAFE_EVENTS:
-        event = "state_updated"
+    requested_event = str(payload.get("event") or "idle")[:64]
+    if requested_event not in _AUTONOMOUS_SAFE_EVENTS:
+        requested_event = "state_updated"
+    durable_state = (
+        requested_event
+        if requested_event in _AUTONOMOUS_DURABLE_TOOL_EVENTS
+        else str(snapshot.get("run_state") or "")[:64]
+    )
+    if durable_state not in _AUTONOMOUS_DURABLE_TOOL_EVENTS:
+        durable_state = ""
+    # Keep the established event vocabulary for older strict clients.  The
+    # exact new lifecycle is an additive safe field on the same frame type.
+    event = (
+        "cancelled" if requested_event == "cancelled_proven"
+        else "blocked_outcome_unknown"
+        if requested_event == "blocked_unknown_effect"
+        else "state_updated"
+        if requested_event in _AUTONOMOUS_DURABLE_TOOL_EVENTS
+        else requested_event
+    )
     run_id = str(st.get("run_id") or "")[:256] if isinstance(st, dict) else "idle"
-    terminal = event in {"done", "failed", "aborted", "plan_failed", "cancelled"}
+    terminal = event in {
+        "done", "failed", "aborted", "plan_failed", "cancelled",
+        "cancelled_proven",
+    }
     terminal_state = bool(
         isinstance(st, dict)
         and (
-            st.get("status") in {"done", "failed", "cancelled"}
-            or st.get("run_state") in {"completed", "failed", "cancelled"}
+            st.get("status") in {"done", "failed", "aborted", "cancelled"}
+            or st.get("run_state") in {
+                "completed", "failed", "cancelled", "cancelled_proven",
+            }
         )
     )
     with _AUTONOMOUS_PROTOCOL_LOCK:
@@ -4892,12 +5046,21 @@ def _autonomous_frame(payload: dict, st=_AUTO_UNSET) -> dict:
             st.get("authorization_revision", 0) or 0
         ) if isinstance(st, dict) else 0,
         "event": event,
+        "durable_state": durable_state,
         "safe_operation_phase": event,
         "safe_site_display": str(
             (snapshot.get("browser_progress") or {}).get("safe_site_display") or ""
         )[:512],
         "safe_progress_text": {
             "running": "Autonomous work is running",
+            "action_starting": "Autonomous action is starting",
+            "action_in_progress": "Autonomous action is in progress",
+            "waiting_tool": "Autonomous is waiting to verify an action",
+            "verifying_tool": "Autonomous is verifying an action",
+            "resuming": "Autonomous is resuming the mission",
+            "cancellation_requested": "Cancellation was requested",
+            "blocked_unknown_effect": "The action outcome could not be established",
+            "cancelled_proven": "The action was cancelled before effect",
             "task_done": "One planned step completed",
             "task_failed": "One planned step needs attention",
             "done": "Autonomous work completed",
@@ -5198,7 +5361,7 @@ def _on_autonomous_progress(payload: dict) -> None:
     False, so its terminal still broadcasts + finalizes exactly as before."""
     try:
         event = payload.get("event")
-        if event in ("done", "failed"):
+        if event in ("done", "failed", "cancelled_proven"):
             # ── Terminal: gate a paused/superseded orphan's late terminal ──
             if _autonomous.get("interrupting") or not _autonomous.get("active"):
                 print(f"[WOR-45] gating stale autonomous terminal {event!r} "
@@ -5438,6 +5601,21 @@ def _autonomous_start_worker(
                     0.0, min(1.0, float(confidence))
                 )
             st["chat_route_type"] = "autonomous"
+            st["source_conversation_id"] = str(
+                chat_route.get("conversation_id") or ""
+            )[:160]
+            st["source_turn_id"] = str(
+                chat_route.get("source_turn_id") or request_id
+            )[:160]
+            st["source_request_id"] = str(
+                chat_route.get("source_request_id") or request_id
+            )[:160]
+            st["source_permission_epoch"] = int(
+                chat_route.get("permission_epoch") or 0
+            )
+            st["attached_tool_attempt_id"] = str(
+                chat_route.get("tool_attempt_id") or ""
+            )[:160]
 
         # ── Establish the run atomically — only if our slot is still current ──
         established = False
@@ -5521,6 +5699,30 @@ def _autonomous_start_worker(
                 "event": "authorization_pending",
             }, st))
             return
+        attached_attempt_id = str(st.get("attached_tool_attempt_id") or "")
+        if attached_attempt_id:
+            if orch.attach_existing_tool_attempt(st, attached_attempt_id):
+                return
+            phase_index, task_index, task = _astate.current_task(st)
+            if task is not None:
+                _astate.set_task_status(
+                    st,
+                    phase_index,
+                    task_index,
+                    "blocked_unknown_effect",
+                    last_error="suspended_attempt_attachment_unsafe",
+                    tool_durable_state="blocked_unknown_effect",
+                    tool_terminal_reason="suspended_attempt_attachment_unsafe",
+                )
+            st["run_state"] = "blocked_unknown_effect"
+            st["authorization_status"] = "outcome_unknown"
+            _astate.save_task_state(st)
+            _broadcast_autonomous(_autonomous_frame({
+                "event": "blocked_unknown_effect",
+                "reason": "suspended_attempt_attachment_unsafe",
+            }, st))
+            _release_single_runner_if_gen(my_gen)
+            return
         orch.start(st)
         # Flip "planning" → "running" only AFTER start() spawned the loop. The
         # engine emits events only on task transitions, never on start, so this
@@ -5573,6 +5775,13 @@ def _chat_route_result_from_state(st: dict | None, *, active: bool) -> dict:
     if run_state == "blocked_outcome_unknown":
         return {**base, "status": "outcome_unknown"}
     if run_state in {
+        "waiting_tool", "verifying_tool", "resuming",
+        "cancellation_requested",
+    }:
+        return {**base, "status": "running"}
+    if run_state == "blocked_unknown_effect":
+        return {**base, "status": "outcome_unknown"}
+    if run_state in {
         "authorization_pending",
         "suspended_scope_extension",
         "suspended_authorization_revoked",
@@ -5609,6 +5818,10 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
         return {"status": "failed", "error_code": "invalid_request"}
     objective = str(request.get("objective") or "").strip()
     request_id = str(request.get("request_id") or "").strip()
+    source_request_id = str(
+        request.get("source_request_id") or request_id
+    ).strip()
+    source_turn_id = str(request.get("source_turn_id") or request_id).strip()
     conversation_id = str(request.get("conversation_id") or "").strip()
     origin_ref = str(request.get("origin_ref") or "desktop").strip()[:160]
     device_id = str(request.get("device_id") or "").strip()[:128]
@@ -5624,6 +5837,8 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
         not objective
         or len(objective) > 16_000
         or not re.fullmatch(r"[A-Za-z0-9_.:-]{8,160}", request_id)
+        or not re.fullmatch(r"[A-Za-z0-9_.:-]{8,160}", source_request_id)
+        or not re.fullmatch(r"[A-Za-z0-9_.:-]{8,160}", source_turn_id)
         or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", conversation_id)
         or not re.fullmatch(r"[a-z0-9_-]{1,48}", provider)
         or len(model) > 160
@@ -5639,6 +5854,8 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
     fingerprint = hashlib.sha256(json.dumps(
         {
             "conversation_id": conversation_id,
+            "source_request_id": source_request_id,
+            "source_turn_id": source_turn_id,
             "objective": objective,
             "provider_id": provider,
             "model_id": model,
@@ -5687,6 +5904,7 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
 
     from osia.mobile_model_catalogue import resolve_current_autonomous_selection
 
+    requested_provider, requested_model = provider, model
     resolution = resolve_current_autonomous_selection(
         provider_id=provider,
         model_id=model,
@@ -5696,7 +5914,13 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
     )
     provider = str(resolution.get("provider_id") or "")
     model = str(resolution.get("model_id") or "")
-    if not provider or not model:
+    if (
+        not provider
+        or not model
+        or resolution.get("fallback_occurred")
+        or provider != requested_provider
+        or model != requested_model
+    ):
         return _remember_chat_route_result(request_id, fingerprint, {
             "status": "failed",
             "error_code": "chat_model_unavailable",
@@ -5720,6 +5944,31 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
         return _remember_chat_route_result(request_id, fingerprint, {
             "status": "failed",
             "error_code": "invalid_document_sources",
+        })
+
+    compatible_attempt = None
+    try:
+        from osia.tool_attempts import get_tool_attempt_store
+
+        suspended = get_tool_attempt_store().find_compatible_suspended_turn(
+            conversation_id
+        )
+        if isinstance(suspended, dict):
+            if (
+                str(suspended.get("turn_id") or "") == source_turn_id
+                and str(suspended.get("provider_id") or "") == provider
+                and str(suspended.get("model_id") or "") == model
+            ):
+                compatible_attempt = suspended
+            else:
+                return _remember_chat_route_result(request_id, fingerprint, {
+                    "status": "failed",
+                    "error_code": "suspended_attempt_attachment_unsafe",
+                })
+    except Exception:
+        return _remember_chat_route_result(request_id, fingerprint, {
+            "status": "failed",
+            "error_code": "suspended_attempt_attachment_unavailable",
         })
 
     autonomous_context = request.get("turn_context")
@@ -5753,6 +6002,13 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
             provider,
             {
                 "request_id": request_id,
+                "source_request_id": source_request_id,
+                "source_turn_id": source_turn_id,
+                "conversation_id": conversation_id,
+                "permission_epoch": permission_epoch,
+                "tool_attempt_id": str(
+                    (compatible_attempt or {}).get("tool_attempt_id") or ""
+                ),
                 "reason_code": str(request.get("reason_code") or "")[:48],
                 "confidence": request.get("confidence"),
             },
@@ -6030,6 +6286,30 @@ def _autonomous_resume_worker(
         )
         provider = resolution.get("provider_id") or ""
         model = resolution.get("model_id") or ""
+        durable_tool_resume = st.get("run_state") in {
+            "waiting_tool", "verifying_tool", "resuming",
+            "cancellation_requested",
+        }
+        exact_recovery_identity = (
+            provider == str(st.get("provider") or "")
+            and model == str(st.get("model") or "")
+            and not resolution.get("fallback_occurred")
+        )
+        if durable_tool_resume and not exact_recovery_identity:
+            established = False
+            with _autonomous_lock:
+                if (
+                    _autonomous.get("active")
+                    and int(_autonomous.get("gen", 0)) == my_gen
+                ):
+                    _autonomous["st"] = st
+                    _write_autonomous_lock(st.get("task_id"))
+                    established = True
+            if established:
+                orch.block_tool_recovery(
+                    st, "tool_recovery_model_mismatch",
+                )
+            return
         if resolution.get("fallback_occurred"):
             print(
                 "[WOR-182] Mobile Autonomous resume model fallback: "
@@ -6087,6 +6367,24 @@ def _autonomous_resume_worker(
         provider_now, model_now = _adiagnostics.actual_provider_model(
             agent, provider, model,
         )
+        if durable_tool_resume and (
+            provider_now != str(st.get("provider") or "")
+            or model_now != str(st.get("model") or "")
+        ):
+            established = False
+            with _autonomous_lock:
+                if (
+                    _autonomous.get("active")
+                    and int(_autonomous.get("gen", 0)) == my_gen
+                ):
+                    _autonomous["st"] = st
+                    _write_autonomous_lock(st.get("task_id"))
+                    established = True
+            if established:
+                orch.block_tool_recovery(
+                    st, "tool_recovery_model_mismatch",
+                )
+            return
         st["provider"] = provider_now
         st["model"] = model_now
         try:
@@ -6134,6 +6432,40 @@ def _autonomous_resume_worker(
         # it once the orphan dies (its terminal must stay gated until then).
         if not _orch_loop_alive():
             _autonomous["interrupting"] = False
+
+
+_DURABLE_AUTONOMOUS_RECOVERY_STATES = frozenset({
+    "waiting_tool", "verifying_tool", "resuming", "cancellation_requested",
+})
+
+
+def _schedule_durable_autonomous_recovery(
+    st: dict,
+    *,
+    origin_ref: str,
+    loop,
+    document_owner_device: str = "",
+) -> bool:
+    """Resume a persisted in-flight tool checkpoint once on fresh-process status."""
+
+    if (
+        not isinstance(st, dict)
+        or st.get("status") != "in_progress"
+        or st.get("run_state") not in _DURABLE_AUTONOMOUS_RECOVERY_STATES
+    ):
+        return False
+    generation = _acquire_single_runner(task_id=st.get("task_id"))
+    if generation is None:
+        return False
+    _autonomous["loop"] = loop
+    _autonomous["origin_ref"] = origin_ref
+    _autonomous["document_owner_device"] = document_owner_device
+    threading.Thread(
+        target=_autonomous_resume_worker,
+        args=(generation, origin_ref),
+        daemon=True,
+    ).start()
+    return True
 
 
 def _autonomous_pc_snapshot(st: dict | None) -> dict:
@@ -6240,6 +6572,7 @@ async def internal_chat_autonomous_start(request: Request):
         return {"status": "failed", "error_code": "invalid_request"}
     allowed = {
         "objective", "source_refs", "request_id", "conversation_id",
+        "source_request_id", "source_turn_id",
         "provider_id", "model_id", "reason_code", "confidence",
         "explicit_request", "language",
     }
@@ -7995,6 +8328,21 @@ async def websocket_endpoint(ws: WebSocket):
                 # Then stop the loop, delete the checkpoint, emit, release.
                 def _abort_worker():
                     st = _autonomous.get("st")
+                    orch = _autonomous.get("orch")
+                    if (
+                        isinstance(st, dict)
+                        and st.get("run_state") in {
+                            "running",
+                            "waiting_tool", "verifying_tool",
+                            "cancellation_requested",
+                        }
+                        and orch is not None
+                        and orch.request_tool_cancellation()
+                    ):
+                        _broadcast_autonomous(_autonomous_frame(
+                            {"event": "cancellation_requested"}, st,
+                        ))
+                        return
                     if isinstance(st, dict):
                         st["status"] = "aborted"
                         st["run_state"] = "cancelled"
@@ -8021,7 +8369,6 @@ async def websocket_endpoint(ws: WebSocket):
                             checkpoint_present=False,
                         )
                         _adiagnostics.record_diagnostic(st, diagnostic)
-                    orch = _autonomous.get("orch")
                     if orch is not None:
                         try:
                             orch.stop()
@@ -8062,11 +8409,20 @@ async def websocket_endpoint(ws: WebSocket):
                     except Exception:
                         st = None
                 if isinstance(st, dict):
+                    _schedule_durable_autonomous_recovery(
+                        st,
+                        origin_ref=authorization_origin_ref,
+                        loop=asyncio.get_running_loop(),
+                        document_owner_device=permission_session.device_id,
+                    )
                     status = st.get("status", "")
                     run_state = st.get("run_state", "")
                     if run_state in {
                         "authorization_pending", "suspended_scope_extension",
                         "suspended_authorization_revoked", "blocked_outcome_unknown",
+                        "waiting_tool", "verifying_tool", "resuming",
+                        "blocked_unknown_effect", "cancellation_requested",
+                        "cancelled_proven",
                     }:
                         ev = run_state
                     elif status == "in_progress":
@@ -10759,13 +11115,19 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             return bool(persisted)
 
         def _tool_attempt_status(status: str, attempt_id: str) -> None:
-            del attempt_id
             safe_status = {
+                "action_starting": "action_starting",
+                "action_in_progress": "action_in_progress",
                 "waiting_tool_result": "waiting_tool_result",
                 "verifying_tool_result": "verifying",
                 "resuming_tool_turn": "resuming",
+                "blocked_unknown_effect": "blocked_unknown_effect",
                 "cancellation_requested": "cancellation_requested",
             }.get(str(status), "action_in_progress")
+            if safe_status == "action_starting" and _apply_queued_tool_cancellation(
+                turn_meta, attempt_id,
+            ):
+                safe_status = "cancellation_requested"
             turn_meta["_tool_attempt_status"] = safe_status
 
             async def _publish_status():
@@ -10815,6 +11177,10 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             "history": history,
             "conversation_id": active_conv_id,
             "request_id": str((turn_meta or {}).get("turn_id") or ""),
+            "source_request_id": str(
+                (turn_meta or {}).get("request_id") or ""
+            ),
+            "source_turn_id": str((turn_meta or {}).get("turn_id") or ""),
             "origin_ref": str(
                 (turn_meta or {}).get("_autonomous_origin_ref") or "desktop"
             ),

@@ -964,8 +964,12 @@ class WebRtcDirectSession:
 
     def _observe_mobile_frame(self, frame: Mapping[str, Any]) -> None:
         frame_type = str(frame.get("type") or "")
-        starts_turn = frame_type in {"text", "audio", "speak"} or (
-            frame_type == "file" and frame.get("is_image") is True
+        waiting_turn_command = (
+            frame_type == "text" and frame.get("waiting_turn_command") is True
+        )
+        starts_turn = not waiting_turn_command and (
+            frame_type in {"text", "audio", "speak"}
+            or (frame_type == "file" and frame.get("is_image") is True)
         )
         if not starts_turn:
             return

@@ -762,8 +762,16 @@ class LanGatewaySession:
             )
             if frame.get("type") == "auth":
                 raise LanProtocolError("auth frames are not allowed over LAN")
-            starts_turn = frame.get("type") in {"text", "audio", "speak"} or (
-                frame.get("type") == "file" and frame.get("is_image") is True
+            waiting_turn_command = (
+                frame.get("type") == "text"
+                and frame.get("waiting_turn_command") is True
+            )
+            starts_turn = not waiting_turn_command and (
+                frame.get("type") in {"text", "audio", "speak"}
+                or (
+                    frame.get("type") == "file"
+                    and frame.get("is_image") is True
+                )
             )
             if starts_turn:
                 request_id = str(

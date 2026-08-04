@@ -356,6 +356,14 @@ class WebRtcDirectLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await session._on_channel_message(json.dumps(envelope))
         self.assertEqual(session.state, WebRtcSessionState.ACTIVE_TURN)
         self.assertEqual(json.loads(self.locals[0].sent[-1]), text)
+        session._observe_mobile_frame({
+            "type": "text",
+            "content": "cancel",
+            "conversation_id": "conv",
+            "client_request_id": "control-request",
+            "waiting_turn_command": True,
+        })
+        self.assertEqual(session.state, WebRtcSessionState.ACTIVE_TURN)
         session._observe_local_frame({
             "type": "audio",
             "client_request_id": "req",

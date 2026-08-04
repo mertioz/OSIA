@@ -269,10 +269,37 @@ class LanGatewayTests(unittest.IsolatedAsyncioTestCase):
         await _wait_for(lambda: len(local.sent) == 1)
         self.assertEqual(json.loads(local.sent[0]), frame)
 
+        control = {
+            "type": "text",
+            "content": "cancel",
+            "conversation_id": "conv",
+            "client_request_id": "control-r2",
+            "waiting_turn_command": True,
+        }
+        control_encrypted = encrypt_frame(
+            control,
+            keys=keys,
+            direction=MOBILE_TO_PC,
+            pair_id=self.pair_id,
+            role="mobile",
+            priority="normal",
+            final=False,
+            seq=2,
+        )
+        await websocket.incoming.put(json.dumps({
+            "v": LAN_PROTOCOL_VERSION,
+            "type": "E2E_FRAME",
+            "role": "mobile",
+            "pair_id": self.pair_id,
+            **control_encrypted,
+        }))
+        await _wait_for(lambda: len(local.sent) == 2)
+        self.assertEqual(json.loads(local.sent[1]), control)
+
         # The same authenticated sequence is a replay: it must not be forwarded twice.
         await websocket.incoming.put(json.dumps(envelope))
         await asyncio.wait_for(task, timeout=1.0)
-        self.assertEqual(len(local.sent), 1)
+        self.assertEqual(len(local.sent), 2)
         self.assertEqual(websocket.close_code, 1008)
         self.assertIsNone(coordinator.active_transport)
 
