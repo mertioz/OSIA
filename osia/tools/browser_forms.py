@@ -28,9 +28,10 @@ FORM_MAX_DOM_CANDIDATES = 250
 FORM_MAX_LIVE_REFERENCES = 500
 FORM_MAX_STALE_REFERENCES = 1000
 FORM_INSPECTION_TIMEOUT_SECONDS = 6.0
-FORM_FILL_TIMEOUT_SECONDS = 8.0
+FORM_FILL_TIMEOUT_SECONDS = 18.0
+FORM_FIELD_ACTION_TIMEOUT_MS = 5000
 FORM_VALIDATION_QUIET_MS = 250
-FORM_VALIDATION_TIMEOUT_MS = 3000
+FORM_VALIDATION_TIMEOUT_MS = 5000
 FORM_TEXT_LIMIT = 120
 FORM_MAX_VALUE_CHARS = 16_000
 
@@ -205,6 +206,32 @@ def _json_result(payload: dict, *, error: bool = False) -> str:
 
 def _error(category: str, field_ref: str | None = None) -> str:
     payload = {"ok": False, "category": category}
+    if field_ref and _FIELD_REF_RE.fullmatch(field_ref):
+        payload["field_ref"] = field_ref
+    return _json_result(payload, error=True)
+
+
+def form_fill_error_receipt(
+    category: str,
+    field_ref: str | None = None,
+    *,
+    dispatched: bool,
+) -> str:
+    """Return a value-free typed terminal/uncertain semantic-fill receipt."""
+
+    payload = {
+        "ok": False,
+        "category": str(category or "fill_failed")[:64],
+        "receipt": {
+            "schema_version": 1,
+            "dispatch_state": "effect_unknown" if dispatched else "not_dispatched",
+            "outcome": (
+                "outcome_unknown"
+                if dispatched else "confirmed_failure_before_effect"
+            ),
+            "reason_code": str(category or "fill_failed")[:64],
+        },
+    }
     if field_ref and _FIELD_REF_RE.fullmatch(field_ref):
         payload["field_ref"] = field_ref
     return _json_result(payload, error=True)
@@ -659,9 +686,14 @@ class SemanticFormSession:
     ) -> str:
         safe_ref = str(field_ref or "")[:128]
         if value is not None and not isinstance(value, (str, bool, int, float)):
-            return _error("invalid_value", safe_ref)
+            return form_fill_error_receipt(
+                "invalid_value", safe_ref, dispatched=False,
+            )
         if isinstance(value, str) and len(value) > FORM_MAX_VALUE_CHARS:
-            return _error("value_too_long", safe_ref)
+            return form_fill_error_receipt(
+                "value_too_long", safe_ref, dispatched=False,
+            )
+        progress = {"dispatched": False}
         try:
             return await asyncio.wait_for(
                 self._fill(
@@ -669,13 +701,20 @@ class SemanticFormSession:
                     context_generation=context_generation,
                     field_ref=safe_ref,
                     value=value,
+                    progress=progress,
                 ),
                 timeout=FORM_FILL_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            return _error("fill_timeout", safe_ref)
+            return form_fill_error_receipt(
+                "fill_timeout", safe_ref,
+                dispatched=bool(progress["dispatched"]),
+            )
         except Exception:
-            return _error("fill_failed", safe_ref)
+            return form_fill_error_receipt(
+                "fill_failed", safe_ref,
+                dispatched=bool(progress["dispatched"]),
+            )
 
     def _entry(self, field_ref: str) -> tuple[dict | None, str | None]:
         self._purge()
@@ -751,43 +790,68 @@ class SemanticFormSession:
         context_generation: int,
         field_ref: str,
         value,
+        progress: dict,
     ) -> str:
         entry, entry_error = self._entry(field_ref)
         if entry is None:
-            return _error(entry_error or "invalid_reference", field_ref)
+            return form_fill_error_receipt(
+                entry_error or "invalid_reference", field_ref, dispatched=False,
+            )
         if entry.get("context_generation") != int(context_generation):
-            return _error("stale_reference", field_ref)
+            return form_fill_error_receipt(
+                "stale_reference", field_ref, dispatched=False,
+            )
         if entry.get("page") is not page:
-            return _error("inactive_page", field_ref)
+            return form_fill_error_receipt(
+                "inactive_page", field_ref, dispatched=False,
+            )
         try:
             if page.is_closed() or entry["frame"] not in list(page.frames):
-                return _error("stale_reference", field_ref)
+                return form_fill_error_receipt(
+                    "stale_reference", field_ref, dispatched=False,
+                )
             await page.bring_to_front()
         except Exception:
-            return _error("page_unavailable", field_ref)
+            return form_fill_error_receipt(
+                "page_unavailable", field_ref, dispatched=False,
+            )
         if entry.get("sensitive"):
-            return _error("sensitive_field_not_authorized", field_ref)
+            return form_fill_error_receipt(
+                "sensitive_field_not_authorized", field_ref, dispatched=False,
+            )
         input_type = str(entry.get("input_type") or "")
         resolved, reresolved, resolve_error = await self._resolve(entry)
         if resolved is None:
-            return _error(resolve_error or "stale_reference", field_ref)
+            return form_fill_error_receipt(
+                resolve_error or "stale_reference", field_ref, dispatched=False,
+            )
         handle, metadata = resolved
         try:
             visible = bool(await handle.is_visible())
             enabled = bool(await handle.is_enabled())
         except Exception:
-            return _error("stale_reference", field_ref)
+            return form_fill_error_receipt(
+                "stale_reference", field_ref, dispatched=False,
+            )
         if not visible:
-            return _error("hidden_field", field_ref)
+            return form_fill_error_receipt(
+                "hidden_field", field_ref, dispatched=False,
+            )
         if not enabled or bool(metadata.get("disabled")):
-            return _error("disabled_field", field_ref)
+            return form_fill_error_receipt(
+                "disabled_field", field_ref, dispatched=False,
+            )
         if bool(metadata.get("readonly")):
-            return _error("readonly_field", field_ref)
+            return form_fill_error_receipt(
+                "readonly_field", field_ref, dispatched=False,
+            )
         if input_type in _UNSUPPORTED_TYPES or (
             input_type not in _TEXT_TYPES
             and input_type not in {"textarea", "select-one", "select-multiple", "checkbox", "radio"}
         ):
-            return _error("unsupported_control", field_ref)
+            return form_fill_error_receipt(
+                "unsupported_control", field_ref, dispatched=False,
+            )
 
         operation = "fill"
         expected = None
@@ -796,14 +860,19 @@ class SemanticFormSession:
             if input_type in {"checkbox", "radio"}:
                 expected = _expected_checked(value)
                 if expected is None:
-                    return _error("invalid_checked_state", field_ref)
+                    return form_fill_error_receipt(
+                        "invalid_checked_state", field_ref, dispatched=False,
+                    )
                 if input_type == "radio" and not expected:
-                    return _error("unsupported_radio_state", field_ref)
+                    return form_fill_error_receipt(
+                        "unsupported_radio_state", field_ref, dispatched=False,
+                    )
                 operation = "check" if expected else "uncheck"
+                progress["dispatched"] = True
                 if expected:
-                    await handle.check(timeout=3000)
+                    await handle.check(timeout=FORM_FIELD_ACTION_TIMEOUT_MS)
                 else:
-                    await handle.uncheck(timeout=3000)
+                    await handle.uncheck(timeout=FORM_FIELD_ACTION_TIMEOUT_MS)
             elif input_type.startswith("select-"):
                 operation = "select"
                 match = await handle.evaluate(_SELECT_MATCH_JS, str(value))
@@ -813,21 +882,35 @@ class SemanticFormSession:
                         and int(match.get("count") or 0) > 1
                         else "invalid_option"
                     )
-                    return _error(category, field_ref)
+                    return form_fill_error_receipt(
+                        category, field_ref, dispatched=False,
+                    )
                 expected = int(match["index"])
-                await handle.select_option(index=expected, timeout=3000)
+                progress["dispatched"] = True
+                await handle.select_option(
+                    index=expected, timeout=FORM_FIELD_ACTION_TIMEOUT_MS,
+                )
             else:
                 expected = _normalize_text(value, input_type)
-                await handle.fill(str(value if value is not None else ""), timeout=3000)
+                progress["dispatched"] = True
+                await handle.fill(
+                    str(value if value is not None else ""),
+                    timeout=FORM_FIELD_ACTION_TIMEOUT_MS,
+                )
         except Exception:
             # The operation may have dispatched input/change before a framework
             # replaced the node.  Re-resolve only to verify; never replay it.
+            if not progress["dispatched"]:
+                return form_fill_error_receipt(
+                    "unverified_result", field_ref, dispatched=False,
+                )
             replacement, replacement_error = await self._reresolve(entry)
             if replacement is None:
-                return _error(
+                return form_fill_error_receipt(
                     "ambiguous_result" if replacement_error == "ambiguous_reference"
                     else "unverified_result",
                     field_ref,
+                    dispatched=True,
                 )
             handle, metadata = replacement
             reresolved = True
@@ -846,24 +929,31 @@ class SemanticFormSession:
         if post_metadata is None or not self._matches_entry(entry, post_metadata):
             replacement, replacement_error = await self._reresolve(entry)
             if replacement is None:
-                return _error(
+                return form_fill_error_receipt(
                     "ambiguous_result" if replacement_error == "ambiguous_reference"
                     else "unverified_result",
                     field_ref,
+                    dispatched=True,
                 )
             handle, post_metadata = replacement
             reresolved = True
         try:
             after = await self._current_value(handle, input_type)
         except Exception:
-            return _error("unverified_result", field_ref)
+            return form_fill_error_receipt(
+                "unverified_result", field_ref, dispatched=True,
+            )
 
         verified = after == expected
         if not verified:
-            return _error("postcondition_mismatch", field_ref)
+            return form_fill_error_receipt(
+                "postcondition_mismatch", field_ref, dispatched=True,
+            )
         validation = _validation(post_metadata)
         if validation.get("status") == "invalid":
-            return _error("validation_rejected", field_ref)
+            return form_fill_error_receipt(
+                "validation_rejected", field_ref, dispatched=True,
+            )
         changed = before != after
         state_token = self._token(
             f"field-state:{field_ref}", repr(after), size=16,
@@ -878,6 +968,12 @@ class SemanticFormSession:
             "reresolved": reresolved,
             "validation": validation,
             "state_token": state_token,
+            "receipt": {
+                "schema_version": 1,
+                "dispatch_state": "effect_confirmed",
+                "outcome": "confirmed_success",
+                "reason_code": "semantic_fill_verified",
+            },
         }
         if input_type not in {"checkbox", "radio", "select-one", "select-multiple"}:
             result["normalized_length"] = len(str(after))
@@ -885,7 +981,11 @@ class SemanticFormSession:
 
 
 __all__ = [
+    "FORM_FIELD_ACTION_TIMEOUT_MS",
+    "FORM_FILL_TIMEOUT_SECONDS",
     "FORM_MAX_FIELDS_DEFAULT",
     "FORM_REFERENCE_TTL_SECONDS",
+    "FORM_VALIDATION_TIMEOUT_MS",
     "SemanticFormSession",
+    "form_fill_error_receipt",
 ]

@@ -1515,6 +1515,11 @@ def test_real_extraction_menu_consent_confirm_and_prompt(controlled_browser):
     consent = _success(browser.inspect_browser_page(state))
     _success(browser.activate_browser_element(
         state, consent["buttons"][0]["element_ref"],
+        {
+            "condition_type": "dom_selector_state",
+            "expected": {"primitive": "dialog", "state": "hidden"},
+            "timeout_seconds": 2,
+        },
     ))
 
     state = _navigate(web.base + "/dialogs", state)
@@ -1525,6 +1530,10 @@ def test_real_extraction_menu_consent_confirm_and_prompt(controlled_browser):
     ):
         _success(browser.activate_browser_element(
             state, dialog_page["buttons"][index]["element_ref"],
+            {
+                "condition_type": "dialog_appearance",
+                "timeout_seconds": 2,
+            },
         ))
         pending = _success(browser.list_browser_dialogs(state))["dialogs"]
         assert len(pending) == 1
@@ -1567,6 +1576,11 @@ def test_real_search_pagination_history_tabs_and_infinite_scroll(controlled_brow
     history = _success(browser.inspect_browser_page(state))
     state = _success(browser.activate_browser_element(
         state, history["links"][0]["element_ref"],
+        {
+            "condition_type": "url_match",
+            "expected": "/history/b",
+            "timeout_seconds": 2,
+        },
     ))["state"]
     state = _success(browser.browser_back(state))["state"]
     state = _success(browser.browser_forward(state))["state"]
@@ -1670,6 +1684,11 @@ def test_real_single_dispatch_popup_dialog_upload_and_download(controlled_browse
     page = _success(browser.inspect_browser_page(state))
     _success(browser.activate_browser_element(
         state, page["buttons"][0]["element_ref"],
+        {
+            "condition_type": "text_appearance",
+            "expected": "Counted once",
+            "timeout_seconds": 2,
+        },
     ))
     deadline = time.monotonic() + 2
     while web.duplicate_count < 1 and time.monotonic() < deadline:
@@ -1680,6 +1699,12 @@ def test_real_single_dispatch_popup_dialog_upload_and_download(controlled_browse
     page = _success(browser.inspect_browser_page(state))
     ambiguous = browser.activate_browser_element(
         state, page["buttons"][0]["element_ref"],
+        {
+            "condition_type": "text_appearance",
+            "expected": "Never appears",
+            "timeout_seconds": 0.2,
+            "quiet_period_seconds": 0.05,
+        },
     )
     assert ambiguous["receipt"]["outcome"] == "outcome_unknown"
     assert ambiguous["receipt"]["dispatch_state"] == "effect_unknown"
@@ -1692,16 +1717,33 @@ def test_real_single_dispatch_popup_dialog_upload_and_download(controlled_browse
     page = _success(browser.inspect_browser_page(state))
     popup = _success(browser.activate_browser_element(
         state, page["buttons"][0]["element_ref"],
+        {
+            "condition_type": "popup_creation",
+            "timeout_seconds": 2,
+        },
     ))
-    assert popup["state"]["page_id"] != state["page_id"]
-    opener = _success(browser.return_to_browser_opener(popup["state"]))["state"]
+    deadline = time.monotonic() + 2
+    popup_state = popup["state"]
+    while time.monotonic() < deadline:
+        tabs = _success(browser.list_browser_tabs())["tabs"]
+        matching = [item for item in tabs if item["safe_url"].endswith("/popup")]
+        if matching:
+            popup_state = matching[0]["state"]
+            break
+        time.sleep(0.02)
+    assert popup_state["page_id"] != state["page_id"]
+    opener = _success(browser.return_to_browser_opener(popup_state))["state"]
     assert opener["page_id"] == state["page_id"]
-    _success(browser.close_browser_tab(popup["state"]))
+    _success(browser.close_browser_tab(popup_state))
 
     state = _navigate(web.base + "/dialogs", opener)
     page = _success(browser.inspect_browser_page(state))
     _success(browser.activate_browser_element(
         state, page["buttons"][0]["element_ref"],
+        {
+            "condition_type": "dialog_appearance",
+            "timeout_seconds": 2,
+        },
     ))
     dialogs = _success(browser.list_browser_dialogs(state))["dialogs"]
     assert dialogs and dialogs[0]["type"] == "alert"

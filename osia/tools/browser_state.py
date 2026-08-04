@@ -19,7 +19,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 BROWSER_STATE_SCHEMA_VERSION = 1
 ACTION_RECEIPT_SCHEMA_VERSION = 1
-MAX_WAIT_SECONDS = 60.0
+MAX_WAIT_SECONDS = 120.0
 MAX_SAFE_EXPECTED_TEXT = 4_000
 MAX_LIFECYCLE_EVENTS = 128
 
@@ -159,9 +159,11 @@ class WaitSpec:
             return value
         if not isinstance(value, Mapping):
             raise ValueError("invalid_wait_spec")
+        if "timeout_seconds" not in value:
+            raise ValueError("missing_wait_timeout")
         try:
             condition = WaitConditionType(str(value.get("condition_type") or ""))
-            timeout = float(value.get("timeout_seconds", 10.0))
+            timeout = float(value["timeout_seconds"])
             quiet = float(value.get("quiet_period_seconds", 0.5))
             failure = WaitFailurePolicy(str(
                 value.get("failure_policy")
@@ -226,6 +228,17 @@ def _safe_expected(value: Any, *, condition: WaitConditionType) -> Any:
         }:
             raise ValueError("invalid_element_state")
         return {"element_ref": element_ref, "state": state}
+    if condition in {
+        WaitConditionType.URL_MATCH,
+        WaitConditionType.TEXT_APPEARANCE,
+        WaitConditionType.TEXT_DISAPPEARANCE,
+        WaitConditionType.DIALOG_CLOSURE,
+    }:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("wait_expected_empty")
+        if len(value) > MAX_SAFE_EXPECTED_TEXT:
+            raise ValueError("wait_expected_too_large")
+        return value
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):

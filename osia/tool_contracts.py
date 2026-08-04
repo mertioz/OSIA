@@ -42,9 +42,12 @@ class ExecutionOutcome(str, Enum):
     NOT_STARTED = "not_started"
     REJECTED_BEFORE_EXECUTION = "rejected_before_execution"
     CONFIRMED_FAILURE_BEFORE_EFFECT = "confirmed_failure_before_effect"
+    PENDING = "pending"
     SUCCESS_VERIFIED = "success_verified"
     SUCCESS_UNVERIFIED = "success_unverified"
+    FAILED_AFTER_EFFECT = "failed_after_effect"
     OUTCOME_UNKNOWN = "outcome_unknown"
+    CANCELLATION_REQUESTED = "cancellation_requested"
     CANCELLED_PROVEN = "cancelled_proven"
 
 
@@ -216,6 +219,17 @@ class ToolExecutionRecord:
     dispatched: bool
     timed_out: bool
     contract: EffectiveToolContract
+    tool_attempt_id: str = ""
+    worker_may_be_active: bool = False
+
+
+@dataclass(frozen=True)
+class ToolValidationIssue:
+    """One schema-derived, value-free argument diagnostic."""
+
+    path: str
+    code: str
+    expected: Any = None
 
 
 class ToolRegistryError(RuntimeError):
@@ -225,9 +239,14 @@ class ToolRegistryError(RuntimeError):
 class ToolValidationError(ValueError):
     """One stable, value-free validation failure."""
 
-    def __init__(self, code: str = "invalid_arguments"):
+    def __init__(
+        self,
+        code: str = "invalid_arguments",
+        issues: Iterable[ToolValidationIssue] = (),
+    ):
         super().__init__(code)
         self.code = code
+        self.issues = tuple(issues)[:16]
 
 
 class ToolRegistry:
@@ -361,21 +380,26 @@ BROWSER_STATE_REF = _object({
     "page_id", "page_generation", "navigation_id", "document_epoch",
     "created_at",
 ))
-WAIT_SPEC = _object({
-    "condition_type": _string(enum=(
-        "navigation_commit", "document_epoch_change", "url_change", "url_match",
-        "dom_selector_state", "element_state", "text_appearance",
-        "text_disappearance", "popup_creation", "dialog_appearance",
-        "dialog_closure", "download_start", "download_completion",
-        "network_quiet", "stable_content_fingerprint", "custom_postcondition",
-    ), maximum=64),
-    "expected": {},
-    "timeout_seconds": _number(0.05, 60.0),
-    "quiet_period_seconds": _number(0.05, 10.0),
-    "failure_policy": _string(enum=(
-        "confirmed_failure", "outcome_unknown_if_dispatched",
-    ), maximum=48),
-}, required=("condition_type",))
+def _wait_spec_schema(maximum_timeout: float) -> dict:
+    return _object({
+        "condition_type": _string(enum=(
+            "navigation_commit", "document_epoch_change", "url_change", "url_match",
+            "dom_selector_state", "element_state", "text_appearance",
+            "text_disappearance", "popup_creation", "dialog_appearance",
+            "dialog_closure", "download_start", "download_completion",
+            "network_quiet", "stable_content_fingerprint", "custom_postcondition",
+        ), maximum=64),
+        "expected": {},
+        "timeout_seconds": _number(0.05, maximum_timeout),
+        "quiet_period_seconds": _number(0.05, 10.0),
+        "failure_policy": _string(enum=(
+            "confirmed_failure", "outcome_unknown_if_dispatched",
+        ), maximum=48),
+    }, required=("condition_type", "timeout_seconds"))
+
+
+WAIT_SPEC = _wait_spec_schema(60.0)
+ACTIVATION_WAIT_SPEC = _wait_spec_schema(120.0)
 TEXT = _string(minimum=0, maximum=16_000)
 LARGE_TEXT = _string(minimum=0, maximum=2_000_000)
 
@@ -980,12 +1004,12 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
         _spec("activate_browser_element", "Activate one opaque browser element exactly once",
               _object({
                   "state_ref": BROWSER_STATE_REF, "element_ref": ELEMENT_REF,
-                  "wait_spec": _nullable(WAIT_SPEC),
+                  "wait_spec": ACTIVATION_WAIT_SPEC,
                   "trusted_final_action": _nullable(_boolean()),
                   "destination_origin": _nullable(_string(maximum=512)),
                   "trusted_target_binding": _nullable(_string(maximum=64)),
-              }, required=("state_ref", "element_ref")), DY, D, FC,
-              preconditions=("fresh_browser_and_element_references",), timeout=65.0,
+              }, required=("state_ref", "element_ref", "wait_spec")), DY, D, FC,
+              preconditions=("fresh_browser_and_element_references",), timeout=125.0,
               progress=effect, real=RealValidationRequirement.USER_VISIBLE,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               permission_category="browser_account", postcondition_required=True,
@@ -1398,6 +1422,104 @@ def _reject_non_finite(value: Any, *, depth: int = 0) -> None:
         raise ToolValidationError("string_too_large")
 
 
+def _validation_issue(error: ValidationError) -> list[ToolValidationIssue]:
+    """Project jsonschema errors without copying rejected argument values."""
+
+    path_parts = [str(item)[:80] for item in error.absolute_path]
+    base_path = "$" + "".join(
+        f"[{item}]" if item.isdigit() else f".{item}"
+        for item in path_parts
+    )
+    validator = str(error.validator or "invalid")[:48]
+    if validator == "required" and isinstance(error.validator_value, list):
+        instance_keys = set(error.instance) if isinstance(error.instance, dict) else set()
+        properties = (
+            error.schema.get("properties")
+            if isinstance(error.schema, dict)
+            and isinstance(error.schema.get("properties"), dict)
+            else {}
+        )
+        return [
+            ToolValidationIssue(
+                path=f"{base_path}.{str(name)[:80]}",
+                code="missing_required_field",
+                expected=_safe_schema_expectation(properties.get(name)),
+            )
+            for name in error.validator_value
+            if isinstance(name, str) and name not in instance_keys
+        ][:16]
+    if validator == "additionalProperties" and isinstance(error.instance, dict):
+        allowed = set(
+            (error.schema.get("properties") or {}).keys()
+            if isinstance(error.schema, dict) else ()
+        )
+        unexpected = [
+            str(name)[:80]
+            for name in error.instance
+            if isinstance(name, str) and name not in allowed
+        ][:16]
+        if unexpected:
+            return [
+                ToolValidationIssue(
+                    path=f"{base_path}.{name}",
+                    code="unexpected_field",
+                    expected="declared_schema_field",
+                )
+                for name in unexpected
+            ]
+    expected: Any = None
+    if validator == "type":
+        raw = error.validator_value
+        if isinstance(raw, str):
+            expected = raw[:48]
+        elif isinstance(raw, list):
+            expected = [str(item)[:48] for item in raw[:8]]
+    elif validator == "enum" and isinstance(error.validator_value, list):
+        allowed = []
+        for item in error.validator_value[:16]:
+            if item is None or isinstance(item, (bool, int, float)):
+                allowed.append(item)
+            elif isinstance(item, str) and len(item) <= 80:
+                allowed.append(item)
+        expected = {"allowed": allowed}
+    elif validator in {
+        "minLength", "maxLength", "minimum", "maximum", "minItems",
+        "maxItems", "format", "pattern", "oneOf", "anyOf",
+        "additionalProperties",
+    }:
+        expected = validator
+    return [ToolValidationIssue(base_path, validator, expected)]
+
+
+def _safe_schema_expectation(schema: Any) -> Any:
+    """Project only field types/enums from a schema, never instance values."""
+
+    if not isinstance(schema, dict):
+        return "required"
+    enum = schema.get("enum")
+    if isinstance(enum, list):
+        allowed = [
+            item for item in enum[:16]
+            if item is None or isinstance(item, (bool, int, float))
+            or isinstance(item, str) and len(item) <= 80
+        ]
+        return {"allowed": allowed}
+    raw_type = schema.get("type")
+    if isinstance(raw_type, str):
+        return raw_type[:48]
+    if isinstance(raw_type, list):
+        return [str(item)[:48] for item in raw_type[:8]]
+    any_of = schema.get("anyOf")
+    if isinstance(any_of, list):
+        types = []
+        for candidate in any_of[:8]:
+            if isinstance(candidate, dict) and isinstance(candidate.get("type"), str):
+                types.append(candidate["type"][:48])
+        if types:
+            return sorted(set(types))
+    return "required"
+
+
 def validate_arguments(schema: dict, arguments: Any) -> dict:
     """Strictly validate one call without coercion or value-bearing errors."""
     if not isinstance(arguments, dict):
@@ -1409,9 +1531,22 @@ def validate_arguments(schema: dict, arguments: Any) -> dict:
         validator = Draft202012Validator(
             effective, format_checker=FormatChecker(),
         )
-        validator.validate(arguments)
+        errors = sorted(
+            validator.iter_errors(arguments),
+            key=lambda item: (
+                tuple(str(part) for part in item.absolute_path),
+                str(item.validator or ""),
+            ),
+        )
+        if errors:
+            issues: list[ToolValidationIssue] = []
+            for error in errors[:16]:
+                issues.extend(_validation_issue(error))
+            raise ToolValidationError("invalid_arguments", issues[:16])
     except SchemaError as exc:
         raise ToolValidationError("invalid_tool_schema") from exc
+    except ToolValidationError:
+        raise
     except ValidationError as exc:
         raise ToolValidationError("invalid_arguments") from exc
     except Exception as exc:
@@ -1419,6 +1554,62 @@ def validate_arguments(schema: dict, arguments: Any) -> dict:
         # schema failures, never dispatch errors and never value-bearing UI.
         raise ToolValidationError("invalid_tool_schema") from exc
     return dict(arguments)
+
+
+def validate_tool_arguments(spec: ToolSpec, arguments: Any) -> dict:
+    """Validate a call plus browser wait semantics before any dispatch gate."""
+
+    clean = validate_arguments(spec.input_schema, arguments)
+    wait_spec = clean.get("wait_spec")
+    if wait_spec is None:
+        return clean
+    try:
+        # Pure value validation: browser_state intentionally has no Playwright
+        # dependency, so this remains a pre-policy/pre-I/O contract check.
+        from osia.tools.browser_state import WaitSpec
+
+        WaitSpec.parse(wait_spec)
+    except ValueError as exc:
+        code = str(exc or "invalid_wait_spec")[:64]
+        path = "$.wait_spec"
+        expected: Any = "object"
+        if code == "missing_wait_timeout" or "timeout" in code:
+            path = "$.wait_spec.timeout_seconds"
+            expected = {"type": "number", "minimum": 0.05, "maximum": 120.0}
+        elif code in {
+            "invalid_dom_primitive", "invalid_dom_state",
+            "invalid_element_state", "invalid_element_reference",
+            "invalid_custom_postcondition", "nested_custom_postcondition",
+            "invalid_wait_expected", "wait_expected_empty",
+            "wait_expected_too_large",
+        }:
+            path = "$.wait_spec.expected"
+            expected = "supported_condition_shape"
+        raise ToolValidationError(
+            "invalid_arguments",
+            [ToolValidationIssue(path=path, code=code, expected=expected)],
+        ) from exc
+    return clean
+
+
+def validation_error_details(error: ToolValidationError, repair_count: int = 0) -> dict:
+    """Return bounded schema diagnostics containing names/types, never values."""
+
+    count = 1 if int(repair_count or 0) >= 1 else 0
+    return {
+        "status": "failed_before_effect",
+        "reason": str(getattr(error, "code", "invalid_arguments") or "invalid_arguments")[:64],
+        "dispatch_state": "not_dispatched",
+        "repair_count": count,
+        "issues": [
+            {
+                "path": issue.path,
+                "code": issue.code,
+                **({"expected": issue.expected} if issue.expected is not None else {}),
+            }
+            for issue in getattr(error, "issues", ())[:16]
+        ],
+    }
 
 
 def validation_error_text(lang: str = "en") -> str:
@@ -1878,7 +2069,8 @@ __all__ = [
     "ProgressEvidencePolicy", "RealValidationRequirement", "ResultPolicy",
     "RetryPolicy", "STATIC_TOOL_REGISTRY", "STATIC_TOOL_SPECS",
     "SideEffectClass", "ToolRegistry", "ToolRegistryError", "ToolSpec",
-    "ToolExecutionRecord", "ToolValidationError", "assert_prompt_tool_examples_compatible",
+    "ToolExecutionRecord", "ToolValidationError", "ToolValidationIssue",
+    "assert_prompt_tool_examples_compatible",
     "bind_static_registry", "bounded_model_result",
     "compatibility_tool_spec",
     "confirmed_call_scope", "current_call_is_confirmed", "dynamic_tool_specs",
@@ -1889,5 +2081,6 @@ __all__ = [
     "replace_static_tool_prompt_section", "safe_confirmation_summary",
     "shell_command_is_proven_read_only", "static_tool_prompt_block",
     "tool_is_eligible_in_current_surface",
-    "unregister_dynamic_tools", "validate_arguments", "validation_error_text",
+    "unregister_dynamic_tools", "validate_arguments", "validation_error_details",
+    "validation_error_text",
 ]

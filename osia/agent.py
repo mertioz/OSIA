@@ -3875,6 +3875,21 @@ _SEMANTIC_FORM_PRIVATE_TOOL_NAMES = frozenset({"fill_form_field"})
 # ---------------------------------------------------------------------------
 
 TOOL_TIMEOUT_SECONDS = 30
+TOOL_OWNER_TRANSPORT_MARGIN_SECONDS = 2.0
+TOOL_DURABLE_COORDINATION_MARGIN_SECONDS = 2.0
+_BROWSER_ACTIVATION_DISPATCH_BUDGET_SECONDS = 5.0
+# The async Playwright owner is authoritative for these operations.  The outer
+# executor merely transports its receipt and must therefore outlive the owner
+# by a small bounded margin instead of truncating every call at 30 seconds.
+_BROWSER_OWNER_TIMEOUT_SECONDS = {
+    "inspect_browser_page": 20.0,
+    "wait_for_browser_condition": 65.0,
+    "activate_browser_element": 65.0,
+    "upload_browser_file": 90.0,
+    "inspect_form_fields": 10.0,
+    "fill_form_field": 22.0,
+    "fill": 45.0,
+}
 # WOR-44 Phase 5 (5-conf-a): an MCP tool may pause for a human confirmation (the
 # write/destructive gate in osia.mcp.registry) before it executes. Give MCP tools
 # (``mcp__*``) a longer executor budget so a user has time to approve without the
@@ -4282,6 +4297,50 @@ def _tool_timeout_seconds(tool_name: str, kwargs: dict) -> float:
     return TOOL_TIMEOUT_SECONDS
 
 
+def _configured_tool_timeout_seconds(spec, tool_name: str, kwargs: dict) -> float:
+    """Return the outer transport timeout without preceding browser owners."""
+
+    owner_timeout = _BROWSER_OWNER_TIMEOUT_SECONDS.get(tool_name)
+    if owner_timeout is not None:
+        if tool_name == "activate_browser_element":
+            wait_spec = kwargs.get("wait_spec")
+            if isinstance(wait_spec, dict):
+                try:
+                    wait_timeout = float(wait_spec["timeout_seconds"])
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    wait_timeout = 0.0
+                owner_timeout = max(
+                    float(owner_timeout),
+                    wait_timeout + _BROWSER_ACTIVATION_DISPATCH_BUDGET_SECONDS,
+                )
+        return owner_timeout + TOOL_OWNER_TRANSPORT_MARGIN_SECONDS
+    return min(
+        float(spec.timeout_seconds),
+        _tool_timeout_seconds(tool_name, kwargs),
+    )
+
+
+def _durable_tool_deadline_seconds(
+    spec, tool_name: str, kwargs: dict, configured_timeout_s: float,
+) -> float:
+    """Bound persistence beyond both the requested wait and owner envelope."""
+
+    wait_timeout = 0.0
+    wait_spec = kwargs.get("wait_spec")
+    if isinstance(wait_spec, dict):
+        try:
+            wait_timeout = float(wait_spec["timeout_seconds"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            wait_timeout = 0.0
+    owner_budget = max(
+        0.0,
+        float(configured_timeout_s) - TOOL_OWNER_TRANSPORT_MARGIN_SECONDS,
+    )
+    return max(10.0, wait_timeout, owner_budget, float(configured_timeout_s)) + (
+        TOOL_DURABLE_COORDINATION_MARGIN_SECONDS
+    )
+
+
 def _tool_spec_and_contract(tool_name: str, kwargs: dict, user_request: str = ""):
     from osia.tool_contracts import (
         compatibility_tool_spec,
@@ -4299,13 +4358,25 @@ class _ExecutionPermitUnavailable(RuntimeError):
     """Internal value-free marker raised before a gated dispatcher starts."""
 
 
-def _typed_browser_receipt_outcome(result):
+def _typed_browser_receipt_outcome(result, *, allow_json_string: bool = False):
     """Map a validated WOR-186 receipt; friendly text is never success proof."""
     from osia.tool_contracts import ExecutionOutcome
 
-    if not isinstance(result, dict) or not isinstance(result.get("receipt"), dict):
+    candidate = result
+    if allow_json_string and isinstance(result, str):
+        encoded = result.strip()
+        if encoded.startswith("ERROR:"):
+            encoded = encoded.split(":", 1)[1].strip()
+        if encoded.startswith("{"):
+            try:
+                candidate = json.loads(encoded)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                candidate = None
+    if not isinstance(candidate, dict) or not isinstance(
+        candidate.get("receipt"), dict,
+    ):
         return None
-    receipt = result["receipt"]
+    receipt = candidate["receipt"]
     if receipt.get("schema_version") != 1:
         return None
     dispatch = str(receipt.get("dispatch_state") or "")
@@ -4327,6 +4398,133 @@ def _typed_browser_receipt_outcome(result):
     return ExecutionOutcome.OUTCOME_UNKNOWN, dispatch != "not_dispatched"
 
 
+def _requires_postcondition_reconciliation(record) -> bool:
+    """Keep dispatched mutations non-terminal until trusted verification."""
+
+    from osia.tool_contracts import ExecutionOutcome, SideEffectClass
+
+    return bool(
+        record.outcome == ExecutionOutcome.SUCCESS_UNVERIFIED
+        and record.dispatched
+        and record.contract.side_effect != SideEffectClass.READ_ONLY
+        and record.contract.spec.postcondition_required
+    )
+
+
+def _late_completion_record(tool_name: str, kwargs: dict, future, contract, lang: str):
+    """Classify a worker that completed after its caller released the turn."""
+    from osia.tool_contracts import (
+        ExecutionOutcome,
+        SideEffectClass,
+        ToolExecutionRecord,
+        bounded_model_result,
+    )
+
+    try:
+        result = bounded_model_result(future.result())
+    except _ExecutionPermitUnavailable:
+        return ToolExecutionRecord(
+            "ERROR: execution permit unavailable; the tool was not executed",
+            True, ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+            0, False, False, contract,
+        )
+    except Exception:
+        outcome = (
+            ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
+            if contract.side_effect == SideEffectClass.READ_ONLY
+            else ExecutionOutcome.OUTCOME_UNKNOWN
+        )
+        return ToolExecutionRecord(
+            "ERROR: internal tool failure; private details were withheld",
+            True, outcome, 1, True, False, contract,
+        )
+    typed = _typed_browser_receipt_outcome(
+        result, allow_json_string=tool_name == "fill_form_field",
+    )
+    is_error = _is_tool_error(result)
+    if typed is not None:
+        outcome, dispatched = typed
+    elif is_error:
+        outcome = (
+            ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
+            if contract.side_effect == SideEffectClass.READ_ONLY
+            else ExecutionOutcome.OUTCOME_UNKNOWN
+        )
+        dispatched = contract.side_effect != SideEffectClass.READ_ONLY
+    else:
+        outcome = (
+            ExecutionOutcome.SUCCESS_VERIFIED
+            if contract.side_effect == SideEffectClass.READ_ONLY
+            or contract.spec.verified_success
+            else ExecutionOutcome.SUCCESS_UNVERIFIED
+        )
+        dispatched = True
+    return ToolExecutionRecord(
+        result,
+        is_error or outcome in {
+            ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT,
+            ExecutionOutcome.OUTCOME_UNKNOWN,
+        },
+        outcome,
+        1 if dispatched else 0,
+        dispatched,
+        False,
+        contract,
+    )
+
+
+def _persist_tool_attempt_terminal(
+    store, attempt_id: str, record, *, reason_code: str = "tool_receipt",
+):
+    from osia.tool_attempts import TERMINAL_STATUSES, ToolAttemptStatus
+    from osia.tool_contracts import ExecutionOutcome
+
+    if _requires_postcondition_reconciliation(record):
+        now = time.time()
+        current = store.get_attempt(attempt_id) or {}
+        if current.get("status") in {status.value for status in TERMINAL_STATUSES}:
+            return current, False
+        deadline = max(
+            float(current.get("deadline_at") or 0.0),
+            now + 10.0,
+        )
+        waiting = store.mark_waiting_verification(
+            attempt_id,
+            next_check_at=now + 2.0,
+            deadline_at=deadline,
+            reason_code="postcondition_required_unverified",
+        )
+        return waiting, False
+
+    status = {
+        ExecutionOutcome.NOT_STARTED: ToolAttemptStatus.FAILED_BEFORE_EFFECT,
+        ExecutionOutcome.REJECTED_BEFORE_EXECUTION: ToolAttemptStatus.FAILED_BEFORE_EFFECT,
+        ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT: ToolAttemptStatus.FAILED_BEFORE_EFFECT,
+        ExecutionOutcome.SUCCESS_VERIFIED: ToolAttemptStatus.SUCCEEDED,
+        ExecutionOutcome.SUCCESS_UNVERIFIED: ToolAttemptStatus.SUCCEEDED,
+        ExecutionOutcome.FAILED_AFTER_EFFECT: ToolAttemptStatus.FAILED_AFTER_EFFECT,
+        ExecutionOutcome.OUTCOME_UNKNOWN: ToolAttemptStatus.UNKNOWN_AFTER_START,
+        ExecutionOutcome.CANCELLED_PROVEN: ToolAttemptStatus.CANCELLED_PROVEN,
+    }.get(record.outcome, ToolAttemptStatus.UNKNOWN_AFTER_START)
+    dispatch_state = {
+        ExecutionOutcome.NOT_STARTED: "not_dispatched",
+        ExecutionOutcome.REJECTED_BEFORE_EXECUTION: "not_dispatched",
+        ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT: "not_dispatched",
+        ExecutionOutcome.CANCELLED_PROVEN: "cancelled_before_effect",
+        ExecutionOutcome.OUTCOME_UNKNOWN: "effect_unknown",
+    }.get(
+        record.outcome,
+        "effect_confirmed" if record.dispatched else "not_dispatched",
+    )
+    return store.record_terminal_result(
+        attempt_id,
+        status=status,
+        terminal_outcome=record.outcome.value,
+        dispatch_state=dispatch_state,
+        reason_code=reason_code,
+    )
+
+
 def _execute_tool_once_record(
     tool_name: str,
     kwargs: dict,
@@ -4335,6 +4533,9 @@ def _execute_tool_once_record(
     contract,
     lang: str = "fr",
     enforce_execution_permit: bool = False,
+    attempt_id: str = "",
+    attempt_store=None,
+    terminal_callback=None,
 ):
     """Dispatch once and preserve truthful timeout/outcome semantics."""
     from osia.tool_contracts import (
@@ -4343,19 +4544,39 @@ def _execute_tool_once_record(
         ToolExecutionRecord,
         bounded_model_result,
     )
+    from osia.tool_attempts import (
+        TERMINAL_STATUSES,
+        publish_tool_attempt_event,
+        tool_attempt_scope,
+    )
 
     fn = TOOL_MAP[tool_name]
+    if attempt_id and attempt_store is not None:
+        attempt_store.mark_running(attempt_id)
+
+    def _attempt_event(event):
+        if attempt_store is not None:
+            attempt_store.record_progress(
+                event.attempt_id,
+                phase=event.reason_code or event.phase or "running",
+            )
+
     try:
         # Preserve the existing key-rotation/context propagation contract.
         ctx = contextvars.copy_context()
 
         def _dispatch():
-            if enforce_execution_permit:
-                from osia.action_policy import consume_pending_execution_permit
+            with tool_attempt_scope(
+                attempt_id,
+                _attempt_event if attempt_id else None,
+            ):
+                publish_tool_attempt_event("dispatcher_running")
+                if enforce_execution_permit:
+                    from osia.action_policy import consume_pending_execution_permit
 
-                if not consume_pending_execution_permit(tool_name, kwargs):
-                    raise _ExecutionPermitUnavailable()
-            return fn(**kwargs)
+                    if not consume_pending_execution_permit(tool_name, kwargs):
+                        raise _ExecutionPermitUnavailable()
+                return fn(**kwargs)
 
         fut = _TOOL_EXECUTOR.submit(ctx.run, _dispatch)
         raw_result = fut.result(timeout=timeout_s)
@@ -4372,7 +4593,38 @@ def _execute_tool_once_record(
         )
     except FutureTimeoutError:
         # Future.result(timeout=...) does not prove cancellation. The worker may
-        # still complete, so no replay or provider fallback may start.
+        # still complete, so persist a non-terminal attempt before releasing
+        # the provider turn and reconcile the same Future via its callback.
+        if attempt_id and attempt_store is not None:
+            now = time.time()
+            attempt_store.mark_pending(
+                attempt_id,
+                next_check_at=now + 2.0,
+                deadline_at=now + max(10.0, float(timeout_s)),
+            )
+
+            def _late_completion(done):
+                late = _late_completion_record(
+                    tool_name, kwargs, done, contract, lang,
+                )
+                late = ToolExecutionRecord(
+                    late.result, late.is_error, late.outcome, late.attempts,
+                    late.dispatched, late.timed_out, late.contract,
+                    attempt_id, False,
+                )
+                persisted, _created = _persist_tool_attempt_terminal(
+                    attempt_store, attempt_id, late,
+                    reason_code="owner_callback",
+                )
+                if (
+                    persisted.get("status") in {
+                        status.value for status in TERMINAL_STATUSES
+                    }
+                    and callable(terminal_callback)
+                ):
+                    terminal_callback(attempt_id, late)
+
+            fut.add_done_callback(_late_completion)
         text = (
             "ERROR: délai d'exécution dépassé ; résultat incertain. "
             "L'outil peut encore terminer et ne sera pas relancé."
@@ -4381,8 +4633,9 @@ def _execute_tool_once_record(
             "The tool may still complete and will not be retried."
         )
         return ToolExecutionRecord(
-            text, True, ExecutionOutcome.OUTCOME_UNKNOWN, 1, True, True,
-            contract,
+            text, True,
+            ExecutionOutcome.PENDING if attempt_id else ExecutionOutcome.OUTCOME_UNKNOWN,
+            1, True, True, contract, attempt_id, bool(attempt_id),
         )
     except Exception:
         # Raw exception text may contain arguments, paths, provider payloads or
@@ -4400,7 +4653,9 @@ def _execute_tool_once_record(
         return ToolExecutionRecord(text, True, outcome, 1, True, False, contract)
 
     is_error = _is_tool_error(result)
-    typed_browser_outcome = _typed_browser_receipt_outcome(result)
+    typed_browser_outcome = _typed_browser_receipt_outcome(
+        result, allow_json_string=tool_name == "fill_form_field",
+    )
     if typed_browser_outcome is not None:
         outcome, dispatched = typed_browser_outcome
         return ToolExecutionRecord(
@@ -4486,6 +4741,7 @@ def _execute_tool_with_policy(
     user_request: str = "",
     lang: str = "fr",
     enforce_execution_permit: bool = False,
+    attempt_context: dict | None = None,
 ):
     """Validate before dispatch and retry only proven-safe read failures."""
     from osia.tool_contracts import (
@@ -4493,13 +4749,13 @@ def _execute_tool_with_policy(
         RetryPolicy,
         ToolExecutionRecord,
         ToolValidationError,
-        validate_arguments,
+        validate_tool_arguments,
         validation_error_text,
     )
 
     spec, contract = _tool_spec_and_contract(tool_name, kwargs, user_request)
     try:
-        kwargs = validate_arguments(spec.input_schema, kwargs)
+        kwargs = validate_tool_arguments(spec, kwargs)
     except ToolValidationError:
         return ToolExecutionRecord(
             validation_error_text(lang), True,
@@ -4507,9 +4763,11 @@ def _execute_tool_with_policy(
             0, False, False, contract,
         )
 
-    configured_timeout_s = min(
-        float(spec.timeout_seconds),
-        _tool_timeout_seconds(tool_name, kwargs),
+    configured_timeout_s = _configured_tool_timeout_seconds(
+        spec, tool_name, kwargs,
+    )
+    durable_deadline_s = _durable_tool_deadline_seconds(
+        spec, tool_name, kwargs, configured_timeout_s,
     )
 
     def _bounded_timeout():
@@ -4537,9 +4795,100 @@ def _execute_tool_with_policy(
             contract,
         )
 
+    attempt_id = ""
+    attempt_store = None
+    terminal_callback = None
+    if isinstance(attempt_context, dict) and attempt_context.get("enabled") is True:
+        from osia.tool_attempts import (
+            IllegalTransition,
+            get_tool_attempt_store,
+        )
+
+        attempt_store = attempt_context.get("store") or get_tool_attempt_store()
+        fingerprint = attempt_store.fingerprint_arguments(kwargs)
+        conversation_id = str(attempt_context.get("conversation_id") or "")
+        if (
+            contract.commits_fallback_barrier
+            and attempt_store.has_terminal_barrier(
+                conversation_id=conversation_id,
+                turn_id=str(attempt_context.get("turn_id") or ""),
+                tool_name=tool_name,
+                argument_fingerprint=fingerprint,
+            )
+        ):
+            return ToolExecutionRecord(
+                "ERROR: duplicate external action blocked by durable receipt",
+                True, ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+                0, False, False, contract,
+            )
+        wait_spec = kwargs.get("wait_spec")
+        postcondition_type = (
+            str(wait_spec.get("condition_type") or "")
+            if isinstance(wait_spec, dict) else
+            "explicit_postcondition" if spec.postcondition_required else ""
+        )
+        context = attempt_context.get("turn_context")
+        context_snapshot = (
+            {
+                "language": context.language,
+                "source": context.source,
+                "turn_ref": context.turn_ref,
+                "mode": context.mode,
+                "allowed_languages": list(context.allowed_languages),
+                "source_language": context.source_language,
+                "target_language": context.target_language,
+            }
+            if isinstance(context, TurnContext) else {}
+        )
+        try:
+            attempt = attempt_store.create_attempt(
+                conversation_id=conversation_id,
+                turn_id=str(attempt_context.get("turn_id") or ""),
+                request_id=str(attempt_context.get("request_id") or ""),
+                tool_call_id=str(attempt_context.get("tool_call_id") or ""),
+                tool_name=tool_name,
+                provider_id=str(attempt_context.get("provider_id") or ""),
+                model_id=str(attempt_context.get("model_id") or ""),
+                turn_context=context_snapshot,
+                argument_fingerprint=fingerprint,
+                side_effect=contract.side_effect.value,
+                idempotence=contract.idempotency.value,
+                retry_policy=contract.retry.value,
+                remote_operation_key=str(
+                    attempt_context.get("remote_operation_key") or ""
+                ),
+                deadline_at=time.time() + durable_deadline_s,
+                postcondition_type=postcondition_type,
+                browser_state_ref=(
+                    kwargs.get("state_ref")
+                    if isinstance(kwargs.get("state_ref"), dict) else None
+                ),
+                repair_count=int(attempt_context.get("repair_count") or 0),
+                final_response_message_id=str(
+                    attempt_context.get("final_response_message_id") or ""
+                ),
+            )
+            attempt = attempt_store.mark_accepted(
+                attempt["tool_attempt_id"],
+                expected_revision=attempt["revision"],
+            )
+            attempt_id = attempt["tool_attempt_id"]
+            terminal_callback = attempt_context.get("terminal_callback")
+            attempt_context["tool_attempt_id"] = attempt_id
+            attempt_context["argument_fingerprint"] = fingerprint
+        except IllegalTransition:
+            return ToolExecutionRecord(
+                "ERROR: another tool result is still pending for this conversation",
+                True, ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+                0, False, False, contract,
+            )
+
     record = _execute_tool_once_record(
         tool_name, kwargs, timeout_s=timeout_s, contract=contract, lang=lang,
         enforce_execution_permit=enforce_execution_permit,
+        attempt_id=attempt_id,
+        attempt_store=attempt_store,
+        terminal_callback=terminal_callback,
     )
     retry_allowed = (
         allow_retry
@@ -4547,6 +4896,37 @@ def _execute_tool_with_policy(
         and record.outcome == ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
     )
     if not retry_allowed:
+        if attempt_id:
+            record = ToolExecutionRecord(
+                record.result, record.is_error, record.outcome, record.attempts,
+                record.dispatched, record.timed_out, record.contract,
+                attempt_id, record.worker_may_be_active,
+            )
+            requires_reconciliation = _requires_postcondition_reconciliation(
+                record,
+            )
+            if (
+                record.outcome == ExecutionOutcome.OUTCOME_UNKNOWN
+                and record.dispatched
+            ) or requires_reconciliation:
+                now = time.time()
+                attempt_store.mark_waiting_verification(
+                    attempt_id,
+                    next_check_at=now + 2.0,
+                    deadline_at=now + durable_deadline_s,
+                    reason_code=(
+                        "postcondition_required_unverified"
+                        if requires_reconciliation else
+                        "postcondition_not_observed"
+                    ),
+                )
+                return ToolExecutionRecord(
+                    record.result, True, ExecutionOutcome.PENDING,
+                    record.attempts, True, record.timed_out, record.contract,
+                    attempt_id, record.worker_may_be_active,
+                )
+            if record.outcome != ExecutionOutcome.PENDING:
+                _persist_tool_attempt_terminal(attempt_store, attempt_id, record)
         return record
     retry_timeout_s = _bounded_timeout()
     if retry_timeout_s <= 0:
@@ -4559,18 +4939,25 @@ def _execute_tool_with_policy(
         tool_name, kwargs, timeout_s=retry_timeout_s,
         contract=contract, lang=lang,
         enforce_execution_permit=enforce_execution_permit,
+        attempt_id=attempt_id,
+        attempt_store=attempt_store,
+        terminal_callback=terminal_callback,
     )
-    return ToolExecutionRecord(
+    final_record = ToolExecutionRecord(
         retried.result, retried.is_error, retried.outcome, 2,
         retried.dispatched, retried.timed_out, retried.contract,
+        attempt_id, retried.worker_may_be_active,
     )
+    if attempt_id and final_record.outcome != ExecutionOutcome.PENDING:
+        _persist_tool_attempt_terminal(attempt_store, attempt_id, final_record)
+    return final_record
 
 
 def _execute_tool_once(tool_name: str, kwargs: dict, timeout_s: float | None = None):
     """Compatibility wrapper returning the historic raw result shape."""
     from osia.tool_contracts import (
         ToolValidationError,
-        validate_arguments,
+        validate_tool_arguments,
         validation_error_text,
     )
 
@@ -4579,7 +4966,7 @@ def _execute_tool_once(tool_name: str, kwargs: dict, timeout_s: float | None = N
     spec, contract = _tool_spec_and_contract(tool_name, kwargs)
     timeout_s = min(float(timeout_s), float(spec.timeout_seconds))
     try:
-        kwargs = validate_arguments(spec.input_schema, kwargs)
+        kwargs = validate_tool_arguments(spec, kwargs)
     except ToolValidationError:
         return validation_error_text("fr")
     return _execute_tool_once_record(
@@ -6154,6 +6541,11 @@ class OSIAAgent:
         self._document_turn_start = 1
         self._semantic_form_values: list[str] = []
         self._chat_autonomous_context: dict | None = None
+        self._tool_attempt_metadata: dict | None = None
+        self._pending_tool_runtime: dict | None = None
+        self.last_pending_tool_attempt_id = ""
+        self._resume_effect_barrier = False
+        self._resume_unknown_effect = False
 
     def set_turn_context(self, context: TurnContext) -> None:
         """Apply one already-resolved language decision to subsequent model calls."""
@@ -6170,6 +6562,221 @@ class OSIAAgent:
                     self.lang, self.model, self.provider, self.turn_context,
                 ),
             }
+
+    def configure_tool_attempts(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+        request_id: str,
+        final_response_message_id: str,
+        status_callback=None,
+        final_callback=None,
+        on_sentence=None,
+        on_first_token=None,
+    ) -> None:
+        """Enable durable normal-chat attempts for one already-accepted turn."""
+
+        self._tool_attempt_metadata = {
+            "conversation_id": str(conversation_id or ""),
+            "turn_id": str(turn_id or ""),
+            "request_id": str(request_id or ""),
+            "final_response_message_id": str(final_response_message_id or ""),
+            "status_callback": status_callback,
+            "final_callback": final_callback,
+            "on_sentence": on_sentence,
+            "on_first_token": on_first_token,
+        }
+        self._pending_tool_runtime = None
+        self.last_pending_tool_attempt_id = ""
+
+    def clear_tool_attempts(self) -> None:
+        self._tool_attempt_metadata = None
+        self._pending_tool_runtime = None
+        self.last_pending_tool_attempt_id = ""
+
+    def activate_pending_tool_attempt(self) -> bool:
+        from osia.tool_attempts import get_tool_attempt_coordinator
+
+        attempt_id = str(self.last_pending_tool_attempt_id or "")
+        return bool(
+            attempt_id
+            and get_tool_attempt_coordinator().activate(attempt_id)
+        )
+
+    def _new_tool_attempt_context(self, *, repair_count: int = 0) -> dict | None:
+        metadata = self._tool_attempt_metadata
+        if not isinstance(metadata, dict):
+            return None
+        from osia.tool_attempts import get_tool_attempt_coordinator
+
+        return {
+            "enabled": True,
+            "conversation_id": metadata.get("conversation_id"),
+            "turn_id": metadata.get("turn_id"),
+            "request_id": metadata.get("request_id"),
+            "tool_call_id": "toolcall_" + secrets.token_urlsafe(18),
+            "provider_id": self.provider,
+            "model_id": self.model,
+            "turn_context": self.turn_context,
+            "repair_count": 1 if repair_count else 0,
+            "final_response_message_id": metadata.get(
+                "final_response_message_id"
+            ),
+            "terminal_callback": (
+                get_tool_attempt_coordinator().notify_terminal
+            ),
+        }
+
+    def _verify_suspended_tool(self, attempt_id: str):
+        """Run only a read-only browser postcondition; never replay the action."""
+
+        runtime = self._pending_tool_runtime
+        if not isinstance(runtime, dict) or runtime.get("attempt_id") != attempt_id:
+            return None
+        if runtime.get("worker_may_be_active"):
+            return None
+        wait_spec = runtime.get("wait_spec")
+        if not isinstance(wait_spec, dict):
+            return None
+        try:
+            from osia.tools import browser as browser_tools
+            from osia.tool_contracts import (
+                ExecutionOutcome,
+                ToolExecutionRecord,
+            )
+            from osia.tool_attempts import get_tool_attempt_store
+
+            current = browser_tools.get_browser_state()
+            data = current.get("data") if isinstance(current, dict) else None
+            state = data.get("state") if isinstance(data, dict) else None
+            if not isinstance(state, dict):
+                return None
+            verified = browser_tools.wait_for_browser_condition(state, wait_spec)
+            typed = _typed_browser_receipt_outcome(verified)
+            if typed is None or typed[0] != ExecutionOutcome.SUCCESS_VERIFIED:
+                return None
+            original = runtime["record"]
+            record = ToolExecutionRecord(
+                verified, False, ExecutionOutcome.SUCCESS_VERIFIED,
+                original.attempts, True, False, original.contract,
+                attempt_id, False,
+            )
+            _persist_tool_attempt_terminal(
+                get_tool_attempt_store(), attempt_id, record,
+                reason_code="postcondition_verified_read_only",
+            )
+            return record
+        except Exception:
+            return None
+
+    def _resume_suspended_tool(self, attempt_id: str, payload) -> str:
+        from osia.tool_attempts import get_tool_attempt_store
+        from osia.tool_contracts import ExecutionOutcome, ToolExecutionRecord
+
+        store = get_tool_attempt_store()
+        attempt = store.get_attempt(attempt_id)
+        if not attempt:
+            raise RuntimeError("tool attempt disappeared before continuation")
+        provider_id = str(attempt.get("provider_id") or "")
+        model_id = str(attempt.get("model_id") or "")
+        if self.provider != provider_id or self.model != model_id:
+            self.set_model(model_id, provider=provider_id)
+        if self.provider != provider_id or self.model != model_id:
+            raise RuntimeError("tool continuation provider/model mismatch")
+        outcome = str(attempt.get("terminal_outcome") or "outcome_unknown")
+        result_text = ""
+        if isinstance(payload, ToolExecutionRecord):
+            result_text = _model_result_text(payload.result, attempt.get("tool_name"))
+            outcome = payload.outcome.value
+        structured = {
+            "event": "tool_attempt_terminal",
+            "tool_attempt_id": attempt_id,
+            "tool": attempt.get("tool_name"),
+            "status": attempt.get("status"),
+            "outcome": outcome,
+            "dispatch_state": attempt.get("dispatch_state"),
+            "reason_code": attempt.get("reason_code"),
+            "must_not_replay": True,
+        }
+        if result_text:
+            structured["result"] = result_text
+        feedback = (
+            "<tool_result>\n"
+            + json.dumps(
+                structured,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n</tool_result>\n"
+            "Continue the same user turn from this durable receipt. Never "
+            "repeat the completed or ambiguous action. Produce one canonical "
+            "final answer; use only read-only verification if the outcome is unknown."
+        )
+        metadata = self._tool_attempt_metadata or {}
+        previous_disable_hierarchy = bool(
+            getattr(self, "_disable_hierarchy_for_turn", False)
+        )
+        self._disable_hierarchy_for_turn = True
+        self._resume_effect_barrier = True
+        self._resume_unknown_effect = outcome in {
+            ExecutionOutcome.OUTCOME_UNKNOWN.value,
+            "outcome_unknown",
+        }
+        self._in_use = True
+        try:
+            return self.run(
+                feedback,
+                history=None,
+                on_sentence=metadata.get("on_sentence"),
+                on_first_token=metadata.get("on_first_token"),
+                current_conversation_id=metadata.get("conversation_id"),
+                turn_context=self.turn_context,
+            )
+        finally:
+            self._in_use = False
+            self._disable_hierarchy_for_turn = previous_disable_hierarchy
+            self._resume_effect_barrier = False
+            self._resume_unknown_effect = False
+
+    def _suspend_tool_turn(self, tool_name: str, kwargs: dict, record) -> str:
+        from osia.tool_attempts import (
+            WAITING_TOOL_RESULT,
+            get_tool_attempt_coordinator,
+        )
+
+        attempt_id = str(record.tool_attempt_id or "")
+        if not attempt_id:
+            return ""
+        metadata = self._tool_attempt_metadata or {}
+        self.last_pending_tool_attempt_id = attempt_id
+        self._pending_tool_runtime = {
+            "attempt_id": attempt_id,
+            "tool_name": tool_name,
+            "wait_spec": (
+                dict(kwargs.get("wait_spec"))
+                if isinstance(kwargs.get("wait_spec"), dict) else None
+            ),
+            "worker_may_be_active": bool(record.worker_may_be_active),
+            "record": record,
+        }
+        final_callback = metadata.get("final_callback")
+        status_callback = metadata.get("status_callback")
+
+        def _finalize(callback_attempt_id, final_text, error):
+            if callable(final_callback):
+                return final_callback(callback_attempt_id, final_text, error)
+            return False
+
+        get_tool_attempt_coordinator().register_suspended(
+            attempt_id,
+            resume=self._resume_suspended_tool,
+            finalize=_finalize,
+            status=status_callback if callable(status_callback) else None,
+            verify=self._verify_suspended_tool,
+        )
+        return WAITING_TOOL_RESULT
 
     def reset(self):
         """Clear conversation history except system prompt."""
@@ -7427,13 +8034,17 @@ class OSIAAgent:
         chat_route_redirect = ""
         chat_scheduled_route_confirmed = False
         language_consistency_retry_used = False
+        argument_repair_used = False
+        argument_repair_active = False
+        argument_repair_provider_model: tuple[str, str] | None = None
+        argument_repair_tool_name = ""
         # Once an account response emits an OSIA textual tool call, the attempt
         # is committed. A later tool-result turn must never replay via an API.
         _account_attempt_committed = False
         # A provider fallback may replay the complete turn. Once a mutating,
         # dynamic or otherwise ambiguous tool has actually been dispatched,
         # replay is forbidden for the rest of this turn (WOR-178).
-        tool_execution_barrier_committed = False
+        tool_execution_barrier_committed = bool(self._resume_effect_barrier)
         turn_has_unknown_outcome = False
         turn_has_tool_timeout = False
         # Empty-response guard: whether the one allowed "your reply was
@@ -7457,6 +8068,34 @@ class OSIAAgent:
             self.messages.append({"role": "assistant", "content": content})
             if self.turn_context is not None:
                 log_round(self.turn_context, round_number, "chat_autonomous_handoff")
+                log_final(self.turn_context, content)
+            return content
+
+        def _finish_invalid_arguments(details: dict, round_number: int) -> str:
+            issue_paths = [
+                str(item.get("path") or "")
+                for item in details.get("issues", ())
+                if isinstance(item, dict) and item.get("path")
+            ][:8]
+            suffix = f" ({', '.join(issue_paths)})" if issue_paths else ""
+            content = (
+                "Les arguments de l'outil restent invalides apr\u00e8s l'unique "
+                f"tentative de correction ; l'outil n'a pas \u00e9t\u00e9 "
+                f"ex\u00e9cut\u00e9{suffix}."
+                if self.lang == "fr" else
+                "The tool arguments remain invalid after the single repair "
+                f"attempt; the tool was not executed{suffix}."
+            )
+            if canonical_output:
+                content = clean_response(content)
+            if on_sentence is not None:
+                try:
+                    on_sentence(content)
+                except Exception:
+                    pass
+            self.messages.append({"role": "assistant", "content": content})
+            if self.turn_context is not None:
+                log_round(self.turn_context, round_number, "invalid_arguments_terminal")
                 log_final(self.turn_context, content)
             return content
 
@@ -7617,6 +8256,7 @@ class OSIAAgent:
                     bool(getattr(e, "native_action", False))
                     or _account_attempt_committed
                     or tool_execution_barrier_committed
+                    or argument_repair_active
                 )
 
                 # Honor one short Retry-After on a transient 429. Quota/billing
@@ -7763,6 +8403,26 @@ class OSIAAgent:
                 content, message=message, provider=self.provider,
             )
             tool_calls = _apply_exact_autonomous_resume_call(self, tool_calls)
+            if argument_repair_active:
+                repaired_name = (
+                    str(tool_calls[0].get("tool") or "")
+                    if len(tool_calls) == 1 and isinstance(tool_calls[0], dict)
+                    else ""
+                )
+                if (
+                    argument_repair_provider_model != (
+                        str(self.provider or ""), str(self.model or ""),
+                    )
+                    or repaired_name != argument_repair_tool_name
+                ):
+                    return _finish_invalid_arguments(
+                        {
+                            "issues": [],
+                            "repair_count": 1,
+                            "reason": "invalid_repair_tool_call",
+                        },
+                        round_number,
+                    )
             if chat_routing_enabled and tool_calls:
                 handoff_calls = [
                     call for call in tool_calls
@@ -7944,12 +8604,38 @@ class OSIAAgent:
                             ProgressEvidencePolicy,
                             ToolExecutionRecord,
                             ToolValidationError,
-                            validate_arguments,
+                            validate_tool_arguments,
+                            validation_error_details,
                             validation_error_text,
                         )
-                        kwargs = validate_arguments(spec.input_schema, kwargs)
-                    except ToolValidationError:
-                        validation_text = validation_error_text(self.lang)
+                        kwargs = validate_tool_arguments(spec, kwargs)
+                    except ToolValidationError as validation_error:
+                        details = validation_error_details(
+                            validation_error,
+                            repair_count=1 if argument_repair_used else 0,
+                        )
+                        if argument_repair_used:
+                            details["repair_count"] = 1
+                            return _finish_invalid_arguments(
+                                details, round_number,
+                            )
+                        argument_repair_used = True
+                        argument_repair_active = True
+                        argument_repair_provider_model = (
+                            str(self.provider or ""), str(self.model or ""),
+                        )
+                        argument_repair_tool_name = tool_name
+                        details["repair_count"] = 1
+                        details["repair_instruction"] = (
+                            "emit_one_complete_replacement_tool_call"
+                        )
+                        details["tool"] = guard._safe_tool_name(tool_name)
+                        validation_text = json.dumps(
+                            details,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
                         tool_results.append(
                             localized_text(
                                 "tool_result_header", self.lang, tool=tool_name,
@@ -7957,8 +8643,31 @@ class OSIAAgent:
                         )
                         guard.record(tool_name, kwargs, "", True)
                         break
+                    if argument_repair_active:
+                        if argument_repair_provider_model != (
+                            str(self.provider or ""), str(self.model or ""),
+                        ):
+                            return _finish_invalid_arguments(
+                                {
+                                    "issues": [],
+                                    "repair_count": 1,
+                                    "reason": "provider_model_changed",
+                                },
+                                round_number,
+                            )
+                        argument_repair_active = False
                     attempted_model_tool_name = tool_name
                     attempted_model_kwargs = dict(kwargs)
+
+                    if (
+                        self._resume_unknown_effect
+                        and effective.commits_fallback_barrier
+                    ):
+                        return self._finish_execution_barrier_stop(
+                            outcome_unknown=True,
+                            tool_name=tool_name,
+                            on_sentence=on_sentence,
+                        )
 
                     if tool_name == _chat_routing.ROUTING_TOOL_NAME:
                         # Starting the planner is the routing boundary itself,
@@ -8086,6 +8795,9 @@ class OSIAAgent:
                                 user_request=user_text,
                                 lang=self.lang,
                                 enforce_execution_permit=autonomous_execution_permit,
+                                attempt_context=self._new_tool_attempt_context(
+                                    repair_count=argument_repair_used,
+                                ),
                             )
                         finally:
                             _memory_runtime.reset_save_memory_context(token)
@@ -8136,6 +8848,9 @@ class OSIAAgent:
                                      user_request=user_text,
                                      lang=self.lang,
                                      enforce_execution_permit=autonomous_execution_permit,
+                                     attempt_context=self._new_tool_attempt_context(
+                                         repair_count=argument_repair_used,
+                                     ),
                                  )
                             finally:
                                 _CURRENT_CONVERSATION_ID.reset(token)
@@ -8210,6 +8925,9 @@ class OSIAAgent:
                                         and not tool_name.startswith("gmail_")
                                         and not tool_name.startswith("mcp__")
                                     ),
+                                    attempt_context=self._new_tool_attempt_context(
+                                        repair_count=argument_repair_used,
+                                    ),
                                 )
 
                             (
@@ -8248,6 +8966,14 @@ class OSIAAgent:
                         # The Scheduled facade already fails closed before any
                         # gated dispatch; outcome persistence cannot broaden it.
                         pass
+                    if (
+                        execution_record.outcome == ExecutionOutcome.PENDING
+                        and self._tool_attempt_metadata is not None
+                    ):
+                        tool_execution_barrier_committed = True
+                        return self._suspend_tool_turn(
+                            tool_name, kwargs, execution_record,
+                        )
                     if execution_record.dispatched:
                         any_tool_executed = True
                     if (
@@ -8540,6 +9266,25 @@ class OSIAAgent:
                 continue
 
             # No tool call in any format — candidate final response.
+            if argument_repair_active:
+                safe_rejection = re.search(
+                    r"\b(?:invalid|rejected|not executed|not run|invalide|"
+                    r"invalides|rejet|pas [e\u00e9]t[e\u00e9] "
+                    r"ex[e\u00e9]cut[e\u00e9])\b",
+                    str(content or ""),
+                    flags=re.IGNORECASE,
+                )
+                if safe_rejection:
+                    argument_repair_active = False
+                else:
+                    return _finish_invalid_arguments(
+                        {
+                            "issues": [],
+                            "repair_count": 1,
+                            "reason": "replacement_tool_call_missing",
+                        },
+                        round_number,
+                    )
             if (
                 explicit_autonomous_turn
                 and not chat_handoff_tool_seen

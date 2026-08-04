@@ -305,7 +305,7 @@ def test_invalid_high_risk_call_is_rejected_before_confirmation(monkeypatch):
         "The invalid call was rejected.",
     ], rounds)
     final = agent.run("Run a fixture.", history=[], on_sentence=lambda _x: None)
-    assert final == "The invalid call was rejected."
+    assert "single repair attempt" in final
     assert dispatches == []
     assert confirmations == []
 

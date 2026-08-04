@@ -1386,6 +1386,25 @@ def wake_mode():
     def _desktop_busy_message() -> str:
         return "OSIA is still working in this conversation."
 
+    def _handle_waiting_tool_command(conv_id: str, text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(text or "").strip().casefold())
+        if not normalized:
+            return False
+        from osia.tool_attempts import get_tool_attempt_coordinator
+
+        coordinator = get_tool_attempt_coordinator()
+        if normalized in {
+            "cancel", "cancel action", "stop action", "annule", "annuler",
+            "annule l'action", "arr\u00eate l'action",
+        }:
+            return coordinator.request_cancellation(conv_id)
+        if normalized in {
+            "continue", "resume", "relaunch", "continue action",
+            "reprends", "reprendre", "relance", "continuer",
+        }:
+            return coordinator.request_reconciliation(conv_id)
+        return False
+
     def _is_conversation_busy(conv_id: str | None) -> bool:
         if not conv_id:
             return False
@@ -1494,6 +1513,7 @@ def wake_mode():
         }
 
         prev_history_len = len(history)
+        suspended_tool_turn = [False]
 
         def _voice_tts_allowed() -> bool:
             return voice_response and not (
@@ -1516,6 +1536,68 @@ def wake_mode():
                     language=turn_context.language,
                 )
 
+        def on_tool_attempt_status(status: str, attempt_id: str) -> None:
+            del attempt_id
+            print(f"[OSIA] normal chat tool status: {status}")
+            bridge.island_state.emit("thinking")
+
+        def on_tool_attempt_final(
+            attempt_id: str,
+            final_text: str,
+            error,
+        ) -> bool:
+            try:
+                if error is not None:
+                    final_text = (
+                        "Le r\u00e9sultat de l'action a \u00e9t\u00e9 conserv\u00e9, mais la "
+                        "reprise du m\u00eame fournisseur a \u00e9chou\u00e9. L'action "
+                        "n'a pas \u00e9t\u00e9 relanc\u00e9e."
+                        if turn_context.language == "fr" else
+                        "The action result was preserved, but continuation with "
+                        "the same provider failed. The action was not repeated."
+                    )
+                    turn_agent.messages.append({
+                        "role": "assistant", "content": final_text,
+                    })
+                _persist_agent_delta(
+                    conv_id,
+                    turn_agent,
+                    prev_history_len,
+                    user_display_text=user_display_text,
+                    turn_meta=turn_meta,
+                )
+                display = clean_response(final_text or "")
+                if error is None:
+                    bridge.assistant_stream_final.emit(conv_id, display)
+                else:
+                    bridge.assistant_stream_error.emit(conv_id, display)
+                if error is not None and _voice_tts_allowed():
+                    speak_streaming(
+                        display,
+                        session_id=tts_session_id,
+                        language=turn_context.language,
+                    )
+                return True
+            finally:
+                turn_agent.clear_tool_attempts()
+                _set_conversation_busy(conv_id, False)
+                bridge.conversations_changed.emit(
+                    active_conv["id"] if active_conv else ""
+                )
+
+        turn_agent.configure_tool_attempts(
+            conversation_id=conv_id,
+            turn_id=str(turn_meta.get("turn_id") or ""),
+            request_id=str(turn_meta.get("request_id") or ""),
+            final_response_message_id=str(
+                turn_meta.get("assistant_message_id") or ""
+            ),
+            status_callback=on_tool_attempt_status,
+            final_callback=on_tool_attempt_final,
+            on_sentence=on_stream_sentence,
+            on_first_token=on_first_token,
+        )
+
         try:
             if voice_response:
                 print(
@@ -1536,6 +1618,14 @@ def wake_mode():
                 current_conversation_id=conv_id,
                 turn_context=turn_context,
             )
+            from osia.tool_attempts import WAITING_TOOL_RESULT
+
+            if reply == WAITING_TOOL_RESULT:
+                suspended_tool_turn[0] = True
+                bridge.island_state.emit("thinking")
+                if not turn_agent.activate_pending_tool_attempt():
+                    raise RuntimeError("pending tool attempt could not be activated")
+                return
             if voice_response:
                 print(
                     f"[TTS] main.wake_mode: agent.run() returned "
@@ -1593,10 +1683,12 @@ def wake_mode():
                         language=turn_context.language,
                     )
         finally:
-            _set_conversation_busy(conv_id, False)
-            bridge.conversations_changed.emit(
-                active_conv["id"] if active_conv else ""
-            )
+            if not suspended_tool_turn[0]:
+                turn_agent.clear_tool_attempts()
+                _set_conversation_busy(conv_id, False)
+                bridge.conversations_changed.emit(
+                    active_conv["id"] if active_conv else ""
+                )
 
     # ── Manual activation handler (voice path) ──────────────────────────
 
@@ -1759,6 +1851,7 @@ def wake_mode():
                 conv = _ensure_active_conversation(user_text)
                 conv_id = conv["id"]
                 if _is_conversation_busy(conv_id):
+                    _handle_waiting_tool_command(conv_id, user_text)
                     _emit_voice_state("speaking")
                     speak(
                         _desktop_busy_message(),
@@ -1806,6 +1899,7 @@ def wake_mode():
         if attachment_turn:
             popup.bind_unbound_draft(conv_id)
         if _is_conversation_busy(conv_id):
+            _handle_waiting_tool_command(conv_id, display_text)
             popup.show_conversation_busy_notice()
             print("Send fired while this conversation is busy; rejected.")
             return False
@@ -3135,6 +3229,21 @@ def main():
         ensure_config_files(create_token=not sys.platform.startswith("linux"))
     except Exception as e:
         print(f"[CONFIG] ensure_config_files skipped: {e}")
+
+    try:
+        from osia.tool_attempts import recover_orphaned_tool_attempts
+
+        recovered_attempts = recover_orphaned_tool_attempts()
+        if recovered_attempts:
+            print(
+                f"[OSIA] reconciled {len(recovered_attempts)} orphaned "
+                "tool attempt(s) without replay"
+            )
+    except Exception as e:
+        print(
+            "[OSIA] tool-attempt startup recovery skipped: "
+            f"{type(e).__name__}"
+        )
 
     # One-time tool health check: logs which tool categories (bash, file
     # read, browser) are usable so missing dependencies show up at startup

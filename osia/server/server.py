@@ -102,6 +102,7 @@ import tempfile
 import threading
 import time
 import traceback
+import unicodedata
 import wave
 from collections import OrderedDict, deque
 from datetime import datetime
@@ -353,11 +354,15 @@ def _log_active_model() -> None:
         settings = load_settings()
         selected = settings.get("selected_model")
         if selected:
-            try:
-                from osia.models import provider_for_model
-                provider = provider_for_model(selected)
-            except Exception:
-                provider = "unknown"
+            provider = str(
+                settings.get("selected_model_provider") or ""
+            ).strip()
+            if not provider:
+                try:
+                    from osia.models import provider_for_model_cached
+                    provider = provider_for_model_cached(selected)
+                except Exception:
+                    provider = "unknown"
             model = selected
             source = "settings.json (selected_model)"
         else:
@@ -1883,7 +1888,9 @@ async def _send_existing_turn_status(
     if not meta or meta.get("client_request_id") != client_request_id:
         return False
     await channel.send_json(_turn_accepted_frame(meta))
-    await channel.send_json(_turn_status_frame(meta, "running"))
+    await channel.send_json(
+        _turn_status_frame(meta, _active_turn_working_status(conv_id))
+    )
     return True
 
 
@@ -1897,6 +1904,167 @@ async def _send_existing_turn_status_for_request(
     if not conv_id:
         return False
     return await _send_existing_turn_status(channel, conv_id, client_request_id)
+
+
+_RESUME_VERIFICATION_SUFFIXES = frozenset({
+    (),
+    ("action",),
+    ("and", "verify"),
+    ("and", "verify", "current", "action"),
+    ("and", "verify", "the", "current", "action"),
+    ("checking", "current", "action"),
+    ("checking", "the", "current", "action"),
+    ("et", "verifie"),
+    ("et", "verifier"),
+    ("et", "verifie", "l", "action", "en", "cours"),
+    ("et", "verifier", "l", "action", "en", "cours"),
+    ("la", "verification", "de", "l", "action", "en", "cours"),
+})
+_RESUME_VERBS = frozenset({
+    "continue", "continuer", "relaunch", "relance", "relancer",
+    "reprendre", "reprends", "resume",
+})
+_WAITING_STATUS_COMMANDS = frozenset({
+    ("check",),
+    ("check", "action"),
+    ("check", "current", "action"),
+    ("check", "status"),
+    ("check", "current", "status"),
+    ("status",),
+    ("action", "status"),
+    ("statut",),
+    ("verifie", "le", "statut"),
+    ("verifier", "le", "statut"),
+    ("verifie", "l", "action", "en", "cours"),
+    ("verifier", "l", "action", "en", "cours"),
+})
+
+
+def _active_turn_working_status(conv_id: str) -> str:
+    """Return one additive non-terminal state for reconnect/status recovery."""
+
+    meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id) or {}
+    remembered = str(meta.get("_tool_attempt_status") or "")
+    try:
+        from osia.tool_attempts import get_tool_attempt_store
+
+        attempt = get_tool_attempt_store().find_compatible_suspended_turn(conv_id)
+    except Exception:
+        attempt = None
+    if isinstance(attempt, dict):
+        status = str(attempt.get("status") or "")
+        if status == "waiting_verification":
+            return "waiting_verification"
+        if status in {"accepted", "running", "pending"}:
+            return "action_running"
+        if status == "cancellation_requested":
+            return "cancellation_requested"
+    if remembered in {
+        "waiting_tool_result", "waiting_verification", "verifying",
+        "resuming", "cancellation_requested", "action_in_progress",
+        "action_running",
+    }:
+        return remembered
+    return "working"
+
+
+async def _send_recovered_turn_state(
+    channel: "_OutboundChannel", conv_id: str,
+) -> bool:
+    """Rebind a connected client to an existing turn with fresh event ids."""
+
+    meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
+    if not isinstance(meta, dict) or not _is_conversation_busy(conv_id):
+        return False
+    accepted = _turn_event_frame(
+        meta,
+        "turn_accepted",
+        message_id=str(meta.get("user_message_id") or ""),
+        payload={
+            "persisted": bool(meta.get("persisted")),
+            "recovered": True,
+        },
+    )
+    status = _turn_status_frame(meta, _active_turn_working_status(conv_id))
+    status["recovered"] = True
+    busy = _conversation_busy_changed_frame(conv_id, True, meta)
+    busy["recovered"] = True
+    await channel.send_json(accepted)
+    await channel.send_json(status)
+    await channel.send_json(busy)
+    return True
+
+
+def _normalized_waiting_command_tokens(text: str) -> tuple[str, ...]:
+    raw = str(text or "").strip()
+    if not raw or len(raw) > 160:
+        return ()
+    folded = unicodedata.normalize("NFKD", raw.casefold())
+    ascii_text = "".join(
+        char for char in folded if not unicodedata.combining(char)
+    )
+    normalized = re.sub(r"[^a-z0-9]+", " ", ascii_text).strip()
+    tokens = tuple(normalized.split())
+    return tokens if len(tokens) <= 8 else ()
+
+
+def _is_resume_reconciliation_command(text: str) -> bool:
+    """Match only an anchored resume verb plus a bounded verification suffix."""
+
+    original = unicodedata.normalize("NFC", str(text or "")).casefold().lstrip()
+    if re.match(r"^r(?:ésume|ésumé)(?:\W|$)", original):
+        # French "résume/résumé" means summarize/summary, not resume work.
+        return False
+    tokens = _normalized_waiting_command_tokens(text)
+    return bool(
+        tokens
+        and tokens[0] in _RESUME_VERBS
+        and tokens[1:] in _RESUME_VERIFICATION_SUFFIXES
+    )
+
+
+async def _handle_waiting_tool_command(
+    channel: "_OutboundChannel",
+    conv_id: str,
+    text: str,
+) -> bool:
+    """Resolve control prose against a suspended attempt without a new turn."""
+
+    from osia.tool_attempts import get_tool_attempt_coordinator
+
+    coordinator = get_tool_attempt_coordinator()
+    if coordinator.store.find_compatible_suspended_turn(conv_id) is None:
+        return False
+    tokens = _normalized_waiting_command_tokens(text)
+    normalized = " ".join(tokens)
+    if normalized in {
+        "cancel", "cancel action", "stop action", "annule", "annuler",
+        "annule l action", "arrete l action",
+    }:
+        handled = coordinator.request_cancellation(conv_id)
+        status = "cancellation_requested"
+    elif _is_resume_reconciliation_command(text):
+        handled = coordinator.request_reconciliation(conv_id)
+        status = "verifying"
+    elif tokens in _WAITING_STATUS_COMMANDS:
+        handled = True
+        status = _active_turn_working_status(conv_id)
+    else:
+        # The conversation is occupied by the suspended turn. Consume the
+        # command on this bounded control path and report busy truthfully; it
+        # must never fall through into a separate provider or Autonomous turn.
+        await _send_conversation_busy(channel, conv_id)
+        meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
+        if isinstance(meta, dict):
+            await channel.send_json(
+                _turn_status_frame(meta, _active_turn_working_status(conv_id))
+            )
+        return True
+    if handled:
+        meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
+        if isinstance(meta, dict):
+            await channel.send_json(_turn_status_frame(meta, status))
+    return handled
 
 
 async def _send_persisted_turn_for_request(
@@ -3803,6 +3971,26 @@ async def _reconcile_legacy_uploads_at_startup() -> None:
     removed = reconcile_legacy_uploads(UPLOAD_DIR)
     if removed:
         print(f"[OSIA Server] removed {removed} orphaned legacy upload(s)")
+
+
+@app.on_event("startup")
+async def _recover_tool_attempts_at_startup() -> None:
+    """Resolve orphaned durable attempts without replaying their action."""
+
+    try:
+        from osia.tool_attempts import recover_orphaned_tool_attempts
+
+        recovered = await asyncio.to_thread(recover_orphaned_tool_attempts)
+        if recovered:
+            print(
+                f"[OSIA Server] reconciled {len(recovered)} orphaned "
+                "tool attempt(s) without replay"
+            )
+    except Exception as exc:
+        print(
+            "[OSIA Server] tool-attempt recovery skipped "
+            f"category={type(exc).__name__}"
+        )
 
 
 @app.on_event("startup")
@@ -6842,9 +7030,10 @@ async def websocket_endpoint(ws: WebSocket):
                     for _cron_frame in _pending_cron_notifications():
                         await ws.send_json(_cron_frame)
                     for _busy_id in _active_conversation_busy_ids():
-                        await ws.send_json(
-                            _conversation_busy_changed_frame(_busy_id, True)
-                        )
+                        if not await _send_recovered_turn_state(out, _busy_id):
+                            await ws.send_json(
+                                _conversation_busy_changed_frame(_busy_id, True)
+                            )
                     print("[OSIA Server] Mobile client authenticated.")
                     # Start the live system-metrics push for this client. The
                     # loop self-gates on heartbeat_enabled; guard against a
@@ -9220,6 +9409,7 @@ async def websocket_endpoint(ws: WebSocket):
                 requested_conversation_id = str(
                     msg.get("conversation_id") or ""
                 ).strip()
+                waiting_turn_command = msg.get("waiting_turn_command") is True
                 content_identity = (
                     f"{user_text}\0{attachment_batch_id}"
                     if attachment_batch_id else user_text
@@ -9294,6 +9484,10 @@ async def websocket_endpoint(ws: WebSocket):
                         })
                         continue
                     if _is_conversation_busy(_conv):
+                        if await _handle_waiting_tool_command(
+                            out, _conv, user_text,
+                        ):
+                            continue
                         if await _send_existing_turn_status(
                             out,
                             _conv,
@@ -9301,6 +9495,17 @@ async def websocket_endpoint(ws: WebSocket):
                         ):
                             continue
                         await _send_conversation_busy(out, _conv)
+                        continue
+                    if waiting_turn_command:
+                        # The suspended turn may have reached terminal between
+                        # Mobile's tap and this receive-loop iteration. Never
+                        # reinterpret that bounded control command as a new
+                        # provider turn; refresh canonical history instead.
+                        settled = conversations.get_conversation(_conv)
+                        if settled is not None:
+                            await out.send_json(
+                                _conversation_history_frame(settled)
+                            )
                         continue
                     committed_attachments = []
                     if attachment_batch_id:
@@ -10340,6 +10545,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         if isinstance(turn_meta, dict)
         else None
     )
+    pending_turn_holder = [None]
 
     def on_first_token() -> None:
         # Called from the agent worker thread the moment the first
@@ -10455,6 +10661,137 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         document_loop = asyncio.get_running_loop()
         document_progress_futures = []
 
+        async def _finalize_pending_tool_attempt(
+            attempt_id: str,
+            final_text: str,
+            error,
+        ) -> bool:
+            del attempt_id
+            if error is not None:
+                final_text = (
+                    "Le r\u00e9sultat de l'action a \u00e9t\u00e9 conserv\u00e9, mais la "
+                    "reprise du m\u00eame fournisseur a \u00e9chou\u00e9. L'action "
+                    "n'a pas \u00e9t\u00e9 relanc\u00e9e."
+                    if turn_context.language == "fr" else
+                    "The action result was preserved, but continuation with "
+                    "the same provider failed. The action was not repeated."
+                )
+                agent.messages.append({"role": "assistant", "content": final_text})
+            from osia.agent import clean_response, strip_raw_tool_tags
+
+            final_text = clean_response(
+                strip_raw_tool_tags(final_text or "")
+            ).strip()
+            if not final_text:
+                final_text = localized_text(
+                    "empty_completion", turn_context.language,
+                )
+            response_frame = _turn_event_frame(
+                turn_meta,
+                "response",
+                message_id=str(turn_meta.get("assistant_message_id") or ""),
+                payload={"content": final_text},
+            )
+            terminal_frame = _turn_status_frame(
+                turn_meta, "done" if error is None else "error",
+            )
+            if error is not None:
+                terminal_frame.update({
+                    "stage": "tool_continuation",
+                    "error_category": "same_provider_continuation_failed",
+                    "reason_code": "same_provider_continuation_failed",
+                })
+            persisted = _persist_completed_assistant_message(
+                active_conv_id,
+                final_text,
+                turn_meta,
+                response_frame,
+                terminal_frame,
+            )
+            if persisted:
+                await _broadcast_committed_receipt(
+                    active_conv_id, turn_meta.get("_assistant_commit"),
+                )
+                turn_meta["persisted"] = True
+                terminal_frame["persisted"] = True
+            try:
+                await ws.send_json(
+                    _turn_event_frame(
+                        turn_meta,
+                        "response_chunk",
+                        message_id=str(
+                            turn_meta.get("assistant_message_id") or ""
+                        ),
+                        payload={"content": final_text},
+                    )
+                )
+                await ws.send_json(response_frame)
+                await ws.send_json(terminal_frame)
+            except Exception as send_error:
+                print(
+                    "[OSIA Server] pending tool final delivery failed "
+                    f"category={type(send_error).__name__}"
+                )
+            if turn_meta.get("tts_enabled", True) is not False:
+                resumed_tts = _ResponseTTSSession(
+                    ws, turn_meta, t0, language=turn_context.language,
+                )
+                if _track_response_audio_task(resumed_tts.start(), turn_meta):
+                    resumed_tts.enqueue(final_text)
+                    resumed_tts.finish_input(final_text)
+                    resumed_tts.mark_text_final_sent()
+                else:
+                    resumed_tts.cancel()
+            else:
+                await _send_response_media_terminal(ws, turn_meta, "done")
+            holder = pending_turn_holder[0]
+            if holder is not None:
+                _clear_conversation_turn(active_conv_id, holder)
+                if not holder.done():
+                    holder.set_result(None)
+            await _broadcast_conversation_busy_changed(
+                active_conv_id, False, turn_meta,
+            )
+            clear_attempts = getattr(agent, "clear_tool_attempts", None)
+            if callable(clear_attempts):
+                clear_attempts()
+            log_final(turn_context, final_text)
+            return bool(persisted)
+
+        def _tool_attempt_status(status: str, attempt_id: str) -> None:
+            del attempt_id
+            safe_status = {
+                "waiting_tool_result": "waiting_tool_result",
+                "verifying_tool_result": "verifying",
+                "resuming_tool_turn": "resuming",
+                "cancellation_requested": "cancellation_requested",
+            }.get(str(status), "action_in_progress")
+            turn_meta["_tool_attempt_status"] = safe_status
+
+            async def _publish_status():
+                frame = _turn_status_frame(turn_meta, safe_status)
+                try:
+                    await ws.send_json(frame)
+                except Exception:
+                    pass
+                await _broadcast_turn_status(
+                    turn_meta, safe_status, exclude=ws, frame=frame,
+                )
+
+            asyncio.run_coroutine_threadsafe(_publish_status(), document_loop)
+
+        def _tool_attempt_final(attempt_id: str, final_text: str, error) -> bool:
+            future = asyncio.run_coroutine_threadsafe(
+                _finalize_pending_tool_attempt(
+                    attempt_id, final_text, error,
+                ),
+                document_loop,
+            )
+            try:
+                return bool(future.result(timeout=120.0))
+            except Exception:
+                return False
+
         def _chat_document_progress(payload: dict) -> None:
             frame = _document_progress_frame(
                 payload,
@@ -10486,6 +10823,20 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             ),
             "turn_context": turn_context,
         }
+        configure_attempts = getattr(agent, "configure_tool_attempts", None)
+        if callable(configure_attempts):
+            configure_attempts(
+                conversation_id=active_conv_id,
+                turn_id=str((turn_meta or {}).get("turn_id") or ""),
+                request_id=str((turn_meta or {}).get("request_id") or ""),
+                final_response_message_id=str(
+                    (turn_meta or {}).get("assistant_message_id") or ""
+                ),
+                status_callback=_tool_attempt_status,
+                final_callback=_tool_attempt_final,
+                on_sentence=on_sentence,
+                on_first_token=on_first_token,
+            )
 
         def _run_agent_busy_tracked():
             try:
@@ -10520,6 +10871,47 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             f"({len(response_text or '')} chars)",
             flush=True,
         )
+        from osia.tool_attempts import WAITING_TOOL_RESULT
+
+        if response_text == WAITING_TOOL_RESULT:
+            await _cancel_turn_progress_task(progress_task)
+            progress_task = None
+            for future in pending_puts:
+                try:
+                    await asyncio.wrap_future(future)
+                except Exception:
+                    pass
+            await chunk_queue.put(_SENTINEL)
+            await sender_task
+            provisional_chunks.clear()
+            if tts_session is not None:
+                tts_session.cancel()
+            current_task = asyncio.current_task()
+            holder = document_loop.create_future()
+            if (
+                active_conv_id
+                and current_task is not None
+                and _ACTIVE_TURNS_BY_CONV.get(active_conv_id) is current_task
+            ):
+                _ACTIVE_TURNS_BY_CONV[active_conv_id] = holder
+                pending_turn_holder[0] = holder
+            waiting_frame = _turn_status_frame(
+                turn_meta, "waiting_tool_result",
+            )
+            await ws.send_json(waiting_frame)
+            await _broadcast_turn_status(
+                turn_meta,
+                "waiting_tool_result",
+                exclude=ws,
+                frame=waiting_frame,
+            )
+            if not agent.activate_pending_tool_attempt():
+                if pending_turn_holder[0] is holder:
+                    _clear_conversation_turn(active_conv_id, holder)
+                    if not holder.done():
+                        holder.set_result(None)
+                raise RuntimeError("pending tool attempt could not be activated")
+            return agent.exported_history(), active_conv_id
     except asyncio.CancelledError:
         # Turn cancelled (client disconnected, or the conversation was
         # deleted/superseded mid-stream). The agent worker thread is
@@ -10846,6 +11238,9 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     _ts(t0, "turn final frame sent")
 
     _ts(t0, "request complete")
+    clear_attempts = getattr(agent, "clear_tool_attempts", None)
+    if callable(clear_attempts):
+        clear_attempts()
     return new_history, active_conv_id
 
 

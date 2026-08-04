@@ -17,7 +17,13 @@ import pytest
 from osia import action_policy
 from osia import agent as agent_module
 from osia.tools import browser
-from osia.tools.browser_forms import FORM_REFERENCE_TTL_SECONDS, SemanticFormSession
+from osia.tools.browser_forms import (
+    FORM_FIELD_ACTION_TIMEOUT_MS,
+    FORM_FILL_TIMEOUT_SECONDS,
+    FORM_REFERENCE_TTL_SECONDS,
+    FORM_VALIDATION_TIMEOUT_MS,
+    SemanticFormSession,
+)
 
 
 PRIVATE_MARKER = "WOR176_PRIVATE_MARKER_DO_NOT_LEAK"
@@ -64,6 +70,8 @@ def _form_html(cross_port: int) -> bytes:
   <input name="private_placeholder" placeholder="{PRIVATE_MARKER}">
   <label for="long">{long_label}</label><input id="long" name="long_label">
   <label for="react">React field</label><input id="react" name="react_field">
+  <label for="delayed-react">Delayed React field</label>
+  <input id="delayed-react" name="delayed_react_field">
   <label for="lost">Lost React field</label><input id="lost" name="lost_react">
   <label for="delayed">Delayed validation</label><input id="delayed" name="delayed_invalid">
   <label for="mismatch">Mismatch</label><input id="mismatch" name="mismatch">
@@ -78,6 +86,13 @@ document.querySelector('#react').addEventListener('input', event => {{
   const clone = event.target.cloneNode(true);
   clone.value = event.target.value;
   event.target.replaceWith(clone);
+}});
+document.querySelector('#delayed-react').addEventListener('input', event => {{
+  setTimeout(() => {{
+    const clone = event.target.cloneNode(true);
+    clone.value = event.target.value;
+    event.target.replaceWith(clone);
+  }}, 100);
 }});
 document.querySelector('#lost').addEventListener('input', event => {{
   const clone = event.target.cloneNode(true);
@@ -224,6 +239,22 @@ def _error_category(result: str) -> str:
     return json.loads(result.split(":", 1)[1])["category"]
 
 
+def test_semantic_fill_budget_chain_is_strictly_nested():
+    assert FORM_FIELD_ACTION_TIMEOUT_MS == 5000
+    assert FORM_VALIDATION_TIMEOUT_MS == 5000
+    assert FORM_FILL_TIMEOUT_SECONDS == 18.0
+    assert FORM_FILL_TIMEOUT_SECONDS < 22.0
+    assert browser._owner is not None
+    assert agent_module._configured_tool_timeout_seconds(
+        agent_module._tool_spec_and_contract(
+            "fill_form_field",
+            {"field_ref": "fld_AAAAAAAAAAAAAAAAAAAAAAAA", "value": "x"},
+        )[0],
+        "fill_form_field",
+        {},
+    ) == 24.0
+
+
 def test_bounded_semantic_snapshot_frames_duplicates_and_no_values(controlled_browser):
     _navigate(controlled_browser)
     raw, snapshot = _snapshot(max_fields=100)
@@ -295,6 +326,12 @@ def test_verified_fill_control_types_rerenders_and_safe_failures(controlled_brow
     assert parsed["changed"] is True
     assert parsed["normalized_length"] == len(VALUE_MARKER)
     assert "screenshot" not in parsed
+    assert parsed["receipt"] == {
+        "dispatch_state": "effect_confirmed",
+        "outcome": "confirmed_success",
+        "reason_code": "semantic_fill_verified",
+        "schema_version": 1,
+    }
     repeated = json.loads(browser.fill_form_field(refs["full_name"], VALUE_MARKER))
     assert repeated["verified"] is True
     assert repeated["changed"] is False
@@ -317,9 +354,16 @@ def test_verified_fill_control_types_rerenders_and_safe_failures(controlled_brow
     react = json.loads(browser.fill_form_field(refs["react_field"], "react-value"))
     assert react["verified"] is True
     assert react["reresolved"] is True
-    assert _error_category(
-        browser.fill_form_field(refs["lost_react"], "lost-value")
-    ) == "unverified_result"
+    delayed_react = json.loads(
+        browser.fill_form_field(refs["delayed_react_field"], "delayed-react-value")
+    )
+    assert delayed_react["verified"] is True
+    assert delayed_react["reresolved"] is True
+    lost_result = browser.fill_form_field(refs["lost_react"], "lost-value")
+    assert _error_category(lost_result) == "unverified_result"
+    lost_receipt = json.loads(lost_result.split(":", 1)[1])["receipt"]
+    assert lost_receipt["dispatch_state"] == "effect_unknown"
+    assert lost_receipt["outcome"] == "outcome_unknown"
     assert _error_category(
         browser.fill_form_field(refs["country"], "not-an-option")
     ) == "invalid_option"
@@ -329,9 +373,11 @@ def test_verified_fill_control_types_rerenders_and_safe_failures(controlled_brow
     assert _error_category(
         browser.fill_form_field(refs["mismatch"], "synthetic")
     ) == "postcondition_mismatch"
-    assert _error_category(
-        browser.fill_form_field(refs["disabled_field"], "synthetic")
-    ) == "disabled_field"
+    disabled_result = browser.fill_form_field(refs["disabled_field"], "synthetic")
+    assert _error_category(disabled_result) == "disabled_field"
+    disabled_receipt = json.loads(disabled_result.split(":", 1)[1])["receipt"]
+    assert disabled_receipt["dispatch_state"] == "not_dispatched"
+    assert disabled_receipt["outcome"] == "confirmed_failure_before_effect"
     assert _error_category(
         browser.fill_form_field(refs["readonly_field"], "synthetic")
     ) == "readonly_field"

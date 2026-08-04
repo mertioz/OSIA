@@ -47,7 +47,11 @@ from urllib.parse import quote_plus, urlsplit
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
-from osia.tools.browser_forms import FORM_MAX_FIELDS_DEFAULT, SemanticFormSession
+from osia.tools.browser_forms import (
+    FORM_MAX_FIELDS_DEFAULT,
+    SemanticFormSession,
+    form_fill_error_receipt,
+)
 from osia.tools.browser_artifacts import (
     BrowserArtifactError,
     MAX_DOWNLOAD_BYTES,
@@ -935,6 +939,14 @@ class _AsyncBrowserOwner:
     def call(self, operation, *args, timeout=None, **kwargs):
         if threading.get_ident() == self._owner_thread_id:
             raise RuntimeError("recursive browser-owner submission is forbidden")
+        from osia.tool_attempts import (
+            current_tool_attempt_id,
+            publish_tool_attempt_event,
+        )
+
+        tool_attempt_id = current_tool_attempt_id()
+        if tool_attempt_id:
+            publish_tool_attempt_event("browser_owner_accepted")
         loop = self._ensure_started()
         acknowledgement = threading.Event()
         future = asyncio.run_coroutine_threadsafe(
@@ -942,11 +954,21 @@ class _AsyncBrowserOwner:
         )
         outer_timeout = _OWNER_CALL_TIMEOUT_S if timeout is None else timeout
         try:
-            return future.result(timeout=outer_timeout)
+            if tool_attempt_id:
+                publish_tool_attempt_event("browser_owner_running")
+            result = future.result(timeout=outer_timeout)
+            if tool_attempt_id:
+                publish_tool_attempt_event("browser_owner_terminal_receipt")
+            return result
         except concurrent.futures.TimeoutError as exc:
             future.cancel()
             acknowledgement.wait(_OWNER_CANCEL_TIMEOUT_S)
             self.close()
+            if tool_attempt_id:
+                publish_tool_attempt_event(
+                    "browser_owner_cancellation_requested",
+                    "owner_timeout_effect_uncertain",
+                )
             raise _OwnerCallTimeout(
                 f"browser operation timed out after {outer_timeout:g}s"
             ) from exc
@@ -2168,8 +2190,22 @@ class _AsyncBrowserOwner:
             text=f"Navigated to: {safe_url_display(after_url)}",
         )
 
-    async def _op_activate(self, state_ref, element_ref, wait_spec=None):
+    async def _op_activate(
+        self, state_ref, element_ref, wait_spec=None, require_wait_spec=False,
+    ):
         started = time.time()
+        if require_wait_spec or wait_spec is not None:
+            try:
+                # Validate the observable postcondition before resolving the
+                # target or permitting the one mutating click. Agent-side
+                # schema repair is the primary gate; this owner-side check
+                # keeps direct canonical callers safe while legacy aliases
+                # retain their established argument contract.
+                wait_spec = WaitSpec.parse(wait_spec).to_dict()
+            except ValueError:
+                return self._receipt_failure(
+                    started_at=started, code="invalid_wait_spec",
+                )
         try:
             page, before = await self._resolve_state_page(state_ref, activate=True)
             locator = self._bound_refs.resolve(
@@ -3046,10 +3082,20 @@ class _AsyncBrowserOwner:
 
     def _emit_browser_progress(self, phase, **safe_values):
         self._download_phase = str(phase)[:32]
+        from osia.tool_attempts import (
+            current_tool_attempt_id,
+            publish_tool_attempt_event,
+        )
+
+        tool_attempt_id = current_tool_attempt_id()
+        if tool_attempt_id:
+            publish_tool_attempt_event("browser_progress", str(phase)[:32])
         callback = self._browser_progress_callback
         if callback is None:
             return
         frame = {"phase": str(phase)[:32]}
+        if tool_attempt_id:
+            frame["tool_attempt_id"] = tool_attempt_id
         for key, value in safe_values.items():
             if isinstance(value, str):
                 frame[str(key)[:32]] = value[:300]
@@ -3757,7 +3803,10 @@ class _AsyncBrowserOwner:
         try:
             page = await self._ensure_browser()
         except Exception:
-            return 'ERROR: {"category":"page_unavailable","ok":false}'
+            return form_fill_error_receipt(
+                "page_unavailable", str(field_ref or "")[:128],
+                dispatched=False,
+            )
         return await self._form_session.fill(
             page=page,
             context_generation=self._registry_generation,
@@ -4149,10 +4198,13 @@ def fill_form_field(field_ref: str, value) -> str:
     """Fill one opaque field reference and prove the resulting state."""
     try:
         return _owner.call(
-            "fill_form_field", field_ref, value, timeout=12.0,
+            "fill_form_field", field_ref, value, timeout=22.0,
         )
     except Exception:
-        return 'ERROR: {"category":"fill_failed","ok":false}'
+        return form_fill_error_receipt(
+            "owner_receipt_unavailable", str(field_ref or "")[:128],
+            dispatched=True,
+        )
 
 
 def get_web_state(expect_url=None, expect_text=None, expect_selector=None) -> dict:
@@ -4205,14 +4257,27 @@ def inspect_browser_page(
 
 
 def wait_for_browser_condition(state_ref: dict, wait_spec: dict) -> dict:
-    return _owner.call("wait_spec", state_ref, wait_spec, timeout=65.0)
+    try:
+        owner_timeout = max(
+            65.0, WaitSpec.parse(wait_spec).timeout_seconds + 5.0,
+        )
+    except ValueError:
+        owner_timeout = 65.0
+    return _owner.call("wait_spec", state_ref, wait_spec, timeout=owner_timeout)
 
 
 def activate_browser_element(
     state_ref: dict, element_ref: str, wait_spec: dict | None = None,
 ) -> dict:
+    try:
+        owner_timeout = max(
+            65.0, WaitSpec.parse(wait_spec).timeout_seconds + 5.0,
+        )
+    except ValueError:
+        owner_timeout = 65.0
     return _owner.call(
-        "activate", state_ref, element_ref, wait_spec, timeout=65.0,
+        "activate", state_ref, element_ref, wait_spec, True,
+        timeout=owner_timeout,
     )
 
 
