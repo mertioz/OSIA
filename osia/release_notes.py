@@ -63,6 +63,91 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="1.1.3",
+        released_on="2026-08-04",
+        public=True,
+        changes_en=(),
+        changes_fr=(),
+        summary_en=(
+            "Long-running and uncertain tool actions now use a durable attempt lifecycle with waiting, verification, and same-turn resumption instead of redispatch.",
+            "Sleep/wake and Mobile reconnect restore the existing attempt and suppress false Retry prompts, duplicate effects, and fallback execution.",
+            "Normal Chat and Autonomous now share one orchestration, and Chat-to-Autonomous handoff attaches to an existing attempt instead of creating another action.",
+            "Cancellation now distinguishes before-dispatch, requested, verified, and unknown-effect states while preserving precise fail-closed results.",
+            "Provider/model continuity, anti-replay, no-fallback behavior, and localized waiting, verifying, resuming, and blocked states persist across recovery.",
+        ),
+        summary_fr=(
+            "Les actions longues ou incertaines utilisent désormais un cycle de vie durable des tentatives avec attente, vérification et reprise du même tour sans renvoi.",
+            "Veille/réveil et reconnexion Mobile restaurent la tentative existante et évitent faux Retry, effets dupliqués et exécution de fallback.",
+            "Chat normal et Autonomous partagent une orchestration ; le transfert Chat vers Autonomous s’attache à la tentative existante sans recréer l’action.",
+            "L’annulation distingue avant envoi, demandée, vérifiée et effet inconnu, tout en conservant des résultats précis et fail-closed.",
+            "Continuité fournisseur/modèle, anti-rejeu, absence de fallback et états localisés d’attente, vérification, reprise et blocage persistent après récupération.",
+        ),
+        sections=(
+            ReleaseSection(
+                "Durable attempts and same-turn resumption",
+                "Tentatives durables et reprise du même tour",
+                (
+                    "A durable tool-attempt lifecycle records acceptance, dispatch, waiting, verification, terminal outcome, and the exact mutation identity across process and transport interruptions.",
+                    "A delayed or uncertain result resumes the same turn from its existing attempt after verification instead of asking the provider to issue the action again.",
+                    "Timeout no longer implies failure or authorizes a duplicate action; an unknown effect remains blocked until verification proves the outcome or the bounded deadline expires.",
+                    "Normal Chat and Autonomous use the same attempt store, reconciliation rules, and terminal-result contract rather than parallel recovery implementations.",
+                ),
+                (
+                    "Un cycle de vie durable des tentatives d’outil conserve acceptation, envoi, attente, vérification, résultat terminal et identité exacte de mutation malgré les coupures de processus ou de transport.",
+                    "Un résultat retardé ou incertain reprend le même tour depuis sa tentative existante après vérification, sans demander au fournisseur de réémettre l’action.",
+                    "Un timeout ne signifie plus échec et n’autorise aucune action dupliquée ; un effet inconnu reste bloqué jusqu’à preuve du résultat ou expiration de la limite de vérification.",
+                    "Chat normal et Autonomous utilisent le même store de tentatives, les mêmes règles de réconciliation et le même contrat de résultat terminal, sans récupération parallèle.",
+                ),
+            ),
+            ReleaseSection(
+                "Recovery across devices and orchestration",
+                "Récupération entre appareils et orchestration",
+                (
+                    "Windows sleep and wake recovery keeps conversation, turn, request, attempt, provider, and model identity while restoring waiting and delivering one final response.",
+                    "Mobile reconnect recovery restores the active waiting state without a false Retry control, a new request, or a second tool dispatch.",
+                    "Autonomous wake and restart reconcile the durable attempt before any retry or replan and keep an unknown external effect fail-closed.",
+                    "Chat-to-Autonomous handoff attaches the mission to the existing attempt and preserves one canonical action, one mutation, and one final outcome.",
+                ),
+                (
+                    "La récupération après veille et réveil Windows conserve conversation, tour, requête, tentative, fournisseur et modèle, restaure l’attente et livre une seule réponse finale.",
+                    "La reconnexion Mobile restaure l’attente active sans faux contrôle Retry, nouvelle requête ni second envoi d’outil.",
+                    "Le réveil ou redémarrage Autonomous réconcilie la tentative durable avant tout retry ou replan et maintient fail-closed un effet externe inconnu.",
+                    "Le transfert Chat vers Autonomous attache la mission à la tentative existante et conserve une action canonique, une mutation et un résultat final uniques.",
+                ),
+            ),
+            ReleaseSection(
+                "Precise cancellation and unknown outcomes",
+                "Annulation précise et résultats inconnus",
+                (
+                    "Cancellation before dispatch proves that no effect occurred, executes no mutation, and reports the exact cancelled-before-effect result.",
+                    "Cancellation requested after dispatch does not pretend the action stopped; OSIA waits for verification and reports the verified success or fail-closed unknown outcome.",
+                    "Verification-deadline expiry produces a precise unknown-after-start diagnosis without replay, retry, replan, provider fallback, or a misleading success or failure claim.",
+                ),
+                (
+                    "L’annulation avant envoi prouve l’absence d’effet, n’exécute aucune mutation et renvoie le résultat exact annulé avant effet.",
+                    "Une annulation demandée après envoi ne prétend pas que l’action s’est arrêtée ; OSIA attend la vérification puis rapporte le succès vérifié ou le résultat inconnu fail-closed.",
+                    "L’expiration de la vérification produit un diagnostic précis d’effet inconnu après démarrage, sans rejeu, retry, replan, fallback fournisseur ni faux succès ou échec.",
+                ),
+            ),
+            ReleaseSection(
+                "Continuity, anti-replay, and localized state",
+                "Continuité, anti-rejeu et états localisés",
+                (
+                    "The exact provider and model remain pinned through waiting, verification, reconnect, restart, handoff, and finalization, with no fallback to another model or provider.",
+                    "Mutation authority stays single-use across Chat, Autonomous, LAN, WebRTC, and relay recovery so rerenders, reconnects, and late completions cannot replay an effect.",
+                    "Waiting, verifying, resuming, cancellation, success, and blocked-unknown states are projected consistently to PC and Mobile with localized English and French copy.",
+                    "Windows 1.1.2 remains the validated rollback; Windows 1.1.3 remains NotSigned with no publisher claim and preserves the bounded official unsigned-Stable policy.",
+                ),
+                (
+                    "Le fournisseur et modèle exacts restent figés pendant attente, vérification, reconnexion, redémarrage, transfert et finalisation, sans aucun fallback vers un autre choix.",
+                    "L’autorité de mutation reste à usage unique entre Chat, Autonomous, LAN, WebRTC et relay afin qu’un rerender, une reconnexion ou une fin tardive ne rejoue aucun effet.",
+                    "Les états attente, vérification, reprise, annulation, succès et blocage inconnu sont cohérents sur PC et Mobile avec textes localisés en anglais et français.",
+                    "Windows 1.1.2 reste le rollback validé ; Windows 1.1.3 reste NotSigned sans éditeur revendiqué et conserve la politique Stable non signée officielle et bornée.",
+                ),
+            ),
+        ),
+    ),
+    ReleaseEntry(
         version="1.1.2",
         released_on="2026-08-03",
         public=True,

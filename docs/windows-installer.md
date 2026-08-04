@@ -72,7 +72,7 @@ byte size and SHA-256 remain mandatory, and the complete download is rehashed
 before execution. An arbitrary `signed: false` manifest is not trusted. Remove
 this isolated policy when WOR-220 introduces recognized Authenticode signing.
 
-The public Windows 1.1.0, 1.1.1, and 1.1.2 installers are intentionally unsigned and
+The public Windows 1.1.0, 1.1.1, 1.1.2, and 1.1.3 installers are intentionally unsigned and
 their manifests record `signed: false` with no publisher claim. Windows may show **Unknown
 publisher** / **Éditeur inconnu** or a Microsoft Defender SmartScreen warning.
 Users should download only from the official OSIA HTTPS domain, verify the
@@ -87,7 +87,7 @@ correction before their manifest check. They may reject the next unsigned
 Stable release with `stable_unsigned` (sometimes reported as
 `stable_notsigned`). A Windows 1.1.1 installation with Preview explicitly
 enabled can use the existing unsigned-preview path; otherwise use the official
-immutable installer directly. The validated rollback bridge remains:
+immutable installer directly. That one-time legacy bridge remains:
 
 - `https://download.osia.space/windows/1.1.1/OSIA-Setup.exe`
 - 1,185,800,867 bytes
@@ -96,6 +96,13 @@ immutable installer directly. The validated rollback bridge remains:
 Verify both values, close OSIA, and run the installer in place. Do not uninstall
 first, clear `%USERPROFILE%\.osia`, or disable SmartScreen, Defender, antivirus,
 or any other Windows protection.
+
+The validated rollback for Windows 1.1.3 is the immutable public Windows 1.1.2
+installer:
+
+- `https://download.osia.space/windows/1.1.2/OSIA-Setup.exe`
+- 1,185,770,433 bytes
+- SHA-256 `efa7a1d949fe366043ae3105bc973adb08beddf4df9e2f5858bb45793b193c8a`
 
 The stock PyAV wheel and bundled eSpeak NG runtime require the documented GPL
 source and notice process. See the installed `THIRD_PARTY_NOTICES.md`.

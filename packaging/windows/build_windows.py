@@ -48,8 +48,10 @@ SOURCE_VERSION = PRODUCT_VERSION
 DEFAULT_BUILD_CHANNEL = "internal-preview"
 ALLOWED_BUILD_CHANNELS = {"internal-preview", "stable"}
 # Build-time release authorization only. This is not embedded as updater trust;
-# runtime acceptance is governed by TEMPORARY_UNSIGNED_STABLE_POLICY.
-UNSIGNED_STABLE_RELEASES = frozenset({"1.1.0", "1.1.1", "1.1.2"})
+# runtime acceptance is governed by TEMPORARY_UNSIGNED_STABLE_POLICY.  WOR-183
+# keeps this temporary switch enabled until WOR-220 supplies recognized signing;
+# do not replace it with a version allowlist (WOR-66 C13).
+ALLOW_UNSIGNED_STABLE_BUILD = True
 UPDATER_SCHEMA_VERSION = 1
 
 _APPROVED_INNO_RUNTIME_CONSTANTS = frozenset({
@@ -756,7 +758,7 @@ def build(
         if (
             channel == "stable"
             and not signed_app
-            and version not in UNSIGNED_STABLE_RELEASES
+            and not ALLOW_UNSIGNED_STABLE_BUILD
         ):
             raise RuntimeError("stable builds require Authenticode signing")
         return None
@@ -787,7 +789,7 @@ def build(
     if (
         channel == "stable"
         and not (signed_app and signed_installer)
-        and version not in UNSIGNED_STABLE_RELEASES
+        and not ALLOW_UNSIGNED_STABLE_BUILD
     ):
         installer.unlink(missing_ok=True)
         raise RuntimeError("stable builds require signed application and installer artifacts")

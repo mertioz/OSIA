@@ -82,9 +82,9 @@ def _controller(monkeypatch, tmp_path, *, cached=False):
 
 def test_embedded_notes_load_offline_and_are_newest_first():
     assert [entry.version for entry in RELEASE_HISTORY] == [
-        "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
+        "1.1.3", "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
     ]
-    current = release_for_version("1.1.2")
+    current = release_for_version("1.1.3")
     assert current is not None and current.public
     assert not is_major_update(current.version)
     major = release_for_version("1.1.0")
@@ -102,6 +102,49 @@ def test_embedded_notes_load_offline_and_are_newest_first():
     assert internal is not None and not internal.public
     assert "superseded" in " ".join(internal.changes("en")).lower()
     assert manifest_release_notes("1.0.6") == list(internal_current.changes_en)
+
+
+def test_113_notes_are_complete_bilingual_and_manifest_compatible():
+    current = release_for_version("1.1.3")
+    assert current is not None and current.public
+    assert manifest_release_notes("1.1.3") == list(current.summary_en)
+    assert len(current.summary("en")) == len(current.summary("fr")) == 5
+    assert all(len(note) <= 240 for note in manifest_release_notes("1.1.3"))
+    assert len(current.sections) == 4
+    assert len(current.changes("en")) == len(current.changes("fr")) == 15
+
+    english = installer_release_notes("1.1.3", "en").lower()
+    french = installer_release_notes("1.1.3", "fr").lower()
+    for subject in (
+        "durable tool-attempt lifecycle",
+        "same turn",
+        "sleep and wake",
+        "mobile reconnect",
+        "chat-to-autonomous",
+        "cancellation",
+        "provider and model",
+        "no fallback",
+        "windows 1.1.2 remains the validated rollback",
+    ):
+        assert subject in english
+    for subject in (
+        "cycle de vie durable des tentatives",
+        "même tour",
+        "veille et réveil",
+        "reconnexion mobile",
+        "chat vers autonomous",
+        "annulation",
+        "fournisseur et modèle",
+        "aucun fallback",
+        "windows 1.1.2 reste le rollback validé",
+    ):
+        assert subject in french
+
+    raw = _manifest(version="1.1.3")
+    raw["releaseNotes"] = manifest_release_notes("1.1.3")
+    parsed = updater.parse_manifest(json.dumps(raw), _metadata("1.1.2"))
+    assert parsed.version == "1.1.3"
+    assert parsed.release_notes == tuple(manifest_release_notes("1.1.3"))
 
 
 def test_112_hotfix_notes_are_complete_bilingual_and_manifest_compatible():

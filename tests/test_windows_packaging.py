@@ -317,6 +317,7 @@ def test_wake_recovery_restarts_only_server(monkeypatch, tmp_path):
     monkeypatch.setattr(wake.sys, "platform", "win32")
     monkeypatch.setattr(wake, "_LOG_PATH", tmp_path / "wake.log")
     monkeypatch.setattr(wake, "_single_instance", lambda _log: Lock())
+    monkeypatch.setattr(wake, "_port_listening", lambda _port: False)
     monkeypatch.setattr(wake, "_wait_for_port", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(wake, "_find_server_children", lambda: [])
     monkeypatch.setattr(wake, "_port_listeners", lambda _port: [1234])
@@ -891,7 +892,7 @@ def test_build_uses_product_version_and_exact_installer_name():
     build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
     assert "from osia.version import PRODUCT_VERSION, parse_product_version" in build
     assert "SOURCE_VERSION = PRODUCT_VERSION" in build
-    assert 'PRODUCT_VERSION = "1.1.2"' in (ROOT / "osia" / "version.py").read_text("utf-8")
+    assert 'PRODUCT_VERSION = "1.1.3"' in (ROOT / "osia" / "version.py").read_text("utf-8")
     assert 'installer = RELEASE / "OSIA-Setup.exe"' in build
     assert "def _write_bundle_file_manifest" in build
     assert 'CODEX_RUNTIME_VERSION = "0.144.1"' in build
@@ -912,14 +913,14 @@ def test_build_identity_metadata_and_internal_override(monkeypatch, tmp_path):
     baseline = module._resolve_build_identity("internal-preview", "1.0.1")
     assert baseline["version"] == "1.0.1"
     assert baseline["override"] == {
-        "sourceVersion": "1.1.2", "version": "1.0.1", "channel": "internal-preview",
+        "sourceVersion": "1.1.3", "version": "1.0.1", "channel": "internal-preview",
     }
     metadata_path = module._write_app_metadata(baseline)
     embedded = __import__("osia.updater", fromlist=["parse_app_metadata"]).parse_app_metadata(
         metadata_path.read_bytes()
     )
     assert embedded.version == "1.0.1"
-    assert embedded.build_override["sourceVersion"] == "1.1.2"
+    assert embedded.build_override["sourceVersion"] == "1.1.3"
     with pytest.raises(ValueError, match="forbidden"):
         module._resolve_build_identity("stable", "1.0.1")
 
@@ -1055,11 +1056,12 @@ def test_wor183_major_update_is_explicit_localized_and_motion_safe():
     assert 'shutil.copy2(release_notes_fr, RELEASE / "release-notes-fr.txt")' in build
 
 
-def test_wor183_unsigned_stable_exception_is_explicit_and_version_scoped():
+def test_wor183_unsigned_stable_exception_has_no_future_version_allowlist():
     script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
     build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
-    assert 'UNSIGNED_STABLE_RELEASES = frozenset({"1.1.0", "1.1.1", "1.1.2"})' in build
-    assert "version not in UNSIGNED_STABLE_RELEASES" in build
+    assert "ALLOW_UNSIGNED_STABLE_BUILD = True" in build
+    assert "UNSIGNED_STABLE_RELEASES" not in build
+    assert "version not in UNSIGNED_STABLE_RELEASES" not in build
     assert "english.UpdateUnsigned=Unsigned installer" in script
     assert "french.UpdateUnsigned=Installateur non signé" in script
     assert "UpdateUnsignedLabel.Visible := ({#SignedBuild} = 0);" in script
