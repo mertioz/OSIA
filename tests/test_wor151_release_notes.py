@@ -82,9 +82,9 @@ def _controller(monkeypatch, tmp_path, *, cached=False):
 
 def test_embedded_notes_load_offline_and_are_newest_first():
     assert [entry.version for entry in RELEASE_HISTORY] == [
-        "1.1.3", "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
+        "1.1.4", "1.1.3", "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
     ]
-    current = release_for_version("1.1.3")
+    current = release_for_version("1.1.4")
     assert current is not None and current.public
     assert not is_major_update(current.version)
     major = release_for_version("1.1.0")
@@ -102,6 +102,45 @@ def test_embedded_notes_load_offline_and_are_newest_first():
     assert internal is not None and not internal.public
     assert "superseded" in " ".join(internal.changes("en")).lower()
     assert manifest_release_notes("1.0.6") == list(internal_current.changes_en)
+
+
+def test_114_notes_are_complete_bilingual_and_manifest_compatible():
+    current = release_for_version("1.1.4")
+    assert current is not None and current.public
+    assert manifest_release_notes("1.1.4") == list(current.summary_en)
+    assert len(current.summary("en")) == len(current.summary("fr")) == 5
+    assert all(len(note) <= 240 for note in manifest_release_notes("1.1.4"))
+    assert len(current.sections) == 3
+    assert len(current.changes("en")) == len(current.changes("fr")) == 9
+
+    english = installer_release_notes("1.1.4", "en").lower()
+    french = installer_release_notes("1.1.4", "fr").lower()
+    for subject in (
+        "active conversation, turn, and mission",
+        "normal chat and autonomous",
+        "legacy textual cancellation",
+        "do not create a provider turn",
+        "does not publish a separate mobile release or change the mobile interface",
+        "windows 1.1.3 remains the validated rollback",
+        "this release is windows-only. the next mobile update will be published separately.",
+    ):
+        assert subject in english
+    for subject in (
+        "conversation, de tour et de mission actifs",
+        "chat normal et autonomous",
+        "annulation textuelle historique",
+        "ne créent ni tour fournisseur",
+        "ne publie pas de release mobile séparée et ne modifie pas l’interface mobile",
+        "windows 1.1.3 reste le rollback validé",
+        "cette publication concerne windows uniquement. la prochaine mise à jour mobile sera publiée séparément.",
+    ):
+        assert subject in french
+
+    raw = _manifest(version="1.1.4")
+    raw["releaseNotes"] = manifest_release_notes("1.1.4")
+    parsed = updater.parse_manifest(json.dumps(raw), _metadata("1.1.3"))
+    assert parsed.version == "1.1.4"
+    assert parsed.release_notes == tuple(manifest_release_notes("1.1.4"))
 
 
 def test_113_notes_are_complete_bilingual_and_manifest_compatible():

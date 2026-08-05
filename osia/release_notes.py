@@ -63,6 +63,71 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="1.1.4",
+        released_on="2026-08-06",
+        public=True,
+        changes_en=(),
+        changes_fr=(),
+        summary_en=(
+            "Windows 1.1.4 improves the reliability and correlation of cancellation requests received from compatible Mobile clients.",
+            "Cancellation controls target the exact active conversation, turn, and mission so normal Chat and Autonomous work remain separate.",
+            "Existing Mobile clients and legacy textual cancellation remain compatible; no new Mobile interface is required for this Windows release.",
+            "Release maintenance preserves single-dispatch, fail-closed behavior and the existing updater compatibility policy.",
+            "This release is Windows-only. The next Mobile update will be published separately.",
+        ),
+        summary_fr=(
+            "Windows 1.1.4 améliore la fiabilité et la corrélation des demandes d’annulation reçues depuis les clients Mobile compatibles.",
+            "Les contrôles d’annulation ciblent exactement la conversation, le tour et la mission actifs afin de séparer Chat normal et Autonomous.",
+            "Les clients Mobile existants et l’annulation textuelle historique restent compatibles ; aucune nouvelle interface Mobile n’est requise.",
+            "La maintenance de cette publication préserve l’envoi unique, le comportement fail-closed et la politique de compatibilité de l’updater.",
+            "Cette publication concerne Windows uniquement. La prochaine mise à jour Mobile sera publiée séparément.",
+        ),
+        sections=(
+            ReleaseSection(
+                "Correlated cancellation control",
+                "Contrôle d’annulation corrélé",
+                (
+                    "The Windows server accepts an additive cancellation control scoped to the active conversation, turn, and mission identifiers.",
+                    "A stale or mismatched target fails safely and cannot cancel unrelated Chat or Autonomous work.",
+                    "Repeated cancellation controls remain idempotent and do not create a provider turn, a second mission, or duplicate work.",
+                ),
+                (
+                    "Le serveur Windows accepte un contrôle d’annulation additif limité aux identifiants de conversation, de tour et de mission actifs.",
+                    "Une cible obsolète ou incohérente échoue de façon sûre et ne peut pas annuler un autre travail Chat ou Autonomous.",
+                    "Les contrôles d’annulation répétés restent idempotents et ne créent ni tour fournisseur, ni seconde mission, ni travail dupliqué.",
+                ),
+            ),
+            ReleaseSection(
+                "Chat, Autonomous, and existing Mobile compatibility",
+                "Compatibilité Chat, Autonomous et Mobile existante",
+                (
+                    "Precise targeting keeps normal Chat and Autonomous cancellation state distinct while preserving the existing public server contract.",
+                    "Current Mobile clients and legacy textual cancellation remain supported; Windows 1.1.4 does not require a new Mobile interface.",
+                    "The additive Windows compatibility support does not publish a separate Mobile release or change the Mobile interface.",
+                ),
+                (
+                    "Le ciblage précis sépare les états d’annulation de Chat normal et Autonomous tout en préservant le contrat serveur public existant.",
+                    "Les clients Mobile actuels et l’annulation textuelle historique restent pris en charge ; Windows 1.1.4 n’exige pas de nouvelle interface Mobile.",
+                    "Ce support de compatibilité Windows additif ne publie pas de release Mobile séparée et ne modifie pas l’interface Mobile.",
+                ),
+            ),
+            ReleaseSection(
+                "Windows-only release maintenance",
+                "Maintenance de publication Windows uniquement",
+                (
+                    "Version, packaging, updater, and release metadata remain aligned on Windows 1.1.4 with strict host, path, size, and SHA-256 validation.",
+                    "Windows 1.1.3 remains the validated rollback; Windows 1.1.4 remains NotSigned with no publisher claim under the authorized general policy.",
+                    "This release is Windows-only. The next Mobile update will be published separately.",
+                ),
+                (
+                    "Version, packaging, updater et métadonnées de publication restent alignés sur Windows 1.1.4 avec validation stricte de l’hôte, du chemin, de la taille et du SHA-256.",
+                    "Windows 1.1.3 reste le rollback validé ; Windows 1.1.4 reste NotSigned sans éditeur revendiqué selon la politique générale autorisée.",
+                    "Cette publication concerne Windows uniquement. La prochaine mise à jour Mobile sera publiée séparément.",
+                ),
+            ),
+        ),
+    ),
+    ReleaseEntry(
         version="1.1.3",
         released_on="2026-08-04",
         public=True,
