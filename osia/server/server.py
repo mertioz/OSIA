@@ -38,6 +38,7 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "get_heartbeat_config"}                                   # request the live-heartbeat enable flag + push interval (seconds)
     {"type": "restart_server"}                                         # restart the server process in place via os.execv; acked with status "done" + "message": "restarting" first (WOR-28)
     {"type": "autonomous_start",     "objective": "...", "model": "..."}  # WOR-45 P5: begin ONE machine-global autonomous run (planner→orchestrator); refused with autonomous_progress{event:"busy"} if a run already holds the single-runner lock
+    {"type": "cancel_active_work", "schema_version": 1, "scope": "chat|autonomous", ...correlated target...}  # WOR-231: exact idempotent cancellation control; never a user turn
     {"type": "autonomous_interrupt"}                                   # WOR-45 P5: pause the autonomous run — state stays in_progress (resumable)
     {"type": "autonomous_abort"}                                       # WOR-45 P5: discard the autonomous run — marks state aborted then deletes the checkpoint
     {"type": "get_autonomous_status"}                                  # WOR-45 P5: request the current autonomous snapshot (or {event:"idle"}); a paused run reports {event:"interrupted"}; lets a phone reconnecting mid-run render progress
@@ -1812,13 +1813,17 @@ def _turn_accepted_frame(turn_meta: dict) -> dict:
 
 def _turn_status_frame(turn_meta: dict, status: str) -> dict:
     terminal = status in {"done", "error", "cancelled", "canceled", "rejected"}
+    payload = {"status": status, "persisted": bool(turn_meta.get("persisted"))}
+    tool_attempt_id = str(turn_meta.get("_tool_attempt_id") or "")
+    if tool_attempt_id:
+        payload["tool_attempt_id"] = tool_attempt_id
     return _turn_event_frame(
         turn_meta,
         "turn_status",
         message_id=str(turn_meta.get("assistant_message_id") or ""),
         terminal=terminal,
         cache_key=f"_terminal_frame_{status}" if terminal else None,
-        payload={"status": status, "persisted": bool(turn_meta.get("persisted"))},
+        payload=payload,
     )
 
 
@@ -1967,7 +1972,7 @@ def _active_turn_working_status(conv_id: str) -> str:
         "waiting_tool_result", "waiting_verification", "verifying",
         "resuming", "cancellation_requested", "action_in_progress",
         "action_running",
-        "action_starting", "blocked_unknown_effect",
+        "action_starting", "blocked_unknown_effect", "cancelled_proven",
     }:
         return remembered
     return "working"
@@ -2115,6 +2120,142 @@ def _apply_queued_tool_cancellation(turn_meta: dict, attempt_id: str) -> bool:
         and turn_meta.get("_tool_cancel_requested") is True
         and _request_exact_tool_attempt_cancellation(attempt_id)
     )
+
+
+def _clean_cancellation_target_id(value, *, maximum: int = 256) -> str:
+    target = str(value or "").strip()
+    if not target or len(target) > maximum:
+        return ""
+    if not all(char.isalnum() or char in "_.:-" for char in target):
+        return ""
+    return target
+
+
+async def _send_cancellation_rejection(
+    channel: "_OutboundChannel",
+    scope: str,
+    reason_code: str,
+    **target,
+) -> None:
+    await channel.send_json({
+        "type": "cancellation_control",
+        "schema_version": 1,
+        "scope": scope,
+        "state": "rejected",
+        "reason_code": reason_code,
+        **{key: value for key, value in target.items() if value},
+    })
+
+
+async def _handle_correlated_chat_cancellation(
+    channel: "_OutboundChannel", msg: dict,
+) -> bool:
+    """Request cancellation only for the exact active canonical chat turn."""
+
+    conv_id = _clean_cancellation_target_id(msg.get("conversation_id"))
+    request_id = _clean_client_request_id(
+        msg.get("request_id") or msg.get("client_request_id")
+    )
+    turn_id = _clean_cancellation_target_id(msg.get("turn_id"))
+    supplied_attempt_id = _clean_cancellation_target_id(
+        msg.get("tool_attempt_id"), maximum=160,
+    ) if msg.get("tool_attempt_id") else ""
+    target = {
+        "conversation_id": conv_id,
+        "request_id": request_id or "",
+        "client_request_id": request_id or "",
+        "turn_id": turn_id,
+        "tool_attempt_id": supplied_attempt_id,
+    }
+    if not conv_id or request_id is None or not turn_id:
+        await _send_cancellation_rejection(
+            channel, "chat", "incomplete_target", **target,
+        )
+        return False
+    meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
+    if not isinstance(meta, dict) or not _is_conversation_busy(conv_id):
+        await _send_cancellation_rejection(
+            channel, "chat", "target_not_active", **target,
+        )
+        return False
+    if (
+        str(meta.get("turn_id") or "") != turn_id
+        or str(meta.get("request_id") or meta.get("client_request_id") or "")
+        != request_id
+    ):
+        await _send_cancellation_rejection(
+            channel, "chat", "target_mismatch", **target,
+        )
+        await _send_recovered_turn_state(channel, conv_id)
+        return False
+
+    from osia.tool_attempts import (
+        TERMINAL_STATUSES,
+        ToolAttemptStatus,
+        get_tool_attempt_store,
+    )
+
+    store = get_tool_attempt_store()
+    attempt = store.find_compatible_suspended_turn(conv_id)
+    if isinstance(attempt, dict) and (
+        str(attempt.get("turn_id") or "") != turn_id
+        or str(attempt.get("request_id") or "") != request_id
+    ):
+        await _send_cancellation_rejection(
+            channel, "chat", "active_receipt_mismatch", **target,
+        )
+        return False
+    remembered_attempt_id = str(meta.get("_tool_attempt_id") or "")
+    active_attempt_id = str(
+        (attempt or {}).get("tool_attempt_id") or remembered_attempt_id
+    )
+    if supplied_attempt_id and supplied_attempt_id != active_attempt_id:
+        await _send_cancellation_rejection(
+            channel, "chat", "tool_attempt_mismatch", **target,
+        )
+        return False
+
+    control_target = (conv_id, request_id, turn_id, active_attempt_id)
+    if meta.get("_cancellation_control_target") == control_target:
+        await channel.send_json(
+            _turn_status_frame(meta, _active_turn_working_status(conv_id))
+        )
+        return True
+
+    if attempt is None and remembered_attempt_id:
+        remembered = store.get_attempt(remembered_attempt_id)
+        if (
+            isinstance(remembered, dict)
+            and ToolAttemptStatus(remembered["status"]) in TERMINAL_STATUSES
+        ):
+            await _send_cancellation_rejection(
+                channel, "chat", "target_not_cancellable", **target,
+            )
+            return False
+
+    status = "cancellation_requested"
+    if isinstance(attempt, dict):
+        attempt_id = str(attempt.get("tool_attempt_id") or "")
+        try:
+            requested = store.request_cancellation(attempt_id)
+        except Exception:
+            await _send_cancellation_rejection(
+                channel, "chat", "cancellation_unavailable", **target,
+            )
+            return False
+        if ToolAttemptStatus(requested["status"]) is ToolAttemptStatus.CANCELLED_PROVEN:
+            status = "cancelled_proven"
+        meta["_tool_attempt_id"] = attempt_id
+    else:
+        # The provider is still planning. Carry the intent to the first exact
+        # accepted tool boundary; it can then be proven cancelled pre-dispatch.
+        meta["_tool_cancel_requested"] = True
+    meta["_tool_attempt_status"] = status
+    meta["_cancellation_control_target"] = control_target
+    frame = _turn_status_frame(meta, status)
+    await channel.send_json(frame)
+    await _broadcast_turn_status(meta, status, exclude=channel, frame=frame)
+    return True
 
 
 async def _send_persisted_turn_for_request(
@@ -4883,8 +5024,13 @@ def _autonomous_snapshot(st) -> dict:
             safe_site = safe_origin(candidate)[:512]
             break
     pending = browser_checkpoint.get("pending_operation") or {}
+    _phase_index, _task_index, current_task = _astate.current_task(st)
+    current_task = current_task or {}
     run_id = str(st.get("run_id") or "")
     return {
+        "task_id": str(current_task.get("id") or "")[:160],
+        "operation_id": str(current_task.get("tool_operation_id") or "")[:160],
+        "tool_attempt_id": str(current_task.get("tool_attempt_id") or "")[:160],
         "tasks_done": done,
         "tasks_total": total,
         # Free-form objective/plan text may repeat a private basename, message
@@ -5093,6 +5239,97 @@ def _autonomous_frame(payload: dict, st=_AUTO_UNSET) -> dict:
     return frame
 
 
+def _autonomous_cancellation_correlation(st: dict) -> dict:
+    _phase_index, _task_index, current_task = _astate.current_task(st)
+    current_task = current_task or {}
+    return {
+        "run_id": str(st.get("run_id") or "")[:256],
+        "task_id": str(current_task.get("id") or "")[:160],
+        "operation_id": str(current_task.get("tool_operation_id") or "")[:160],
+        "tool_attempt_id": str(current_task.get("tool_attempt_id") or "")[:160],
+    }
+
+
+async def _prepare_correlated_autonomous_cancellation(
+    channel: "_OutboundChannel", msg: dict,
+) -> bool:
+    """Validate and durably mark one exact Autonomous cancellation target."""
+
+    supplied = {
+        "run_id": _clean_cancellation_target_id(msg.get("run_id")),
+        "task_id": _clean_cancellation_target_id(
+            msg.get("task_id"), maximum=160,
+        ) if msg.get("task_id") else "",
+        "operation_id": _clean_cancellation_target_id(
+            msg.get("operation_id"), maximum=160,
+        ) if msg.get("operation_id") else "",
+        "tool_attempt_id": _clean_cancellation_target_id(
+            msg.get("tool_attempt_id"), maximum=160,
+        ) if msg.get("tool_attempt_id") else "",
+    }
+    if not supplied["run_id"]:
+        await _send_cancellation_rejection(
+            channel, "autonomous", "incomplete_target", **supplied,
+        )
+        return False
+    st = _autonomous.get("st")
+    if not isinstance(st, dict):
+        await _send_cancellation_rejection(
+            channel, "autonomous", "target_not_active", **supplied,
+        )
+        return False
+    current = _autonomous_cancellation_correlation(st)
+    if supplied["run_id"] != current["run_id"]:
+        await _send_cancellation_rejection(
+            channel, "autonomous", "target_mismatch", **supplied,
+        )
+        await channel.send_json(_autonomous_frame({"event": "state_updated"}, st))
+        return False
+    for field in ("task_id", "operation_id", "tool_attempt_id"):
+        if supplied[field] and supplied[field] != current[field]:
+            await _send_cancellation_rejection(
+                channel, "autonomous", f"{field}_mismatch", **supplied,
+            )
+            await channel.send_json(
+                _autonomous_frame({"event": "state_updated"}, st)
+            )
+            return False
+    if (
+        st.get("status") in {"done", "failed", "aborted", "cancelled"}
+        or st.get("run_state") in {
+            "completed", "failed", "cancelled", "cancelled_proven",
+        }
+    ):
+        await _send_cancellation_rejection(
+            channel, "autonomous", "target_not_active", **supplied,
+        )
+        return False
+
+    control_target = tuple(current[field] for field in (
+        "run_id", "task_id", "operation_id", "tool_attempt_id",
+    ))
+    if (
+        _autonomous.get("cancellation_control_target") == control_target
+        or st.get("run_state") == "cancellation_requested"
+    ):
+        await channel.send_json(
+            _autonomous_frame({"event": "cancellation_requested"}, st)
+        )
+        return False
+
+    _autonomous["cancellation_control_target"] = control_target
+    _autonomous["correlated_cancellation_published"] = True
+    st["run_state"] = "cancellation_requested"
+    try:
+        _astate.save_task_state(st)
+    except Exception:
+        pass
+    _broadcast_autonomous(
+        _autonomous_frame({"event": "cancellation_requested"}, st)
+    )
+    return True
+
+
 def _snapshot_ws_clients() -> tuple:
     """Race-tolerant snapshot of ``_WS_CLIENTS``. Broadcasts run on a daemon
     thread while the event-loop thread may add (auth) / discard (disconnect) —
@@ -5271,6 +5508,8 @@ def _do_release_locked() -> None:
     """Clear the in-process flag and delete OUR lockfile — never a foreign live
     owner's (the pid guard). MUST be called holding ``_autonomous_lock``."""
     _autonomous["active"] = False
+    _autonomous.pop("cancellation_control_target", None)
+    _autonomous.pop("correlated_cancellation_published", None)
     existing = _read_autonomous_lock()
     if isinstance(existing, dict) and existing.get("pid") != os.getpid():
         return  # not ours — leave the other owner's lock intact
@@ -8221,6 +8460,30 @@ async def websocket_endpoint(ws: WebSocket):
                 }, st))
                 continue
 
+            if msg_type == "cancel_active_work":
+                scope = str(msg.get("scope") or "").strip().lower()
+                if msg.get("schema_version") != 1:
+                    await _send_cancellation_rejection(
+                        out, scope or "unknown", "wrong_schema_version",
+                    )
+                    continue
+                if scope == "chat":
+                    await _handle_correlated_chat_cancellation(out, msg)
+                    continue
+                if scope == "autonomous":
+                    if not await _prepare_correlated_autonomous_cancellation(
+                        out, msg,
+                    ):
+                        continue
+                    # Reuse the established abort worker after exact target
+                    # validation. Legacy autonomous_abort remains compatible.
+                    msg_type = "autonomous_abort"
+                else:
+                    await _send_cancellation_rejection(
+                        out, scope or "unknown", "unsupported_scope",
+                    )
+                    continue
+
             if msg_type == "autonomous_resume":
                 # Resume a PAUSED (interrupted) autonomous run from its cursor.
                 # interrupt already released the single-runner slot, so this
@@ -8329,6 +8592,11 @@ async def websocket_endpoint(ws: WebSocket):
                 def _abort_worker():
                     st = _autonomous.get("st")
                     orch = _autonomous.get("orch")
+                    correlated_status_published = bool(
+                        _autonomous.pop(
+                            "correlated_cancellation_published", False,
+                        )
+                    )
                     if (
                         isinstance(st, dict)
                         and st.get("run_state") in {
@@ -8339,9 +8607,10 @@ async def websocket_endpoint(ws: WebSocket):
                         and orch is not None
                         and orch.request_tool_cancellation()
                     ):
-                        _broadcast_autonomous(_autonomous_frame(
-                            {"event": "cancellation_requested"}, st,
-                        ))
+                        if not correlated_status_published:
+                            _broadcast_autonomous(_autonomous_frame(
+                                {"event": "cancellation_requested"}, st,
+                            ))
                         return
                     if isinstance(st, dict):
                         st["status"] = "aborted"
@@ -11115,6 +11384,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             return bool(persisted)
 
         def _tool_attempt_status(status: str, attempt_id: str) -> None:
+            turn_meta["_tool_attempt_id"] = str(attempt_id or "")
             safe_status = {
                 "action_starting": "action_starting",
                 "action_in_progress": "action_in_progress",
@@ -11123,11 +11393,24 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 "resuming_tool_turn": "resuming",
                 "blocked_unknown_effect": "blocked_unknown_effect",
                 "cancellation_requested": "cancellation_requested",
+                "cancelled_proven": "cancelled_proven",
             }.get(str(status), "action_in_progress")
             if safe_status == "action_starting" and _apply_queued_tool_cancellation(
                 turn_meta, attempt_id,
             ):
-                safe_status = "cancellation_requested"
+                try:
+                    from osia.tool_attempts import get_tool_attempt_store
+
+                    queued_attempt = get_tool_attempt_store().get_attempt(
+                        attempt_id,
+                    ) or {}
+                except Exception:
+                    queued_attempt = {}
+                safe_status = (
+                    "cancelled_proven"
+                    if queued_attempt.get("status") == "cancelled_proven"
+                    else "cancellation_requested"
+                )
             turn_meta["_tool_attempt_status"] = safe_status
 
             async def _publish_status():
