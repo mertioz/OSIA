@@ -63,6 +63,71 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="1.1.5",
+        released_on="2026-08-06",
+        public=True,
+        changes_en=(),
+        changes_fr=(),
+        summary_en=(
+            "Windows 1.1.5 isolates Chat activity from Autonomous runs so Send and Stop remain bound to the exact conversation, request, and turn.",
+            "Autonomous Abandon is exact and idempotent across active, blocked, and failed runs while preserving completed and failed terminal truth.",
+            "A possible or unknown external effect remains fail-closed and is never replayed merely to complete abandonment.",
+            "Reconnect and restart restore Chat and Autonomous independently without duplicating a mission, provider turn, or tool effect.",
+            "This is a Windows-only release; the matching Mobile UI correction was validated locally, but no Mobile publication is included.",
+        ),
+        summary_fr=(
+            "Windows 1.1.5 isole l’activité Chat des runs Autonomous afin que Send et Stop restent liés à la conversation, la requête et au tour exacts.",
+            "Abandon Autonomous est exact et idempotent pour les runs actifs, bloqués ou en échec, tout en préservant la vérité terminale.",
+            "Un effet externe possible ou inconnu reste fail-closed et n’est jamais rejoué uniquement pour terminer l’abandon.",
+            "Reconnexion et redémarrage restaurent Chat et Autonomous séparément sans dupliquer mission, tour fournisseur ni effet d’outil.",
+            "Cette release concerne Windows uniquement ; la correction UI Mobile correspondante a été validée localement sans publication Mobile.",
+        ),
+        sections=(
+            ReleaseSection(
+                "Independent Chat and Autonomous state",
+                "États Chat et Autonomous indépendants",
+                (
+                    "Chat activity is keyed only to its exact conversation, request, and turn; a successful handoff releases the originating Chat turn immediately.",
+                    "An active or failed Autonomous run never disables a new Chat send, and Chat Stop can cancel only the current Chat turn.",
+                    "One Autonomous run may block a second Autonomous run, while Autonomous Abandon targets only the exact run and never Chat.",
+                ),
+                (
+                    "L’activité Chat dépend uniquement de sa conversation, de sa requête et de son tour exacts ; un handoff réussi libère immédiatement le tour Chat d’origine.",
+                    "Un run Autonomous actif ou en échec ne désactive jamais un nouvel envoi Chat, et Stop Chat annule uniquement le tour Chat courant.",
+                    "Un run Autonomous peut en bloquer un second, tandis qu’Abandon Autonomous cible uniquement le run exact et jamais Chat.",
+                ),
+            ),
+            ReleaseSection(
+                "Truthful and durable abandonment",
+                "Abandon durable et fidèle",
+                (
+                    "Abandon is idempotent from running, waiting, verifying, blocked, and failed states, with requested and proven states persisted separately.",
+                    "Completed and failed terminal outcomes remain unchanged while abandonment records whether no effect, a confirmed effect, or an unknown effect is possible.",
+                    "A possible or unknown external effect is never replayed, retried, or replanned merely to prove workflow abandonment.",
+                ),
+                (
+                    "Abandon est idempotent depuis les états running, waiting, verifying, blocked et failed, avec demande et preuve persistées séparément.",
+                    "Les résultats terminaux completed et failed restent inchangés tandis que l’abandon distingue absence d’effet, effet confirmé ou effet inconnu possible.",
+                    "Un effet externe possible ou inconnu n’est jamais rejoué, réessayé ni replannifié uniquement pour prouver l’abandon du workflow.",
+                ),
+            ),
+            ReleaseSection(
+                "Windows release and compatibility",
+                "Release Windows et compatibilité",
+                (
+                    "Version, packaging, updater, and release metadata remain aligned on Windows 1.1.5 with strict host, path, size, and SHA-256 validation.",
+                    "Windows 1.1.4 remains the validated rollback and immutable fallback; Windows 1.1.5 remains NotSigned with no publisher claim under the authorized policy.",
+                    "No Mobile publication is part of this Windows release; the locally validated Mobile UI build retains its existing versionCode and is not announced as public.",
+                ),
+                (
+                    "Version, packaging, updater et métadonnées restent alignés sur Windows 1.1.5 avec validation stricte de l’hôte, du chemin, de la taille et du SHA-256.",
+                    "Windows 1.1.4 reste le rollback validé et le fallback immuable ; Windows 1.1.5 reste NotSigned sans éditeur revendiqué selon la politique autorisée.",
+                    "Aucune publication Mobile ne fait partie de cette release Windows ; le build UI Mobile validé localement conserve son versionCode et n’est pas annoncé public.",
+                ),
+            ),
+        ),
+    ),
+    ReleaseEntry(
         version="1.1.4",
         released_on="2026-08-06",
         public=True,
