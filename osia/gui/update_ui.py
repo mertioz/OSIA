@@ -42,6 +42,8 @@ from osia.updater import (
     LEGACY_UNSIGNED_STABLE_BRIDGE,
     UpdateScheduler,
     UpdateStateStore,
+    UpdaterSnapshot,
+    UpdaterStateMachine,
     dismiss_update,
     download_installer,
     fetch_channel_manifest,
@@ -83,7 +85,45 @@ def update_error_text(code: str) -> str:
             size=size,
             sha256=bridge.sha256,
         )
+    categories = {
+        "offline": "network",
+        "download_http_error": "network",
+        "download_interrupted": "network",
+        "redirect_rejected": "network",
+        "insufficient_disk_space": "disk",
+        "disk_write_failed": "disk",
+        "download_permission_denied": "permission",
+        "installer_unreadable": "permission",
+        "installer_launch_permission_denied": "permission",
+        "sha256_mismatch": "hash",
+        "content_length_mismatch": "verification",
+        "byte_count_mismatch": "verification",
+        "installer_reverification_failed": "verification",
+        "installer_launch_failed": "launch",
+    }
+    category = categories.get(code)
+    if category is not None:
+        return i18n.t(f"updates.error.{category}")
     return i18n.t("updates.error", code=code)
+
+
+def _download_size_text(value: int) -> str:
+    amount = max(0, int(value))
+    french = i18n.get_language() == "fr"
+    units = (
+        (1_000_000_000, "Go" if french else "GB"),
+        (1_000_000, "Mo" if french else "MB"),
+        (1_000, "Ko" if french else "KB"),
+    )
+    for scale, unit in units:
+        if amount >= scale:
+            shown = amount / scale
+            decimals = 0 if shown >= 100 else 1 if shown >= 10 else 2
+            text = f"{shown:.{decimals}f}"
+            if french:
+                text = text.replace(".", ",")
+            return f"{text} {unit}"
+    return f"{amount} {'octets' if french else 'bytes'}"
 
 
 def _system_reduced_motion() -> bool:
@@ -125,14 +165,26 @@ class UpdateController(QObject):
 
     state_changed = pyqtSignal(dict)
     _check_finished = pyqtSignal(object, bool, object, bool)
-    _download_progress = pyqtSignal(int, int)
+    _operation_snapshot = pyqtSignal(object)
     _download_finished = pyqtSignal(object, object)
     _launch_finished = pyqtSignal(object)
 
-    def __init__(self, parent: QObject | None = None, *, store=None, scheduler=None):
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        *,
+        store=None,
+        scheduler=None,
+        updates_dir: Path | None = None,
+        open_response=None,
+        process_factory=None,
+    ):
         super().__init__(parent)
         self.store = store or UpdateStateStore()
         self.scheduler = scheduler or UpdateScheduler()
+        self._updates_dir = Path(updates_dir) if updates_dir is not None else None
+        self._open_response = open_response
+        self._process_factory = process_factory
         self.metadata = None
         self.manifest = None
         self.installer: Path | None = None
@@ -142,9 +194,10 @@ class UpdateController(QObject):
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(lambda: self.check(manual=False))
         self._check_finished.connect(self._on_check_finished)
-        self._download_progress.connect(self._on_download_progress)
+        self._operation_snapshot.connect(self._on_operation_snapshot)
         self._download_finished.connect(self._on_download_finished)
         self._launch_finished.connect(self._on_launch_finished)
+        self.operation = UpdaterStateMachine(self._operation_snapshot.emit)
         try:
             candidate = load_app_metadata()
         except Exception:
@@ -176,6 +229,9 @@ class UpdateController(QObject):
             "releaseNotes": (),
             "progressReceived": 0,
             "progressTotal": 0,
+            "progressPercent": None,
+            "progressIndeterminate": False,
+            "operationSnapshot": self.operation.snapshot,
             "error": None,
             "internalUnsigned": False,
             "stableUnsigned": False,
@@ -234,7 +290,7 @@ class UpdateController(QObject):
             if manual:
                 self._publish(status="disabled", error=None)
             return False
-        if self._state["status"] in {"downloading", "verifying", "pending"}:
+        if self.operation.in_flight:
             return False
         if not self.scheduler.begin():
             return False
@@ -322,6 +378,8 @@ class UpdateController(QObject):
 
     def set_preview_opt_in(self, enabled: bool) -> bool:
         enabled = bool(enabled)
+        if self.operation.in_flight:
+            return False
         if enabled == self.preview_opt_in:
             return False
         persist_preview_opt_in(self.store, enabled)
@@ -353,7 +411,7 @@ class UpdateController(QObject):
         return True
 
     def dismiss(self) -> None:
-        if self.manifest is None:
+        if self.manifest is None or self.operation.in_flight:
             return
         dismiss_update(self.store, self.manifest.version)
         self._publish(bannerVisible=False)
@@ -361,23 +419,23 @@ class UpdateController(QObject):
     def install(self, parent: QWidget | None = None) -> bool:
         if self.manifest is None:
             return False
-        if self._state["status"] in {"downloading", "verifying", "pending"}:
+        if self.operation.begin() is None:
             return False
         self._confirmation_parent = parent
         if self.installer is not None and self.installer.is_file():
-            self._confirm_and_launch()
+            QTimer.singleShot(0, self._confirm_and_launch)
             return True
-        self._publish(
-            status="downloading", progressReceived=0,
-            progressTotal=self.manifest.installer.size_bytes, error=None,
-        )
+        manifest = self.manifest
 
         def worker() -> None:
             try:
-                path = download_installer(
-                    self.manifest,
-                    progress=lambda received, total: self._download_progress.emit(received, total),
-                )
+                kwargs = {
+                    "updates_dir": self._updates_dir,
+                    "operation": self.operation,
+                }
+                if self._open_response is not None:
+                    kwargs["open_response"] = self._open_response
+                path = download_installer(manifest, **kwargs)
                 self._download_finished.emit(path, None)
             except Exception as exc:
                 self._download_finished.emit(None, exc)
@@ -385,20 +443,41 @@ class UpdateController(QObject):
         threading.Thread(target=worker, name="osia-update-download", daemon=True).start()
         return True
 
-    def _on_download_progress(self, received: int, total: int) -> None:
-        self._publish(
-            status="verifying" if total and received >= total else "downloading",
-            progressReceived=received, progressTotal=total,
-        )
+    def _on_operation_snapshot(self, snapshot: UpdaterSnapshot) -> None:
+        if not isinstance(snapshot, UpdaterSnapshot):
+            return
+        changes = {
+            "operationSnapshot": snapshot,
+            "progressReceived": snapshot.bytes_received,
+            "progressTotal": snapshot.total_bytes or 0,
+            "progressPercent": snapshot.percentage,
+            "progressIndeterminate": snapshot.indeterminate,
+        }
+        if snapshot.phase == "idle":
+            changes.update(
+                status="available" if self.manifest is not None else "idle",
+                error=None,
+                bannerVisible=bool(self.manifest),
+            )
+        else:
+            changes.update(
+                status=snapshot.phase,
+                error=snapshot.error,
+                bannerVisible=bool(self.manifest),
+            )
+        self._publish(**changes)
 
     def _on_download_finished(self, path, error) -> None:
         if error is not None:
             code = safe_error_code(error)
-            status = "available" if isinstance(error, DownloadCancelled) else "error"
-            self._publish(status=status, error=code)
+            self.installer = None
+            if isinstance(error, DownloadCancelled):
+                if self.operation.snapshot.phase != "idle":
+                    self.operation.reset()
+            elif self.operation.snapshot.phase != "failed":
+                self.operation.fail(code)
             return
         self.installer = Path(path)
-        self._publish(status="ready", error=None)
         self._confirm_and_launch()
 
     def _confirm_and_launch(self) -> None:
@@ -418,13 +497,24 @@ class UpdateController(QObject):
             QMessageBox.StandardButton.Cancel,
         )
         if answer != QMessageBox.StandardButton.Yes:
-            self._publish(status="ready", error=None)
+            self.operation.reset()
             return
-        self._publish(status="verifying", error=None)
+        if self.operation.snapshot.phase == "preparing":
+            self.operation.verifying(
+                self.manifest.installer.size_bytes,
+                self.manifest.installer.size_bytes,
+            )
+        manifest = self.manifest
+        installer = self.installer
 
         def worker() -> None:
             try:
-                launch_update_installer(self.manifest, self.installer, self.store)
+                kwargs = {"operation": self.operation}
+                if self._process_factory is not None:
+                    kwargs["process_factory"] = self._process_factory
+                launch_update_installer(
+                    manifest, installer, self.store, **kwargs,
+                )
                 self._launch_finished.emit(None)
             except Exception as exc:
                 self._launch_finished.emit(exc)
@@ -433,12 +523,13 @@ class UpdateController(QObject):
 
     def _on_launch_finished(self, error) -> None:
         if error is not None:
-            self._publish(status="error", error=safe_error_code(error))
+            if self.operation.snapshot.phase != "failed":
+                self.operation.fail(safe_error_code(error))
             return
-        self._publish(status="pending", bannerVisible=False, error=None)
+        self._publish(status="launching", bannerVisible=True, error=None)
         app = QApplication.instance()
         if app is not None:
-            QTimer.singleShot(0, app.quit)
+            QTimer.singleShot(400, app.quit)
 
 
 class UpdateBanner(QFrame):
@@ -449,8 +540,11 @@ class UpdateBanner(QFrame):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("updateBanner")
-        row = QHBoxLayout(self)
-        row.setContentsMargins(10, 7, 10, 7)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 7, 10, 7)
+        layout.setSpacing(5)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(7)
         self.label = QLabel()
         self.label.setObjectName("updateBannerText")
@@ -464,28 +558,101 @@ class UpdateBanner(QFrame):
         row.addWidget(self.view_button)
         row.addWidget(self.install_button)
         row.addWidget(self.dismiss_button)
+        self.progress = QProgressBar()
+        self.progress.setObjectName("updateBannerProgress")
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(4)
+        self.progress.setRange(0, 1000)
+        self.progress.hide()
+        layout.addLayout(row)
+        layout.addWidget(self.progress)
         self.view_button.clicked.connect(self.view_requested)
         self.install_button.clicked.connect(self.install_requested)
         self.dismiss_button.clicked.connect(self.dismiss_requested)
         self._version = ""
+        self._state: dict = {}
         self._retranslate()
         i18n.add_listener(self._retranslate)
         self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
         self.hide()
 
     def _retranslate(self) -> None:
+        if self._state:
+            self._render(self._state)
+            return
         self.label.setText(i18n.t("updates.banner", version=self._version))
         self.view_button.setText(i18n.t("updates.view"))
         self.install_button.setText(i18n.t("updates.install"))
         self.dismiss_button.setText(i18n.t("updates.later"))
 
+    def _render(self, state: dict) -> None:
+        snapshot = state.get("operationSnapshot")
+        if not isinstance(snapshot, UpdaterSnapshot):
+            snapshot = None
+        phase = snapshot.phase if snapshot is not None else str(
+            state.get("status") or "idle"
+        )
+        if phase == "preparing":
+            text = i18n.t("updates.phase.preparing")
+        elif phase == "downloading":
+            total = snapshot.total_bytes if snapshot is not None else None
+            received = snapshot.bytes_received if snapshot is not None else 0
+            percentage = snapshot.percentage if snapshot is not None else None
+            if total is None or percentage is None:
+                text = i18n.t("updates.phase.downloading_unknown")
+            else:
+                text = i18n.t(
+                    "updates.phase.downloading",
+                    percent=percentage,
+                    received=_download_size_text(received),
+                    total=_download_size_text(total),
+                )
+        elif phase == "verifying":
+            text = i18n.t("updates.phase.verifying")
+        elif phase == "launching":
+            text = i18n.t("updates.phase.launching")
+        elif phase == "failed":
+            text = update_error_text(str(
+                (snapshot.error if snapshot is not None else None)
+                or state.get("error") or ""
+            ))
+        else:
+            text = i18n.t("updates.banner", version=self._version)
+        self.label.setText(text)
+
+        active = phase in {"preparing", "downloading", "verifying", "launching"}
+        failed = phase == "failed"
+        self.view_button.setText(i18n.t("updates.view"))
+        self.install_button.setText(
+            i18n.t("updates.retry") if failed else i18n.t("updates.install")
+        )
+        self.dismiss_button.setText(i18n.t("updates.later"))
+        self.view_button.setVisible(not active)
+        self.install_button.setVisible(not active)
+        self.install_button.setEnabled(not active)
+        self.dismiss_button.setVisible(not active)
+
+        self.progress.setVisible(active)
+        if active:
+            if phase == "downloading" and snapshot.total_bytes is not None:
+                self.progress.setRange(0, 1000)
+                self.progress.setValue(min(
+                    1000,
+                    snapshot.bytes_received * 1000 // snapshot.total_bytes,
+                ))
+            else:
+                self.progress.setRange(0, 0)
+
     def apply_state(self, state: dict) -> None:
+        self._state = dict(state)
         self._version = state.get("availableVersion") or ""
         major = bool(state.get("majorUpdate") and self._version)
-        self.setObjectName("majorUpdateBanner" if major else "updateBanner")
-        self.style().unpolish(self)
-        self.style().polish(self)
-        self._retranslate()
+        object_name = "majorUpdateBanner" if major else "updateBanner"
+        if self.objectName() != object_name:
+            self.setObjectName(object_name)
+            self.style().unpolish(self)
+            self.style().polish(self)
+        self._render(state)
         self.setVisible(bool(state.get("bannerVisible") and self._version))
 
 
@@ -712,6 +879,18 @@ class _MajorProgressBar(QProgressBar):
 
 
 class UpdateSettingsSection(QFrame):
+    _RELEASE_STATE_KEYS = (
+        "installedVersion",
+        "previewOptIn",
+        "availableVersion",
+        "availableChannel",
+        "availablePublishedAt",
+        "releaseNotes",
+        "internalUnsigned",
+        "stableUnsigned",
+        "majorUpdate",
+    )
+
     def __init__(self, controller: UpdateController, parent: QWidget | None = None):
         super().__init__(parent)
         self.controller = controller
@@ -795,10 +974,12 @@ class UpdateSettingsSection(QFrame):
         controller.state_changed.connect(self.apply_state)
         i18n.add_listener(self._retranslate)
         self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
-        self._state = controller.state
-        self.apply_state(self._state)
+        self._state: dict = {}
+        self._rendered_language: str | None = None
+        self.apply_state(controller.state)
 
     def _retranslate(self) -> None:
+        self._rendered_language = None
         self.apply_state(self._state)
 
     def _on_history_toggled(self, visible: bool) -> None:
@@ -827,11 +1008,72 @@ class UpdateSettingsSection(QFrame):
                 return
         self.controller.set_preview_opt_in(requested)
 
+    def _apply_dynamic_state(self, state: dict) -> None:
+        status = state.get("status", "idle")
+        installed = state.get("installedVersion", "—")
+        available = state.get("availableVersion")
+        self.summary.setText(i18n.t(
+            "updates.installed_summary",
+            version=installed,
+            status=i18n.t(f"updates.status.{status}"),
+        ))
+        self.preview_toggle.setEnabled(
+            status not in {"preparing", "downloading", "verifying", "launching"}
+        )
+        if status == "offline":
+            empty = i18n.t("updates.offline_installed_available")
+        elif state.get("error"):
+            empty = update_error_text(str(state["error"]))
+        elif not available:
+            empty = i18n.t("updates.no_newer")
+        else:
+            empty = ""
+        self.empty_state.setText(empty)
+        self.empty_state.setVisible(bool(empty))
+
+        total = int(state.get("progressTotal") or 0)
+        received = int(state.get("progressReceived") or 0)
+        major_available = bool(
+            state.get("majorUpdate") or is_major_update(str(available))
+        ) if available else False
+        self.progress.set_major_update(major_available)
+        self.progress.setVisible(
+            status in {"preparing", "downloading", "verifying", "launching"}
+        )
+        if status == "downloading" and total:
+            self.progress.setRange(0, 1000)
+            self.progress.setValue(round(received * 1000 / total))
+        else:
+            self.progress.setRange(0, 0)
+        self.check_button.setText(
+            i18n.t("updates.retry") if status in {"error", "offline"}
+            else i18n.t("updates.check")
+        )
+        self.check_button.setEnabled(status not in {
+            "checking", "preparing", "downloading", "verifying", "launching",
+        })
+        self.install_button.setText(
+            i18n.t("updates.retry") if status == "failed"
+            else i18n.t("updates.install")
+        )
+        self.install_button.setVisible(status in {"available", "ready", "failed"})
+
     def apply_state(self, state: dict) -> None:
+        previous = self._state
         self._state = dict(state)
         status = state.get("status", "idle")
         installed = state.get("installedVersion", "—")
         language = i18n.get_language()
+        if (
+            previous
+            and self._rendered_language == language
+            and all(
+                previous.get(key) == state.get(key)
+                for key in self._RELEASE_STATE_KEYS
+            )
+        ):
+            self._apply_dynamic_state(state)
+            return
         self.title.setText(i18n.t("updates.title"))
         self.summary.setText(i18n.t(
             "updates.installed_summary",
@@ -855,7 +1097,7 @@ class UpdateSettingsSection(QFrame):
         self.preview_toggle.setChecked(preview_enabled)
         self.preview_toggle.blockSignals(False)
         self.preview_toggle.setEnabled(
-            status not in {"downloading", "verifying", "pending"}
+            status not in {"preparing", "downloading", "verifying", "launching"}
         )
 
         current = release_for_version(installed)
@@ -913,17 +1155,6 @@ class UpdateSettingsSection(QFrame):
                 major_update=major_available,
             )
 
-        if status == "offline":
-            empty = i18n.t("updates.offline_installed_available")
-        elif state.get("error"):
-            empty = update_error_text(str(state["error"]))
-        elif not available:
-            empty = i18n.t("updates.no_newer")
-        else:
-            empty = ""
-        self.empty_state.setText(empty)
-        self.empty_state.setVisible(bool(empty))
-
         while self.history_layout.count():
             item = self.history_layout.takeAt(0)
             widget = item.widget()
@@ -950,15 +1181,5 @@ class UpdateSettingsSection(QFrame):
             if self.history_button.isChecked() else i18n.t("updates.history")
         )
         self.history_button.setAccessibleName(self.history_button.text())
-        total = int(state.get("progressTotal") or 0)
-        received = int(state.get("progressReceived") or 0)
-        self.progress.set_major_update(major_available)
-        self.progress.setVisible(status in {"downloading", "verifying"})
-        self.progress.setValue(round(received * 1000 / total) if total else 0)
-        self.check_button.setText(
-            i18n.t("updates.retry") if status in {"error", "offline"}
-            else i18n.t("updates.check")
-        )
-        self.check_button.setEnabled(status not in {"checking", "downloading", "verifying", "pending"})
-        self.install_button.setText(i18n.t("updates.install"))
-        self.install_button.setVisible(status in {"available", "ready"})
+        self._apply_dynamic_state(state)
+        self._rendered_language = language

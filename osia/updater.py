@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import errno
 import json
 import os
 import random
@@ -100,6 +101,182 @@ class DownloadError(UpdaterError):
 
 class DownloadCancelled(DownloadError):
     pass
+
+
+@dataclass(frozen=True)
+class UpdaterSnapshot:
+    """Immutable, GUI-safe view of one canonical install attempt."""
+
+    phase: str = "idle"
+    bytes_received: int = 0
+    total_bytes: int | None = None
+    percentage: int | None = None
+    indeterminate: bool = False
+    error: str | None = None
+    attempt: int = 0
+
+
+class UpdaterStateMachine:
+    """Thread-safe owner of installer download and launch state."""
+
+    _ACTIVE_PHASES = frozenset({
+        "preparing", "downloading", "verifying", "launching",
+    })
+
+    def __init__(
+        self,
+        listener: Callable[[UpdaterSnapshot], None] | None = None,
+    ):
+        self._lock = threading.RLock()
+        self._listener = listener
+        self._snapshot = UpdaterSnapshot()
+
+    @property
+    def snapshot(self) -> UpdaterSnapshot:
+        with self._lock:
+            return self._snapshot
+
+    @property
+    def in_flight(self) -> bool:
+        with self._lock:
+            return self._snapshot.phase in self._ACTIVE_PHASES
+
+    @staticmethod
+    def _progress_snapshot(
+        phase: str,
+        *,
+        received: int,
+        total: int | None,
+        error: str | None,
+        attempt: int,
+    ) -> UpdaterSnapshot:
+        received = max(0, int(received))
+        normalized_total = None if total is None else max(1, int(total))
+        percentage = (
+            None
+            if normalized_total is None
+            else min(100, received * 100 // normalized_total)
+        )
+        return UpdaterSnapshot(
+            phase=phase,
+            bytes_received=received,
+            total_bytes=normalized_total,
+            percentage=percentage,
+            indeterminate=(phase == "downloading" and normalized_total is None),
+            error=error,
+            attempt=attempt,
+        )
+
+    @staticmethod
+    def _notify(
+        snapshot: UpdaterSnapshot,
+        listener: Callable[[UpdaterSnapshot], None] | None,
+    ) -> UpdaterSnapshot:
+        if listener is not None:
+            try:
+                listener(snapshot)
+            except Exception:
+                # Presentation listeners must never break verification or cleanup.
+                pass
+        return snapshot
+
+    def begin(self) -> UpdaterSnapshot | None:
+        with self._lock:
+            current = self._snapshot
+            if current.phase in self._ACTIVE_PHASES:
+                return None
+            snapshot = UpdaterSnapshot(
+                phase="preparing",
+                attempt=current.attempt + 1,
+            )
+            self._snapshot = snapshot
+            listener = self._listener
+        return self._notify(snapshot, listener)
+
+    def downloading(self, total: int | None) -> UpdaterSnapshot:
+        with self._lock:
+            current = self._snapshot
+            if current.phase not in {"preparing", "downloading"}:
+                raise UpdaterError("invalid_updater_transition")
+            snapshot = self._progress_snapshot(
+                "downloading", received=current.bytes_received,
+                total=total, error=None, attempt=current.attempt,
+            )
+            self._snapshot = snapshot
+            listener = self._listener
+        return self._notify(snapshot, listener)
+
+    def advance(self, received: int, total: int | None) -> UpdaterSnapshot:
+        with self._lock:
+            current = self._snapshot
+            if current.phase != "downloading":
+                raise UpdaterError("invalid_updater_transition")
+            if int(received) < current.bytes_received:
+                raise UpdaterError("invalid_updater_progress")
+            snapshot = self._progress_snapshot(
+                "downloading", received=received, total=total,
+                error=None, attempt=current.attempt,
+            )
+            self._snapshot = snapshot
+            listener = self._listener
+        return self._notify(snapshot, listener)
+
+    def verifying(
+        self,
+        received: int | None = None,
+        total: int | None = None,
+    ) -> UpdaterSnapshot:
+        with self._lock:
+            current = self._snapshot
+            if current.phase not in {"preparing", "downloading", "verifying"}:
+                raise UpdaterError("invalid_updater_transition")
+            snapshot = self._progress_snapshot(
+                "verifying",
+                received=(
+                    current.bytes_received if received is None else received
+                ),
+                total=current.total_bytes if total is None else total,
+                error=None,
+                attempt=current.attempt,
+            )
+            self._snapshot = snapshot
+            listener = self._listener
+        return self._notify(snapshot, listener)
+
+    def launching(self) -> UpdaterSnapshot:
+        with self._lock:
+            current = self._snapshot
+            if current.phase != "verifying":
+                raise UpdaterError("invalid_updater_transition")
+            snapshot = self._progress_snapshot(
+                "launching", received=current.bytes_received,
+                total=current.total_bytes, error=None, attempt=current.attempt,
+            )
+            self._snapshot = snapshot
+            listener = self._listener
+        return self._notify(snapshot, listener)
+
+    def fail(self, code: str) -> UpdaterSnapshot:
+        with self._lock:
+            current = self._snapshot
+            if current.phase == "failed" and current.error == str(code):
+                return current
+            snapshot = self._progress_snapshot(
+                "failed", received=current.bytes_received,
+                total=current.total_bytes, error=str(code),
+                attempt=current.attempt,
+            )
+            self._snapshot = snapshot
+            listener = self._listener
+        return self._notify(snapshot, listener)
+
+    def reset(self) -> UpdaterSnapshot:
+        with self._lock:
+            attempt = self._snapshot.attempt
+            snapshot = UpdaterSnapshot(attempt=attempt)
+            self._snapshot = snapshot
+            listener = self._listener
+        return self._notify(snapshot, listener)
 
 
 @dataclass(frozen=True)
@@ -1114,30 +1291,56 @@ def download_installer(
     progress: Callable[[int, int], None] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
     open_response: Callable = _open_https,
+    operation: UpdaterStateMachine | None = None,
 ) -> Path:
-    _require_installable_channel(manifest)
     root = Path(updates_dir) if updates_dir is not None else UPDATES_DIR
-    root.mkdir(parents=True, exist_ok=True)
-    cleanup_updates(root, preserve_versions=(manifest.version,))
     final = installer_path(manifest.version, root)
     partial = partial_path(manifest.version, root)
-    if final.is_file():
-        if (
-            final.stat().st_size == manifest.installer.size_bytes
-            and _hash_file(final) == manifest.installer.sha256
-        ):
-            if progress:
-                progress(manifest.installer.size_bytes, manifest.installer.size_bytes)
-            return final
-        final.unlink(missing_ok=True)
-    partial.unlink(missing_ok=True)
-    free = shutil.disk_usage(root).free
-    if free < manifest.installer.size_bytes:
-        raise DownloadError("insufficient_disk_space")
-
     digest = hashlib.sha256()
     received = 0
+    progress_total: int | None = None
+
+    if operation is not None and operation.snapshot.phase != "preparing":
+        raise DownloadError("update_operation_in_progress")
+
+    def report_progress() -> None:
+        if operation is not None:
+            operation.advance(received, progress_total)
+        if progress is not None:
+            progress(received, progress_total or 0)
+
+    def remove_partial() -> None:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     try:
+        _require_installable_channel(manifest)
+        root.mkdir(parents=True, exist_ok=True)
+        cleanup_updates(root, preserve_versions=(manifest.version,))
+        if final.is_file():
+            if (
+                final.stat().st_size == manifest.installer.size_bytes
+                and _hash_file(final) == manifest.installer.sha256
+            ):
+                if operation is not None:
+                    operation.verifying(
+                        manifest.installer.size_bytes,
+                        manifest.installer.size_bytes,
+                    )
+                if progress:
+                    progress(
+                        manifest.installer.size_bytes,
+                        manifest.installer.size_bytes,
+                    )
+                return final
+            final.unlink(missing_ok=True)
+        partial.unlink(missing_ok=True)
+        free = shutil.disk_usage(root).free
+        if free < manifest.installer.size_bytes:
+            raise DownloadError("insufficient_disk_space")
+
         with open_response(
             manifest.installer.url,
             {
@@ -1153,17 +1356,21 @@ def download_installer(
             if response.status != 200:
                 raise DownloadError("download_http_error")
             length = response.headers.get("Content-Length")
-            if (
-                not isinstance(length, str)
-                or len(length) > 10
-                or re.fullmatch(r"[0-9]+", length) is None
-            ):
-                raise DownloadError("content_length_required")
-            if int(length) != manifest.installer.size_bytes:
-                raise DownloadError("content_length_mismatch")
+            if length not in (None, ""):
+                if (
+                    not isinstance(length, str)
+                    or len(length) > 10
+                    or re.fullmatch(r"[0-9]+", length) is None
+                ):
+                    raise DownloadError("invalid_content_length")
+                progress_total = int(length)
+                if progress_total != manifest.installer.size_bytes:
+                    raise DownloadError("content_length_mismatch")
             encoding = response.headers.get("Content-Encoding")
             if encoding not in (None, "", "identity"):
                 raise DownloadError("content_encoding_rejected")
+            if operation is not None:
+                operation.downloading(progress_total)
             with partial.open("xb") as handle:
                 while True:
                     if cancel_requested is not None and cancel_requested():
@@ -1171,27 +1378,58 @@ def download_installer(
                     chunk = response.read(DOWNLOAD_CHUNK_BYTES)
                     if not chunk:
                         break
-                    received += len(chunk)
-                    if received > manifest.installer.size_bytes:
+                    if received + len(chunk) > manifest.installer.size_bytes:
                         raise DownloadError("byte_count_mismatch")
-                    handle.write(chunk)
-                    digest.update(chunk)
-                    if progress:
-                        progress(received, manifest.installer.size_bytes)
+                    written = handle.write(chunk)
+                    if written != len(chunk):
+                        raise DownloadError("disk_write_failed")
+                    received += written
+                    digest.update(chunk[:written])
+                    # A known-length final 100% snapshot is deferred until both
+                    # response and file contexts have closed successfully.
+                    if progress_total is None or received < progress_total:
+                        report_progress()
                 handle.flush()
                 os.fsync(handle.fileno())
+        if operation is not None:
+            operation.verifying(received, progress_total)
+        if progress is not None:
+            progress(received, progress_total or 0)
         if received != manifest.installer.size_bytes:
-            raise DownloadError("byte_count_mismatch")
+            raise DownloadError(
+                "download_interrupted"
+                if progress_total is not None else "byte_count_mismatch"
+            )
         if digest.hexdigest() != manifest.installer.sha256:
             raise DownloadError("sha256_mismatch")
         os.replace(partial, final)
         return final
-    except UpdaterError:
-        partial.unlink(missing_ok=True)
+    except DownloadCancelled:
+        remove_partial()
+        if operation is not None:
+            operation.reset()
+        raise
+    except UpdaterError as exc:
+        remove_partial()
+        if operation is not None:
+            operation.fail(exc.code)
         raise
     except (OSError, TimeoutError, http.client.HTTPException) as exc:
-        partial.unlink(missing_ok=True)
-        raise DownloadError("download_interrupted") from exc
+        remove_partial()
+        if isinstance(exc, PermissionError):
+            code = "download_permission_denied"
+        elif isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            code = "insufficient_disk_space"
+        else:
+            code = "download_interrupted"
+        if operation is not None:
+            operation.fail(code)
+        raise DownloadError(code) from exc
+    except Exception as exc:
+        remove_partial()
+        if operation is not None:
+            operation.fail("unexpected_download_error")
+        raise DownloadError("unexpected_download_error") from exc
 
 
 def prepare_installer_plan(manifest: UpdateManifest, path: Path) -> InstallerPlan:
@@ -1228,12 +1466,16 @@ def launch_update_installer(
     store: UpdateStateStore,
     *,
     process_factory: Callable = subprocess.Popen,
+    operation: UpdaterStateMachine | None = None,
 ):
-    plan = prepare_installer_plan(manifest, path)
-    state = store.load()
-    state["pending"] = _pending_payload(manifest, plan)
-    state["lastError"] = None
-    store.save(state)
+    try:
+        plan = prepare_installer_plan(manifest, path)
+    except UpdaterError as exc:
+        if operation is not None:
+            operation.fail(exc.code)
+        raise
+    if operation is not None:
+        operation.launching()
     kwargs: dict = {
         "cwd": str(plan.executable.parent),
         "stdin": subprocess.DEVNULL,
@@ -1247,13 +1489,27 @@ def launch_update_installer(
             subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
         )
     try:
+        state = store.load()
+        state["pending"] = _pending_payload(manifest, plan)
+        state["lastError"] = None
+        store.save(state)
         process = process_factory(plan.command, **kwargs)
     except Exception as exc:
-        state = store.load()
-        state["pending"] = None
-        state["lastError"] = "installer_launch_failed"
-        store.save(state)
-        raise DownloadError("installer_launch_failed") from exc
+        code = (
+            "installer_launch_permission_denied"
+            if isinstance(exc, PermissionError)
+            else "installer_launch_failed"
+        )
+        try:
+            state = store.load()
+            state["pending"] = None
+            state["lastError"] = code
+            store.save(state)
+        except OSError:
+            pass
+        if operation is not None:
+            operation.fail(code)
+        raise DownloadError(code) from exc
     return process
 
 
@@ -1314,6 +1570,8 @@ __all__ = [
     "UpdateManifest",
     "TEMPORARY_UNSIGNED_STABLE_POLICY",
     "UpdateScheduler",
+    "UpdaterSnapshot",
+    "UpdaterStateMachine",
     "UpdateStateStore",
     "cleanup_updates",
     "compare_versions",

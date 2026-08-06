@@ -332,9 +332,8 @@ def test_streamed_download_atomic_rename_and_progress(tmp_path):
 @pytest.mark.parametrize(
     ("headers", "payload", "code"),
     [
-        ({}, b"installer", "content_length_required"),
         ({"Content-Length": "8"}, b"installer", "content_length_mismatch"),
-        ({"Content-Length": "9"}, b"short", "byte_count_mismatch"),
+        ({"Content-Length": "9"}, b"short", "download_interrupted"),
     ],
 )
 def test_download_size_failures_remove_partial(tmp_path, headers, payload, code):

@@ -11197,6 +11197,18 @@ class MainPopup(QWidget):
                 font-size: 11px;
                 font-weight: 600;
             }
+            QProgressBar#updateBannerProgress {
+                min-height: 4px;
+                max-height: 4px;
+                background: rgba(196, 181, 245, 0.16);
+                border: none;
+                border-radius: 2px;
+            }
+            QProgressBar#updateBannerProgress::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #8b5cff, stop:1 #34d8ff);
+                border-radius: 2px;
+            }
 
             QScrollArea#chatScroll, QScrollArea#panelScroll,
             QWidget#chatHost, QWidget#panelHost {

@@ -161,6 +161,26 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "updates.view": {"en": "View", "fr": "Voir"},
     "updates.install": {"en": "Install", "fr": "Installer"},
     "updates.later": {"en": "Later", "fr": "Plus tard"},
+    "updates.phase.preparing": {
+        "en": "Preparing…",
+        "fr": "Préparation…",
+    },
+    "updates.phase.downloading": {
+        "en": "Downloading {percent}% — {received} / {total}",
+        "fr": "Téléchargement {percent} % — {received} / {total}",
+    },
+    "updates.phase.downloading_unknown": {
+        "en": "Downloading…",
+        "fr": "Téléchargement…",
+    },
+    "updates.phase.verifying": {
+        "en": "Verifying…",
+        "fr": "Vérification…",
+    },
+    "updates.phase.launching": {
+        "en": "Launching the update…",
+        "fr": "Lancement de la mise à jour…",
+    },
     "updates.check": {"en": "Check for updates", "fr": "Rechercher les mises à jour"},
     "updates.retry": {"en": "Retry", "fr": "Réessayer"},
     "updates.none": {"en": "None", "fr": "Aucune"},
@@ -250,6 +270,30 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Last error: {code}",
         "fr": "Dernière erreur : {code}",
     },
+    "updates.error.network": {
+        "en": "The download was interrupted. Check the network and retry.",
+        "fr": "Le téléchargement a été interrompu. Vérifiez le réseau puis réessayez.",
+    },
+    "updates.error.disk": {
+        "en": "Not enough disk space to download the update.",
+        "fr": "Espace disque insuffisant pour télécharger la mise à jour.",
+    },
+    "updates.error.permission": {
+        "en": "Windows denied access to the update file. Check permissions and retry.",
+        "fr": "Windows a refusé l’accès au fichier de mise à jour. Vérifiez les autorisations puis réessayez.",
+    },
+    "updates.error.hash": {
+        "en": "The update integrity check failed. Nothing was launched; retry.",
+        "fr": "Le contrôle d’intégrité de la mise à jour a échoué. Aucun installateur n’a été lancé ; réessayez.",
+    },
+    "updates.error.verification": {
+        "en": "The downloaded file does not match the expected update. Nothing was launched.",
+        "fr": "Le fichier téléchargé ne correspond pas à la mise à jour attendue. Aucun installateur n’a été lancé.",
+    },
+    "updates.error.launch": {
+        "en": "The verified installer could not be launched. Check Windows permissions and retry.",
+        "fr": "L’installateur vérifié n’a pas pu être lancé. Vérifiez les autorisations Windows puis réessayez.",
+    },
     "updates.error.legacy_unsigned_stable": {
         "en": "This installed updater is too old to install the current unsigned stable release automatically.\n\nUse the official manual in-place update:\n{url}\nVersion: {version}\nSize: {size} bytes\nSHA-256: {sha256}\n\nThe installer is NotSigned. Windows will show Unknown Publisher and may show Microsoft Defender SmartScreen. Keep Windows protections enabled; do not disable them.",
         "fr": "Le programme de mise à jour installé est trop ancien pour installer automatiquement la version stable non signée actuelle.\n\nUtilisez la mise à jour manuelle officielle sur place :\n{url}\nVersion : {version}\nTaille : {size} octets\nSHA-256 : {sha256}\n\nL’installateur est NotSigned. Windows affichera Éditeur inconnu et peut afficher Microsoft Defender SmartScreen. Gardez les protections Windows activées ; ne les désactivez pas.",
@@ -270,8 +314,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "updates.status.no_update": {"en": "Up to date", "fr": "À jour"},
     "updates.status.paused": {"en": "Channel paused", "fr": "Canal en pause"},
     "updates.status.available": {"en": "Available", "fr": "Disponible"},
+    "updates.status.preparing": {"en": "Preparing", "fr": "Préparation"},
     "updates.status.downloading": {"en": "Downloading", "fr": "Téléchargement"},
     "updates.status.verifying": {"en": "Verifying", "fr": "Vérification"},
+    "updates.status.launching": {"en": "Launching", "fr": "Lancement"},
+    "updates.status.failed": {"en": "Retry required", "fr": "Nouvel essai requis"},
     "updates.status.ready": {"en": "Verified and ready", "fr": "Vérifiée et prête"},
     "updates.status.error": {"en": "Retry required", "fr": "Nouvel essai requis"},
     "updates.status.pending": {"en": "Installer launching", "fr": "Lancement de l’installateur"},
