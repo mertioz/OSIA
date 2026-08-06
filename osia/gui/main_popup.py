@@ -22,6 +22,7 @@ import json
 import math
 import re
 import shlex
+import sys
 import threading
 import webbrowser
 from dataclasses import dataclass, field
@@ -122,7 +123,8 @@ RADIUS = 16     # WOR-48 P3: 20 → 16, lightly-rounded rectangle (not pill-like
 COMPOSER_BUTTON_SIZE = 34
 COMPOSER_BUTTON_RADIUS = 8
 COMPOSER_ICON_SIZE = 14
-# WOR-48 audit #2 — the drop shadow is painted BY HAND in MainPopup.paintEvent
+# WOR-48 audit #2 — the non-Windows drop shadow is painted BY HAND in
+# MainPopup.paintEvent
 # (no QGraphicsDropShadowEffect, which makes Qt render the widget off-screen and
 # thereby defeats the per-frame transparent clear, leaving ghost rectangles on
 # the translucent moving/resizing window). SHADOW_MARGIN is the transparent
@@ -134,6 +136,9 @@ SHADOW_LAYERS = 9     # concentric rounded-rect outlines faking a blurred shadow
 SHADOW_STEP = 2       # px each successive ring expands outward from the card
 SHADOW_DY = 8         # downward shadow offset (light reads as coming from above)
 SHADOW_ALPHA = 45     # alpha of the innermost (darkest) ring; fades to 0 outward
+# WOR-237: Windows must not paint the broad external halo.  The inset, window
+# geometry, translucent clear and rounded glass card remain unchanged.
+_PAINT_EXTERNAL_WINDOW_SHADOW = sys.platform != "win32"
 # Dark, semi-transparent glassmorphism fill so the popup reads as a floating
 # glass panel rather than an opaque window. Lower alpha → more transparent;
 # a second, slightly lighter layer painted on top fakes a soft blur/frost.
@@ -10302,9 +10307,10 @@ class MainPopup(QWidget):
         # installed graphics effect makes Qt render the widget into an off-screen
         # buffer, which defeats the per-frame transparent clear in paintEvent and
         # leaves ghost rectangles when this translucent window is dragged/resized.
-        # The drop shadow is instead painted by hand in paintEvent, inside the
-        # SHADOW_MARGIN canvas band → it lives in the backing store and is wiped
-        # clean every frame (no ghosts). No setGraphicsEffect anywhere.
+        # The non-Windows drop shadow is instead painted by hand in paintEvent,
+        # inside the SHADOW_MARGIN canvas band → it lives in the backing store
+        # and is wiped clean every frame (no ghosts). WOR-237 skips only those
+        # rings on Windows. No setGraphicsEffect anywhere.
 
         outer = QVBoxLayout(self)
         # Settings-reopen hit-test fix (root cause). MainPopup is a top-level
@@ -11057,9 +11063,9 @@ class MainPopup(QWidget):
         painter.fillRect(self.rect(), Qt.GlobalColor.transparent)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
 
-        # The card sits inside the SHADOW_MARGIN band; the band holds the
-        # hand-painted drop shadow drawn just below. Inset by SHADOW_MARGIN and
-        # -1px so the 1px border stroke stays crisp inside the widget.
+        # The card sits inside the SHADOW_MARGIN band; on non-Windows the band
+        # holds the hand-painted drop shadow drawn just below. Inset by
+        # SHADOW_MARGIN and -1px so the 1px border stays crisp inside the widget.
         card = self.rect().adjusted(
             SHADOW_MARGIN, SHADOW_MARGIN, -SHADOW_MARGIN - 1, -SHADOW_MARGIN - 1
         )
@@ -11074,26 +11080,27 @@ class MainPopup(QWidget):
         # WOR-74: the window is dragged via the OS (startSystemMove), which moves
         # the existing backing store — paintEvent no longer fires per mouse-move
         # during a drag, so there is no repaint flood to optimise against and the
-        # 9-ring shadow is ALWAYS painted (the old drag-time shadow-skip branch is
-        # gone). The transparent clear at the top of this method still wipes the
-        # entire widget rect each frame, so there is no ghost/smear concern.
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        for i in range(SHADOW_LAYERS, 0, -1):
-            frac = (i - 1) / (SHADOW_LAYERS - 1)   # 0 = innermost/darkest, 1 = outer
-            alpha = int(round(SHADOW_ALPHA * (1.0 - frac)))
-            spread = (i - 1) * SHADOW_STEP
-            pen = QPen(QColor(0, 0, 0, alpha))
-            pen.setWidthF(2.0)
-            painter.setPen(pen)
-            ring = QRectF(
-                card.x() + 0.5 - spread,
-                card.y() + 0.5 - spread + SHADOW_DY,
-                card.width() + spread * 2,
-                card.height() + spread * 2,
-            )
-            ring_path = QPainterPath()
-            ring_path.addRoundedRect(ring, RADIUS + spread, RADIUS + spread)
-            painter.drawPath(ring_path)
+        # old drag-time shadow-skip branch is gone. WOR-237 disables only these
+        # external rings on Windows; other platforms keep the established paint.
+        # The transparent clear at the top still wipes the entire widget rect.
+        if _PAINT_EXTERNAL_WINDOW_SHADOW:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for i in range(SHADOW_LAYERS, 0, -1):
+                frac = (i - 1) / (SHADOW_LAYERS - 1)   # 0 = inner, 1 = outer
+                alpha = int(round(SHADOW_ALPHA * (1.0 - frac)))
+                spread = (i - 1) * SHADOW_STEP
+                pen = QPen(QColor(0, 0, 0, alpha))
+                pen.setWidthF(2.0)
+                painter.setPen(pen)
+                ring = QRectF(
+                    card.x() + 0.5 - spread,
+                    card.y() + 0.5 - spread + SHADOW_DY,
+                    card.width() + spread * 2,
+                    card.height() + spread * 2,
+                )
+                ring_path = QPainterPath()
+                ring_path.addRoundedRect(ring, RADIUS + spread, RADIUS + spread)
+                painter.drawPath(ring_path)
 
         # The glass card itself, painted ON TOP of the shadow.
         path = QPainterPath()
