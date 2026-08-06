@@ -322,13 +322,29 @@ def test_startup_recovery_targets_actual_unverified_mutation_without_redispatch(
 
     recovered = tool_attempts.recover_orphaned_tool_attempts()
 
+    assert recovered == []
+    waiting = store.get_attempt(pending.tool_attempt_id)
+    assert waiting["status"] == ToolAttemptStatus.WAITING_VERIFICATION.value
+    assert waiting["reason_code"] == "restart_reconciliation_pending"
+    assert conversations.get_conversation(conversation["id"])["messages"][-1][
+        "role"
+    ] == "user"
+
+    store.mark_waiting_verification(
+        pending.tool_attempt_id,
+        next_check_at=time.time() - 1.0,
+        deadline_at=time.time() - 0.5,
+        reason_code="restart_reconciliation_pending",
+        owner_settled=True,
+    )
+    recovered = tool_attempts.recover_orphaned_tool_attempts()
     assert len(recovered) == 1
     assert recovered[0]["tool_attempt_id"] == pending.tool_attempt_id
     assert dispatches == ["Activate controlled fixture"]
     terminal = store.get_attempt(pending.tool_attempt_id)
     assert terminal["tool_name"] == "find_and_click"
     assert terminal["status"] == ToolAttemptStatus.UNKNOWN_AFTER_START.value
-    assert terminal["reason_code"] == "session_lost_after_unknown_effect"
+    assert terminal["reason_code"] == "reconciliation_hard_deadline"
     assert terminal["dispatch_state"] == "effect_unknown"
     assert terminal["provider_id"] == "provider_restart_fixture"
     assert terminal["model_id"] == "model_restart_fixture"
@@ -340,8 +356,8 @@ def test_startup_recovery_targets_actual_unverified_mutation_without_redispatch(
         ("user", "Activate the controlled fixture once"),
         (
             "assistant",
-            "The tool session was lost after the action may have started. "
-            "OSIA did not repeat it.",
+            "Read-only verification reached its hard limit. OSIA did not "
+            "repeat the action.",
         ),
     ]
 

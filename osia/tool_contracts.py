@@ -93,6 +93,16 @@ class ProgressEvidencePolicy(str, Enum):
     VERIFIED_FORM_STATE = "verified_form_state"
 
 
+class ToolPersistenceFamily(str, Enum):
+    """Bounded waiting profile shared by related tool owners."""
+
+    BROWSER = "browser"
+    FILE = "file"
+    API_MCP = "api_mcp"
+    SYSTEM = "system"
+    GENERIC = "generic"
+
+
 class EvidenceClassification(str, Enum):
     PROVED = "proved"
     UNAVAILABLE_IN_ENVIRONMENT = "unavailable_in_environment"
@@ -134,6 +144,19 @@ AUTONOMOUS_WEB_VERIFY_TOOL_NAMES = frozenset({
     "inspect_form_fields", "get_browser_state", "inspect_browser_page",
     "wait_for_browser_condition", "list_browser_tabs",
     "list_browser_dialogs",
+})
+
+_FILE_PERSISTENCE_TOOLS = frozenset({
+    "read_file", "read_document", "read_document_artifact", "query_document",
+    "write_file", "render_pdf", "list_files", "delete_file",
+    "create_directory", "delete_directory", "rename_file", "copy_file",
+    "get_file_info", "search_files", "open_file", "edit_file_lines",
+})
+_SYSTEM_PERSISTENCE_TOOLS = frozenset({
+    "bash", "run_command", "open_application", "open_uri",
+    "get_system_info", "list_running_processes", "kill_process", "set_volume",
+    "get_clipboard", "set_clipboard", "is_running", "is_installed",
+    "has_window", "steam_game_state",
 })
 
 _ACTIVE_TOOL_SURFACE: ContextVar[str] = ContextVar(
@@ -221,6 +244,26 @@ class ToolExecutionRecord:
     contract: EffectiveToolContract
     tool_attempt_id: str = ""
     worker_may_be_active: bool = False
+    reason_code: str = ""
+
+
+@dataclass(frozen=True)
+class ToolPersistenceContract:
+    """One value-free, tool-family-specific durable waiting policy.
+
+    ``release_after_seconds`` bounds how long a Chat/provider turn waits for a
+    local owner.  The owner may continue after that boundary, while the common
+    attempt store performs read-only reconciliation.  Inactivity and hard
+    limits remain distinct so new verified progress can extend only the former.
+    """
+
+    family: ToolPersistenceFamily
+    release_after_seconds: float
+    inactivity_timeout_seconds: float
+    hard_timeout_seconds: float
+    check_delays_seconds: tuple[float, ...]
+    safe_alternatives: tuple[str, ...] = ()
+    restart_reconciliation: bool = True
 
 
 @dataclass(frozen=True)
@@ -1710,6 +1753,81 @@ def effective_contract(
     return EffectiveToolContract(spec, side_effect, idempotency, confirmation, retry)
 
 
+def persistence_contract(
+    spec: ToolSpec,
+    *,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    owner_timeout_seconds: float,
+) -> ToolPersistenceContract:
+    """Resolve one bounded durable-waiting policy from the tool contract.
+
+    The values are deliberately family-specific.  They do not authorize a
+    replay: alternatives are read-only reconciliation strategies, while retry
+    permission remains exclusively governed by :class:`RetryPolicy`.
+    """
+
+    name = str(tool_name or spec.name or "")
+    owner_timeout = max(0.05, min(float(owner_timeout_seconds), 86_400.0))
+    wait_timeout = 0.0
+    wait_spec = arguments.get("wait_spec") if isinstance(arguments, Mapping) else None
+    if isinstance(wait_spec, Mapping):
+        try:
+            wait_timeout = max(0.0, min(float(wait_spec.get("timeout_seconds") or 0), 86_400.0))
+        except (TypeError, ValueError, OverflowError):
+            wait_timeout = 0.0
+
+    if name in AUTONOMOUS_WEB_TOOL_NAMES or any(
+        "browser" in str(item) for item in spec.preconditions
+    ):
+        family = ToolPersistenceFamily.BROWSER
+        release_after = min(owner_timeout, 3.0)
+        inactivity = max(owner_timeout + 5.0, wait_timeout + 10.0)
+        hard = max(inactivity + 15.0, owner_timeout * 1.5)
+        delays = (1.0, 2.0, 3.0, 5.0, 8.0, 13.0)
+        alternatives = (
+            ("fresh_browser_postcondition",)
+            if spec.postcondition_required else ()
+        )
+    elif name in _FILE_PERSISTENCE_TOOLS:
+        family = ToolPersistenceFamily.FILE
+        release_after = min(owner_timeout, 1.5)
+        inactivity = owner_timeout + 2.0
+        hard = max(inactivity + 10.0, owner_timeout * 1.5)
+        delays = (0.5, 1.0, 2.0, 4.0, 8.0)
+        alternatives = ()
+    elif spec.dynamic or name.startswith("mcp__") or name.startswith("gmail_"):
+        family = ToolPersistenceFamily.API_MCP
+        release_after = min(owner_timeout, 3.0)
+        inactivity = owner_timeout + 5.0
+        hard = max(inactivity + 20.0, owner_timeout * 1.25)
+        delays = (1.0, 2.0, 5.0, 10.0, 15.0)
+        alternatives = ()
+    elif name in _SYSTEM_PERSISTENCE_TOOLS:
+        family = ToolPersistenceFamily.SYSTEM
+        release_after = min(owner_timeout, 2.0)
+        inactivity = owner_timeout + 2.0
+        hard = max(inactivity + 15.0, owner_timeout * 1.1)
+        delays = (1.0, 2.0, 5.0, 10.0, 20.0)
+        alternatives = ()
+    else:
+        family = ToolPersistenceFamily.GENERIC
+        release_after = min(owner_timeout, 2.0)
+        inactivity = owner_timeout + 2.0
+        hard = max(inactivity + 10.0, owner_timeout * 1.5)
+        delays = (1.0, 2.0, 5.0)
+        alternatives = ()
+
+    return ToolPersistenceContract(
+        family=family,
+        release_after_seconds=max(0.05, release_after),
+        inactivity_timeout_seconds=max(0.1, inactivity),
+        hard_timeout_seconds=max(inactivity, hard),
+        check_delays_seconds=delays,
+        safe_alternatives=alternatives,
+    )
+
+
 def normalized_call_hash(tool_name: str, arguments: Mapping[str, Any]) -> str:
     payload = json.dumps(
         {"tool": str(tool_name), "arguments": dict(arguments)},
@@ -2069,7 +2187,8 @@ __all__ = [
     "ProgressEvidencePolicy", "RealValidationRequirement", "ResultPolicy",
     "RetryPolicy", "STATIC_TOOL_REGISTRY", "STATIC_TOOL_SPECS",
     "SideEffectClass", "ToolRegistry", "ToolRegistryError", "ToolSpec",
-    "ToolExecutionRecord", "ToolValidationError", "ToolValidationIssue",
+    "ToolExecutionRecord", "ToolPersistenceContract", "ToolPersistenceFamily",
+    "ToolValidationError", "ToolValidationIssue",
     "assert_prompt_tool_examples_compatible",
     "bind_static_registry", "bounded_model_result",
     "compatibility_tool_spec",
@@ -2077,7 +2196,7 @@ __all__ = [
     "current_tool_surface", "effective_contract", "effective_static_tool_specs",
     "effective_tool_surface_scope", "get_static_registry", "get_tool_spec",
     "harden_input_schema", "is_final_browser_commit", "matrix_rows",
-    "normalized_call_hash", "register_dynamic_tool",
+    "normalized_call_hash", "persistence_contract", "register_dynamic_tool",
     "replace_static_tool_prompt_section", "safe_confirmation_summary",
     "shell_command_is_proven_read_only", "static_tool_prompt_block",
     "tool_is_eligible_in_current_surface",

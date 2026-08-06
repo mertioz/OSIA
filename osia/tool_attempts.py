@@ -34,6 +34,8 @@ ANTI_REPLAY_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 _OPAQUE_BROWSER_TOKEN = re.compile(r"^[A-Za-z0-9_-]{8,96}$")
 _SAFE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
+_PERSISTENCE_STATES = frozenset({"waiting", "reconciling", "stalled", "terminal"})
+_PERSISTENCE_FAMILIES = frozenset({"browser", "file", "api_mcp", "system", "generic"})
 
 
 class ToolAttemptStatus(str, Enum):
@@ -251,6 +253,54 @@ def _safe_browser_state(value: Mapping[str, Any] | None) -> dict[str, Any] | Non
     return result
 
 
+def _safe_persistence_contract(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    family = str(source.get("family") or "generic")
+    if family not in _PERSISTENCE_FAMILIES:
+        family = "generic"
+
+    def _seconds(name: str, default: float) -> float:
+        try:
+            result = float(source.get(name, default))
+        except (TypeError, ValueError, OverflowError):
+            result = default
+        return max(0.05, min(result, 86_400.0))
+
+    inactivity = _seconds("inactivity_timeout_seconds", 30.0)
+    hard = max(inactivity, _seconds("hard_timeout_seconds", inactivity))
+    delays: list[float] = []
+    for item in source.get("check_delays_seconds", ()):
+        try:
+            delay = float(item)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if 0.05 <= delay <= 300.0:
+            delays.append(delay)
+        if len(delays) >= 12:
+            break
+    if not delays:
+        delays = [2.0, 5.0]
+    alternatives = []
+    for item in source.get("safe_alternatives", ()):
+        candidate = _safe_reason(item)
+        if candidate and candidate not in alternatives:
+            alternatives.append(candidate)
+        if len(alternatives) >= 8:
+            break
+    return {
+        "family": family,
+        "release_after_seconds": _seconds("release_after_seconds", 2.0),
+        "inactivity_timeout_seconds": inactivity,
+        "hard_timeout_seconds": hard,
+        "check_delays_seconds": delays,
+        "safe_alternatives": alternatives,
+        # Legacy WOR-227 records had no restart-reconciliation contract and
+        # retain their original fail-closed behavior. New attempts opt in
+        # explicitly through the family policy snapshot.
+        "restart_reconciliation": source.get("restart_reconciliation") is True,
+    }
+
+
 class ToolAttemptStore:
     """Atomic JSON-file store with cross-process locking and revision CAS."""
 
@@ -398,6 +448,56 @@ class ToolAttemptStore:
         record.setdefault("continuation_claimed_at", None)
         record.setdefault("continuation_claimed_pid", None)
         record.setdefault("reconciliation_claimed_pid", None)
+        policy = _safe_persistence_contract(record.get("persistence_contract"))
+        record["persistence_contract"] = policy
+        hard_deadline = record.get("hard_deadline_at", record.get("deadline_at"))
+        inactivity_deadline = record.get("inactivity_deadline_at", hard_deadline)
+        for field, value in (
+            ("hard_deadline_at", hard_deadline),
+            ("inactivity_deadline_at", inactivity_deadline),
+        ):
+            try:
+                record[field] = float(value) if value is not None else None
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise CorruptAttemptError("invalid_persistence_deadline") from exc
+        persistence_state = str(record.get("persistence_state") or "")
+        if not persistence_state:
+            persistence_state = (
+                "terminal" if status in TERMINAL_STATUSES else "waiting"
+            )
+        if persistence_state not in _PERSISTENCE_STATES:
+            raise CorruptAttemptError("invalid_persistence_state")
+        record["persistence_state"] = persistence_state
+        record.setdefault(
+            "terminal_state", "terminal" if status in TERMINAL_STATUSES else "",
+        )
+        record.setdefault("stalled_at", None)
+        for field in ("reconciliation_check_index", "useful_progress_count"):
+            try:
+                number = int(record.get(field, 0))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise CorruptAttemptError("invalid_persistence_counter") from exc
+            if number < 0 or number > 1_000_000:
+                raise CorruptAttemptError("invalid_persistence_counter")
+            record[field] = number
+        fingerprints = record.get("useful_progress_fingerprints", [])
+        if not isinstance(fingerprints, list) or any(
+            not re.fullmatch(r"sha256:[0-9a-f]{64}", str(item or ""))
+            for item in fingerprints
+        ):
+            raise CorruptAttemptError("invalid_progress_fingerprints")
+        record["useful_progress_fingerprints"] = fingerprints[-32:]
+        attempted = record.get("attempted_safe_alternatives", [])
+        if not isinstance(attempted, list):
+            raise CorruptAttemptError("invalid_safe_alternatives")
+        safe_attempted = []
+        for item in attempted:
+            candidate = _safe_reason(item)
+            if not candidate or candidate not in policy["safe_alternatives"]:
+                raise CorruptAttemptError("invalid_safe_alternatives")
+            if candidate not in safe_attempted:
+                safe_attempted.append(candidate)
+        record["attempted_safe_alternatives"] = safe_attempted
         return dict(record)
 
     def _read_unlocked(self, attempt_id: str) -> dict[str, Any]:
@@ -454,6 +554,7 @@ class ToolAttemptStore:
         autonomous_operation_id: str = "",
         operation_revision: int = 0,
         permission_epoch: int = 0,
+        persistence_contract: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         conversation_id = _safe_token(conversation_id, field="conversation_id")
         turn_id = _safe_token(turn_id, field="turn_id")
@@ -485,6 +586,16 @@ class ToolAttemptStore:
         ):
             raise ValueError("invalid_autonomous_revision")
         now = _now()
+        persistence = _safe_persistence_contract(persistence_contract)
+        hard_deadline = (
+            float(deadline_at)
+            if deadline_at is not None
+            else now + persistence["hard_timeout_seconds"]
+        )
+        inactivity_deadline = min(
+            hard_deadline,
+            now + persistence["inactivity_timeout_seconds"],
+        )
         attempt_id = "attempt_" + secrets.token_urlsafe(24)
         record = {
             "schema_version": SCHEMA_VERSION,
@@ -510,7 +621,17 @@ class ToolAttemptStore:
             "last_progress_at": None,
             "completed_at": None,
             "next_check_at": float(next_check_at) if next_check_at is not None else None,
-            "deadline_at": float(deadline_at) if deadline_at is not None else None,
+            "deadline_at": hard_deadline,
+            "hard_deadline_at": hard_deadline,
+            "inactivity_deadline_at": inactivity_deadline,
+            "persistence_contract": persistence,
+            "persistence_state": "waiting",
+            "terminal_state": "",
+            "stalled_at": None,
+            "reconciliation_check_index": 0,
+            "useful_progress_count": 0,
+            "useful_progress_fingerprints": [],
+            "attempted_safe_alternatives": [],
             "postcondition_type": _safe_reason(postcondition_type),
             "browser_state_ref": _safe_browser_state(browser_state_ref),
             "dispatch_state": "not_dispatched",
@@ -617,37 +738,109 @@ class ToolAttemptStore:
     def mark_pending(
         self, attempt_id: str, *, next_check_at: float, deadline_at: float,
         reason_code: str = "owner_still_running",
+        check_index: int | None = None,
     ) -> dict:
+        updates = {
+            "next_check_at": float(next_check_at),
+            "deadline_at": float(deadline_at),
+            "hard_deadline_at": float(deadline_at),
+            "dispatch_state": "worker_may_be_active",
+            "reason_code": _safe_reason(reason_code),
+            "persistence_state": "waiting",
+        }
+        if check_index is not None:
+            updates["reconciliation_check_index"] = max(0, int(check_index))
         return self._transition(
             attempt_id, ToolAttemptStatus.PENDING,
-            updates={"next_check_at": float(next_check_at),
-                     "deadline_at": float(deadline_at),
-                     "dispatch_state": "worker_may_be_active",
-                     "reason_code": _safe_reason(reason_code)},
+            updates=updates,
         )
 
     def mark_waiting_verification(
         self, attempt_id: str, *, next_check_at: float, deadline_at: float,
         reason_code: str = "postcondition_not_observed",
+        owner_settled: bool = False,
+        check_index: int | None = None,
     ) -> dict:
+        updates = {
+            "next_check_at": float(next_check_at),
+            "deadline_at": float(deadline_at),
+            "hard_deadline_at": float(deadline_at),
+            "reason_code": _safe_reason(reason_code),
+            "persistence_state": "waiting",
+        }
+        if owner_settled:
+            updates["dispatch_state"] = "owner_settled_unverified"
+        if check_index is not None:
+            updates["reconciliation_check_index"] = max(0, int(check_index))
         return self._transition(
             attempt_id, ToolAttemptStatus.WAITING_VERIFICATION,
-            updates={"next_check_at": float(next_check_at),
-                     "deadline_at": float(deadline_at),
-                     "reason_code": _safe_reason(reason_code)},
+            updates=updates,
         )
 
     def record_progress(
         self, attempt_id: str, *, phase: str = "running",
         next_check_at: float | None = None,
+        useful: bool = False,
+        evidence_token: str = "",
     ) -> dict:
         record = self.get_attempt(attempt_id)
         if record is None or ToolAttemptStatus(record["status"]) in TERMINAL_STATUSES:
             return record or {}
-        updates = {"last_progress_at": _now(), "reason_code": _safe_reason(phase)}
+        now = _now()
+        updates: dict[str, Any] = {"reason_code": _safe_reason(phase)}
+        if useful and evidence_token:
+            fingerprint = "sha256:" + hashlib.sha256(
+                str(evidence_token).encode("utf-8", errors="replace")
+            ).hexdigest()
+            seen = list(record.get("useful_progress_fingerprints") or [])
+            if fingerprint not in seen:
+                seen.append(fingerprint)
+                policy = record.get("persistence_contract") or {}
+                inactivity = float(
+                    policy.get("inactivity_timeout_seconds") or 0.0
+                )
+                hard_deadline = float(
+                    record.get("hard_deadline_at")
+                    or record.get("deadline_at")
+                    or now
+                )
+                updates.update({
+                    "last_progress_at": now,
+                    "inactivity_deadline_at": min(
+                        hard_deadline, now + max(0.05, inactivity),
+                    ),
+                    "useful_progress_count": int(
+                        record.get("useful_progress_count") or 0
+                    ) + 1,
+                    "useful_progress_fingerprints": seen[-32:],
+                    "reconciliation_check_index": 0,
+                })
         if next_check_at is not None:
             updates["next_check_at"] = float(next_check_at)
         return self._transition(attempt_id, ToolAttemptStatus(record["status"]), updates=updates)
+
+    def record_safe_alternative(self, attempt_id: str, strategy: str) -> bool:
+        """Claim one configured read-only alternative at most once."""
+
+        strategy = _safe_reason(strategy)
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            if ToolAttemptStatus(record["status"]) in TERMINAL_STATUSES:
+                return False
+            allowed = list(
+                (record.get("persistence_contract") or {}).get(
+                    "safe_alternatives", ()
+                )
+            )
+            attempted = list(record.get("attempted_safe_alternatives") or [])
+            if not strategy or strategy not in allowed or strategy in attempted:
+                return False
+            attempted.append(strategy)
+            record["attempted_safe_alternatives"] = attempted
+            record["revision"] = int(record["revision"]) + 1
+            record["updated_at"] = _now()
+            self._write_atomic(self._path(attempt_id), record)
+            return True
 
     def record_terminal_result(
         self,
@@ -674,15 +867,25 @@ class ToolAttemptStore:
                     f"illegal_transition:{current.value}:{status.value}"
                 )
             now = _now()
+            safe_reason = _safe_reason(reason_code)
+            stalled = safe_reason in {
+                "reconciliation_stalled", "owner_timeout_stalled",
+            }
             record.update({
                 "status": status.value,
                 "terminal_outcome": _safe_token(
                     terminal_outcome, field="terminal_outcome",
                 ),
                 "dispatch_state": _safe_token(dispatch_state, field="dispatch_state"),
-                "reason_code": _safe_reason(reason_code),
+                "reason_code": safe_reason,
                 "completed_at": now,
                 "next_check_at": None,
+                "reconciliation_claim": "",
+                "reconciliation_claimed_at": None,
+                "reconciliation_claimed_pid": None,
+                "persistence_state": "stalled" if stalled else "terminal",
+                "terminal_state": "terminal",
+                "stalled_at": now if stalled else record.get("stalled_at"),
                 "updated_at": now,
                 "revision": int(record["revision"]) + 1,
             })
@@ -710,6 +913,8 @@ class ToolAttemptStore:
                     "reason_code": "cancellation_acknowledged_before_effect",
                     "completed_at": now,
                     "next_check_at": None,
+                    "persistence_state": "terminal",
+                    "terminal_state": "terminal",
                     "updated_at": now,
                     "revision": int(record["revision"]) + 1,
                 })
@@ -789,6 +994,7 @@ class ToolAttemptStore:
             record["reconciliation_claim"] = claim
             record["reconciliation_claimed_at"] = _now()
             record["reconciliation_claimed_pid"] = os.getpid()
+            record["persistence_state"] = "reconciling"
             record["revision"] = int(record["revision"]) + 1
             record["updated_at"] = _now()
             self._write_atomic(self._path(attempt_id), record)
@@ -804,6 +1010,7 @@ class ToolAttemptStore:
             record["reconciliation_claim"] = ""
             record["reconciliation_claimed_at"] = None
             record["reconciliation_claimed_pid"] = None
+            record["persistence_state"] = "waiting"
             record["revision"] = int(record["revision"]) + 1
             record["updated_at"] = _now()
             self._write_atomic(self._path(attempt_id), record)
@@ -1176,6 +1383,41 @@ class ToolAttemptCoordinator:
             runtime.timer = timer
         timer.start()
 
+    @staticmethod
+    def _effective_deadline(record: Mapping[str, Any], now: float) -> tuple[float, str]:
+        hard = float(
+            record.get("hard_deadline_at")
+            or record.get("deadline_at")
+            or now
+        )
+        inactivity = float(record.get("inactivity_deadline_at") or hard)
+        if hard <= inactivity:
+            return hard, "reconciliation_hard_deadline"
+        return inactivity, "reconciliation_stalled"
+
+    @staticmethod
+    def _next_progressive_check(record: Mapping[str, Any], now: float) -> tuple[float, int]:
+        policy = record.get("persistence_contract") or {}
+        delays = list(policy.get("check_delays_seconds") or (2.0, 5.0))
+        index = max(0, int(record.get("reconciliation_check_index") or 0))
+        delay = float(delays[min(index, len(delays) - 1)])
+        # Small bounded jitter avoids synchronized external probes without
+        # changing the progressive contract or making tests timing-sensitive.
+        jitter = min(0.5, delay * 0.1) * (secrets.randbelow(1001) / 1000.0)
+        return now + delay + jitter, min(index + 1, len(delays))
+
+    def notify_reconciliation_ready(self, attempt_id: str) -> bool:
+        """Wake one read-only verifier after its owner has settled."""
+
+        with self._lock:
+            runtime = self._runtimes.get(attempt_id)
+            usable = bool(
+                runtime is not None and runtime.activated and not runtime.running
+            )
+        if usable:
+            self._schedule_timer(attempt_id, immediate=True)
+        return usable
+
     def _timer_fired(self, attempt_id: str) -> None:
         with self._lock:
             runtime = self._runtimes.get(attempt_id)
@@ -1196,6 +1438,7 @@ class ToolAttemptCoordinator:
             return
         try:
             self._emit(runtime, attempt_id, "verifying_tool_result")
+            progress_before = int(record.get("useful_progress_count") or 0)
             if runtime.verify is not None:
                 try:
                     payload = runtime.verify(attempt_id)
@@ -1205,31 +1448,68 @@ class ToolAttemptCoordinator:
                     self.notify_terminal(attempt_id, payload)
                     return
             now = _now()
-            deadline = float(record.get("deadline_at") or now)
-            if now >= deadline:
+            try:
+                current_record = self.store.get_attempt(attempt_id) or record
+            except CorruptAttemptError:
+                return
+            if ToolAttemptStatus(current_record["status"]) in TERMINAL_STATUSES:
+                self.notify_terminal(attempt_id, current_record)
+                return
+            effective_deadline, deadline_reason = self._effective_deadline(
+                current_record, now,
+            )
+            if now >= effective_deadline:
+                side_effect = str(current_record.get("side_effect") or "")
+                dispatch_state = str(
+                    current_record.get("dispatch_state") or "not_dispatched"
+                )
+                effect_possible = bool(
+                    side_effect != "read_only"
+                    and dispatch_state not in {
+                        "not_dispatched", "cancelled_before_effect",
+                    }
+                )
                 terminal, _created = self.store.record_terminal_result(
                     attempt_id,
-                    status=ToolAttemptStatus.UNKNOWN_AFTER_START,
-                    terminal_outcome="outcome_unknown",
-                    dispatch_state="effect_unknown",
-                    reason_code="verification_deadline_expired",
+                    status=(
+                        ToolAttemptStatus.UNKNOWN_AFTER_START
+                        if effect_possible
+                        else ToolAttemptStatus.FAILED_BEFORE_EFFECT
+                    ),
+                    terminal_outcome=(
+                        "outcome_unknown"
+                        if effect_possible
+                        else "confirmed_failure_before_effect"
+                    ),
+                    dispatch_state=(
+                        "effect_unknown" if effect_possible else "not_dispatched"
+                    ),
+                    reason_code=deadline_reason,
                 )
                 self.notify_terminal(attempt_id, terminal)
                 return
-            # Bounded low-frequency fallback; delivery of an owner callback
-            # still cancels this timer and claims continuation first.
-            next_check = min(
-                deadline, now + 5.0 + secrets.randbelow(1000) / 1000.0,
+            progress_after = int(
+                current_record.get("useful_progress_count") or 0
             )
+            if progress_after > progress_before:
+                current_record["reconciliation_check_index"] = 0
+            next_check, check_index = self._next_progressive_check(
+                current_record, now,
+            )
+            next_check = min(effective_deadline, next_check)
             try:
-                current_record = self.store.get_attempt(attempt_id) or record
                 current = ToolAttemptStatus(current_record["status"])
                 if current == ToolAttemptStatus.PENDING:
                     self.store.mark_pending(
                         attempt_id,
                         next_check_at=next_check,
-                        deadline_at=deadline,
+                        deadline_at=float(
+                            current_record.get("hard_deadline_at")
+                            or current_record.get("deadline_at")
+                            or effective_deadline
+                        ),
                         reason_code="owner_still_running",
+                        check_index=check_index,
                     )
                 elif current == ToolAttemptStatus.CANCELLATION_REQUESTED:
                     self.store.record_progress(
@@ -1241,8 +1521,17 @@ class ToolAttemptCoordinator:
                     self.store.mark_waiting_verification(
                         attempt_id,
                         next_check_at=next_check,
-                        deadline_at=deadline,
+                        deadline_at=float(
+                            current_record.get("hard_deadline_at")
+                            or current_record.get("deadline_at")
+                            or effective_deadline
+                        ),
                         reason_code="postcondition_not_observed",
+                        owner_settled=(
+                            current_record.get("dispatch_state")
+                            == "owner_settled_unverified"
+                        ),
+                        check_index=check_index,
                     )
                 else:
                     self.notify_terminal(attempt_id, current_record)
@@ -1408,9 +1697,15 @@ class ToolAttemptCoordinator:
             )
         return discontinuity
 
-    def startup_fail_closed(self) -> list[dict]:
-        """Finalize orphaned attempts without replaying their external action."""
+    def startup_fail_closed(self, *, now: float | None = None) -> list[dict]:
+        """Recover orphaned attempts without replaying their external action.
 
+        A process restart no longer turns a still-live durable budget into an
+        immediate unknown result.  The attempt remains waiting for bounded
+        read-only reattachment until its persisted inactivity/hard boundary.
+        """
+
+        now = _now() if now is None else float(now)
         recovered = []
         for record in self.store.list_recoverable_attempts():
             attempt_id = record["tool_attempt_id"]
@@ -1418,6 +1713,67 @@ class ToolAttemptCoordinator:
             if claim is None:
                 continue
             dispatch_started = record.get("dispatch_state") != "not_dispatched"
+            if (
+                dispatch_started
+                and (record.get("persistence_contract") or {}).get(
+                    "restart_reconciliation", True,
+                )
+            ):
+                effective_deadline, deadline_reason = self._effective_deadline(
+                    record, now,
+                )
+                if now < effective_deadline:
+                    next_check, check_index = self._next_progressive_check(
+                        record, now,
+                    )
+                    try:
+                        self.store.mark_waiting_verification(
+                            attempt_id,
+                            next_check_at=min(next_check, effective_deadline),
+                            deadline_at=float(
+                                record.get("hard_deadline_at")
+                                or record.get("deadline_at")
+                                or effective_deadline
+                            ),
+                            reason_code="restart_reconciliation_pending",
+                            owner_settled=True,
+                            check_index=check_index,
+                        )
+                    except (IllegalTransition, CorruptAttemptError):
+                        pass
+                    finally:
+                        try:
+                            self.store.release_reconciliation(attempt_id, claim)
+                        except (IllegalTransition, CorruptAttemptError):
+                            pass
+                    continue
+                side_effect = str(record.get("side_effect") or "")
+                effect_possible = bool(
+                    side_effect != "read_only"
+                    and record.get("dispatch_state") not in {
+                        "not_dispatched", "cancelled_before_effect",
+                    }
+                )
+                terminal, created = self.store.record_terminal_result(
+                    attempt_id,
+                    status=(
+                        ToolAttemptStatus.UNKNOWN_AFTER_START
+                        if effect_possible else
+                        ToolAttemptStatus.FAILED_BEFORE_EFFECT
+                    ),
+                    terminal_outcome=(
+                        "outcome_unknown"
+                        if effect_possible else
+                        "confirmed_failure_before_effect"
+                    ),
+                    dispatch_state=(
+                        "effect_unknown" if effect_possible else "not_dispatched"
+                    ),
+                    reason_code=deadline_reason,
+                )
+                if created:
+                    recovered.append(terminal)
+                continue
             status = (
                 ToolAttemptStatus.UNKNOWN_AFTER_START
                 if dispatch_started else ToolAttemptStatus.FAILED_BEFORE_EFFECT
@@ -1482,6 +1838,8 @@ def publish_tool_attempt_event(phase: str, reason_code: str = "") -> None:
 _DEFAULT_STORE: ToolAttemptStore | None = None
 _DEFAULT_STORE_LOCK = threading.Lock()
 _DEFAULT_COORDINATOR: ToolAttemptCoordinator | None = None
+_ORPHAN_TIMER_LOCK = threading.Lock()
+_ORPHAN_TIMERS: dict[str, threading.Timer] = {}
 
 
 def get_tool_attempt_store() -> ToolAttemptStore:
@@ -1505,10 +1863,42 @@ def get_tool_attempt_coordinator() -> ToolAttemptCoordinator:
     return _DEFAULT_COORDINATOR
 
 
+def _schedule_orphan_recovery_checks() -> None:
+    """Arm one daemon deadline wake-up per unowned durable attempt."""
+
+    store = get_tool_attempt_store()
+    coordinator = get_tool_attempt_coordinator()
+    now = _now()
+    for record in store.list_recoverable_attempts():
+        attempt_id = str(record.get("tool_attempt_id") or "")
+        if not attempt_id:
+            continue
+        deadline, _reason = coordinator._effective_deadline(record, now)
+        delay = max(0.05, min(deadline - now, 86_400.0))
+
+        def _wake(target=attempt_id):
+            with _ORPHAN_TIMER_LOCK:
+                _ORPHAN_TIMERS.pop(target, None)
+            try:
+                recover_orphaned_tool_attempts()
+            except Exception:
+                pass
+
+        with _ORPHAN_TIMER_LOCK:
+            existing = _ORPHAN_TIMERS.get(attempt_id)
+            if existing is not None and existing.is_alive():
+                continue
+            timer = threading.Timer(delay, _wake)
+            timer.daemon = True
+            _ORPHAN_TIMERS[attempt_id] = timer
+            timer.start()
+
+
 def recover_orphaned_tool_attempts() -> list[dict]:
     """Fail closed on startup and finish any accepted chat turn exactly once."""
 
     recovered = get_tool_attempt_coordinator().startup_fail_closed()
+    _schedule_orphan_recovery_checks()
     if not recovered:
         try:
             get_tool_attempt_store().cleanup()
@@ -1530,11 +1920,27 @@ def recover_orphaned_tool_attempts() -> list[dict]:
             ToolAttemptStatus.FAILED_AFTER_EFFECT,
         }
         recovery_reason = (
+            str(record.get("reason_code") or "")
+            if record.get("reason_code") in {
+                "reconciliation_stalled", "reconciliation_hard_deadline",
+            } else
             "session_lost_after_unknown_effect" if unknown else
             "session_lost_after_terminal_receipt" if confirmed_effect else
             "session_lost_before_dispatch"
         )
         text = (
+            "La v\u00e9rification en lecture seule n'a montr\u00e9 aucun nouveau "
+            "progr\u00e8s avant sa limite d'inactivit\u00e9. OSIA n'a pas relanc\u00e9 l'action."
+            if language == "fr" and recovery_reason == "reconciliation_stalled" else
+            "La v\u00e9rification en lecture seule a atteint sa limite totale. "
+            "OSIA n'a pas relanc\u00e9 l'action."
+            if language == "fr" and recovery_reason == "reconciliation_hard_deadline" else
+            "Read-only verification made no new progress before its bounded "
+            "inactivity limit. OSIA did not repeat the action."
+            if recovery_reason == "reconciliation_stalled" else
+            "Read-only verification reached its hard limit. OSIA did not "
+            "repeat the action."
+            if recovery_reason == "reconciliation_hard_deadline" else
             "La session de l'outil a \u00e9t\u00e9 perdue apr\u00e8s le d\u00e9but "
             "possible de l'action. OSIA ne l'a pas relanc\u00e9e."
             if language == "fr" and unknown else

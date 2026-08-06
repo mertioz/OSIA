@@ -3972,6 +3972,7 @@ def _same_turn_reused_execution_record(record):
         False,
         record.timed_out,
         record.contract,
+        reason_code=getattr(record, "reason_code", ""),
     )
 
 
@@ -4262,6 +4263,87 @@ def _is_tool_error(result) -> bool:
     return any(upper.startswith(p) for p in _ERROR_PREFIXES)
 
 
+_PROMPT_TERMINAL_TOOL_REASONS = frozenset({
+    "dns_failure", "authentication_failure", "permission_failure",
+    "command_blocked", "stale_semantic_reference",
+})
+
+
+def _canonical_tool_reason_code(result=None, error: BaseException | None = None) -> str:
+    """Classify a terminal tool failure without persisting private details."""
+
+    fragments: list[str] = []
+    status_codes: set[int] = set()
+    if error is not None:
+        for candidate in (
+            getattr(error, "status_code", None),
+            getattr(getattr(error, "response", None), "status_code", None),
+        ):
+            try:
+                status_codes.add(int(candidate))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        fragments.extend([
+            type(error).__name__,
+            str(getattr(error, "status_code", "") or ""),
+            str(getattr(getattr(error, "response", None), "status_code", "") or ""),
+            str(error),
+        ])
+    if isinstance(result, dict):
+        receipt = result.get("receipt")
+        tool_error = result.get("error")
+        if isinstance(receipt, dict):
+            fragments.extend([
+                str(receipt.get("reason_code") or ""),
+                str(receipt.get("outcome") or ""),
+            ])
+        if isinstance(tool_error, dict):
+            fragments.extend([
+                str(tool_error.get("code") or ""),
+                str(tool_error.get("category") or ""),
+            ])
+        fragments.append(str(result.get("text") or ""))
+    elif result is not None:
+        fragments.append(_result_text(result))
+    text = " ".join(fragments).lower()
+    if any(marker in text for marker in (
+        "block_system_destruction", "command_blocked", "deletion blocked",
+        "action policy", "sensitive action blocked", "not allowed by policy",
+    )):
+        return "command_blocked"
+    if any(marker in text for marker in (
+        "dns_probe", "err_name_not_resolved", "getaddrinfo",
+        "name resolution", "nodename nor servname", "dns failure",
+    )):
+        return "dns_failure"
+    if 401 in status_codes or any(marker in text for marker in (
+        "http 401", "status 401", "unauthorized", "unauthenticated",
+        "authentication failed", "authentication required", "invalid token",
+    )):
+        return "authentication_failure"
+    if 403 in status_codes or any(marker in text for marker in (
+        "http 403", "status 403", "forbidden", "permission denied",
+        "access denied", "permission failure",
+    )):
+        return "permission_failure"
+    if any(marker in text for marker in (
+        "stale_browser_reference", "stale_element_reference",
+        "stale_pagination_reference", "browser_state_stale",
+        "stale_reference", "stale semantic",
+    )):
+        return "stale_semantic_reference"
+    if isinstance(result, dict) and isinstance(result.get("receipt"), dict):
+        receipt_reason = str(result["receipt"].get("reason_code") or "")
+        return (
+            receipt_reason
+            if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", receipt_reason)
+            else ""
+        )
+    if result is not None and not isinstance(result, dict) and not _result_text(result).strip():
+        return "no_result"
+    return "tool_error" if error is not None or _is_tool_error(result) else ""
+
+
 def _tool_timeout_seconds(tool_name: str, kwargs: dict) -> float:
     """Wall-clock budget for ONE tool execution in the executor. Shell commands
     get a 300 s default budget plus a small grace so ``tool_bash`` can return
@@ -4427,17 +4509,22 @@ def _late_completion_record(tool_name: str, kwargs: dict, future, contract, lang
         return ToolExecutionRecord(
             "ERROR: execution permit unavailable; the tool was not executed",
             True, ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
-            0, False, False, contract,
+            0, False, False, contract, reason_code="execution_permit_unavailable",
         )
-    except Exception:
+    except Exception as exc:
+        reason_code = _canonical_tool_reason_code(error=exc)
         outcome = (
             ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
-            if contract.side_effect == SideEffectClass.READ_ONLY
+            if (
+                contract.side_effect == SideEffectClass.READ_ONLY
+                or reason_code in _PROMPT_TERMINAL_TOOL_REASONS
+            )
             else ExecutionOutcome.OUTCOME_UNKNOWN
         )
         return ToolExecutionRecord(
             "ERROR: internal tool failure; private details were withheld",
             True, outcome, 1, True, False, contract,
+            reason_code=reason_code,
         )
     typed = _typed_browser_receipt_outcome(
         result, allow_json_string=tool_name == "fill_form_field",
@@ -4446,9 +4533,13 @@ def _late_completion_record(tool_name: str, kwargs: dict, future, contract, lang
     if typed is not None:
         outcome, dispatched = typed
     elif is_error:
+        reason_code = _canonical_tool_reason_code(result)
         outcome = (
             ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
-            if contract.side_effect == SideEffectClass.READ_ONLY
+            if (
+                contract.side_effect == SideEffectClass.READ_ONLY
+                or reason_code in _PROMPT_TERMINAL_TOOL_REASONS
+            )
             else ExecutionOutcome.OUTCOME_UNKNOWN
         )
         dispatched = contract.side_effect != SideEffectClass.READ_ONLY
@@ -4460,9 +4551,12 @@ def _late_completion_record(tool_name: str, kwargs: dict, future, contract, lang
             else ExecutionOutcome.SUCCESS_UNVERIFIED
         )
         dispatched = True
+        reason_code = ""
+    if typed is not None:
+        reason_code = _canonical_tool_reason_code(result)
     return ToolExecutionRecord(
         result,
-        is_error or outcome in {
+        outcome in {
             ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT,
             ExecutionOutcome.OUTCOME_UNKNOWN,
         },
@@ -4471,6 +4565,7 @@ def _late_completion_record(tool_name: str, kwargs: dict, future, contract, lang
         dispatched,
         False,
         contract,
+        reason_code=reason_code,
     )
 
 
@@ -4480,20 +4575,31 @@ def _persist_tool_attempt_terminal(
     from osia.tool_attempts import TERMINAL_STATUSES, ToolAttemptStatus
     from osia.tool_contracts import ExecutionOutcome
 
-    if _requires_postcondition_reconciliation(record):
+    requires_postcondition = _requires_postcondition_reconciliation(record)
+    effect_possible = bool(
+        record.outcome == ExecutionOutcome.OUTCOME_UNKNOWN
+        and record.dispatched
+    )
+    if requires_postcondition or effect_possible:
         now = time.time()
         current = store.get_attempt(attempt_id) or {}
         if current.get("status") in {status.value for status in TERMINAL_STATUSES}:
             return current, False
-        deadline = max(
-            float(current.get("deadline_at") or 0.0),
-            now + 10.0,
+        deadline = float(
+            current.get("hard_deadline_at")
+            or current.get("deadline_at")
+            or now + 10.0
         )
         waiting = store.mark_waiting_verification(
             attempt_id,
-            next_check_at=now + 2.0,
+            next_check_at=min(deadline, now + 2.0),
             deadline_at=deadline,
-            reason_code="postcondition_required_unverified",
+            reason_code=(
+                "postcondition_required_unverified"
+                if requires_postcondition else
+                "effect_possible_unverified"
+            ),
+            owner_settled=True,
         )
         return waiting, False
 
@@ -4522,7 +4628,10 @@ def _persist_tool_attempt_terminal(
         status=status,
         terminal_outcome=record.outcome.value,
         dispatch_state=dispatch_state,
-        reason_code=reason_code,
+        reason_code=(
+            record.reason_code
+            if getattr(record, "reason_code", "") else reason_code
+        ),
     )
 
 
@@ -4538,6 +4647,7 @@ def _execute_tool_once_record(
     attempt_store=None,
     terminal_callback=None,
     status_callback=None,
+    release_after_s: float | None = None,
 ):
     """Dispatch once and preserve truthful timeout/outcome semantics."""
     from osia.tool_contracts import (
@@ -4580,9 +4690,18 @@ def _execute_tool_once_record(
 
     def _attempt_event(event):
         if attempt_store is not None:
+            progress_phase = event.reason_code or event.phase or "running"
+            useful = bool(
+                event.phase == "browser_progress"
+                and progress_phase in {"downloading", "finalizing", "complete"}
+            )
             attempt_store.record_progress(
                 event.attempt_id,
-                phase=event.reason_code or event.phase or "running",
+                phase=progress_phase,
+                useful=useful,
+                evidence_token=(
+                    f"{event.phase}:{progress_phase}" if useful else ""
+                ),
             )
 
     try:
@@ -4603,7 +4722,12 @@ def _execute_tool_once_record(
                 return fn(**kwargs)
 
         fut = _TOOL_EXECUTOR.submit(ctx.run, _dispatch)
-        raw_result = fut.result(timeout=timeout_s)
+        owner_wait_s = (
+            min(float(timeout_s), max(0.05, float(release_after_s)))
+            if attempt_id and release_after_s is not None
+            else float(timeout_s)
+        )
+        raw_result = fut.result(timeout=owner_wait_s)
         result = bounded_model_result(raw_result)
     except _ExecutionPermitUnavailable:
         text = (
@@ -4621,10 +4745,20 @@ def _execute_tool_once_record(
         # the provider turn and reconcile the same Future via its callback.
         if attempt_id and attempt_store is not None:
             now = time.time()
+            current = attempt_store.get_attempt(attempt_id) or {}
+            persistence = current.get("persistence_contract") or {}
+            delays = list(
+                persistence.get("check_delays_seconds") or (2.0,)
+            )
+            hard_deadline = float(
+                current.get("hard_deadline_at")
+                or current.get("deadline_at")
+                or now + max(10.0, float(timeout_s))
+            )
             attempt_store.mark_pending(
                 attempt_id,
-                next_check_at=now + 2.0,
-                deadline_at=now + max(10.0, float(timeout_s)),
+                next_check_at=min(hard_deadline, now + float(delays[0])),
+                deadline_at=hard_deadline,
             )
 
             def _late_completion(done):
@@ -4634,7 +4768,7 @@ def _execute_tool_once_record(
                 late = ToolExecutionRecord(
                     late.result, late.is_error, late.outcome, late.attempts,
                     late.dispatched, late.timed_out, late.contract,
-                    attempt_id, False,
+                    attempt_id, False, late.reason_code,
                 )
                 persisted, _created = _persist_tool_attempt_terminal(
                     attempt_store, attempt_id, late,
@@ -4647,9 +4781,22 @@ def _execute_tool_once_record(
                     and callable(terminal_callback)
                 ):
                     terminal_callback(attempt_id, late)
+                elif persisted.get("status") == "waiting_verification":
+                    try:
+                        from osia.tool_attempts import get_tool_attempt_coordinator
+
+                        get_tool_attempt_coordinator().notify_reconciliation_ready(
+                            attempt_id,
+                        )
+                    except Exception:
+                        pass
 
             fut.add_done_callback(_late_completion)
         text = (
+            "PENDING: l'outil continue ; réconciliation durable programmée."
+            if attempt_id and str(lang or "").lower().startswith("fr") else
+            "PENDING: tool owner still running; durable reconciliation scheduled."
+            if attempt_id else
             "ERROR: délai d'exécution dépassé ; résultat incertain. "
             "L'outil peut encore terminer et ne sera pas relancé."
             if str(lang or "").lower().startswith("fr") else
@@ -4659,9 +4806,10 @@ def _execute_tool_once_record(
         return ToolExecutionRecord(
             text, True,
             ExecutionOutcome.PENDING if attempt_id else ExecutionOutcome.OUTCOME_UNKNOWN,
-            1, True, True, contract, attempt_id, bool(attempt_id),
+            1, True, not bool(attempt_id), contract, attempt_id, bool(attempt_id),
+            "owner_still_running" if attempt_id else "tool_timeout",
         )
-    except Exception:
+    except Exception as exc:
         # Raw exception text may contain arguments, paths, provider payloads or
         # credentials and therefore never enters feedback or diagnostics.
         text = (
@@ -4669,12 +4817,19 @@ def _execute_tool_once_record(
             if str(lang or "").lower().startswith("fr") else
             "ERROR: internal tool failure; private details were withheld"
         )
+        reason_code = _canonical_tool_reason_code(error=exc)
         outcome = (
             ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
-            if contract.side_effect == SideEffectClass.READ_ONLY
+            if (
+                contract.side_effect == SideEffectClass.READ_ONLY
+                or reason_code in _PROMPT_TERMINAL_TOOL_REASONS
+            )
             else ExecutionOutcome.OUTCOME_UNKNOWN
         )
-        return ToolExecutionRecord(text, True, outcome, 1, True, False, contract)
+        return ToolExecutionRecord(
+            text, True, outcome, 1, True, False, contract,
+            reason_code=reason_code,
+        )
 
     is_error = _is_tool_error(result)
     typed_browser_outcome = _typed_browser_receipt_outcome(
@@ -4684,7 +4839,7 @@ def _execute_tool_once_record(
         outcome, dispatched = typed_browser_outcome
         return ToolExecutionRecord(
             result,
-            is_error or outcome in {
+            outcome in {
                 ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT,
                 ExecutionOutcome.OUTCOME_UNKNOWN,
             },
@@ -4693,11 +4848,13 @@ def _execute_tool_once_record(
             dispatched,
             False,
             contract,
+            reason_code=_canonical_tool_reason_code(result),
         )
     proven_before_effect = False
     confirmed_document_failure = False
     if is_error:
         text = _result_text(result).lower().strip()
+        reason_code = _canonical_tool_reason_code(result)
         timed_out = "timed out" in text or "timeout" in text
         # read_document returns a bounded typed JSON error only after its local
         # worker has reached a terminal state.  That is a confirmed failure,
@@ -4718,8 +4875,10 @@ def _execute_tool_once_record(
             except Exception:
                 deletion_call = False
         proven_before_effect = (
-            deletion_call
-            and (
+            reason_code in _PROMPT_TERMINAL_TOOL_REASONS
+            or (
+                deletion_call
+                and (
                 text == "error: deletion_plan_changed_requires_new_confirmation"
                 or (
                     text.startswith("error: deletion blocked before i/o (")
@@ -4727,6 +4886,7 @@ def _execute_tool_once_record(
                 )
                 or text == (
                     "error: deletion authorization unavailable; nothing was deleted"
+                )
                 )
             )
         )
@@ -4741,6 +4901,7 @@ def _execute_tool_once_record(
         )
     else:
         timed_out = False
+        reason_code = ""
         outcome = (
             ExecutionOutcome.SUCCESS_VERIFIED
             if contract.side_effect == SideEffectClass.READ_ONLY
@@ -4753,6 +4914,7 @@ def _execute_tool_once_record(
         not proven_before_effect,
         timed_out,
         contract,
+        reason_code=reason_code,
     )
 
 
@@ -4774,6 +4936,7 @@ def _execute_tool_with_policy(
         SideEffectClass,
         ToolExecutionRecord,
         ToolValidationError,
+        persistence_contract,
         validate_tool_arguments,
         validation_error_text,
     )
@@ -4791,9 +4954,18 @@ def _execute_tool_with_policy(
     configured_timeout_s = _configured_tool_timeout_seconds(
         spec, tool_name, kwargs,
     )
-    durable_deadline_s = _durable_tool_deadline_seconds(
-        spec, tool_name, kwargs, configured_timeout_s,
+    persistence = persistence_contract(
+        spec,
+        tool_name=tool_name,
+        arguments=kwargs,
+        owner_timeout_seconds=configured_timeout_s,
     )
+    durable_deadline_s = persistence.hard_timeout_seconds
+    if hard_deadline is not None:
+        durable_deadline_s = min(
+            durable_deadline_s,
+            max(0.05, hard_deadline - time.monotonic()),
+        )
 
     def _bounded_timeout():
         if hard_deadline is None:
@@ -4969,6 +5141,23 @@ def _execute_tool_with_policy(
                 ),
                 operation_revision=int(binding.get("operation_revision") or 0),
                 permission_epoch=int(binding.get("permission_epoch") or 0),
+                persistence_contract={
+                    "family": persistence.family.value,
+                    "release_after_seconds": persistence.release_after_seconds,
+                    "inactivity_timeout_seconds": (
+                        persistence.inactivity_timeout_seconds
+                    ),
+                    "hard_timeout_seconds": persistence.hard_timeout_seconds,
+                    "check_delays_seconds": list(
+                        persistence.check_delays_seconds
+                    ),
+                    "safe_alternatives": list(
+                        persistence.safe_alternatives
+                    ),
+                    "restart_reconciliation": (
+                        persistence.restart_reconciliation
+                    ),
+                },
             )
             attempt = attempt_store.mark_accepted(
                 attempt["tool_attempt_id"],
@@ -4998,18 +5187,20 @@ def _execute_tool_with_policy(
         attempt_store=attempt_store,
         terminal_callback=terminal_callback,
         status_callback=status_callback,
+        release_after_s=persistence.release_after_seconds,
     )
     retry_allowed = (
         allow_retry
         and contract.retry == RetryPolicy.READ_ONCE_AFTER_CONFIRMED_FAILURE
         and record.outcome == ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
+        and record.reason_code not in _PROMPT_TERMINAL_TOOL_REASONS
     )
     if not retry_allowed:
         if attempt_id:
             record = ToolExecutionRecord(
                 record.result, record.is_error, record.outcome, record.attempts,
                 record.dispatched, record.timed_out, record.contract,
-                attempt_id, record.worker_may_be_active,
+                attempt_id, record.worker_may_be_active, record.reason_code,
             )
             requires_reconciliation = _requires_postcondition_reconciliation(
                 record,
@@ -5019,15 +5210,22 @@ def _execute_tool_with_policy(
                 and record.dispatched
             ) or requires_reconciliation:
                 now = time.time()
+                current = attempt_store.get_attempt(attempt_id) or {}
+                durable_deadline = float(
+                    current.get("hard_deadline_at")
+                    or current.get("deadline_at")
+                    or now + durable_deadline_s
+                )
                 attempt_store.mark_waiting_verification(
                     attempt_id,
-                    next_check_at=now + 2.0,
-                    deadline_at=now + durable_deadline_s,
+                    next_check_at=min(durable_deadline, now + 2.0),
+                    deadline_at=durable_deadline,
                     reason_code=(
                         "postcondition_required_unverified"
                         if requires_reconciliation else
                         "postcondition_not_observed"
                     ),
+                    owner_settled=not record.worker_may_be_active,
                 )
                 return ToolExecutionRecord(
                     record.result, True, ExecutionOutcome.PENDING,
@@ -5052,11 +5250,12 @@ def _execute_tool_with_policy(
         attempt_store=attempt_store,
         terminal_callback=terminal_callback,
         status_callback=status_callback,
+        release_after_s=persistence.release_after_seconds,
     )
     final_record = ToolExecutionRecord(
         retried.result, retried.is_error, retried.outcome, 2,
         retried.dispatched, retried.timed_out, retried.contract,
-        attempt_id, retried.worker_may_be_active,
+        attempt_id, retried.worker_may_be_active, retried.reason_code,
     )
     if attempt_id and final_record.outcome != ExecutionOutcome.PENDING:
         _persist_tool_attempt_terminal(attempt_store, attempt_id, final_record)
@@ -6763,8 +6962,6 @@ class OSIAAgent:
         runtime = self._pending_tool_runtime
         if not isinstance(runtime, dict) or runtime.get("attempt_id") != attempt_id:
             return None
-        if runtime.get("worker_may_be_active"):
-            return None
         wait_spec = runtime.get("wait_spec")
         if not isinstance(wait_spec, dict):
             return None
@@ -6776,12 +6973,56 @@ class OSIAAgent:
             )
             from osia.tool_attempts import get_tool_attempt_store
 
+            store = get_tool_attempt_store()
+            durable = store.get_attempt(attempt_id) or {}
+            if durable.get("dispatch_state") in {
+                "dispatch_started", "worker_may_be_active",
+            }:
+                return None
+            store.record_safe_alternative(
+                attempt_id, "fresh_browser_postcondition",
+            )
             current = browser_tools.get_browser_state()
             data = current.get("data") if isinstance(current, dict) else None
             state = data.get("state") if isinstance(data, dict) else None
             if not isinstance(state, dict):
                 return None
-            verified = browser_tools.wait_for_browser_condition(state, wait_spec)
+            original_state = durable.get("browser_state_ref")
+            state_changed = bool(
+                not isinstance(original_state, dict)
+                or any(
+                    original_state.get(key) != state.get(key)
+                    for key in (
+                        "browser_session_id", "context_id", "context_epoch",
+                        "page_id", "page_generation", "navigation_id",
+                        "document_epoch",
+                    )
+                )
+            )
+            store.record_progress(
+                attempt_id,
+                phase="fresh_browser_state",
+                useful=state_changed,
+                evidence_token=(
+                    json.dumps(
+                        state,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=lambda _value: "<unsupported>",
+                    )
+                    if state_changed else ""
+                ),
+            )
+            probe_spec = dict(wait_spec)
+            try:
+                probe_spec["timeout_seconds"] = min(
+                    1.0, max(0.05, float(wait_spec["timeout_seconds"])),
+                )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return None
+            verified = browser_tools.wait_for_browser_condition(
+                state, probe_spec,
+            )
             typed = _typed_browser_receipt_outcome(verified)
             if typed is None or typed[0] != ExecutionOutcome.SUCCESS_VERIFIED:
                 return None
@@ -6792,7 +7033,7 @@ class OSIAAgent:
                 attempt_id, False,
             )
             _persist_tool_attempt_terminal(
-                get_tool_attempt_store(), attempt_id, record,
+                store, attempt_id, record,
                 reason_code="postcondition_verified_read_only",
             )
             return record

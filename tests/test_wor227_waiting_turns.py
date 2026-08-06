@@ -275,7 +275,7 @@ def test_unverified_postcondition_mutation_suspends_before_provider_continuation
     attempt_id = agent.last_pending_tool_attempt_id
     durable = store.get_attempt(attempt_id)
     assert durable["status"] == ToolAttemptStatus.WAITING_VERIFICATION.value
-    assert durable["dispatch_state"] == "dispatch_started"
+    assert durable["dispatch_state"] == "owner_settled_unverified"
     assert durable["reason_code"] == "postcondition_required_unverified"
     assert not any(
         message.get("role") == "assistant" and not message.get("_provisional")
