@@ -40,7 +40,7 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "autonomous_start",     "objective": "...", "model": "..."}  # WOR-45 P5: begin ONE machine-global autonomous run (planner→orchestrator); refused with autonomous_progress{event:"busy"} if a run already holds the single-runner lock
     {"type": "cancel_active_work", "schema_version": 1, "scope": "chat|autonomous", ...correlated target...}  # WOR-231: exact idempotent cancellation control; never a user turn
     {"type": "autonomous_interrupt"}                                   # WOR-45 P5: pause the autonomous run — state stays in_progress (resumable)
-    {"type": "autonomous_abort"}                                       # WOR-45 P5: discard the autonomous run — marks state aborted then deletes the checkpoint
+    {"type": "autonomous_abort", "run_id": "..."}                    # WOR-45 P5 compatibility alias: exact run correlation is still required before terminalizing the workflow
     {"type": "get_autonomous_status"}                                  # WOR-45 P5: request the current autonomous snapshot (or {event:"idle"}); a paused run reports {event:"interrupted"}; lets a phone reconnecting mid-run render progress
     {"type": "autonomous_resume"}                                      # WOR-45: resume a PAUSED (interrupted) autonomous run from its cursor (re-acquires the single-runner lock; refused with {event:"busy"} if another run holds it, {event:"idle"} if nothing is resumable)
     {"type": "scheduled_task_authorization_request", "task_id": "..."}
@@ -4826,6 +4826,13 @@ _AUTONOMOUS_DURABLE_TOOL_EVENTS = frozenset({
     "verifying_tool", "resuming", "cancellation_requested",
     "blocked_unknown_effect", "cancelled_proven",
 })
+_AUTONOMOUS_ABANDON_STATES = frozenset({
+    "abandon_requested", "abandoned_proven",
+})
+_AUTONOMOUS_ABANDON_EFFECT_STATES = frozenset({
+    "no_current_effect", "no_effect_proven", "effect_confirmed",
+    "effect_possible_or_unknown",
+})
 
 
 def _document_progress_frame(
@@ -5027,6 +5034,12 @@ def _autonomous_snapshot(st) -> dict:
     _phase_index, _task_index, current_task = _astate.current_task(st)
     current_task = current_task or {}
     run_id = str(st.get("run_id") or "")
+    abandon_state = str(st.get("abandon_state") or "")
+    if abandon_state not in _AUTONOMOUS_ABANDON_STATES:
+        abandon_state = ""
+    abandon_effect_state = str(st.get("abandon_effect_state") or "")
+    if abandon_effect_state not in _AUTONOMOUS_ABANDON_EFFECT_STATES:
+        abandon_effect_state = ""
     return {
         "task_id": str(current_task.get("id") or "")[:160],
         "operation_id": str(current_task.get("tool_operation_id") or "")[:160],
@@ -5040,6 +5053,8 @@ def _autonomous_snapshot(st) -> dict:
         "objective": "",
         "status": st.get("status", "") or "",
         "run_state": str(st.get("run_state") or "")[:64],
+        "abandon_state": abandon_state,
+        "abandon_effect_state": abandon_effect_state,
         "provider": str(st.get("provider") or ""),
         "model": str(st.get("model") or ""),
         "language": normalize_locale(st.get("language")) or i18n.DEFAULT_LANG,
@@ -5132,8 +5147,19 @@ def _autonomous_frame(payload: dict, st=_AUTO_UNSET) -> dict:
     requested_event = str(payload.get("event") or "idle")[:64]
     if requested_event not in _AUTONOMOUS_SAFE_EVENTS:
         requested_event = "state_updated"
+    terminal_state = bool(
+        isinstance(st, dict)
+        and (
+            st.get("status") in {"done", "failed", "aborted", "cancelled"}
+            or st.get("run_state") in {
+                "completed", "failed", "cancelled", "cancelled_proven",
+            }
+        )
+    )
     durable_state = (
-        requested_event
+        ""
+        if terminal_state
+        else requested_event
         if requested_event in _AUTONOMOUS_DURABLE_TOOL_EVENTS
         else str(snapshot.get("run_state") or "")[:64]
     )
@@ -5154,15 +5180,6 @@ def _autonomous_frame(payload: dict, st=_AUTO_UNSET) -> dict:
         "done", "failed", "aborted", "plan_failed", "cancelled",
         "cancelled_proven",
     }
-    terminal_state = bool(
-        isinstance(st, dict)
-        and (
-            st.get("status") in {"done", "failed", "aborted", "cancelled"}
-            or st.get("run_state") in {
-                "completed", "failed", "cancelled", "cancelled_proven",
-            }
-        )
-    )
     with _AUTONOMOUS_PROTOCOL_LOCK:
         existing_terminal = _AUTONOMOUS_PROTOCOL_STATE["terminals"].get(run_id)
         if existing_terminal is not None:
@@ -5250,6 +5267,166 @@ def _autonomous_cancellation_correlation(st: dict) -> dict:
     }
 
 
+def _autonomous_abandon_effect_state(st: dict) -> str:
+    """Classify the current exact tool receipt without changing or replaying it."""
+
+    existing = str(st.get("abandon_effect_state") or "")
+    if existing in _AUTONOMOUS_ABANDON_EFFECT_STATES:
+        return existing
+    _phase_index, _task_index, current_task = _astate.current_task(st)
+    current_task = current_task or {}
+    attempt_id = str(current_task.get("tool_attempt_id") or "")
+    if not attempt_id:
+        if str(st.get("run_state") or "") in {
+            "blocked_outcome_unknown", "blocked_unknown_effect",
+        }:
+            return "effect_possible_or_unknown"
+        return "no_current_effect"
+    try:
+        from osia.tool_attempts import get_tool_attempt_store
+
+        attempt = get_tool_attempt_store().get_attempt(attempt_id) or {}
+    except Exception:
+        return "effect_possible_or_unknown"
+    if (
+        attempt.get("owner_scope") != "autonomous"
+        or str(attempt.get("autonomous_run_id") or "")
+        != str(st.get("run_id") or "")
+        or str(attempt.get("autonomous_task_id") or "")
+        != str(current_task.get("id") or "")
+    ):
+        return "effect_possible_or_unknown"
+    status = str(attempt.get("status") or "")
+    dispatch = str(attempt.get("dispatch_state") or "")
+    outcome = str(attempt.get("terminal_outcome") or "")
+    if (
+        status == "cancelled_proven"
+        or dispatch in {"not_dispatched", "cancelled_before_effect"}
+        or outcome in {
+            "cancelled_proven", "confirmed_failure_before_effect",
+            "rejected_before_execution",
+        }
+    ):
+        return "no_effect_proven"
+    if dispatch == "effect_confirmed" or outcome in {
+        "success_verified", "confirmed_success", "failed_after_effect",
+    }:
+        return "effect_confirmed"
+    return "effect_possible_or_unknown"
+
+
+def _request_exact_autonomous_attempt_abandon(st: dict) -> str:
+    """Request cancellation of this run's receipt once, without resuming it."""
+
+    _phase_index, _task_index, current_task = _astate.current_task(st)
+    current_task = current_task or {}
+    attempt_id = str(current_task.get("tool_attempt_id") or "")
+    if not attempt_id:
+        return _autonomous_abandon_effect_state(st)
+    try:
+        from osia.tool_attempts import TERMINAL_STATUSES, ToolAttemptStatus
+        from osia.tool_attempts import get_tool_attempt_store
+
+        store = get_tool_attempt_store()
+        attempt = store.get_attempt(attempt_id) or {}
+        if (
+            attempt.get("owner_scope") != "autonomous"
+            or str(attempt.get("autonomous_run_id") or "")
+            != str(st.get("run_id") or "")
+            or str(attempt.get("autonomous_task_id") or "")
+            != str(current_task.get("id") or "")
+        ):
+            return "effect_possible_or_unknown"
+        status = ToolAttemptStatus(attempt.get("status"))
+        if status not in TERMINAL_STATUSES:
+            store.request_cancellation(attempt_id)
+    except Exception:
+        return _autonomous_abandon_effect_state(st)
+    st.pop("abandon_effect_state", None)
+    return _autonomous_abandon_effect_state(st)
+
+
+def _terminalize_autonomous_abandon(st: dict, orch) -> bool:
+    """Prove workflow abandonment while preserving the external-effect truth."""
+
+    if not isinstance(st, dict):
+        return False
+    if st.get("abandon_state") == "abandoned_proven":
+        return False
+    original_status = str(
+        st.get("abandon_origin_status") or st.get("status") or ""
+    )
+    original_run_state = str(
+        st.get("abandon_origin_run_state") or st.get("run_state") or ""
+    )
+    effect_state = _request_exact_autonomous_attempt_abandon(st)
+    preserve_terminal = (
+        original_status in {"done", "failed"}
+        or original_run_state in {"completed", "failed"}
+    )
+    if not preserve_terminal:
+        st["status"] = "aborted"
+        st["run_state"] = "cancelled"
+        try:
+            _aauthorization.revoke_run_authorization(
+                st, save=lambda _state: None,
+            )
+        except Exception:
+            pass
+        st["status"] = "aborted"
+        st["run_state"] = "cancelled"
+        agent = _autonomous.get("agent")
+        provider_now, model_now = _adiagnostics.actual_provider_model(
+            agent, st.get("provider", ""), st.get("model", ""),
+        )
+        diagnostic = _adiagnostics.make_diagnostic(
+            st,
+            stage=_adiagnostics.AutonomousStage.CONTROL,
+            category=_adiagnostics.FailureCategory.ABORTED,
+            reason_code="user_aborted",
+            provider=provider_now,
+            model=model_now,
+            resumable=False,
+            checkpoint_present=True,
+        )
+        _adiagnostics.record_diagnostic(st, diagnostic)
+    st["abandon_effect_state"] = effect_state
+    st["abandon_state"] = "abandoned_proven"
+    if orch is not None and not preserve_terminal:
+        try:
+            orch.stop()
+        except Exception:
+            _adiagnostics.emit_diagnostic_log(
+                _adiagnostics.make_diagnostic(
+                    st,
+                    stage=_adiagnostics.AutonomousStage.CONTROL,
+                    category=_adiagnostics.FailureCategory.ORCHESTRATOR_FAILURE,
+                    reason_code="abort_stop_failure",
+                    resumable=False,
+                    checkpoint_present=True,
+                )
+            )
+    try:
+        _astate.save_task_state(st)
+    except Exception:
+        _adiagnostics.set_checkpoint_present(st, False)
+    return not preserve_terminal
+
+
+async def _send_autonomous_abandon_ack(
+    channel: "_OutboundChannel", st: dict,
+) -> None:
+    await channel.send_json({
+        "type": "cancellation_control",
+        "schema_version": 1,
+        "scope": "autonomous",
+        "state": "accepted",
+        **_autonomous_cancellation_correlation(st),
+        "abandon_state": str(st.get("abandon_state") or ""),
+        "abandon_effect_state": str(st.get("abandon_effect_state") or ""),
+    })
+
+
 async def _prepare_correlated_autonomous_cancellation(
     channel: "_OutboundChannel", msg: dict,
 ) -> bool:
@@ -5294,15 +5471,8 @@ async def _prepare_correlated_autonomous_cancellation(
                 _autonomous_frame({"event": "state_updated"}, st)
             )
             return False
-    if (
-        st.get("status") in {"done", "failed", "aborted", "cancelled"}
-        or st.get("run_state") in {
-            "completed", "failed", "cancelled", "cancelled_proven",
-        }
-    ):
-        await _send_cancellation_rejection(
-            channel, "autonomous", "target_not_active", **supplied,
-        )
+    if st.get("abandon_state") == "abandoned_proven":
+        await _send_autonomous_abandon_ack(channel, st)
         return False
 
     control_target = tuple(current[field] for field in (
@@ -5310,8 +5480,9 @@ async def _prepare_correlated_autonomous_cancellation(
     ))
     if (
         _autonomous.get("cancellation_control_target") == control_target
-        or st.get("run_state") == "cancellation_requested"
+        or st.get("abandon_state") == "abandon_requested"
     ):
+        await _send_autonomous_abandon_ack(channel, st)
         await channel.send_json(
             _autonomous_frame({"event": "cancellation_requested"}, st)
         )
@@ -5319,6 +5490,20 @@ async def _prepare_correlated_autonomous_cancellation(
 
     _autonomous["cancellation_control_target"] = control_target
     _autonomous["correlated_cancellation_published"] = True
+    st["abandon_origin_status"] = str(st.get("status") or "")[:32]
+    st["abandon_origin_run_state"] = str(st.get("run_state") or "")[:64]
+    st["abandon_state"] = "abandon_requested"
+    st["abandon_effect_state"] = _autonomous_abandon_effect_state(st)
+    if (
+        st.get("status") in {"done", "failed", "aborted", "cancelled"}
+        or st.get("run_state") in {
+            "completed", "failed", "cancelled", "cancelled_proven",
+        }
+    ):
+        _terminalize_autonomous_abandon(st, _autonomous.get("orch"))
+        await _send_autonomous_abandon_ack(channel, st)
+        _release_single_runner()
+        return False
     st["run_state"] = "cancellation_requested"
     try:
         _astate.save_task_state(st)
@@ -5327,6 +5512,7 @@ async def _prepare_correlated_autonomous_cancellation(
     _broadcast_autonomous(
         _autonomous_frame({"event": "cancellation_requested"}, st)
     )
+    await _send_autonomous_abandon_ack(channel, st)
     return True
 
 
@@ -5600,6 +5786,15 @@ def _on_autonomous_progress(payload: dict) -> None:
     False, so its terminal still broadcasts + finalizes exactly as before."""
     try:
         event = payload.get("event")
+        current_state = _autonomous.get("st")
+        if (
+            isinstance(current_state, dict)
+            and current_state.get("abandon_state") in {
+                "abandon_requested", "abandoned_proven",
+            }
+            and event != "cancellation_requested"
+        ):
+            return
         if event in ("done", "failed", "cancelled_proven"):
             # ── Terminal: gate a paused/superseded orphan's late terminal ──
             if _autonomous.get("interrupting") or not _autonomous.get("active"):
@@ -7527,6 +7722,7 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             msg_type = msg.get("type", "")
+            correlated_autonomous_abandon = False
 
             # --- Auth ---
             if msg_type == "auth":
@@ -8476,7 +8672,9 @@ async def websocket_endpoint(ws: WebSocket):
                     ):
                         continue
                     # Reuse the established abort worker after exact target
-                    # validation. Legacy autonomous_abort remains compatible.
+                    # validation. The legacy name remains compatible below,
+                    # but it must now carry the same exact run correlation.
+                    correlated_autonomous_abandon = True
                     msg_type = "autonomous_abort"
                 else:
                     await _send_cancellation_rejection(
@@ -8585,83 +8783,31 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             if msg_type == "autonomous_abort":
-                # Discard. Mark the SHARED state dict aborted FIRST — before
-                # stop() — so a late daemon checkpoint on its way out persists
-                # status="aborted" (never in_progress), which a resume ignores.
-                # Then stop the loop, delete the checkpoint, emit, release.
+                if not correlated_autonomous_abandon:
+                    if not await _prepare_correlated_autonomous_cancellation(
+                        out, msg,
+                    ):
+                        continue
+                # Terminalize the workflow while retaining the exact durable
+                # receipt. A late engine callback cannot revive this run, and
+                # an external effect is never replayed to prove abandonment.
                 def _abort_worker():
                     st = _autonomous.get("st")
                     orch = _autonomous.get("orch")
-                    correlated_status_published = bool(
-                        _autonomous.pop(
-                            "correlated_cancellation_published", False,
+                    _autonomous.pop("correlated_cancellation_published", None)
+                    if isinstance(st, dict) and not st.get("abandon_state"):
+                        st["abandon_origin_status"] = str(
+                            st.get("status") or ""
+                        )[:32]
+                        st["abandon_origin_run_state"] = str(
+                            st.get("run_state") or ""
+                        )[:64]
+                        st["abandon_state"] = "abandon_requested"
+                    terminalized = _terminalize_autonomous_abandon(st, orch)
+                    if terminalized:
+                        _broadcast_autonomous(
+                            _autonomous_frame({"event": "aborted"}, st)
                         )
-                    )
-                    if (
-                        isinstance(st, dict)
-                        and st.get("run_state") in {
-                            "running",
-                            "waiting_tool", "verifying_tool",
-                            "cancellation_requested",
-                        }
-                        and orch is not None
-                        and orch.request_tool_cancellation()
-                    ):
-                        if not correlated_status_published:
-                            _broadcast_autonomous(_autonomous_frame(
-                                {"event": "cancellation_requested"}, st,
-                            ))
-                        return
-                    if isinstance(st, dict):
-                        st["status"] = "aborted"
-                        st["run_state"] = "cancelled"
-                        try:
-                            _aauthorization.revoke_run_authorization(
-                                st, save=_astate.save_task_state,
-                            )
-                            st["status"] = "aborted"
-                            st["run_state"] = "cancelled"
-                        except Exception:
-                            pass
-                        agent = _autonomous.get("agent")
-                        provider_now, model_now = _adiagnostics.actual_provider_model(
-                            agent, st.get("provider", ""), st.get("model", ""),
-                        )
-                        diagnostic = _adiagnostics.make_diagnostic(
-                            st,
-                            stage=_adiagnostics.AutonomousStage.CONTROL,
-                            category=_adiagnostics.FailureCategory.ABORTED,
-                            reason_code="user_aborted",
-                            provider=provider_now,
-                            model=model_now,
-                            resumable=False,
-                            checkpoint_present=False,
-                        )
-                        _adiagnostics.record_diagnostic(st, diagnostic)
-                    if orch is not None:
-                        try:
-                            orch.stop()
-                        except Exception:
-                            _adiagnostics.emit_diagnostic_log(
-                                _adiagnostics.make_diagnostic(
-                                    st,
-                                    stage=_adiagnostics.AutonomousStage.CONTROL,
-                                    category=(
-                                        _adiagnostics.FailureCategory
-                                        .ORCHESTRATOR_FAILURE
-                                    ),
-                                    reason_code="abort_stop_failure",
-                                    resumable=False,
-                                    checkpoint_present=False,
-                                )
-                            )
-                    try:
-                        _astate.clear_task_state()
-                    except Exception:
-                        pass
-                    _broadcast_autonomous(
-                        _autonomous_frame({"event": "aborted"}, st)
-                    )
                     _release_single_runner()
 
                 threading.Thread(target=_abort_worker, daemon=True).start()
@@ -8686,7 +8832,13 @@ async def websocket_endpoint(ws: WebSocket):
                     )
                     status = st.get("status", "")
                     run_state = st.get("run_state", "")
-                    if run_state in {
+                    if status in {"done", "failed", "aborted"}:
+                        ev = {
+                            "done": "done",
+                            "failed": "failed",
+                            "aborted": "aborted",
+                        }[status]
+                    elif run_state in {
                         "authorization_pending", "suspended_scope_extension",
                         "suspended_authorization_revoked", "blocked_outcome_unknown",
                         "waiting_tool", "verifying_tool", "resuming",
@@ -8704,11 +8856,7 @@ async def websocket_endpoint(ws: WebSocket):
                         # only a genuinely live run (active True) is "running".
                         ev = "running" if _autonomous.get("active") else "interrupted"
                     else:
-                        ev = {
-                            "done": "done",
-                            "failed": "failed",
-                            "aborted": "aborted",
-                        }.get(status, "running")
+                        ev = "running"
                     frame_type = (
                         "autonomous_plan_ready"
                         if ev == "authorization_pending"
@@ -8723,6 +8871,8 @@ async def websocket_endpoint(ws: WebSocket):
                     await out.send_json(_autonomous_frame({
                         "type": frame_type, "event": ev,
                     }, st))
+                    if st.get("abandon_state") in _AUTONOMOUS_ABANDON_STATES:
+                        await _send_autonomous_abandon_ack(out, st)
                 else:
                     await out.send_json(_autonomous_frame({"event": "idle"}, None))
                 continue
