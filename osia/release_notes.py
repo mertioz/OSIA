@@ -63,6 +63,77 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="1.1.6",
+        released_on="2026-08-07",
+        public=True,
+        changes_en=(),
+        changes_fr=(),
+        summary_en=(
+            "Windows 1.1.6 durably reconciles delayed tool outcomes without replaying possible external effects.",
+            "The external shadow around the OSIA PC window is removed while the existing compact and expanded layouts remain intact.",
+            "Updates initiated by 1.1.6 show real download, verification, and launch progress; the legacy 1.1.5 download UI is unchanged.",
+            "Canonical per-turn language enforcement keeps short French Chat replies French across repair, persistence, and speech.",
+            "Windows 1.1.5 remains the immutable rollback; 1.1.6 is Windows-only and NotSigned, with no Mobile publication.",
+        ),
+        summary_fr=(
+            "Windows 1.1.6 réconcilie durablement les résultats d’outils retardés sans rejouer un effet externe possible.",
+            "L’ombre externe autour de la fenêtre PC OSIA est supprimée sans modifier les dispositions compacte et élargie existantes.",
+            "Les mises à jour lancées par 1.1.6 affichent la progression réelle du téléchargement, de la vérification et du lancement ; l’UI 1.1.5 reste inchangée.",
+            "La langue canonique par tour maintient les réponses Chat françaises courtes en français lors de la réparation, de la persistance et de la synthèse vocale.",
+            "Windows 1.1.5 reste le rollback immuable ; 1.1.6 concerne uniquement Windows, reste NotSigned et n’inclut aucune publication Mobile.",
+        ),
+        sections=(
+            ReleaseSection(
+                "Durable tool reconciliation",
+                "Réconciliation durable des outils",
+                (
+                    "A slow tool can release the Chat turn while its canonical attempt remains durably reconcilable after completion or restart.",
+                    "Late results are verified once and possible or unknown external effects are never replayed merely to obtain a terminal answer.",
+                ),
+                (
+                    "Un outil lent peut libérer le tour Chat tandis que sa tentative canonique reste réconciliable durablement après achèvement ou redémarrage.",
+                    "Les résultats tardifs sont vérifiés une seule fois et les effets externes possibles ou inconnus ne sont jamais rejoués uniquement pour obtenir une réponse terminale.",
+                ),
+            ),
+            ReleaseSection(
+                "Windows window and updater state",
+                "Fenêtre Windows et état de l’updater",
+                (
+                    "The PC window no longer draws an external operating-system shadow, while its existing shape, size transitions, and controls are preserved.",
+                    "The 1.1.6 updater reports bytes received, verification, readiness, launch, interruption, retry, and indeterminate-length states without duplicate downloads.",
+                ),
+                (
+                    "La fenêtre PC n’affiche plus d’ombre externe du système, tout en préservant sa forme, ses transitions de largeur et ses contrôles existants.",
+                    "L’updater 1.1.6 affiche les octets reçus, la vérification, la disponibilité, le lancement, l’interruption, le nouvel essai et les tailles indéterminées sans double téléchargement.",
+                ),
+            ),
+            ReleaseSection(
+                "Canonical language per turn",
+                "Langue canonique par tour",
+                (
+                    "Each Chat and Autonomous turn keeps one canonical target language across provider output, repair, persistence, projection, and TTS.",
+                    "Short or ambiguous French messages use the current conversation and client locale so accidental English output is repaired once without replaying tools.",
+                ),
+                (
+                    "Chaque tour Chat et Autonomous conserve une langue cible canonique pour la sortie fournisseur, la réparation, la persistance, la projection et le TTS.",
+                    "Les messages français courts ou ambigus utilisent la conversation et la langue du client ; une sortie anglaise accidentelle est réparée une fois sans rejouer d’outil.",
+                ),
+            ),
+            ReleaseSection(
+                "Windows-only release compatibility",
+                "Compatibilité de la release Windows uniquement",
+                (
+                    "Version, packaging, updater, and release metadata are aligned on Windows 1.1.6 with strict host, path, size, and SHA-256 validation.",
+                    "Windows 1.1.5 remains the verified immutable rollback; Windows 1.1.6 remains NotSigned with no publisher claim and includes no Mobile publication.",
+                ),
+                (
+                    "Version, packaging, updater et métadonnées de release sont alignés sur Windows 1.1.6 avec validation stricte de l’hôte, du chemin, de la taille et du SHA-256.",
+                    "Windows 1.1.5 reste le rollback immuable vérifié ; Windows 1.1.6 reste NotSigned sans éditeur revendiqué et n’inclut aucune publication Mobile.",
+                ),
+            ),
+        ),
+    ),
+    ReleaseEntry(
         version="1.1.5",
         released_on="2026-08-06",
         public=True,

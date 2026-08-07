@@ -72,7 +72,7 @@ byte size and SHA-256 remain mandatory, and the complete download is rehashed
 before execution. An arbitrary `signed: false` manifest is not trusted. Remove
 this isolated policy when WOR-220 introduces recognized Authenticode signing.
 
-The public Windows 1.1.0, 1.1.1, 1.1.2, 1.1.3, 1.1.4, and 1.1.5 installers are intentionally unsigned and
+The public Windows 1.1.0, 1.1.1, 1.1.2, 1.1.3, 1.1.4, 1.1.5, and 1.1.6 installers are intentionally unsigned and
 their manifests record `signed: false` with no publisher claim. Windows may show **Unknown
 publisher** / **Éditeur inconnu** or a Microsoft Defender SmartScreen warning.
 Users should download only from the official OSIA HTTPS domain, verify the
@@ -97,12 +97,12 @@ Verify both values, close OSIA, and run the installer in place. Do not uninstall
 first, clear `%USERPROFILE%\.osia`, or disable SmartScreen, Defender, antivirus,
 or any other Windows protection.
 
-The validated rollback for Windows 1.1.5 is the immutable public Windows 1.1.4
+The validated rollback for Windows 1.1.6 is the immutable public Windows 1.1.5
 installer:
 
-- `https://download.osia.space/windows/1.1.4/OSIA-Setup.exe`
-- 1,186,094,475 bytes
-- SHA-256 `cc594867594bc73c0bc45443297db875506f73b08670b07920d33f0aa783791e`
+- `https://download.osia.space/windows/1.1.5/OSIA-Setup.exe`
+- 1,186,101,696 bytes
+- SHA-256 `0098631f3d19abc089a273ad7ab75ee1d6350f0a9cb64ddeec10ebf5fe4f1fcf`
 
 The stock PyAV wheel and bundled eSpeak NG runtime require the documented GPL
 source and notice process. See the installed `THIRD_PARTY_NOTICES.md`.

@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 
-PRODUCT_VERSION = "1.1.5"
+PRODUCT_VERSION = "1.1.6"
 VERSION = PRODUCT_VERSION
 
 _PRODUCT_VERSION_RE = re.compile(

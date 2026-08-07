@@ -82,9 +82,9 @@ def _controller(monkeypatch, tmp_path, *, cached=False):
 
 def test_embedded_notes_load_offline_and_are_newest_first():
     assert [entry.version for entry in RELEASE_HISTORY] == [
-        "1.1.5", "1.1.4", "1.1.3", "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
+        "1.1.6", "1.1.5", "1.1.4", "1.1.3", "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
     ]
-    current = release_for_version("1.1.5")
+    current = release_for_version("1.1.6")
     assert current is not None and current.public
     assert not is_major_update(current.version)
     major = release_for_version("1.1.0")
@@ -102,6 +102,45 @@ def test_embedded_notes_load_offline_and_are_newest_first():
     assert internal is not None and not internal.public
     assert "superseded" in " ".join(internal.changes("en")).lower()
     assert manifest_release_notes("1.0.6") == list(internal_current.changes_en)
+
+
+def test_116_notes_are_complete_bilingual_and_manifest_compatible():
+    current = release_for_version("1.1.6")
+    assert current is not None and current.public
+    assert manifest_release_notes("1.1.6") == list(current.summary_en)
+    assert len(current.summary("en")) == len(current.summary("fr")) == 5
+    assert all(len(note) <= 240 for note in manifest_release_notes("1.1.6"))
+    assert len(current.sections) == 4
+    assert len(current.changes("en")) == len(current.changes("fr")) == 8
+
+    english = installer_release_notes("1.1.6", "en").lower()
+    french = installer_release_notes("1.1.6", "fr").lower()
+    for subject in (
+        "slow tool can release the chat turn",
+        "possible or unknown external effects are never replayed",
+        "no longer draws an external operating-system shadow",
+        "updater reports bytes received",
+        "canonical target language",
+        "windows 1.1.5 remains the verified immutable rollback",
+        "includes no mobile publication",
+    ):
+        assert subject in english
+    for subject in (
+        "outil lent peut libérer le tour chat",
+        "effets externes possibles ou inconnus ne sont jamais rejoués",
+        "n’affiche plus d’ombre externe du système",
+        "updater 1.1.6 affiche les octets reçus",
+        "langue cible canonique",
+        "windows 1.1.5 reste le rollback immuable vérifié",
+        "n’inclut aucune publication mobile",
+    ):
+        assert subject in french
+
+    raw = _manifest(version="1.1.6")
+    raw["releaseNotes"] = manifest_release_notes("1.1.6")
+    parsed = updater.parse_manifest(json.dumps(raw), _metadata("1.1.5"))
+    assert parsed.version == "1.1.6"
+    assert parsed.release_notes == tuple(manifest_release_notes("1.1.6"))
 
 
 def test_115_notes_are_complete_bilingual_and_manifest_compatible():

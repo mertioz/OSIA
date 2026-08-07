@@ -107,7 +107,7 @@ def test_app_metadata_is_strict_and_records_only_internal_override():
         "buildTimestamp": "2026-07-20T10:00:00Z", "commitSha": None,
         "updaterSchemaVersion": 1,
         "buildOverride": {
-            "sourceVersion": "1.1.5", "version": "1.0.1",
+            "sourceVersion": "1.1.6", "version": "1.0.1",
             "channel": "internal-preview",
         },
     }
