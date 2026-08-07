@@ -6863,7 +6863,7 @@ class OSIAAgent:
         if not isinstance(context, TurnContext):
             raise TypeError("context must be a TurnContext")
         self.turn_context = context
-        self.lang = context.language
+        self.lang = context.canonical_language
         self._has_turn_language = True
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0] = {
@@ -7523,7 +7523,7 @@ class OSIAAgent:
 
         logical = [copy.deepcopy(message) for message in self.messages]
 
-        # Restate the current turn's soft-authoritative language preference at
+        # Restate the current turn's authoritative target language at
         # the end of the latest user/provider-continuation payload. This is a
         # wire-only copy: persisted user text and external evidence remain
         # byte-for-byte unchanged. Putting the contract here covers the first
@@ -8586,6 +8586,11 @@ class OSIAAgent:
                         reasoning_request.get("diagnostic") or {},
                         accepted=False,
                         error=e,
+                    )
+                if language_consistency_retry_used:
+                    return self._finish_language_consistency_failure(
+                        on_sentence=on_sentence,
+                        round_number=round_number,
                     )
                 if guard.check_time():
                     return self._finish_anti_loop_stop(
@@ -9942,6 +9947,11 @@ class OSIAAgent:
                     f"tools_executed={len(guard.actions)}, "
                     f"empty_retry_used={empty_retry_used})"
                 )
+                if language_consistency_retry_used:
+                    return self._finish_language_consistency_failure(
+                        on_sentence=on_sentence,
+                        round_number=round_number,
+                    )
                 if not empty_retry_used:
                     empty_retry_used = True
                     print(
@@ -9994,6 +10004,12 @@ class OSIAAgent:
                             round_number,
                             "language_drift_rejected",
                         )
+                    self.messages.append({
+                        "role": "assistant",
+                        "_internal": True,
+                        "_provisional": True,
+                        "content": content,
+                    })
                     self.messages.append({
                         "role": "user",
                         "_internal": True,

@@ -43,10 +43,12 @@ _LANG_LABELS = {
 }
 _LEXICAL_HINTS = {
     "en": frozenset({
-        "please", "thanks", "hello", "could", "would", "answer", "show",
+        "please", "thanks", "thank", "hello", "could", "would", "answer",
+        "show", "how", "help", "doing", "well", "sure", "okay",
+        "continuing", "now",
     }),
     "fr": frozenset({
-        "bonjour", "merci", "sûr", "sur", "donc", "peux", "réponds",
+        "bonjour", "salut", "merci", "sûr", "sur", "donc", "peux", "réponds",
         "reponds", "fais", "produire", "pourquoi", "français", "francais",
     }),
     "de": frozenset({
@@ -58,6 +60,28 @@ _LEXICAL_HINTS = {
     }),
     "it": frozenset({"ciao", "grazie", "italiano", "perché", "perche"}),
     "pt": frozenset({"olá", "ola", "obrigado", "português", "portugues"}),
+}
+_ASSISTANT_LEXICAL_HINTS = {
+    **_LEXICAL_HINTS,
+    "en": _LEXICAL_HINTS["en"] | frozenset({
+        "yes", "done", "ready", "welcome", "sorry", "response",
+    }),
+    "fr": _LEXICAL_HINTS["fr"] | frozenset({
+        "oui", "terminé", "termine", "prêt", "pret", "prête", "prete",
+        "désolé", "desole", "désolée", "desolee", "volontiers",
+    }),
+    "de": _LEXICAL_HINTS["de"] | frozenset({
+        "ja", "klar", "fertig", "bereit", "gerne",
+    }),
+    "es": _LEXICAL_HINTS["es"] | frozenset({
+        "sí", "si", "claro", "listo", "hecho",
+    }),
+    "it": _LEXICAL_HINTS["it"] | frozenset({
+        "sì", "si", "certo", "fatto", "pronto",
+    }),
+    "pt": _LEXICAL_HINTS["pt"] | frozenset({
+        "sim", "claro", "feito", "pronto", "obrigada",
+    }),
 }
 
 _SCRIPT_PATTERNS = (
@@ -84,6 +108,21 @@ class TurnContext:
     allowed_languages: tuple[str, ...] = ()
     source_language: str | None = None
     target_language: str | None = None
+
+    def __post_init__(self) -> None:
+        canonical = (
+            normalize_locale(self.target_language)
+            or normalize_locale(self.language)
+            or i18n.DEFAULT_LANG
+        )
+        object.__setattr__(self, "language", canonical)
+        object.__setattr__(self, "target_language", canonical)
+
+    @property
+    def canonical_language(self) -> str:
+        """The immutable output language owned by this turn."""
+
+        return self.target_language or self.language
 
 
 def normalize_locale(value) -> str | None:
@@ -117,6 +156,25 @@ def _display_text(value) -> str:
             for part in value if isinstance(part, dict) and part.get("type") == "text"
         )
     return str(value or "")
+
+
+def _lexical_language(words, *, hints_by_language=None) -> str | None:
+    """Return one unambiguous language represented by the lexical registry."""
+
+    registry = hints_by_language or _LEXICAL_HINTS
+    folded_words = [_fold(str(word)) for word in words]
+    lexical_scores = {
+        code: sum(word in {_fold(item) for item in hints} for word in folded_words)
+        for code, hints in registry.items()
+    }
+    ranked = sorted(lexical_scores.items(), key=lambda item: item[1], reverse=True)
+    if (
+        ranked
+        and ranked[0][1] >= 1
+        and (len(ranked) == 1 or ranked[0][1] > ranked[1][1])
+    ):
+        return ranked[0][0]
+    return None
 
 
 def _without_foreign_evidence(text: str) -> str:
@@ -224,21 +282,7 @@ def detect_request_language(
     words = re.findall(r"[^\W\d_]+", visible.casefold(), flags=re.UNICODE)
     if not words:
         return None
-    folded_words = [_fold(word) for word in words]
-    lexical_scores = {
-        code: sum(word in {_fold(item) for item in hints} for word in folded_words)
-        for code, hints in _LEXICAL_HINTS.items()
-    }
-    ranked_lexical = sorted(
-        lexical_scores.items(), key=lambda item: item[1], reverse=True,
-    )
-    lexical_language = None
-    if (
-        ranked_lexical
-        and ranked_lexical[0][1] >= 1
-        and (len(ranked_lexical) == 1 or ranked_lexical[0][1] > ranked_lexical[1][1])
-    ):
-        lexical_language = ranked_lexical[0][0]
+    lexical_language = _lexical_language(words)
     try:
         candidates = detect_langs(visible)
         best = candidates[0] if candidates else None
@@ -256,9 +300,11 @@ def detect_request_language(
         # change: keep the previous turn when one exists, and otherwise prefer a
         # lexical signal/client locale over a guessed language.
         if len(words) <= 2:
+            if lexical_language:
+                return lexical_language
             if previous:
-                return previous if lexical_language == previous else None
-            return lexical_language
+                return None
+            return None
         if lexical_language:
             return lexical_language
         if previous and detected != previous and confidence < 0.80:
@@ -312,6 +358,7 @@ def resolve_turn_context(
         context = TurnContext(
             requested, "explicit_request", _turn_ref(reference),
             allowed_languages=(requested,),
+            target_language=requested,
         )
         log_turn_context(context)
         return context
@@ -341,6 +388,9 @@ def resolve_turn_context(
             _turn_ref(reference),
             mode="multilingual",
             allowed_languages=multilingual,
+            target_language=(
+                dominant if dominant in multilingual else multilingual[0]
+            ),
         )
         log_turn_context(context)
         return context
@@ -355,6 +405,7 @@ def resolve_turn_context(
             context = TurnContext(
                 language, source, _turn_ref(reference),
                 allowed_languages=(language,),
+                target_language=language,
             )
             log_turn_context(context)
             return context
@@ -364,6 +415,7 @@ def resolve_turn_context(
         "safe_default",
         _turn_ref(reference),
         allowed_languages=(i18n.DEFAULT_LANG,),
+        target_language=i18n.DEFAULT_LANG,
     )
     log_turn_context(context)
     return context
@@ -382,6 +434,7 @@ def fixed_turn_context(
     """Build a context from a previously authoritative persisted decision."""
 
     normalized = normalize_locale(language) or i18n.DEFAULT_LANG
+    canonical = normalize_locale(target_language) or normalized
     allowed = tuple(
         dict.fromkeys(
             code for code in (normalize_locale(item) for item in allowed_languages)
@@ -391,13 +444,13 @@ def fixed_turn_context(
     if mode not in {"single-language", "translation", "multilingual"}:
         mode = "single-language"
     context = TurnContext(
-        normalized,
+        canonical,
         source,
         _turn_ref(reference),
         mode=mode,
-        allowed_languages=allowed or (normalized,),
+        allowed_languages=allowed or (canonical,),
         source_language=normalize_locale(source_language),
-        target_language=normalize_locale(target_language),
+        target_language=canonical,
     )
     log_turn_context(context)
     return context
@@ -405,7 +458,9 @@ def fixed_turn_context(
 
 def language_instruction(language: str | TurnContext) -> str:
     context = language if isinstance(language, TurnContext) else None
-    code = normalize_locale(context.language if context else language) or i18n.DEFAULT_LANG
+    code = normalize_locale(
+        context.canonical_language if context else language
+    ) or i18n.DEFAULT_LANG
     if context is not None and context.mode == "translation":
         allowed = ", ".join(
             _LANG_LABELS[item] for item in context.allowed_languages
@@ -463,6 +518,7 @@ def _assistant_prose_for_language_check(text) -> str:
             not stripped
             or stripped.startswith(">")
             or _SOURCE_VALUE_LINE.match(stripped)
+            or re.fullmatch(r"[A-Z0-9_:@./+-]+", stripped)
         ):
             continue
         if stripped.startswith("|") and stripped.endswith("|"):
@@ -475,7 +531,15 @@ def _assistant_prose_for_language_check(text) -> str:
 
 def _strong_prose_language(text: str) -> str | None:
     words = re.findall(r"[^\W\d_]+", str(text or ""), flags=re.UNICODE)
-    if len(words) < 5 or sum(len(word) for word in words) < 20:
+    lexical = _lexical_language(
+        words, hints_by_language=_ASSISTANT_LEXICAL_HINTS,
+    )
+    if lexical:
+        return lexical
+    for code, pattern in _SCRIPT_PATTERNS:
+        if pattern.search(str(text or "")):
+            return code
+    if len(words) < 4 or sum(len(word) for word in words) < 12:
         return None
     try:
         candidates = detect_langs(text)
@@ -484,7 +548,7 @@ def _strong_prose_language(text: str) -> str | None:
         confidence = float(getattr(best, "prob", 0.0))
     except Exception:
         return None
-    return language if language and confidence >= 0.92 else None
+    return language if language and confidence >= 0.85 else None
 
 
 def response_language_drift(text, context: TurnContext | None) -> str | None:
@@ -498,7 +562,7 @@ def response_language_drift(text, context: TurnContext | None) -> str | None:
 
     if not isinstance(context, TurnContext) or context.mode != "single-language":
         return None
-    target = normalize_locale(context.language)
+    target = normalize_locale(context.canonical_language)
     if not target:
         return None
     visible = _assistant_prose_for_language_check(text)
@@ -736,7 +800,7 @@ def content_hash(text) -> str:
 
 def log_turn_context(context: TurnContext) -> None:
     _LOG.info("turn_language language=%s source=%s turn_ref=%s",
-              context.language, context.source, context.turn_ref)
+              context.canonical_language, context.source, context.turn_ref)
 
 
 def log_round(context: TurnContext, round_number: int, state: str) -> None:
@@ -747,4 +811,5 @@ def log_round(context: TurnContext, round_number: int, state: str) -> None:
 def log_final(context: TurnContext, text) -> None:
     rendered = _display_text(text)
     _LOG.info("turn_final turn_ref=%s language=%s length=%d hash=%s",
-              context.turn_ref, context.language, len(rendered), content_hash(rendered))
+              context.turn_ref, context.canonical_language,
+              len(rendered), content_hash(rendered))
