@@ -32,6 +32,7 @@ from pathlib import Path
 import psutil
 from openai import OpenAI
 
+from osia import execution_strategy as _execution_strategy
 from osia import i18n
 from osia.turn_context import (
     TurnContext,
@@ -3048,17 +3049,17 @@ _REFINE_ZOOM = 2
 # per-axis reach) so a genuine far-side refinement isn't falsely rejected.
 _MAX_REFINE_DRIFT_PX = 150
 
-# A/B toggle for the 2nd-pass fine-locate refinement in tool_desktop_click.
+# Toggle for the 2nd-pass fine-locate refinement in tool_desktop_click.
 # Override at runtime with the env var DESKTOP_CLICK_REFINE (1/true/yes/on to
-# enable, 0/false/no/off to disable). Default is FALSE pending live A/B
-# validation: WOR-46 vol2 added the missing real ZOOM (the crop is now upscaled
+# enable, 0/false/no/off to disable). WOR-248 makes zoomed/local vision the
+# default before coarse global coordinates. WOR-46 vol2 added the missing real
+# ZOOM (the crop is now upscaled
 # by _REFINE_ZOOM so the model sees the element genuinely larger) and made the
 # crop→screen remap zoom-aware (divide by Z, in lockstep with the upscale), which
 # is what the earlier "drifts further away" observation was caused by (no zoom →
-# no added precision). The default stays OFF until that fix is confirmed reliably
-# better than coarse-only on a real no-accessibility app (e.g. Steam); enable via
-# the env var to run the A/B without a code change.
-_REFINE_DEFAULT = False
+# no added precision). Operators may still explicitly disable the pass for
+# bounded diagnostics.
+_REFINE_DEFAULT = True
 
 
 def _refine_flag() -> bool:
@@ -3294,6 +3295,35 @@ def tool_desktop_click(description: str) -> str:
         return "ERROR: desktop_click: provide a description of what to click."
     description = str(description).strip()
 
+    active_strategy = _execution_strategy.current_execution_strategy()
+
+    def _strategy_mechanism(mechanism_id, layer, reason):
+        if active_strategy is None:
+            return None
+        goal = active_strategy.goal
+        mechanism = _execution_strategy.StrategyMechanism(
+            mechanism_id,
+            layer,
+            reason,
+            application=goal.required_application,
+            surface=goal.required_surface,
+            account=goal.required_account,
+            covers_goal=False,
+            mutation=True,
+        )
+        return active_strategy.select(mechanism, {"target": description})
+
+    def _strategy_record(decision, outcome, reason="", evidence=""):
+        if active_strategy is None or decision is None:
+            return
+        active_strategy.record(
+            decision,
+            outcome,
+            failure_reason=reason,
+            observation=evidence,
+            postcondition_evidence=evidence,
+        )
+
     # WOR-84 — WEB DOM-FIRST. If OSIA's own browser is the foreground window and a
     # live Playwright page is driving it, click the target THROUGH the DOM (a real
     # locator.click() in the visible browser — pixel-exact, no coordinate
@@ -3303,13 +3333,39 @@ def tool_desktop_click(description: str) -> str:
     # not found / ambiguous, canvas / cross-origin iframe, or any exception) —
     # None falls through UNCHANGED to the native paths, so the vision fallback is
     # always reachable and native (non-browser) apps are unaffected.
+    dom_decision = None
+    if active_strategy is not None:
+        dom_mechanism = _execution_strategy.mechanism_for_tool(
+            active_strategy,
+            "click",
+            {"selector": description},
+        )
+        if dom_mechanism is not None:
+            dom_decision = active_strategy.select(
+                dom_mechanism,
+                {"target": description},
+            )
     try:
         from osia.tools import browser as _browser
-        dom_res = _browser.dom_click(description)
+        dom_res = (
+            _browser.dom_click(description)
+            if dom_decision is None or dom_decision.allowed else None
+        )
     except Exception:
         dom_res = None
     if dom_res is not None:
+        _strategy_record(
+            dom_decision,
+            "progress",
+            evidence="DOM target activated; postcondition still requires observation",
+        )
         return dom_res
+    if dom_decision is not None and dom_decision.allowed:
+        _strategy_record(
+            dom_decision,
+            "failed",
+            reason="dom_target_not_resolved_or_not_applicable",
+        )
 
     shot = str(Path(tempfile.gettempdir()) / "osia_desktop_click.png")
     err = _capture_screen(shot)
@@ -3326,13 +3382,29 @@ def tool_desktop_click(description: str) -> str:
     # any fuzzy-match miss / COM error, or headless — and NEVER raises or returns
     # an "ERROR:" string — so None cleanly routes us to the existing vision path
     # below. Either way the BEFORE/AFTER verification screenshots are still taken.
+    uia_decision = _strategy_mechanism(
+        "native_accessibility",
+        _execution_strategy.StrategyLayer.NATIVE_ACCESSIBILITY,
+        "fresh native accessibility target",
+    )
+    if uia_decision is not None and not uia_decision.allowed:
+        return (
+            "ERROR: native accessibility strategy blocked before dispatch "
+            f"({uia_decision.reason_code})."
+        )
     hit = _dc.resolve_element_rect(description)
     if hit is not None:
         cx, cy = hit
         fx, fy, refined = cx, cy, False
+        used_strategy_decision = uia_decision
         print(f"[WOR-46] UIA resolved \"{description}\" -> ({cx}, {cy}) "
               f"— skipping vision locate + refine.")
     else:
+        _strategy_record(
+            uia_decision,
+            "failed",
+            reason="native_accessibility_target_not_resolved",
+        )
         # WOR-90 — KEYBOARD-NAVIGATION tier (Windows-only), between UIA-direct
         # (above) and vision (below). When UIA could not resolve a clickable rect,
         # try to ACTIVATE the element by driving the keyboard: Tab/Shift+Tab across
@@ -3343,9 +3415,29 @@ def tool_desktop_click(description: str) -> str:
         # — it returns a success string on a VERIFIED activation, or None on ANY
         # miss / non-Windows / no-op. None falls through UNCHANGED to the vision
         # locate below (the last resort), so every miss reaches vision as today.
+        keyboard_decision = _strategy_mechanism(
+            "keyboard_focus",
+            _execution_strategy.StrategyLayer.KEYBOARD,
+            "keyboard navigation with observable accessibility focus",
+        )
+        if keyboard_decision is not None and not keyboard_decision.allowed:
+            return (
+                "ERROR: keyboard strategy blocked before dispatch "
+                f"({keyboard_decision.reason_code})."
+            )
         kbd = _dc.activate_by_keyboard(description)
         if kbd is not None:
+            _strategy_record(
+                keyboard_decision,
+                "progress",
+                evidence="keyboard activation produced an observed screen change",
+            )
             return kbd
+        _strategy_record(
+            keyboard_decision,
+            "failed",
+            reason="keyboard_focus_target_not_resolved_or_activation_stagnated",
+        )
         # The keyboard tier presses navigation keys (Tab / arrows) before it
         # misses, so the live screen may differ from `shot` (captured above, before
         # the tier ran). Re-capture on Windows so the vision locate AND the
@@ -3356,10 +3448,33 @@ def tool_desktop_click(description: str) -> str:
         # byte-identical to today; a re-capture failure leaves the prior `shot`.
         if sys.platform == "win32":
             _capture_screen(shot)
+        local_vision_decision = _strategy_mechanism(
+            "local_vision",
+            _execution_strategy.StrategyLayer.LOCAL_VISION,
+            "zoomed local vision after deterministic native paths stagnated",
+        )
+        if (
+            local_vision_decision is not None
+            and not local_vision_decision.allowed
+        ):
+            return (
+                "ERROR: local vision strategy blocked before dispatch "
+                f"({local_vision_decision.reason_code})."
+            )
         loc = _vision_locate(shot, description)
         if loc.get("error"):
+            _strategy_record(
+                local_vision_decision,
+                "failed",
+                reason="coarse_localization_unavailable",
+            )
             return loc["error"]
         if not loc.get("found"):
+            _strategy_record(
+                local_vision_decision,
+                "failed",
+                reason="target_not_visible_for_local_refinement",
+            )
             return (
                 f"ERROR: could not find \"{description}\" on screen "
                 f"({loc.get('reason', 'not visible')}). Take a screenshot to see what "
@@ -3372,15 +3487,44 @@ def tool_desktop_click(description: str) -> str:
         # corrected point. Sharpens small targets (text links, tiny icons). Best-
         # effort: any hiccup (quota, vision error, not-found) falls back to the coarse
         # coordinates rather than failing the whole click. Gated by the
-        # DESKTOP_CLICK_REFINE A/B flag (default OFF — coarse-only) so the zoom
-        # refinement (WOR-46 vol2) can be toggled without code changes during live
-        # A/B validation on a real no-accessibility app.
+        # DESKTOP_CLICK_REFINE defaults ON so zoomed/local vision is attempted
+        # before the coarse global-coordinate fallback. The environment toggle
+        # remains available for bounded diagnostics.
         if DESKTOP_CLICK_REFINE:
             fx, fy, refined = _refine_click_target(cx, cy, description, _dc)
+            if refined:
+                used_strategy_decision = local_vision_decision
+            else:
+                _strategy_record(
+                    local_vision_decision,
+                    "failed",
+                    reason="local_zoom_refinement_stagnated",
+                )
         else:
+            _strategy_record(
+                local_vision_decision,
+                "stagnated",
+                reason="local_zoom_explicitly_disabled",
+            )
             print(f"[DESKTOP-REFINE] disabled (DESKTOP_CLICK_REFINE=off) — "
                   f"clicking coarse ({cx}, {cy})")
             fx, fy, refined = cx, cy, False
+
+        if not refined:
+            global_vision_decision = _strategy_mechanism(
+                "global_vision",
+                _execution_strategy.StrategyLayer.GLOBAL_VISION,
+                "global coordinates after every higher applicable layer failed",
+            )
+            if (
+                global_vision_decision is not None
+                and not global_vision_decision.allowed
+            ):
+                return (
+                    "ERROR: global vision strategy blocked before dispatch "
+                    f"({global_vision_decision.reason_code})."
+                )
+            used_strategy_decision = global_vision_decision
 
     # Click IMMEDIATELY once coordinates are resolved — no vision describe in
     # front of the click. The BEFORE screenshot (`shot`, captured above) is
@@ -3388,6 +3532,11 @@ def tool_desktop_click(description: str) -> str:
     # pixel diff (see _screens_changed), not a vision call.
     res = _dc.click_at(fx, fy)
     if isinstance(res, str) and res.upper().startswith("ERROR"):
+        _strategy_record(
+            used_strategy_decision,
+            "ambiguous",
+            reason="coordinate_dispatch_failed_after_possible_effect",
+        )
         return res
 
     if refined and (fx, fy) != (cx, cy):
@@ -3399,6 +3548,11 @@ def tool_desktop_click(description: str) -> str:
     # Verification screenshot (distinct path so it never clobbers the click-shot).
     verify = str(Path(tempfile.gettempdir()) / "osia_desktop_verify.png")
     if _capture_screen(verify) is not None:
+        _strategy_record(
+            used_strategy_decision,
+            "ambiguous",
+            reason="postcondition_capture_unavailable_after_click",
+        )
         # Re-capture failed — report the click without a before/after compare.
         return note
 
@@ -3413,12 +3567,25 @@ def tool_desktop_click(description: str) -> str:
     # of assuming the tool crashed. A click that DID change the screen stays a
     # normal success (plain `note`, no banner, resets the streak).
     if not _screens_changed(shot, verify):
+        _strategy_record(
+            used_strategy_decision,
+            "ambiguous",
+            reason="click_effect_possible_postcondition_not_observed",
+        )
         return (
             f"ERROR: clicked \"{description}\" at ({fx}, {fy}) but the screen "
             "did not visibly change — the click likely MISSED. Take a "
             "screenshot to re-locate the target, then retry once or try an "
             "alternative."
         )
+    _strategy_record(
+        used_strategy_decision,
+        "progress",
+        evidence=(
+            "screen changed after the selected mechanism; exact goal still "
+            "requires verification"
+        ),
+    )
     return note
 
 
@@ -8118,16 +8285,20 @@ class OSIAAgent:
 
         def _run_scoped():
             with task_scope():
-                return self._run_turn(
+                with _execution_strategy.execution_strategy_scope(
                     user_input,
-                    max_tool_rounds=max_tool_rounds,
-                    on_sentence=on_sentence,
-                    history=history,
-                    max_tokens=max_tokens,
-                    on_first_token=on_first_token,
-                    current_conversation_id=current_conversation_id,
-                    canonical_output=canonical_output,
-                )
+                    TOOL_MAP.keys(),
+                ):
+                    return self._run_turn(
+                        user_input,
+                        max_tool_rounds=max_tool_rounds,
+                        on_sentence=on_sentence,
+                        history=history,
+                        max_tokens=max_tokens,
+                        on_first_token=on_first_token,
+                        current_conversation_id=current_conversation_id,
+                        canonical_output=canonical_output,
+                    )
 
         routing_token = _CHAT_ROUTING_CONTEXT.set(
             dict(self._chat_autonomous_context)
@@ -8364,6 +8535,19 @@ class OSIAAgent:
                     + "]"
                 ),
             })
+        active_execution_strategy = (
+            _execution_strategy.current_execution_strategy()
+        )
+        if (
+            active_execution_strategy is not None
+            and active_execution_strategy.goal.requires_execution
+        ):
+            self.messages.append({
+                "role": "user",
+                "_internal": True,
+                "_execution_strategy": True,
+                "content": active_execution_strategy.model_instruction(),
+            })
         self.messages.append({"role": "user", "content": user_input})
 
         # ── Task-hierarchy routing (Bloc 3) ──────────────────────────────
@@ -8495,6 +8679,7 @@ class OSIAAgent:
         chat_handoff_tool_seen = False
         chat_handoff_retry_used = False
         chat_route_redirect = ""
+        chat_normal_route_confirmed = False
         chat_scheduled_route_confirmed = False
         language_consistency_retry_used = False
         argument_repair_used = False
@@ -9131,6 +9316,21 @@ class OSIAAgent:
                         argument_repair_active = False
                     attempted_model_tool_name = tool_name
                     attempted_model_kwargs = dict(kwargs)
+                    strategy_decision = _execution_strategy.tool_preflight(
+                        tool_name, kwargs,
+                    )
+                    strategy_policy_error = ""
+                    if (
+                        strategy_decision is not None
+                        and not strategy_decision.allowed
+                    ):
+                        strategy_policy_error = (
+                            "ERROR: execution strategy blocked this call before "
+                            "dispatch ("
+                            f"{strategy_decision.reason_code}). Preserve the exact "
+                            "goal and use the earliest safe semantically equivalent "
+                            "alternative reported in execution_strategy."
+                        )
 
                     if (
                         self._resume_unknown_effect
@@ -9173,6 +9373,8 @@ class OSIAAgent:
                             chat_route_redirect = route
                             if route == "scheduled":
                                 chat_scheduled_route_confirmed = True
+                            else:
+                                chat_normal_route_confirmed = True
                             tool_results.append(
                                 localized_text(
                                     "tool_result_header", self.lang,
@@ -9215,7 +9417,19 @@ class OSIAAgent:
                     autonomous_policy_error = None
                     autonomous_execution_permit = False
                     same_turn_result_reused = False
-                    if tool_name == "save_memory" or tool_name in _SCHEDULED_TASK_TOOL_NAMES:
+                    if strategy_policy_error:
+                        result, is_error = strategy_policy_error, True
+                        execution_record = ToolExecutionRecord(
+                            result,
+                            True,
+                            ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+                            0,
+                            False,
+                            False,
+                            effective,
+                            reason_code=strategy_decision.reason_code,
+                        )
+                    elif tool_name == "save_memory" or tool_name in _SCHEDULED_TASK_TOOL_NAMES:
                         try:
                             from osia.action_policy import (
                                 autonomous_permission_gate,
@@ -9476,6 +9690,18 @@ class OSIAAgent:
                         # The Scheduled facade already fails closed before any
                         # gated dispatch; outcome persistence cannot broaden it.
                         pass
+                    _execution_strategy.record_tool_outcome(
+                        tool_name,
+                        strategy_decision,
+                        outcome=getattr(
+                            execution_record.outcome,
+                            "value",
+                            str(execution_record.outcome),
+                        ),
+                        is_error=execution_record.is_error,
+                        reason_code=execution_record.reason_code,
+                        result=execution_record.result,
+                    )
                     if execution_record.outcome == ExecutionOutcome.CANCELLED_PROVEN:
                         tool_execution_barrier_committed = True
                         return self._finish_cancelled_tool_stop(
@@ -9559,6 +9785,13 @@ class OSIAAgent:
                         )
                         + f"\n{display_text}"
                     )
+                    active_execution_strategy = (
+                        _execution_strategy.current_execution_strategy()
+                    )
+                    if active_execution_strategy is not None:
+                        result_entry += (
+                            "\n\n" + active_execution_strategy.model_feedback()
+                        )
                     # Force screenshot analysis: navigation tool results
                     # (navigate, click, find_and_click) carrying a screenshot
                     # the model will actually see get a mandatory
@@ -9828,6 +10061,31 @@ class OSIAAgent:
                     return _finish_chat_handoff(
                         {"status": "failed"}, round_number,
                     )
+
+            active_execution_strategy = (
+                _execution_strategy.current_execution_strategy()
+            )
+            if (
+                active_execution_strategy is not None
+                and not chat_normal_route_confirmed
+            ):
+                perseverance_instruction = (
+                    active_execution_strategy.premature_final_instruction()
+                )
+                if perseverance_instruction:
+                    self.messages.append({
+                        "role": "assistant",
+                        "_internal": True,
+                        "_provisional": True,
+                        "content": content,
+                    })
+                    self.messages.append({
+                        "role": "user",
+                        "_internal": True,
+                        "_execution_strategy": True,
+                        "content": perseverance_instruction,
+                    })
+                    continue
 
             #
             # STEP 4 — fallback honesty. Nothing was executed this round.
