@@ -577,6 +577,27 @@ def response_language_drift(text, context: TurnContext | None) -> str | None:
     return detected if detected and detected != target else None
 
 
+def response_prose_language(text, context: TurnContext | None) -> str | None:
+    """Return a strong language signal for bounded assistant prose.
+
+    This shares the final-boundary evidence filtering used by
+    :func:`response_language_drift`, but exposes only a confident positive
+    signal.  Streaming callers can therefore hold a small prefix until its
+    canonical language is known without buffering the complete response.
+    """
+
+    if not isinstance(context, TurnContext):
+        return None
+    visible = _assistant_prose_for_language_check(text)
+    if not visible.strip():
+        return None
+    return _strong_prose_language(visible)
+
+
+class ValidatedLiveAssistantChunk(str):
+    """Assistant prose approved for replaceable live projection."""
+
+
 _LOCALIZED = {
     "empty_completion": {
         "en": "I couldn't produce a reliable final response. Please try again or rephrase your request.",

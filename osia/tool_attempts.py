@@ -29,6 +29,13 @@ from osia.config import CONFIG_DIR
 
 SCHEMA_VERSION = 1
 WAITING_TOOL_RESULT = "WAITING_TOOL_RESULT"
+_INTERNAL_TOOL_CONTROL_STATES = frozenset({
+    WAITING_TOOL_RESULT,
+    "WAITING_TOOL",
+    "RECONCILING",
+    "INTERNAL_RETRY",
+    "TOOL_RETRY",
+})
 DEFAULT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 ANTI_REPLAY_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
@@ -36,6 +43,24 @@ _OPAQUE_BROWSER_TOKEN = re.compile(r"^[A-Za-z0-9_-]{8,96}$")
 _SAFE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
 _PERSISTENCE_STATES = frozenset({"waiting", "reconciling", "stalled", "terminal"})
 _PERSISTENCE_FAMILIES = frozenset({"browser", "file", "api_mcp", "system", "generic"})
+
+
+def is_internal_tool_control_text(value: Any) -> bool:
+    """Return whether *value* is a whole internal orchestration marker.
+
+    These values are transport/control state, never assistant-authored prose.
+    Matching is deliberately restricted to the complete marker-shaped value;
+    ordinary sentences that happen to discuss waiting or retries are untouched.
+    """
+
+    normalized = str(value or "").strip().upper()
+    if normalized in _INTERNAL_TOOL_CONTROL_STATES:
+        return True
+    return bool(re.fullmatch(
+        r"(?:WAITING_TOOL|RECONCILING|INTERNAL_RETRY|TOOL_RETRY)"
+        r"(?:_[A-Z0-9]+)*",
+        normalized,
+    ))
 
 
 class ToolAttemptStatus(str, Enum):
@@ -1585,9 +1610,32 @@ class ToolAttemptCoordinator:
             except BaseException as exc:  # finalizer must release busy state
                 error = exc
             try:
-                finalized = runtime.finalize(
-                    attempt_id, final_text, error,
-                ) is not False
+                # A resumed provider round may itself suspend on a new durable
+                # attempt.  That is a continuation hand-off, not assistant
+                # content: the agent has already registered/activated the new
+                # attempt and its typed status keeps the same Chat turn active.
+                # Never send the internal marker through the final callback.
+                if error is None and final_text == WAITING_TOOL_RESULT:
+                    current_record = self.store.get_attempt(attempt_id) or {}
+                    chained = self.store.find_compatible_suspended_turn(
+                        str(current_record.get("conversation_id") or "")
+                    )
+                    if (
+                        isinstance(chained, dict)
+                        and str(chained.get("tool_attempt_id") or "")
+                        and str(chained.get("tool_attempt_id") or "") != attempt_id
+                    ):
+                        finalized = True
+                    else:
+                        error = RuntimeError(
+                            "tool continuation returned a wait marker without "
+                            "an active correlated hand-off"
+                        )
+                        final_text = ""
+                if not finalized:
+                    finalized = runtime.finalize(
+                        attempt_id, final_text, error,
+                    ) is not False
                 if finalized:
                     record = self.store.get_attempt(attempt_id)
                     final_message_id = str(
@@ -2019,5 +2067,6 @@ __all__ = [
     "ToolAttemptStore",
     "WAITING_TOOL_RESULT", "current_tool_attempt_id", "get_tool_attempt_store",
     "get_tool_attempt_coordinator", "publish_tool_attempt_event",
-    "recover_orphaned_tool_attempts", "tool_attempt_scope",
+    "is_internal_tool_control_text", "recover_orphaned_tool_attempts",
+    "tool_attempt_scope",
 ]

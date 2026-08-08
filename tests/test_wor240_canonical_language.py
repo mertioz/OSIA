@@ -145,7 +145,9 @@ def test_partial_english_stream_is_private_and_one_repaired_final_is_exported():
     )
 
     assert final == repaired
-    assert visible == [repaired]
+    assert visible == ["Bonjour !", "Comment puis-je vous aider ?"]
+    assert " ".join(visible) == repaired
+    assert all("Hello" not in chunk for chunk in visible)
     assert len(wire_rounds) == 2
     assert any(
         message.get("role") == "assistant"
@@ -237,7 +239,7 @@ def test_english_skill_and_spanish_tool_result_cannot_replay_effects_for_repair(
     assert executions == ["system"]
     assert final.startswith("Le service est prêt.")
     assert "https://example.test" in final
-    assert visible == [final]
+    assert visible == ["Le service est prêt."]
 
 
 @pytest.mark.parametrize("provider", ["deepseek", "groq", "chatgpt_account"])

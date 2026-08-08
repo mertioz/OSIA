@@ -1563,20 +1563,12 @@ def wake_mode():
             )
 
         def on_first_token(*_a, **_kw):
-            if _voice_tts_allowed():
-                if emit_voice_state is not None:
-                    emit_voice_state("speaking")
-                else:
-                    bridge.island_state.emit("speaking")
+            # Provider text is still a replaceable draft at this point. Keep
+            # voice state in thinking until the canonical final is known.
+            return None
 
         def on_stream_sentence(sentence: str) -> None:
             bridge.assistant_stream_chunk.emit(conv_id, sentence)
-            if _voice_tts_allowed():
-                speak_streaming(
-                    sentence,
-                    session_id=tts_session_id,
-                    language=turn_context.language,
-                )
 
         def on_tool_attempt_status(status: str, attempt_id: str) -> None:
             del attempt_id
@@ -1623,7 +1615,11 @@ def wake_mode():
                     bridge.assistant_stream_final.emit(conv_id, display)
                 else:
                     bridge.assistant_stream_error.emit(conv_id, display)
-                if error is not None and _voice_tts_allowed():
+                if _voice_tts_allowed():
+                    if emit_voice_state is not None:
+                        emit_voice_state("speaking")
+                    else:
+                        bridge.island_state.emit("speaking")
                     speak_streaming(
                         display,
                         session_id=tts_session_id,
@@ -1693,6 +1689,16 @@ def wake_mode():
             )
             display = clean_response(reply or "")
             bridge.assistant_stream_final.emit(conv_id, display)
+            if _voice_tts_allowed():
+                if emit_voice_state is not None:
+                    emit_voice_state("speaking")
+                else:
+                    bridge.island_state.emit("speaking")
+                speak_streaming(
+                    display,
+                    session_id=tts_session_id,
+                    language=turn_context.language,
+                )
         except Exception as e:
             refusal = _finalize_controlled_refusal(
                 e,

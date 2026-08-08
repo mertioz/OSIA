@@ -35,6 +35,7 @@ from openai import OpenAI
 from osia import i18n
 from osia.turn_context import (
     TurnContext,
+    ValidatedLiveAssistantChunk,
     language_consistency_failure_text,
     language_consistency_retry_text,
     language_instruction,
@@ -43,6 +44,7 @@ from osia.turn_context import (
     log_round,
     normalize_locale,
     response_language_drift,
+    response_prose_language,
     resolve_turn_context,
 )
 
@@ -673,6 +675,10 @@ def clean_response(text: str) -> str:
     """
     if not text:
         return text
+    from osia.tool_attempts import is_internal_tool_control_text
+
+    if is_internal_tool_control_text(text):
+        return ""
 
     # Step 1: Remove <tool_call> and <tool_result> blocks entirely
     text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL)
@@ -6790,6 +6796,11 @@ def _sanitize_persisted_history_message(msg: dict) -> dict | None:
 
     raw = msg.get("content", "")
     text = _history_text_for_hygiene(raw)
+    if role == "assistant":
+        from osia.tool_attempts import is_internal_tool_control_text
+
+        if is_internal_tool_control_text(text):
+            return None
     if "RÈGLES ABSOLUES" in text or "ABSOLUTE RULES" in text:
         return None
     if text.lstrip().startswith("##"):
@@ -7096,7 +7107,7 @@ class OSIAAgent:
         }
         self._in_use = True
         try:
-            return self.run(
+            final_text = self.run(
                 feedback,
                 history=None,
                 on_sentence=metadata.get("on_sentence"),
@@ -7104,6 +7115,19 @@ class OSIAAgent:
                 current_conversation_id=metadata.get("conversation_id"),
                 turn_context=self.turn_context,
             )
+            from osia.tool_attempts import WAITING_TOOL_RESULT
+
+            if final_text == WAITING_TOOL_RESULT:
+                chained_attempt_id = str(self.last_pending_tool_attempt_id or "")
+                if (
+                    not chained_attempt_id
+                    or chained_attempt_id == attempt_id
+                    or not self.activate_pending_tool_attempt()
+                ):
+                    raise RuntimeError(
+                        "chained pending tool attempt could not be activated"
+                    )
+            return final_text
         finally:
             self._in_use = False
             self._disable_hierarchy_for_turn = previous_disable_hierarchy
@@ -8393,11 +8417,18 @@ class OSIAAgent:
                 and hasattr(self.client, "set_conversation_id")):
             self.client.set_conversation_id(current_conversation_id)
 
-        # Provider deltas are provisional until the entire round has been
-        # parsed. They are deliberately buffered here: a round that later
-        # yields a tool call must never reach display, TTS or persistence.
+        # Provider sentences remain provisional until the canonical `response`
+        # event, but safe prose may be projected live as a replaceable draft.
+        # Hold only a bounded language prefix: clearly foreign prose stays
+        # private for the WOR-240 repair round, while confidently canonical
+        # prose reaches PC/Mobile before provider completion. Callers must not
+        # persist or speak these callbacks until `run()` returns its one final.
         _stream_emitted = {"v": False}
         provisional_sentences: list[str] = []
+        visible_round_sentences: list[str] = []
+        language_prefix_sentences: list[str] = []
+        stream_language_accepted = {"v": False}
+        stream_language_rejected = {"v": False}
         schedule_guard_state = {
             "ignored_unrelated_tool": False,
             "failure_retry_used": False,
@@ -8410,10 +8441,40 @@ class OSIAAgent:
                 _schedule_state=schedule_guard_state,
             ):
                 _text = self._redact_semantic_form_values(_text)
-                _flag["v"] = True
                 provisional_sentences.append(_text)
                 if _schedule_state["ignored_unrelated_tool"]:
                     _schedule_state["buffered_sentences"].append(_text)
+                    return None
+                if stream_language_rejected["v"]:
+                    return None
+                language_prefix_sentences.append(_text)
+                prefix = " ".join(language_prefix_sentences).strip()
+                if response_language_drift(prefix, self.turn_context):
+                    stream_language_rejected["v"] = True
+                    language_prefix_sentences.clear()
+                    return None
+                if not stream_language_accepted["v"]:
+                    if (
+                        self.turn_context is not None
+                        and self.turn_context.mode == "single-language"
+                    ):
+                        detected = response_prose_language(
+                            prefix, self.turn_context,
+                        )
+                        if detected != self.turn_context.canonical_language:
+                            return None
+                    stream_language_accepted["v"] = True
+                    ready = list(language_prefix_sentences)
+                    language_prefix_sentences.clear()
+                else:
+                    ready = [language_prefix_sentences.pop()]
+                for sentence in ready:
+                    try:
+                        on_sentence(ValidatedLiveAssistantChunk(sentence))
+                    except Exception:
+                        continue
+                    visible_round_sentences.append(sentence)
+                    _flag["v"] = True
                 return None
         else:
             _on_sentence_cb = on_sentence
@@ -8524,12 +8585,17 @@ class OSIAAgent:
             record_active_key,
         )
         retry_after_attempted = set()
+        failed_read_only_calls: set[str] = set()
         round_number = 0
 
         while True:
             round_number += 1
             self._mark_document_private_history()
             provisional_sentences.clear()
+            visible_round_sentences.clear()
+            language_prefix_sentences.clear()
+            stream_language_accepted["v"] = False
+            stream_language_rejected["v"] = False
             schedule_guard_state["buffered_sentences"] = []
             reasoning_request = None
             reasoning_outcome_recorded = False
@@ -9311,7 +9377,41 @@ class OSIAAgent:
                             def _dispatch_validated_document_call(
                                 dispatch_kwargs,
                             ):
-                                return _execute_tool_with_policy(
+                                from osia.tool_contracts import SideEffectClass
+
+                                read_only_fingerprint = ""
+                                if effective.side_effect == SideEffectClass.READ_ONLY:
+                                    read_only_fingerprint = hashlib.sha256(
+                                        json.dumps(
+                                            {
+                                                "tool": tool_name,
+                                                "arguments": dispatch_kwargs,
+                                            },
+                                            ensure_ascii=False,
+                                            sort_keys=True,
+                                            separators=(",", ":"),
+                                            default=lambda _value: "<unsupported>",
+                                        ).encode("utf-8", errors="replace")
+                                    ).hexdigest()
+                                    if read_only_fingerprint in failed_read_only_calls:
+                                        return ToolExecutionRecord(
+                                            (
+                                                "ERROR: identical failed read-only call "
+                                                "blocked before dispatch; inspect the prior "
+                                                "failure and repair the arguments/path or use "
+                                                "a safe semantically equivalent alternative"
+                                            ),
+                                            True,
+                                            ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+                                            0,
+                                            False,
+                                            False,
+                                            effective,
+                                            reason_code=(
+                                                "identical_failed_read_only_call_blocked"
+                                            ),
+                                        )
+                                record = _execute_tool_with_policy(
                                     tool_name,
                                     dispatch_kwargs,
                                     hard_deadline=(
@@ -9336,6 +9436,9 @@ class OSIAAgent:
                                         repair_count=argument_repair_used,
                                     ),
                                 )
+                                if read_only_fingerprint and record.is_error:
+                                    failed_read_only_calls.add(read_only_fingerprint)
+                                return record
 
                             (
                                 execution_record,
@@ -10031,7 +10134,7 @@ class OSIAAgent:
                 content = clean_response(content)
             if not content:
                 content = self._empty_response_fallback(guard)
-            if on_sentence is not None:
+            if on_sentence is not None and not visible_round_sentences:
                 try:
                     on_sentence(content)
                 except Exception:

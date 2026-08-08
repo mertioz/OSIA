@@ -141,10 +141,12 @@ from osia.memory import (
 from osia.server.text_coalescer import AssistantTextCoalescer
 from osia.turn_context import (
     TurnContext,
+    ValidatedLiveAssistantChunk,
     fixed_turn_context,
     localized_text,
     log_final,
     normalize_locale,
+    response_language_drift,
     resolve_turn_context,
 )
 
@@ -10707,6 +10709,10 @@ def _displayable_history(history: list) -> list[dict]:
         # stored history but must never render on mobile.
         if role == "assistant":
             from osia.agent import strip_raw_tool_tags
+            from osia.tool_attempts import is_internal_tool_control_text
+
+            if is_internal_tool_control_text(text):
+                continue
             text = strip_raw_tool_tags(text).strip()
             if not text:
                 continue
@@ -10740,6 +10746,32 @@ def _join_sent_chunks(chunks: list[str]) -> str:
     """Rebuild the text Mobile sees from stripped sentence chunks."""
 
     return " ".join(chunks)
+
+
+class _LiveAssistantChunkGuard:
+    """Defence-in-depth boundary for provisional assistant stream chunks."""
+
+    def __init__(self, turn_context: TurnContext) -> None:
+        self.turn_context = turn_context
+        self._accepted: list[str] = []
+
+    def accept(self, value) -> str:
+        from osia.agent import clean_response, strip_raw_tool_tags
+        from osia.tool_attempts import is_internal_tool_control_text
+
+        if not isinstance(value, ValidatedLiveAssistantChunk):
+            return ""
+        raw = str(value or "").strip()
+        if not raw or is_internal_tool_control_text(raw):
+            return ""
+        cleaned = clean_response(strip_raw_tool_tags(raw)).strip()
+        if not cleaned or is_internal_tool_control_text(cleaned):
+            return ""
+        candidate = _join_sent_chunks([*self._accepted, cleaned])
+        if response_language_drift(candidate, self.turn_context):
+            return ""
+        self._accepted.append(cleaned)
+        return cleaned
 
 
 def _tail_not_sent(full: str, sent: str) -> str:
@@ -11290,8 +11322,9 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         )
 
     # ── Canonical response plumbing ───────────────────────────────────
-    # Agent callbacks are buffered until agent.run returns successfully.
-    # Only the cleaned canonical return value is then sent to WebSocket/TTS.
+    # Only explicitly validated prose callbacks are projected live as
+    # replaceable WebSocket drafts. Persistence and TTS still wait for the
+    # single cleaned canonical return value from agent.run().
     loop = asyncio.get_running_loop()
     chunk_queue: asyncio.Queue = asyncio.Queue()
     pending_puts: list = []
@@ -11304,6 +11337,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # detect a missing tail at the end of the run.
     sent_chunks: list[str] = []
     provisional_chunks: list[str] = []
+    live_chunk_guard = _LiveAssistantChunkGuard(turn_context)
     tts_session: _ResponseTTSSession | None = None
     tts_enabled = (
         not isinstance(turn_meta, dict)
@@ -11330,9 +11364,14 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             _ts(t0, "first model token received")
 
     def on_sentence(sentence: str) -> None:
-        if not sentence:
+        safe_sentence = live_chunk_guard.accept(sentence)
+        if not safe_sentence:
             return
-        provisional_chunks.append(sentence)
+        provisional_chunks.append(safe_sentence)
+        future = asyncio.run_coroutine_threadsafe(
+            chunk_queue.put(safe_sentence), loop,
+        )
+        pending_puts.append(future)
 
     async def sender() -> None:
         from osia.agent import strip_raw_tool_tags
@@ -11369,8 +11408,6 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     )
                 )
                 sent_chunks.append(item)
-                if tts_session is not None:
-                    tts_session.enqueue(item)
                 # Yield to the event loop after every chunk. Enqueuing a frame
                 # does NOT itself yield (unbounded queue put returns straight
                 # away), so without this the sender could monopolise the loop
@@ -11461,6 +11498,19 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 final_text = localized_text(
                     "empty_completion", turn_context.language,
                 )
+            for future in list(pending_puts):
+                try:
+                    await asyncio.wrap_future(future)
+                except Exception:
+                    pass
+            tail = _tail_not_sent(
+                final_text, _join_sent_chunks(sent_chunks),
+            )
+            if tail:
+                await chunk_queue.put(tail)
+            await chunk_queue.put(_SENTINEL)
+            await sender_task
+            provisional_chunks.clear()
             response_frame = _turn_event_frame(
                 turn_meta,
                 "response",
@@ -11490,16 +11540,6 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 turn_meta["persisted"] = True
                 terminal_frame["persisted"] = True
             try:
-                await ws.send_json(
-                    _turn_event_frame(
-                        turn_meta,
-                        "response_chunk",
-                        message_id=str(
-                            turn_meta.get("assistant_message_id") or ""
-                        ),
-                        payload={"content": final_text},
-                    )
-                )
                 await ws.send_json(response_frame)
                 await ws.send_json(terminal_frame)
             except Exception as send_error:
@@ -11680,8 +11720,6 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     await asyncio.wrap_future(future)
                 except Exception:
                     pass
-            await chunk_queue.put(_SENTINEL)
-            await sender_task
             provisional_chunks.clear()
             if tts_session is not None:
                 tts_session.cancel()
@@ -11867,8 +11905,6 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                         )
                     )
                     sent_chunks.append(tail)
-                    if tts_session is not None:
-                        tts_session.enqueue(tail)
                     _ts(t0, "tail response_chunk flushed",
                         f"({len(tail)} chars)")
                 except Exception as e:
