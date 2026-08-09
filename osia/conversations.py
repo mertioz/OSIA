@@ -32,6 +32,10 @@ from pathlib import Path
 CONVERSATIONS_DIR = Path.home() / ".osia" / "conversations"
 TITLE_MAX_LEN = 60
 DEFAULT_TITLE = "New conversation"
+CONVERSATIONS_SNAPSHOT_VERSION = 2
+FOLDER_STATE_SCHEMA_VERSION = 1
+FOLDER_NAME_MAX_LEN = 60
+_RECENT_FOLDER_OPERATIONS = 256
 
 # ── Smart title — keyword extraction ───────────────────────────────────────
 # Multi-word phrases are stripped first (so "est-ce que" doesn't survive as
@@ -184,10 +188,21 @@ def _path_for(conv_id: str) -> Path:
     return CONVERSATIONS_DIR / f"{conv_id}.json"
 
 
+def _folder_state_path() -> Path:
+    """Return the metadata path relative to the active conversation store.
+
+    Keeping this dynamic is important for deterministic tests which redirect
+    ``CONVERSATIONS_DIR`` to a disposable directory.
+    """
+
+    return CONVERSATIONS_DIR / "_folders" / "state.json"
+
+
 def _write_atomic(path: Path, data: dict) -> None:
     """Write JSON atomically — temp file + rename so a crashed write
     never leaves a half-finished file behind.
     """
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(
         f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
@@ -219,6 +234,235 @@ def _next_revision(conv: dict) -> int:
     except (TypeError, ValueError):
         current = 0
     return max(0, current) + 1
+
+
+def _default_folder_state() -> dict:
+    return {
+        "schema_version": FOLDER_STATE_SCHEMA_VERSION,
+        "revision": 0,
+        "last_operation_id": "",
+        "folders": [],
+        "memberships": {},
+        "recent_operations": [],
+    }
+
+
+def _normalize_folder_state(raw) -> dict:
+    """Return a compatible canonical folder state without touching history."""
+
+    state = _default_folder_state()
+    if not isinstance(raw, dict):
+        return state
+    try:
+        state["revision"] = max(0, int(raw.get("revision") or 0))
+    except (TypeError, ValueError):
+        pass
+    state["last_operation_id"] = str(raw.get("last_operation_id") or "")
+
+    folders: list[tuple[int, int, dict]] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(raw.get("folders") or []):
+        if not isinstance(item, dict):
+            continue
+        folder_id = str(item.get("id") or "").strip()[:160]
+        name = str(item.get("name") or "").strip()[:FOLDER_NAME_MAX_LEN]
+        if not folder_id or not name or folder_id in seen_ids:
+            continue
+        seen_ids.add(folder_id)
+        try:
+            requested_order = max(0, int(item.get("order") or 0))
+        except (TypeError, ValueError):
+            requested_order = index
+        folders.append((requested_order, index, {
+            "id": folder_id,
+            "name": name,
+            "order": 0,
+            "collapsed": bool(item.get("collapsed", False)),
+            "allow_folder_context": bool(
+                item.get("allow_folder_context", False)
+            ),
+        }))
+    folders.sort(key=lambda value: (value[0], value[1], value[2]["id"]))
+    state["folders"] = []
+    for order, (_requested, _index, folder) in enumerate(folders):
+        folder["order"] = order
+        state["folders"].append(folder)
+
+    memberships = raw.get("memberships")
+    if isinstance(memberships, dict):
+        state["memberships"] = {
+            str(conv_id): str(folder_id)
+            for conv_id, folder_id in memberships.items()
+            if str(conv_id).strip() and str(folder_id) in seen_ids
+        }
+
+    recent: list[dict] = []
+    for item in raw.get("recent_operations") or []:
+        if not isinstance(item, dict):
+            continue
+        operation_id = str(item.get("id") or "").strip()[:200]
+        kind = str(item.get("kind") or "").strip()[:80]
+        result = item.get("result")
+        if operation_id and kind and isinstance(result, dict):
+            recent.append({
+                "id": operation_id,
+                "kind": kind,
+                "result": dict(result),
+            })
+    state["recent_operations"] = recent[-_RECENT_FOLDER_OPERATIONS:]
+    return state
+
+
+def _load_folder_state_unlocked() -> dict:
+    path = _folder_state_path()
+    if not path.exists():
+        # Migration is intentionally lossless and lazy: every pre-WOR-243
+        # conversation is represented as ungrouped without rewriting its file.
+        state = _default_folder_state()
+        _recover_bulk_transactions_unlocked(state)
+        return state
+    try:
+        state = _normalize_folder_state(
+            json.loads(path.read_text(encoding="utf-8"))
+        )
+    except (OSError, json.JSONDecodeError):
+        state = _default_folder_state()
+    _recover_bulk_transactions_unlocked(state)
+    return state
+
+
+def _recover_bulk_transactions_unlocked(state: dict) -> None:
+    """Finish or roll back an interrupted bulk-delete transaction."""
+
+    root = _folder_state_path().parent
+    if not root.exists():
+        return
+    completed = {
+        str(item.get("id") or "")
+        for item in state.get("recent_operations") or []
+        if item.get("kind") == "delete_ungrouped"
+    }
+    for transaction in root.glob("bulk-*"):
+        if not transaction.is_dir():
+            continue
+        manifest_path = transaction / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            # Unknown data under the metadata directory is never destroyed.
+            continue
+        operation_id = str(manifest.get("operation_id") or "")
+        names = manifest.get("files") or []
+        if not operation_id or not isinstance(names, list):
+            continue
+        committed = operation_id in completed
+        recovered = True
+        for raw_name in names:
+            name = Path(str(raw_name or "")).name
+            if not name or name != str(raw_name) or not name.endswith(".json"):
+                recovered = False
+                continue
+            staged = transaction / name
+            if not staged.exists():
+                continue
+            try:
+                if committed:
+                    staged.unlink()
+                else:
+                    original = CONVERSATIONS_DIR / name
+                    if original.exists():
+                        recovered = False
+                        continue
+                    os.replace(staged, original)
+            except OSError:
+                recovered = False
+        if not recovered:
+            continue
+        try:
+            manifest_path.unlink(missing_ok=True)
+            transaction.rmdir()
+        except OSError:
+            pass
+
+
+def _write_folder_state_unlocked(state: dict) -> None:
+    _write_atomic(_folder_state_path(), _normalize_folder_state(state))
+
+
+def _folder_receipt(
+    state: dict,
+    *,
+    operation_id: str,
+    result: dict,
+    replayed: bool,
+) -> dict:
+    return {
+        **dict(result),
+        "success": bool(result.get("success", True)),
+        "operation_id": operation_id,
+        "revision": int(state.get("revision") or 0),
+        "replayed": replayed,
+    }
+
+
+def _mutate_folder_state(operation_id: str | None, kind: str, mutate) -> dict:
+    """Apply one idempotent folder mutation under the canonical store lock."""
+
+    op_id = str(operation_id or "").strip()[:200]
+    if not op_id:
+        op_id = f"op_{uuid.uuid4().hex}"
+    with _store_lock():
+        state = _load_folder_state_unlocked()
+        for previous in state.get("recent_operations") or []:
+            if previous.get("id") != op_id:
+                continue
+            if previous.get("kind") != kind:
+                return _folder_receipt(
+                    state,
+                    operation_id=op_id,
+                    result={
+                        "success": False,
+                        "error": "operation_id_conflict",
+                    },
+                    replayed=True,
+                )
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result=previous.get("result") or {},
+                replayed=True,
+            )
+
+        result = mutate(state)
+        if not isinstance(result, dict):
+            result = {"success": False, "error": "invalid_mutation_result"}
+        if result.get("success") is False:
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result=result,
+                replayed=False,
+            )
+
+        state["revision"] = int(state.get("revision") or 0) + 1
+        state["last_operation_id"] = op_id
+        stored_result = dict(result)
+        stored_result["success"] = True
+        state.setdefault("recent_operations", []).append({
+            "id": op_id,
+            "kind": kind,
+            "result": stored_result,
+        })
+        state["recent_operations"] = state["recent_operations"][
+            -_RECENT_FOLDER_OPERATIONS:
+        ]
+        _write_folder_state_unlocked(state)
+        return _folder_receipt(
+            state,
+            operation_id=op_id,
+            result=stored_result,
+            replayed=False,
+        )
 
 
 def _commit_receipt(
@@ -406,14 +650,9 @@ def get_conversation(conv_id: str) -> dict | None:
         return None
 
 
-def list_conversations() -> list[dict]:
-    """Return summaries of every stored conversation (NO messages),
-    sorted by ``updated_at`` descending. Unreadable files are skipped.
-
-    Each summary has: ``id``, ``title``, ``created_at``, ``updated_at``,
-    ``message_count``.
-    """
+def _list_conversations_unlocked(state: dict) -> list[dict]:
     _ensure_dir()
+    memberships = state.get("memberships") or {}
     items: list[dict] = []
     for path in CONVERSATIONS_DIR.glob("*.json"):
         try:
@@ -428,9 +667,418 @@ def list_conversations() -> list[dict]:
             "message_count": len(data.get("messages") or []),
             "revision": int(data.get("revision") or 0),
             "operation_id": str(data.get("last_operation_id") or ""),
+            "folder_id": memberships.get(str(data.get("id") or "")),
         })
     items.sort(key=lambda c: c.get("updated_at") or "", reverse=True)
     return items
+
+
+def list_conversations() -> list[dict]:
+    """Return conversation summaries, including canonical folder metadata."""
+
+    with _store_lock():
+        state = _load_folder_state_unlocked()
+        return _list_conversations_unlocked(state)
+
+
+def list_folders() -> list[dict]:
+    """Return the canonical ordered folder entities, including empty folders."""
+
+    with _store_lock():
+        state = _load_folder_state_unlocked()
+        return [dict(folder) for folder in state.get("folders") or []]
+
+
+def conversation_snapshot() -> dict:
+    """Return the versioned compatible conversations + folders snapshot."""
+
+    with _store_lock():
+        state = _load_folder_state_unlocked()
+        return {
+            "type": "conversations",
+            "version": CONVERSATIONS_SNAPSHOT_VERSION,
+            "snapshot_revision": int(state.get("revision") or 0),
+            "operation_id": str(state.get("last_operation_id") or ""),
+            "items": _list_conversations_unlocked(state),
+            "folders": [
+                dict(folder) for folder in state.get("folders") or []
+            ],
+        }
+
+
+def folder_for_conversation(conv_id: str) -> dict | None:
+    """Return the canonical folder for a conversation, if it has one."""
+
+    if not conv_id:
+        return None
+    with _store_lock():
+        state = _load_folder_state_unlocked()
+        folder_id = (state.get("memberships") or {}).get(conv_id)
+        if not folder_id:
+            return None
+        return next(
+            (
+                dict(folder)
+                for folder in state.get("folders") or []
+                if folder.get("id") == folder_id
+            ),
+            None,
+        )
+
+
+def conversation_ids_in_folder(folder_id: str) -> list[str]:
+    """Return stable IDs assigned to one folder without loading histories."""
+
+    if not folder_id:
+        return []
+    with _store_lock():
+        state = _load_folder_state_unlocked()
+        memberships = state.get("memberships") or {}
+        existing_ids = {
+            str(item.get("id") or "")
+            for item in _list_conversations_unlocked(state)
+        }
+        return sorted(
+            conv_id
+            for conv_id, assigned in memberships.items()
+            if assigned == folder_id and conv_id in existing_ids
+        )
+
+
+def apply_folder_mutation(message: dict) -> dict:
+    """Apply one canonical Mobile/PC transport mutation to the PC store."""
+
+    msg = message if isinstance(message, dict) else {}
+    msg_type = str(msg.get("type") or "")
+    operation_id = str(msg.get("operation_id") or "")
+    if msg_type == "create_conversation_folder":
+        return create_folder(msg.get("name", ""), operation_id=operation_id)
+    if msg_type == "rename_conversation_folder":
+        return rename_folder(
+            str(msg.get("folder_id") or ""),
+            msg.get("name", ""),
+            operation_id=operation_id,
+        )
+    if msg_type == "set_conversation_folder_state":
+        return set_folder_collapsed(
+            str(msg.get("folder_id") or ""),
+            bool(msg.get("collapsed", False)),
+            operation_id=operation_id,
+        )
+    if msg_type == "set_conversation_folder_context":
+        return set_folder_context_policy(
+            str(msg.get("folder_id") or ""),
+            bool(msg.get("allow_folder_context", False)),
+            operation_id=operation_id,
+        )
+    if msg_type == "reorder_conversation_folders":
+        raw_order = msg.get("folder_ids")
+        return reorder_folders(
+            list(raw_order) if isinstance(raw_order, list) else [],
+            operation_id=operation_id,
+        )
+    if msg_type == "move_conversation_to_folder":
+        return move_conversation_to_folder(
+            str(msg.get("conversation_id") or msg.get("id") or ""),
+            msg.get("folder_id"),
+            operation_id=operation_id,
+        )
+    return {
+        "success": False,
+        "error": "unsupported_folder_mutation",
+        "operation_id": operation_id,
+        "revision": 0,
+        "replayed": False,
+    }
+
+
+def create_folder(name: str, *, operation_id: str | None = None) -> dict:
+    """Create a stable folder at the end of the canonical folder order."""
+
+    clean_name = str(name or "").strip()[:FOLDER_NAME_MAX_LEN]
+    if not clean_name:
+        return {
+            "success": False,
+            "error": "invalid_folder_name",
+            "operation_id": str(operation_id or ""),
+            "revision": 0,
+            "replayed": False,
+        }
+
+    def mutate(state: dict) -> dict:
+        folder = {
+            "id": f"folder_{uuid.uuid4().hex}",
+            "name": clean_name,
+            "order": len(state.get("folders") or []),
+            "collapsed": False,
+            "allow_folder_context": False,
+        }
+        state.setdefault("folders", []).append(folder)
+        return {"success": True, "folder": dict(folder)}
+
+    return _mutate_folder_state(operation_id, "create_folder", mutate)
+
+
+def rename_folder(
+    folder_id: str,
+    name: str,
+    *,
+    operation_id: str | None = None,
+) -> dict:
+    clean_name = str(name or "").strip()[:FOLDER_NAME_MAX_LEN]
+
+    def mutate(state: dict) -> dict:
+        if not clean_name:
+            return {"success": False, "error": "invalid_folder_name"}
+        for folder in state.get("folders") or []:
+            if folder.get("id") == folder_id:
+                folder["name"] = clean_name
+                return {"success": True, "folder": dict(folder)}
+        return {"success": False, "error": "folder_not_found"}
+
+    return _mutate_folder_state(operation_id, "rename_folder", mutate)
+
+
+def set_folder_collapsed(
+    folder_id: str,
+    collapsed: bool,
+    *,
+    operation_id: str | None = None,
+) -> dict:
+    def mutate(state: dict) -> dict:
+        for folder in state.get("folders") or []:
+            if folder.get("id") == folder_id:
+                folder["collapsed"] = bool(collapsed)
+                return {"success": True, "folder": dict(folder)}
+        return {"success": False, "error": "folder_not_found"}
+
+    return _mutate_folder_state(operation_id, "set_folder_collapsed", mutate)
+
+
+def set_folder_context_policy(
+    folder_id: str,
+    allow: bool,
+    *,
+    operation_id: str | None = None,
+) -> dict:
+    def mutate(state: dict) -> dict:
+        for folder in state.get("folders") or []:
+            if folder.get("id") == folder_id:
+                folder["allow_folder_context"] = bool(allow)
+                return {"success": True, "folder": dict(folder)}
+        return {"success": False, "error": "folder_not_found"}
+
+    return _mutate_folder_state(operation_id, "set_folder_context_policy", mutate)
+
+
+def reorder_folders(
+    ordered_ids: list[str],
+    *,
+    operation_id: str | None = None,
+) -> dict:
+    requested = [str(folder_id or "") for folder_id in ordered_ids]
+
+    def mutate(state: dict) -> dict:
+        folders = state.get("folders") or []
+        current = [str(folder.get("id") or "") for folder in folders]
+        if len(requested) != len(set(requested)) or set(requested) != set(current):
+            return {"success": False, "error": "invalid_folder_order"}
+        by_id = {str(folder.get("id") or ""): folder for folder in folders}
+        state["folders"] = [by_id[folder_id] for folder_id in requested]
+        for order, folder in enumerate(state["folders"]):
+            folder["order"] = order
+        return {
+            "success": True,
+            "folder_ids": list(requested),
+        }
+
+    return _mutate_folder_state(operation_id, "reorder_folders", mutate)
+
+
+def move_conversation_to_folder(
+    conv_id: str,
+    folder_id: str | None,
+    *,
+    operation_id: str | None = None,
+) -> dict:
+    """Change membership metadata only; conversation history is never cloned."""
+
+    target = str(folder_id or "").strip() or None
+
+    def mutate(state: dict) -> dict:
+        if get_conversation(conv_id) is None:
+            return {"success": False, "error": "conversation_not_found"}
+        folder_ids = {
+            str(folder.get("id") or "") for folder in state.get("folders") or []
+        }
+        if target is not None and target not in folder_ids:
+            return {"success": False, "error": "folder_not_found"}
+        memberships = state.setdefault("memberships", {})
+        if target is None:
+            memberships.pop(conv_id, None)
+        else:
+            memberships[conv_id] = target
+        return {
+            "success": True,
+            "conversation_id": conv_id,
+            "folder_id": target,
+        }
+
+    return _mutate_folder_state(operation_id, "move_conversation", mutate)
+
+
+def _delete_all_ungrouped_conversations(
+    *,
+    operation_id: str | None = None,
+    expected_count: int | None = None,
+) -> dict:
+    """Atomically remove every ungrouped conversation and preserve folders.
+
+    Candidates are first moved out of the visible store under the process/file
+    lock. If any move or metadata commit fails, every moved file is restored.
+    Replaying the same operation ID returns the original durable receipt.
+    """
+
+    op_id = str(operation_id or "").strip()[:200] or f"op_{uuid.uuid4().hex}"
+    with _store_lock():
+        state = _load_folder_state_unlocked()
+        for previous in state.get("recent_operations") or []:
+            if previous.get("id") != op_id:
+                continue
+            if previous.get("kind") != "delete_ungrouped":
+                return _folder_receipt(
+                    state,
+                    operation_id=op_id,
+                    result={"success": False, "error": "operation_id_conflict"},
+                    replayed=True,
+                )
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result=previous.get("result") or {},
+                replayed=True,
+            )
+
+        foldered_ids = set((state.get("memberships") or {}).keys())
+        candidates: list[tuple[str, Path]] = []
+        for path in CONVERSATIONS_DIR.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            conv_id = str(data.get("id") or "")
+            if conv_id and conv_id not in foldered_ids:
+                candidates.append((conv_id, path))
+        candidates.sort(key=lambda item: item[0])
+        if expected_count is not None and len(candidates) != expected_count:
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result={
+                    "success": False,
+                    "error": "ungrouped_count_changed",
+                    "expected_count": expected_count,
+                    "actual_count": len(candidates),
+                },
+                replayed=False,
+            )
+
+        trash = _folder_state_path().parent / f"bulk-{uuid.uuid4().hex}"
+        moved: list[tuple[Path, Path]] = []
+        try:
+            if candidates:
+                trash.mkdir(parents=True, exist_ok=False)
+                _write_atomic(trash / "manifest.json", {
+                    "operation_id": op_id,
+                    "files": [path.name for _conv_id, path in candidates],
+                })
+            for _conv_id, source in candidates:
+                target = trash / source.name
+                os.replace(source, target)
+                moved.append((source, target))
+
+            result = {
+                "success": True,
+                "deleted_count": len(candidates),
+                "deleted_ids": [conv_id for conv_id, _path in candidates],
+            }
+            state["revision"] = int(state.get("revision") or 0) + 1
+            state["last_operation_id"] = op_id
+            state.setdefault("recent_operations", []).append({
+                "id": op_id,
+                "kind": "delete_ungrouped",
+                "result": dict(result),
+            })
+            state["recent_operations"] = state["recent_operations"][
+                -_RECENT_FOLDER_OPERATIONS:
+            ]
+            _write_folder_state_unlocked(state)
+        except OSError:
+            for source, target in reversed(moved):
+                try:
+                    os.replace(target, source)
+                except OSError:
+                    pass
+            try:
+                (trash / "manifest.json").unlink(missing_ok=True)
+                trash.rmdir()
+            except OSError:
+                pass
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result={"success": False, "error": "bulk_delete_failed"},
+                replayed=False,
+            )
+
+        for _source, target in moved:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            (trash / "manifest.json").unlink(missing_ok=True)
+            trash.rmdir()
+        except OSError:
+            pass
+        return _folder_receipt(
+            state,
+            operation_id=op_id,
+            result=result,
+            replayed=False,
+        )
+
+
+def delete_all_ungrouped_conversations(
+    *,
+    operation_id: str | None = None,
+) -> dict:
+    """Delete the current ungrouped set; retained for existing callers."""
+
+    return _delete_all_ungrouped_conversations(operation_id=operation_id)
+
+
+def delete_confirmed_ungrouped_conversations(
+    expected_count: int,
+    *,
+    operation_id: str | None = None,
+) -> dict:
+    """Delete only when the canonical count still matches confirmation."""
+
+    try:
+        expected = max(0, int(expected_count))
+    except (TypeError, ValueError):
+        return {
+            "success": False,
+            "error": "invalid_expected_count",
+            "operation_id": str(operation_id or ""),
+            "revision": 0,
+            "replayed": False,
+        }
+    return _delete_all_ungrouped_conversations(
+        operation_id=operation_id,
+        expected_count=expected,
+    )
 
 
 def commit_message(
@@ -687,11 +1335,32 @@ def delete_conversation(conv_id: str) -> bool:
         path = _path_for(conv_id)
         if not path.exists():
             return False
+        state = _load_folder_state_unlocked()
+        memberships = state.get("memberships") or {}
+        staged = (
+            _folder_state_path().parent
+            / f"delete-{conv_id}-{uuid.uuid4().hex}.json"
+        )
         try:
-            path.unlink()
-            return True
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(path, staged)
+            if conv_id in memberships:
+                memberships.pop(conv_id, None)
+                state["revision"] = int(state.get("revision") or 0) + 1
+                state["last_operation_id"] = f"op_{uuid.uuid4().hex}"
+                _write_folder_state_unlocked(state)
         except OSError:
+            if staged.exists() and not path.exists():
+                try:
+                    os.replace(staged, path)
+                except OSError:
+                    pass
             return False
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return True
 
 
 def rename_conversation(conv_id: str, title: str) -> bool:

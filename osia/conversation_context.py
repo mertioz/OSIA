@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 
@@ -24,6 +25,10 @@ RECENT_MESSAGE_COUNT = 10
 MAX_HISTORY_MESSAGES = 20_000
 MAX_MESSAGE_CHARS = 8_000_000
 IMAGE_TOKEN_ESTIMATE = 8_192
+FOLDER_CONTEXT_MAX_CONVERSATIONS = 4
+FOLDER_CONTEXT_MAX_EXCERPTS = 6
+FOLDER_CONTEXT_MAX_CHARS = 6_000
+FOLDER_CONTEXT_EXCERPT_CHARS = 1_200
 
 # Kept outside ``osia.models`` because that provider registry is a protected
 # compatibility surface.  Exact current entries use published provider limits;
@@ -108,6 +113,18 @@ _ENTITY_DECLARATION_RE = re.compile(
     r"[A-Z][^\W\d_]{2,}\b",
     re.IGNORECASE,
 )
+_FOLDER_CONTEXT_STOP_WORDS = frozenset({
+    "a", "about", "an", "and", "are", "as", "at", "be", "can", "chat",
+    "conversation", "could", "did", "do", "does", "for", "from", "give",
+    "has", "have", "how", "i", "in", "is", "it", "me", "of", "on", "or",
+    "other", "please", "say", "tell", "that", "the", "this", "to", "use",
+    "was", "were", "what", "when", "where", "which", "who", "why", "with",
+    "you", "your", "au", "aux", "avec", "ce", "ces", "cette", "conversation",
+    "dans", "de", "des", "dis", "donne", "du", "elle", "en", "est", "et",
+    "il", "je", "la", "le", "les", "me", "mon", "nous", "ou", "par",
+    "peux", "pour", "pourquoi", "qu", "que", "quel", "quelle", "qui", "sa",
+    "sur", "tu", "un", "une", "utilise", "vous",
+})
 
 
 class ContextBuildError(ValueError):
@@ -123,6 +140,16 @@ class ContextBuildError(ValueError):
 class ContextBuildResult:
     messages: list[dict]
     receipt: dict
+    folder_context_conversation_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FolderContextSelection:
+    """Bounded relevant sibling context plus its raw internal provenance."""
+
+    prompt: str
+    conversation_ids: tuple[str, ...]
+    excerpt_count: int
 
 
 @dataclass
@@ -130,6 +157,134 @@ class _Entry:
     message: dict
     source_indexes: list[int]
     source_ids: list[str]
+
+
+def _folder_context_tokens(value) -> set[str]:
+    text = _content_text(value).casefold().replace("_", " ")
+    decomposed = unicodedata.normalize("NFKD", text)
+    normalized = "".join(
+        char for char in decomposed if not unicodedata.combining(char)
+    )
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", normalized)
+        if len(token) > 1 and token not in _FOLDER_CONTEXT_STOP_WORDS
+    }
+
+
+def _bounded_folder_excerpt(messages: list, index: int) -> str:
+    message = messages[index]
+    role = str(message.get("role") or "")
+    text = _content_text(message.get("content", "")).strip()
+    parts = [f"{role.title()}: {text}"] if text else []
+    if role == "user" and index + 1 < len(messages):
+        following = messages[index + 1]
+        if isinstance(following, dict) and following.get("role") == "assistant":
+            answer = _content_text(following.get("content", "")).strip()
+            if answer:
+                parts.append(f"Assistant: {answer}")
+    rendered = "\n".join(parts)
+    if len(rendered) > FOLDER_CONTEXT_EXCERPT_CHARS:
+        rendered = rendered[: FOLDER_CONTEXT_EXCERPT_CHARS - 1].rstrip() + "…"
+    return rendered
+
+
+def retrieve_folder_context(
+    conversation_id: str | None,
+    query,
+) -> FolderContextSelection:
+    """Select relevant excerpts from enabled siblings in exactly one folder.
+
+    This is deterministic local retrieval: it never calls a provider, never
+    mutates conversation files, and never scans another folder or ungrouped
+    conversations. Empty/noisy queries intentionally retrieve nothing.
+    """
+
+    from osia import conversations
+
+    current_id = str(conversation_id or "").strip()
+    query_tokens = _folder_context_tokens(query)
+    if not current_id or not query_tokens:
+        return FolderContextSelection("", (), 0)
+    folder = conversations.folder_for_conversation(current_id)
+    if not folder or not folder.get("allow_folder_context", False):
+        return FolderContextSelection("", (), 0)
+    folder_id = str(folder.get("id") or "")
+    if not folder_id:
+        return FolderContextSelection("", (), 0)
+
+    candidates: list[tuple[int, str, int, str]] = []
+    for summary in conversations.list_conversations():
+        sibling_id = str(summary.get("id") or "")
+        if (
+            not sibling_id
+            or sibling_id == current_id
+            or str(summary.get("folder_id") or "") != folder_id
+        ):
+            continue
+        sibling = conversations.get_conversation(sibling_id)
+        if not sibling:
+            continue
+        title_tokens = _folder_context_tokens(summary.get("title") or "")
+        messages = [
+            message
+            for message in sibling.get("messages") or []
+            if isinstance(message, dict)
+            and message.get("role") in {"user", "assistant"}
+            and not message.get("_internal")
+        ]
+        for index, message in enumerate(messages):
+            if message.get("role") != "user":
+                continue
+            excerpt = _bounded_folder_excerpt(messages, index)
+            if not excerpt:
+                continue
+            candidate_tokens = _folder_context_tokens(excerpt)
+            overlap = query_tokens & candidate_tokens
+            if not overlap:
+                continue
+            score = (len(overlap) * 10) + len(query_tokens & title_tokens) * 4
+            candidates.append((score, sibling_id, index, excerpt))
+
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+    selected: list[str] = []
+    contributing_ids: list[str] = []
+    total_chars = 0
+    for _score, sibling_id, _index, excerpt in candidates:
+        if len(selected) >= FOLDER_CONTEXT_MAX_EXCERPTS:
+            break
+        if (
+            sibling_id not in contributing_ids
+            and len(contributing_ids) >= FOLDER_CONTEXT_MAX_CONVERSATIONS
+        ):
+            continue
+        remaining = FOLDER_CONTEXT_MAX_CHARS - total_chars
+        if remaining <= 0:
+            break
+        bounded = excerpt[:remaining].rstrip()
+        if not bounded:
+            break
+        if sibling_id not in contributing_ids:
+            contributing_ids.append(sibling_id)
+        selected.append(bounded)
+        total_chars += len(bounded)
+
+    if not selected:
+        return FolderContextSelection("", (), 0)
+    sections = [
+        "[Relevant context selected from other conversations in the same "
+        "user-enabled folder. Use it only when it helps answer the current "
+        "request; do not imply access to any other conversation.]",
+    ]
+    sections.extend(
+        f"Sibling excerpt {index}:\n{excerpt}"
+        for index, excerpt in enumerate(selected, start=1)
+    )
+    return FolderContextSelection(
+        "\n\n".join(sections),
+        tuple(contributing_ids),
+        len(selected),
+    )
 
 
 def resolve_context_limit(provider, model) -> int:
@@ -584,7 +739,38 @@ def build_context(
     """Return the exact bounded logical context and a sanitized receipt."""
 
     conversation = str(conversation_id or "")
-    entries, duplicates_removed = _canonical_entries(messages, conversation)
+    logical_messages = [
+        copy.deepcopy(message) for message in messages
+    ] if isinstance(messages, list) else messages
+    latest_user_content = next(
+        (
+            message.get("content", "")
+            for message in reversed(logical_messages or [])
+            if isinstance(message, dict)
+            and message.get("role") == "user"
+            and not message.get("_internal")
+            and not _is_tool_result(message)
+        ),
+        "",
+    )
+    folder_context = retrieve_folder_context(conversation, latest_user_content)
+    if folder_context.prompt and isinstance(logical_messages, list):
+        insert_at = 0
+        while (
+            insert_at < len(logical_messages)
+            and isinstance(logical_messages[insert_at], dict)
+            and logical_messages[insert_at].get("role") in {"system", "developer"}
+        ):
+            insert_at += 1
+        logical_messages.insert(insert_at, {
+            "role": "user",
+            "content": folder_context.prompt,
+            "_internal": True,
+            "_folder_context": True,
+        })
+    entries, duplicates_removed = _canonical_entries(
+        logical_messages, conversation,
+    )
     before = [copy.deepcopy(entry.message) for entry in entries]
     resolved_limit = int(
         context_limit
@@ -614,7 +800,19 @@ def build_context(
             duplicates_removed=duplicates_removed,
             metadata_messages=metadata_messages if metadata_messages is not None else messages,
         )
-        return ContextBuildResult(before, receipt)
+        receipt["folder_context_conversation_count"] = len(
+            folder_context.conversation_ids
+        )
+        receipt["folder_context_conversation_ids"] = [
+            _safe_identifier(value, "conv")
+            for value in folder_context.conversation_ids
+        ]
+        receipt["folder_context_excerpt_count"] = folder_context.excerpt_count
+        return ContextBuildResult(
+            before,
+            receipt,
+            folder_context.conversation_ids,
+        )
 
     instruction_indexes = {
         index
@@ -795,7 +993,19 @@ def build_context(
         duplicates_removed=duplicates_removed,
         metadata_messages=metadata_messages if metadata_messages is not None else messages,
     )
-    return ContextBuildResult(after, receipt)
+    receipt["folder_context_conversation_count"] = len(
+        folder_context.conversation_ids
+    )
+    receipt["folder_context_conversation_ids"] = [
+        _safe_identifier(value, "conv")
+        for value in folder_context.conversation_ids
+    ]
+    receipt["folder_context_excerpt_count"] = folder_context.excerpt_count
+    return ContextBuildResult(
+        after,
+        receipt,
+        folder_context.conversation_ids,
+    )
 
 
 def record_context_receipt(receipt: dict) -> dict:
@@ -809,9 +1019,11 @@ def record_context_receipt(receipt: dict) -> dict:
 __all__ = [
     "ContextBuildError",
     "ContextBuildResult",
+    "FolderContextSelection",
     "build_context",
     "estimate_message_tokens",
     "estimate_messages_tokens",
     "record_context_receipt",
+    "retrieve_folder_context",
     "resolve_context_limit",
 ]

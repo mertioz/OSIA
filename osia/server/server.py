@@ -1456,12 +1456,12 @@ async def _broadcast_conversations(exclude: "_OutboundChannel | None" = None) ->
     ``conversations`` list and does NOT clear the chat view; it only refreshes
     the sidebar.
     """
-    items = conversations.list_conversations()
+    frame = conversations.conversation_snapshot()
     for client in list(_WS_CLIENTS):
         if client is exclude:
             continue
         try:
-            await client.send_json({"type": "conversations", "items": items})
+            await client.send_json(frame)
         except Exception:
             _WS_CLIENTS.discard(client)
 
@@ -3355,20 +3355,24 @@ async def internal_conversation_changed(request: Request):
         body = {}
     conv_id = str(body.get("conversation_id") or "").strip()
     action = str(body.get("action") or "upsert").strip().lower()
-    if action not in {"upsert", "rename", "delete"}:
+    if action not in {"upsert", "rename", "delete", "folders"}:
         action = "upsert"
     try:
         revision = max(0, int(body.get("revision") or 0))
     except (TypeError, ValueError):
         revision = 0
-    broadcast = await _broadcast_canonical_conversation_change(
-        conv_id,
-        revision=revision,
-        operation_id=str(body.get("operation_id") or ""),
-        action=action,
-    )
+    if action == "folders":
+        await _broadcast_conversations()
+        broadcast = True
+    else:
+        broadcast = await _broadcast_canonical_conversation_change(
+            conv_id,
+            revision=revision,
+            operation_id=str(body.get("operation_id") or ""),
+            action=action,
+        )
     return {
-        "ok": bool(conv_id),
+        "ok": bool(conv_id) or action == "folders",
         "broadcast": broadcast,
         "clients": len(_WS_CLIENTS),
     }
@@ -7830,14 +7834,11 @@ async def websocket_endpoint(ws: WebSocket):
         # Defensive like the post-auth burst: a list failure must not abort
         # the turn now that the conversation already exists.
         try:
-            items = conversations.list_conversations()
+            snapshot = conversations.conversation_snapshot()
         except Exception as e:
             print(f"[OSIA Server] list_conversations() failed post-create: {e}")
-            items = []
-        await out.send_json({
-            "type": "conversations",
-            "items": items,
-        })
+            snapshot = {"type": "conversations", "items": []}
+        await out.send_json(snapshot)
         return active_conv_id
 
     async def _resolve_turn_conversation(msg: dict, seed_text):
@@ -8073,18 +8074,16 @@ async def websocket_endpoint(ws: WebSocket):
                     })
                     print("[WS] auth OK, sending: status/done")
                     try:
-                        items = conversations.list_conversations()
+                        snapshot = conversations.conversation_snapshot()
                     except Exception as e:
                         print(
                             "[WS] list_conversations() failed during initial "
                             f"send, falling back to empty list: {e!r}"
                         )
                         traceback.print_exc()
-                        items = []
-                    await ws.send_json({
-                        "type": "conversations",
-                        "items": items,
-                    })
+                        snapshot = {"type": "conversations", "items": []}
+                    await ws.send_json(snapshot)
+                    items = snapshot.get("items") or []
                     print(
                         f"[WS] auth OK, sending: conversations "
                         f"({len(items)} items)"
@@ -8189,10 +8188,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             # --- Conversation management ---
             if msg_type == "list_conversations":
-                await out.send_json({
-                    "type": "conversations",
-                    "items": conversations.list_conversations(),
-                })
+                await out.send_json(conversations.conversation_snapshot())
                 continue
 
             if msg_type == "get_conversations":
@@ -8232,10 +8228,7 @@ async def websocket_endpoint(ws: WebSocket):
                     "id": conv["id"],
                     "title": conv["title"],
                 })
-                await out.send_json({
-                    "type": "conversations",
-                    "items": conversations.list_conversations(),
-                })
+                await out.send_json(conversations.conversation_snapshot())
                 continue
 
             if msg_type == "new_chat":
@@ -8261,10 +8254,7 @@ async def websocket_endpoint(ws: WebSocket):
                     "id": conv["id"],
                     "title": conv["title"],
                 })
-                await out.send_json({
-                    "type": "conversations",
-                    "items": conversations.list_conversations(),
-                })
+                await out.send_json(conversations.conversation_snapshot())
                 await _broadcast_new_chat(exclude=out)
                 continue
 
@@ -8420,10 +8410,7 @@ async def websocket_endpoint(ws: WebSocket):
                 # every OTHER connected device (NOT new_chat — that would wrongly
                 # clear the chat view). All sends go through the outbound channel,
                 # honouring the single-writer rule.
-                await out.send_json({
-                    "type": "conversations",
-                    "items": conversations.list_conversations(),
-                })
+                await out.send_json(conversations.conversation_snapshot())
                 if ok:
                     updated = conversations.get_conversation(conv_id) or {}
                     await _broadcast_canonical_conversation_change(
@@ -8436,6 +8423,61 @@ async def websocket_endpoint(ws: WebSocket):
                         exclude=out,
                     )
                 else:
+                    await _broadcast_conversations(exclude=out)
+                continue
+
+            if msg_type in {
+                "create_conversation_folder",
+                "rename_conversation_folder",
+                "set_conversation_folder_state",
+                "set_conversation_folder_context",
+                "reorder_conversation_folders",
+                "move_conversation_to_folder",
+            }:
+                result = conversations.apply_folder_mutation(msg)
+                await out.send_json({
+                    "type": "conversation_folder_mutated",
+                    "mutation": msg_type,
+                    **result,
+                })
+                if result.get("success"):
+                    snapshot = conversations.conversation_snapshot()
+                    snapshot["operation_id"] = result.get("operation_id", "")
+                    await out.send_json(snapshot)
+                    await _broadcast_conversations(exclude=out)
+                continue
+
+            if msg_type == "bulk_delete_ungrouped_conversations":
+                result = conversations.delete_confirmed_ungrouped_conversations(
+                    msg.get("expected_count"),
+                    operation_id=str(msg.get("operation_id") or ""),
+                )
+                if result.get("success"):
+                    for conv_id in result.get("deleted_ids") or []:
+                        doomed = streaming_tasks.pop(conv_id, None)
+                        if doomed is None:
+                            doomed = _ACTIVE_TURNS_BY_CONV.get(conv_id)
+                        if doomed is not None:
+                            doomed.cancel()
+                        media_task = _POST_TURN_MEDIA_BY_CONV.pop(conv_id, None)
+                        if media_task is not None:
+                            media_task.cancel()
+                        dead_agent = conn_agents.pop(conv_id, None)
+                        if dead_agent is not None and not getattr(
+                            dead_agent, "_in_use", False,
+                        ):
+                            _close_agent_client(dead_agent)
+                        if active_conv_id == conv_id:
+                            active_conv_id = None
+                            session_history = []
+                await out.send_json({
+                    "type": "conversations_bulk_deleted",
+                    **result,
+                })
+                snapshot = conversations.conversation_snapshot()
+                snapshot["operation_id"] = result.get("operation_id", "")
+                await out.send_json(snapshot)
+                if result.get("success"):
                     await _broadcast_conversations(exclude=out)
                 continue
 
@@ -11555,10 +11597,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             "id": conv["id"],
             "title": conv["title"],
         })
-        await ws.send_json({
-            "type": "conversations",
-            "items": conversations.list_conversations(),
-        })
+        await ws.send_json(conversations.conversation_snapshot())
 
     # Resolve from the original user-authored turn before attachment manifests
     # or other generated English metadata can enter the provider input. Keep

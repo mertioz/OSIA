@@ -2155,6 +2155,78 @@ def wake_mode():
         print(f"✏️  Renamed conversation {conv_id}: {'ok' if ok else 'rejected'}")
         popup.refresh_conversations(active_conv["id"] if active_conv else None)
 
+    def handle_folder_mutation(request: dict):
+        action = str((request or {}).get("action") or "")
+        operation_id = f"desktop_folder_{uuid.uuid4().hex}"
+        if action == "create":
+            result = conversations.create_folder(
+                request.get("name", ""), operation_id=operation_id,
+            )
+        elif action == "rename":
+            result = conversations.rename_folder(
+                str(request.get("folder_id") or ""),
+                request.get("name", ""),
+                operation_id=operation_id,
+            )
+        elif action == "collapse":
+            result = conversations.set_folder_collapsed(
+                str(request.get("folder_id") or ""),
+                bool(request.get("collapsed", False)),
+                operation_id=operation_id,
+            )
+        elif action == "context":
+            result = conversations.set_folder_context_policy(
+                str(request.get("folder_id") or ""),
+                bool(request.get("allow", False)),
+                operation_id=operation_id,
+            )
+        elif action == "reorder":
+            result = conversations.reorder_folders(
+                list(request.get("folder_ids") or []),
+                operation_id=operation_id,
+            )
+        elif action == "move":
+            result = conversations.move_conversation_to_folder(
+                str(request.get("conversation_id") or ""),
+                request.get("folder_id"),
+                operation_id=operation_id,
+            )
+        else:
+            return
+        if result.get("success"):
+            _notify_mobile_conversation_changed(
+                "",
+                revision=result.get("revision", 0),
+                operation_id=result.get("operation_id", ""),
+                action="folders",
+            )
+        popup.refresh_conversations(active_conv["id"] if active_conv else None)
+
+    def handle_bulk_delete_ungrouped(expected_count: int):
+        nonlocal active_conv
+        result = conversations.delete_confirmed_ungrouped_conversations(
+            expected_count,
+            operation_id=f"desktop_bulk_{uuid.uuid4().hex}",
+        )
+        if not result.get("success"):
+            return
+        deleted_ids = set(result.get("deleted_ids") or [])
+        for conv_id in deleted_ids:
+            _set_conversation_busy(conv_id, False)
+            popup.discard_conversation_draft(conv_id)
+        if active_conv and active_conv.get("id") in deleted_ids:
+            tts_stop()
+            agent.reset()
+            active_conv = None
+            popup.set_messages([])
+        _notify_mobile_conversation_changed(
+            "",
+            revision=result.get("revision", 0),
+            operation_id=result.get("operation_id", ""),
+            action="folders",
+        )
+        popup.refresh_conversations(active_conv["id"] if active_conv else None)
+
     # ── Model + settings wiring ─────────────────────────────────────────
 
     def handle_model_change(model: str, provider: str):
@@ -2250,6 +2322,10 @@ def wake_mode():
     popup.open_conversation.connect(handle_open_conversation)
     popup.rename_conversation.connect(handle_rename_conversation)
     popup.delete_conversation.connect(handle_delete_conversation)
+    popup.folder_mutation_requested.connect(handle_folder_mutation)
+    popup.bulk_delete_ungrouped_requested.connect(
+        handle_bulk_delete_ungrouped
+    )
     popup.model_changed.connect(handle_model_change)
     popup.api_keys_saved.connect(handle_keys_saved)
     popup.chatgpt_status_changed.connect(handle_chatgpt_status_changed)

@@ -1944,6 +1944,73 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Neuer Name:",
         "es": "Nuevo nombre:",
     },
+    "conversations.create_folder": {
+        "en": "Create folder", "fr": "Créer un dossier", "zh": "创建文件夹",
+        "ja": "フォルダーを作成", "de": "Ordner erstellen", "es": "Crear carpeta",
+    },
+    "conversations.folder_name": {
+        "en": "Folder name:", "fr": "Nom du dossier :", "zh": "文件夹名称：",
+        "ja": "フォルダー名：", "de": "Ordnername:", "es": "Nombre de la carpeta:",
+    },
+    "conversations.rename_folder": {
+        "en": "Rename folder", "fr": "Renommer le dossier", "zh": "重命名文件夹",
+        "ja": "フォルダー名を変更", "de": "Ordner umbenennen", "es": "Renombrar carpeta",
+    },
+    "conversations.folder_settings": {
+        "en": "Folder settings", "fr": "Paramètres du dossier", "zh": "文件夹设置",
+        "ja": "フォルダー設定", "de": "Ordnereinstellungen", "es": "Ajustes de carpeta",
+    },
+    "conversations.allow_folder_context": {
+        "en": "Allow OSIA to use other conversations in this folder as context",
+        "fr": "Autoriser OSIA à utiliser les autres conversations de ce dossier comme contexte",
+        "zh": "允许 OSIA 使用此文件夹中的其他对话作为上下文",
+        "ja": "OSIA がこのフォルダー内の他の会話をコンテキストとして使用することを許可",
+        "de": "OSIA erlauben, andere Unterhaltungen in diesem Ordner als Kontext zu verwenden",
+        "es": "Permitir que OSIA use otras conversaciones de esta carpeta como contexto",
+    },
+    "conversations.move_to_folder": {
+        "en": "Move to folder", "fr": "Déplacer vers un dossier", "zh": "移动到文件夹",
+        "ja": "フォルダーへ移動", "de": "In Ordner verschieben", "es": "Mover a carpeta",
+    },
+    "conversations.ungrouped": {
+        "en": "Outside folders", "fr": "Hors dossiers", "zh": "文件夹外",
+        "ja": "フォルダー外", "de": "Außerhalb von Ordnern", "es": "Fuera de carpetas",
+    },
+    "conversations.move_folder_up": {
+        "en": "Move folder up", "fr": "Monter le dossier", "zh": "上移文件夹",
+        "ja": "フォルダーを上へ", "de": "Ordner nach oben", "es": "Subir carpeta",
+    },
+    "conversations.move_folder_down": {
+        "en": "Move folder down", "fr": "Descendre le dossier", "zh": "下移文件夹",
+        "ja": "フォルダーを下へ", "de": "Ordner nach unten", "es": "Bajar carpeta",
+    },
+    "conversations.delete_all_ungrouped": {
+        "en": "Delete all conversations", "fr": "Supprimer toutes les conversations",
+        "zh": "删除所有对话", "ja": "すべての会話を削除",
+        "de": "Alle Unterhaltungen löschen", "es": "Eliminar todas las conversaciones",
+    },
+    "conversations.bulk_delete_title": {
+        "en": "Permanently delete ungrouped conversations?",
+        "fr": "Supprimer définitivement les conversations hors dossiers ?",
+        "zh": "永久删除文件夹外的对话？", "ja": "フォルダー外の会話を完全に削除しますか？",
+        "de": "Unterhaltungen außerhalb von Ordnern dauerhaft löschen?",
+        "es": "¿Eliminar definitivamente las conversaciones fuera de carpetas?",
+    },
+    "conversations.bulk_delete_confirm": {
+        "en": "{count} conversations outside folders will be permanently deleted. Conversations inside folders and all folders are preserved. Type {phrase} to confirm:",
+        "fr": "{count} conversations hors dossiers seront supprimées définitivement. Les conversations dans les dossiers et tous les dossiers seront conservés. Saisissez {phrase} pour confirmer :",
+        "zh": "将永久删除文件夹外的 {count} 个对话。文件夹内的对话和所有文件夹都会保留。输入 {phrase} 以确认：",
+        "ja": "フォルダー外の会話 {count} 件を完全に削除します。フォルダー内の会話とすべてのフォルダーは保持されます。確認するには {phrase} と入力してください：",
+        "de": "{count} Unterhaltungen außerhalb von Ordnern werden dauerhaft gelöscht. Unterhaltungen in Ordnern und alle Ordner bleiben erhalten. Geben Sie zur Bestätigung {phrase} ein:",
+        "es": "Se eliminarán permanentemente {count} conversaciones fuera de carpetas. Se conservarán las conversaciones dentro de carpetas y todas las carpetas. Escribe {phrase} para confirmar:",
+    },
+    "conversations.bulk_delete_none": {
+        "en": "There are no conversations outside folders to delete.",
+        "fr": "Aucune conversation hors dossiers à supprimer.",
+        "zh": "没有可删除的文件夹外对话。", "ja": "削除できるフォルダー外の会話はありません。",
+        "de": "Es gibt keine Unterhaltungen außerhalb von Ordnern zu löschen.",
+        "es": "No hay conversaciones fuera de carpetas para eliminar.",
+    },
     # — Model panel (two-level picker) —
     "models.title": {
         "en": "Models",

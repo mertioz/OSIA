@@ -1243,15 +1243,25 @@ class _ConvRow(QFrame):
     open_clicked = pyqtSignal(str)
     rename_clicked = pyqtSignal(str, str)   # (conv_id, new_title)
     delete_clicked = pyqtSignal(str)
+    move_clicked = pyqtSignal(str, object)
 
-    def __init__(self, conv: dict, is_active: bool = False):
+    def __init__(
+        self,
+        conv: dict,
+        is_active: bool = False,
+        *,
+        folders: list[dict] | None = None,
+        indented: bool = False,
+    ):
         super().__init__()
         self.setObjectName("convRow")
         self.setProperty("active", is_active)
         self._conv_id = conv.get("id", "")
+        self._folder_id = conv.get("folder_id")
+        self._folders = list(folders or [])
 
         row = QHBoxLayout(self)
-        row.setContentsMargins(16, 10, 10, 10)
+        row.setContentsMargins(28 if indented else 16, 10, 10, 10)
         row.setSpacing(8)
 
         title_col = QVBoxLayout()
@@ -1287,6 +1297,13 @@ class _ConvRow(QFrame):
         rename_btn.setToolTip(i18n.t("conversations.rename"))
         rename_btn.clicked.connect(self._prompt_rename)
 
+        move_btn = QPushButton("↳")
+        move_btn.setObjectName("convRename")
+        move_btn.setFixedSize(26, 26)
+        move_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        move_btn.setToolTip(i18n.t("conversations.move_to_folder"))
+        move_btn.clicked.connect(self._show_move_menu)
+
         del_btn = QPushButton("✕")
         del_btn.setObjectName("convDel")
         del_btn.setFixedSize(26, 26)
@@ -1295,8 +1312,31 @@ class _ConvRow(QFrame):
 
         row.addLayout(title_col, 1)
         row.addWidget(open_btn)
+        row.addWidget(move_btn)
         row.addWidget(rename_btn)
         row.addWidget(del_btn)
+
+    def _show_move_menu(self) -> None:
+        menu = QMenu(self)
+        ungrouped = menu.addAction(i18n.t("conversations.ungrouped"))
+        ungrouped.setCheckable(True)
+        ungrouped.setChecked(not self._folder_id)
+        ungrouped.triggered.connect(
+            lambda _checked=False: self.move_clicked.emit(self._conv_id, None)
+        )
+        if self._folders:
+            menu.addSeparator()
+        for folder in self._folders:
+            folder_id = str(folder.get("id") or "")
+            action = menu.addAction(str(folder.get("name") or ""))
+            action.setCheckable(True)
+            action.setChecked(folder_id == self._folder_id)
+            action.triggered.connect(
+                lambda _checked=False, fid=folder_id: self.move_clicked.emit(
+                    self._conv_id, fid,
+                )
+            )
+        menu.exec(self.mapToGlobal(self.rect().bottomRight()))
 
     def _prompt_rename(self) -> None:
         # Prompt for a new title, pre-filled with the current one. Emit only on
@@ -1326,6 +1366,93 @@ class _ConvRow(QFrame):
         super().resizeEvent(event)
 
 
+class _FolderRow(QFrame):
+    """Visually distinct canonical folder header and its compact settings."""
+
+    collapsed_changed = pyqtSignal(str, bool)
+    rename_clicked = pyqtSignal(str, str)
+    context_policy_changed = pyqtSignal(str, bool)
+    reorder_clicked = pyqtSignal(str, int)
+
+    def __init__(self, folder: dict, count: int, index: int, total: int):
+        super().__init__()
+        self.setObjectName("folderRow")
+        self._folder = dict(folder)
+        self._folder_id = str(folder.get("id") or "")
+        self._folder_name = str(folder.get("name") or "")
+        self._collapsed = bool(folder.get("collapsed", False))
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 8, 8, 8)
+        row.setSpacing(7)
+        toggle = QPushButton("▸" if self._collapsed else "▾")
+        toggle.setObjectName("folderToggle")
+        toggle.setFixedSize(24, 24)
+        toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        toggle.clicked.connect(
+            lambda: self.collapsed_changed.emit(
+                self._folder_id, not self._collapsed,
+            )
+        )
+        title = QLabel(f"📁  {self._folder_name}")
+        title.setObjectName("folderTitle")
+        title.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred,
+        )
+        count_label = QLabel(str(count))
+        count_label.setObjectName("folderCount")
+        settings = QPushButton("⋯")
+        settings.setObjectName("folderMenu")
+        settings.setFixedSize(28, 26)
+        settings.setCursor(Qt.CursorShape.PointingHandCursor)
+        settings.clicked.connect(
+            lambda: self._show_settings(settings, index, total)
+        )
+        row.addWidget(toggle)
+        row.addWidget(title, 1)
+        row.addWidget(count_label)
+        row.addWidget(settings)
+
+    def _show_settings(self, anchor: QWidget, index: int, total: int) -> None:
+        menu = QMenu(self)
+        rename = menu.addAction(i18n.t("conversations.rename_folder"))
+        rename.triggered.connect(self._prompt_rename)
+        settings_menu = menu.addMenu(i18n.t("conversations.folder_settings"))
+        allow = settings_menu.addAction(
+            i18n.t("conversations.allow_folder_context")
+        )
+        allow.setCheckable(True)
+        allow.setChecked(bool(self._folder.get("allow_folder_context", False)))
+        allow.triggered.connect(
+            lambda checked: self.context_policy_changed.emit(
+                self._folder_id, bool(checked),
+            )
+        )
+        menu.addSeparator()
+        move_up = menu.addAction(i18n.t("conversations.move_folder_up"))
+        move_up.setEnabled(index > 0)
+        move_up.triggered.connect(
+            lambda: self.reorder_clicked.emit(self._folder_id, -1)
+        )
+        move_down = menu.addAction(i18n.t("conversations.move_folder_down"))
+        move_down.setEnabled(index + 1 < total)
+        move_down.triggered.connect(
+            lambda: self.reorder_clicked.emit(self._folder_id, 1)
+        )
+        menu.exec(anchor.mapToGlobal(anchor.rect().bottomRight()))
+
+    def _prompt_rename(self) -> None:
+        name, accepted = QInputDialog.getText(
+            self,
+            i18n.t("conversations.rename_folder"),
+            i18n.t("conversations.folder_name"),
+            text=self._folder_name,
+        )
+        name = name.strip()
+        if accepted and name and name != self._folder_name:
+            self.rename_clicked.emit(self._folder_id, name)
+
+
 class _ConversationsPanel(QWidget):
     """List of past conversations + 'new chat' action."""
 
@@ -1333,10 +1460,13 @@ class _ConversationsPanel(QWidget):
     open_conversation = pyqtSignal(str)
     rename_conversation = pyqtSignal(str, str)
     delete_conversation = pyqtSignal(str)
+    folder_mutation_requested = pyqtSignal(dict)
+    bulk_delete_ungrouped_requested = pyqtSignal(int)
 
     def __init__(self):
         super().__init__()
         self._active_id: str | None = None
+        self._last_signature = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 12, 14, 12)
@@ -1349,9 +1479,15 @@ class _ConversationsPanel(QWidget):
         self._new_btn.setObjectName("primaryBtn")
         self._new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._new_btn.clicked.connect(self.new_conversation.emit)
+        self._more_btn = QPushButton("⋯")
+        self._more_btn.setObjectName("convMore")
+        self._more_btn.setFixedSize(30, 30)
+        self._more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._more_btn.clicked.connect(self._show_more_menu)
         header.addWidget(self._title)
         header.addStretch()
         header.addWidget(self._new_btn)
+        header.addWidget(self._more_btn)
         outer.addLayout(header)
 
         scroll = QScrollArea()
@@ -1381,6 +1517,10 @@ class _ConversationsPanel(QWidget):
         # on language change.
         i18n.add_listener(self._retranslate)
         self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(750)
+        self._poll_timer.timeout.connect(self._poll_canonical_store)
+        self._poll_timer.start()
 
     def _retranslate(self) -> None:
         self._title.setText(i18n.t("conversations.title"))
@@ -1391,15 +1531,141 @@ class _ConversationsPanel(QWidget):
         self._active_id = conv_id
         self.refresh()
 
-    def refresh(self) -> None:
+    @staticmethod
+    def _snapshot_signature(snapshot: dict):
+        return (
+            int(snapshot.get("snapshot_revision") or 0),
+            tuple(
+                (
+                    folder.get("id"), folder.get("name"), folder.get("order"),
+                    bool(folder.get("collapsed", False)),
+                    bool(folder.get("allow_folder_context", False)),
+                )
+                for folder in snapshot.get("folders") or []
+            ),
+            tuple(
+                (
+                    item.get("id"), item.get("title"), item.get("updated_at"),
+                    item.get("folder_id"),
+                )
+                for item in snapshot.get("items") or []
+            ),
+        )
+
+    def _poll_canonical_store(self) -> None:
+        if not self.isVisible():
+            return
+        snapshot = conversations.conversation_snapshot()
+        if self._snapshot_signature(snapshot) != self._last_signature:
+            self.refresh(snapshot=snapshot)
+
+    def _show_more_menu(self) -> None:
+        menu = QMenu(self)
+        create = menu.addAction(i18n.t("conversations.create_folder"))
+        create.triggered.connect(self._prompt_create_folder)
+        delete_all = menu.addAction(
+            i18n.t("conversations.delete_all_ungrouped")
+        )
+        delete_all.triggered.connect(self._confirm_bulk_delete)
+        menu.exec(self._more_btn.mapToGlobal(self._more_btn.rect().bottomRight()))
+
+    def _prompt_create_folder(self) -> None:
+        name, accepted = QInputDialog.getText(
+            self,
+            i18n.t("conversations.create_folder"),
+            i18n.t("conversations.folder_name"),
+        )
+        name = name.strip()
+        if accepted and name:
+            self.folder_mutation_requested.emit({
+                "action": "create",
+                "name": name,
+            })
+
+    def _confirm_bulk_delete(self) -> None:
+        snapshot = conversations.conversation_snapshot()
+        affected = sum(
+            1 for item in snapshot.get("items") or []
+            if not item.get("folder_id")
+        )
+        if affected <= 0:
+            QMessageBox.information(
+                self,
+                i18n.t("conversations.delete_all_ungrouped"),
+                i18n.t("conversations.bulk_delete_none"),
+            )
+            return
+        phrase = f"DELETE {affected}"
+        typed, accepted = QInputDialog.getText(
+            self,
+            i18n.t("conversations.bulk_delete_title"),
+            i18n.t(
+                "conversations.bulk_delete_confirm",
+                count=affected,
+                phrase=phrase,
+            ),
+        )
+        if accepted and typed.strip() == phrase:
+            self.bulk_delete_ungrouped_requested.emit(affected)
+
+    def _emit_folder_state(self, folder_id: str, collapsed: bool) -> None:
+        self.folder_mutation_requested.emit({
+            "action": "collapse",
+            "folder_id": folder_id,
+            "collapsed": collapsed,
+        })
+
+    def _emit_folder_rename(self, folder_id: str, name: str) -> None:
+        self.folder_mutation_requested.emit({
+            "action": "rename",
+            "folder_id": folder_id,
+            "name": name,
+        })
+
+    def _emit_folder_context(self, folder_id: str, allow: bool) -> None:
+        self.folder_mutation_requested.emit({
+            "action": "context",
+            "folder_id": folder_id,
+            "allow": allow,
+        })
+
+    def _emit_folder_reorder(self, folder_id: str, delta: int) -> None:
+        ids = [
+            str(folder.get("id") or "")
+            for folder in conversations.list_folders()
+        ]
+        try:
+            index = ids.index(folder_id)
+        except ValueError:
+            return
+        target = index + int(delta)
+        if target < 0 or target >= len(ids):
+            return
+        ids[index], ids[target] = ids[target], ids[index]
+        self.folder_mutation_requested.emit({
+            "action": "reorder",
+            "folder_ids": ids,
+        })
+
+    def _emit_move(self, conv_id: str, folder_id) -> None:
+        self.folder_mutation_requested.emit({
+            "action": "move",
+            "conversation_id": conv_id,
+            "folder_id": folder_id,
+        })
+
+    def refresh(self, *, snapshot: dict | None = None) -> None:
         # Wipe & rebuild — the list is small so we don't bother diffing.
         while self._host_layout.count() > 1:
             item = self._host_layout.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.deleteLater()
-        items = conversations.list_conversations()
-        if not items:
+        snapshot = snapshot or conversations.conversation_snapshot()
+        self._last_signature = self._snapshot_signature(snapshot)
+        items = list(snapshot.get("items") or [])
+        folders = list(snapshot.get("folders") or [])
+        if not items and not folders:
             # An empty list is a valid state — never auto-create here. A new
             # conversation is created only when the user clicks "New chat"
             # or sends a first message.
@@ -1411,12 +1677,47 @@ class _ConversationsPanel(QWidget):
             self._host_layout.insertStretch(0, 1)
             self._host_layout.insertWidget(1, placeholder)
             return
-        for i, conv in enumerate(items):
-            row = _ConvRow(conv, is_active=(conv.get("id") == self._active_id))
+        insert_at = 0
+
+        def add_conversation(conv: dict, *, indented: bool) -> None:
+            nonlocal insert_at
+            row = _ConvRow(
+                conv,
+                is_active=(conv.get("id") == self._active_id),
+                folders=folders,
+                indented=indented,
+            )
             row.open_clicked.connect(self.open_conversation.emit)
             row.rename_clicked.connect(self.rename_conversation.emit)
             row.delete_clicked.connect(self.delete_conversation.emit)
-            self._host_layout.insertWidget(i, row)
+            row.move_clicked.connect(self._emit_move)
+            self._host_layout.insertWidget(insert_at, row)
+            insert_at += 1
+
+        ungrouped = [item for item in items if not item.get("folder_id")]
+        if folders and ungrouped:
+            label = QLabel(i18n.t("conversations.ungrouped"))
+            label.setObjectName("folderSectionLabel")
+            self._host_layout.insertWidget(insert_at, label)
+            insert_at += 1
+        for conv in ungrouped:
+            add_conversation(conv, indented=False)
+
+        for index, folder in enumerate(folders):
+            folder_id = str(folder.get("id") or "")
+            members = [
+                item for item in items if item.get("folder_id") == folder_id
+            ]
+            folder_row = _FolderRow(folder, len(members), index, len(folders))
+            folder_row.collapsed_changed.connect(self._emit_folder_state)
+            folder_row.rename_clicked.connect(self._emit_folder_rename)
+            folder_row.context_policy_changed.connect(self._emit_folder_context)
+            folder_row.reorder_clicked.connect(self._emit_folder_reorder)
+            self._host_layout.insertWidget(insert_at, folder_row)
+            insert_at += 1
+            if not folder.get("collapsed", False):
+                for conv in members:
+                    add_conversation(conv, indented=True)
 
 
 # ── Model panel ─────────────────────────────────────────────────────────────
@@ -10224,6 +10525,8 @@ class MainPopup(QWidget):
     open_conversation = pyqtSignal(str)
     rename_conversation = pyqtSignal(str, str)
     delete_conversation = pyqtSignal(str)
+    folder_mutation_requested = pyqtSignal(dict)
+    bulk_delete_ungrouped_requested = pyqtSignal(int)
     model_changed = pyqtSignal(str, str)
     api_keys_saved = pyqtSignal(dict)
     chatgpt_status_changed = pyqtSignal(dict)
@@ -10416,6 +10719,12 @@ class MainPopup(QWidget):
         self._convs.open_conversation.connect(self._on_open_conv)
         self._convs.rename_conversation.connect(self.rename_conversation.emit)
         self._convs.delete_conversation.connect(self.delete_conversation.emit)
+        self._convs.folder_mutation_requested.connect(
+            self.folder_mutation_requested.emit
+        )
+        self._convs.bulk_delete_ungrouped_requested.connect(
+            self.bulk_delete_ungrouped_requested.emit
+        )
 
         self._model_remote_models: list[dict] = []
         self._model_account_status: dict = {}
@@ -11418,6 +11727,31 @@ class MainPopup(QWidget):
                 background: rgba(196, 181, 245, 0.16);
                 border: 1px solid rgba(196, 181, 245, 0.5);
                 border-left: 3px solid #c4b5f5;
+            }
+            QFrame#folderRow {
+                background: rgba(196, 181, 245, 0.10);
+                border: 1px solid rgba(196, 181, 245, 0.28);
+                border-radius: 10px;
+            }
+            QLabel#folderTitle {
+                font-size: 12px;
+                font-weight: 700;
+                color: #e8e6f0;
+            }
+            QLabel#folderCount, QLabel#folderSectionLabel {
+                font-size: 10px;
+                color: #9d9aad;
+            }
+            QPushButton#folderToggle, QPushButton#folderMenu,
+            QPushButton#convMore, QPushButton#convRename {
+                background: rgba(196, 181, 245, 0.08);
+                border: 1px solid rgba(196, 181, 245, 0.16);
+                border-radius: 8px;
+                color: #e8e6f0;
+            }
+            QPushButton#folderToggle:hover, QPushButton#folderMenu:hover,
+            QPushButton#convMore:hover, QPushButton#convRename:hover {
+                background: rgba(196, 181, 245, 0.22);
             }
             QLabel#convTitle {
                 font-size: 13px;
