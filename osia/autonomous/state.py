@@ -618,6 +618,34 @@ def _normalize_task(index: int, task, *, private_filenames=()) -> dict:
         )
     except (TypeError, ValueError, OverflowError):
         tool_revision = 0
+    semantic_attempts = []
+    for item in (task.get("semantic_attempt_tuples") or [])[:128]:
+        if not isinstance(item, (list, tuple)) or len(item) != 4:
+            continue
+        postcondition, strategy_id, provider_route, revision = item
+        try:
+            revision = max(0, int(revision))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        values = [
+            str(postcondition or "")[:96],
+            str(strategy_id or "")[:160],
+            str(provider_route or "")[:160],
+            revision,
+        ]
+        if all(values[:3]) and values not in semantic_attempts:
+            semantic_attempts.append(values)
+    semantic_tokens = []
+    for token in (task.get("semantic_evidence_tokens") or [])[:128]:
+        value = str(token or "")
+        if re.fullmatch(r"[0-9a-f]{24}", value) and value not in semantic_tokens:
+            semantic_tokens.append(value)
+    try:
+        semantic_revision = max(
+            0, int(task.get("semantic_evidence_revision", 0) or 0),
+        )
+    except (TypeError, ValueError, OverflowError):
+        semantic_revision = 0
     normalized = {
         "id": str(task.get("id") or f"t{index}"),
         "objective": sanitize_autonomous_text(
@@ -644,6 +672,21 @@ def _normalize_task(index: int, task, *, private_filenames=()) -> dict:
         "tool_terminal_reason": tool_reason,
         "tool_continuation_claimed": bool(
             task.get("tool_continuation_claimed", False)
+        ),
+        "semantic_attempt_tuples": semantic_attempts,
+        "semantic_evidence_tokens": semantic_tokens,
+        "semantic_evidence_revision": semantic_revision,
+        "semantic_frontier_remaining": [
+            str(item or "")[:160]
+            for item in (task.get("semantic_frontier_remaining") or [])[:64]
+            if re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", str(item or ""))
+        ],
+        "semantic_next_strategy": (
+            str(task.get("semantic_next_strategy") or "")[:160]
+            if re.fullmatch(
+                r"[A-Za-z0-9_.:-]{1,160}",
+                str(task.get("semantic_next_strategy") or ""),
+            ) else ""
         ),
     }
     if normalized["objective"] != raw_objective:
@@ -1088,6 +1131,10 @@ def set_task_status(state: dict, phase_idx: int, task_idx: int, status: str,
                         "max_attempts_per_task", DEFAULT_MAX_ATTEMPTS_PER_TASK,
                     ) or DEFAULT_MAX_ATTEMPTS_PER_TASK
                 ))
+                semantic_retry = bool(
+                    task.get("semantic_next_strategy")
+                    or task.get("semantic_frontier_remaining")
+                )
                 if status == "done":
                     checklist_item.update({
                         "status": "verified",
@@ -1102,7 +1149,7 @@ def set_task_status(state: dict, phase_idx: int, task_idx: int, status: str,
                         "failure_reason": str(
                             task.get("last_error") or "requirement_not_verified"
                         )[:96],
-                        "retry_eligible": attempts < max_attempts,
+                        "retry_eligible": attempts < max_attempts or semantic_retry,
                     })
                 elif status in {
                     "in_progress", "waiting_tool", "verifying_tool",
@@ -1112,7 +1159,10 @@ def set_task_status(state: dict, phase_idx: int, task_idx: int, status: str,
                         "status": "active",
                         "evidence_ref": "",
                         "failure_reason": str(task.get("last_error") or "")[:96],
-                        "retry_eligible": status == "in_progress" and attempts < max_attempts,
+                        "retry_eligible": (
+                            status == "in_progress"
+                            and (attempts < max_attempts or semantic_retry)
+                        ),
                     })
                 elif status == "blocked_unknown_effect":
                     checklist_item.update({

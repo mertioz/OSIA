@@ -635,7 +635,19 @@ class CronManager:
                 )
                 if isinstance(result, dict):
                     raw_status = str(result.get("status") or "").strip().lower()
-                    if raw_status in {"failed", "error"}:
+                    if raw_status == "success_verified":
+                        status = "completed"
+                        job_status = "success_verified"
+                    elif raw_status == "completed":
+                        status = "completed"
+                        job_status = "completed"
+                    elif raw_status == "user_cancelled":
+                        job_status = "user_cancelled"
+                    elif raw_status == "hard_safety_block":
+                        job_status = "hard_safety_block"
+                    elif raw_status == "blocked_verified":
+                        job_status = "blocked_verified"
+                    elif raw_status in {"failed", "error"}:
                         status = "failed"
                         job_status = "error"
                     elif result.get("conversation_stale"):
@@ -660,7 +672,10 @@ class CronManager:
                     occurrence_outcome = (
                         "outcome_unknown" if blocked == "blocked_outcome_unknown"
                         else "blocked_authorization" if blocked
-                        else "success_verified" if job_status.startswith("completed")
+                        else "success_verified" if job_status in {
+                            "success_verified", "completed", "completed_unlinked"
+                        }
+                        else "cancelled_proven" if job_status == "user_cancelled"
                         else "failed_before_dispatch"
                     )
                     record_scheduled_occurrence(

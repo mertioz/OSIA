@@ -37,6 +37,7 @@ import os
 import re
 import inspect
 import json
+import hashlib
 import threading
 from contextlib import contextmanager
 from typing import NamedTuple
@@ -791,6 +792,100 @@ class Orchestrator:
             return "browser_state_stale"
         return None
 
+    def _capture_semantic_frontier(self, task: dict) -> list | None:
+        """Persist the next untried semantic tuple from the agent snapshot."""
+
+        # A claimed strategy is one-shot: reaching this point means that exact
+        # next attempt has run and its new snapshot is now authoritative.
+        task["semantic_next_strategy"] = ""
+        snapshot = getattr(
+            self.agent, "last_execution_strategy_snapshot", None,
+        )
+        if not isinstance(snapshot, dict):
+            task["semantic_frontier_remaining"] = []
+            return None
+        previous_revision = max(
+            0, int(task.get("semantic_evidence_revision", 0) or 0),
+        )
+        postcondition = str(
+            task.get("requirement_id")
+            or hashlib.sha256(
+                str(task.get("success_criterion") or "").encode(
+                    "utf-8", errors="replace",
+                )
+            ).hexdigest()[:24]
+        )[:96]
+        provider_route = (
+            f"{getattr(self.agent, 'provider', '')}:"
+            f"{getattr(self.agent, 'model', '')}"
+        )[:160]
+        attempted = list(task.get("semantic_attempt_tuples") or [])
+        for item in snapshot.get("attempts") or []:
+            if not isinstance(item, dict):
+                continue
+            strategy_id = str(item.get("mechanism_id") or "")[:160]
+            if not strategy_id:
+                continue
+            candidate = [
+                postcondition, strategy_id, provider_route, previous_revision,
+            ]
+            if candidate not in attempted:
+                attempted.append(candidate)
+
+        known_tokens = list(task.get("semantic_evidence_tokens") or [])
+        raw_tokens = list(snapshot.get("evidence_tokens") or [])
+        raw_tokens.extend(snapshot.get("postcondition_evidence") or [])
+        for item in snapshot.get("attempts") or []:
+            if isinstance(item, dict):
+                raw_tokens.extend(item.get("observations_gained") or [])
+        for raw in raw_tokens:
+            token = hashlib.sha256(
+                str(raw or "").encode("utf-8", errors="replace")
+            ).hexdigest()[:24]
+            if raw not in (None, "") and token not in known_tokens:
+                known_tokens.append(token)
+        revision = previous_revision + max(
+            0, len(known_tokens) - len(task.get("semantic_evidence_tokens") or []),
+        )
+        frontier = [
+            str(item)[:160]
+            for item in snapshot.get("alternatives_still_applicable") or []
+            if re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", str(item or ""))
+        ]
+        goal = snapshot.get("goal") if isinstance(snapshot.get("goal"), dict) else {}
+        if (
+            goal.get("requires_execution")
+            and not snapshot.get("succeeded")
+            and not snapshot.get("frozen_reason")
+            and not frontier
+        ):
+            frontier = ["provider_capability_selection"]
+        available = []
+        next_tuple = None
+        for strategy_id in frontier:
+            candidate = [postcondition, strategy_id, provider_route, revision]
+            if candidate not in attempted:
+                available.append(strategy_id)
+                if next_tuple is None:
+                    next_tuple = candidate
+        task["semantic_attempt_tuples"] = attempted[-128:]
+        task["semantic_evidence_tokens"] = known_tokens[-128:]
+        task["semantic_evidence_revision"] = revision
+        task["semantic_frontier_remaining"] = available[:64]
+        return next_tuple
+
+    @staticmethod
+    def _claim_semantic_strategy(task: dict, candidate: list) -> None:
+        attempted = list(task.get("semantic_attempt_tuples") or [])
+        if candidate not in attempted:
+            attempted.append(list(candidate))
+        task["semantic_attempt_tuples"] = attempted[-128:]
+        task["semantic_next_strategy"] = str(candidate[1])[:160]
+        task["semantic_frontier_remaining"] = [
+            item for item in task.get("semantic_frontier_remaining") or []
+            if item != candidate[1]
+        ]
+
     def _begin(self, st, resume):
         # Idempotent: never spawn a second loop over the same Orchestrator.
         if self._thread and self._thread.is_alive():
@@ -1256,6 +1351,7 @@ class Orchestrator:
         # (D) Run the isolated subtask. run() can raise when fallbacks are
         # exhausted ⇒ treat as an empty result + recorded error (never crash).
         agent_failure = None
+        semantic_candidate = None
         previous_exact_resume_call = getattr(
             self.agent, "_autonomous_resume_exact_call", None,
         )
@@ -1361,6 +1457,11 @@ class Orchestrator:
             self.agent._autonomous_resume_exact_call = (
                 previous_exact_resume_call
             )
+            try:
+                semantic_candidate = self._capture_semantic_frontier(task)
+            except Exception:
+                task["semantic_frontier_remaining"] = []
+                semantic_candidate = None
 
         with self._tool_cancel_lock:
             queued_cancel = self._cancel_before_dispatch_requested
@@ -1493,6 +1594,25 @@ class Orchestrator:
             checkpoint_present=True,
         )
         if attempts >= max_attempts:
+            if semantic_candidate is not None:
+                # A numeric budget alone is not semantic exhaustion.
+                self._claim_semantic_strategy(task, semantic_candidate)
+                state.set_task_status(
+                    st, p, t, "in_progress", last_error=last_error,
+                )
+                self._append_log(
+                    st,
+                    "semantic_retry",
+                    ref=task.get("id"),
+                    note=str(semantic_candidate[1]),
+                )
+                self._safe_save(st)
+                self._emit({
+                    "event": "retry",
+                    "task_id": task.get("id"),
+                    "reason": "safe_semantic_strategy_remains",
+                })
+                return True
             # Task is out of attempts — fail it and its phase. CHECKPOINT C.
             state.set_task_status(st, p, t, "failed", last_error=last_error)
             phase["status"] = "failed"
@@ -1956,6 +2076,14 @@ class Orchestrator:
                 "",
                 "VERIFIED OPERATIONS FOR THIS STEP (do not replay them): "
                 + ", ".join(completed_operations[:32]),
+            ]
+        semantic_next = str(task.get("semantic_next_strategy") or "")
+        if semantic_next:
+            parts += [
+                "",
+                "NEXT SAFE SEMANTIC STRATEGY: " + semantic_next,
+                "Do not replay any prior strategy tuple unless new typed "
+                "evidence has changed its evidence revision.",
             ]
         if self._uses_autonomous_web_surface(self._state or {}):
             from osia.tool_contracts import AUTONOMOUS_WEB_TOOL_NAMES

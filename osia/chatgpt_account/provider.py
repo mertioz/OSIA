@@ -509,6 +509,7 @@ class _AccountCompletions:
 
     def create(self, *, model: str, messages: list[dict], stream: bool = False, **kwargs):
         self._owner._set_capability_events(())
+        self._owner._set_invocation_metadata({})
         conversation_id = self._owner.conversation_id or f"ephemeral:{id(self._owner)}"
         effort = kwargs.get("effort")
         timeout = _bounded_turn_timeout(kwargs.get("timeout", 300.0))
@@ -527,6 +528,12 @@ class _AccountCompletions:
             self._owner._set_capability_events(
                 getattr(result, "capability_events", ()),
             )
+            self._owner._set_invocation_metadata({
+                "native_turn_id": getattr(result, "turn_id", None),
+                "native_thread_id": getattr(result, "thread_id", None),
+                "native_status": getattr(result, "status", ""),
+                "output_started": bool(getattr(result, "output_started", False)),
+            })
             message = SimpleNamespace(content=result.text, tool_calls=None)
             return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
@@ -549,6 +556,12 @@ class _AccountCompletions:
                 self._owner._set_capability_events(
                     getattr(result, "capability_events", ()),
                 )
+                self._owner._set_invocation_metadata({
+                    "native_turn_id": getattr(result, "turn_id", None),
+                    "native_thread_id": getattr(result, "thread_id", None),
+                    "native_status": getattr(result, "status", ""),
+                    "output_started": bool(getattr(result, "output_started", False)),
+                })
                 events.put(("done", None))
             except Exception as exc:
                 events.put(("error", exc))
@@ -586,6 +599,8 @@ class _AccountChatClient:
         self.final_response_message_id: str | None = None
         self._capability_events: tuple = ()
         self._capability_events_lock = threading.Lock()
+        self._invocation_metadata: dict = {}
+        self._invocation_metadata_lock = threading.Lock()
         self.chat = SimpleNamespace(completions=_AccountCompletions(self))
 
     def _set_capability_events(self, events) -> None:
@@ -599,6 +614,18 @@ class _AccountChatClient:
             events = self._capability_events
             self._capability_events = ()
         return events
+
+    def _set_invocation_metadata(self, metadata) -> None:
+        with self._invocation_metadata_lock:
+            self._invocation_metadata = dict(metadata or {})
+
+    def consume_invocation_metadata(self) -> dict:
+        """Return native identity/status for one completed provider segment."""
+
+        with self._invocation_metadata_lock:
+            metadata = dict(self._invocation_metadata)
+            self._invocation_metadata = {}
+        return metadata
 
     def set_conversation_id(self, conversation_id: str | None) -> None:
         self.conversation_id = conversation_id

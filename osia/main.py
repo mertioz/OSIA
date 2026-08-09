@@ -317,6 +317,25 @@ def _new_desktop_turn_meta(conv_id: str) -> dict:
     }
 
 
+def _run_turn_to_terminality(agent, user_input: str, *, turn_id: str, **kwargs):
+    """Use the verified lifecycle while retaining narrow legacy-test adapters."""
+
+    runner = getattr(agent, "run_terminal_turn", None)
+    if callable(runner):
+        return runner(user_input, turn_id=turn_id, **kwargs)
+    return agent.run(user_input, **kwargs)
+
+
+def _terminality_result(agent, turn_id: str, final_text: str = "") -> dict | None:
+    checker = getattr(agent, "terminality_result", None)
+    if callable(checker):
+        return checker(turn_id)
+    return {
+        "terminal_state": "success_verified",
+        "final_text": str(final_text or ""),
+    }
+
+
 def _turn_persistence_metadata(
     turn_meta: dict,
     *,
@@ -927,12 +946,18 @@ def text_mode():
             response = _dispatch_after_persisted_user(
                 active_conv["id"],
                 user_input,
-                lambda _meta: agent.run(
+                lambda _meta: _run_turn_to_terminality(
+                    agent,
                     user_input,
+                    turn_id=str(turn_meta.get("turn_id") or ""),
                     current_conversation_id=active_conv["id"],
                 ),
                 turn_meta=turn_meta,
             )
+            if not _terminality_result(
+                agent, str(turn_meta.get("turn_id") or ""), response,
+            ):
+                raise RuntimeError("turn did not reach verified terminality")
             print(f"\nOSIA: {response}")
             _persist_agent_delta(
                 active_conv["id"],
@@ -1027,8 +1052,10 @@ def voice_mode():
             response = _dispatch_after_persisted_user(
                 active_conv["id"],
                 user_text,
-                lambda _meta: turn_agent.run(
+                lambda _meta: _run_turn_to_terminality(
+                    turn_agent,
                     user_text,
+                    turn_id=str(turn_meta.get("turn_id") or ""),
                     history=history,
                     current_conversation_id=active_conv["id"],
                     turn_context=turn_context,
@@ -1044,6 +1071,13 @@ def voice_mode():
             print(f"[voice] turn failed: {type(exc).__name__}")
             continue
         response = clean_response(response)
+        if not _terminality_result(
+            turn_agent,
+            str(turn_meta.get("turn_id") or ""),
+            response,
+        ):
+            print("[voice] non-terminal result retained without finalization")
+            continue
         print(f"[voice] assistant response accepted ({len(response)} chars).")
 
         _persist_agent_delta(
@@ -1591,18 +1625,19 @@ def wake_mode():
             error,
         ) -> bool:
             try:
-                if error is not None:
-                    final_text = (
-                        "Le r\u00e9sultat de l'action a \u00e9t\u00e9 conserv\u00e9, mais la "
-                        "reprise du m\u00eame fournisseur a \u00e9chou\u00e9. L'action "
-                        "n'a pas \u00e9t\u00e9 relanc\u00e9e."
-                        if turn_context.language == "fr" else
-                        "The action result was preserved, but continuation with "
-                        "the same provider failed. The action was not repeated."
+                terminal = _terminality_result(
+                    turn_agent,
+                    str(turn_meta.get("turn_id") or ""),
+                    final_text,
+                )
+                if not terminal:
+                    print(
+                        "[TERMINALITY] desktop pending callback held without "
+                        "a verified terminal reservation"
                     )
-                    turn_agent.messages.append({
-                        "role": "assistant", "content": final_text,
-                    })
+                    return False
+                if error is not None:
+                    final_text = str(terminal.get("final_text") or final_text or "")
                 _persist_agent_delta(
                     conv_id,
                     turn_agent,
@@ -1658,8 +1693,10 @@ def wake_mode():
                     "[TTS] main.wake_mode: TTS disabled for this turn (text-only)",
                     flush=True,
                 )
-            reply = turn_agent.run(
+            reply = _run_turn_to_terminality(
+                turn_agent,
                 user_input,
+                turn_id=str(turn_meta.get("turn_id") or ""),
                 history=history,
                 on_sentence=on_stream_sentence,
                 on_first_token=on_first_token,
@@ -1674,6 +1711,14 @@ def wake_mode():
                 if not turn_agent.activate_pending_tool_attempt():
                     raise RuntimeError("pending tool attempt could not be activated")
                 return
+            if not _terminality_result(
+                turn_agent,
+                str(turn_meta.get("turn_id") or ""),
+                reply,
+            ):
+                raise RuntimeError(
+                    "agent returned without a verified terminal reservation"
+                )
             if voice_response:
                 print(
                     f"[TTS] main.wake_mode: agent.run() returned "
@@ -1700,46 +1745,33 @@ def wake_mode():
                     language=turn_context.language,
                 )
         except Exception as e:
-            refusal = _finalize_controlled_refusal(
-                e,
+            terminal = _terminality_result(
                 turn_agent,
+                str(turn_meta.get("turn_id") or ""),
+            )
+            if not terminal:
+                suspended_tool_turn[0] = True
+                print(
+                    "[TERMINALITY] desktop turn retained after a non-terminal "
+                    f"error: {type(e).__name__}"
+                )
+                return
+            display = clean_response(str(terminal.get("final_text") or ""))
+            _persist_agent_delta(
                 conv_id,
+                turn_agent,
                 prev_history_len,
-                bridge.assistant_stream_final.emit,
                 user_display_text=user_display_text,
                 turn_meta=turn_meta,
             )
-            if refusal is not None:
-                if _voice_tts_allowed():
-                    if emit_voice_state is not None:
-                        emit_voice_state("speaking")
-                    speak_streaming(
-                        refusal,
-                        session_id=tts_session_id,
-                        language=turn_context.language,
-                    )
-            else:
-                err = localized_text("provider_failure", turn_agent.lang)
-                turn_agent.messages.append({
-                    "role": "assistant",
-                    "content": err,
-                })
-                _persist_agent_delta(
-                    conv_id,
-                    turn_agent,
-                    prev_history_len,
-                    user_display_text=user_display_text,
-                    turn_meta=turn_meta,
+            bridge.assistant_stream_final.emit(conv_id, display)
+            if _voice_tts_allowed():
+                speak_streaming(
+                    display,
+                    session_id=tts_session_id,
+                    language=turn_context.language,
                 )
-                bridge.assistant_stream_error.emit(conv_id, err)
-                if _voice_tts_allowed():
-                    if emit_voice_state is not None:
-                        emit_voice_state("speaking")
-                    speak_streaming(
-                        err,
-                        session_id=tts_session_id,
-                        language=turn_context.language,
-                    )
+            return
         finally:
             if not suspended_tool_turn[0]:
                 turn_agent.clear_tool_attempts()
@@ -2256,6 +2288,10 @@ def wake_mode():
                 "message": "OSIA was busy; scheduled task skipped",
             }
         conversation_stale = False
+        terminal_turn_id = str(
+            (scheduled_execution or {}).get("occurrence_id")
+            or f"cron-{uuid.uuid4().hex}"
+        )
         try:
             tts_stop()
             model_meta = model if isinstance(model, dict) else {}
@@ -2288,12 +2324,16 @@ def wake_mode():
                     reply = cron_agent.run_scheduled(
                         task_text,
                         scheduled_execution,
+                        terminal_turn=True,
+                        turn_id=terminal_turn_id,
                         history=history,
                         current_conversation_id=conversation_id,
                     )
                 else:
-                    reply = cron_agent.run(
+                    reply = _run_turn_to_terminality(
+                        cron_agent,
                         task_text,
+                        turn_id=terminal_turn_id,
                         history=history,
                         current_conversation_id=conversation_id,
                     )
@@ -2309,9 +2349,15 @@ def wake_mode():
                     reply = cron_agent.run_scheduled(
                         task_text,
                         scheduled_execution,
+                        terminal_turn=True,
+                        turn_id=terminal_turn_id,
                     )
                 else:
-                    reply = cron_agent.run(task_text)
+                    reply = _run_turn_to_terminality(
+                        cron_agent,
+                        task_text,
+                        turn_id=terminal_turn_id,
+                    )
             display = clean_response(reply or "")
             if display:
                 if conv is not None and conversation_id:
@@ -2329,13 +2375,15 @@ def wake_mode():
                         None,
                     ),
                 )
+            terminal = _terminality_result(cron_agent, terminal_turn_id, reply)
+            terminal_state = str((terminal or {}).get("terminal_state") or "")
             if conversation_stale:
                 return {
-                    "status": "completed",
+                    "status": terminal_state or "blocked_verified",
                     "conversation_stale": True,
                     "message": "linked conversation not found; ran unlinked",
                 }
-            return {"status": "completed"}
+            return {"status": terminal_state or "blocked_verified"}
         except Exception as e:
             print(f"[CRON] task error: {e}")
             return {"status": "failed", "message": str(e)}

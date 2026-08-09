@@ -6927,6 +6927,7 @@ class OSIAAgent:
         self._memory_store = None
         self._chatgpt_conversation_id = None
         self.last_run_diagnostic: dict | None = None
+        self.last_execution_strategy_snapshot: dict | None = None
         self.last_context_receipt: dict | None = None
         self.last_run_artifacts: list[dict] = []
         self._prior_run_document_artifacts: list[dict] = []
@@ -6949,6 +6950,12 @@ class OSIAAgent:
         self._continuation_reconcile_required = False
         self._continuation_reconciled = False
         self._continuation_control_retry_used = False
+        self._terminality_controller = None
+        self._terminality_strategy = None
+        self._turn_terminal_results: dict[str, dict] = {}
+        self._queued_terminal_cancellations: dict[str, bool] = {}
+        self._terminality_cancel_lock = threading.Lock()
+        self._tool_cancel_requested = False
 
     def set_turn_context(self, context: TurnContext) -> None:
         """Apply one already-resolved language decision to subsequent model calls."""
@@ -7036,6 +7043,21 @@ class OSIAAgent:
         from osia.tool_contracts import ExecutionOutcome
 
         outcome = getattr(execution_record, "outcome", None)
+        terminality = self._terminality_controller
+        strategy = _execution_strategy.current_execution_strategy()
+        if terminality is not None:
+            postcondition = (
+                strategy.goal.observable_success_postcondition
+                if strategy is not None else ""
+            )
+            try:
+                terminality.record_execution_record(
+                    tool_name,
+                    execution_record,
+                    postcondition=postcondition,
+                )
+            except Exception as exc:
+                print(f"[TERMINALITY] could not record tool receipt: {exc}")
         call = {"tool": str(tool_name or "")}
         call.update(dict(kwargs) if isinstance(kwargs, dict) else {})
         current = self._unfinished_execution
@@ -7280,14 +7302,50 @@ class OSIAAgent:
         }
         self._in_use = True
         try:
-            final_text = self.run(
-                feedback,
-                history=None,
-                on_sentence=metadata.get("on_sentence"),
-                on_first_token=metadata.get("on_first_token"),
-                current_conversation_id=metadata.get("conversation_id"),
-                turn_context=self.turn_context,
-            )
+            terminality = self._terminality_controller
+            if terminality is not None and self._terminality_strategy is not None:
+                if isinstance(payload, ToolExecutionRecord):
+                    _execution_strategy.record_resumed_tool_outcome(
+                        self._terminality_strategy,
+                        str(attempt.get("tool_name") or ""),
+                        payload,
+                    )
+                    terminality.record_execution_record(
+                        str(attempt.get("tool_name") or ""),
+                        payload,
+                        postcondition=(
+                            self._terminality_strategy.goal.observable_success_postcondition
+                        ),
+                    )
+                else:
+                    terminality.set_attempt_state(attempt_id, status="completed")
+                    terminality.record_typed_evidence(
+                        outcome=outcome,
+                        evidence=result_text or structured,
+                        attempt_id=attempt_id,
+                        reason_code=str(attempt.get("reason_code") or ""),
+                    )
+                final_text = self._drive_terminal_turn(
+                    terminality,
+                    self._terminality_strategy,
+                    initial_input=feedback,
+                    initial_strategy_id="tool_receipt_continuation",
+                    history=None,
+                    on_sentence=metadata.get("on_sentence"),
+                    on_first_token=metadata.get("on_first_token"),
+                    current_conversation_id=metadata.get("conversation_id"),
+                    turn_context=self.turn_context,
+                    canonical_output=True,
+                )
+            else:
+                final_text = self.run(
+                    feedback,
+                    history=None,
+                    on_sentence=metadata.get("on_sentence"),
+                    on_first_token=metadata.get("on_first_token"),
+                    current_conversation_id=metadata.get("conversation_id"),
+                    turn_context=self.turn_context,
+                )
             from osia.tool_attempts import WAITING_TOOL_RESULT
 
             if final_text == WAITING_TOOL_RESULT:
@@ -8233,6 +8291,433 @@ class OSIAAgent:
         if saved:
             print(f"[CONTEXT] dropped screenshot from history ({saved} chars saved)")
 
+    def terminality_result(self, turn_id: str = "") -> dict | None:
+        """Return a verified terminal reservation for an outer final gate."""
+
+        key = str(turn_id or "")
+        if key:
+            result = self._turn_terminal_results.get(key)
+            return dict(result) if isinstance(result, dict) else None
+        if self._terminality_controller is not None:
+            result = self._turn_terminal_results.get(
+                self._terminality_controller.turn_id,
+            )
+            return dict(result) if isinstance(result, dict) else None
+        return None
+
+    def request_turn_cancellation(
+        self,
+        turn_id: str,
+        *,
+        effect_possible: bool = False,
+    ) -> bool:
+        """Forward one authoritative correlated cancellation to the controller."""
+
+        stable_turn_id = str(turn_id or "")
+        if not stable_turn_id:
+            return False
+        controller = self._terminality_controller
+        if controller is None or controller.turn_id != stable_turn_id:
+            with self._terminality_cancel_lock:
+                self._queued_terminal_cancellations[stable_turn_id] = bool(
+                    effect_possible
+                    or self._queued_terminal_cancellations.get(stable_turn_id)
+                )
+            return True
+        snapshot = controller.snapshot()
+        possible = bool(
+            effect_possible
+            or snapshot.get("active_attempts")
+            or snapshot.get("unknown_effects")
+        )
+        controller.request_cancellation(effect_possible=possible)
+        self._tool_cancel_requested = True
+        cancel_conversation = getattr(self.client, "cancel_conversation", None)
+        if not callable(cancel_conversation):
+            cancel_conversation = getattr(
+                getattr(self.client, "provider", None),
+                "cancel_conversation",
+                None,
+            )
+        conversation_id = str(
+            getattr(self.client, "conversation_id", "") or ""
+        )
+        if callable(cancel_conversation) and conversation_id:
+            try:
+                cancel_conversation(conversation_id)
+            except Exception:
+                pass
+        return True
+
+    @staticmethod
+    def _mark_provisional_assistant_candidate(messages: list, content: str) -> None:
+        for message in reversed(messages):
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and not message.get("_internal")
+                and str(message.get("content") or "") == str(content or "")
+            ):
+                message["_internal"] = True
+                message["_provisional"] = True
+                return
+
+    def _terminal_final_text(
+        self,
+        state: str,
+        candidate: str,
+        *,
+        reason_code: str = "",
+    ) -> str:
+        from osia.turn_terminality import TerminalState
+
+        if state == TerminalState.SUCCESS_VERIFIED.value and str(candidate or "").strip():
+            return str(candidate).strip()
+        if state == TerminalState.USER_CANCELLED.value:
+            return clean_response(localized_text(
+                "autonomous.status_cancelled_proven", self.lang,
+            ))
+        if state == TerminalState.HARD_SAFETY_BLOCK.value:
+            if str(candidate or "").strip() and "BLOCK_SYSTEM_DESTRUCTION" in str(candidate):
+                return clean_response(str(candidate))
+            return (
+                "Cette action est bloqu\u00e9e par une barri\u00e8re de s\u00e9curit\u00e9 absolue."
+                if self.lang == "fr" else
+                "This action is blocked by an absolute safety barrier."
+            )
+        if reason_code == "safe_reconciliation_frontier_exhausted":
+            return (
+                "L'effet possible reste incertain après épuisement des "
+                "vérifications sûres en lecture seule. Aucune action n'a été rejouée."
+                if self.lang == "fr" else
+                "The possible effect remains unknown after the safe read-only "
+                "verification frontier was exhausted. No action was replayed."
+            )
+        return (
+            "Le travail restant est r\u00e9ellement bloqu\u00e9 apr\u00e8s \u00e9puisement des "
+            "strat\u00e9gies s\u00fbres et s\u00e9mantiquement \u00e9quivalentes."
+            if self.lang == "fr" else
+            "The remaining work is genuinely blocked after the safe, "
+            "semantically equivalent strategy frontier was exhausted."
+        )
+
+    def _reserve_terminal_final(
+        self,
+        controller,
+        decision,
+        candidate: str,
+        *,
+        on_sentence=None,
+        provider_route: str = "default",
+    ) -> str:
+        existing = self._turn_terminal_results.get(controller.turn_id)
+        if isinstance(existing, dict):
+            return str(existing.get("final_text") or "")
+        snapshot = controller.snapshot()
+        reservation = snapshot.get("final_reservation") or {}
+        if reservation and snapshot.get("terminal_state"):
+            result = {
+                "turn_id": controller.turn_id,
+                "terminal_state": str(snapshot.get("terminal_state") or ""),
+                "reason_code": str(snapshot.get("terminal_reason") or ""),
+                "final_text": str(reservation.get("final_text") or ""),
+                "reservation_id": str(reservation.get("reservation_id") or ""),
+                "reservation_reused": True,
+            }
+            self._turn_terminal_results[controller.turn_id] = result
+            self._terminality_controller = None
+            self._terminality_strategy = None
+            return result["final_text"]
+        final_text = self._terminal_final_text(
+            decision.terminal_state,
+            candidate,
+            reason_code=decision.reason_code,
+        )
+        if decision.terminal_state != "success_verified":
+            self._mark_provisional_assistant_candidate(self.messages, candidate)
+        if not controller.reserve_final(
+            decision.terminal_state,
+            reason_code=decision.reason_code,
+            provider_route=provider_route,
+            final_text=final_text,
+        ):
+            return ""
+        final_is_existing_candidate = bool(
+            decision.terminal_state == "success_verified"
+            and self.messages
+            and self.messages[-1].get("role") == "assistant"
+            and not self.messages[-1].get("_internal")
+            and str(self.messages[-1].get("content") or "") == final_text
+        )
+        if not final_is_existing_candidate:
+            self.messages.append({"role": "assistant", "content": final_text})
+        if controller.execution_required and on_sentence is not None:
+            try:
+                on_sentence(final_text)
+            except Exception:
+                pass
+        snapshot = controller.snapshot()
+        result = {
+            "turn_id": controller.turn_id,
+            "terminal_state": decision.terminal_state,
+            "reason_code": decision.reason_code,
+            "final_text": final_text,
+            "reservation_id": str(
+                (snapshot.get("final_reservation") or {}).get("reservation_id") or ""
+            ),
+        }
+        self._turn_terminal_results[controller.turn_id] = result
+        self._terminality_controller = None
+        self._terminality_strategy = None
+        return final_text
+
+    def _drive_terminal_turn(
+        self,
+        controller,
+        strategy,
+        *,
+        initial_input: str,
+        initial_strategy_id: str,
+        history: list | None,
+        on_sentence,
+        on_first_token,
+        current_conversation_id: str | None,
+        turn_context: TurnContext | None,
+        canonical_output: bool,
+        client_locale: str | None = None,
+    ) -> str:
+        from osia.tool_attempts import (
+            WAITING_TOOL_RESULT,
+            is_internal_tool_control_text,
+        )
+
+        segment_input = initial_input
+        segment_strategy = initial_strategy_id
+        segment_postcondition = ""
+        segment_history = history
+        last_candidate = ""
+        while True:
+            provider_route = f"{self.provider}:{self.model}"
+            invocation_id = controller.begin_invocation(
+                provider_route=provider_route,
+                strategy_id=segment_strategy,
+                postcondition=segment_postcondition,
+            )
+            if not invocation_id:
+                decision = controller.evaluate(provider_route=provider_route)
+                if decision.terminal:
+                    return self._reserve_terminal_final(
+                        controller, decision, last_candidate,
+                        on_sentence=on_sentence,
+                        provider_route=provider_route,
+                    )
+                if decision.action == "continue":
+                    segment_input = controller.continuation_context(decision)
+                    segment_strategy = decision.next_strategy
+                    segment_postcondition = decision.postcondition
+                    segment_history = None
+                    continue
+                return WAITING_TOOL_RESULT
+
+            self._terminality_controller = controller
+            self._terminality_strategy = strategy
+            previous_unknown_barrier = self._resume_unknown_effect
+            self._resume_unknown_effect = bool(
+                segment_strategy == "reconcile_unknown_read_only"
+            )
+            buffered_callback = None if controller.execution_required else on_sentence
+            try:
+                candidate = self.run(
+                    segment_input,
+                    history=segment_history,
+                    on_sentence=buffered_callback,
+                    on_first_token=on_first_token,
+                    current_conversation_id=current_conversation_id,
+                    turn_context=turn_context,
+                    client_locale=client_locale,
+                    canonical_output=canonical_output,
+                )
+            except Exception as exc:
+                candidate = ""
+                controller.record_typed_evidence(
+                    outcome="failed_before_effect",
+                    evidence=f"{type(exc).__name__}:{exc}",
+                    reason_code="provider_invocation_failed_before_effect",
+                )
+            finally:
+                self._resume_unknown_effect = previous_unknown_barrier
+
+            metadata = {}
+            consume_metadata = getattr(
+                self.client, "consume_invocation_metadata", None,
+            )
+            if callable(consume_metadata):
+                try:
+                    metadata = dict(consume_metadata() or {})
+                except Exception:
+                    metadata = {}
+            controller.record_provider_invocation_completed(
+                invocation_id,
+                native_turn_id=str(metadata.get("native_turn_id") or ""),
+                native_status=str(metadata.get("native_status") or ""),
+                response_fingerprint=(
+                    hashlib.sha256(str(candidate or "").encode("utf-8", errors="replace")).hexdigest()[:24]
+                    if candidate else ""
+                ),
+            )
+            controller.set_strategy_snapshot(strategy.snapshot())
+            if candidate == WAITING_TOOL_RESULT:
+                decision = controller.evaluate(provider_route=provider_route)
+                if decision.action == "wait":
+                    return WAITING_TOOL_RESULT
+                if (
+                    decision.terminal_state
+                    == "success_verified"
+                ):
+                    segment_input = (
+                        "[Internal terminality final synthesis. This is the same "
+                        "user turn. All required postconditions are proven by "
+                        "typed evidence. Produce one concise canonical final "
+                        "answer now. Do not call another tool.]"
+                    )
+                    segment_strategy = "provider_final_synthesis"
+                    segment_postcondition = ""
+                    segment_history = None
+                    continue
+                if decision.terminal:
+                    return self._reserve_terminal_final(
+                        controller,
+                        decision,
+                        last_candidate,
+                        on_sentence=on_sentence,
+                        provider_route=provider_route,
+                    )
+                if decision.action == "continue":
+                    segment_input = controller.continuation_context(decision)
+                    segment_strategy = decision.next_strategy
+                    segment_postcondition = decision.postcondition
+                    segment_history = None
+                    continue
+                return WAITING_TOOL_RESULT
+            last_candidate = str(candidate or "")
+
+            coherent_information = bool(
+                not controller.execution_required
+                and str(candidate or "").strip()
+                and not is_internal_tool_control_text(str(candidate or ""))
+                and not (
+                    isinstance(self.last_run_diagnostic, dict)
+                    and self.last_run_diagnostic.get("error_category") in {
+                        "empty_completion", "provider_failure", "tool_timeout",
+                    }
+                )
+            )
+            decision = controller.evaluate(
+                informational_answer_satisfied=coherent_information,
+                provider_route=provider_route,
+            )
+            if decision.terminal:
+                return self._reserve_terminal_final(
+                    controller, decision, last_candidate,
+                    on_sentence=on_sentence,
+                    provider_route=provider_route,
+                )
+            if decision.action == "wait":
+                return WAITING_TOOL_RESULT
+            if decision.action != "continue":
+                return WAITING_TOOL_RESULT
+
+            self._mark_provisional_assistant_candidate(
+                self.messages, last_candidate,
+            )
+            segment_input = controller.continuation_context(decision)
+            segment_strategy = decision.next_strategy
+            segment_postcondition = decision.postcondition
+            segment_history = None
+
+    def run_terminal_turn(
+        self,
+        user_input: str,
+        *,
+        turn_id: str = "",
+        required_postconditions=(),
+        execution_required: bool | None = None,
+        history: list | None = None,
+        on_sentence=None,
+        on_first_token=None,
+        current_conversation_id: str | None = None,
+        turn_context: TurnContext | None = None,
+        client_locale: str | None = None,
+        canonical_output: bool = True,
+    ) -> str:
+        """Run one user turn until a verified terminal state or durable wait."""
+
+        from osia.turn_terminality import TurnTerminalityController
+
+        stable_turn_id = str(
+            turn_id
+            or (self._tool_attempt_metadata or {}).get("turn_id")
+            or ("turn-" + secrets.token_hex(16))
+        )
+        postconditions = tuple(
+            str(item).strip() for item in required_postconditions
+            if str(item).strip()
+        )
+        strategy = _execution_strategy.build_execution_strategy(
+            user_input,
+            TOOL_MAP.keys(),
+            postconditions=postconditions,
+        )
+        requires_execution = (
+            strategy.goal.requires_execution
+            if execution_required is None else bool(execution_required)
+        )
+        if requires_execution and not strategy.goal.requires_execution:
+            goal_data = strategy.goal.public_dict()
+            goal_data["requires_execution"] = True
+            strategy.goal = _execution_strategy.SemanticGoal(**goal_data)
+        controller = TurnTerminalityController(
+            turn_id=stable_turn_id,
+            objective=user_input,
+            required_postconditions=(
+                postconditions or strategy.goal.required_postconditions
+            ),
+            execution_required=requires_execution,
+        )
+        saved_strategy = controller.snapshot().get("strategy_snapshot") or {}
+        if saved_strategy:
+            try:
+                strategy = _execution_strategy.ExecutionStrategy.from_snapshot(
+                    saved_strategy,
+                )
+            except (TypeError, ValueError, KeyError):
+                pass
+        controller.set_strategy_snapshot(strategy.snapshot())
+        self._terminality_controller = controller
+        self._terminality_strategy = strategy
+        with self._terminality_cancel_lock:
+            queued_cancellation = self._queued_terminal_cancellations.pop(
+                stable_turn_id, None,
+            )
+        if queued_cancellation is not None:
+            controller.request_cancellation(
+                effect_possible=bool(queued_cancellation),
+            )
+            self._tool_cancel_requested = True
+        return self._drive_terminal_turn(
+            controller,
+            strategy,
+            initial_input=user_input,
+            initial_strategy_id="provider_initial",
+            history=history,
+            on_sentence=on_sentence,
+            on_first_token=on_first_token,
+            current_conversation_id=current_conversation_id,
+            turn_context=turn_context,
+            canonical_output=canonical_output,
+            client_locale=client_locale,
+        )
+
     def run(self, user_input: str, max_tool_rounds: int | None = None, on_sentence=None,
             history: list | None = None, max_tokens: int | None = None,
             on_first_token=None, current_conversation_id: str | None = None,
@@ -8256,6 +8741,7 @@ class OSIAAgent:
         from osia.utils.key_chain import task_scope
 
         self.last_run_diagnostic = None
+        self.last_execution_strategy_snapshot = None
         prior_artifacts = self.last_run_artifacts
         if not prior_artifacts:
             prior_artifacts = _latest_persisted_document_references(
@@ -8301,17 +8787,23 @@ class OSIAAgent:
                 with _execution_strategy.execution_strategy_scope(
                     user_input,
                     TOOL_MAP.keys(),
-                ):
-                    return self._run_turn(
-                        user_input,
-                        max_tool_rounds=max_tool_rounds,
-                        on_sentence=on_sentence,
-                        history=history,
-                        max_tokens=max_tokens,
-                        on_first_token=on_first_token,
-                        current_conversation_id=current_conversation_id,
-                        canonical_output=canonical_output,
-                    )
+                    strategy=self._terminality_strategy,
+                ) as active_strategy:
+                    try:
+                        return self._run_turn(
+                            user_input,
+                            max_tool_rounds=max_tool_rounds,
+                            on_sentence=on_sentence,
+                            history=history,
+                            max_tokens=max_tokens,
+                            on_first_token=on_first_token,
+                            current_conversation_id=current_conversation_id,
+                            canonical_output=canonical_output,
+                        )
+                    finally:
+                        self.last_execution_strategy_snapshot = (
+                            active_strategy.snapshot()
+                        )
 
         routing_token = _CHAT_ROUTING_CONTEXT.set(
             dict(self._chat_autonomous_context)
@@ -8395,7 +8887,9 @@ class OSIAAgent:
         token = _SCHEDULED_EXECUTION_CONTEXT.set(context)
         try:
             with execution_context_scope(policy_context):
-                return self.run(user_input, **run_kwargs)
+                terminal_turn = bool(run_kwargs.pop("terminal_turn", False))
+                runner = self.run_terminal_turn if terminal_turn else self.run
+                return runner(user_input, **run_kwargs)
         finally:
             self.messages = [
                 message for message in self.messages
@@ -8887,6 +9381,7 @@ class OSIAAgent:
                     except Exception:
                         capability_events = ()
                     for capability_event in capability_events:
+                        terminality = self._terminality_controller
                         event_source = str(
                             getattr(capability_event, "source", "") or ""
                         )
@@ -8896,6 +9391,37 @@ class OSIAAgent:
                         event_outcome = str(
                             getattr(capability_event, "outcome", "") or ""
                         )
+                        event_attempt_id = str(
+                            getattr(capability_event, "tool_attempt_id", "") or ""
+                        )
+                        if terminality is not None and event_source == "provider_native":
+                            terminality.require_execution(
+                                (
+                                    _execution_strategy.current_execution_strategy().goal.observable_success_postcondition
+                                    if _execution_strategy.current_execution_strategy() is not None
+                                    else ""
+                                )
+                            )
+                            if event_phase in {"accepted", "started"} and event_attempt_id:
+                                terminality.set_attempt_state(
+                                    event_attempt_id,
+                                    status=("pending" if event_outcome == "permission_pending" else "running"),
+                                    permission_state=("pending" if event_outcome == "permission_pending" else ""),
+                                )
+                            if event_phase in {"completed", "denied"}:
+                                terminality.record_typed_evidence(
+                                    outcome=event_outcome,
+                                    evidence={
+                                        "source": event_source,
+                                        "identity": str(getattr(capability_event, "identity", "") or ""),
+                                        "tool_name": str(getattr(capability_event, "tool_name", "") or ""),
+                                    },
+                                    attempt_id=event_attempt_id,
+                                    reason_code="provider_native_" + event_phase,
+                                    useful_progress=(event_outcome == "success_verified"),
+                                )
+                                if event_attempt_id:
+                                    terminality.set_attempt_state(event_attempt_id, status="completed")
                         if (
                             event_source == "provider_native"
                             and event_phase == "denied"
@@ -8923,6 +9449,10 @@ class OSIAAgent:
                                     "reason_code": event_outcome,
                                     "attempt_id": "",
                                 }
+                            if terminality is not None:
+                                terminality.set_permission_state(
+                                    event_outcome.removeprefix("permission_")
+                                )
                             return self._finish_structural_execution_state(
                                 event_outcome,
                                 on_sentence=on_sentence,
@@ -9971,6 +10501,19 @@ class OSIAAgent:
                         and self._tool_attempt_metadata is not None
                     ):
                         tool_execution_barrier_committed = True
+                        return self._suspend_tool_turn(
+                            tool_name, kwargs, execution_record,
+                        )
+                    if (
+                        execution_record.outcome == ExecutionOutcome.OUTCOME_UNKNOWN
+                        and self._tool_attempt_metadata is not None
+                        and self._terminality_controller is not None
+                        and execution_record.tool_attempt_id
+                    ):
+                        tool_execution_barrier_committed = True
+                        turn_has_unknown_outcome = True
+                        if execution_record.timed_out:
+                            turn_has_tool_timeout = True
                         return self._suspend_tool_turn(
                             tool_name, kwargs, execution_record,
                         )

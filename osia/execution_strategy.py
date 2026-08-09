@@ -107,12 +107,18 @@ class SemanticGoal:
     observable_success_postcondition: str
     fingerprint: str
     requires_execution: bool = False
+    required_postconditions: tuple[str, ...] = ()
 
     def public_dict(self) -> dict:
         return asdict(self)
 
 
-def derive_semantic_goal(request: str, *, postcondition: str = "") -> SemanticGoal:
+def derive_semantic_goal(
+    request: str,
+    *,
+    postcondition: str = "",
+    postconditions: Iterable[str] = (),
+) -> SemanticGoal:
     """Derive bounded goal invariants without an extra model call.
 
     The parser intentionally extracts only explicit constraints.  Missing
@@ -142,16 +148,23 @@ def derive_semantic_goal(request: str, *, postcondition: str = "") -> SemanticGo
         account = "specified_account"
 
     action = ""
+    action_match = None
     for canonical, pattern in _ACTION_PATTERNS:
-        if re.search(pattern, norm):
-            action = canonical
-            break
+        for match in re.finditer(pattern, norm):
+            if (
+                (match.start() > 0 and norm[match.start() - 1] in "-_")
+                or (match.end() < len(norm) and norm[match.end()] in "-_")
+            ):
+                continue
+            if action_match is None or match.start() > action_match.start():
+                action = canonical
+                action_match = match
 
     target = ""
     quoted = re.findall(r"[\"'\u201c\u201d\u00ab\u00bb]([^\"'\u201c\u201d\u00ab\u00bb]{1,160})[\"'\u201c\u201d\u00ab\u00bb]", source)
     if quoted:
         target = _bounded(quoted[-1], 160)
-    if action == "search":
+    if action == "search" and not quoted:
         search_match = re.search(
             r"\b(?:search(?:\s+for)?|find|look\s+for|cherche(?:r)?|"
             r"recherche(?:r)?)\b\s+(?:for\s+|pour\s+)?(.{1,220})$",
@@ -159,16 +172,41 @@ def derive_semantic_goal(request: str, *, postcondition: str = "") -> SemanticGo
         )
         if search_match:
             candidate = search_match.group(1).strip(" .?!,;:")
+            candidate = re.split(
+                r"(?:[;!?]|\.\s+)",
+                candidate,
+                maxsplit=1,
+            )[0].strip()
             if " for " in candidate:
                 candidate = candidate.rsplit(" for ", 1)[-1]
             if " pour " in candidate:
                 candidate = candidate.rsplit(" pour ", 1)[-1]
             target = _bounded(candidate, 160)
+    elif action_match is not None and not quoted:
+        candidate = norm[action_match.end():].strip(" .?!,;:")
+        candidate = re.split(r"[.;!?]", candidate, maxsplit=1)[0].strip()
+        candidate = re.sub(
+            r"^(?:to|for|on|at|in|the|a|an|le|la|les|un|une|des|du|de|a|au|aux)\s+",
+            "",
+            candidate,
+        )
+        candidate = re.split(
+            r"\b(?:and then|then|and|puis|ensuite|et)\b",
+            candidate,
+            maxsplit=1,
+        )[0].strip(" .?!,;:")
+        if candidate:
+            target = _bounded(candidate, 160)
     if not target:
         target = application or surface or _bounded(source, 160)
 
+    explicit_postconditions = tuple(
+        _bounded(item, 320) for item in postconditions if _bounded(item, 320)
+    )
     if postcondition:
         success = _bounded(postcondition, 320)
+    elif explicit_postconditions:
+        success = explicit_postconditions[0]
     else:
         where = " ".join(part for part in (application, surface) if part)
         if action == "search":
@@ -191,6 +229,22 @@ def derive_semantic_goal(request: str, *, postcondition: str = "") -> SemanticGo
             norm,
         )
     )
+    if (
+        action == "create"
+        and not application
+        and not surface
+        and not re.search(
+            r"\b(file|folder|directory|spreadsheet|workbook|document|pdf|"
+            r"presentation|slides?|calendar|event|reminder|scheduled task|"
+            r"account|record|database|table|project|issue|ticket|fichier|"
+            r"dossier|repertoire|classeur|feuille de calcul|document|"
+            r"presentation|diapos?|calendrier|evenement|rappel|tache|compte|"
+            r"enregistrement|base de donnees|tableau|projet|ticket)\b",
+            norm,
+        )
+    ):
+        requires_execution = False
+    required = explicit_postconditions or (success,)
     payload = {
         "target_object": target,
         "required_application": application,
@@ -200,9 +254,18 @@ def derive_semantic_goal(request: str, *, postcondition: str = "") -> SemanticGo
         "observable_success_postcondition": success,
     }
     fingerprint = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        json.dumps(
+            {**payload, "required_postconditions": required},
+            sort_keys=True,
+            ensure_ascii=True,
+        ).encode("utf-8")
     ).hexdigest()[:24]
-    return SemanticGoal(**payload, fingerprint=fingerprint, requires_execution=requires_execution)
+    return SemanticGoal(
+        **payload,
+        fingerprint=fingerprint,
+        requires_execution=requires_execution,
+        required_postconditions=required,
+    )
 
 
 @dataclass(frozen=True)
@@ -281,6 +344,7 @@ class ExecutionStrategy:
         self.current_mechanism = ""
         self.current_layer: int | None = None
         self.postcondition_evidence: list[str] = []
+        self.proven_postconditions: dict[str, str] = {}
         self.succeeded = False
         self.frozen_reason = ""
         self._evidence_revision = 0
@@ -517,10 +581,13 @@ class ExecutionStrategy:
                     attempt.status = AttemptStatus.FAILED.value
                     attempt.failure_or_stagnation_reason = "postcondition_unverified"
                     self._failed_signatures[attempt.action_signature] = self._evidence_revision
-                elif mechanism.covers_goal:
+                elif mechanism.covers_goal and len(self.goal.required_postconditions) == 1:
                     attempt.status = AttemptStatus.SUCCEEDED.value
                     attempt.postcondition_evidence = evidence
                     self.postcondition_evidence.append(evidence)
+                    self.proven_postconditions[
+                        self.goal.required_postconditions[0]
+                    ] = evidence
                     self.succeeded = True
                 else:
                     attempt.status = AttemptStatus.PROGRESSED.value
@@ -540,19 +607,39 @@ class ExecutionStrategy:
             if not self.frozen_reason:
                 return
             if succeeded and evidence:
-                self.succeeded = True
-                self.postcondition_evidence.append(_bounded(evidence, 180))
+                bounded = _bounded(evidence, 180)
+                self.postcondition_evidence.append(bounded)
+                required = self.goal.required_postconditions or (
+                    self.goal.observable_success_postcondition,
+                )
+                if len(required) == 1:
+                    self.proven_postconditions[required[0]] = bounded
+                    self.succeeded = True
             self.frozen_reason = ""
             self._evidence_revision += 1
 
-    def verify_postcondition(self, evidence: str) -> bool:
+    def verify_postcondition(
+        self,
+        evidence: str,
+        *,
+        postcondition: str = "",
+    ) -> bool:
         """Accept only explicit read-only evidence for the goal postcondition."""
 
         with self._lock:
             bounded = _bounded(evidence, 180)
             if not bounded or self.frozen_reason:
                 return False
-            self.succeeded = True
+            required = self.goal.required_postconditions or (
+                self.goal.observable_success_postcondition,
+            )
+            target = _bounded(postcondition, 320)
+            if not target and len(required) == 1:
+                target = required[0]
+            if target not in required:
+                return False
+            self.proven_postconditions[target] = bounded
+            self.succeeded = all(item in self.proven_postconditions for item in required)
             self.postcondition_evidence.append(bounded)
             self._evidence_revision += 1
             return True
@@ -592,13 +679,78 @@ class ExecutionStrategy:
                 "current_mechanism": self.current_mechanism,
                 "current_layer": self.current_layer,
                 "attempts": [item.public_dict() for item in self.attempts[-16:]],
+                "mechanisms": [
+                    {
+                        **asdict(item),
+                        "layer": int(item.layer),
+                    }
+                    for item in sorted(
+                        self._mechanisms.values(),
+                        key=lambda value: (int(value.layer), value.mechanism_id),
+                    )
+                ],
                 "alternatives_still_applicable": [
                     item.mechanism_id for item in self.remaining_mechanisms()
                 ],
                 "postcondition_evidence": list(self.postcondition_evidence[-8:]),
+                "proven_postconditions": dict(self.proven_postconditions),
                 "frozen_reason": self.frozen_reason,
                 "succeeded": self.succeeded,
+                "evidence_revision": self._evidence_revision,
+                "evidence_tokens": sorted(self._evidence_tokens)[-64:],
+                "failed_signatures": dict(self._failed_signatures),
+                "signature_attempt_counts": dict(self._signature_attempt_counts),
+                "stale_mechanisms": dict(self._stale_mechanisms),
+                "terminal_prompt_tokens": sorted(self._terminal_prompt_tokens)[-32:],
             }
+
+    @classmethod
+    def from_snapshot(cls, snapshot: dict) -> "ExecutionStrategy":
+        """Restore the exact frontier for another provider segment."""
+
+        if not isinstance(snapshot, dict) or not isinstance(snapshot.get("goal"), dict):
+            raise ValueError("invalid execution strategy snapshot")
+        goal_data = dict(snapshot["goal"])
+        goal_data["required_postconditions"] = tuple(
+            goal_data.get("required_postconditions") or ()
+        )
+        goal = SemanticGoal(**goal_data)
+        mechanisms = []
+        for raw in snapshot.get("mechanisms") or []:
+            if not isinstance(raw, dict):
+                continue
+            data = dict(raw)
+            data["layer"] = StrategyLayer(int(data["layer"]))
+            mechanisms.append(StrategyMechanism(**data))
+        strategy = cls(goal, mechanisms)
+        strategy.attempts = [
+            StrategyAttempt(**dict(item))
+            for item in snapshot.get("attempts") or []
+            if isinstance(item, dict)
+        ]
+        strategy.current_mechanism = str(snapshot.get("current_mechanism") or "")
+        layer = snapshot.get("current_layer")
+        strategy.current_layer = int(layer) if layer is not None else None
+        strategy.postcondition_evidence = list(snapshot.get("postcondition_evidence") or [])
+        strategy.proven_postconditions = dict(snapshot.get("proven_postconditions") or {})
+        strategy.frozen_reason = str(snapshot.get("frozen_reason") or "")
+        strategy.succeeded = bool(snapshot.get("succeeded"))
+        strategy._evidence_revision = int(snapshot.get("evidence_revision") or 0)
+        strategy._evidence_tokens = set(snapshot.get("evidence_tokens") or [])
+        strategy._failed_signatures = {
+            str(key): int(value)
+            for key, value in (snapshot.get("failed_signatures") or {}).items()
+        }
+        strategy._signature_attempt_counts = {
+            str(key): int(value)
+            for key, value in (snapshot.get("signature_attempt_counts") or {}).items()
+        }
+        strategy._stale_mechanisms = {
+            str(key): int(value)
+            for key, value in (snapshot.get("stale_mechanisms") or {}).items()
+        }
+        strategy._terminal_prompt_tokens = set(snapshot.get("terminal_prompt_tokens") or [])
+        return strategy
 
     def model_instruction(self) -> str:
         available = [
@@ -677,6 +829,7 @@ _OBSERVATION_TOOLS = frozenset({
     "steam_game_state", "web_state", "get_current_url", "read_page",
     "get_page_text", "inspect_browser_page", "inspect_form_fields",
     "list_browser_tabs", "get_browser_download", "read_file", "list_files",
+    "search_files",
 })
 
 _DOM_ACTION_TOOLS = frozenset({
@@ -765,8 +918,11 @@ def build_execution_strategy(
     available_tools: Iterable[str] = (),
     *,
     postcondition: str = "",
+    postconditions: Iterable[str] = (),
 ) -> ExecutionStrategy:
-    goal = derive_semantic_goal(request, postcondition=postcondition)
+    goal = derive_semantic_goal(
+        request, postcondition=postcondition, postconditions=postconditions,
+    )
     tools = frozenset(str(item) for item in available_tools)
     mechanisms: list[StrategyMechanism] = []
     deep_link = _recommended_deep_link(goal)
@@ -893,10 +1049,16 @@ def tool_preflight(tool_name: str, arguments: dict) -> StrategyDecision | None:
     return strategy.select(mechanism, {"tool": tool_name, "arguments": arguments})
 
 
-def record_tool_observation(tool_name: str, result: object, *, is_error: bool) -> None:
-    strategy = current_execution_strategy()
+def record_tool_observation(
+    tool_name: str,
+    result: object,
+    *,
+    is_error: bool,
+    strategy: ExecutionStrategy | None = None,
+) -> bool:
+    strategy = strategy or current_execution_strategy()
     if strategy is None or tool_name not in _OBSERVATION_TOOLS or is_error:
-        return
+        return False
     digest = hashlib.sha256(_bounded(result, 2000).encode("utf-8", errors="replace")).hexdigest()[:16]
     strategy.observe(f"read-only observation from {tool_name}", evidence_token=f"{tool_name}:{digest}")
     text = _normalized(result)
@@ -913,6 +1075,11 @@ def record_tool_observation(tool_name: str, result: object, *, is_error: bool) -
     goal = strategy.goal
     page_proves_goal = (
         tool_name in {"read_page", "get_page_text", "inspect_browser_page"}
+        and target_visible
+    )
+    file_search_proves_goal = (
+        tool_name in {"search_files", "list_files"}
+        and goal.requested_action == "search"
         and target_visible
     )
     app_state_proves_goal = (
@@ -935,6 +1102,7 @@ def record_tool_observation(tool_name: str, result: object, *, is_error: bool) -
     )
     proves_goal = not negative and (
         page_proves_goal
+        or file_search_proves_goal
         or app_state_proves_goal
         or steam_state_proves_goal
         or web_state_proves_goal
@@ -944,13 +1112,67 @@ def record_tool_observation(tool_name: str, result: object, *, is_error: bool) -
             strategy.reconcile(
                 succeeded=True, evidence=f"{tool_name}:{digest}",
             )
+            return True
         elif negative and tool_name in {
-            "is_running", "has_window", "steam_game_state", "web_state",
+            "search_files", "list_files", "is_running", "has_window",
+            "steam_game_state", "web_state",
         }:
             strategy.reconcile(succeeded=False, evidence=f"{tool_name}:{digest}")
-        return
+        return False
     if proves_goal:
-        strategy.verify_postcondition(f"{tool_name}:{digest}")
+        return strategy.verify_postcondition(f"{tool_name}:{digest}")
+    return False
+
+
+def record_resumed_tool_outcome(
+    strategy: ExecutionStrategy,
+    tool_name: str,
+    execution_record,
+) -> None:
+    """Reconcile a durable pending receipt against the preserved strategy."""
+
+    outcome_value = getattr(getattr(execution_record, "outcome", None), "value", None)
+    outcome = _normalized(
+        outcome_value or getattr(execution_record, "outcome", "")
+    ).replace(" ", "_")
+    is_error = bool(getattr(execution_record, "is_error", False))
+    result = getattr(execution_record, "result", "")
+    observation_proven = record_tool_observation(
+        tool_name,
+        result,
+        is_error=is_error,
+        strategy=strategy,
+    )
+    if not strategy.frozen_reason:
+        return
+    terminal_receipt = outcome in {
+        "success_verified",
+        "success_unverified",
+        "confirmed_failure_before_effect",
+        "failed_before_effect",
+        "cancelled_proven",
+        "rejected_before_execution",
+    }
+    if not terminal_receipt:
+        return
+    evidence = hashlib.sha256(
+        _bounded(result, 4000).encode("utf-8", errors="replace")
+    ).hexdigest()[:20]
+    current = strategy._mechanisms.get(strategy.current_mechanism)
+    covers_goal = bool(
+        outcome == "success_verified"
+        and not is_error
+        and current is not None
+        and current.covers_goal
+        and (
+            tool_name not in _OBSERVATION_TOOLS
+            or observation_proven
+        )
+    )
+    strategy.reconcile(
+        succeeded=covers_goal,
+        evidence=f"{tool_name}:{evidence}",
+    )
 
 
 def record_tool_outcome(
@@ -1018,12 +1240,17 @@ def execution_strategy_scope(
     available_tools: Iterable[str] = (),
     *,
     postcondition: str = "",
+    postconditions: Iterable[str] = (),
+    strategy: ExecutionStrategy | None = None,
 ):
-    strategy = build_execution_strategy(
-        request, available_tools, postcondition=postcondition,
+    active = strategy or build_execution_strategy(
+        request,
+        available_tools,
+        postcondition=postcondition,
+        postconditions=postconditions,
     )
-    token = _ACTIVE_STRATEGY.set(strategy)
+    token = _ACTIVE_STRATEGY.set(active)
     try:
-        yield strategy
+        yield active
     finally:
         _ACTIVE_STRATEGY.reset(token)

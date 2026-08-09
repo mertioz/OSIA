@@ -2247,6 +2247,15 @@ async def _handle_correlated_chat_cancellation(
             return False
 
     status = "cancellation_requested"
+    terminality_cancel = meta.get("_terminality_cancel")
+    if callable(terminality_cancel):
+        try:
+            terminality_cancel(
+                turn_id,
+                effect_possible=bool(active_attempt_id),
+            )
+        except Exception:
+            pass
     if isinstance(attempt, dict):
         attempt_id = str(attempt.get("tool_attempt_id") or "")
         try:
@@ -4875,6 +4884,10 @@ def _server_run_cron_task(
             print(f"[OSIA Server CRON] set_model({selected_model!r}) failed: {e}")
 
     conversation_stale = False
+    terminal_turn_id = str(
+        (scheduled_execution or {}).get("occurrence_id")
+        or ("cron-" + secrets.token_hex(16))
+    )
     conv = conversations.get_conversation(conversation_id) if conversation_id else None
     if conversation_id and conv is None:
         conversation_stale = True
@@ -4890,12 +4903,15 @@ def _server_run_cron_task(
                 reply = agent.run_scheduled(
                     task_text,
                     scheduled_execution,
+                    terminal_turn=True,
+                    turn_id=terminal_turn_id,
                     history=history,
                     current_conversation_id=conversation_id,
                 )
             else:
-                reply = agent.run(
+                reply = agent.run_terminal_turn(
                     task_text,
+                    turn_id=terminal_turn_id,
                     history=history,
                     current_conversation_id=conversation_id,
                 )
@@ -4928,13 +4944,20 @@ def _server_run_cron_task(
                 reply = agent.run_scheduled(
                     task_text,
                     scheduled_execution,
+                    terminal_turn=True,
+                    turn_id=terminal_turn_id,
                 )
             else:
-                reply = agent.run(task_text)
+                reply = agent.run_terminal_turn(
+                    task_text,
+                    turn_id=terminal_turn_id,
+                )
             display = clean_response(reply or "")
+        terminal = agent.terminality_result(terminal_turn_id)
+        terminal_state = str((terminal or {}).get("terminal_state") or "")
         if conversation_stale:
             return {
-                "status": "completed",
+                "status": terminal_state or "blocked_verified",
                 "conversation_stale": True,
                 "message": "linked conversation not found; ran unlinked",
             }
@@ -4946,7 +4969,7 @@ def _server_run_cron_task(
             )
             if blocked:
                 return {"status": "failed", "message": blocked}
-        return {"status": "completed"}
+        return {"status": terminal_state or "blocked_verified"}
     except Exception as e:
         print(f"[OSIA Server CRON] task error: {e}")
         traceback.print_exc()
@@ -11714,6 +11737,15 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         # supplied (a direct/legacy call); the live text/audio/vision paths
         # always pass get_agent, keyed by this turn's conversation.
         agent = get_agent(active_conv_id) if get_agent is not None else OSIAAgent()
+        if isinstance(turn_meta, dict):
+            cancel_turn = getattr(agent, "request_turn_cancellation", None)
+            if callable(cancel_turn):
+                turn_meta["_terminality_cancel"] = cancel_turn
+                if turn_meta.get("_tool_cancel_requested") is True:
+                    cancel_turn(
+                        str(turn_meta.get("turn_id") or ""),
+                        effect_possible=bool(turn_meta.get("_tool_attempt_id")),
+                    )
         selected_model = load_settings().get("selected_model")
         # Only (re)build the client when the agent isn't already on a clean
         # primary client for this model — the user switched models, a prior
@@ -11765,16 +11797,21 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             error,
         ) -> bool:
             del attempt_id
-            if error is not None:
-                final_text = (
-                    "Le r\u00e9sultat de l'action a \u00e9t\u00e9 conserv\u00e9, mais la "
-                    "reprise du m\u00eame fournisseur a \u00e9chou\u00e9. L'action "
-                    "n'a pas \u00e9t\u00e9 relanc\u00e9e."
-                    if turn_context.language == "fr" else
-                    "The action result was preserved, but continuation with "
-                    "the same provider failed. The action was not repeated."
+            terminal_result = getattr(agent, "terminality_result", None)
+            terminal = (
+                terminal_result(str((turn_meta or {}).get("turn_id") or ""))
+                if callable(terminal_result) else
+                {"terminal_state": "success_verified", "final_text": final_text}
+            )
+            if not terminal:
+                print(
+                    "[TERMINALITY] pending Mobile final held without a "
+                    "verified terminal reservation"
                 )
-                agent.messages.append({"role": "assistant", "content": final_text})
+                return False
+            final_text = str(terminal.get("final_text") or final_text or "")
+            if error is not None:
+                error = None
             from osia.agent import clean_response, strip_raw_tool_tags
 
             final_text = clean_response(
@@ -11981,6 +12018,17 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     str((turn_meta or {}).get("turn_id") or "chat"),
                     sink=_chat_document_progress,
                 ):
+                    terminal_runner = getattr(agent, "run_terminal_turn", None)
+                    if callable(terminal_runner):
+                        return terminal_runner(
+                            text,
+                            turn_id=str((turn_meta or {}).get("turn_id") or ""),
+                            history=history,
+                            on_sentence=on_sentence,
+                            on_first_token=on_first_token,
+                            current_conversation_id=active_conv_id,
+                            turn_context=turn_context,
+                        )
                     return agent.run(
                         text,
                         history=history,
@@ -12081,12 +12129,41 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 await asyncio.wrap_future(future)
             except Exception:
                 pass
+        terminality_result = getattr(locals().get("agent"), "terminality_result", None)
+        verified_terminal = (
+            terminality_result(str((turn_meta or {}).get("turn_id") or ""))
+            if callable(terminality_result) else None
+        )
+        if callable(terminality_result) and not verified_terminal:
+            provisional_chunks.clear()
+            if tts_session is not None:
+                tts_session.cancel()
+            if isinstance(turn_meta, dict):
+                await ws.send_json(
+                    _turn_status_frame(
+                        turn_meta, _active_turn_working_status(active_conv_id),
+                    )
+                )
+            current_task = asyncio.current_task()
+            if (
+                active_conv_id
+                and current_task is not None
+                and _ACTIVE_TURNS_BY_CONV.get(active_conv_id) is current_task
+            ):
+                holder = document_loop.create_future()
+                _ACTIVE_TURNS_BY_CONV[active_conv_id] = holder
+                pending_turn_holder[0] = holder
+            return history + [{"role": "user", "content": text}], active_conv_id
         if isinstance(turn_meta, dict):
             _retire_document_scope(
                 "chat", str(turn_meta.get("turn_id") or ""),
             )
             provisional_chunks.clear()
-            error_text = localized_text("provider_failure", turn_context.language)
+            error_text = (
+                str(verified_terminal.get("final_text") or "")
+                if isinstance(verified_terminal, dict) else
+                localized_text("provider_failure", turn_context.language)
+            )
             chunk_frame = _turn_event_frame(
                 turn_meta,
                 "response_chunk",
@@ -12103,12 +12180,16 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 message_id=str(turn_meta.get("assistant_message_id") or ""),
                 payload={"content": error_text},
             )
-            terminal_frame = _turn_status_frame(turn_meta, "error")
-            terminal_frame.update({
-                "stage": "response_generation",
-                "error_category": "provider_failure",
-                "reason_code": "provider_failure",
-            })
+            terminal_frame = _turn_status_frame(
+                turn_meta,
+                "done" if isinstance(verified_terminal, dict) else "error",
+            )
+            if not isinstance(verified_terminal, dict):
+                terminal_frame.update({
+                    "stage": "response_generation",
+                    "error_category": "provider_failure",
+                    "reason_code": "provider_failure",
+                })
             if accepted_user_persisted and _persist_completed_assistant_message(
                 active_conv_id,
                 error_text,
@@ -12157,6 +12238,17 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # flush, the final `response` message, and TTS synthesis — tool markup
     # must never reach the mobile client or be spoken.
     raw_response_text = response_text or ""
+    terminal_result = getattr(agent, "terminality_result", None)
+    terminal = (
+        terminal_result(str((turn_meta or {}).get("turn_id") or ""))
+        if callable(terminal_result) else
+        {"terminal_state": "success_verified", "final_text": response_text}
+    )
+    if not terminal:
+        raise RuntimeError(
+            "agent returned without a verified terminal reservation"
+        )
+    response_text = str(terminal.get("final_text") or response_text or "")
     if response_text:
         from osia.agent import clean_response, strip_raw_tool_tags
         response_text = clean_response(strip_raw_tool_tags(response_text)).strip()
