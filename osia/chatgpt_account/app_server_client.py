@@ -277,6 +277,8 @@ class CapabilityEvent:
     outcome: str
     item_id: str
     tool_attempt_id: str = ""
+    tool_name: str = ""
+    arguments: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -930,6 +932,8 @@ class AppServerClient:
         outcome: str,
         item_id: str,
         tool_attempt_id: str = "",
+        tool_name: str = "",
+        arguments: Mapping[str, Any] | None = None,
     ) -> None:
         attempt.capability_events.append(CapabilityEvent(
             source=source,
@@ -938,6 +942,8 @@ class AppServerClient:
             outcome=outcome,
             item_id=str(item_id or "")[:256],
             tool_attempt_id=str(tool_attempt_id or "")[:256],
+            tool_name=str(tool_name or "")[:128],
+            arguments=dict(arguments) if isinstance(arguments, Mapping) else None,
         ))
 
     def _file_change_broker_call(
@@ -1033,6 +1039,8 @@ class AppServerClient:
     def _deny_native_approval(
         self, attempt: _TurnAttempt, request_id: Any, method: str, item_id: str,
         *, outcome: str = "rejected_before_execution",
+        tool_name: str = "",
+        arguments: Mapping[str, Any] | None = None,
     ) -> None:
         try:
             self._send({"id": request_id, "result": {"decision": "decline"}})
@@ -1048,6 +1056,8 @@ class AppServerClient:
             phase="denied",
             outcome=outcome,
             item_id=item_id,
+            tool_name=tool_name,
+            arguments=arguments,
         )
 
     def _resolve_native_approval(
@@ -1115,7 +1125,22 @@ class AppServerClient:
                     return
             blocked = guard_tool_call(attempt.user_request, tool_name, arguments)
             if blocked is not None:
-                self._deny_native_approval(attempt, request_id, method, item_id)
+                from osia.permission_outcome import permission_outcome_from_text
+
+                permission_outcome = permission_outcome_from_text(blocked)
+                self._deny_native_approval(
+                    attempt,
+                    request_id,
+                    method,
+                    item_id,
+                    outcome=(
+                        f"permission_{permission_outcome.value}"
+                        if permission_outcome is not None
+                        else "rejected_before_execution"
+                    ),
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
                 return
             requires_permit = contract.confirmation in {
                 ConfirmationPolicy.CONFIRMATION_REQUIRED,
@@ -1123,10 +1148,20 @@ class AppServerClient:
             }
             has_permit = pending_execution_permit_matches(tool_name, arguments)
             if requires_permit and not has_permit:
-                self._deny_native_approval(attempt, request_id, method, item_id)
+                self._deny_native_approval(
+                    attempt, request_id, method, item_id,
+                    outcome="permission_internal_failure",
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
                 return
             if has_permit and not consume_pending_execution_permit(tool_name, arguments):
-                self._deny_native_approval(attempt, request_id, method, item_id)
+                self._deny_native_approval(
+                    attempt, request_id, method, item_id,
+                    outcome="permission_internal_failure",
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
                 return
 
             dispatch = _NativeDispatch(

@@ -508,6 +508,7 @@ class _AccountCompletions:
         self._owner = owner
 
     def create(self, *, model: str, messages: list[dict], stream: bool = False, **kwargs):
+        self._owner._set_capability_events(())
         conversation_id = self._owner.conversation_id or f"ephemeral:{id(self._owner)}"
         effort = kwargs.get("effort")
         timeout = _bounded_turn_timeout(kwargs.get("timeout", 300.0))
@@ -523,6 +524,9 @@ class _AccountCompletions:
                 effort=effort,
                 timeout=timeout,
             )
+            self._owner._set_capability_events(
+                getattr(result, "capability_events", ()),
+            )
             message = SimpleNamespace(content=result.text, tool_calls=None)
             return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
@@ -530,7 +534,7 @@ class _AccountCompletions:
 
         def worker():
             try:
-                self._owner.provider.complete(
+                result = self._owner.provider.complete(
                     conversation_id=conversation_id,
                     model=model,
                     messages=messages,
@@ -541,6 +545,9 @@ class _AccountCompletions:
                     effort=effort,
                     on_delta=lambda delta: events.put(("delta", delta)),
                     timeout=timeout,
+                )
+                self._owner._set_capability_events(
+                    getattr(result, "capability_events", ()),
                 )
                 events.put(("done", None))
             except Exception as exc:
@@ -577,7 +584,21 @@ class _AccountChatClient:
         self.conversation_id = conversation_id
         self.osia_turn_id: str | None = None
         self.final_response_message_id: str | None = None
+        self._capability_events: tuple = ()
+        self._capability_events_lock = threading.Lock()
         self.chat = SimpleNamespace(completions=_AccountCompletions(self))
+
+    def _set_capability_events(self, events) -> None:
+        with self._capability_events_lock:
+            self._capability_events = tuple(events or ())
+
+    def consume_capability_events(self) -> tuple:
+        """Return provider-native events from exactly one completed model call."""
+
+        with self._capability_events_lock:
+            events = self._capability_events
+            self._capability_events = ()
+        return events
 
     def set_conversation_id(self, conversation_id: str | None) -> None:
         self.conversation_id = conversation_id

@@ -33,6 +33,13 @@ import threading
 from enum import Enum
 from typing import Any, Optional
 
+from osia.permission_outcome import (
+    PermissionOutcome,
+    PermissionResult,
+    normalize_permission_result,
+    permission_error_text,
+)
+
 # Namespacing: mcp__<server_id>__<tool_name>. Matches the convention used for
 # MCP tools elsewhere (e.g. mcp__<server>__<tool>) and cannot collide with the
 # 48 native tool names (none contain "__").
@@ -107,8 +114,9 @@ def classify_tool(name: str, annotations: Optional[dict] = None) -> bool:
 # Process-wide confirmation provider. A UI (desktop Qt dialog / mobile WS round-
 # trip — later sub-steps) registers ONE provider; the gate calls it for write
 # tools when confirmation is enabled. Signature:
-# ``provider(server_id, tool_name, summary) -> bool | None``
-# True = approved, False = declined/denied, None = no approver target available.
+# ``provider(server_id, tool_name, summary) -> PermissionResult | bool | None``
+# Typed results preserve delivery failures.  Legacy True/False remain explicit
+# synchronous approve/deny decisions; None means presentation failed.
 # A missing provider also means no provider is registered (an unattended
 # cron/autonomous run).
 _confirmation_provider = None
@@ -228,34 +236,41 @@ def confirm_sensitive_action(
                 "confirmation scope unavailable"
             )
         try:
-            decision = provider(origin_id, tool_name, str(summary or ""))
+            raw_decision = provider(origin_id, tool_name, str(summary or ""))
+            decision = normalize_permission_result(
+                raw_decision,
+                correlation_id=grant.token,
+            )
         except Exception:
-            decision = False  # a provider failure is treated as a decline (safe)
-        if decision is not None:
-            if bool(decision):
-                # Turn the UI decision into one exact, opaque, expiring and
-                # single-use grant. Raw values never leave the hash boundary.
-                if CONFIRMATION_LEDGER.consume(
-                    grant.token, tool_name, normalized,
-                ):
-                    permit = policy.mint_permit(
-                        request, permission_decision, confirmed=True,
-                    )
-                    if permit is not None:
-                        hold_execution_permit(permit, request, policy=policy)
-                        return None
-                return (
-                    f"ERROR: {error_namespace}/{origin_id}/{tool_name}: "
-                    "confirmation scope unavailable"
+            decision = PermissionResult(
+                PermissionOutcome.INTERNAL_FAILURE,
+                grant.token,
+            )
+        if decision.approved:
+            # Turn the UI decision into one exact, opaque, expiring and
+            # single-use grant. Raw values never leave the hash boundary.
+            if CONFIRMATION_LEDGER.consume(
+                grant.token, tool_name, normalized,
+            ):
+                permit = policy.mint_permit(
+                    request, permission_decision, confirmed=True,
                 )
-            CONFIRMATION_LEDGER.consume(grant.token, tool_name, normalized)
+                if permit is not None:
+                    hold_execution_permit(permit, request, policy=policy)
+                    return None
             return (
-                f"ERROR: {error_namespace}/{origin_id}/{tool_name}: user declined"
+                f"ERROR: {error_namespace}/{origin_id}/{tool_name}: "
+                "confirmation scope unavailable"
             )
         CONFIRMATION_LEDGER.consume(grant.token, tool_name, normalized)
-    return (
-        f"ERROR: {error_namespace}/{origin_id}/{tool_name}: sensitive action blocked "
-        "(confirmation required, no approver available)"
+        return permission_error_text(
+            error_namespace, origin_id, tool_name, decision,
+        )
+    return permission_error_text(
+        error_namespace,
+        origin_id,
+        tool_name,
+        PermissionResult(PermissionOutcome.PRESENTATION_FAILED),
     )
 
 

@@ -123,6 +123,11 @@ from osia.attachments import (
     cleanup_orphan_batches,
 )
 from osia.config import CONFIG_DIR as _CONFIG_DIR, regenerate_mobile_token
+from osia.permission_outcome import (
+    PermissionOutcome,
+    PermissionResult,
+    normalize_permission_result,
+)
 from osia.document_progress import document_progress_scope
 from osia.version import current_product_version
 from osia.legacy_uploads import (
@@ -4009,9 +4014,9 @@ async def internal_mcp_oauth_switch(request: Request):
 # destructive MCP tool. THIS server registers a provider that does a WS round-
 # trip to the mobile client that ORIGINATED the current turn: send an
 # ``mcp_confirm_request``, block the agent's worker thread on a Future, then
-# resolve it when the matching ``mcp_confirm_response`` arrives (or deny on
-# timeout / no client / send failure). A device-bound request keeps waiting
-# across a transient Mobile transport disconnect.
+# resolve it when the matching ``mcp_confirm_response`` arrives. Timeout,
+# missing presentation and delivery failures stay typed. A device-bound
+# request keeps waiting across a transient Mobile transport disconnect.
 #
 # Correlating the worker-thread provider call back to the originating connection:
 # ``_turn_target`` is a ContextVar holding ``(channel, loop)``. The actual agent
@@ -4063,11 +4068,14 @@ class _PendingConfirmation:
         self.last_projected_channel = None
 
 
-def _settle_confirmation(entry: "_PendingConfirmation", approved: bool) -> None:
+def _settle_confirmation(entry: "_PendingConfirmation", result) -> None:
     if entry.future.done():
         return
     try:
-        entry.future.set_result(bool(approved))
+        entry.future.set_result(normalize_permission_result(
+            result,
+            correlation_id=str(entry.frame.get("id") or ""),
+        ))
     except Exception:
         pass
 
@@ -4091,9 +4099,41 @@ async def _project_pending_confirmation(
             expired = True
         frame = dict(entry.frame)
     if expired:
-        _settle_confirmation(entry, False)
+        _settle_confirmation(
+            entry,
+            PermissionResult(PermissionOutcome.TIMEOUT, request_id),
+        )
         return
-    await channel.send_json(frame)
+    try:
+        await channel.send_json(frame)
+    except Exception:
+        preserved_for_reconnect = False
+        with _pending_confirms_lock:
+            if _pending_confirms.get(request_id) is entry:
+                if entry.device_id:
+                    entry.channel = None
+                    entry.loop = None
+                    replacement = _confirmation_channels_by_device.get(
+                        entry.device_id,
+                    )
+                    if replacement is not None and replacement[0] is not channel:
+                        _schedule_confirmation_projection_locked(
+                            request_id, entry, replacement[0], replacement[1],
+                        )
+                    preserved_for_reconnect = True
+                else:
+                    _pending_confirms.pop(request_id, None)
+        if preserved_for_reconnect:
+            return
+        outcome = (
+            PermissionOutcome.DISCONNECTED
+            if bool(getattr(channel, "_closed", False))
+            else PermissionOutcome.PRESENTATION_FAILED
+        )
+        _settle_confirmation(
+            entry,
+            PermissionResult(outcome, request_id),
+        )
 
 
 def _schedule_confirmation_projection_locked(
@@ -4161,7 +4201,13 @@ def _attach_confirmation_channel(device_id: str, channel, loop) -> int:
             ):
                 restored += 1
     for entry in expired:
-        _settle_confirmation(entry, False)
+        _settle_confirmation(
+            entry,
+            PermissionResult(
+                PermissionOutcome.TIMEOUT,
+                str(entry.frame.get("id") or ""),
+            ),
+        )
     return restored
 
 
@@ -4184,7 +4230,16 @@ def _resolve_confirm(request_id: str, approved: bool, *, channel=None) -> bool:
             return False
         else:
             _pending_confirms.pop(request_id, None)
-    _settle_confirmation(entry, False if expired else bool(approved))
+    _settle_confirmation(
+        entry,
+        PermissionResult(
+            PermissionOutcome.TIMEOUT if expired else (
+                PermissionOutcome.ALLOWED
+                if bool(approved) else PermissionOutcome.USER_DENIED
+            ),
+            request_id,
+        ),
+    )
     return not expired
 
 
@@ -4219,20 +4274,27 @@ def _deny_confirms_for_channel(channel) -> None:
             entry.channel = None
             entry.loop = None
     for entry in denied:
-        _settle_confirmation(entry, False)
+        _settle_confirmation(
+            entry,
+            PermissionResult(
+                PermissionOutcome.DISCONNECTED,
+                str(entry.frame.get("id") or ""),
+            ),
+        )
 
 
-def _ws_confirm_provider(server_id: str, tool_name: str, summary: str) -> bool | None:
+def _ws_confirm_provider(
+    server_id: str, tool_name: str, summary: str,
+) -> PermissionResult:
     """MCP confirmation provider for the SERVER process. CALLED ON THE AGENT'S
     WORKER THREAD. Sends an ``mcp_confirm_request`` to the turn's originating
-    client and blocks until the user answers or the timeout elapses. Returns True
-    ONLY on an explicit approve, False on decline / timeout / disconnect, and
-    None when there is no active target to ask. Never raises (the provider
-    contract)."""
+    client and blocks until the user answers or the timeout elapses. Every exit
+    preserves its exact typed outcome; only a correlated response can produce
+    ``user_denied``. Never raises (the provider contract)."""
     try:
         target = _turn_target.get()
         if not target:
-            return None  # no originating channel; let unattended policy decide
+            return PermissionResult(PermissionOutcome.PRESENTATION_FAILED)
         channel, loop = target
         if (
             channel is None
@@ -4240,7 +4302,7 @@ def _ws_confirm_provider(server_id: str, tool_name: str, summary: str) -> bool |
             or not loop.is_running()
             or bool(getattr(channel, "_closed", False))
         ):
-            return None
+            return PermissionResult(PermissionOutcome.PRESENTATION_FAILED)
         with _pending_confirms_lock:
             request_id = secrets.token_hex(8)
             while request_id in _pending_confirms:
@@ -4277,7 +4339,10 @@ def _ws_confirm_provider(server_id: str, tool_name: str, summary: str) -> bool |
             # Never overwrite a live request even if the opaque-id generator
             # were unexpectedly forced to collide.
             if request_id in _pending_confirms:
-                return None
+                return PermissionResult(
+                    PermissionOutcome.INTERNAL_FAILURE,
+                    request_id,
+                )
             _pending_confirms[request_id] = entry
             scheduled = _schedule_confirmation_projection_locked(
                 request_id, entry, channel, loop,
@@ -4285,22 +4350,38 @@ def _ws_confirm_provider(server_id: str, tool_name: str, summary: str) -> bool |
             if not scheduled:
                 _pending_confirms.pop(request_id, None)
         if not scheduled:
-            return None
+            return PermissionResult(
+                PermissionOutcome.PRESENTATION_FAILED,
+                request_id,
+            )
         try:
-            approved = fut.result(
+            result = fut.result(
                 timeout=max(0.0, deadline - time.monotonic()),
             )
-        except Exception:  # TimeoutError or any -> deny
-            approved = False
+        except concurrent.futures.TimeoutError:
+            timeout_result = PermissionResult(
+                PermissionOutcome.TIMEOUT,
+                request_id,
+            )
+            _settle_confirmation(entry, timeout_result)
+            result = fut.result()
+        except Exception:
+            result = PermissionResult(
+                PermissionOutcome.INTERNAL_FAILURE,
+                request_id,
+            )
         finally:
             # Idempotent drop: a resolve already popped it; a timeout pops it here
             # so a late response finds nothing and is ignored (no double-resolve).
             with _pending_confirms_lock:
                 if _pending_confirms.get(request_id) is entry:
                     _pending_confirms.pop(request_id, None)
-        return bool(approved)
+        return normalize_permission_result(
+            result,
+            correlation_id=request_id,
+        )
     except Exception:
-        return False  # any failure -> deny (safe)
+        return PermissionResult(PermissionOutcome.INTERNAL_FAILURE)
 
 
 def _ws_reinforced_deletion_provider(plan) -> bool:

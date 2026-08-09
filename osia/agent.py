@@ -3668,6 +3668,9 @@ def tool_delete_scheduled_task(task_id: str = None, **_extra) -> str:
     return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
 
+_CONTINUATION_CONTROL_TOOL = "resolve_unfinished_execution"
+
+
 TOOL_MAP = {
     # Chat routing
     "start_autonomous_mission": tool_start_autonomous_mission,
@@ -3786,6 +3789,9 @@ TOOL_REGISTRY.assert_complete(TOOL_MAP)
 # parser) are validated against this set so arbitrary JSON the model shows
 # in prose (code examples, config snippets…) is never executed as a tool.
 KNOWN_TOOL_NAMES = set(TOOL_MAP.keys())
+# Provider-only semantic control. It is consumed before dispatch and is never
+# exposed as an executable capability in TOOL_MAP or the public tool registry.
+KNOWN_TOOL_NAMES.add(_CONTINUATION_CONTROL_TOOL)
 _DOCUMENT_TOOL_NAMES = frozenset({
     "read_document", "read_document_artifact", "query_document",
 })
@@ -3895,6 +3901,21 @@ def _same_turn_reused_execution_record(record):
         record.contract,
         reason_code=getattr(record, "reason_code", ""),
     )
+
+
+def _same_turn_completed_mutation_key(tool_name: str, arguments: dict) -> tuple:
+    """Return one exact in-memory key for a completed mutating call."""
+
+    canonical = json.dumps(
+        arguments,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return str(tool_name or ""), hashlib.sha256(
+        canonical.encode("utf-8", errors="replace"),
+    ).hexdigest()
 
 
 def _document_single_flight_result_is_shareable(record) -> bool:
@@ -4168,6 +4189,95 @@ def _apply_exact_autonomous_resume_call(agent, tool_calls):
     return [dict(call)]
 
 
+def _unfinished_execution_prompt(state: dict) -> str:
+    """Render one provider-only semantic continuation decision contract."""
+
+    call = state.get("call") if isinstance(state, dict) else None
+    if not isinstance(call, dict):
+        return ""
+    payload = {
+        "unfinished_call": call,
+        "outcome": str(state.get("outcome") or "failed_before_effect"),
+        "reason_code": str(state.get("reason_code") or "")[:96],
+    }
+    return (
+        "[Internal unfinished-execution contract. Before returning final prose, "
+        "make a semantic decision for the current user message. If the user is "
+        "asking to retry, resume or continue the unfinished work, emit exactly "
+        '<tool_call>{"tool":"resolve_unfinished_execution",'
+        '"decision":"resume"}</tool_call>. If the message is a different goal, '
+        "emit the same control call with decision=keep_pending before handling "
+        "that goal. If the user explicitly abandons the old work, use "
+        "decision=cancel. This is a structured decision, not a promise of future "
+        "work. OSIA will substitute the exact unfinished operation only after a "
+        "resume decision. Never restate or alter private argument values. State: "
+        + json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "]"
+    )
+
+
+def _same_unfinished_call(call: dict, state: dict) -> bool:
+    expected = state.get("call") if isinstance(state, dict) else None
+    return bool(isinstance(expected, dict) and call == expected)
+
+
+def _apply_unfinished_execution_decision(agent, tool_calls):
+    """Apply one model-selected semantic decision without parsing user phrases."""
+
+    state = getattr(agent, "_unfinished_execution", None)
+    if not isinstance(state, dict):
+        return tool_calls, ""
+    calls = [dict(call) for call in tool_calls if isinstance(call, dict)]
+    exact = next(
+        (call for call in calls if _same_unfinished_call(call, state)),
+        None,
+    )
+    if exact is not None:
+        agent._continuation_resolution_pending = False
+        agent._continuation_resume_selected = True
+        if (
+            str(state.get("outcome") or "") == "outcome_unknown"
+            and not getattr(agent, "_continuation_reconciled", False)
+        ):
+            agent._continuation_reconcile_required = True
+            return [], "reconcile"
+        return [exact], "resume"
+    control = next(
+        (
+            call for call in calls
+            if call.get("tool") == _CONTINUATION_CONTROL_TOOL
+        ),
+        None,
+    )
+    if control is None:
+        if calls:
+            # A different structured action is an unambiguous new-goal choice;
+            # preserve the old unfinished work without blocking the new one.
+            agent._continuation_resolution_pending = False
+        return calls, ""
+    decision = str(control.get("decision") or "").strip().lower()
+    siblings = [call for call in calls if call is not control]
+    if decision == "resume":
+        agent._continuation_resolution_pending = False
+        agent._continuation_resume_selected = True
+        if (
+            str(state.get("outcome") or "") == "outcome_unknown"
+            and not getattr(agent, "_continuation_reconciled", False)
+        ):
+            agent._continuation_reconcile_required = True
+            return [], "reconcile"
+        exact_call = state.get("call")
+        return [dict(exact_call)] if isinstance(exact_call, dict) else [], "resume"
+    if decision == "keep_pending":
+        agent._continuation_resolution_pending = False
+        return siblings, "keep_pending"
+    if decision == "cancel":
+        agent._unfinished_execution = None
+        agent._continuation_resolution_pending = False
+        return siblings, "cancel"
+    return [], "invalid"
+
+
 def _is_tool_error(result) -> bool:
     """A tool result is treated as a failure when its text is empty/whitespace
     or its first non-blank token begins with ERROR/ERREUR (with or
@@ -4186,12 +4296,24 @@ def _is_tool_error(result) -> bool:
 
 _PROMPT_TERMINAL_TOOL_REASONS = frozenset({
     "dns_failure", "authentication_failure", "permission_failure",
-    "command_blocked", "stale_semantic_reference",
+    "permission_user_denied", "permission_presentation_failed",
+    "permission_timeout", "permission_disconnected",
+    "permission_internal_failure", "command_blocked",
+    "stale_semantic_reference",
 })
 
 
 def _canonical_tool_reason_code(result=None, error: BaseException | None = None) -> str:
     """Classify a terminal tool failure without persisting private details."""
+
+    try:
+        from osia.permission_outcome import permission_outcome_from_text
+
+        permission_outcome = permission_outcome_from_text(result)
+    except Exception:
+        permission_outcome = None
+    if permission_outcome is not None:
+        return "permission_" + permission_outcome.value
 
     fragments: list[str] = []
     status_codes: set[int] = set()
@@ -4849,6 +4971,8 @@ def _execute_tool_with_policy(
     lang: str = "fr",
     enforce_execution_permit: bool = False,
     attempt_context: dict | None = None,
+    preflight_error: str | None = None,
+    preflight_reason_code: str = "",
 ):
     """Validate before dispatch and retry only proven-safe read failures."""
     from osia.tool_contracts import (
@@ -5118,6 +5242,25 @@ def _execute_tool_with_policy(
                 True, ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
                 0, False, False, contract,
             )
+
+    if preflight_error:
+        record = ToolExecutionRecord(
+            str(preflight_error),
+            True,
+            ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+            0,
+            False,
+            False,
+            contract,
+            attempt_id,
+            False,
+            preflight_reason_code or _canonical_tool_reason_code(
+                preflight_error,
+            ),
+        )
+        if attempt_id:
+            _persist_tool_attempt_terminal(attempt_store, attempt_id, record)
+        return record
 
     record = _execute_tool_once_record(
         tool_name, kwargs, timeout_s=timeout_s, contract=contract, lang=lang,
@@ -6800,6 +6943,12 @@ class OSIAAgent:
         self._pending_tool_attached_existing = False
         self._resume_effect_barrier = False
         self._resume_unknown_effect = False
+        self._unfinished_execution: dict | None = None
+        self._continuation_resolution_pending = False
+        self._continuation_resume_selected = False
+        self._continuation_reconcile_required = False
+        self._continuation_reconciled = False
+        self._continuation_control_retry_used = False
 
     def set_turn_context(self, context: TurnContext) -> None:
         """Apply one already-resolved language decision to subsequent model calls."""
@@ -6858,6 +7007,97 @@ class OSIAAgent:
         self._pending_tool_runtime = None
         self.last_pending_tool_attempt_id = ""
         self._pending_tool_attached_existing = False
+
+    def _active_tool_attempt_snapshot(self) -> dict | None:
+        metadata = self._tool_attempt_metadata
+        if not isinstance(metadata, dict):
+            return None
+        conversation_id = str(metadata.get("conversation_id") or "")
+        if not conversation_id:
+            return None
+        try:
+            from osia.tool_attempts import get_tool_attempt_store
+
+            active = get_tool_attempt_store().find_compatible_suspended_turn(
+                conversation_id,
+            )
+        except Exception:
+            return None
+        return dict(active) if isinstance(active, dict) else None
+
+    def _record_unfinished_execution(
+        self,
+        tool_name: str,
+        kwargs: dict,
+        execution_record,
+    ) -> None:
+        """Keep only the exact unfinished step; completed calls stay complete."""
+
+        from osia.tool_contracts import ExecutionOutcome
+
+        outcome = getattr(execution_record, "outcome", None)
+        call = {"tool": str(tool_name or "")}
+        call.update(dict(kwargs) if isinstance(kwargs, dict) else {})
+        current = self._unfinished_execution
+        matches_current = bool(
+            isinstance(current, dict)
+            and _same_unfinished_call(call, current)
+        )
+        if (
+            getattr(execution_record, "reason_code", "")
+            == "outcome_unknown_requires_reconciliation"
+            and isinstance(current, dict)
+        ):
+            return
+        if outcome in {
+            ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+            ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT,
+            ExecutionOutcome.OUTCOME_UNKNOWN,
+        }:
+            self._unfinished_execution = {
+                "call": call,
+                "outcome": (
+                    "outcome_unknown"
+                    if outcome is ExecutionOutcome.OUTCOME_UNKNOWN
+                    else "failed_before_effect"
+                ),
+                "reason_code": str(
+                    getattr(execution_record, "reason_code", "") or ""
+                )[:96],
+                "attempt_id": str(
+                    getattr(execution_record, "tool_attempt_id", "") or ""
+                )[:160],
+            }
+            return
+        if matches_current and outcome in {
+            ExecutionOutcome.SUCCESS_VERIFIED,
+            ExecutionOutcome.SUCCESS_UNVERIFIED,
+            ExecutionOutcome.PENDING,
+            ExecutionOutcome.CANCELLED_PROVEN,
+        }:
+            self._unfinished_execution = None
+
+    def _finish_structural_execution_state(
+        self,
+        code: str,
+        *,
+        on_sentence=None,
+    ) -> str:
+        """Emit one deterministic final for permission/continuation state."""
+
+        from osia.permission_outcome import execution_state_text
+
+        content = execution_state_text(code, self.lang)
+        if on_sentence is not None:
+            try:
+                on_sentence(content)
+            except Exception:
+                pass
+        self._mark_document_private_history()
+        self.messages.append({"role": "assistant", "content": content})
+        if self.turn_context is not None:
+            log_final(self.turn_context, content)
+        return content
 
     def activate_pending_tool_attempt(self) -> bool:
         from osia.tool_attempts import get_tool_attempt_coordinator
@@ -8037,6 +8277,13 @@ class OSIAAgent:
         self.last_run_document_error = None
         self._document_private_run = False
         self._semantic_form_values = []
+        self._continuation_resolution_pending = isinstance(
+            self._unfinished_execution, dict,
+        )
+        self._continuation_resume_selected = False
+        self._continuation_reconcile_required = False
+        self._continuation_reconciled = False
+        self._continuation_control_retry_used = False
 
         if turn_context is None:
             turn_context = resolve_turn_context(
@@ -8238,6 +8485,18 @@ class OSIAAgent:
 
         self._document_turn_start = len(self.messages)
 
+        active_attempt = self._active_tool_attempt_snapshot()
+        attempt_metadata = self._tool_attempt_metadata or {}
+        if (
+            active_attempt is not None
+            and not str(attempt_metadata.get("existing_attempt_id") or "")
+        ):
+            self.messages.append({"role": "user", "content": user_input})
+            return self._finish_structural_execution_state(
+                "active",
+                on_sentence=on_sentence,
+            )
+
         if scheduled_execution is not None:
             self.messages.append({
                 "role": "user",
@@ -8313,6 +8572,16 @@ class OSIAAgent:
                 "_internal": True,
                 "_execution_strategy": True,
                 "content": active_execution_strategy.model_instruction(),
+            })
+        continuation_prompt = _unfinished_execution_prompt(
+            self._unfinished_execution,
+        )
+        if continuation_prompt:
+            self.messages.append({
+                "role": "user",
+                "_internal": True,
+                "_execution_continuation": True,
+                "content": continuation_prompt,
             })
         self.messages.append({"role": "user", "content": user_input})
 
@@ -8450,6 +8719,8 @@ class OSIAAgent:
         # any tool ACTUALLY ran this turn, and whether the one allowed
         # "you never called the tool" retry has been spent.
         any_tool_executed = False
+        accepted_execution_transition = False
+        provider_execution_terminal = False
         hallucination_retry_used = False
         memory_save_tool_seen = False
         memory_save_tool_succeeded = False
@@ -8542,6 +8813,7 @@ class OSIAAgent:
         guard = _AntiLoopGuard(lang=self.lang)
         unresolved_tool_timeout = False
         document_single_flight = _SameTurnDocumentSingleFlight()
+        completed_mutations: dict[tuple, object] = {}
 
         # The chat path drives its OWN key rotation (the except block below +
         # _activate_next_api_key), so it never reaches with_key_rotation's
@@ -8606,6 +8878,82 @@ class OSIAAgent:
                     # structured tool calls on it (message.tool_calls).
                     message = response.choices[0].message
                     content = message.content or ""
+                consume_capability_events = getattr(
+                    self.client, "consume_capability_events", None,
+                )
+                if callable(consume_capability_events):
+                    try:
+                        capability_events = tuple(consume_capability_events())
+                    except Exception:
+                        capability_events = ()
+                    for capability_event in capability_events:
+                        event_source = str(
+                            getattr(capability_event, "source", "") or ""
+                        )
+                        event_phase = str(
+                            getattr(capability_event, "phase", "") or ""
+                        )
+                        event_outcome = str(
+                            getattr(capability_event, "outcome", "") or ""
+                        )
+                        if (
+                            event_source == "provider_native"
+                            and event_phase == "denied"
+                            and event_outcome in {
+                                "permission_user_denied",
+                                "permission_presentation_failed",
+                                "permission_timeout",
+                                "permission_disconnected",
+                                "permission_internal_failure",
+                            }
+                        ):
+                            event_tool_name = str(
+                                getattr(capability_event, "tool_name", "") or ""
+                            )
+                            event_arguments = getattr(
+                                capability_event, "arguments", None,
+                            )
+                            if event_tool_name and isinstance(event_arguments, dict):
+                                self._unfinished_execution = {
+                                    "call": {
+                                        "tool": event_tool_name,
+                                        **dict(event_arguments),
+                                    },
+                                    "outcome": "failed_before_effect",
+                                    "reason_code": event_outcome,
+                                    "attempt_id": "",
+                                }
+                            return self._finish_structural_execution_state(
+                                event_outcome,
+                                on_sentence=on_sentence,
+                            )
+                        if (
+                            event_source == "provider_native"
+                            and event_phase == "accepted"
+                            and event_outcome in {"dispatch_started", "read_only"}
+                        ):
+                            accepted_execution_transition = True
+                            any_tool_executed = True
+                            if event_outcome == "dispatch_started":
+                                tool_execution_barrier_committed = True
+                        if (
+                            event_source == "provider_native"
+                            and event_phase == "completed"
+                            and event_outcome in {
+                                "success_verified",
+                                "failed_before_effect",
+                                "failed_after_effect",
+                                "cancelled_proven",
+                                "outcome_unknown",
+                            }
+                        ):
+                            provider_execution_terminal = True
+                            if event_outcome == "success_verified":
+                                accepted_execution_transition = True
+                                any_tool_executed = True
+                            if event_outcome == "outcome_unknown":
+                                turn_has_unknown_outcome = True
+                                tool_execution_barrier_committed = True
             except _TurnBudgetStop:
                 guard.check_time()
                 return self._finish_anti_loop_stop(
@@ -8844,6 +9192,44 @@ class OSIAAgent:
                 content, message=message, provider=self.provider,
             )
             tool_calls = _apply_exact_autonomous_resume_call(self, tool_calls)
+            tool_calls, continuation_decision = (
+                _apply_unfinished_execution_decision(self, tool_calls)
+            )
+            if continuation_decision in {
+                "keep_pending", "cancel", "reconcile", "invalid",
+            } and not tool_calls:
+                self.messages.append({
+                    "role": "assistant",
+                    "_internal": True,
+                    "_provisional": True,
+                    "content": content,
+                })
+                if continuation_decision == "reconcile":
+                    instruction = (
+                        "The previous operation has a possible effect. Call one "
+                        "applicable read-only observation tool now to reconcile "
+                        "its postcondition. Do not replay or replace the unfinished "
+                        "mutation before that observation completes."
+                    )
+                elif continuation_decision == "invalid":
+                    instruction = (
+                        "The unfinished-execution decision was invalid. Emit exactly "
+                        "one resolve_unfinished_execution control call with decision "
+                        "resume, keep_pending, or cancel. Do not narrate a future action."
+                    )
+                else:
+                    instruction = (
+                        "The unfinished-execution decision is recorded. Answer the "
+                        "current user message now without claiming that the preserved "
+                        "operation was resumed."
+                    )
+                self.messages.append({
+                    "role": "user",
+                    "_internal": True,
+                    "_execution_continuation": True,
+                    "content": instruction,
+                })
+                continue
             if argument_repair_active:
                 repaired_name = (
                     str(tool_calls[0].get("tool") or "")
@@ -9043,6 +9429,7 @@ class OSIAAgent:
                             ConfirmationPolicy,
                             ExecutionOutcome,
                             ProgressEvidencePolicy,
+                            SideEffectClass,
                             ToolExecutionRecord,
                             ToolValidationError,
                             validate_tool_arguments,
@@ -9099,9 +9486,28 @@ class OSIAAgent:
                         argument_repair_active = False
                     attempted_model_tool_name = tool_name
                     attempted_model_kwargs = dict(kwargs)
-                    strategy_decision = _execution_strategy.tool_preflight(
-                        tool_name, kwargs,
-                    )
+                    continuation_policy_error = ""
+                    if (
+                        self._continuation_reconcile_required
+                        and effective.side_effect != SideEffectClass.READ_ONLY
+                    ):
+                        continuation_policy_error = (
+                            "ERROR: outcome_unknown_requires_reconciliation; "
+                            "the operation was not replayed"
+                        )
+                    if (
+                        self._continuation_resume_selected
+                        and isinstance(self._unfinished_execution, dict)
+                        and _same_unfinished_call(
+                            {"tool": tool_name, **kwargs},
+                            self._unfinished_execution,
+                        )
+                    ):
+                        strategy_decision = None
+                    else:
+                        strategy_decision = _execution_strategy.tool_preflight(
+                            tool_name, kwargs,
+                        )
                     strategy_policy_error = ""
                     if (
                         strategy_decision is not None
@@ -9200,7 +9606,37 @@ class OSIAAgent:
                     autonomous_policy_error = None
                     autonomous_execution_permit = False
                     same_turn_result_reused = False
-                    if strategy_policy_error:
+                    completed_mutation_key = None
+                    if effective.side_effect != SideEffectClass.READ_ONLY:
+                        try:
+                            completed_mutation_key = (
+                                _same_turn_completed_mutation_key(tool_name, kwargs)
+                            )
+                        except (TypeError, ValueError):
+                            completed_mutation_key = None
+                    completed_mutation = completed_mutations.get(
+                        completed_mutation_key,
+                    )
+                    if completed_mutation is not None:
+                        execution_record = _same_turn_reused_execution_record(
+                            completed_mutation,
+                        )
+                        result = execution_record.result
+                        is_error = execution_record.is_error
+                        same_turn_result_reused = True
+                    elif continuation_policy_error:
+                        result, is_error = continuation_policy_error, True
+                        execution_record = ToolExecutionRecord(
+                            result,
+                            True,
+                            ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+                            0,
+                            False,
+                            False,
+                            effective,
+                            reason_code="outcome_unknown_requires_reconciliation",
+                        )
+                    elif strategy_policy_error:
                         result, is_error = strategy_policy_error, True
                         execution_record = ToolExecutionRecord(
                             result,
@@ -9241,7 +9677,9 @@ class OSIAAgent:
                                 "ERROR: autonomous authorization unavailable; "
                                 "the action was not executed"
                             )
-                    if autonomous_policy_error:
+                    if same_turn_result_reused:
+                        pass
+                    elif autonomous_policy_error:
                         result, is_error = autonomous_policy_error, True
                         execution_record = ToolExecutionRecord(
                             result,
@@ -9360,16 +9798,25 @@ class OSIAAgent:
                             final_external_call = True
                             explicit_execution_permit = False
                         if policy_error:
-                            result, is_error = policy_error, True
-                            execution_record = ToolExecutionRecord(
-                                result,
-                                True,
-                                ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
-                                0,
-                                False,
-                                False,
-                                effective,
+                            execution_record = _execute_tool_with_policy(
+                                tool_name,
+                                kwargs,
+                                hard_deadline=(
+                                    guard.started_at + guard.hard_limit
+                                ),
+                                allow_retry=False,
+                                user_request=user_text,
+                                lang=self.lang,
+                                attempt_context=self._new_tool_attempt_context(
+                                    repair_count=argument_repair_used,
+                                ),
+                                preflight_error=policy_error,
+                                preflight_reason_code=(
+                                    _canonical_tool_reason_code(policy_error)
+                                ),
                             )
+                            result = execution_record.result
+                            is_error = execution_record.is_error
                         else:
                             def _dispatch_validated_document_call(
                                 dispatch_kwargs,
@@ -9448,9 +9895,18 @@ class OSIAAgent:
                             )
                             result = execution_record.result
                             is_error = execution_record.is_error
+                    if (
+                        not same_turn_result_reused
+                        and completed_mutation_key is not None
+                        and execution_record.outcome in {
+                            ExecutionOutcome.SUCCESS_VERIFIED,
+                            ExecutionOutcome.SUCCESS_UNVERIFIED,
+                        }
+                    ):
+                        completed_mutations[completed_mutation_key] = execution_record
                     if same_turn_result_reused:
                         print(
-                            "[OSIA Agent] same-turn document result reused: "
+                            "[OSIA Agent] same-turn completed result reused: "
                             f"{tool_name}"
                         )
                     try:
@@ -9485,6 +9941,26 @@ class OSIAAgent:
                         reason_code=execution_record.reason_code,
                         result=execution_record.result,
                     )
+                    self._record_unfinished_execution(
+                        tool_name,
+                        kwargs,
+                        execution_record,
+                    )
+                    if (
+                        self._continuation_reconcile_required
+                        and effective.side_effect == SideEffectClass.READ_ONLY
+                        and not execution_record.is_error
+                        and execution_record.dispatched
+                    ):
+                        self._continuation_reconcile_required = False
+                        self._continuation_reconciled = True
+                    if str(execution_record.reason_code or "").startswith(
+                        "permission_"
+                    ):
+                        return self._finish_structural_execution_state(
+                            str(execution_record.reason_code),
+                            on_sentence=on_sentence,
+                        )
                     if execution_record.outcome == ExecutionOutcome.CANCELLED_PROVEN:
                         tool_execution_barrier_committed = True
                         return self._finish_cancelled_tool_stop(
@@ -9845,12 +10321,39 @@ class OSIAAgent:
                         {"status": "failed"}, round_number,
                     )
 
+            if self._continuation_resolution_pending:
+                if not self._continuation_control_retry_used:
+                    self._continuation_control_retry_used = True
+                    self.messages.append({
+                        "role": "assistant",
+                        "_internal": True,
+                        "_provisional": True,
+                        "content": content,
+                    })
+                    self.messages.append({
+                        "role": "user",
+                        "_internal": True,
+                        "_execution_continuation": True,
+                        "content": (
+                            "A prior step is unfinished, but your candidate final "
+                            "contains no structured continuation decision. Emit "
+                            "resolve_unfinished_execution with decision resume, "
+                            "keep_pending, or cancel now. Do not promise a future action."
+                        ),
+                    })
+                    continue
+                return self._finish_structural_execution_state(
+                    "unresolved",
+                    on_sentence=on_sentence,
+                )
+
             active_execution_strategy = (
                 _execution_strategy.current_execution_strategy()
             )
             if (
                 active_execution_strategy is not None
                 and not chat_normal_route_confirmed
+                and not provider_execution_terminal
             ):
                 perseverance_instruction = (
                     active_execution_strategy.premature_final_instruction()
@@ -9869,6 +10372,17 @@ class OSIAAgent:
                         "content": perseverance_instruction,
                     })
                     continue
+                if (
+                    active_execution_strategy.goal.requires_execution
+                    and not accepted_execution_transition
+                    and not any_tool_executed
+                    and active_execution_strategy.final_diagnostic().get("code")
+                    == "safe_strategies_remain"
+                ):
+                    return self._finish_structural_execution_state(
+                        "unresolved",
+                        on_sentence=on_sentence,
+                    )
 
             #
             # STEP 4 — fallback honesty. Nothing was executed this round.

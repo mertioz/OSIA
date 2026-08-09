@@ -19,6 +19,7 @@ import osia.config as config
 from osia import oauth_relay
 from osia.integrations import google_oauth
 from osia.mcp_client import registry
+from osia.permission_outcome import PermissionOutcome
 from osia.tools import gmail
 
 
@@ -272,11 +273,10 @@ class GmailWriteSafetyTests(unittest.TestCase):
 
         token = server_mod._turn_target.set(None)
         try:
-            self.assertIsNone(
-                server_mod._ws_confirm_provider(
-                    "gmail", "gmail_create_draft", "safe summary"
-                )
+            result = server_mod._ws_confirm_provider(
+                "gmail", "gmail_create_draft", "safe summary"
             )
+            self.assertEqual(result.outcome, PermissionOutcome.PRESENTATION_FAILED)
         finally:
             server_mod._turn_target.reset(token)
 
