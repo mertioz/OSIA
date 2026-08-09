@@ -425,6 +425,30 @@ def _adb_text(adb: Path, serial: str | None, *arguments: str) -> str:
     return _run(_adb_args(adb, serial, *arguments), timeout=45.0).stdout.strip()
 
 
+def _adb_package_paths(adb: Path, serial: str, package: str) -> list[str]:
+    try:
+        completed = subprocess.run(
+            _adb_args(adb, serial, "shell", "pm", "path", package),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=45.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProbeError("Android package probe unavailable") from exc
+    output = completed.stdout.strip()
+    error = completed.stderr.strip()
+    if completed.returncode != 0 and (output or error):
+        raise ProbeError(error or output)
+    return [
+        line.removeprefix("package:").strip()
+        for line in output.splitlines()
+        if line.strip()
+    ]
+
+
 def _hash_remote_apk(
     adb: Path, serial: str, remote_path: str
 ) -> tuple[str, int]:
@@ -471,17 +495,11 @@ def inspect_android(
     selected_serial = device["serial"]
     result["device_serial"] = selected_serial
     try:
-        package_paths = [
-            line.removeprefix("package:").strip()
-            for line in _adb_text(
-                adb, selected_serial, "shell", "pm", "path", OFFICIAL_ANDROID_PACKAGE
-            ).splitlines()
-            if line.strip()
-        ]
+        package_paths = _adb_package_paths(
+            adb, selected_serial, OFFICIAL_ANDROID_PACKAGE
+        )
         forbidden = {
-            package: bool(
-                _adb_text(adb, selected_serial, "shell", "pm", "path", package)
-            )
+            package: bool(_adb_package_paths(adb, selected_serial, package))
             for package in FORBIDDEN_ANDROID_PACKAGES
         }
     except ProbeError as exc:

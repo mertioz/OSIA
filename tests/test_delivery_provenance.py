@@ -4,6 +4,7 @@ import hashlib
 import subprocess
 from pathlib import Path
 
+from tools import delivery_provenance as provenance
 from tools.delivery_provenance import (
     RuntimeRecord,
     assess_runtime,
@@ -129,6 +130,20 @@ def test_windows_adb_space_separated_device_is_detected():
     assert check.ok
     assert selected is not None
     assert selected["serial"] == "5C091JEBF03275"
+
+
+def test_absent_android_package_is_not_a_probe_failure(monkeypatch):
+    monkeypatch.setattr(
+        provenance.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 1, stdout="", stderr=""
+        ),
+    )
+
+    assert provenance._adb_package_paths(
+        Path("adb"), "physical-device", "space.osia.app.test"
+    ) == []
 
 
 def test_protected_dirty_checkout_is_reported_without_mutation(tmp_path):
