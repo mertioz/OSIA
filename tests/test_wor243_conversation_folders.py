@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 
 from osia import conversation_context, conversations
 
@@ -83,6 +84,55 @@ def test_folder_lifecycle_membership_order_and_restart(monkeypatch, tmp_path):
     assert moved_out["success"]
     assert conversations.get_conversation(conv["id"]) == original
     assert conversations.conversation_snapshot()["items"][0]["folder_id"] is None
+
+
+def test_projects_render_before_ungrouped_conversations():
+    source = (
+        Path(__file__).parents[1] / "osia" / "gui" / "main_popup.py"
+    ).read_text(encoding="utf-8")
+    method = source.index("def refresh(self, *, snapshot: dict | None = None)")
+    project_section = source.index('i18n.t("conversations.projects")')
+    project_rows = source.index("for index, folder in enumerate(folders)", method)
+    ungrouped_rows = source.index("for conv in ungrouped", method)
+
+    assert method < project_section < project_rows < ungrouped_rows
+
+
+def test_project_ui_copy_has_no_folder_terminology():
+    from osia import i18n
+
+    keys = {
+        "conversations.create_folder",
+        "conversations.folder_name",
+        "conversations.rename_folder",
+        "conversations.folder_settings",
+        "conversations.allow_folder_context",
+        "conversations.move_to_folder",
+        "conversations.remove_from_project",
+        "conversations.projects",
+        "conversations.ungrouped",
+        "conversations.move_folder_up",
+        "conversations.move_folder_down",
+        "conversations.bulk_delete_title",
+        "conversations.bulk_delete_confirm",
+        "conversations.bulk_delete_none",
+    }
+    visible_copy = "\n".join(
+        value
+        for key in keys
+        for value in i18n.TRANSLATIONS[key].values()
+    ).casefold()
+
+    for forbidden in (
+        "folder", "dossier", "ordner", "carpeta", "文件夹", "フォルダー",
+    ):
+        assert forbidden not in visible_copy
+    assert i18n.TRANSLATIONS["conversations.create_folder"]["en"] == (
+        "Create project"
+    )
+    assert i18n.TRANSLATIONS["conversations.create_folder"]["fr"] == (
+        "Créer un projet"
+    )
 
 
 def test_mobile_mutation_frames_round_trip_through_pc_snapshot(

@@ -1318,7 +1318,9 @@ class _ConvRow(QFrame):
 
     def _show_move_menu(self) -> None:
         menu = QMenu(self)
-        ungrouped = menu.addAction(i18n.t("conversations.ungrouped"))
+        ungrouped = menu.addAction(
+            i18n.t("conversations.remove_from_project")
+        )
         ungrouped.setCheckable(True)
         ungrouped.setChecked(not self._folder_id)
         ungrouped.triggered.connect(
@@ -1694,15 +1696,11 @@ class _ConversationsPanel(QWidget):
             self._host_layout.insertWidget(insert_at, row)
             insert_at += 1
 
-        ungrouped = [item for item in items if not item.get("folder_id")]
-        if folders and ungrouped:
-            label = QLabel(i18n.t("conversations.ungrouped"))
+        if folders:
+            label = QLabel(i18n.t("conversations.projects"))
             label.setObjectName("folderSectionLabel")
             self._host_layout.insertWidget(insert_at, label)
             insert_at += 1
-        for conv in ungrouped:
-            add_conversation(conv, indented=False)
-
         for index, folder in enumerate(folders):
             folder_id = str(folder.get("id") or "")
             members = [
@@ -1718,6 +1716,15 @@ class _ConversationsPanel(QWidget):
             if not folder.get("collapsed", False):
                 for conv in members:
                     add_conversation(conv, indented=True)
+
+        ungrouped = [item for item in items if not item.get("folder_id")]
+        if folders and ungrouped:
+            label = QLabel(i18n.t("conversations.ungrouped"))
+            label.setObjectName("folderSectionLabel")
+            self._host_layout.insertWidget(insert_at, label)
+            insert_at += 1
+        for conv in ungrouped:
+            add_conversation(conv, indented=False)
 
 
 # ── Model panel ─────────────────────────────────────────────────────────────
