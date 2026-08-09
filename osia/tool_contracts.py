@@ -1994,16 +1994,13 @@ def effective_static_tool_specs() -> tuple[ToolSpec, ...]:
 
 
 def static_tool_prompt_block(lang: str = "en") -> str:
-    """Render provider-facing native schemas from the authoritative registry."""
-    fr = str(lang or "").lower().startswith("fr")
+    """Render compact canonical signatures from the authoritative registry."""
+
+    del lang
     lines = [
-        "## Outils disponibles (schemas autoritatifs)" if fr
-        else "## Available Tools (authoritative schemas)",
-        (
-            "Les arguments doivent respecter exactement ces schemas; les champs inconnus sont refuses."
-            if fr else
-            "Arguments must match these schemas exactly; unknown fields are rejected."
-        ),
+        "## Available OSIA tools (authoritative signatures)",
+        "Only these OSIA tools exist on this turn's surface. Required and optional "
+        "top-level arguments must match the signatures; unknown fields are rejected.",
     ]
     for spec in effective_static_tool_specs():
         schema = spec.input_schema
@@ -2022,48 +2019,59 @@ def static_tool_prompt_block(lang: str = "en") -> str:
                 if isinstance(branch_required, list) and branch_required:
                     required = branch_required
                     break
-        parts = [f'"tool": "{spec.name}"']
-        for key in required:
-            if key in props:
-                parts.append(f'"{key}": {_schema_placeholder(props[key])}')
-        usage = "{" + ", ".join(parts) + "}"
+        required = [key for key in required if key in props]
+        signature = ", ".join(
+            f"{key}:{_prompt_schema_type(props[key])}" for key in required
+        )
         optional = [key for key in props if key not in required]
-        suffix = ""
         if optional:
-            label = "optionnels" if fr else "optional"
-            suffix = f" ({label}: {', '.join(optional)})"
-        lines.append(f"- {spec.name}: {spec.capability}. Usage: {usage}{suffix}")
+            signature += ("; " if signature else "") + "optional:" + ",".join(
+                f"{key}:{_prompt_schema_type(props[key])}" for key in optional
+            )
+        lines.append(f"- {spec.name}: ({signature}) {spec.capability}")
     return "\n".join(lines)
 
 
-def _schema_placeholder(schema: Any) -> str:
-    if isinstance(schema, dict) and "anyOf" in schema:
-        options = schema.get("anyOf") or []
-        schema = next((item for item in options
-                       if isinstance(item, dict) and item.get("type") != "null"), {})
+def _prompt_schema_type(schema: Any) -> str:
+    if isinstance(schema, dict):
+        options = schema.get("anyOf") or schema.get("oneOf") or []
+        if isinstance(options, list) and options:
+            variants = []
+            for item in options:
+                if not isinstance(item, dict) or item.get("type") == "null":
+                    continue
+                rendered = _prompt_schema_type(item)
+                if rendered not in variants:
+                    variants.append(rendered)
+            if variants:
+                return "|".join(variants[:4])
+    if isinstance(schema, dict) and isinstance(schema.get("enum"), list):
+        values = [str(value) for value in schema["enum"][:8]]
+        rendered = "|".join(values)
+        if rendered and len(rendered) <= 80:
+            return "enum[" + rendered + "]"
     kind = schema.get("type") if isinstance(schema, dict) else None
-    if kind == "boolean":
-        return "true"
-    if kind in {"integer", "number"}:
-        return "0"
-    if kind == "array":
-        return "[]"
-    if kind == "object":
-        return "{}"
-    return '"<value>"'
+    return {
+        "array": "list",
+        "boolean": "bool",
+        "integer": "int",
+        "number": "number",
+        "object": "object",
+        "string": "string",
+    }.get(kind, "value")
 
 
 def replace_static_tool_prompt_section(body: str, lang: str = "en") -> str:
-    fr = str(lang or "").lower().startswith("fr")
-    start = "## Outils disponibles" if fr else "## Available Tools"
-    end = "## Comment utiliser les outils" if fr else "## How to Use Tools"
+    del lang
+    start = "## Available Tools"
+    end = "## How to Use Tools"
     start_index = body.find(start)
     end_index = body.find(end)
     if start_index < 0 or end_index <= start_index:
         return body
     return (
         body[:start_index]
-        + static_tool_prompt_block(lang)
+        + static_tool_prompt_block()
         + "\n\n"
         + body[end_index:]
     )

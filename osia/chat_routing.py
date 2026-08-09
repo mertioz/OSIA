@@ -81,26 +81,9 @@ _SCHEDULE_ROUTE_RE = re.compile(
 
 
 def routing_prompt(language: str = "en") -> str:
-    """Return the provider-only routing policy; never includes hidden reasoning."""
+    """Return the single canonical provider-only routing policy."""
 
-    if str(language or "").lower().startswith("fr"):
-        return (
-            "## Routage Chat / Autonomous\n"
-            "Avant tout appel d'outil normal, choisis une seule route pour la "
-            "demande courante : chat normal, Autonomous, Scheduled Tasks, ou "
-            "clarification. N'ajoute aucune requête de classification. Les "
-            "questions simples et actions courtes restent dans le chat normal. "
-            "Toute demande future/récurrente utilise exclusivement les outils "
-            "Scheduled Tasks. Pour une demande naturelle explicite d'Autonomous, "
-            "ou un travail réellement long qui exige des phases dépendantes, une "
-            "recherche prolongée, des itérations d'artefact, un contrôle soutenu "
-            "de l'ordinateur, ou qui ne tient pas raisonnablement dans un tour, "
-            "appelle start_autonomous_mission AVANT tout autre outil. Fournis "
-            "seulement reason_code, confidence et explicit_request ; ne révèle "
-            "aucun raisonnement privé. Ne combine jamais ce handoff avec un autre "
-            "outil dans le même lot. Si l'objectif essentiel manque, pose une "
-            "question de clarification."
-        )
+    del language
     return (
         "## Chat / Autonomous routing\n"
         "Before any normal tool call, choose exactly one route for the current "

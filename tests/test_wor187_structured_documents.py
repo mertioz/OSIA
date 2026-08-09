@@ -464,7 +464,8 @@ def test_model_contract_advertises_exact_path_or_opaque_source_and_complete_quer
             validate_arguments(read_spec.input_schema, invalid)
     prompt = static_tool_prompt_block("en")
     read_line = next(line for line in prompt.splitlines() if line.startswith("- read_document:"))
-    assert '"path": "<value>"' in read_line
+    assert "(path:string; optional:source_ref:string" in read_line
+    assert r'{"path":"C:\\Users\\Example\\Desktop\\report.pdf"}' in read_line
     assert "never shell, read_file, or render_pdf" in read_line
     assert query_spec.side_effect.value == "read_only"
     assert query_spec.idempotency.value == "idempotent"

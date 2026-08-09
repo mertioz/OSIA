@@ -101,8 +101,8 @@ class MemoryAgentTests(unittest.TestCase):
 
         self.assertIn("save_memory", TOOL_MAP)
         self.assertIn("save_memory", prompt)
-        self.assertIn('{"ok": true}', prompt)
-        self.assertIn("Never say you remembered", prompt)
+        self.assertIn('{"ok":true}', prompt)
+        self.assertIn("Claim that memory was saved only after", prompt)
 
     def test_save_memory_tool_writes_and_returns_ok(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -474,7 +474,7 @@ class MemoryAgentTests(unittest.TestCase):
                     str(message.get("content", ""))
                     for message in agent.client.calls[-1]["messages"]
                 )
-                self.assertIn("Tool save_memory result", latest_wire_text)
+                self.assertIn("save_memory", latest_wire_text)
                 self.assertIn('"ok": true', latest_wire_text)
         finally:
             config.get_setting = original_get_setting

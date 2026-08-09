@@ -709,26 +709,12 @@ def mcp_tool_prompt_block(lang: str = "en") -> str:
         items = sorted(_tool_meta.items())
     if not items:
         return ""
-    if lang == "fr":
-        lines = [
-            "## Outils MCP connectés",
-            "Ces outils proviennent de serveurs MCP connectés (Model Context "
-            "Protocol). Appelle-les EXACTEMENT comme les outils natifs, avec le "
-            "même format JSON {\"tool\": ..., ...}.",
-            "Passe chaque argument au PREMIER NIVEAU de l'appel (ex. {\"tool\": "
-            "\"mcp__serveur__outil\", \"pageSize\": 50}) ; n'enveloppe JAMAIS "
-            "les arguments dans un objet « args » ou « arguments ».",
-        ]
-    else:
-        lines = [
-            "## Connected MCP tools",
-            "These tools come from connected MCP servers (Model Context "
-            "Protocol). Call them EXACTLY like native tools, using the same "
-            "JSON format {\"tool\": ..., ...}.",
-            "Pass each argument at the TOP LEVEL of the call (e.g. {\"tool\": "
-            "\"mcp__server__tool\", \"pageSize\": 50}); NEVER wrap arguments "
-            "inside an \"args\" or \"arguments\" object.",
-        ]
+    del lang
+    lines = [
+        "## Connected MCP tools (available now)",
+        "Call these with the same textual <tool_call> JSON protocol and top-level "
+        "arguments as OSIA tools. Their connector permissions and anti-replay rules apply.",
+    ]
     shown = items[:_MAX_PROMPT_TOOLS]
     for full, meta in shown:
         desc = _one_line(meta.get("description") or "")
@@ -737,206 +723,19 @@ def mcp_tool_prompt_block(lang: str = "en") -> str:
         lines.append(f"- {full}: {desc}{sep}Usage: {usage}")
     extra = len(items) - len(shown)
     if extra > 0:
-        if lang == "fr":
-            lines.append(
-                f"- (+{extra} autres outils MCP connectés, non listés ici — "
-                "appelle-les par leur nom mcp__<serveur>__<outil>.)"
-            )
-        else:
-            lines.append(
-                f"- (+{extra} more connected MCP tools not listed here — call "
-                "them by their mcp__<server>__<tool> name.)"
-            )
+        lines.append(
+            f"- (+{extra} more connected MCP tools not listed here; call them "
+            "by their mcp__<server>__<tool> name.)"
+        )
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Connector-AWARENESS block (WOR-92) — connector-level, not tool-level
+# Legacy connector-summary compatibility
 # ---------------------------------------------------------------------------
-# Cap how many CATALOG connector names are listed in the "you can also connect"
-# line (the catalog is ~12 suggestable entries today, so this never trims in
-# practice — it is a defensive bound, mirroring _MAX_PROMPT_TOOLS).
-_MAX_PROMPT_CONNECTORS = 24
-
-
-def _i18n_desc(desc_key: str, lang: str) -> str:
-    """Resolve a connector ``desc_key`` in the REQUESTED ``lang`` directly from
-    ``osia.i18n.TRANSLATIONS``: fallback chain is ``lang`` -> ``"en"`` -> ``""``.
-    We bypass ``i18n.t`` on purpose because ``t`` resolves against the
-    process-global UI language, whereas the system prompt is built for a specific
-    ``lang`` argument (which may differ — e.g. a mobile client in a different
-    locale than the desktop UI). The terminal fallback is ``""`` (NOT the raw key
-    like ``i18n.t``) so an untranslated key never leaks into the prompt; the
-    caller renders a name-only row when the desc is empty. Never raises."""
-    try:
-        from osia import i18n
-        entry = i18n.TRANSLATIONS.get(desc_key)
-        if not isinstance(entry, dict):
-            return ""
-        return entry.get(lang) or entry.get("en") or ""
-    except Exception:
-        return ""
 
 
 def mcp_connectors_prompt_block(lang: str = "en") -> str:
-    """Render the ``## MCP connectors`` system-prompt section: a SHORT,
-    connector-LEVEL awareness block (1 line per connector), distinct from and
-    complementary to ``mcp_tool_prompt_block`` (which lists individual tools).
-
-    Two levels (WOR-92):
-      * CONNECTED — connectors whose tools are registered right now (so OSIA knows
-        WHICH connectors are active, not just a flat tool list). Emitted only when
-        at least one is connected.
-      * CATALOG — connectors OSIA could OFFER to connect (``suggestable`` in the
-        Qt-free ``osia.mcp_client.catalog``), excluding any already connected. A
-        single comma-joined name line, capped with "(+N more)". Gated by the live
-        ``mcp_suggest_connectors`` setting (default on).
-
-    Always ends with a no-duplicate-native guard so OSIA never implies it needs a
-    connector for things it already does natively (shell, files, web, screen).
-
-    Built FRESH on every ``get_system_prompt`` call (same refresh boundary as
-    ``mcp_tool_prompt_block``). Soft + lazy: any failure yields ``""`` and never
-    breaks prompt construction. Returns ``""`` when there is nothing to say."""
-    try:
-        # Which connectors are ACTIVE now = those with registered (non-stub) tools
-        # in this process. _tool_meta only holds currently-registered tools
-        # (unregister pops them), so its server set is exactly the connected set.
-        with _lock:
-            connected_ids = sorted({
-                str(m.get("server")) for m in _tool_meta.values() if m.get("server")
-            })
-        connected_set = set(connected_ids)
-
-        try:
-            from osia.mcp_client.catalog import get_catalog_meta
-            catalog = get_catalog_meta()
-        except Exception:
-            catalog = []
-        cat_by_id = {m.get("id"): m for m in catalog}
-
-        # Human names for connected connectors: catalog name first, else the
-        # user's saved connector name (custom servers), else the raw id.
-        saved_names: dict = {}
-        try:
-            from osia.config import get_setting
-            for s in (get_setting("mcp_servers", []) or []):
-                if isinstance(s, dict) and s.get("id"):
-                    saved_names[s["id"]] = s.get("name") or s["id"]
-        except Exception:
-            pass
-
-        # Best-effort live status for a suffix on a connected-but-unhealthy
-        # connector. The connected list comes from _tool_meta (tools registered ==
-        # connected); we add a suffix ONLY for the manager's DEFINITIVELY-bad
-        # states (FAILED/CONNECTING). A plain DISCONNECTED status while tools are
-        # still registered is a benign registry/manager divergence — treat it as
-        # active (no misleading suffix). Never raises.
-        def _status_suffix(sid: str) -> str:
-            try:
-                from osia.mcp_client.manager import (
-                    get_manager, STATUS_FAILED, STATUS_CONNECTING,
-                )
-                st = get_manager().status(sid)
-                if st == STATUS_FAILED:
-                    return " (failed)" if lang != "fr" else " (échec)"
-                if st == STATUS_CONNECTING:
-                    return " (reconnecting)" if lang != "fr" else " (reconnexion)"
-            except Exception:
-                pass
-            return ""
-
-        fr = (lang == "fr")
-        header = "## Connecteurs MCP" if fr else "## MCP connectors"
-        lines: list = []
-
-        # ── CONNECTED sub-block (only when ≥1 connected) ────────────────────
-        if connected_ids:
-            lines.append(header)
-            if fr:
-                lines.append(
-                    "Tu as ces connecteurs ACTIFS (leurs outils "
-                    "mcp__<id>__<outil> sont listés ci-dessous — utilise-les) :"
-                )
-            else:
-                lines.append(
-                    "You have these connectors ACTIVE (their mcp__<id>__<tool> "
-                    "tools are listed below — use them):"
-                )
-            rows = []
-            for sid in connected_ids:
-                meta = cat_by_id.get(sid)
-                if meta:
-                    name = meta.get("name") or sid
-                    desc = _i18n_desc(meta.get("desc_key") or "", lang)
-                else:
-                    # A custom server's display name is user free-text (only its
-                    # id is charset-validated, never the name). Same as the saved
-                    # name path below — see the _one_line() hardening note.
-                    name = saved_names.get(sid, sid)
-                    desc = ""
-                # SEC-01/SEC-02: collapse whitespace/newlines AND cap length on the
-                # interpolated name + desc, mirroring mcp_tool_prompt_block's
-                # _one_line() hardening — so a connector name (custom-server names
-                # come from the un-validated mcp_servers setting) cannot inject
-                # prompt structure (a fake "## " heading / "- mcp__..." tool line)
-                # or bloat the row. Catalog names/descs are short i18n text, so this
-                # is a no-op for them and defensive for custom ones.
-                name = _one_line(name, 80)
-                desc = _one_line(desc)
-                suffix = _status_suffix(sid)
-                rows.append((name, f"- {name} — {desc}{suffix}" if desc
-                             else f"- {name}{suffix}"))
-            for _name, row in sorted(rows, key=lambda r: r[0].lower()):
-                lines.append(row)
-
-        # ── CATALOG sub-block (suggestable, not already connected) ──────────
-        suggest_on = _non_security_setting_bool("mcp_suggest_connectors", True)
-        if suggest_on and catalog:
-            names = [
-                m.get("name") for m in catalog
-                if m.get("suggestable") and m.get("id") not in connected_set
-                and m.get("name")
-            ]
-            if names:
-                shown = names[:_MAX_PROMPT_CONNECTORS]
-                extra = len(names) - len(shown)
-                joined = ", ".join(shown)
-                if extra > 0:
-                    joined += (f" (+{extra} de plus)" if fr
-                               else f" (+{extra} more)")
-                if not lines:
-                    lines.append(header)
-                if fr:
-                    lines.append(
-                        "Tu peux aussi connecter (à proposer UNIQUEMENT si "
-                        "l'utilisateur demande quelque chose qu'un connecteur "
-                        "couvre ; il l'active dans Réglages → Connecteurs) : "
-                        + joined + "."
-                    )
-                else:
-                    lines.append(
-                        "You can also connect (offer ONLY if the user asks for "
-                        "something a connector covers; they enable it in "
-                        "Settings → Connectors): " + joined + "."
-                    )
-
-        if not lines:
-            return ""
-
-        # ── No-duplicate-native guard (always last) ─────────────────────────
-        if fr:
-            lines.append(
-                "N'utilise et ne propose PAS de connecteur pour ce que tu fais "
-                "déjà nativement (shell, fichiers, navigateur web, écran) — "
-                "uniquement pour ces services externes."
-            )
-        else:
-            lines.append(
-                "Do NOT use or suggest a connector for things you already do "
-                "natively (shell, files, web browser, screen) — only for these "
-                "external services."
-            )
-        return "\n".join(lines)
-    except Exception:
-        return ""
+    """Return no duplicate connector catalog; connected tool signatures are canonical."""
+    del lang
+    return ""

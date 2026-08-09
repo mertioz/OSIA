@@ -636,7 +636,8 @@ def test_dedicated_document_routing_has_one_final_and_no_shell_fallback(monkeypa
     read_line = next(
         line for line in prompt.splitlines() if line.startswith("- read_document:")
     )
-    assert '"path": "<value>"' in read_line
+    assert "(path:string; optional:source_ref:string" in read_line
+    assert windows_example in read_line
     assert "never shell, read_file, or render_pdf" in read_line
     assert "whole-document safety ceiling" in read_line
 

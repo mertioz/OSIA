@@ -25,25 +25,20 @@ _ACCOUNT_CHANGE_LISTENERS: set[Callable[[], None]] = set()
 
 _CONTAINMENT_INSTRUCTIONS = """
 
-CHATGPT ACCOUNT PROVIDER CONTAINMENT (mandatory):
-- Return assistant-message text only.
-- Never call Codex native tools or request native permissions. This containment
-  does NOT prohibit the user's benign local, web, browser, or communication task.
-- Delegate commands, files, MCP, web, browser/computer use and local actions to
-  OSIA by emitting the exact textual <tool_call> JSON format described above.
-  OSIA, not Codex, executes and confirms those actions.
-- Do not claim those delegated capabilities are forbidden or unavailable merely
-  because Codex's own native tools are disabled. Follow OSIA's action-risk policy.
-- Do not mention or infer local file paths unless the user's request requires it.
+CHATGPT ACCOUNT PROVIDER CONTAINMENT:
+- Return assistant text or OSIA textual <tool_call> blocks only; never invoke or
+  request Codex-native tools or permissions in this adapter.
+- Delegate local, shell, file, web, browser, MCP, and connector actions through
+  the listed OSIA calls. OSIA owns permissions, execution, and reported outcomes.
+- This adapter restriction does NOT prohibit benign tasks or make them unavailable.
+  Do not generically refuse them; follow the base action policy and never claim
+  an action without its result.
+- Do not mention or infer local paths unless the current request requires them.
 """
 
 _DEVELOPER_INSTRUCTIONS = (
-    "You are the text-generation provider inside OSIA. Produce only ordinary "
-    "assistant text or OSIA's textual <tool_call> blocks. Codex native tools and "
-    "permissions are disabled, but benign computer tasks remain allowed: delegate "
-    "shell, web, browser, computer-use, file, connector and local actions through "
-    "OSIA textual tool calls. Do not generically refuse a task merely because it "
-    "requires an OSIA tool. Follow the action-risk policy in the base instructions."
+    "Act as OSIA's text-generation provider. Follow the base instructions and "
+    "account-provider containment; emit assistant text or OSIA <tool_call> blocks only."
 )
 
 _LANGUAGE_MARKER = "\n\n[AUTHORITATIVE TURN LANGUAGE]\n"
@@ -209,15 +204,11 @@ def _sanitized_system_prompt(system: str, messages: list[dict]) -> str:
     desktop_match = re.search(r"(?m)^\[DESKTOP PATH: (.+?)\]\s*$", system or "")
     desktop_path = desktop_match.group(1) if desktop_match else None
     cleaned = re.sub(r"(?m)^\[DESKTOP PATH: .+?\]\s*$", "", system or "")
-    cleaned = re.sub(r"(?m)^Your working directory is .*$", "", cleaned)
-    cleaned = re.sub(r"(?m)^Ton répertoire de travail est .*$", "", cleaned)
+    cleaned = re.sub(r"(?m)^\[PROJECT ROOT: .+?\]\s*$", "", cleaned)
     cleaned = cleaned.replace(
-        "Always use the exact absolute path given in the [DESKTOP PATH: ...] line of this prompt.",
-        "Use a local desktop path only when the current user request requires it.",
-    )
-    cleaned = cleaned.replace(
-        "Utilise toujours le chemin absolu exact donné dans la ligne [DESKTOP PATH: ...] de ce prompt.",
-        "N'utilise un chemin local du bureau que si la demande actuelle l'exige.",
+        'When the user says "desktop" or "bureau", use the exact path in the '
+        '[DESKTOP PATH: ...] line.',
+        "Use a local desktop path only when the current request requires it.",
     )
     latest_user = next(
         (_text_content(message.get("content")) for message in reversed(messages)

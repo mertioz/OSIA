@@ -14,15 +14,6 @@ EN_STYLE = (
     "accuracy or necessary completeness. Do not reveal private chain-of-thought; "
     "provide conclusions, relevant evidence, and concise reasoning summaries instead."
 )
-FR_STYLE = (
-    "Raisonne avec soin et en profondeur en interne lorsque la tâche l’exige. "
-    "Garde les explications destinées à l’utilisateur concises et directes sans "
-    "sacrifier l’exactitude ni les éléments nécessaires. Ne révèle pas la chaîne "
-    "de pensée privée ; fournis plutôt les conclusions, les preuves pertinentes "
-    "et un résumé concis du raisonnement."
-)
-
-
 def _stable_personality(monkeypatch):
     monkeypatch.setattr(personality, "load_personality", lambda: personality.DEFAULT_PERSONALITY)
     monkeypatch.setattr(personality, "load_enabled_skills_text", lambda: "")
@@ -35,7 +26,8 @@ def test_new_instruction_appears_exactly_once_and_old_generic_copy_is_removed(
     english = agent.get_system_prompt("en", "model", "provider")
     french = agent.get_system_prompt("fr", "model", "provider")
     assert english.count(EN_STYLE) == 1
-    assert french.count(FR_STYLE) == 1
+    assert french.count(EN_STYLE) == 1
+    assert "Raisonne avec soin et en profondeur" not in french
     assert "helpful, concise, and friendly" not in english
     assert "Be concise." not in english
     assert "concise" not in personality.DEFAULT_PERSONALITY.lower()

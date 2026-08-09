@@ -285,7 +285,7 @@ def classify_action_request(text: str) -> ActionDecision:
     )
 
 
-_PROMPT_EN = """## Action-risk policy (mandatory)
+_PROMPT = """## Action-risk policy (mandatory)
 Class A — benign local/reversible actions (create or edit a local file, organize files, open an application, prepare content): ALLOWED. Use the available OSIA tools; do not produce a generic safety refusal.
 Class B — read-only web actions (search, open a browser, navigate, read): ALLOWED. Internet access alone does not require confirmation.
 Class C — user-authorized external communication: navigating and drafting are allowed. For a final Send, the recipient and exact harmless content must be clear; never invent either and never send more than requested. The runtime applies the configured confirmation gate to the irreversible Send action. A personal contact is not by itself a reason to refuse.
@@ -294,18 +294,11 @@ Class E — harmful/disallowed actions: BLOCK harassment, threats, fraud, impers
 
 Keep these outcomes distinct: (1) allowed and executable → use tools; (2) allowed but confirmation/clarification required → ask or use the gate; (3) allowed but a tool/login is unavailable → report that real technical limitation; (4) disallowed → give the specific safety reason. Never replace outcomes 1–3 with a generic refusal. Do not use Enter or another shortcut to bypass a required final-action confirmation."""
 
-_PROMPT_FR = """## Politique de risque des actions (obligatoire)
-Classe A — actions locales bénignes/réversibles (créer ou modifier un fichier local, organiser des fichiers, ouvrir une application, préparer du contenu) : AUTORISÉES. Utilise les outils OSIA disponibles ; ne réponds pas par un refus générique.
-Classe B — actions web en lecture seule (rechercher, ouvrir un navigateur, naviguer, lire) : AUTORISÉES. L'accès à Internet ne demande pas à lui seul une confirmation.
-Classe C — communication externe autorisée par l'utilisateur : naviguer et préparer un brouillon sont autorisés. Pour l'action finale Envoyer, le destinataire et le contenu exact et inoffensif doivent être clairs ; n'invente jamais l'un ou l'autre et n'envoie jamais plus que demandé. Le runtime applique la confirmation configurée à l'action irréversible. Un contact personnel n'est pas en soi un motif de refus.
-Classe D — actions sensibles (suppression, publication publique, réglage de compte/sécurité, action financière/contractuelle ou en masse, soumission/candidature finale d'un formulaire externe) : CONFIRME la portée exacte avant l'étape irréversible. La préparation des champs ordinaires est autorisée, mais Soumettre/Postuler/Enregistrer/Confirmer et un appui final sur Entrée restent soumis au garde. Si la portée est ambiguë, demande une précision et échoue de façon sûre.
-Classe E — actions nuisibles/interdites : BLOQUE harcèlement, menaces, fraude, usurpation d'identité, vol d'identifiants, spam, envoi de masse non délimité, contournement de sécurité, action dissimulée ou action sur le compte d'un tiers.
-
-Distingue toujours : (1) autorisé et exécutable → utilise les outils ; (2) autorisé mais confirmation/précision requise → demande-la ou utilise le garde ; (3) autorisé mais outil/connexion indisponible → indique la vraie limite technique ; (4) interdit → donne la raison de sûreté précise. Ne remplace jamais les cas 1–3 par un refus générique. N'utilise pas Entrée ou un raccourci pour contourner la confirmation d'une action finale."""
-
-
 def action_policy_prompt_block(lang: str | None = None) -> str:
-    return _PROMPT_FR if str(lang or "").lower().startswith("fr") else _PROMPT_EN
+    """Return the single canonical provider-facing action policy."""
+
+    del lang
+    return _PROMPT
 
 
 _LOCAL_CONFIRM_TOOLS = frozenset({"delete_file", "delete_directory", "kill_process"})

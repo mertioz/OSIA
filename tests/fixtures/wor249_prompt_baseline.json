@@ -1,0 +1,15 @@
+{
+  "source_commit": "49e7fa1c07cb83e1427f5da6a272d333068bcec7",
+  "tokenizer": "tiktoken:o200k_base",
+  "snapshots": {
+    "autonomous_api_en": {"chars": 24847, "utf8_bytes": 24921, "o200k_tokens": 5861, "approx_tokens": 6231, "sha256": "b7bf45ed0c6647ccd1c67c572ce61c256552972ee42e1c9a6b8e05b6013a61e"},
+    "autonomous_web_api_fr": {"chars": 4812, "utf8_bytes": 4832, "o200k_tokens": 1091, "approx_tokens": 1208, "sha256": "e9b3d6c08f5ff0b82294939320c0666c26b0e5cf7293d80aa207a310caef317e"},
+    "chat_api_en": {"chars": 27554, "utf8_bytes": 27628, "o200k_tokens": 6485, "approx_tokens": 6907, "sha256": "1e935a370956b347cf90a88c1fc7eac75a73b6121851537f3a892dde24cba697"},
+    "chat_api_fr": {"chars": 29448, "utf8_bytes": 29770, "o200k_tokens": 7253, "approx_tokens": 7443, "sha256": "2c4cfd3a6e355386c8bdb8395158aebaa6401c6b8a9fa224a74a230fa9f1aac3"},
+    "chat_api_fr_rich": {"chars": 30362, "utf8_bytes": 30684, "o200k_tokens": 7458, "approx_tokens": 7671, "sha256": "e7bef8e5c719f8560a278244b7ab252cbca2cad3bc238ab1cf3715ecd31fed2c"},
+    "chat_api_fr_rich_context": {"chars": 30974, "utf8_bytes": 31296, "o200k_tokens": 7583, "approx_tokens": 7824, "sha256": "abc1842cbe85d25fe233f5aa2cc667355135be35fd5525dae5c34607d6b1755e"},
+    "chatgpt_account_developer": {"chars": 456, "utf8_bytes": 456, "o200k_tokens": 91, "approx_tokens": 114, "sha256": "7439571f00f7143d5c8a58da780cfb391ef485dfdb75a333bddad77c24c008d4"},
+    "chatgpt_account_fr_rich_base": {"chars": 30962, "utf8_bytes": 31282, "o200k_tokens": 7576, "approx_tokens": 7821, "sha256": "ff2e678edf66837b2bf3e21ae79d2dae41f84f9299c35e7099b05d17a1cd6ea5"},
+    "chatgpt_account_fr_rich_combined": {"chars": 31432, "utf8_bytes": 31752, "o200k_tokens": 7672, "approx_tokens": 7938, "sha256": "f06dfe6fc8a16f0e7db7f21b82657d16dc0fd98bb5b4c6dbd6ee3cfdad835c62"}
+  }
+}

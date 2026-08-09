@@ -464,6 +464,11 @@ def test_agent_routes_exact_message_through_confirmation_then_send(
         "find_and_click",
         lambda text: sent.append(text) or "Clicked Send",
     )
+    monkeypatch.setitem(
+        agent_module.TOOL_MAP,
+        "web_state",
+        lambda **_kwargs: "verified true: Hello from the test is visible",
+    )
     monkeypatch.setattr(
         action_policy,
         "_confirm_irreversible",
@@ -475,6 +480,7 @@ def test_agent_routes_exact_message_through_confirmation_then_send(
         monkeypatch,
         [
             _tool_call("find_and_click", text="Send"),
+            _tool_call("web_state", expect_text="Hello from the test"),
             "The one requested message was sent.",
         ],
     )
