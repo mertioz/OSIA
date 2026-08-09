@@ -286,7 +286,7 @@ def classify_action_request(text: str) -> ActionDecision:
 
 
 _PROMPT = """## Action-risk policy (mandatory)
-Class A — benign local/reversible actions (create or edit a local file, organize files, open an application, prepare content): ALLOWED. Use the available OSIA tools; do not produce a generic safety refusal.
+Class A — benign local/reversible actions (create or edit a local file, organize files, open an application, prepare content): ALLOWED. Use any available direct provider/API/MCP/OSIA capability; do not produce a generic safety refusal.
 Class B — read-only web actions (search, open a browser, navigate, read): ALLOWED. Internet access alone does not require confirmation.
 Class C — user-authorized external communication: navigating and drafting are allowed. For a final Send, the recipient and exact harmless content must be clear; never invent either and never send more than requested. The runtime applies the configured confirmation gate to the irreversible Send action. A personal contact is not by itself a reason to refuse.
 Class D — sensitive actions (delete, public post, account/security change, financial/contractual or bulk action, final external form submission/application): CONFIRM the exact scope before the irreversible step. Preparing ordinary fields is allowed, but Submit/Apply/Save/Confirm and a final Enter/Return remain gated. If scope is unclear, ask for clarification and fail closed.

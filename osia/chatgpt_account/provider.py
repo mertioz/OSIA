@@ -26,20 +26,24 @@ _ACCOUNT_CHANGE_LISTENERS: set[Callable[[], None]] = set()
 
 _CONTAINMENT_INSTRUCTIONS = """
 
-CHATGPT ACCOUNT PROVIDER CONTAINMENT:
-- Return assistant text or OSIA textual <tool_call> blocks only; never invoke or
-  request Codex-native tools or permissions in this adapter.
-- Delegate local, shell, file, web, browser, MCP, and connector actions through
-  the listed OSIA calls. OSIA owns permissions, execution, and reported outcomes.
-- This adapter restriction does NOT prohibit benign tasks or make them unavailable.
-  Do not generically refuse them; follow the base action policy and never claim
-  an action without its result.
+CHATGPT ACCOUNT PROVIDER CONTAINMENT AND CAPABILITY FEDERATION:
+- Provider-hosted tools and listed OSIA calls are both available. OSIA calls are
+  optional additions, never required substitutes; choose the best valid path.
+- Request native local command/file approval normally. OSIA applies the same
+  permission broker used by OSIA tools and may pause before the effect.
+- This federation does NOT prohibit benign tasks or delegation; delegate through
+  OSIA when it is the best valid path.
+- Once any native or OSIA mutation is accepted or started, never repeat it through
+  an equivalent mechanism. Switch only after a proven no-effect outcome permits it.
+- Do not generically refuse benign tasks. Follow the base action policy and claim
+  actions only from observed results.
 - Do not mention or infer local paths unless the current request requires them.
 """
 
 _DEVELOPER_INSTRUCTIONS = (
-    "Act as OSIA's text-generation provider. Follow the base instructions and "
-    "account-provider containment; emit assistant text or OSIA <tool_call> blocks only."
+    "Act as OSIA's provider. Follow base instructions and capability federation. "
+    "Native hosted tools and optional OSIA calls are available; choose one path "
+    "and report only observed outcomes."
 )
 
 _LANGUAGE_MARKER = "\n\n[AUTHORITATIVE TURN LANGUAGE]\n"
@@ -414,6 +418,8 @@ class ChatGPTAccountProvider:
         conversation_id: str,
         model: str,
         messages: list[dict],
+        osia_turn_id: str | None = None,
+        final_response_message_id: str | None = None,
         effort: str | None = None,
         on_delta=None,
         timeout: float = 300.0,
@@ -424,6 +430,9 @@ class ChatGPTAccountProvider:
             turn_input = _turn_input(delta_messages)
             run_kwargs = dict(
                 thread_id=state.thread_id,
+                conversation_id=conversation_id,
+                osia_turn_id=osia_turn_id,
+                final_response_message_id=final_response_message_id,
                 model=model,
                 effort=effort,
                 on_delta=on_delta,
@@ -507,6 +516,10 @@ class _AccountCompletions:
                 conversation_id=conversation_id,
                 model=model,
                 messages=messages,
+                osia_turn_id=self._owner.osia_turn_id,
+                final_response_message_id=(
+                    self._owner.final_response_message_id
+                ),
                 effort=effort,
                 timeout=timeout,
             )
@@ -521,6 +534,10 @@ class _AccountCompletions:
                     conversation_id=conversation_id,
                     model=model,
                     messages=messages,
+                    osia_turn_id=self._owner.osia_turn_id,
+                    final_response_message_id=(
+                        self._owner.final_response_message_id
+                    ),
                     effort=effort,
                     on_delta=lambda delta: events.put(("delta", delta)),
                     timeout=timeout,
@@ -558,10 +575,20 @@ class _AccountChatClient:
     def __init__(self, provider: ChatGPTAccountProvider, conversation_id: str | None = None):
         self.provider = provider
         self.conversation_id = conversation_id
+        self.osia_turn_id: str | None = None
+        self.final_response_message_id: str | None = None
         self.chat = SimpleNamespace(completions=_AccountCompletions(self))
 
     def set_conversation_id(self, conversation_id: str | None) -> None:
         self.conversation_id = conversation_id
+
+    def set_tool_attempt_turn_id(self, turn_id: str | None) -> None:
+        self.osia_turn_id = str(turn_id) if turn_id else None
+
+    def set_tool_attempt_final_response_message_id(
+        self, message_id: str | None,
+    ) -> None:
+        self.final_response_message_id = str(message_id) if message_id else None
 
 
 _PROVIDER: ChatGPTAccountProvider | None = None

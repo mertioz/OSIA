@@ -4927,6 +4927,20 @@ def _execute_tool_with_policy(
 
         attempt_store = attempt_context.get("store") or get_tool_attempt_store()
         fingerprint = attempt_store.fingerprint_arguments(kwargs)
+        equivalence_fingerprint = ""
+        if contract.commits_fallback_barrier:
+            try:
+                from osia.capability_federation import (
+                    mutation_equivalence_arguments,
+                )
+
+                equivalence = mutation_equivalence_arguments(tool_name, kwargs)
+                if equivalence is not None:
+                    equivalence_fingerprint = (
+                        attempt_store.fingerprint_arguments(equivalence)
+                    )
+            except Exception:
+                equivalence_fingerprint = ""
         conversation_id = str(attempt_context.get("conversation_id") or "")
         binding = {}
         binding_factory = attempt_context.get("autonomous_binding")
@@ -4994,15 +5008,18 @@ def _execute_tool_with_policy(
                 0, True, False, contract,
                 existing_attempt_id, True,
             )
-        if (
+        turn_id = str(attempt_context.get("turn_id") or "")
+        dispatch_barrier = bool(
             contract.commits_fallback_barrier
-            and attempt_store.has_terminal_barrier(
+            and attempt_store.has_dispatch_barrier(
                 conversation_id=conversation_id,
-                turn_id=str(attempt_context.get("turn_id") or ""),
+                turn_id=turn_id,
                 tool_name=tool_name,
                 argument_fingerprint=fingerprint,
+                equivalence_fingerprint=equivalence_fingerprint,
             )
-        ):
+        )
+        if dispatch_barrier:
             return ToolExecutionRecord(
                 "ERROR: duplicate external action blocked by durable receipt",
                 True, ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
@@ -5038,6 +5055,7 @@ def _execute_tool_with_policy(
                 model_id=str(attempt_context.get("model_id") or ""),
                 turn_context=context_snapshot,
                 argument_fingerprint=fingerprint,
+                equivalence_fingerprint=equivalence_fingerprint,
                 side_effect=contract.side_effect.value,
                 idempotence=contract.idempotency.value,
                 retry_policy=contract.retry.value,
@@ -8348,6 +8366,23 @@ class OSIAAgent:
         if (self.provider == "chatgpt_account"
                 and hasattr(self.client, "set_conversation_id")):
             self.client.set_conversation_id(current_conversation_id)
+        if (
+            self.provider == "chatgpt_account"
+            and hasattr(self.client, "set_tool_attempt_turn_id")
+        ):
+            metadata = self._tool_attempt_metadata or {}
+            self.client.set_tool_attempt_turn_id(metadata.get("turn_id"))
+        if (
+            self.provider == "chatgpt_account"
+            and hasattr(
+                self.client,
+                "set_tool_attempt_final_response_message_id",
+            )
+        ):
+            metadata = self._tool_attempt_metadata or {}
+            self.client.set_tool_attempt_final_response_message_id(
+                metadata.get("final_response_message_id"),
+            )
 
         # Provider sentences remain provisional until the canonical `response`
         # event, but safe prose may be projected live as a replaceable draft.

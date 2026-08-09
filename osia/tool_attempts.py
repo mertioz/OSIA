@@ -446,6 +446,9 @@ class ToolAttemptStore:
         fingerprint = str(record.get("argument_fingerprint") or "")
         if not re.fullmatch(r"hmac256:[0-9a-f]{64}", fingerprint):
             raise CorruptAttemptError("invalid_argument_fingerprint")
+        equivalence = str(record.get("equivalence_fingerprint") or "")
+        if equivalence and not re.fullmatch(r"hmac256:[0-9a-f]{64}", equivalence):
+            raise CorruptAttemptError("invalid_equivalence_fingerprint")
         if status in TERMINAL_STATUSES and not record.get("terminal_outcome"):
             raise CorruptAttemptError("terminal_outcome_missing")
         browser_state = record.get("browser_state_ref")
@@ -566,6 +569,7 @@ class ToolAttemptStore:
         side_effect: str,
         idempotence: str,
         retry_policy: str,
+        equivalence_fingerprint: str = "",
         remote_operation_key: str = "",
         next_check_at: float | None = None,
         deadline_at: float | None = None,
@@ -590,6 +594,10 @@ class ToolAttemptStore:
         model_id = _safe_token(model_id, field="model_id")
         if not re.fullmatch(r"hmac256:[0-9a-f]{64}", argument_fingerprint):
             raise ValueError("invalid_argument_fingerprint")
+        if equivalence_fingerprint and not re.fullmatch(
+            r"hmac256:[0-9a-f]{64}", equivalence_fingerprint,
+        ):
+            raise ValueError("invalid_equivalence_fingerprint")
         if repair_count not in {0, 1}:
             raise ValueError("invalid_repair_count")
         owner_scope = str(owner_scope or "chat")
@@ -634,6 +642,7 @@ class ToolAttemptStore:
             "model_id": model_id,
             "turn_context": _safe_turn_context(turn_context),
             "argument_fingerprint": argument_fingerprint,
+            "equivalence_fingerprint": str(equivalence_fingerprint or ""),
             "side_effect": _safe_token(side_effect, field="side_effect"),
             "idempotence": _safe_token(idempotence, field="idempotence"),
             "retry_policy": _safe_token(retry_policy, field="retry_policy"),
@@ -1185,6 +1194,76 @@ class ToolAttemptStore:
                 return True
         return False
 
+    def has_dispatch_barrier(
+        self, *, conversation_id: str, turn_id: str, tool_name: str,
+        argument_fingerprint: str, equivalence_fingerprint: str = "",
+        block_unknown_effect: bool = True,
+    ) -> bool:
+        """Check exact, equivalent, and unknown-effect barriers in one scan."""
+
+        for record in self._terminal_records_and_barriers():
+            if (
+                record.get("conversation_id") != conversation_id
+                or record.get("turn_id") != turn_id
+                or record.get("dispatch_state") == "not_dispatched"
+            ):
+                continue
+            if (
+                block_unknown_effect
+                and record.get("terminal_outcome") == "outcome_unknown"
+            ):
+                return True
+            if (
+                record.get("tool_name") == tool_name
+                and hmac.compare_digest(
+                    str(record.get("argument_fingerprint") or ""),
+                    str(argument_fingerprint or ""),
+                )
+            ):
+                return True
+            if equivalence_fingerprint and hmac.compare_digest(
+                str(record.get("equivalence_fingerprint") or ""),
+                equivalence_fingerprint,
+            ):
+                return True
+        return False
+
+    def has_equivalent_terminal_barrier(
+        self, *, conversation_id: str, turn_id: str,
+        equivalence_fingerprint: str,
+    ) -> bool:
+        """Block another mutation that targets the same private equivalence key."""
+
+        if not re.fullmatch(r"hmac256:[0-9a-f]{64}", equivalence_fingerprint or ""):
+            return False
+        for record in self._terminal_records_and_barriers():
+            if (
+                record.get("conversation_id") == conversation_id
+                and record.get("turn_id") == turn_id
+                and hmac.compare_digest(
+                    str(record.get("equivalence_fingerprint") or ""),
+                    equivalence_fingerprint,
+                )
+                and record.get("dispatch_state") != "not_dispatched"
+            ):
+                return True
+        return False
+
+    def has_unknown_effect_barrier(
+        self, *, conversation_id: str, turn_id: str,
+    ) -> bool:
+        """Return whether any started mutation in this turn has unknown outcome."""
+
+        for record in self._terminal_records_and_barriers():
+            if (
+                record.get("conversation_id") == conversation_id
+                and record.get("turn_id") == turn_id
+                and record.get("terminal_outcome") == "outcome_unknown"
+                and record.get("dispatch_state") != "not_dispatched"
+            ):
+                return True
+        return False
+
     def _terminal_records_and_barriers(self):
         self._ensure_dirs()
         for directory in (self.attempts_dir, self.barriers_dir):
@@ -1225,6 +1304,9 @@ class ToolAttemptStore:
                     "turn_id": record["turn_id"],
                     "tool_name": record["tool_name"],
                     "argument_fingerprint": record["argument_fingerprint"],
+                    "equivalence_fingerprint": record.get(
+                        "equivalence_fingerprint", "",
+                    ),
                     "dispatch_state": record["dispatch_state"],
                     "terminal_outcome": record["terminal_outcome"],
                     "completed_at": completed,

@@ -1,16 +1,16 @@
 """Small fail-closed client for the stable Codex App Server JSONL protocol.
 
 The process is deliberately isolated from the normal Codex installation and
-from OSIA's repository/configuration.  Only agent-message text is accepted as
-provider output; turn-scoped local images are input-only.  A narrow set of
-exact canonical OSIA dynamic-tool requests may be handed back to OSIA's normal
-dispatcher, while every direct native action item or approval request still
-cancels the turn.
+from OSIA's repository/configuration.  Turn-scoped local images are input-only.
+Provider-hosted read capabilities remain native, observable local command/file
+effects use OSIA's canonical permission broker, and exact OSIA dynamic tools
+remain a compatibility path.
 """
 
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 import os
 import queue
@@ -23,7 +23,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
 from osia.runtime import resource_path
@@ -45,6 +45,25 @@ CLIENT_VERSION = "1.0.0"
 
 _SAFE_CONFIG = """# Managed by OSIA for the isolated ChatGPT-account provider.
 check_for_update_on_startup = false
+web_search = "live"
+approval_policy = "on-request"
+sandbox_mode = "read-only"
+
+[features]
+apps = false
+plugins = false
+
+[tools]
+web_search = true
+
+[shell_environment_policy]
+inherit = "core"
+"""
+
+_NO_ENV_SAFE_CONFIG = _SAFE_CONFIG.replace('inherit = "core"', 'inherit = "none"')
+
+_LEGACY_SAFE_CONFIG = """# Managed by OSIA for the isolated ChatGPT-account provider.
+check_for_update_on_startup = false
 web_search = "disabled"
 approval_policy = "never"
 sandbox_mode = "read-only"
@@ -60,22 +79,20 @@ web_search = false
 inherit = "none"
 """
 
-_SAFE_ITEM_TYPES = frozenset(
-    {"agentMessage", "userMessage", "reasoning", "plan", "contextCompaction"}
-)
+_SAFE_ITEM_TYPES = frozenset({
+    "agentMessage", "userMessage", "reasoning", "plan",
+    "contextCompaction", "webSearch",
+})
 _FORBIDDEN_ITEM_TYPES = frozenset(
     {
         "collabAgentToolCall",
-        "commandExecution",
         "dynamicToolCall",
-        "fileChange",
         "hookPrompt",
         "imageGeneration",
         "imageView",
         "mcpToolCall",
         "sleep",
         "subAgentActivity",
-        "webSearch",
     }
 )
 _SAFE_NOTIFICATIONS = frozenset(
@@ -85,7 +102,11 @@ _SAFE_NOTIFICATIONS = frozenset(
         "account/updated",
         "error",
         "item/agentMessage/delta",
+        "item/commandExecution/outputDelta",
+        "item/commandExecution/terminalInteraction",
         "item/completed",
+        "item/fileChange/outputDelta",
+        "item/fileChange/patchUpdated",
         "item/reasoning/summaryPartAdded",
         "item/reasoning/summaryTextDelta",
         "item/reasoning/textDelta",
@@ -100,6 +121,7 @@ _SAFE_NOTIFICATIONS = frozenset(
         "thread/status/changed",
         "thread/tokenUsage/updated",
         "turn/completed",
+        "turn/diff/updated",
         "turn/moderationMetadata",
         "turn/plan/updated",
         "turn/started",
@@ -121,11 +143,19 @@ _CANONICAL_NATIVE_TOOL_NAMES = (
 def _canonical_native_tools() -> list[dict]:
     """Expose only exact OSIA identities backed by authoritative schemas."""
 
+    from osia.capability_federation import federated_capabilities
     from osia.tool_contracts import get_static_registry
 
     registry = get_static_registry()
+    available_osia = {
+        item.identity
+        for item in federated_capabilities("chatgpt_account")
+        if item.available and item.source == "osia"
+    }
     tools = []
     for name in _CANONICAL_NATIVE_TOOL_NAMES:
+        if name not in available_osia:
+            continue
         spec = registry.get(name)
         if spec is None or not spec.chat_eligible:
             continue
@@ -240,12 +270,23 @@ def _native_action_refusal(turn_content: str | list[dict]) -> str:
 
 
 @dataclass(frozen=True)
+class CapabilityEvent:
+    source: str
+    identity: str
+    phase: str
+    outcome: str
+    item_id: str
+    tool_attempt_id: str = ""
+
+
+@dataclass(frozen=True)
 class TurnResult:
     text: str
     thread_id: str
     turn_id: str | None
     status: str
     output_started: bool = False
+    capability_events: tuple[CapabilityEvent, ...] = ()
 
 
 @dataclass
@@ -254,8 +295,27 @@ class _PendingRequest:
 
 
 @dataclass
+class _NativeDispatch:
+    item_id: str
+    tool_name: str
+    arguments: dict
+    side_effect: str
+    idempotence: str
+    retry_policy: str
+    equivalence_fingerprint: str = ""
+    tool_attempt_id: str = ""
+    started: bool = False
+    terminal: bool = False
+
+
+@dataclass
 class _TurnAttempt:
     thread_id: str
+    conversation_id: str = ""
+    osia_turn_id: str = ""
+    final_response_message_id: str = ""
+    model_id: str = ""
+    user_request: str = ""
     events: queue.Queue = field(default_factory=queue.Queue)
     turn_id: str | None = None
     text_parts: list[str] = field(default_factory=list)
@@ -264,6 +324,13 @@ class _TurnAttempt:
     native_tool_call: dict | None = None
     unsafe_category: str | None = None
     interrupt_sent: bool = False
+    capability_events: list[CapabilityEvent] = field(default_factory=list)
+    native_items: dict[str, dict] = field(default_factory=dict)
+    native_dispatches: dict[str, _NativeDispatch] = field(default_factory=dict)
+    terminal_native_items: set[str] = field(default_factory=set)
+    frozen_equivalences: set[str] = field(default_factory=set)
+    native_effect_started: bool = False
+    outcome_unknown: bool = False
 
 
 def _runtime_base_dir() -> Path:
@@ -362,6 +429,7 @@ class AppServerClient:
         runtime_version_override: str | None = None,
         startup_timeout: float = 15.0,
         request_timeout: float = 30.0,
+        tool_attempt_store=None,
     ):
         self.base_dir = Path(base_dir) if base_dir else _runtime_base_dir()
         self.home_dir = self.base_dir / "home"
@@ -372,6 +440,7 @@ class AppServerClient:
         self._runtime_version_override = runtime_version_override
         self.startup_timeout = startup_timeout
         self.request_timeout = request_timeout
+        self._tool_attempt_store = tool_attempt_store
 
         self._process = None
         self._start_lock = threading.RLock()
@@ -494,7 +563,10 @@ class AppServerClient:
         config = self.home_dir / "config.toml"
         if config.exists():
             try:
-                if config.read_text(encoding="utf-8") != _SAFE_CONFIG:
+                current_config = config.read_text(encoding="utf-8")
+                if current_config in {_LEGACY_SAFE_CONFIG, _NO_ENV_SAFE_CONFIG}:
+                    config.write_text(_SAFE_CONFIG, encoding="utf-8", newline="\n")
+                elif current_config != _SAFE_CONFIG:
                     raise RuntimeUnavailableError(
                         "ERROR: OSIA's isolated Codex configuration was modified.",
                         category="isolation_failed",
@@ -829,6 +901,486 @@ class AppServerClient:
                 "turn/interrupt", {"threadId": attempt.thread_id, "turnId": attempt.turn_id}
             )
 
+    @staticmethod
+    def _safe_receipt_ref(value: Any, prefix: str) -> str:
+        candidate = str(value or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", candidate):
+            return candidate
+        digest = hashlib.sha256(candidate.encode("utf-8", errors="replace")).hexdigest()
+        return f"{prefix}:{digest}"
+
+    def _attempt_store(self):
+        if self._tool_attempt_store is None:
+            from osia.tool_attempts import get_tool_attempt_store
+
+            self._tool_attempt_store = get_tool_attempt_store()
+        return self._tool_attempt_store
+
+    @staticmethod
+    def _native_item_id(params: Mapping[str, Any]) -> str:
+        return str(params.get("itemId") or params.get("item_id") or "")
+
+    @staticmethod
+    def _append_capability_event(
+        attempt: _TurnAttempt,
+        *,
+        source: str,
+        identity: str,
+        phase: str,
+        outcome: str,
+        item_id: str,
+        tool_attempt_id: str = "",
+    ) -> None:
+        attempt.capability_events.append(CapabilityEvent(
+            source=source,
+            identity=identity,
+            phase=phase,
+            outcome=outcome,
+            item_id=str(item_id or "")[:256],
+            tool_attempt_id=str(tool_attempt_id or "")[:256],
+        ))
+
+    def _file_change_broker_call(
+        self, attempt: _TurnAttempt, item_id: str,
+    ) -> tuple[str, dict] | None:
+        item = attempt.native_items.get(item_id)
+        changes = item.get("changes") if isinstance(item, dict) else None
+        if not isinstance(changes, list) or len(changes) != 1:
+            return None
+        change = changes[0] if isinstance(changes[0], dict) else {}
+        kind = change.get("kind")
+        kind_name = str(kind.get("type") or "") if isinstance(kind, dict) else str(kind or "")
+        if kind_name not in {"add", "update"}:
+            return None
+        if kind_name == "update" and isinstance(kind, dict) and kind.get("move_path"):
+            return None
+        path_value = str(change.get("path") or "").strip()
+        diff = change.get("diff")
+        if not path_value or not isinstance(diff, str) or len(diff) > 2_000_000:
+            return None
+        path = Path(path_value)
+        if not path.is_absolute():
+            path = self.workspace_dir / path
+        return "write_file", {
+            "path": str(path.resolve(strict=False)),
+            # This is the exact proposed patch body used only for policy and
+            # receipt binding; OSIA does not execute it as write_file content.
+            "content": diff,
+        }
+
+    def _native_broker_call(
+        self, attempt: _TurnAttempt, method: str, params: dict,
+    ) -> tuple[str, dict] | None:
+        item_id = self._native_item_id(params)
+        if not item_id:
+            return None
+        if method == "item/fileChange/requestApproval":
+            return self._file_change_broker_call(attempt, item_id)
+        if method != "item/commandExecution/requestApproval":
+            return None
+        if any(
+            params.get(field)
+            for field in (
+                "additionalPermissions",
+                "networkApprovalContext",
+            )
+        ):
+            # These expand authority beyond the exact local command contract;
+            # the canonical broker has no sealed permit for that extra scope.
+            return None
+        command = params.get("command")
+        if not isinstance(command, str) or not command or len(command) > 32_768:
+            return None
+        available_decisions = params.get("availableDecisions")
+        if isinstance(available_decisions, list) and "accept" not in {
+            str(item) for item in available_decisions
+        }:
+            return None
+        cwd = params.get("cwd")
+        try:
+            resolved_cwd = Path(
+                str(cwd) if cwd else self.workspace_dir,
+            ).resolve(strict=False)
+        except (OSError, ValueError):
+            return None
+        started_item = attempt.native_items.get(item_id)
+        if (
+            not isinstance(started_item, dict)
+            or started_item.get("type") != "commandExecution"
+            or started_item.get("command") != command
+        ):
+            return None
+        try:
+            started_cwd = Path(
+                str(started_item.get("cwd") or self.workspace_dir),
+            ).resolve(strict=False)
+        except (OSError, ValueError):
+            return None
+        if started_cwd != resolved_cwd:
+            return None
+        arguments = {"command": command, "cwd": str(resolved_cwd)}
+        try:
+            from osia.deletion_plan import DeletionPreflightKind, prepare_deletion_call
+
+            deletion = prepare_deletion_call("run_command", arguments)
+            if deletion.kind is not DeletionPreflightKind.NOT_DELETION:
+                return None
+        except Exception:
+            # Native deletion cannot consume OSIA's sealed deletion plan.
+            return None
+        return "run_command", arguments
+
+    def _deny_native_approval(
+        self, attempt: _TurnAttempt, request_id: Any, method: str, item_id: str,
+        *, outcome: str = "rejected_before_execution",
+    ) -> None:
+        try:
+            self._send({"id": request_id, "result": {"decision": "decline"}})
+        except AppServerError:
+            pass
+        self._append_capability_event(
+            attempt,
+            source="provider_native",
+            identity=(
+                "commandExecution"
+                if "commandExecution" in method else "fileChange"
+            ),
+            phase="denied",
+            outcome=outcome,
+            item_id=item_id,
+        )
+
+    def _resolve_native_approval(
+        self, attempt: _TurnAttempt, payload: dict,
+    ) -> None:
+        method = str(payload.get("method") or "")
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        request_id = payload.get("request_id")
+        item_id = self._native_item_id(params)
+        broker_call = self._native_broker_call(attempt, method, params)
+        if broker_call is None:
+            self._deny_native_approval(attempt, request_id, method, item_id)
+            return
+        tool_name, arguments = broker_call
+        try:
+            from osia.action_policy import (
+                consume_pending_execution_permit,
+                guard_tool_call,
+                pending_execution_permit_matches,
+            )
+            from osia.capability_federation import mutation_equivalence_arguments
+            from osia.tool_contracts import (
+                ConfirmationPolicy,
+                SideEffectClass,
+                effective_contract,
+                get_tool_spec,
+            )
+
+            spec = get_tool_spec(tool_name)
+            if spec is None:
+                raise ValueError("native_broker_tool_unavailable")
+            contract = effective_contract(spec, arguments, attempt.user_request)
+            effectful = contract.side_effect is not SideEffectClass.READ_ONLY
+            store = None
+            fingerprint = ""
+            equivalence_fingerprint = ""
+            if effectful:
+                store = self._attempt_store()
+                fingerprint = store.fingerprint_arguments(arguments)
+                equivalence = mutation_equivalence_arguments(tool_name, arguments)
+                if equivalence is not None:
+                    equivalence_fingerprint = store.fingerprint_arguments(
+                        equivalence,
+                    )
+                if store.has_dispatch_barrier(
+                    conversation_id=self._safe_receipt_ref(
+                        attempt.conversation_id or attempt.thread_id,
+                        "conversation",
+                    ),
+                    turn_id=self._safe_receipt_ref(
+                        attempt.osia_turn_id or attempt.turn_id or attempt.thread_id,
+                        "turn",
+                    ),
+                    tool_name=tool_name,
+                    argument_fingerprint=fingerprint,
+                    equivalence_fingerprint=equivalence_fingerprint,
+                ):
+                    self._deny_native_approval(
+                        attempt,
+                        request_id,
+                        method,
+                        item_id,
+                        outcome="duplicate_or_unknown_frozen",
+                    )
+                    return
+            blocked = guard_tool_call(attempt.user_request, tool_name, arguments)
+            if blocked is not None:
+                self._deny_native_approval(attempt, request_id, method, item_id)
+                return
+            requires_permit = contract.confirmation in {
+                ConfirmationPolicy.CONFIRMATION_REQUIRED,
+                ConfirmationPolicy.FINAL_COMMIT_CONFIRMATION,
+            }
+            has_permit = pending_execution_permit_matches(tool_name, arguments)
+            if requires_permit and not has_permit:
+                self._deny_native_approval(attempt, request_id, method, item_id)
+                return
+            if has_permit and not consume_pending_execution_permit(tool_name, arguments):
+                self._deny_native_approval(attempt, request_id, method, item_id)
+                return
+
+            dispatch = _NativeDispatch(
+                item_id=item_id,
+                tool_name=tool_name,
+                arguments=dict(arguments),
+                side_effect=contract.side_effect.value,
+                idempotence=contract.idempotency.value,
+                retry_policy=contract.retry.value,
+            )
+            if effectful:
+                dispatch.equivalence_fingerprint = equivalence_fingerprint
+                receipt = store.create_attempt(
+                    conversation_id=self._safe_receipt_ref(
+                        attempt.conversation_id or attempt.thread_id, "conversation",
+                    ),
+                    turn_id=self._safe_receipt_ref(
+                        attempt.osia_turn_id or attempt.turn_id or attempt.thread_id,
+                        "turn",
+                    ),
+                    request_id=self._safe_receipt_ref(request_id, "request"),
+                    tool_call_id=self._safe_receipt_ref(item_id, "native_item"),
+                    tool_name=tool_name,
+                    provider_id="chatgpt_account",
+                    model_id=attempt.model_id or "unknown",
+                    turn_context={},
+                    argument_fingerprint=fingerprint,
+                    equivalence_fingerprint=dispatch.equivalence_fingerprint,
+                    side_effect=contract.side_effect.value,
+                    idempotence=contract.idempotency.value,
+                    retry_policy=contract.retry.value,
+                    postcondition_type="provider_typed_item_status",
+                    final_response_message_id=attempt.final_response_message_id,
+                    persistence_contract={
+                        "family": "system" if tool_name == "run_command" else "file",
+                        "release_after_seconds": 2.0,
+                        "inactivity_timeout_seconds": 30.0,
+                        "hard_timeout_seconds": 300.0,
+                        "check_delays_seconds": [2.0, 5.0],
+                        "safe_alternatives": [],
+                        "restart_reconciliation": True,
+                    },
+                )
+                dispatch.tool_attempt_id = str(receipt["tool_attempt_id"])
+                store.mark_accepted(dispatch.tool_attempt_id)
+                store.mark_running(dispatch.tool_attempt_id)
+                dispatch.started = True
+                attempt.native_effect_started = True
+                if dispatch.equivalence_fingerprint:
+                    attempt.frozen_equivalences.add(
+                        dispatch.equivalence_fingerprint,
+                    )
+            attempt.native_dispatches[item_id] = dispatch
+            self._send({"id": request_id, "result": {"decision": "accept"}})
+            self._append_capability_event(
+                attempt,
+                source="provider_native",
+                identity=(
+                    "commandExecution"
+                    if tool_name == "run_command" else "fileChange"
+                ),
+                phase="accepted",
+                outcome="dispatch_started" if effectful else "read_only",
+                item_id=item_id,
+                tool_attempt_id=dispatch.tool_attempt_id,
+            )
+        except Exception:
+            dispatch = attempt.native_dispatches.get(item_id)
+            if dispatch is not None and dispatch.tool_attempt_id:
+                try:
+                    from osia.tool_attempts import ToolAttemptStatus
+
+                    self._attempt_store().record_terminal_result(
+                        dispatch.tool_attempt_id,
+                        status=ToolAttemptStatus.UNKNOWN_AFTER_START,
+                        terminal_outcome="outcome_unknown",
+                        dispatch_state="dispatch_started",
+                        reason_code="native_approval_transport_failed",
+                    )
+                except Exception:
+                    pass
+                attempt.outcome_unknown = True
+                attempt.native_effect_started = True
+            self._deny_native_approval(
+                attempt, request_id, method, item_id,
+                outcome=(
+                    "outcome_unknown" if attempt.outcome_unknown
+                    else "rejected_before_execution"
+                ),
+            )
+
+    def _native_dynamic_call_is_frozen(
+        self, attempt: _TurnAttempt, native_tool_call: dict,
+    ) -> bool:
+        try:
+            from osia.capability_federation import mutation_equivalence_arguments
+            from osia.tool_contracts import SideEffectClass, effective_contract, get_tool_spec
+
+            tool_name = str(native_tool_call.get("tool") or "")
+            arguments = native_tool_call.get("arguments")
+            arguments = arguments if isinstance(arguments, dict) else {}
+            spec = get_tool_spec(tool_name)
+            if spec is None:
+                return True
+            contract = effective_contract(spec, arguments, attempt.user_request)
+            if contract.side_effect is SideEffectClass.READ_ONLY:
+                return False
+            if attempt.outcome_unknown:
+                return True
+            equivalence = mutation_equivalence_arguments(tool_name, arguments)
+            if equivalence is None:
+                return False
+            fingerprint = self._attempt_store().fingerprint_arguments(equivalence)
+            return fingerprint in attempt.frozen_equivalences
+        except Exception:
+            return bool(attempt.native_effect_started)
+
+    def _complete_native_item(self, attempt: _TurnAttempt, item: dict) -> None:
+        item_id = str(item.get("id") or "")
+        item_type = str(item.get("type") or "")
+        status = str(item.get("status") or "")
+        if status != "inProgress":
+            if item_id in attempt.terminal_native_items:
+                return
+            attempt.terminal_native_items.add(item_id)
+        dispatch = attempt.native_dispatches.get(item_id)
+        if dispatch is None:
+            if status in {"declined", "failed"}:
+                self._append_capability_event(
+                    attempt,
+                    source="provider_native",
+                    identity=item_type,
+                    phase="completed",
+                    outcome=(
+                        "cancelled_proven" if status == "declined"
+                        else "failed_before_effect"
+                    ),
+                    item_id=item_id,
+                )
+                return
+            if item_type == "commandExecution" and status == "completed":
+                try:
+                    from osia.tool_contracts import SideEffectClass, effective_contract, get_tool_spec
+
+                    spec = get_tool_spec("run_command")
+                    contract = effective_contract(
+                        spec, {"command": str(item.get("command") or "")},
+                        attempt.user_request,
+                    )
+                    if (
+                        contract.side_effect is SideEffectClass.READ_ONLY
+                        and isinstance(item.get("exitCode"), int)
+                        and not isinstance(item.get("exitCode"), bool)
+                        and item.get("exitCode") == 0
+                    ):
+                        self._append_capability_event(
+                            attempt,
+                            source="provider_native",
+                            identity=item_type,
+                            phase="completed",
+                            outcome="success_verified",
+                            item_id=item_id,
+                        )
+                        return
+                except Exception:
+                    pass
+            attempt.outcome_unknown = True
+            attempt.native_effect_started = True
+            self._mark_unsafe(
+                {"threadId": attempt.thread_id, "turnId": attempt.turn_id},
+                f"unbrokered_native_item:{item_type or 'unknown'}",
+            )
+            return
+        if dispatch.terminal or status == "inProgress":
+            return
+        dispatch.terminal = True
+        lifecycle_matches = True
+        if dispatch.tool_name == "run_command":
+            try:
+                completed_cwd = Path(
+                    str(item.get("cwd") or self.workspace_dir),
+                ).resolve(strict=False)
+            except (OSError, ValueError):
+                lifecycle_matches = False
+            else:
+                lifecycle_matches = bool(
+                    item.get("command") == dispatch.arguments.get("command")
+                    and str(completed_cwd) == dispatch.arguments.get("cwd")
+                )
+        elif dispatch.tool_name == "write_file":
+            completed_call = self._file_change_broker_call(attempt, item_id)
+            lifecycle_matches = bool(
+                completed_call is not None
+                and completed_call[0] == dispatch.tool_name
+                and completed_call[1] == dispatch.arguments
+            )
+        if not lifecycle_matches:
+            status = "lifecycleMismatch"
+        if status == "completed" and (
+            dispatch.tool_name != "run_command"
+            or (
+                isinstance(item.get("exitCode"), int)
+                and not isinstance(item.get("exitCode"), bool)
+                and item.get("exitCode") == 0
+            )
+        ):
+            terminal_status = "succeeded"
+            outcome = "success_verified"
+            dispatch_state = "effect_applied"
+            reason = "provider_typed_completion"
+        elif (
+            status == "completed"
+            and isinstance(item.get("exitCode"), int)
+            and not isinstance(item.get("exitCode"), bool)
+        ):
+            terminal_status = "failed_after_effect"
+            outcome = "failed_after_effect"
+            dispatch_state = "effect_applied"
+            reason = "provider_nonzero_exit"
+        elif status == "declined":
+            terminal_status = "cancelled_proven"
+            outcome = "cancelled_proven"
+            dispatch_state = "cancelled_before_effect"
+            reason = "provider_declined_before_effect"
+        else:
+            terminal_status = "unknown_after_start"
+            outcome = "outcome_unknown"
+            dispatch_state = "dispatch_started"
+            reason = "provider_failed_after_start"
+            attempt.outcome_unknown = True
+        if dispatch.tool_attempt_id:
+            try:
+                from osia.tool_attempts import ToolAttemptStatus
+
+                self._attempt_store().record_terminal_result(
+                    dispatch.tool_attempt_id,
+                    status=ToolAttemptStatus(terminal_status),
+                    terminal_outcome=outcome,
+                    dispatch_state=dispatch_state,
+                    reason_code=reason,
+                )
+            except Exception:
+                attempt.outcome_unknown = True
+                outcome = "outcome_unknown"
+        self._append_capability_event(
+            attempt,
+            source="provider_native",
+            identity=item_type,
+            phase="completed",
+            outcome=outcome,
+            item_id=item_id,
+            tool_attempt_id=dispatch.tool_attempt_id,
+        )
+
     def _handle_server_request(self, message: dict) -> None:
         method = str(message.get("method") or "")
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
@@ -837,7 +1389,19 @@ class AppServerClient:
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
         }:
-            result = {"decision": "cancel"}
+            attempt = self._attempt_for(params)
+            if attempt is None:
+                try:
+                    self._send({"id": request_id, "result": {"decision": "cancel"}})
+                except AppServerError:
+                    pass
+                return
+            attempt.events.put(("native_approval", {
+                "method": method,
+                "params": deepcopy(params),
+                "request_id": request_id,
+            }))
+            return
         elif method in {"execCommandApproval", "applyPatchApproval"}:
             result = {"decision": "abort"}
         elif method == "item/permissions/requestApproval":
@@ -846,10 +1410,21 @@ class AppServerClient:
             result = {"action": "cancel", "content": None}
         elif method == "item/tool/call":
             native_tool_call = _exact_canonical_native_call(params)
+            attempt = self._attempt_for(params)
+            frozen = bool(
+                native_tool_call is not None
+                and attempt is not None
+                and self._native_dynamic_call_is_frozen(
+                    attempt, native_tool_call,
+                )
+            )
             result = {
                 "contentItems": [{
                     "type": "inputText",
                     "text": (
+                        "The equivalent action is already committed and must "
+                        "not be repeated."
+                        if frozen else
                         "The request was not executed by Codex. OSIA will "
                         "evaluate it through its canonical tool pipeline."
                     ),
@@ -874,13 +1449,13 @@ class AppServerClient:
             self._send({"id": request_id, "result": result})
         except AppServerError:
             pass
-        if method == "item/tool/call" and native_tool_call is not None:
+        if method == "item/tool/call" and native_tool_call is not None and not frozen:
             self._mark_unsafe(
                 params,
                 f"canonical_tool:{native_tool_call['tool']}",
                 native_tool_call=native_tool_call,
             )
-        else:
+        elif method != "item/tool/call" or native_tool_call is None:
             self._mark_unsafe(params, "native_request")
 
     def _dispatch_notification(self, method: str, params: dict) -> None:
@@ -929,6 +1504,79 @@ class AppServerClient:
         if method in {"item/started", "item/completed"}:
             item = params.get("item") if isinstance(params.get("item"), dict) else {}
             item_type = str(item.get("type") or "")
+            item_id = str(item.get("id") or "")
+            if item_type == "webSearch":
+                if attempt is not None:
+                    self._append_capability_event(
+                        attempt,
+                        source="provider_hosted",
+                        identity="webSearch",
+                        phase="started" if method == "item/started" else "completed",
+                        outcome=(
+                            "pending" if method == "item/started"
+                            else "success_verified"
+                        ),
+                        item_id=item_id,
+                    )
+                return
+            if item_type in {"commandExecution", "fileChange"}:
+                if attempt is not None and item_id:
+                    valid_item = bool(
+                        item.get("status") in {
+                            "inProgress", "completed", "failed", "declined",
+                        }
+                        and (
+                            (
+                                item_type == "commandExecution"
+                                and isinstance(item.get("command"), str)
+                                and isinstance(item.get("commandActions"), list)
+                            )
+                            or (
+                                item_type == "fileChange"
+                                and isinstance(item.get("changes"), list)
+                            )
+                        )
+                    )
+                    if not valid_item:
+                        self._mark_unsafe(
+                            params, f"invalid_native_item:{item_type}",
+                        )
+                        return
+                    attempt.native_items[item_id] = deepcopy(item)
+                    if method == "item/started":
+                        selection_outcome = "pending_approval"
+                        if item_type == "commandExecution":
+                            try:
+                                from osia.tool_contracts import (
+                                    SideEffectClass,
+                                    effective_contract,
+                                    get_tool_spec,
+                                )
+
+                                command_spec = get_tool_spec("run_command")
+                                command_contract = effective_contract(
+                                    command_spec,
+                                    {"command": str(item.get("command") or "")},
+                                    attempt.user_request,
+                                )
+                                if (
+                                    command_contract.side_effect
+                                    is SideEffectClass.READ_ONLY
+                                ):
+                                    selection_outcome = "running_read_only"
+                            except Exception:
+                                pass
+                        self._append_capability_event(
+                            attempt,
+                            source="provider_native",
+                            identity=item_type,
+                            phase="selected",
+                            outcome=selection_outcome,
+                            item_id=item_id,
+                        )
+                    else:
+                        self._complete_native_item(attempt, item)
+                return
             if item_type == "dynamicToolCall":
                 lifecycle_params = {**params, **item}
                 if not lifecycle_params.get("callId") and isinstance(item.get("id"), str):
@@ -974,7 +1622,6 @@ class AppServerClient:
             return
 
         if method == "turn/diff/updated":
-            self._mark_unsafe(params, "native_diff")
             return
 
         if method not in _SAFE_NOTIFICATIONS:
@@ -1238,7 +1885,7 @@ class AppServerClient:
                         "threadId": thread_id,
                         "model": model,
                         "cwd": str(self.workspace_dir),
-                        "approvalPolicy": "never",
+                        "approvalPolicy": "on-request",
                         "sandbox": "read-only",
                     },
                 )
@@ -1259,7 +1906,7 @@ class AppServerClient:
             {
                 "model": model,
                 "cwd": str(self.workspace_dir),
-                "approvalPolicy": "never",
+                "approvalPolicy": "on-request",
                 "sandbox": "read-only",
                 "ephemeral": True,
                 "serviceName": "osia_pc",
@@ -1286,6 +1933,9 @@ class AppServerClient:
         model: str,
         text: str | None = None,
         content: str | list[dict] | None = None,
+        conversation_id: str | None = None,
+        osia_turn_id: str | None = None,
+        final_response_message_id: str | None = None,
         effort: str | None = None,
         on_delta: Callable[[str], None] | None = None,
         timeout: float = 300.0,
@@ -1297,7 +1947,14 @@ class AppServerClient:
                 category="empty_input",
             )
         staged_images: list[Path] = []
-        attempt = _TurnAttempt(thread_id=thread_id)
+        attempt = _TurnAttempt(
+            thread_id=thread_id,
+            conversation_id=str(conversation_id or thread_id),
+            osia_turn_id=str(osia_turn_id or ""),
+            final_response_message_id=str(final_response_message_id or ""),
+            model_id=str(model or "unknown"),
+            user_request=_latest_user_text(turn_content),
+        )
         with self._state_lock:
             if thread_id in self._attempts:
                 raise AppServerError(
@@ -1312,7 +1969,7 @@ class AppServerClient:
                 "threadId": thread_id,
                 "input": app_input,
                 "model": model,
-                "approvalPolicy": "never",
+                "approvalPolicy": "on-request",
                 "cwd": str(self.workspace_dir),
             }
             if effort:
@@ -1331,7 +1988,11 @@ class AppServerClient:
                     raise AppServerError(
                         "ERROR: the ChatGPT account turn timed out.",
                         output_started=attempt.output_started,
-                        allow_fallback=not attempt.output_started,
+                        native_action=attempt.native_effect_started,
+                        allow_fallback=(
+                            not attempt.output_started
+                            and not attempt.native_effect_started
+                        ),
                         category="turn_timeout",
                     )
                 try:
@@ -1342,7 +2003,11 @@ class AppServerClient:
                         raise AppServerError(
                             "ERROR: the Codex App Server stopped during the turn.",
                             output_started=attempt.output_started,
-                            allow_fallback=not attempt.output_started,
+                            native_action=attempt.native_effect_started,
+                            allow_fallback=(
+                                not attempt.output_started
+                                and not attempt.native_effect_started
+                            ),
                             category="process_crash",
                         )
                     continue
@@ -1351,9 +2016,19 @@ class AppServerClient:
                         on_delta(str(payload))
                 elif kind == "provider_error":
                     provider_error = str(payload)
+                elif kind == "native_approval" and isinstance(payload, dict):
+                    approval_started = time.monotonic()
+                    self._resolve_native_approval(attempt, payload)
+                    deadline += max(0.0, time.monotonic() - approval_started)
                 elif kind == "error" and isinstance(payload, AppServerError):
                     payload.output_started = attempt.output_started
-                    payload.allow_fallback = not attempt.output_started
+                    payload.native_action = (
+                        payload.native_action or attempt.native_effect_started
+                    )
+                    payload.allow_fallback = bool(
+                        not attempt.output_started
+                        and not attempt.native_effect_started
+                    )
                     raise payload
                 elif kind == "unsafe":
                     native_tool_call = attempt.native_tool_call
@@ -1374,6 +2049,17 @@ class AppServerClient:
                 elif kind == "done":
                     status = str(payload.get("status") or "failed")
                     turn_id = payload.get("turnId") or attempt.turn_id
+                    for dispatch in tuple(attempt.native_dispatches.values()):
+                        if dispatch.started and not dispatch.terminal:
+                            self._complete_native_item(attempt, {
+                                "id": dispatch.item_id,
+                                "type": (
+                                    "commandExecution"
+                                    if dispatch.tool_name == "run_command"
+                                    else "fileChange"
+                                ),
+                                "status": "failed",
+                            })
                     if attempt.native_action:
                         native_tool_call = attempt.native_tool_call
                         raise AppServerError(
@@ -1390,6 +2076,15 @@ class AppServerClient:
                             allow_fallback=False,
                             category=attempt.unsafe_category or "native_action",
                         )
+                    if attempt.outcome_unknown:
+                        raise AppServerError(
+                            "ERROR: native action outcome is unknown; equivalent execution is frozen.",
+                            output_started=attempt.output_started,
+                            native_action=True,
+                            controlled_refusal=True,
+                            allow_fallback=False,
+                            category="native_outcome_unknown",
+                        )
                     if status != "completed":
                         cancelled = status == "interrupted"
                         raise AppServerError(
@@ -1397,16 +2092,23 @@ class AppServerClient:
                             if cancelled
                             else "ERROR: the ChatGPT account turn failed before completion.",
                             output_started=attempt.output_started,
-                            allow_fallback=not attempt.output_started and not cancelled,
+                            native_action=attempt.native_effect_started,
+                            allow_fallback=(
+                                not attempt.output_started
+                                and not cancelled
+                                and not attempt.native_effect_started
+                            ),
                             category=provider_error or str(payload.get("errorCategory") or status),
                         )
-                    return TurnResult(
+                    result = TurnResult(
                         text="".join(attempt.text_parts),
                         thread_id=thread_id,
                         turn_id=str(turn_id) if turn_id else None,
                         status=status,
                         output_started=attempt.output_started,
+                        capability_events=tuple(attempt.capability_events),
                     )
+                    return result
         finally:
             with self._state_lock:
                 self._attempts.pop(thread_id, None)

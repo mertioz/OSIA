@@ -23,6 +23,7 @@ from osia.chatgpt_account.rate_limits import (
     quota_windows,
     sanitize_rate_limit_payload,
 )
+from osia.tool_attempts import ToolAttemptStore
 
 
 class _QueueReader:
@@ -181,6 +182,7 @@ class AppServerClientTests(unittest.TestCase):
             runtime_version_override="codex-cli 0.144.1",
             startup_timeout=2,
             request_timeout=2,
+            tool_attempt_store=ToolAttemptStore(Path(temp.name) / "attempts"),
         )
         self.addCleanup(client.shutdown)
         return client, factory
@@ -275,8 +277,9 @@ class AppServerClientTests(unittest.TestCase):
                 for key in env)
         )
         config = (client.home_dir / "config.toml").read_text(encoding="utf-8")
-        self.assertIn('web_search = "disabled"', config)
-        self.assertIn('inherit = "none"', config)
+        self.assertIn('web_search = "live"', config)
+        self.assertIn('approval_policy = "on-request"', config)
+        self.assertIn('inherit = "core"', config)
 
     def test_managed_runtime_is_primary_and_global_codex_is_not_required(self):
         temp = tempfile.TemporaryDirectory()
@@ -535,6 +538,22 @@ class AppServerClientTests(unittest.TestCase):
         self.assertEqual(caught.exception.category, "isolation_failed")
         self.assertEqual(factory.calls, [])
 
+    def test_exact_legacy_managed_configuration_migrates_in_place(self):
+        for previous in (
+            client_module._LEGACY_SAFE_CONFIG,
+            client_module._NO_ENV_SAFE_CONFIG,
+        ):
+            with self.subTest(previous=previous):
+                client, _factory = self.make_client()
+                client.home_dir.mkdir(parents=True, exist_ok=True)
+                config = client.home_dir / "config.toml"
+                config.write_text(previous, encoding="utf-8", newline="\n")
+                client._ensure_layout()
+                self.assertEqual(
+                    config.read_text(encoding="utf-8"),
+                    client_module._SAFE_CONFIG,
+                )
+
     def test_repeated_crashes_disable_bounded_restart(self):
         client, factory = self.make_client()
         client._crash_times = [time.monotonic(), time.monotonic()]
@@ -686,30 +705,185 @@ class AppServerClientTests(unittest.TestCase):
                     if isinstance(message.get("result"), dict)
                 ))
 
-    def test_command_and_file_approvals_are_cancelled_without_fallback(self):
+    def test_unobservable_command_and_file_approvals_are_declined_in_same_turn(self):
         for approval_method in (
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
         ):
             with self.subTest(approval_method=approval_method):
-                error, received, _deltas = self.run_native_failure(
-                    approval_method=approval_method,
+                def handler(process, message, current=approval_method):
+                    if message.get("method") == "turn/start":
+                        process.emit({
+                            "id": message["id"],
+                            "result": {"turn": {"id": "turn-native"}},
+                        })
+                        process.emit({
+                            "id": 900,
+                            "method": current,
+                            "params": {
+                                "threadId": "thread-native",
+                                "turnId": "turn-native",
+                                "itemId": "item-native",
+                            },
+                        })
+                    elif message.get("id") == 900 and "result" in message:
+                        process.emit({
+                            "method": "item/agentMessage/delta",
+                            "params": {
+                                "threadId": "thread-native",
+                                "turnId": "turn-native",
+                                "delta": "The unavailable native path was not executed.",
+                            },
+                        })
+                        process.emit({
+                            "method": "turn/completed",
+                            "params": {
+                                "threadId": "thread-native",
+                                "turn": {"id": "turn-native", "status": "completed"},
+                            },
+                        })
+                    else:
+                        _base_handler(process, message)
+
+                client, factory = self.make_client(handler)
+                result = client.run_turn(
+                    thread_id="thread-native", text="test", model="visible",
                 )
+                received = factory.processes[0].received
                 approval = next(
                     message for message in received
                     if message.get("id") == 900 and "result" in message
                 )
-                self.assertEqual(approval["result"], {"decision": "cancel"})
-                self.assertTrue(error.native_action)
-                self.assertTrue(error.controlled_refusal)
-                self.assertFalse(error.allow_fallback)
+                self.assertEqual(approval["result"], {"decision": "decline"})
+                self.assertEqual(
+                    result.text, "The unavailable native path was not executed.",
+                )
                 self.assertEqual(
                     len([
                         message for message in received
                         if message.get("method") == "turn/interrupt"
                     ]),
-                    1,
+                    0,
                 )
+
+    def test_observable_native_command_uses_broker_and_continues_same_turn(self):
+        command = "echo wor250"
+        state = {"cwd": ""}
+
+        def handler(process, message):
+            if message.get("method") == "turn/start":
+                params = message["params"]
+                state["cwd"] = params["cwd"]
+                process.emit({
+                    "id": message["id"],
+                    "result": {"turn": {"id": "turn-brokered"}},
+                })
+                process.emit({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread-brokered",
+                        "turnId": "turn-brokered",
+                        "item": {
+                            "id": "item-brokered",
+                            "type": "commandExecution",
+                            "status": "inProgress",
+                            "command": command,
+                            "cwd": params["cwd"],
+                            "commandActions": [{
+                                "type": "unknown", "command": command,
+                            }],
+                        },
+                    },
+                })
+                process.emit({
+                    "id": 901,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "threadId": "thread-brokered",
+                        "turnId": "turn-brokered",
+                        "itemId": "item-brokered",
+                        "command": command,
+                        "cwd": params["cwd"],
+                        "commandActions": [{
+                            "type": "unknown", "command": command,
+                        }],
+                        "availableDecisions": ["accept", "decline"],
+                    },
+                })
+            elif message.get("id") == 901 and "result" in message:
+                process.emit({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-brokered",
+                        "turnId": "turn-brokered",
+                        "item": {
+                            "id": "item-brokered",
+                            "type": "commandExecution",
+                            "status": "completed",
+                            "command": command,
+                            "cwd": state["cwd"],
+                            "commandActions": [{
+                                "type": "unknown", "command": command,
+                            }],
+                            "exitCode": 0,
+                        },
+                    },
+                })
+                process.emit({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-brokered",
+                        "turnId": "turn-brokered",
+                        "delta": "Native command completed.",
+                    },
+                })
+                process.emit({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-brokered",
+                        "turn": {"id": "turn-brokered", "status": "completed"},
+                    },
+                })
+            else:
+                _base_handler(process, message)
+
+        client, factory = self.make_client(handler)
+        with (
+            patch("osia.action_policy.guard_tool_call", return_value=None),
+            patch(
+                "osia.action_policy.pending_execution_permit_matches",
+                return_value=True,
+            ),
+            patch(
+                "osia.action_policy.consume_pending_execution_permit",
+                return_value=True,
+            ),
+        ):
+            result = client.run_turn(
+                thread_id="thread-brokered",
+                conversation_id="conversation:brokered",
+                osia_turn_id="turn:osia",
+                text="Run the command.",
+                model="visible",
+            )
+        approval = next(
+            message for message in factory.processes[0].received
+            if message.get("id") == 901 and "result" in message
+        )
+        self.assertEqual(approval["result"], {"decision": "accept"})
+        self.assertEqual(result.text, "Native command completed.")
+        self.assertEqual(
+            [(event.phase, event.outcome) for event in result.capability_events],
+            [
+                ("selected", "pending_approval"),
+                ("accepted", "dispatch_started"),
+                ("completed", "success_verified"),
+            ],
+        )
+        self.assertFalse(any(
+            message.get("method") == "turn/interrupt"
+            for message in factory.processes[0].received
+        ))
 
     def test_partial_text_then_native_action_has_one_safe_terminal_failure(self):
         error, received, deltas = self.run_native_failure(
@@ -855,7 +1029,7 @@ class AppServerClientTests(unittest.TestCase):
 
     def test_all_stable_native_action_categories_fail_closed(self):
         for item_type in (
-            "fileChange", "mcpToolCall", "webSearch", "imageGeneration",
+            "fileChange", "mcpToolCall", "imageGeneration",
             "collabAgentToolCall", "subAgentActivity", "dynamicToolCall",
         ):
             with self.subTest(item_type=item_type):
@@ -874,6 +1048,57 @@ class AppServerClientTests(unittest.TestCase):
                 self.assertTrue(caught.exception.native_action)
                 self.assertTrue(caught.exception.controlled_refusal)
                 self.assertFalse(caught.exception.allow_fallback)
+
+    def test_provider_hosted_web_search_remains_native_and_observable(self):
+        def handler(process, message):
+            if message.get("method") == "turn/start":
+                process.emit({
+                    "id": message["id"],
+                    "result": {"turn": {"id": "turn-web"}},
+                })
+                for method in ("item/started", "item/completed"):
+                    process.emit({
+                        "method": method,
+                        "params": {
+                            "threadId": "thread-web",
+                            "turnId": "turn-web",
+                            "item": {
+                                "id": "web-item", "type": "webSearch",
+                                "query": "private query",
+                            },
+                        },
+                    })
+                process.emit({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-web", "turnId": "turn-web",
+                        "delta": "Hosted search result.",
+                    },
+                })
+                process.emit({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-web",
+                        "turn": {"id": "turn-web", "status": "completed"},
+                    },
+                })
+            else:
+                _base_handler(process, message)
+
+        client, factory = self.make_client(handler)
+        result = client.run_turn(
+            thread_id="thread-web", text="search", model="visible",
+        )
+        self.assertEqual(result.text, "Hosted search result.")
+        self.assertEqual(
+            [(event.identity, event.phase) for event in result.capability_events],
+            [("webSearch", "started"), ("webSearch", "completed")],
+        )
+        self.assertNotIn("private query", repr(result.capability_events))
+        self.assertFalse(any(
+            message.get("method") == "turn/interrupt"
+            for message in factory.processes[0].received
+        ))
 
 
 if __name__ == "__main__":
