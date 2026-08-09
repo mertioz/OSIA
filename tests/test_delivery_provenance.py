@@ -118,6 +118,19 @@ def test_no_device_fails_clearly():
     assert "found 0" in check.detail
 
 
+def test_windows_adb_space_separated_device_is_detected():
+    devices = parse_adb_devices(
+        "List of devices attached\n"
+        "5C091JEBF03275         device product:tegu model:Pixel_9a device:tegu\n"
+    )
+
+    selected, check = select_device(devices)
+
+    assert check.ok
+    assert selected is not None
+    assert selected["serial"] == "5C091JEBF03275"
+
+
 def test_protected_dirty_checkout_is_reported_without_mutation(tmp_path):
     repo, head = _matching_repo(tmp_path)
     protected = repo / "osia" / "mcp_client" / "reconnect.py"

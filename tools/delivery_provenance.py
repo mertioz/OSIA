@@ -338,11 +338,17 @@ def parse_adb_devices(output: str) -> list[dict[str, str]]:
     devices: list[dict[str, str]] = []
     for raw_line in output.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("List of devices") or "\t" not in line:
+        if not line or line.startswith("List of devices"):
             continue
-        serial, rest = line.split("\t", 1)
-        state, _, details = rest.partition(" ")
-        devices.append({"serial": serial, "state": state, "details": details})
+        match = re.match(r"^(\S+)\s+(\S+)(?:\s+(.*))?$", line)
+        if match:
+            devices.append(
+                {
+                    "serial": match.group(1),
+                    "state": match.group(2),
+                    "details": match.group(3) or "",
+                }
+            )
     return devices
 
 
