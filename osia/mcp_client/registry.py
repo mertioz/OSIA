@@ -532,9 +532,13 @@ def register_server_tools(manager: Any, server_id: str, tools) -> list:
         # Classify ONCE at registration; the result is baked into the wrapper
         # closure (the hot path never re-classifies).
         is_write = classify_tool(name, annotations)
+        # MCP's destructive hint marks a potentially irreversible write; it
+        # does not mean the operation literally deletes an object. Route only
+        # deletion-named tools through the reinforced deletion preflight. Other
+        # destructive writes still remain write-biased and reach the canonical
+        # confirmation gate below.
         is_deletion = bool(
-            annotations.get("destructiveHint") is True
-            or re.search(r"(?:^|_)(?:delete|remove|erase|destroy)(?:_|$)", name, re.IGNORECASE)
+            re.search(r"(?:^|_)(?:delete|remove|erase|destroy)(?:_|$)", name, re.IGNORECASE)
         )
         if is_deletion:
             is_write = True

@@ -1352,11 +1352,17 @@ class _OutboundChannel:
     free while a response streams.
     """
 
-    __slots__ = ("_closed", "_queue", "_text_coalescer")
+    __slots__ = (
+        "_closed", "_permission_device_id", "_queue", "_text_coalescer",
+    )
 
     def __init__(self) -> None:
         self._queue: asyncio.Queue = asyncio.Queue()
         self._closed = False
+        # Stable opaque identity bound only after Mobile authentication.  It
+        # lets one pending approval follow the same device across a transport
+        # reconnect without ever falling back to an unrelated connection.
+        self._permission_device_id = ""
         self._text_coalescer = AssistantTextCoalescer(
             lambda frame: self._queue.put_nowait(("json", frame)),
             loop=asyncio.get_running_loop(),
@@ -4004,15 +4010,14 @@ async def internal_mcp_oauth_switch(request: Request):
 # trip to the mobile client that ORIGINATED the current turn: send an
 # ``mcp_confirm_request``, block the agent's worker thread on a Future, then
 # resolve it when the matching ``mcp_confirm_response`` arrives (or deny on
-# timeout / disconnect / no client / send failure).
+# timeout / no client / send failure). A device-bound request keeps waiting
+# across a transient Mobile transport disconnect.
 #
 # Correlating the worker-thread provider call back to the originating connection:
-# ``_turn_target`` is a ContextVar holding ``(channel, loop)``, set ONCE per
-# connection in the WebSocket endpoint. asyncio.create_task (the turn task),
-# asyncio.to_thread (the agent run) and the tool executor's
-# ``contextvars.copy_context`` (osia.agent._execute_tool_once) all PROPAGATE the
-# context, so the provider reads the right ``(channel, loop)`` even three
-# thread-hops away — and a confirm is always routed to the device that asked.
+# ``_turn_target`` is a ContextVar holding ``(channel, loop)``. The actual agent
+# worker binds it to the originating connection; every further provider/tool
+# thread bridge copies that context, so a confirm is always routed to the
+# device that asked.
 # No secret rides these frames: only the server id, tool name, and an
 # arg-NAMES-only summary (osia.mcp.registry._confirm_summary).
 #
@@ -4022,10 +4027,16 @@ async def internal_mcp_oauth_switch(request: Request):
 _turn_target: "contextvars.ContextVar" = contextvars.ContextVar(
     "osia_mcp_turn_target", default=None
 )
+_turn_confirmation_correlation: "contextvars.ContextVar" = (
+    contextvars.ContextVar("osia_permission_turn_correlation", default=None)
+)
 
-# request_id -> (concurrent.futures.Future, originating _OutboundChannel).
+# request_id -> _PendingConfirmation.  The existing Future and immutable frame
+# survive a Mobile transport reconnect; only the exact authenticated device's
+# presentation channel is rebound.
 _pending_confirms: dict = {}
 _pending_confirms_lock = threading.Lock()
+_confirmation_channels_by_device: dict = {}
 
 # Confirmation wait budget. Kept UNDER the per-call MCP tool budget granted in
 # 5-conf-a (osia.agent._MCP_CONFIRM_TOOL_TIMEOUT == 150 s) so the worker returns
@@ -4033,40 +4044,182 @@ _pending_confirms_lock = threading.Lock()
 _MCP_CONFIRM_WS_TIMEOUT = 120.0
 
 
-def _resolve_confirm(request_id: str, approved: bool) -> bool:
+class _PendingConfirmation:
+    __slots__ = (
+        "channel", "deadline", "device_id", "frame", "future",
+        "last_projected_channel", "loop",
+    )
+
+    def __init__(
+        self, *, future, channel, loop, device_id: str, frame: dict,
+        deadline: float,
+    ) -> None:
+        self.future = future
+        self.channel = channel
+        self.loop = loop
+        self.device_id = device_id
+        self.frame = dict(frame)
+        self.deadline = float(deadline)
+        self.last_projected_channel = None
+
+
+def _settle_confirmation(entry: "_PendingConfirmation", approved: bool) -> None:
+    if entry.future.done():
+        return
+    try:
+        entry.future.set_result(bool(approved))
+    except Exception:
+        pass
+
+
+async def _project_pending_confirmation(
+    request_id: str, entry: "_PendingConfirmation", channel,
+) -> None:
+    """Queue one still-current immutable approval frame on one exact channel."""
+
+    expired = False
+    with _pending_confirms_lock:
+        current = _pending_confirms.get(request_id)
+        if (
+            current is not entry
+            or entry.channel is not channel
+            or entry.last_projected_channel is not channel
+        ):
+            return
+        if entry.deadline <= time.monotonic():
+            _pending_confirms.pop(request_id, None)
+            expired = True
+        frame = dict(entry.frame)
+    if expired:
+        _settle_confirmation(entry, False)
+        return
+    await channel.send_json(frame)
+
+
+def _schedule_confirmation_projection_locked(
+    request_id: str,
+    entry: "_PendingConfirmation",
+    channel,
+    loop,
+) -> bool:
+    """Bind and schedule one projection. Caller holds the pending lock."""
+
+    if (
+        channel is None
+        or loop is None
+        or not loop.is_running()
+        or bool(getattr(channel, "_closed", False))
+    ):
+        return False
+    if entry.last_projected_channel is channel:
+        return True
+    entry.channel = channel
+    entry.loop = loop
+    entry.last_projected_channel = channel
+    try:
+        asyncio.run_coroutine_threadsafe(
+            _project_pending_confirmation(request_id, entry, channel), loop,
+        )
+    except Exception:
+        entry.channel = None
+        entry.loop = None
+        return False
+    return True
+
+
+def _attach_confirmation_channel(device_id: str, channel, loop) -> int:
+    """Register one authenticated device channel and restore its pending UI."""
+
+    safe_device = _permission_safe_id(device_id)
+    if (
+        not safe_device
+        or channel is None
+        or loop is None
+        or not loop.is_running()
+    ):
+        return 0
+    restored = 0
+    expired = []
+    with _pending_confirms_lock:
+        _confirmation_channels_by_device[safe_device] = (channel, loop)
+        for request_id, entry in list(_pending_confirms.items()):
+            if entry.device_id != safe_device:
+                continue
+            if entry.deadline <= time.monotonic():
+                _pending_confirms.pop(request_id, None)
+                expired.append(entry)
+                continue
+            # A live old channel may still be finishing teardown.  Its detach
+            # path will rebind to this new channel, avoiding two simultaneous
+            # presentations of the same request.
+            if entry.channel is not None and not bool(
+                getattr(entry.channel, "_closed", False)
+            ):
+                continue
+            if _schedule_confirmation_projection_locked(
+                request_id, entry, channel, loop,
+            ):
+                restored += 1
+    for entry in expired:
+        _settle_confirmation(entry, False)
+    return restored
+
+
+def _resolve_confirm(request_id: str, approved: bool, *, channel=None) -> bool:
     """Resolve a pending confirmation Future by id and remove it. Returns True if
     a pending entry was found and resolved, False if the id was unknown/expired
     (a late / duplicate / foreign response — ignored cleanly). Thread-safe; never
     raises."""
+    expired = False
     with _pending_confirms_lock:
-        entry = _pending_confirms.pop(request_id, None)
-    if entry is None:
-        return False
-    fut, _channel = entry
-    if not fut.done():
-        try:
-            fut.set_result(bool(approved))
-        except Exception:
-            pass
-    return True
+        entry = _pending_confirms.get(request_id)
+        if entry is None:
+            return False
+        if entry.deadline <= time.monotonic():
+            _pending_confirms.pop(request_id, None)
+            expired = True
+        elif channel is not None and entry.channel is not channel:
+            # A stale transport cannot approve a request already rebound to the
+            # same device's replacement channel.
+            return False
+        else:
+            _pending_confirms.pop(request_id, None)
+    _settle_confirmation(entry, False if expired else bool(approved))
+    return not expired
 
 
 def _deny_confirms_for_channel(channel) -> None:
-    """Deny (resolve False) + drop every pending confirmation targeting
-    ``channel`` — called when that connection disconnects so a blocked worker
-    thread wakes immediately (deny) instead of hanging until the timeout.
-    Thread-safe; never raises."""
+    """Detach a transport while preserving device-bound pending approvals.
+
+    Requests without a stable authenticated device id still fail closed. A
+    device-bound request keeps its original Future, id, and deadline until the
+    same device reconnects or the request expires.
+    """
+    denied = []
     with _pending_confirms_lock:
-        victims = [
-            rid for rid, (_f, ch) in _pending_confirms.items() if ch is channel
-        ]
-        for rid in victims:
-            fut, _ch = _pending_confirms.pop(rid)
-            if not fut.done():
-                try:
-                    fut.set_result(False)
-                except Exception:
-                    pass
+        device_id = _permission_safe_id(
+            getattr(channel, "_permission_device_id", "")
+        )
+        registered = _confirmation_channels_by_device.get(device_id)
+        if registered is not None and registered[0] is channel:
+            _confirmation_channels_by_device.pop(device_id, None)
+        for request_id, entry in list(_pending_confirms.items()):
+            if entry.channel is not channel:
+                continue
+            if not entry.device_id:
+                _pending_confirms.pop(request_id, None)
+                denied.append(entry)
+                continue
+            replacement = _confirmation_channels_by_device.get(entry.device_id)
+            if replacement is not None and replacement[0] is not channel:
+                if _schedule_confirmation_projection_locked(
+                    request_id, entry, replacement[0], replacement[1],
+                ):
+                    continue
+            entry.channel = None
+            entry.loop = None
+    for entry in denied:
+        _settle_confirmation(entry, False)
 
 
 def _ws_confirm_provider(server_id: str, tool_name: str, summary: str) -> bool | None:
@@ -4081,36 +4234,70 @@ def _ws_confirm_provider(server_id: str, tool_name: str, summary: str) -> bool |
         if not target:
             return None  # no originating channel; let unattended policy decide
         channel, loop = target
-        if channel is None or loop is None or not loop.is_running():
+        if (
+            channel is None
+            or loop is None
+            or not loop.is_running()
+            or bool(getattr(channel, "_closed", False))
+        ):
             return None
-        request_id = secrets.token_hex(8)
-        fut: "concurrent.futures.Future" = concurrent.futures.Future()
         with _pending_confirms_lock:
-            _pending_confirms[request_id] = (fut, channel)
+            request_id = secrets.token_hex(8)
+            while request_id in _pending_confirms:
+                request_id = secrets.token_hex(8)
+        fut: "concurrent.futures.Future" = concurrent.futures.Future()
+        deadline = time.monotonic() + _MCP_CONFIRM_WS_TIMEOUT
         frame = {
             "type": "mcp_confirm_request",
             "id": request_id,
+            "permission_request_id": request_id,
+            "operation_id": request_id,
             "server": str(server_id),
             "tool": str(tool_name),
             "summary": str(summary or ""),
+            "expires_at": time.time() + _MCP_CONFIRM_WS_TIMEOUT,
         }
-        try:
-            # Enqueue the request onto the originating connection's single-writer
-            # channel from this worker thread (the established bridge).
-            asyncio.run_coroutine_threadsafe(channel.send_json(frame), loop)
-        except Exception:
-            with _pending_confirms_lock:
+        correlation = _turn_confirmation_correlation.get()
+        if isinstance(correlation, dict):
+            for key in ("conversation_id", "request_id", "turn_id"):
+                value = _permission_safe_id(correlation.get(key))
+                if value:
+                    frame[key] = value
+        entry = _PendingConfirmation(
+            future=fut,
+            channel=channel,
+            loop=loop,
+            device_id=_permission_safe_id(
+                getattr(channel, "_permission_device_id", "")
+            ),
+            frame=frame,
+            deadline=deadline,
+        )
+        with _pending_confirms_lock:
+            # Never overwrite a live request even if the opaque-id generator
+            # were unexpectedly forced to collide.
+            if request_id in _pending_confirms:
+                return None
+            _pending_confirms[request_id] = entry
+            scheduled = _schedule_confirmation_projection_locked(
+                request_id, entry, channel, loop,
+            )
+            if not scheduled:
                 _pending_confirms.pop(request_id, None)
+        if not scheduled:
             return None
         try:
-            approved = fut.result(timeout=_MCP_CONFIRM_WS_TIMEOUT)
+            approved = fut.result(
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
         except Exception:  # TimeoutError or any -> deny
             approved = False
         finally:
             # Idempotent drop: a resolve already popped it; a timeout pops it here
             # so a late response finds nothing and is ignored (no double-resolve).
             with _pending_confirms_lock:
-                _pending_confirms.pop(request_id, None)
+                if _pending_confirms.get(request_id) is entry:
+                    _pending_confirms.pop(request_id, None)
         return bool(approved)
     except Exception:
         return False  # any failure -> deny (safe)
@@ -7745,7 +7932,8 @@ async def websocket_endpoint(ws: WebSocket):
                         set_browser_progress_callback(_on_browser_progress)
                     except Exception:
                         pass
-                    permission_session.bind_device(msg.get("device_id"))
+                    if permission_session.bind_device(msg.get("device_id")):
+                        out._permission_device_id = permission_session.device_id
                     permission_session.activate()
                     session_history = []
                     active_conv_id = None
@@ -7805,6 +7993,11 @@ async def websocket_endpoint(ws: WebSocket):
                                 _conversation_busy_changed_frame(_busy_id, True)
                             )
                     print("[OSIA Server] Mobile client authenticated.")
+                    _attach_confirmation_channel(
+                        permission_session.device_id,
+                        out,
+                        asyncio.get_running_loop(),
+                    )
                     # Start the live system-metrics push for this client. The
                     # loop self-gates on heartbeat_enabled; guard against a
                     # stray second auth frame spawning a duplicate loop. It
@@ -7838,6 +8031,18 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 if not permission_session.bind_device(msg.get("device_id")):
                     continue
+                # Direct LAN/WebRTC bridges authenticate the local server hop
+                # without forwarding an application auth frame. The first
+                # canonical snapshot request carries the same stable Mobile
+                # identity, so bind the approval presenter here as well as on
+                # direct WebSocket auth. This remains one channel and one
+                # pending request; reconnect merely reprojects that request.
+                out._permission_device_id = permission_session.device_id
+                _attach_confirmation_channel(
+                    permission_session.device_id,
+                    out,
+                    asyncio.get_running_loop(),
+                )
                 pending_ids = msg.get("pending_request_ids", [])
                 if not isinstance(pending_ids, list) or any(
                     not isinstance(item, str) for item in pending_ids
@@ -9666,9 +9871,9 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "mcp_confirm_response":
                 raw_cid = msg.get("id")
                 cid = raw_cid.strip() if isinstance(raw_cid, str) else ""
-                approved = bool(msg.get("approved", False))
+                approved = msg.get("approved") is True
                 if cid:
-                    _resolve_confirm(cid, approved)
+                    _resolve_confirm(cid, approved, channel=out)
                 continue
 
             # --- Heartbeat config (mobile live-metrics screen) ---
@@ -10569,10 +10774,10 @@ async def websocket_endpoint(ws: WebSocket):
                 unsubscribe_scheduled_tasks()
             except Exception:
                 pass
-        # WOR-44 Phase 5 (5-conf-c): deny + drop any MCP confirmation still pending
-        # for THIS connection so a blocked agent worker thread (a detached turn's
-        # write tool awaiting approval) wakes immediately with a deny instead of
-        # hanging until the timeout. No-op if none are pending.
+        # Preserve an exact device-bound approval across a transient Mobile
+        # transport reconnect. Unbound requests still fail closed; every other
+        # request keeps its original id/Future/deadline and is projected once
+        # onto the same device's replacement channel.
         _deny_confirms_for_channel(out)
         # WOR-62: DETACH any in-flight streaming turn for this connection
         # instead of cancelling it. Cancelling raised CancelledError inside the
@@ -11678,6 +11883,17 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             )
 
         def _run_agent_busy_tracked():
+            # ChatGPT App Server native approvals arrive while agent.run is
+            # already executing on this worker. Bind the originating channel
+            # here instead of assuming one ContextVar survived every provider
+            # and thread bridge. MCP workers copy this same context, so native
+            # and MCP approvals share one presentation target and broker path.
+            target_token = _turn_target.set((ws, document_loop))
+            correlation_token = _turn_confirmation_correlation.set({
+                "conversation_id": str(active_conv_id or ""),
+                "request_id": str((turn_meta or {}).get("request_id") or ""),
+                "turn_id": str((turn_meta or {}).get("turn_id") or ""),
+            })
             try:
                 with document_progress_scope(
                     "chat",
@@ -11693,6 +11909,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                         turn_context=turn_context,
                     )
             finally:
+                _turn_confirmation_correlation.reset(correlation_token)
+                _turn_target.reset(target_token)
                 agent._in_use = False
                 agent._chat_autonomous_context = None
 

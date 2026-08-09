@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import math
@@ -528,7 +529,16 @@ class _AccountCompletions:
             except Exception as exc:
                 events.put(("error", exc))
 
-        threading.Thread(target=worker, name="osia-chatgpt-turn", daemon=True).start()
+        # Streaming uses a dedicated provider thread.  Carry the originating
+        # server turn context into it so a native approval reaches the same
+        # canonical permission presenter as OSIA and MCP tool calls.
+        context = contextvars.copy_context()
+        threading.Thread(
+            target=context.run,
+            args=(worker,),
+            name="osia-chatgpt-turn",
+            daemon=True,
+        ).start()
 
         def iterator():
             while True:
