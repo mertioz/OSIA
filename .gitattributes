@@ -7,6 +7,9 @@
 *.sh        text eol=lf
 *.py        text eol=lf
 
+# Canonical Guide artifacts are hashed across the PC and Mobile repositories.
+assets/guide/catalog.v4.json text eol=lf
+
 # Treat binaries as binary (no EOL/CRLF munging, no diff).
 *.wav       binary
 *.pkl       binary

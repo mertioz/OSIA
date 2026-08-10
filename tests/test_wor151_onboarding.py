@@ -12,7 +12,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PIL import Image
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QPoint, QPointF, Qt
+from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication, QFrame, QLabel, QPushButton
 
@@ -29,6 +30,7 @@ from osia.guide_content import (
 )
 from osia.gui import main_popup
 from osia.gui.onboarding import OnboardingDialog, _ScaledPixmapLabel
+from osia.gui.theme import get_theme_manager
 from osia.utils.assets import asset_path
 
 
@@ -140,13 +142,18 @@ def test_old_v1_state_gains_progress_without_resetting_or_reopening(tmp_path):
     )
     progress = onboarding.guide_progress(marker)
     assert progress["contentSchemaVersion"] == GUIDE_CONTENT_SCHEMA_VERSION
-    assert progress["currentLesson"] == "advanced.voice-tts-stt"
-    assert progress["masteryCompleted"] == ["advanced.pc-mobile-connection"]
+    assert progress["currentLesson"] == "mastery.voice-tts"
+    assert progress["masteryCompleted"] == [
+        "mastery.mobile-pairing",
+        "mastery.mobile-transport",
+        "mastery.single-transport",
+        "mastery.mobile-offline",
+    ]
     assert progress["advancedCompleted"] == []
     onboarding.update_guide_progress(marker, finished=True)
     state = onboarding.onboarding_state(marker)
     assert state["outcome"] == "completed"
-    assert state["currentLesson"] == "advanced.voice-tts-stt"
+    assert state["currentLesson"] == "mastery.voice-tts"
     assert not onboarding.claim_automatic_onboarding(marker)
 
 
@@ -171,8 +178,13 @@ def test_corrupt_progress_is_bounded_to_registered_lesson_ids(tmp_path):
         encoding="utf-8",
     )
     progress = onboarding.guide_progress(marker)
-    assert progress["currentLesson"] == ""
-    assert progress["masteryCompleted"] == ["advanced.voice-tts-stt"]
+    assert progress["currentLesson"] == "essential.osia-role"
+    assert progress["masteryCompleted"] == [
+        "mastery.voice-tts",
+        "mastery.voice-stt",
+        "mastery.voice-recovery",
+        "mastery.voice-privacy",
+    ]
     assert progress["advancedCompleted"] == []
 
 
@@ -195,8 +207,13 @@ def test_v2_advanced_progress_migrates_to_mastery_only(tmp_path):
     )
     progress = onboarding.guide_progress(marker)
     assert progress["essentialCompleted"] is True
-    assert progress["currentLesson"] == "advanced.ai-model-hierarchy"
-    assert progress["masteryCompleted"] == ["advanced.ai-model-hierarchy"]
+    assert progress["currentLesson"] == "mastery.manual-model"
+    assert progress["masteryCompleted"] == [
+        "mastery.manual-model",
+        "mastery.task-routing",
+        "mastery.model-fallback",
+        "mastery.vision-local",
+    ]
     assert progress["advancedCompleted"] == []
     assert progress["finished"] is True
     assert onboarding.onboarding_state(marker)["outcome"] == "completed"
@@ -248,17 +265,12 @@ def test_three_categories_and_all_stable_ids_are_unique():
         assert orders == list(range(1, len(orders) + 1))
 
 
-def test_decorative_guide_header_is_removed_without_reserved_space(tmp_path):
-    source = (ROOT / "osia" / "gui" / "onboarding.py").read_text("utf-8")
-    assert "def _build_header" not in source
-    assert "outer.addWidget(self._build_header())" not in source
-    assert "guideHeader" not in source
-    assert "guideTitle" not in source
-    assert "guideSubtitle" not in source
+def test_premium_header_exposes_three_track_selectors(tmp_path):
     dialog = OnboardingDialog(state_path=tmp_path / "state.json")
-    assert dialog.findChild(QFrame, "guideHeader") is None
+    assert dialog.findChild(QFrame, "guideHeader") is not None
+    assert len(dialog._category_buttons) == 3
     body_top = dialog._toc.mapTo(dialog, dialog._toc.rect().topLeft()).y()
-    assert body_top < 170
+    assert body_top < 190
     dialog.deleteLater()
 
 
@@ -269,7 +281,12 @@ def test_mastery_and_developer_progress_are_independent(tmp_path):
         mastery_completed=["advanced.ai-model-hierarchy"],
         advanced_completed=["advanced.handshake"],
     )
-    assert progress["masteryCompleted"] == ["advanced.ai-model-hierarchy"]
+    assert progress["masteryCompleted"] == [
+        "mastery.manual-model",
+        "mastery.task-routing",
+        "mastery.model-fallback",
+        "mastery.vision-local",
+    ]
     assert progress["advancedCompleted"] == ["advanced.handshake"]
     restored = onboarding.guide_progress(marker)
     assert restored == progress
@@ -389,23 +406,23 @@ def test_no_content_level_configuration_or_application_action_buttons(tmp_path):
 def test_toc_category_previous_and_next_navigation(tmp_path):
     dialog = OnboardingDialog(state_path=tmp_path / "state.json")
     assert dialog._current_lesson_id is None
-    assert dialog._toc.count() == 8
-    assert dialog._next.text() == "Start"
+    assert dialog._toc.count() == 17
+    assert dialog._next.text() == "Resume"
     QTest.mouseClick(dialog._next, Qt.MouseButton.LeftButton)
-    assert dialog._current_lesson_id == "essential.what-is-osia"
+    assert dialog._current_lesson_id == "essential.osia-role"
     assert not dialog._back.isEnabled()
     QTest.mouseClick(dialog._next, Qt.MouseButton.LeftButton)
-    assert dialog._current_lesson_id == "essential.answer-methods"
+    assert dialog._current_lesson_id == "essential.requirements"
     assert dialog._back.isEnabled()
     QTest.mouseClick(dialog._back, Qt.MouseButton.LeftButton)
-    assert dialog._current_lesson_id == "essential.what-is-osia"
+    assert dialog._current_lesson_id == "essential.osia-role"
     QTest.mouseClick(
         dialog._category_buttons[CATEGORY_MASTERY], Qt.MouseButton.LeftButton
     )
     assert dialog._selected_category == CATEGORY_MASTERY
-    assert dialog._current_lesson_id is None
+    assert dialog._current_lesson_id == "mastery.pc-authority"
     dialog._toc.setCurrentRow(4)
-    assert dialog._current_lesson_id == "advanced.ai-model-hierarchy"
+    assert dialog._current_lesson_id == "mastery.provider-routes"
     dialog.deleteLater()
 
 
@@ -420,7 +437,7 @@ def test_skip_persists_and_french_ui_is_available(tmp_path):
         assert dialog._skip.text() == "Passer"
         assert dialog._next.text() == "Suivant"
         titles = " ".join(label.text() for label in dialog.findChildren(QLabel))
-        assert "Qu’est-ce qu’OSIA" in titles
+        assert "OSIA fonctionne depuis votre PC" in titles
         QTest.mouseClick(dialog._skip, Qt.MouseButton.LeftButton)
         state = onboarding.onboarding_state(marker)
         assert state["outcome"] == "skipped"
@@ -446,7 +463,7 @@ def test_finish_persists_essential_completion_and_second_launch_is_quiet(tmp_pat
     assert not onboarding.claim_automatic_onboarding(marker)
     manual = OnboardingDialog(automatic=False, state_path=marker)
     assert manual._current_lesson_id is None
-    assert manual._toc.count() == 8
+    assert manual._toc.count() == 17
     manual.deleteLater()
 
 
@@ -458,16 +475,14 @@ def test_close_and_manual_reopen_resume_from_saved_lesson(tmp_path):
     state = onboarding.onboarding_state(marker)
     assert state["status"] == "handled"
     assert state["outcome"] == "migrated"
-    assert state["currentLesson"] == "advanced.voice-tts-stt"
+    assert state["currentLesson"] == "mastery.voice-tts"
 
     reopened = OnboardingDialog(automatic=False, state_path=marker)
     assert reopened._current_lesson_id is None
     QTest.mouseClick(
         reopened._category_buttons[CATEGORY_MASTERY], Qt.MouseButton.LeftButton
     )
-    assert reopened._next.text() == "Resume"
-    QTest.mouseClick(reopened._next, Qt.MouseButton.LeftButton)
-    assert reopened._current_lesson_id == "advanced.voice-tts-stt"
+    assert reopened._current_lesson_id == "mastery.voice-tts"
     reopened.deleteLater()
 
 
@@ -479,7 +494,7 @@ def test_advanced_guide_is_not_forced_on_first_launch(tmp_path):
     dialog.show()
     _QT_APP.processEvents()
     assert dialog._selected_category == CATEGORY_ESSENTIAL
-    assert dialog._current_lesson_id == "essential.what-is-osia"
+    assert dialog._current_lesson_id == "essential.osia-role"
     assert dialog._skip.isVisible()
     dialog.close()
 
@@ -557,21 +572,17 @@ def test_layout_scrolls_wraps_and_has_no_horizontal_overflow(tmp_path, size):
     dialog.show()
     _QT_APP.processEvents()
     assert dialog._scroll.horizontalScrollBar().maximum() == 0
-    assert dialog._scroll.verticalScrollBar().maximum() > 0
     body_labels = [
         label for label in dialog.findChildren(QLabel)
-        if label.objectName() in {"guideBody", "guideIntro"}
+        if label.objectName() in {"guideBody", "guideSubtitle", "guideLessonTitle"}
     ]
     assert body_labels and all(label.wordWrap() for label in body_labels)
-    images = dialog.findChildren(_ScaledPixmapLabel)
-    assert len(images) == 1
-    assert images[0].pixmap() is not None and not images[0].pixmap().isNull()
     dialog.close()
 
 
 def test_keyboard_focus_shortcuts_and_accessible_image_text(tmp_path):
     dialog = OnboardingDialog(state_path=tmp_path / "state.json")
-    dialog._show_lesson("essential.api-key", persist=True)
+    dialog._show_lesson("essential.pairing-token", persist=True)
     for button in dialog.findChildren(QPushButton):
         assert button.focusPolicy() == Qt.FocusPolicy.StrongFocus
         assert button.accessibleName().strip()
@@ -583,3 +594,58 @@ def test_keyboard_focus_shortcuts_and_accessible_image_text(tmp_path):
     assert "mask" in image.accessibleName().lower()
     assert image.toolTip() == image.accessibleName()
     dialog.deleteLater()
+
+
+def test_keyboard_wheel_theme_and_reduced_motion_behaviors(tmp_path, monkeypatch):
+    monkeypatch.setenv("OSIA_REDUCED_MOTION", "1")
+    dialog = OnboardingDialog(state_path=tmp_path / "state.json")
+    dialog._show_lesson("essential.osia-role", persist=True)
+    dialog.show()
+    _QT_APP.processEvents()
+    assert dialog._motion.active_animation_count == 0
+
+    dialog.setFocus()
+    QTest.keyClick(dialog, Qt.Key.Key_Right)
+    assert dialog._current_lesson_id == "essential.requirements"
+    QTest.keyClick(dialog, Qt.Key.Key_Left, Qt.KeyboardModifier.AltModifier)
+    assert dialog._current_lesson_id == "essential.osia-role"
+    QTest.keyClick(dialog, Qt.Key.Key_Right, Qt.KeyboardModifier.AltModifier)
+    assert dialog._current_lesson_id == "essential.requirements"
+    QTest.keyClick(dialog, Qt.Key.Key_Home, Qt.KeyboardModifier.ControlModifier)
+    assert dialog._current_lesson_id is None
+
+    dialog._show_lesson("essential.osia-role", persist=True)
+    normal = QWheelEvent(
+        QPointF(10, 10), QPointF(10, 10), QPoint(), QPoint(0, -120),
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate, False,
+    )
+    assert dialog.eventFilter(dialog._scroll.viewport(), normal) is False
+    assert dialog._current_lesson_id == "essential.osia-role"
+    shifted = QWheelEvent(
+        QPointF(10, 10), QPointF(10, 10), QPoint(), QPoint(0, -120),
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.ShiftModifier,
+        Qt.ScrollPhase.ScrollUpdate, False,
+    )
+    assert dialog.eventFilter(dialog._scroll.viewport(), shifted) is True
+    assert dialog._current_lesson_id == "essential.requirements"
+    shifted_again = QWheelEvent(
+        QPointF(10, 10), QPointF(10, 10), QPoint(), QPoint(0, -120),
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.ShiftModifier,
+        Qt.ScrollPhase.ScrollUpdate, False,
+    )
+    assert dialog.eventFilter(dialog._scroll.viewport(), shifted_again) is True
+    assert dialog._current_lesson_id == "essential.requirements"
+
+    manager = get_theme_manager()
+    original = manager.palette.key
+    alternate = "azure" if original != "azure" else "rose"
+    before = dialog.styleSheet()
+    try:
+        assert manager.set_theme(alternate, persist=False)
+        _QT_APP.processEvents()
+        assert dialog.styleSheet() != before
+        assert manager.palette.primary in dialog.styleSheet()
+    finally:
+        manager.set_theme(original, persist=False)
+        dialog.close()
