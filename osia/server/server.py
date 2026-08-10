@@ -1860,6 +1860,25 @@ async def _broadcast_turn_status(
             _WS_CLIENTS.discard(client)
 
 
+async def _broadcast_execution_trace(
+    frame: dict,
+    *,
+    primary: "_OutboundChannel | None" = None,
+) -> None:
+    """Deliver one optional standalone trace frame to each live Mobile mirror."""
+
+    targets = []
+    if primary is not None:
+        targets.append(primary)
+    targets.extend(client for client in list(_WS_CLIENTS) if client is not primary)
+    for client in targets:
+        try:
+            await client.send_json(frame)
+        except Exception:
+            if client is not primary:
+                _WS_CLIENTS.discard(client)
+
+
 async def _turn_progress_loop(
     channel: "_OutboundChannel",
     turn_meta: dict | None,
@@ -2477,6 +2496,13 @@ def _persist_completed_assistant_message(
         artifact_refs = normalize_references(turn_meta.get("_artifact_refs"))
         if artifact_refs:
             metadata["_artifact_refs"] = artifact_refs
+        from osia.execution_trace import validate_persisted_trace
+
+        safe_trace = validate_persisted_trace(
+            turn_meta.get("_execution_trace_v1")
+        )
+        if safe_trace is not None:
+            metadata["_execution_trace_v1"] = safe_trace
         receipt = conversations.commit_message(
             conv_id,
             "assistant",
@@ -11157,6 +11183,14 @@ def _displayable_history(history: list) -> list[dict]:
                 "turn_id": turn_id,
                 "message_id": message_id,
             })
+        if role == "assistant":
+            from osia.execution_trace import validate_persisted_trace
+
+            safe_trace = validate_persisted_trace(
+                msg.get("_execution_trace_v1")
+            )
+            if safe_trace is not None:
+                display["execution_trace"] = safe_trace
         out.append(display)
     return out
 
@@ -11897,6 +11931,34 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         agent._in_use = True
         document_loop = asyncio.get_running_loop()
         document_progress_futures = []
+        execution_trace_futures = []
+
+        def _execution_trace_event(frame: dict) -> None:
+            if not isinstance(frame, dict) or frame.get("type") != "execution_trace":
+                return
+            if (
+                frame.get("conversation_id") != active_conv_id
+                or frame.get("request_id")
+                != str((turn_meta or {}).get("request_id") or "")
+                or frame.get("turn_id")
+                != str((turn_meta or {}).get("turn_id") or "")
+            ):
+                return
+            future = asyncio.run_coroutine_threadsafe(
+                _broadcast_execution_trace(frame, primary=ws),
+                document_loop,
+            )
+            if len(execution_trace_futures) < 32:
+                execution_trace_futures.append(future)
+
+        async def _drain_execution_trace() -> None:
+            pending = list(execution_trace_futures)
+            execution_trace_futures.clear()
+            for future in pending:
+                try:
+                    await asyncio.wrap_future(future)
+                except Exception:
+                    pass
 
         async def _finalize_pending_tool_attempt(
             attempt_id: str,
@@ -11916,6 +11978,11 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     "verified terminal reservation"
                 )
                 return False
+            from osia.execution_trace import validate_persisted_trace
+
+            safe_trace = validate_persisted_trace(terminal.get("execution_trace"))
+            if safe_trace is not None:
+                turn_meta["_execution_trace_v1"] = safe_trace
             final_text = str(terminal.get("final_text") or final_text or "")
             if error is not None:
                 error = None
@@ -11940,6 +12007,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 await chunk_queue.put(tail)
             await chunk_queue.put(_SENTINEL)
             await sender_task
+            await _drain_execution_trace()
             provisional_chunks.clear()
             response_frame = _turn_event_frame(
                 turn_meta,
@@ -12106,6 +12174,14 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 on_sentence=on_sentence,
                 on_first_token=on_first_token,
             )
+        configure_trace = getattr(agent, "configure_execution_trace", None)
+        if callable(configure_trace):
+            configure_trace(
+                conversation_id=str(active_conv_id or ""),
+                request_id=str((turn_meta or {}).get("request_id") or ""),
+                turn_id=str((turn_meta or {}).get("turn_id") or ""),
+                callback=_execution_trace_event,
+            )
 
         def _run_agent_busy_tracked():
             # ChatGPT App Server native approvals arrive while agent.run is
@@ -12157,6 +12233,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 await asyncio.wrap_future(future)
             except Exception:
                 pass
+        await _drain_execution_trace()
         await _cancel_turn_progress_task(progress_task)
         progress_task = None
         print(
@@ -12222,6 +12299,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     except Exception as e:
         await _cancel_turn_progress_task(progress_task)
         progress_task = None
+        if "_drain_execution_trace" in locals():
+            await _drain_execution_trace()
         print(f"[OSIA Server] Agent error category={type(e).__name__}")
         # Drain any in-flight puts and shut the sender down cleanly.
         for fut in pending_puts:
@@ -12241,6 +12320,14 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             terminality_result(str((turn_meta or {}).get("turn_id") or ""))
             if callable(terminality_result) else None
         )
+        if isinstance(verified_terminal, dict) and isinstance(turn_meta, dict):
+            from osia.execution_trace import validate_persisted_trace
+
+            safe_trace = validate_persisted_trace(
+                verified_terminal.get("execution_trace")
+            )
+            if safe_trace is not None:
+                turn_meta["_execution_trace_v1"] = safe_trace
         if callable(terminality_result) and not verified_terminal:
             provisional_chunks.clear()
             if tts_session is not None:
@@ -12355,6 +12442,11 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         raise RuntimeError(
             "agent returned without a verified terminal reservation"
         )
+    from osia.execution_trace import validate_persisted_trace
+
+    safe_trace = validate_persisted_trace(terminal.get("execution_trace"))
+    if safe_trace is not None:
+        turn_meta["_execution_trace_v1"] = safe_trace
     response_text = str(terminal.get("final_text") or response_text or "")
     if response_text:
         from osia.agent import clean_response, strip_raw_tool_tags

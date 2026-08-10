@@ -76,6 +76,10 @@ MAX_SAFE_RELAY_MESSAGE_BYTES = 48 * 1024
 # one public relay frame.  Keep that receive allowance bounded independently;
 # eligible frames are encrypted and chunked before they reach the public relay.
 MAX_LOCAL_SERVER_FRAME_BYTES = 16 * 1024 * 1024
+MAX_RELAY_TRACE_INCREMENTAL = 6
+MAX_RELAY_TRACE_ENVELOPES = 7
+MAX_RELAY_TRACE_SNAPSHOT_EVENTS = 8
+MAX_RELAY_TRACE_SNAPSHOT_BYTES = 4 * 1024
 E2E_CHUNK_VERSION = 1
 E2E_CHUNK_CIPHERTEXT_CHARS = 40 * 1024
 MAX_E2E_CHUNK_TOTAL_BYTES = 8 * 1024 * 1024
@@ -289,6 +293,154 @@ class RelayBridge:
         self._chunk_tombstone_order: deque[tuple] = deque()
         self._outbound_chunk_ids: dict[str, float] = {}
         self._outbound_chunk_order: deque[str] = deque()
+        self._relay_trace_state: dict[tuple[str, str, str], dict] = {}
+        self._relay_trace_tombstones: set[tuple[str, str, str]] = set()
+        self._relay_trace_tombstone_order: deque[tuple[str, str, str]] = deque()
+
+    @staticmethod
+    def _execution_trace_key(frame: dict) -> tuple[str, str, str] | None:
+        if (
+            frame.get("type") != "execution_trace"
+            or frame.get("schema_version") != 1
+            or frame.get("redaction_class") != "public_ui"
+        ):
+            return None
+        values = tuple(
+            str(frame.get(name) or "")
+            for name in ("conversation_id", "request_id", "turn_id")
+        )
+        if any(not value or len(value) > 256 for value in values):
+            return None
+        return values
+
+    def _remember_relay_trace_tombstone(
+        self,
+        key: tuple[str, str, str],
+    ) -> None:
+        if key in self._relay_trace_tombstones:
+            return
+        while len(self._relay_trace_tombstone_order) >= 64:
+            expired = self._relay_trace_tombstone_order.popleft()
+            self._relay_trace_tombstones.discard(expired)
+        self._relay_trace_tombstones.add(key)
+        self._relay_trace_tombstone_order.append(key)
+
+    @staticmethod
+    def _compact_relay_trace_snapshot(frame: dict) -> dict | None:
+        snapshot = frame.get("snapshot")
+        if not isinstance(snapshot, list):
+            snapshot = []
+        priority = {
+            "terminal": 0,
+            "goal": 1,
+            "waiting_permission": 2,
+            "reconciliation": 3,
+            "result": 4,
+            "continuation": 5,
+            "action": 6,
+        }
+        valid = [
+            dict(item) for item in snapshot
+            if isinstance(item, dict)
+            and item.get("redaction_class") == "public_ui"
+            and item.get("conversation_id") == frame.get("conversation_id")
+            and item.get("request_id") == frame.get("request_id")
+            and item.get("turn_id") == frame.get("turn_id")
+            and item.get("kind") in priority
+        ]
+        selected = sorted(
+            valid,
+            key=lambda item: (
+                priority[str(item.get("kind"))],
+                -int(item.get("sequence") or 0),
+            ),
+        )[:MAX_RELAY_TRACE_SNAPSHOT_EVENTS]
+        selected.sort(key=lambda item: int(item.get("sequence") or 0))
+        compact = dict(frame)
+        compact["snapshot"] = selected
+        while selected:
+            size = len(json.dumps(
+                compact, ensure_ascii=True, separators=(",", ":"),
+            ).encode("utf-8"))
+            if size <= MAX_RELAY_TRACE_SNAPSHOT_BYTES:
+                return compact
+            removable = max(
+                range(len(selected)),
+                key=lambda index: (
+                    priority[str(selected[index].get("kind"))],
+                    -int(selected[index].get("sequence") or 0),
+                ),
+            )
+            selected.pop(removable)
+        if len(json.dumps(
+            compact, ensure_ascii=True, separators=(",", ":"),
+        ).encode("utf-8")) <= MAX_RELAY_TRACE_SNAPSHOT_BYTES:
+            return compact
+        return None
+
+    def _relay_execution_trace_frame(self, frame: dict) -> dict | None:
+        """Apply the optional <=6 incremental + one terminal Relay budget."""
+
+        key = self._execution_trace_key(frame)
+        if key is None or key in self._relay_trace_tombstones:
+            return None
+        from osia.execution_trace import validate_persisted_trace
+
+        validated = validate_persisted_trace({
+            "schema_version": frame.get("schema_version"),
+            "conversation_id": frame.get("conversation_id"),
+            "request_id": frame.get("request_id"),
+            "turn_id": frame.get("turn_id"),
+            "redaction_class": frame.get("redaction_class"),
+            "events": frame.get("snapshot"),
+        })
+        if validated is None:
+            return None
+        matching = next((
+            event for event in validated["events"]
+            if event.get("event_id") == frame.get("event_id")
+            and event.get("revision") == frame.get("revision")
+        ), None)
+        if (
+            matching is None
+            or set(frame) != set(matching) | {"type", "snapshot"}
+            or any(frame.get(name) != value for name, value in matching.items())
+        ):
+            return None
+        frame = dict(frame)
+        frame["snapshot"] = validated["events"]
+        if key not in self._relay_trace_state and len(self._relay_trace_state) >= 64:
+            evicted = next(iter(self._relay_trace_state))
+            self._relay_trace_state.pop(evicted)
+            self._remember_relay_trace_tombstone(evicted)
+        state = self._relay_trace_state.setdefault(
+            key,
+            {"incremental": 0, "signatures": set(), "envelopes": 0},
+        )
+        terminal = frame.get("terminal") is True and frame.get("kind") == "terminal"
+        if terminal:
+            if state["envelopes"] >= MAX_RELAY_TRACE_ENVELOPES:
+                return None
+            compact = self._compact_relay_trace_snapshot(frame)
+            self._relay_trace_state.pop(key, None)
+            self._remember_relay_trace_tombstone(key)
+            if compact is None:
+                return None
+            state["envelopes"] += 1
+            return compact
+        if frame.get("terminal") is True or state["incremental"] >= MAX_RELAY_TRACE_INCREMENTAL:
+            return None
+        display = frame.get("display")
+        signature = (
+            str(frame.get("kind") or ""),
+            str(display.get("key") or "") if isinstance(display, dict) else "",
+        )
+        if not signature[0] or not signature[1] or signature in state["signatures"]:
+            return None
+        state["signatures"].add(signature)
+        state["incremental"] += 1
+        state["envelopes"] += 1
+        return frame
 
     def _reset_relay_chunk_capabilities(self) -> None:
         self.relay_chunk_version = 0
@@ -763,6 +915,10 @@ class RelayBridge:
                     continue
                 if not isinstance(frame, dict):
                     continue
+                if frame.get("type") == "execution_trace":
+                    frame = self._relay_execution_trace_frame(frame)
+                    if frame is None:
+                        continue
                 await self._send_e2e_frame(relay_ws, frame)
         except asyncio.CancelledError:
             raise

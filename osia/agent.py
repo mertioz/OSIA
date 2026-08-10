@@ -6956,6 +6956,8 @@ class OSIAAgent:
         self._queued_terminal_cancellations: dict[str, bool] = {}
         self._terminality_cancel_lock = threading.Lock()
         self._tool_cancel_requested = False
+        self._execution_trace_ledger = None
+        self._execution_trace_callback = None
 
     def set_turn_context(self, context: TurnContext) -> None:
         """Apply one already-resolved language decision to subsequent model calls."""
@@ -7009,6 +7011,71 @@ class OSIAAgent:
         self.last_pending_tool_attempt_id = ""
         self._pending_tool_attached_existing = False
 
+    def configure_execution_trace(
+        self,
+        *,
+        conversation_id: str,
+        request_id: str,
+        turn_id: str,
+        callback=None,
+    ) -> None:
+        """Bind one safe public trace to the already-correlated chat turn."""
+
+        from osia.execution_trace import ExecutionTraceLedger
+
+        self._execution_trace_callback = callback if callable(callback) else None
+        self._execution_trace_ledger = ExecutionTraceLedger(
+            conversation_id=conversation_id,
+            request_id=request_id,
+            turn_id=turn_id,
+            callback=self._execution_trace_callback,
+        )
+
+    def execution_trace_snapshot(self, turn_id: str = "") -> dict | None:
+        ledger = self._execution_trace_ledger
+        if ledger is None or (turn_id and ledger.turn_id != str(turn_id)):
+            return None
+        return ledger.snapshot()
+
+    def _emit_execution_trace(
+        self,
+        kind: str,
+        display_key: str,
+        *,
+        terminal: bool = False,
+        invocation_id: str = "",
+        tool_attempt_id: str = "",
+        permission_request_id: str = "",
+        dedupe_key: str = "",
+    ):
+        ledger = self._execution_trace_ledger
+        if ledger is None:
+            return None
+        return ledger.record(
+            kind=kind,
+            display_key=display_key,
+            terminal=terminal,
+            invocation_id=invocation_id,
+            tool_attempt_id=tool_attempt_id,
+            permission_request_id=permission_request_id,
+            dedupe_key=dedupe_key,
+        )
+
+    def _emit_execution_trace_continuation(self, decision) -> None:
+        strategy = str(getattr(decision, "next_strategy", "") or "")
+        if strategy == "reconcile_unknown_read_only":
+            self._emit_execution_trace(
+                "reconciliation",
+                "execution.reconciliation.verifying",
+                dedupe_key=f"reconciliation:{strategy}",
+            )
+            return
+        self._emit_execution_trace(
+            "continuation",
+            "execution.continuation.new_strategy",
+            dedupe_key=f"continuation:{strategy}",
+        )
+
     def clear_tool_attempts(self) -> None:
         self._tool_attempt_metadata = None
         self._pending_tool_runtime = None
@@ -7058,6 +7125,56 @@ class OSIAAgent:
                 )
             except Exception as exc:
                 print(f"[TERMINALITY] could not record tool receipt: {exc}")
+        trace_outcome = str(getattr(outcome, "value", outcome) or "")
+        trace_attempt_id = str(
+            getattr(execution_record, "tool_attempt_id", "") or ""
+        )
+        trace_reason = str(getattr(execution_record, "reason_code", "") or "")
+        trace_slot = trace_attempt_id or (
+            f"tool-result:{str(tool_name or '').lower()}:{trace_outcome}:"
+            f"{getattr(execution_record, 'attempts', 0)}"
+        )
+        if trace_outcome == "pending" and (
+            trace_reason.startswith("permission_")
+            or (
+                terminality is not None
+                and (terminality.snapshot().get("permission_state") == "pending")
+            )
+        ):
+            self._emit_execution_trace(
+                "waiting_permission",
+                "execution.permission.waiting",
+                tool_attempt_id=trace_attempt_id,
+                permission_request_id=trace_attempt_id,
+                dedupe_key=f"permission:{trace_slot}",
+            )
+        elif trace_outcome in {"success_verified", "success_unverified"}:
+            self._emit_execution_trace(
+                "result",
+                "execution.result.completed",
+                tool_attempt_id=trace_attempt_id,
+                dedupe_key=f"result:{trace_slot}",
+            )
+        elif trace_outcome == "cancelled_proven":
+            self._emit_execution_trace(
+                "result",
+                "execution.result.cancelled",
+                tool_attempt_id=trace_attempt_id,
+                dedupe_key=f"result:{trace_slot}",
+            )
+        elif trace_outcome in {
+            "rejected_before_execution",
+            "failed_before_effect",
+            "confirmed_failure_before_effect",
+            "failed_after_effect",
+            "outcome_unknown",
+        }:
+            self._emit_execution_trace(
+                "result",
+                "execution.result.needs_attention",
+                tool_attempt_id=trace_attempt_id,
+                dedupe_key=f"result:{trace_slot}",
+            )
         call = {"tool": str(tool_name or "")}
         call.update(dict(kwargs) if isinstance(kwargs, dict) else {})
         current = self._unfinished_execution
@@ -8416,6 +8533,16 @@ class OSIAAgent:
         snapshot = controller.snapshot()
         reservation = snapshot.get("final_reservation") or {}
         if reservation and snapshot.get("terminal_state"):
+            from osia.execution_trace import terminal_display_key
+
+            trace_key = terminal_display_key(snapshot.get("terminal_state"))
+            if trace_key:
+                self._emit_execution_trace(
+                    "terminal",
+                    trace_key,
+                    terminal=True,
+                    dedupe_key="terminal",
+                )
             result = {
                 "turn_id": controller.turn_id,
                 "terminal_state": str(snapshot.get("terminal_state") or ""),
@@ -8423,6 +8550,7 @@ class OSIAAgent:
                 "final_text": str(reservation.get("final_text") or ""),
                 "reservation_id": str(reservation.get("reservation_id") or ""),
                 "reservation_reused": True,
+                "execution_trace": self.execution_trace_snapshot(controller.turn_id),
             }
             self._turn_terminal_results[controller.turn_id] = result
             self._terminality_controller = None
@@ -8457,6 +8585,16 @@ class OSIAAgent:
             except Exception:
                 pass
         snapshot = controller.snapshot()
+        from osia.execution_trace import terminal_display_key
+
+        trace_key = terminal_display_key(decision.terminal_state)
+        if trace_key:
+            self._emit_execution_trace(
+                "terminal",
+                trace_key,
+                terminal=True,
+                dedupe_key="terminal",
+            )
         result = {
             "turn_id": controller.turn_id,
             "terminal_state": decision.terminal_state,
@@ -8465,6 +8603,7 @@ class OSIAAgent:
             "reservation_id": str(
                 (snapshot.get("final_reservation") or {}).get("reservation_id") or ""
             ),
+            "execution_trace": self.execution_trace_snapshot(controller.turn_id),
         }
         self._turn_terminal_results[controller.turn_id] = result
         self._terminality_controller = None
@@ -8512,12 +8651,20 @@ class OSIAAgent:
                         provider_route=provider_route,
                     )
                 if decision.action == "continue":
+                    self._emit_execution_trace_continuation(decision)
                     segment_input = controller.continuation_context(decision)
                     segment_strategy = decision.next_strategy
                     segment_postcondition = decision.postcondition
                     segment_history = None
                     continue
                 return WAITING_TOOL_RESULT
+
+            self._emit_execution_trace(
+                "action",
+                "execution.action.preparing",
+                invocation_id=invocation_id,
+                dedupe_key=f"invocation:{invocation_id}",
+            )
 
             self._terminality_controller = controller
             self._terminality_strategy = strategy
@@ -8574,6 +8721,11 @@ class OSIAAgent:
                     decision.terminal_state
                     == "success_verified"
                 ):
+                    self._emit_execution_trace(
+                        "continuation",
+                        "execution.continuation.new_strategy",
+                        dedupe_key="continuation:provider_final_synthesis",
+                    )
                     segment_input = (
                         "[Internal terminality final synthesis. This is the same "
                         "user turn. All required postconditions are proven by "
@@ -8593,6 +8745,7 @@ class OSIAAgent:
                         provider_route=provider_route,
                     )
                 if decision.action == "continue":
+                    self._emit_execution_trace_continuation(decision)
                     segment_input = controller.continuation_context(decision)
                     segment_strategy = decision.next_strategy
                     segment_postcondition = decision.postcondition
@@ -8630,6 +8783,7 @@ class OSIAAgent:
             self._mark_provisional_assistant_candidate(
                 self.messages, last_candidate,
             )
+            self._emit_execution_trace_continuation(decision)
             segment_input = controller.continuation_context(decision)
             segment_strategy = decision.next_strategy
             segment_postcondition = decision.postcondition
@@ -8695,6 +8849,15 @@ class OSIAAgent:
         controller.set_strategy_snapshot(strategy.snapshot())
         self._terminality_controller = controller
         self._terminality_strategy = strategy
+        self._emit_execution_trace(
+            "goal",
+            (
+                "execution.goal.complete_task"
+                if requires_execution else
+                "execution.goal.answer"
+            ),
+            dedupe_key="goal",
+        )
         with self._terminality_cancel_lock:
             queued_cancellation = self._queued_terminal_cancellations.pop(
                 stable_turn_id, None,
@@ -9394,6 +9557,47 @@ class OSIAAgent:
                         event_attempt_id = str(
                             getattr(capability_event, "tool_attempt_id", "") or ""
                         )
+                        event_tool_name = str(
+                            getattr(capability_event, "tool_name", "") or ""
+                        )
+                        if event_phase in {"accepted", "started"}:
+                            from osia.execution_trace import display_key_for_tool
+
+                            self._emit_execution_trace(
+                                "action",
+                                display_key_for_tool(event_tool_name),
+                                tool_attempt_id=event_attempt_id,
+                                dedupe_key=(
+                                    "provider-action:"
+                                    + (event_attempt_id or event_tool_name or event_phase)
+                                ),
+                            )
+                        if event_outcome == "permission_pending":
+                            self._emit_execution_trace(
+                                "waiting_permission",
+                                "execution.permission.waiting",
+                                tool_attempt_id=event_attempt_id,
+                                permission_request_id=event_attempt_id,
+                                dedupe_key=(
+                                    "provider-permission:"
+                                    + (event_attempt_id or event_tool_name or "pending")
+                                ),
+                            )
+                        if event_phase in {"completed", "denied"}:
+                            result_key = (
+                                "execution.result.completed"
+                                if event_outcome == "success_verified" else
+                                "execution.result.needs_attention"
+                            )
+                            self._emit_execution_trace(
+                                "result",
+                                result_key,
+                                tool_attempt_id=event_attempt_id,
+                                dedupe_key=(
+                                    "provider-result:"
+                                    + (event_attempt_id or event_tool_name or event_phase)
+                                ),
+                            )
                         if terminality is not None and event_source == "provider_native":
                             terminality.require_execution(
                                 (
@@ -9433,9 +9637,6 @@ class OSIAAgent:
                                 "permission_internal_failure",
                             }
                         ):
-                            event_tool_name = str(
-                                getattr(capability_event, "tool_name", "") or ""
-                            )
                             event_arguments = getattr(
                                 capability_event, "arguments", None,
                             )
@@ -10132,6 +10333,16 @@ class OSIAAgent:
                     print(
                         f"[OSIA Agent] tool start: {tool_name} "
                         f"({len(kwargs)} argument field(s))"
+                    )
+                    from osia.execution_trace import display_key_for_tool
+
+                    self._emit_execution_trace(
+                        "action",
+                        display_key_for_tool(tool_name),
+                        dedupe_key=(
+                            f"tool-action:{round_number}:"
+                            f"{len(guard.actions)}:{str(tool_name or '').lower()}"
+                        ),
                     )
                     autonomous_policy_error = None
                     autonomous_execution_permit = False
