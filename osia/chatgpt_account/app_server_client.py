@@ -208,6 +208,8 @@ class AppServerError(RuntimeError):
         category: str = "app_server",
         method: str | None = None,
         server_code: int | None = None,
+        capability_events=(),
+        native_turn_id: str | None = None,
     ):
         super().__init__(message)
         self.output_started = bool(output_started)
@@ -225,6 +227,8 @@ class AppServerError(RuntimeError):
             if isinstance(server_code, int) and not isinstance(server_code, bool)
             else None
         )
+        self.capability_events = tuple(capability_events or ())
+        self.native_turn_id = str(native_turn_id) if native_turn_id else None
 
 
 class RuntimeUnavailableError(AppServerError):
@@ -279,6 +283,8 @@ class CapabilityEvent:
     tool_attempt_id: str = ""
     tool_name: str = ""
     arguments: dict | None = None
+    semantic_node_id: str = ""
+    semantic_postcondition: str = ""
 
 
 @dataclass(frozen=True)
@@ -308,6 +314,8 @@ class _NativeDispatch:
     tool_attempt_id: str = ""
     started: bool = False
     terminal: bool = False
+    strategy_decision: Any = None
+    semantic_postcondition: str = ""
 
 
 @dataclass
@@ -315,6 +323,7 @@ class _TurnAttempt:
     thread_id: str
     conversation_id: str = ""
     osia_turn_id: str = ""
+    client_request_id: str = ""
     final_response_message_id: str = ""
     model_id: str = ""
     user_request: str = ""
@@ -333,6 +342,8 @@ class _TurnAttempt:
     frozen_equivalences: set[str] = field(default_factory=set)
     native_effect_started: bool = False
     outcome_unknown: bool = False
+    terminal_permission_outcome: str = ""
+    execution_strategy: Any = None
 
 
 def _runtime_base_dir() -> Path:
@@ -934,6 +945,8 @@ class AppServerClient:
         tool_attempt_id: str = "",
         tool_name: str = "",
         arguments: Mapping[str, Any] | None = None,
+        semantic_node_id: str = "",
+        semantic_postcondition: str = "",
     ) -> None:
         attempt.capability_events.append(CapabilityEvent(
             source=source,
@@ -944,6 +957,8 @@ class AppServerClient:
             tool_attempt_id=str(tool_attempt_id or "")[:256],
             tool_name=str(tool_name or "")[:128],
             arguments=dict(arguments) if isinstance(arguments, Mapping) else None,
+            semantic_node_id=str(semantic_node_id or "")[:128],
+            semantic_postcondition=str(semantic_postcondition or "")[:512],
         ))
 
     def _file_change_broker_call(
@@ -1041,6 +1056,8 @@ class AppServerClient:
         *, outcome: str = "rejected_before_execution",
         tool_name: str = "",
         arguments: Mapping[str, Any] | None = None,
+        semantic_node_id: str = "",
+        semantic_postcondition: str = "",
     ) -> None:
         try:
             self._send({"id": request_id, "result": {"decision": "decline"}})
@@ -1058,7 +1075,18 @@ class AppServerClient:
             item_id=item_id,
             tool_name=tool_name,
             arguments=arguments,
+            semantic_node_id=semantic_node_id,
+            semantic_postcondition=semantic_postcondition,
         )
+        if outcome in {
+            "permission_user_denied",
+            "permission_presentation_failed",
+            "permission_timeout",
+            "permission_disconnected",
+            "permission_internal_failure",
+        }:
+            if not attempt.terminal_permission_outcome:
+                attempt.terminal_permission_outcome = outcome
 
     def _resolve_native_approval(
         self, attempt: _TurnAttempt, payload: dict,
@@ -1067,11 +1095,22 @@ class AppServerClient:
         params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
         request_id = payload.get("request_id")
         item_id = self._native_item_id(params)
+        if attempt.terminal_permission_outcome:
+            try:
+                self._send({
+                    "id": request_id,
+                    "result": {"decision": "decline"},
+                })
+            except AppServerError:
+                pass
+            return
         broker_call = self._native_broker_call(attempt, method, params)
         if broker_call is None:
             self._deny_native_approval(attempt, request_id, method, item_id)
             return
         tool_name, arguments = broker_call
+        strategy_decision = None
+        semantic_postcondition = ""
         try:
             from osia.action_policy import (
                 consume_pending_execution_permit,
@@ -1091,6 +1130,54 @@ class AppServerClient:
                 raise ValueError("native_broker_tool_unavailable")
             contract = effective_contract(spec, arguments, attempt.user_request)
             effectful = contract.side_effect is not SideEffectClass.READ_ONLY
+            if effectful:
+                try:
+                    from osia.execution_strategy import tool_preflight
+
+                    strategy_decision = tool_preflight(
+                        tool_name,
+                        arguments,
+                        strategy=attempt.execution_strategy,
+                    )
+                except Exception:
+                    if attempt.execution_strategy is not None:
+                        self._deny_native_approval(
+                            attempt,
+                            request_id,
+                            method,
+                            item_id,
+                            outcome="semantic_preflight_unavailable",
+                            tool_name=tool_name,
+                            arguments=arguments,
+                        )
+                        return
+                    strategy_decision = None
+                if strategy_decision is not None:
+                    node = (
+                        attempt.execution_strategy.node_by_id(
+                            strategy_decision.node_id,
+                        )
+                        if attempt.execution_strategy is not None else None
+                    )
+                    semantic_postcondition = (
+                        node.observable_success_postcondition
+                        if node is not None else ""
+                    )
+                    if not strategy_decision.allowed:
+                        self._deny_native_approval(
+                            attempt,
+                            request_id,
+                            method,
+                            item_id,
+                            outcome=(
+                                "semantic_" + strategy_decision.reason_code
+                            ),
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            semantic_node_id=strategy_decision.node_id,
+                            semantic_postcondition=semantic_postcondition,
+                        )
+                        return
             store = None
             fingerprint = ""
             equivalence_fingerprint = ""
@@ -1140,7 +1227,27 @@ class AppServerClient:
                     ),
                     tool_name=tool_name,
                     arguments=arguments,
+                    semantic_node_id=(
+                        strategy_decision.node_id if strategy_decision else ""
+                    ),
+                    semantic_postcondition=semantic_postcondition,
                 )
+                if strategy_decision is not None:
+                    from osia.execution_strategy import record_tool_outcome
+
+                    record_tool_outcome(
+                        tool_name,
+                        strategy_decision,
+                        outcome="failed_before_effect",
+                        is_error=True,
+                        reason_code=(
+                            f"permission_{permission_outcome.value}"
+                            if permission_outcome is not None
+                            else "rejected_before_execution"
+                        ),
+                        result=blocked,
+                        strategy=attempt.execution_strategy,
+                    )
                 return
             requires_permit = contract.confirmation in {
                 ConfirmationPolicy.CONFIRMATION_REQUIRED,
@@ -1171,6 +1278,8 @@ class AppServerClient:
                 side_effect=contract.side_effect.value,
                 idempotence=contract.idempotency.value,
                 retry_policy=contract.retry.value,
+                strategy_decision=strategy_decision,
+                semantic_postcondition=semantic_postcondition,
             )
             if effectful:
                 dispatch.equivalence_fingerprint = equivalence_fingerprint
@@ -1182,7 +1291,10 @@ class AppServerClient:
                         attempt.osia_turn_id or attempt.turn_id or attempt.thread_id,
                         "turn",
                     ),
-                    request_id=self._safe_receipt_ref(request_id, "request"),
+                    request_id=self._safe_receipt_ref(
+                        attempt.client_request_id or request_id,
+                        "request",
+                    ),
                     tool_call_id=self._safe_receipt_ref(item_id, "native_item"),
                     tool_name=tool_name,
                     provider_id="chatgpt_account",
@@ -1227,6 +1339,12 @@ class AppServerClient:
                 outcome="dispatch_started" if effectful else "read_only",
                 item_id=item_id,
                 tool_attempt_id=dispatch.tool_attempt_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                semantic_node_id=(
+                    strategy_decision.node_id if strategy_decision else ""
+                ),
+                semantic_postcondition=semantic_postcondition,
             )
         except Exception:
             dispatch = attempt.native_dispatches.get(item_id)
@@ -1406,6 +1524,25 @@ class AppServerClient:
             except Exception:
                 attempt.outcome_unknown = True
                 outcome = "outcome_unknown"
+        if dispatch.strategy_decision is not None:
+            try:
+                from osia.execution_strategy import record_tool_outcome
+
+                record_tool_outcome(
+                    dispatch.tool_name,
+                    dispatch.strategy_decision,
+                    outcome=outcome,
+                    is_error=(outcome != "success_verified"),
+                    reason_code=reason,
+                    result={
+                        "provider_native_item": item_id,
+                        "status": status,
+                        "outcome": outcome,
+                    },
+                    strategy=attempt.execution_strategy,
+                )
+            except Exception:
+                pass
         self._append_capability_event(
             attempt,
             source="provider_native",
@@ -1414,6 +1551,13 @@ class AppServerClient:
             outcome=outcome,
             item_id=item_id,
             tool_attempt_id=dispatch.tool_attempt_id,
+            tool_name=dispatch.tool_name,
+            arguments=dispatch.arguments,
+            semantic_node_id=(
+                dispatch.strategy_decision.node_id
+                if dispatch.strategy_decision is not None else ""
+            ),
+            semantic_postcondition=dispatch.semantic_postcondition,
         )
 
     def _handle_server_request(self, message: dict) -> None:
@@ -1970,6 +2114,7 @@ class AppServerClient:
         content: str | list[dict] | None = None,
         conversation_id: str | None = None,
         osia_turn_id: str | None = None,
+        client_request_id: str | None = None,
         final_response_message_id: str | None = None,
         effort: str | None = None,
         on_delta: Callable[[str], None] | None = None,
@@ -1986,10 +2131,17 @@ class AppServerClient:
             thread_id=thread_id,
             conversation_id=str(conversation_id or thread_id),
             osia_turn_id=str(osia_turn_id or ""),
+            client_request_id=str(client_request_id or ""),
             final_response_message_id=str(final_response_message_id or ""),
             model_id=str(model or "unknown"),
             user_request=_latest_user_text(turn_content),
         )
+        try:
+            from osia.execution_strategy import current_execution_strategy
+
+            attempt.execution_strategy = current_execution_strategy()
+        except Exception:
+            attempt.execution_strategy = None
         with self._state_lock:
             if thread_id in self._attempts:
                 raise AppServerError(
@@ -2144,6 +2296,10 @@ class AppServerClient:
                         capability_events=tuple(attempt.capability_events),
                     )
                     return result
+        except AppServerError as exc:
+            exc.capability_events = tuple(attempt.capability_events)
+            exc.native_turn_id = attempt.turn_id
+            raise
         finally:
             with self._state_lock:
                 self._attempts.pop(thread_id, None)

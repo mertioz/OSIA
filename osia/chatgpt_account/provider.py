@@ -73,6 +73,10 @@ class AccountProviderError(RuntimeError):
         self.category = error.category
         self.method = error.method
         self.server_code = error.server_code
+        self.capability_events = tuple(
+            getattr(error, "capability_events", ()) or ()
+        )
+        self.native_turn_id = getattr(error, "native_turn_id", None)
         self.selected_model = str(selected_model) if selected_model else None
         self.reasoning_level = str(reasoning_level or "auto")
 
@@ -419,6 +423,7 @@ class ChatGPTAccountProvider:
         model: str,
         messages: list[dict],
         osia_turn_id: str | None = None,
+        client_request_id: str | None = None,
         final_response_message_id: str | None = None,
         effort: str | None = None,
         on_delta=None,
@@ -432,6 +437,7 @@ class ChatGPTAccountProvider:
                 thread_id=state.thread_id,
                 conversation_id=conversation_id,
                 osia_turn_id=osia_turn_id,
+                client_request_id=client_request_id,
                 final_response_message_id=final_response_message_id,
                 model=model,
                 effort=effort,
@@ -463,6 +469,9 @@ class ChatGPTAccountProvider:
                     turn_id=None,
                     status="interrupted",
                     output_started=exc.output_started,
+                    capability_events=tuple(
+                        getattr(exc, "capability_events", ()) or ()
+                    ),
                 )
                 with self._lock:
                     current = self._threads.get(conversation_id)
@@ -514,17 +523,22 @@ class _AccountCompletions:
         effort = kwargs.get("effort")
         timeout = _bounded_turn_timeout(kwargs.get("timeout", 300.0))
         if not stream:
-            result = self._owner.provider.complete(
-                conversation_id=conversation_id,
-                model=model,
-                messages=messages,
-                osia_turn_id=self._owner.osia_turn_id,
-                final_response_message_id=(
-                    self._owner.final_response_message_id
-                ),
-                effort=effort,
-                timeout=timeout,
-            )
+            try:
+                result = self._owner.provider.complete(
+                    conversation_id=conversation_id,
+                    model=model,
+                    messages=messages,
+                    osia_turn_id=self._owner.osia_turn_id,
+                    client_request_id=self._owner.client_request_id,
+                    final_response_message_id=(
+                        self._owner.final_response_message_id
+                    ),
+                    effort=effort,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                self._owner._preserve_exception_state(exc)
+                raise
             self._owner._set_capability_events(
                 getattr(result, "capability_events", ()),
             )
@@ -546,6 +560,7 @@ class _AccountCompletions:
                     model=model,
                     messages=messages,
                     osia_turn_id=self._owner.osia_turn_id,
+                    client_request_id=self._owner.client_request_id,
                     final_response_message_id=(
                         self._owner.final_response_message_id
                     ),
@@ -564,6 +579,7 @@ class _AccountCompletions:
                 })
                 events.put(("done", None))
             except Exception as exc:
+                self._owner._preserve_exception_state(exc)
                 events.put(("error", exc))
 
         # Streaming uses a dedicated provider thread.  Carry the originating
@@ -596,6 +612,7 @@ class _AccountChatClient:
         self.provider = provider
         self.conversation_id = conversation_id
         self.osia_turn_id: str | None = None
+        self.client_request_id: str | None = None
         self.final_response_message_id: str | None = None
         self._capability_events: tuple = ()
         self._capability_events_lock = threading.Lock()
@@ -606,6 +623,16 @@ class _AccountChatClient:
     def _set_capability_events(self, events) -> None:
         with self._capability_events_lock:
             self._capability_events = tuple(events or ())
+
+    def _preserve_exception_state(self, exc: Exception) -> None:
+        self._set_capability_events(
+            getattr(exc, "capability_events", ()) or ()
+        )
+        self._set_invocation_metadata({
+            "native_turn_id": getattr(exc, "native_turn_id", None),
+            "native_status": "failed",
+            "output_started": bool(getattr(exc, "output_started", False)),
+        })
 
     def consume_capability_events(self) -> tuple:
         """Return provider-native events from exactly one completed model call."""
@@ -632,6 +659,9 @@ class _AccountChatClient:
 
     def set_tool_attempt_turn_id(self, turn_id: str | None) -> None:
         self.osia_turn_id = str(turn_id) if turn_id else None
+
+    def set_tool_attempt_request_id(self, request_id: str | None) -> None:
+        self.client_request_id = str(request_id) if request_id else None
 
     def set_tool_attempt_final_response_message_id(
         self, message_id: str | None,

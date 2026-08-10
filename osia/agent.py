@@ -7104,6 +7104,7 @@ class OSIAAgent:
         tool_name: str,
         kwargs: dict,
         execution_record,
+        strategy_decision=None,
     ) -> None:
         """Keep only the exact unfinished step; completed calls stay complete."""
 
@@ -7113,8 +7114,16 @@ class OSIAAgent:
         terminality = self._terminality_controller
         strategy = _execution_strategy.current_execution_strategy()
         if terminality is not None:
+            node = (
+                strategy.node_by_id(
+                    str(getattr(strategy_decision, "node_id", "") or "")
+                )
+                if strategy is not None else None
+            )
             postcondition = (
-                strategy.goal.observable_success_postcondition
+                node.observable_success_postcondition
+                if node is not None else
+                strategy.postcondition_for_tool(tool_name, kwargs)
                 if strategy is not None else ""
             )
             try:
@@ -8479,17 +8488,220 @@ class OSIAAgent:
                 message["_provisional"] = True
                 return
 
+    def _consume_provider_capability_events(self) -> dict:
+        """Consume and project one provider segment, including failed calls."""
+
+        summary = {
+            "accepted": False,
+            "barrier": False,
+            "provider_terminal": False,
+            "unknown": False,
+            "permission_outcome": "",
+        }
+        consume = getattr(self.client, "consume_capability_events", None)
+        if not callable(consume):
+            return summary
+        try:
+            events = tuple(consume())
+        except Exception:
+            events = ()
+        for event in events:
+            terminality = self._terminality_controller
+            strategy = (
+                _execution_strategy.current_execution_strategy()
+                or self._terminality_strategy
+            )
+            source = str(getattr(event, "source", "") or "")
+            phase = str(getattr(event, "phase", "") or "")
+            outcome = str(getattr(event, "outcome", "") or "")
+            attempt_id = str(getattr(event, "tool_attempt_id", "") or "")
+            tool_name = str(getattr(event, "tool_name", "") or "")
+            arguments = getattr(event, "arguments", None)
+            arguments = dict(arguments) if isinstance(arguments, dict) else {}
+            identity = str(getattr(event, "identity", "") or "")
+            item_id = str(getattr(event, "item_id", "") or "")
+            semantic_node_id = str(
+                getattr(event, "semantic_node_id", "") or ""
+            )
+            semantic_postcondition = str(
+                getattr(event, "semantic_postcondition", "") or ""
+            )
+
+            if phase in {"accepted", "started"}:
+                from osia.execution_trace import display_key_for_tool
+
+                self._emit_execution_trace(
+                    "action",
+                    display_key_for_tool(tool_name),
+                    tool_attempt_id=attempt_id,
+                    dedupe_key=(
+                        "provider-action:"
+                        + (attempt_id or tool_name or phase)
+                    ),
+                )
+            if outcome == "permission_pending":
+                self._emit_execution_trace(
+                    "waiting_permission",
+                    "execution.permission.waiting",
+                    tool_attempt_id=attempt_id,
+                    permission_request_id=attempt_id,
+                    dedupe_key=(
+                        "provider-permission:"
+                        + (attempt_id or tool_name or "pending")
+                    ),
+                )
+            if phase in {"completed", "denied"}:
+                self._emit_execution_trace(
+                    "result",
+                    (
+                        "execution.result.completed"
+                        if outcome == "success_verified" else
+                        "execution.result.needs_attention"
+                    ),
+                    tool_attempt_id=attempt_id,
+                    dedupe_key=(
+                        "provider-result:"
+                        + (attempt_id or tool_name or phase)
+                    ),
+                )
+
+            node = None
+            evidence_ref = ":".join(
+                item for item in ("provider_native", attempt_id, item_id, outcome)
+                if item
+            )
+            if source == "provider_native" and strategy is not None:
+                node = strategy.record_external_event(
+                    tool_name,
+                    arguments,
+                    outcome=outcome,
+                    evidence=evidence_ref,
+                )
+                if node is None and semantic_node_id:
+                    node = strategy.node_by_id(semantic_node_id)
+            if source == "provider_native" and outcome == "outcome_unknown":
+                summary["unknown"] = True
+                summary["barrier"] = True
+                summary["provider_terminal"] = True
+            postcondition = (
+                node.observable_success_postcondition
+                if node is not None else semantic_postcondition
+            )
+            if terminality is not None and source == "provider_native":
+                terminality.require_execution(postcondition)
+                if phase in {"accepted", "started"} and attempt_id:
+                    terminality.set_attempt_state(
+                        attempt_id,
+                        status=(
+                            "pending" if outcome == "permission_pending" else
+                            "running"
+                        ),
+                        permission_state=(
+                            "pending" if outcome == "permission_pending" else ""
+                        ),
+                    )
+                if phase in {"completed", "denied"}:
+                    terminality.record_typed_evidence(
+                        outcome=outcome,
+                        evidence={
+                            "source": source,
+                            "identity": identity,
+                            "tool_name": tool_name,
+                            "item_id": item_id,
+                        },
+                        postcondition=postcondition,
+                        attempt_id=attempt_id,
+                        reason_code="provider_native_" + phase,
+                        useful_progress=(outcome == "success_verified"),
+                    )
+                    if outcome == "success_verified" and postcondition:
+                        terminality.prove_postcondition(
+                            postcondition,
+                            evidence_ref or {"provider_native": identity},
+                        )
+                    if attempt_id:
+                        terminality.set_attempt_state(attempt_id, status="completed")
+
+            if (
+                source == "provider_native"
+                and phase == "denied"
+                and outcome in {
+                    "permission_user_denied",
+                    "permission_presentation_failed",
+                    "permission_timeout",
+                    "permission_disconnected",
+                    "permission_internal_failure",
+                }
+            ):
+                if tool_name and arguments:
+                    self._unfinished_execution = {
+                        "call": {"tool": tool_name, **arguments},
+                        "outcome": "failed_before_effect",
+                        "reason_code": outcome,
+                        "attempt_id": attempt_id,
+                    }
+                if terminality is not None:
+                    terminality.set_permission_state(
+                        outcome.removeprefix("permission_")
+                    )
+                summary["permission_outcome"] = outcome
+            if (
+                source == "provider_native"
+                and phase == "accepted"
+                and outcome in {"dispatch_started", "read_only"}
+            ):
+                summary["accepted"] = True
+                if outcome == "dispatch_started":
+                    summary["barrier"] = True
+            if (
+                source == "provider_native"
+                and phase == "completed"
+                and outcome in {
+                    "success_verified",
+                    "failed_before_effect",
+                    "failed_after_effect",
+                    "cancelled_proven",
+                    "outcome_unknown",
+                }
+            ):
+                summary["provider_terminal"] = True
+                if outcome == "success_verified":
+                    summary["accepted"] = True
+                if outcome == "outcome_unknown":
+                    summary["unknown"] = True
+                    summary["barrier"] = True
+        return summary
+
     def _terminal_final_text(
         self,
         state: str,
         candidate: str,
         *,
         reason_code: str = "",
+        snapshot: dict | None = None,
     ) -> str:
         from osia.turn_terminality import TerminalState
 
-        if state == TerminalState.SUCCESS_VERIFIED.value and str(candidate or "").strip():
-            return str(candidate).strip()
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        forbidden = (
+            "postcondition", "terminality", "strategy frontier",
+            "semantic equivalence", "evidence revision",
+            "safe strategies exhausted", "invocation lifecycle",
+            "front de strat\u00e9gies", "\u00e9quivalence s\u00e9mantique",
+        )
+        clean_candidate = str(candidate or "").strip()
+        if (
+            state == TerminalState.SUCCESS_VERIFIED.value
+            and clean_candidate
+            and not any(item in clean_candidate.lower() for item in forbidden)
+        ):
+            return clean_candidate
+        if state == TerminalState.SUCCESS_VERIFIED.value:
+            return (
+                "Tout ce qui \u00e9tait demand\u00e9 est termin\u00e9."
+                if self.lang == "fr" else
+                "Everything requested is complete."
+            )
         if state == TerminalState.USER_CANCELLED.value:
             return clean_response(localized_text(
                 "autonomous.status_cancelled_proven", self.lang,
@@ -8502,21 +8714,123 @@ class OSIAAgent:
                 if self.lang == "fr" else
                 "This action is blocked by an absolute safety barrier."
             )
-        if reason_code == "safe_reconciliation_frontier_exhausted":
-            return (
-                "L'effet possible reste incertain après épuisement des "
-                "vérifications sûres en lecture seule. Aucune action n'a été rejouée."
-                if self.lang == "fr" else
-                "The possible effect remains unknown after the safe read-only "
-                "verification frontier was exhausted. No action was replayed."
-            )
-        return (
-            "Le travail restant est r\u00e9ellement bloqu\u00e9 apr\u00e8s \u00e9puisement des "
-            "strat\u00e9gies s\u00fbres et s\u00e9mantiquement \u00e9quivalentes."
-            if self.lang == "fr" else
-            "The remaining work is genuinely blocked after the safe, "
-            "semantically equivalent strategy frontier was exhausted."
+        strategy_snapshot = snapshot.get("strategy_snapshot") or {}
+        mission = strategy_snapshot.get("mission") or {}
+        nodes = [
+            item for item in mission.get("action_nodes") or []
+            if isinstance(item, dict)
+        ]
+        proven = snapshot.get("proven_postconditions") or {}
+
+        def action_label(node: dict) -> str:
+            action = str(node.get("requested_action") or "").strip()
+            application = str(node.get("required_application") or "").strip()
+            target = str(node.get("target_object") or "").strip()
+            clause = str(node.get("source_clause") or "").strip()
+            subject = application or target or clause
+            if self.lang == "fr":
+                if action == "open":
+                    return f"ouvrir {subject}"
+                if action == "type":
+                    return (
+                        f"\u00e9crire le contenu demand\u00e9 dans {application}"
+                        if application else "\u00e9crire le contenu demand\u00e9"
+                    )
+                if action in {"navigate", "search"}:
+                    return f"atteindre {target or subject}"
+                if action == "activate":
+                    return f"s\u00e9lectionner {target or subject}"
+                return clause or f"terminer l'action demand\u00e9e sur {subject}"
+            if action == "open":
+                return f"open {subject}"
+            if action == "type":
+                return (
+                    f"type the requested content in {application}"
+                    if application else "type the requested content"
+                )
+            if action in {"navigate", "search"}:
+                return f"reach {target or subject}"
+            if action == "activate":
+                return f"select {target or subject}"
+            return clause or f"finish the requested action on {subject}"
+
+        completed = []
+        remaining = []
+        for node in nodes:
+            required = tuple(node.get("required_postconditions") or ())
+            label = action_label(node)
+            if required and all(item in proven for item in required):
+                completed.append(label)
+            else:
+                remaining.append(label)
+
+        permission_state = str(snapshot.get("permission_state") or "")
+        unknown_effects = snapshot.get("unknown_effects") or {}
+        recent = snapshot.get("typed_evidence") or []
+        recent_reasons = " ".join(
+            str(item.get("reason_code") or "")
+            for item in recent[-12:]
+            if isinstance(item, dict)
         )
+        reason_source = " ".join((permission_state, recent_reasons, reason_code))
+        if unknown_effects or reason_code == "safe_reconciliation_frontier_exhausted":
+            blocker = (
+                "Une action pr\u00e9c\u00e9dente a peut-\u00eatre eu lieu et doit \u00eatre "
+                "v\u00e9rifi\u00e9e avant de continuer."
+                if self.lang == "fr" else
+                "A previous action may have happened and must be checked before continuing."
+            )
+        elif "user_denied" in reason_source:
+            blocker = (
+                "L'autorisation n\u00e9cessaire a \u00e9t\u00e9 refus\u00e9e."
+                if self.lang == "fr" else
+                "The required permission was declined."
+            )
+        elif "presentation_failed" in reason_source:
+            blocker = (
+                "La demande d'autorisation n'a pas pu \u00eatre affich\u00e9e."
+                if self.lang == "fr" else
+                "The permission request could not be displayed."
+            )
+        elif "disconnected" in reason_source:
+            blocker = (
+                "La connexion a \u00e9t\u00e9 interrompue avant la d\u00e9cision "
+                "d'autorisation."
+                if self.lang == "fr" else
+                "The connection ended before the permission decision."
+            )
+        elif "timeout" in reason_source:
+            blocker = (
+                "La demande d'autorisation a expir\u00e9 avant de recevoir une r\u00e9ponse."
+                if self.lang == "fr" else
+                "The permission request expired before a response arrived."
+            )
+        elif "required_application_changed" in recent_reasons:
+            blocker = (
+                "L'application n\u00e9cessaire n'\u00e9tait pas disponible pour cette action."
+                if self.lang == "fr" else
+                "The application required for this action was unavailable."
+            )
+        else:
+            blocker = (
+                "Aucun moyen valide ne restait pour terminer cette action."
+                if self.lang == "fr" else
+                "No valid way remained to complete this action."
+            )
+
+        parts = []
+        if completed:
+            parts.append(
+                ("Termin\u00e9 : " if self.lang == "fr" else "Completed: ")
+                + ", ".join(completed[:4]) + "."
+            )
+        if remaining:
+            parts.append(
+                ("Reste \u00e0 faire : " if self.lang == "fr" else "Still incomplete: ")
+                + ", ".join(remaining[:4]) + "."
+            )
+        parts.append(blocker)
+        return " ".join(parts)
 
     def _reserve_terminal_final(
         self,
@@ -8560,6 +8874,7 @@ class OSIAAgent:
             decision.terminal_state,
             candidate,
             reason_code=decision.reason_code,
+            snapshot=snapshot,
         )
         if decision.terminal_state != "success_verified":
             self._mark_provisional_assistant_candidate(self.messages, candidate)
@@ -8686,11 +9001,12 @@ class OSIAAgent:
                 )
             except Exception as exc:
                 candidate = ""
-                controller.record_typed_evidence(
-                    outcome="failed_before_effect",
-                    evidence=f"{type(exc).__name__}:{exc}",
-                    reason_code="provider_invocation_failed_before_effect",
-                )
+                if not controller.snapshot().get("unknown_effects"):
+                    controller.record_typed_evidence(
+                        outcome="failed_before_effect",
+                        evidence=f"{type(exc).__name__}:{exc}",
+                        reason_code="provider_invocation_failed_before_effect",
+                    )
             finally:
                 self._resume_unknown_effect = previous_unknown_barrier
 
@@ -8713,6 +9029,8 @@ class OSIAAgent:
                 ),
             )
             controller.set_strategy_snapshot(strategy.snapshot())
+            if strategy.terminal_blocker:
+                controller.set_strategy_frontier(())
             if candidate == WAITING_TOOL_RESULT:
                 decision = controller.evaluate(provider_route=provider_route)
                 if decision.action == "wait":
@@ -8754,9 +9072,8 @@ class OSIAAgent:
                 return WAITING_TOOL_RESULT
             last_candidate = str(candidate or "")
 
-            coherent_information = bool(
-                not controller.execution_required
-                and str(candidate or "").strip()
+            coherent_candidate = bool(
+                str(candidate or "").strip()
                 and not is_internal_tool_control_text(str(candidate or ""))
                 and not (
                     isinstance(self.last_run_diagnostic, dict)
@@ -8764,6 +9081,23 @@ class OSIAAgent:
                         "empty_completion", "provider_failure", "tool_timeout",
                     }
                 )
+            )
+            if coherent_candidate:
+                informational_evidence = "provider_answer:" + hashlib.sha256(
+                    str(candidate).encode("utf-8", errors="replace")
+                ).hexdigest()[:24]
+                for postcondition in strategy.prove_informational_nodes(
+                    informational_evidence
+                ):
+                    controller.prove_postcondition(
+                        postcondition,
+                        informational_evidence,
+                    )
+                controller.set_strategy_snapshot(strategy.snapshot())
+                if strategy.terminal_blocker:
+                    controller.set_strategy_frontier(())
+            coherent_information = bool(
+                not controller.execution_required and coherent_candidate
             )
             decision = controller.evaluate(
                 informational_answer_satisfied=coherent_information,
@@ -8823,18 +9157,16 @@ class OSIAAgent:
             postconditions=postconditions,
         )
         requires_execution = (
-            strategy.goal.requires_execution
+            strategy.requires_execution
             if execution_required is None else bool(execution_required)
         )
-        if requires_execution and not strategy.goal.requires_execution:
-            goal_data = strategy.goal.public_dict()
-            goal_data["requires_execution"] = True
-            strategy.goal = _execution_strategy.SemanticGoal(**goal_data)
+        if requires_execution and not strategy.requires_execution:
+            strategy.require_execution()
         controller = TurnTerminalityController(
             turn_id=stable_turn_id,
             objective=user_input,
             required_postconditions=(
-                postconditions or strategy.goal.required_postconditions
+                postconditions or strategy.required_postconditions
             ),
             execution_required=requires_execution,
         )
@@ -9222,7 +9554,7 @@ class OSIAAgent:
         )
         if (
             active_execution_strategy is not None
-            and active_execution_strategy.goal.requires_execution
+            and active_execution_strategy.requires_execution
         ):
             self.messages.append({
                 "role": "user",
@@ -9298,6 +9630,12 @@ class OSIAAgent:
         ):
             metadata = self._tool_attempt_metadata or {}
             self.client.set_tool_attempt_turn_id(metadata.get("turn_id"))
+        if (
+            self.provider == "chatgpt_account"
+            and hasattr(self.client, "set_tool_attempt_request_id")
+        ):
+            metadata = self._tool_attempt_metadata or {}
+            self.client.set_tool_attempt_request_id(metadata.get("request_id"))
         if (
             self.provider == "chatgpt_account"
             and hasattr(
@@ -9535,156 +9873,21 @@ class OSIAAgent:
                     # structured tool calls on it (message.tool_calls).
                     message = response.choices[0].message
                     content = message.content or ""
-                consume_capability_events = getattr(
-                    self.client, "consume_capability_events", None,
-                )
-                if callable(consume_capability_events):
-                    try:
-                        capability_events = tuple(consume_capability_events())
-                    except Exception:
-                        capability_events = ()
-                    for capability_event in capability_events:
-                        terminality = self._terminality_controller
-                        event_source = str(
-                            getattr(capability_event, "source", "") or ""
-                        )
-                        event_phase = str(
-                            getattr(capability_event, "phase", "") or ""
-                        )
-                        event_outcome = str(
-                            getattr(capability_event, "outcome", "") or ""
-                        )
-                        event_attempt_id = str(
-                            getattr(capability_event, "tool_attempt_id", "") or ""
-                        )
-                        event_tool_name = str(
-                            getattr(capability_event, "tool_name", "") or ""
-                        )
-                        if event_phase in {"accepted", "started"}:
-                            from osia.execution_trace import display_key_for_tool
-
-                            self._emit_execution_trace(
-                                "action",
-                                display_key_for_tool(event_tool_name),
-                                tool_attempt_id=event_attempt_id,
-                                dedupe_key=(
-                                    "provider-action:"
-                                    + (event_attempt_id or event_tool_name or event_phase)
-                                ),
-                            )
-                        if event_outcome == "permission_pending":
-                            self._emit_execution_trace(
-                                "waiting_permission",
-                                "execution.permission.waiting",
-                                tool_attempt_id=event_attempt_id,
-                                permission_request_id=event_attempt_id,
-                                dedupe_key=(
-                                    "provider-permission:"
-                                    + (event_attempt_id or event_tool_name or "pending")
-                                ),
-                            )
-                        if event_phase in {"completed", "denied"}:
-                            result_key = (
-                                "execution.result.completed"
-                                if event_outcome == "success_verified" else
-                                "execution.result.needs_attention"
-                            )
-                            self._emit_execution_trace(
-                                "result",
-                                result_key,
-                                tool_attempt_id=event_attempt_id,
-                                dedupe_key=(
-                                    "provider-result:"
-                                    + (event_attempt_id or event_tool_name or event_phase)
-                                ),
-                            )
-                        if terminality is not None and event_source == "provider_native":
-                            terminality.require_execution(
-                                (
-                                    _execution_strategy.current_execution_strategy().goal.observable_success_postcondition
-                                    if _execution_strategy.current_execution_strategy() is not None
-                                    else ""
-                                )
-                            )
-                            if event_phase in {"accepted", "started"} and event_attempt_id:
-                                terminality.set_attempt_state(
-                                    event_attempt_id,
-                                    status=("pending" if event_outcome == "permission_pending" else "running"),
-                                    permission_state=("pending" if event_outcome == "permission_pending" else ""),
-                                )
-                            if event_phase in {"completed", "denied"}:
-                                terminality.record_typed_evidence(
-                                    outcome=event_outcome,
-                                    evidence={
-                                        "source": event_source,
-                                        "identity": str(getattr(capability_event, "identity", "") or ""),
-                                        "tool_name": str(getattr(capability_event, "tool_name", "") or ""),
-                                    },
-                                    attempt_id=event_attempt_id,
-                                    reason_code="provider_native_" + event_phase,
-                                    useful_progress=(event_outcome == "success_verified"),
-                                )
-                                if event_attempt_id:
-                                    terminality.set_attempt_state(event_attempt_id, status="completed")
-                        if (
-                            event_source == "provider_native"
-                            and event_phase == "denied"
-                            and event_outcome in {
-                                "permission_user_denied",
-                                "permission_presentation_failed",
-                                "permission_timeout",
-                                "permission_disconnected",
-                                "permission_internal_failure",
-                            }
-                        ):
-                            event_arguments = getattr(
-                                capability_event, "arguments", None,
-                            )
-                            if event_tool_name and isinstance(event_arguments, dict):
-                                self._unfinished_execution = {
-                                    "call": {
-                                        "tool": event_tool_name,
-                                        **dict(event_arguments),
-                                    },
-                                    "outcome": "failed_before_effect",
-                                    "reason_code": event_outcome,
-                                    "attempt_id": "",
-                                }
-                            if terminality is not None:
-                                terminality.set_permission_state(
-                                    event_outcome.removeprefix("permission_")
-                                )
-                            return self._finish_structural_execution_state(
-                                event_outcome,
-                                on_sentence=on_sentence,
-                            )
-                        if (
-                            event_source == "provider_native"
-                            and event_phase == "accepted"
-                            and event_outcome in {"dispatch_started", "read_only"}
-                        ):
-                            accepted_execution_transition = True
-                            any_tool_executed = True
-                            if event_outcome == "dispatch_started":
-                                tool_execution_barrier_committed = True
-                        if (
-                            event_source == "provider_native"
-                            and event_phase == "completed"
-                            and event_outcome in {
-                                "success_verified",
-                                "failed_before_effect",
-                                "failed_after_effect",
-                                "cancelled_proven",
-                                "outcome_unknown",
-                            }
-                        ):
-                            provider_execution_terminal = True
-                            if event_outcome == "success_verified":
-                                accepted_execution_transition = True
-                                any_tool_executed = True
-                            if event_outcome == "outcome_unknown":
-                                turn_has_unknown_outcome = True
-                                tool_execution_barrier_committed = True
+                event_summary = self._consume_provider_capability_events()
+                if event_summary["permission_outcome"]:
+                    return self._finish_structural_execution_state(
+                        event_summary["permission_outcome"],
+                        on_sentence=on_sentence,
+                    )
+                if event_summary["accepted"]:
+                    accepted_execution_transition = True
+                    any_tool_executed = True
+                if event_summary["barrier"]:
+                    tool_execution_barrier_committed = True
+                if event_summary["provider_terminal"]:
+                    provider_execution_terminal = True
+                if event_summary["unknown"]:
+                    turn_has_unknown_outcome = True
             except _TurnBudgetStop:
                 guard.check_time()
                 return self._finish_anti_loop_stop(
@@ -9693,6 +9896,21 @@ class OSIAAgent:
                     on_first_token=on_first_token,
                 )
             except Exception as e:
+                event_summary = self._consume_provider_capability_events()
+                if event_summary["permission_outcome"]:
+                    return self._finish_structural_execution_state(
+                        event_summary["permission_outcome"],
+                        on_sentence=on_sentence,
+                    )
+                if event_summary["accepted"]:
+                    accepted_execution_transition = True
+                    any_tool_executed = True
+                if event_summary["barrier"]:
+                    tool_execution_barrier_committed = True
+                if event_summary["provider_terminal"]:
+                    provider_execution_terminal = True
+                if event_summary["unknown"]:
+                    turn_has_unknown_outcome = True
                 if reasoning_request is not None and not reasoning_outcome_recorded:
                     from osia.reasoning import record_reasoning_outcome
                     record_reasoning_outcome(
@@ -10686,6 +10904,7 @@ class OSIAAgent:
                         tool_name,
                         kwargs,
                         execution_record,
+                        strategy_decision,
                     )
                     if (
                         self._continuation_reconcile_required
@@ -11127,7 +11346,7 @@ class OSIAAgent:
                     })
                     continue
                 if (
-                    active_execution_strategy.goal.requires_execution
+                    active_execution_strategy.requires_execution
                     and not accepted_execution_transition
                     and not any_tool_executed
                     and active_execution_strategy.final_diagnostic().get("code")

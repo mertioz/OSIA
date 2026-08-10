@@ -94,11 +94,13 @@ _ACTION_PATTERNS = (
 _KNOWN_APPLICATIONS = (
     "steam", "spotify", "vscode", "visual studio code", "discord",
     "brave", "chrome", "firefox", "edge", "outlook", "gmail",
+    "notepad", "bloc-notes", "calculator", "paint", "character map",
+    "xbox",
 )
 
 
-@dataclass(frozen=True)
-class SemanticGoal:
+@dataclass
+class SemanticActionNode:
     target_object: str
     required_application: str
     required_surface: str
@@ -108,17 +110,57 @@ class SemanticGoal:
     fingerprint: str
     requires_execution: bool = False
     required_postconditions: tuple[str, ...] = ()
+    node_id: str = ""
+    order: int = 0
+    source_clause: str = ""
+    requested_content: str = ""
+    status: str = "pending"
+    evidence_links: tuple[str, ...] = ()
 
     def public_dict(self) -> dict:
         return asdict(self)
 
 
-def derive_semantic_goal(
+@dataclass
+class SemanticMission:
+    objective: str
+    action_nodes: tuple[SemanticActionNode, ...]
+    fingerprint: str
+    execution_required_override: bool = False
+
+    @property
+    def requires_execution(self) -> bool:
+        return self.execution_required_override or any(
+            node.requires_execution for node in self.action_nodes
+        )
+
+    @property
+    def required_postconditions(self) -> tuple[str, ...]:
+        return tuple(
+            postcondition
+            for node in self.action_nodes
+            for postcondition in node.required_postconditions
+        )
+
+    def public_dict(self) -> dict:
+        return {
+            "objective": self.objective,
+            "action_nodes": [node.public_dict() for node in self.action_nodes],
+            "fingerprint": self.fingerprint,
+            "execution_required_override": self.execution_required_override,
+        }
+
+
+# Compatibility name for focused WOR-248 callers which construct one node.
+SemanticGoal = SemanticActionNode
+
+
+def _derive_semantic_node(
     request: str,
     *,
     postcondition: str = "",
     postconditions: Iterable[str] = (),
-) -> SemanticGoal:
+) -> SemanticActionNode:
     """Derive bounded goal invariants without an extra model call.
 
     The parser intentionally extracts only explicit constraints.  Missing
@@ -184,7 +226,9 @@ def derive_semantic_goal(
             target = _bounded(candidate, 160)
     elif action_match is not None and not quoted:
         candidate = norm[action_match.end():].strip(" .?!,;:")
-        candidate = re.split(r"[.;!?]", candidate, maxsplit=1)[0].strip()
+        candidate = re.split(
+            r"(?:[;!?]|\.(?:\s+|$))", candidate, maxsplit=1,
+        )[0].strip()
         candidate = re.sub(
             r"^(?:to|for|on|at|in|the|a|an|le|la|les|un|une|des|du|de|a|au|aux)\s+",
             "",
@@ -260,11 +304,247 @@ def derive_semantic_goal(
             ensure_ascii=True,
         ).encode("utf-8")
     ).hexdigest()[:24]
-    return SemanticGoal(
+    return SemanticActionNode(
         **payload,
         fingerprint=fingerprint,
         requires_execution=requires_execution,
         required_postconditions=required,
+        source_clause=source,
+    )
+
+
+def derive_semantic_goal(
+    request: str,
+    *,
+    postcondition: str = "",
+    postconditions: Iterable[str] = (),
+) -> SemanticActionNode:
+    """Compatibility parser for one semantic action chain.
+
+    Production turn orchestration uses :func:`derive_semantic_mission`.  This
+    helper intentionally preserves the WOR-248 single-goal contract for tests
+    and callers which explicitly ask for one compound action chain.
+    """
+
+    return _derive_semantic_node(
+        request,
+        postcondition=postcondition,
+        postconditions=postconditions,
+    )
+
+
+_ACTION_WORDS = (
+    r"search|find|look\s+for|cherche|chercher|recherche|rechercher|"
+    r"open|launch|start|ouvre|ouvrir|lance|lancer|demarre|demarrer|"
+    r"go\s+to|navigate|visit|va\s+a|aller\s+a|rends\s+toi|accede|"
+    r"click|select|activate|clique|selectionne|active|"
+    r"type|enter|write|saisis|ecris|tape|send|submit|envoie|envoyer|"
+    r"create|add|cree|creer|ajoute|ajouter|delete|remove|supprime|efface|"
+    r"do|perform|execute|run|check|verify|confirm|report|"
+    r"faire|effectuer|executer|verifier|confirmer|rapporter"
+)
+_ACTION_SPLIT_PATTERN = re.compile(
+    rf"(?:\s*;\s*|\s*\.(?:\s+|$)\s*|"
+    rf"\s*,?\s*\b(?:and\s+then|then|puis|ensuite)\b\s*|"
+    rf"\s*,\s*(?=(?:{_ACTION_WORDS})\b)|"
+    rf"\s+\b(?:and|et)\b\s+(?=(?:{_ACTION_WORDS})\b))",
+    re.IGNORECASE,
+)
+
+
+def _explicit_application(clause: str, node: SemanticActionNode) -> str:
+    if node.required_application:
+        return node.required_application
+    norm = _normalized(clause)
+    if node.requested_action == "open":
+        target = _normalized(node.target_object)
+        target = re.sub(r"^(?:the|a|an|le|la|les|un|une)\s+", "", target)
+        return _bounded(target, 80)
+    if node.requested_action in {"type", "send", "create"}:
+        match = re.search(
+            r"\b(?:in|into|inside|dans|sur)\s+([^,.;]{1,80})$", norm,
+        )
+        if match:
+            return _bounded(match.group(1).strip(), 80)
+    return ""
+
+
+def _open_list_targets(clause: str) -> tuple[str, ...]:
+    norm = _normalized(clause)
+    match = re.search(
+        r"\b(?:open|launch|start|ouvre|ouvrir|lance|lancer|demarre|demarrer)\b\s+(.+)$",
+        norm,
+    )
+    if not match:
+        return ()
+    tail = match.group(1).strip(" .?!,;:")
+    if re.search(r"\b(?:at|in|on|to|dans|sur|vers)\b", tail):
+        return ()
+    parts = [
+        re.sub(r"^(?:the|a|an|le|la|les|un|une)\s+", "", item).strip()
+        for item in re.split(r"\s*(?:,|\band\b|\bet\b)\s*", tail)
+        if item.strip()
+    ]
+    return tuple(_bounded(item, 80) for item in parts) if len(parts) > 1 else ()
+
+
+def _looks_like_bare_application(clause: str) -> bool:
+    norm = _normalized(clause).strip(" .?!,;:")
+    if not norm or len(norm.split()) > 5:
+        return False
+    return not re.search(
+        r"\b(?:do|perform|execute|run|verify|check|confirm|report|use|with|it|this|that|"
+        r"verifie|verifier|confirme|confirmer|rapporte|utilise|utiliser|cela|ceci)\b",
+        norm,
+    )
+
+
+def _node_with_identity(
+    node: SemanticActionNode,
+    *,
+    order: int,
+    clause: str,
+    application: str = "",
+    postcondition: str = "",
+) -> SemanticActionNode:
+    if application:
+        node.required_application = _normalized(application)
+        if node.requested_action == "open":
+            node.target_object = _bounded(application, 160)
+    if postcondition:
+        node.observable_success_postcondition = _bounded(postcondition, 320)
+        node.required_postconditions = (node.observable_success_postcondition,)
+    node.order = order
+    node.source_clause = _bounded(clause, 500)
+    node.node_id = "node_" + hashlib.sha256(
+        json.dumps(
+            {
+                "order": order,
+                "clause": node.source_clause,
+                "application": node.required_application,
+                "action": node.requested_action,
+                "target": node.target_object,
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    if node.requested_action in {"type", "send", "create"}:
+        quoted = re.findall(
+            r"[\"'\u201c\u201d\u00ab\u00bb]([^\"'\u201c\u201d\u00ab\u00bb]{1,320})[\"'\u201c\u201d\u00ab\u00bb]",
+            clause,
+        )
+        if quoted:
+            node.requested_content = _bounded(quoted[-1], 320)
+    return node
+
+
+def derive_semantic_mission(
+    request: str,
+    *,
+    postcondition: str = "",
+    postconditions: Iterable[str] = (),
+) -> SemanticMission:
+    """Build an ordered mission without merging independent requested work."""
+
+    source = _bounded(request, 4000)
+    explicit_postconditions = tuple(
+        _bounded(item, 320) for item in postconditions if _bounded(item, 320)
+    )
+    clauses = [
+        item.strip(" ,") for item in _ACTION_SPLIT_PATTERN.split(source)
+        if item.strip(" ,")
+    ] or [source]
+    nodes: list[SemanticActionNode] = []
+    current_application = ""
+    current_action = ""
+    for clause in clauses:
+        open_targets = _open_list_targets(clause)
+        if open_targets:
+            for target in open_targets:
+                node = _derive_semantic_node("Open " + target)
+                node = _node_with_identity(
+                    node,
+                    order=len(nodes),
+                    clause=target,
+                    application=target,
+                )
+                nodes.append(node)
+                current_application = node.required_application
+                current_action = "open"
+            continue
+
+        node = _derive_semantic_node(clause)
+        if (
+            not node.requested_action
+            and current_action == "open"
+            and _looks_like_bare_application(clause)
+        ):
+            node = _derive_semantic_node("Open " + clause)
+        explicit_application = _explicit_application(clause, node)
+        if explicit_application:
+            node.required_application = explicit_application
+        elif current_application and node.requested_action:
+            node.required_application = current_application
+
+        # Navigation/search/activation/typing with no new application is a
+        # dependent refinement of the preceding node, not a second effect.
+        if (
+            nodes
+            and node.requested_action in {"navigate", "search", "activate", "type"}
+            and not explicit_application
+            and nodes[-1].required_application == node.required_application
+        ):
+            combined = _derive_semantic_node(
+                nodes[-1].source_clause + " and " + clause,
+            )
+            nodes[-1] = _node_with_identity(
+                combined,
+                order=nodes[-1].order,
+                clause=nodes[-1].source_clause + " and " + clause,
+                application=current_application,
+            )
+            continue
+
+        node = _node_with_identity(
+            node,
+            order=len(nodes),
+            clause=clause,
+            application=explicit_application,
+        )
+        nodes.append(node)
+        if node.required_application:
+            current_application = node.required_application
+        if node.requested_action:
+            current_action = node.requested_action
+
+    if not nodes:
+        nodes.append(_node_with_identity(
+            _derive_semantic_node(source), order=0, clause=source,
+        ))
+
+    if postcondition and len(nodes) == 1:
+        nodes[0] = _node_with_identity(
+            nodes[0], order=0, clause=nodes[0].source_clause,
+            postcondition=postcondition,
+        )
+    elif explicit_postconditions:
+        for index, value in enumerate(explicit_postconditions):
+            if index >= len(nodes):
+                break
+            nodes[index] = _node_with_identity(
+                nodes[index], order=index, clause=nodes[index].source_clause,
+                postcondition=value,
+            )
+
+    payload = [node.public_dict() for node in nodes]
+    fingerprint = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()[:24]
+    return SemanticMission(
+        objective=source,
+        action_nodes=tuple(nodes),
+        fingerprint=fingerprint,
     )
 
 
@@ -279,6 +559,7 @@ class StrategyMechanism:
     applicable: bool = True
     covers_goal: bool = True
     mutation: bool = False
+    node_id: str = ""
 
     @property
     def label(self) -> str:
@@ -309,6 +590,7 @@ class StrategyAttempt:
     failure_or_stagnation_reason: str = ""
     alternatives_still_applicable: list[str] = field(default_factory=list)
     postcondition_evidence: str = ""
+    node_id: str = ""
 
     def public_dict(self) -> dict:
         return asdict(self)
@@ -320,6 +602,7 @@ class StrategyDecision:
     reason_code: str
     attempt_id: str = ""
     mechanism_id: str = ""
+    node_id: str = ""
 
 
 _TERMINAL_FOR_ESCALATION = frozenset({
@@ -333,12 +616,27 @@ _TERMINAL_FOR_ESCALATION = frozenset({
 
 
 class ExecutionStrategy:
-    """Bounded strategy state for one active semantic goal."""
+    """Bounded strategy state for one ordered semantic mission."""
 
     _MAX_IDENTICAL_ACTION_ATTEMPTS = 2
 
-    def __init__(self, goal: SemanticGoal, mechanisms: Iterable[StrategyMechanism] = ()):
-        self.goal = goal
+    def __init__(
+        self,
+        mission: SemanticMission | SemanticActionNode,
+        mechanisms: Iterable[StrategyMechanism] = (),
+    ):
+        if isinstance(mission, SemanticActionNode):
+            node = mission
+            if not node.node_id:
+                node = _node_with_identity(
+                    node, order=0, clause=node.source_clause or node.target_object,
+                )
+            mission = SemanticMission(
+                objective=node.source_clause or node.target_object,
+                action_nodes=(node,),
+                fingerprint=node.fingerprint,
+            )
+        self.mission = mission
         self._mechanisms: dict[str, StrategyMechanism] = {}
         self.attempts: list[StrategyAttempt] = []
         self.current_mechanism = ""
@@ -353,16 +651,250 @@ class ExecutionStrategy:
         self._signature_attempt_counts: dict[str, int] = {}
         self._stale_mechanisms: dict[str, int] = {}
         self._terminal_prompt_tokens: set[str] = set()
+        self._frozen_node_id = ""
+        self.terminal_blocker = ""
         self._lock = threading.RLock()
         for mechanism in mechanisms:
             self.register(mechanism)
+
+    @property
+    def goal(self) -> SemanticActionNode:
+        """Compatibility view of the currently relevant action node."""
+
+        pending = self.pending_nodes()
+        if pending:
+            return pending[0]
+        return self.mission.action_nodes[-1]
+
+    @goal.setter
+    def goal(self, value: SemanticActionNode) -> None:
+        if len(self.mission.action_nodes) != 1:
+            raise ValueError("cannot replace one node in a multi-action mission")
+        self.mission.action_nodes = (value,)
+
+    @property
+    def required_postconditions(self) -> tuple[str, ...]:
+        return self.mission.required_postconditions
+
+    @property
+    def requires_execution(self) -> bool:
+        return self.mission.requires_execution
+
+    def require_execution(self) -> None:
+        self.mission.execution_required_override = True
+        if not any(node.requires_execution for node in self.mission.action_nodes):
+            self.mission.action_nodes[0].requires_execution = True
+
+    def pending_nodes(self) -> list[SemanticActionNode]:
+        return [
+            node for node in self.mission.action_nodes
+            if not all(
+                item in self.proven_postconditions
+                for item in node.required_postconditions
+            )
+        ]
+
+    def node_by_id(self, node_id: str) -> SemanticActionNode | None:
+        return next(
+            (node for node in self.mission.action_nodes if node.node_id == node_id),
+            None,
+        )
+
+    @staticmethod
+    def _tool_action(tool_name: str, arguments: dict) -> str:
+        if tool_name == "open_application":
+            return "open"
+        if tool_name in {"desktop_type", "type_text", "fill", "fill_form_field"}:
+            return "type"
+        if tool_name in {"open_uri", "navigate", "navigate_browser", "open_browser_tab"}:
+            return "navigate"
+        if tool_name in {"click", "find_and_click", "desktop_click", "activate_browser_element"}:
+            return "activate"
+        if tool_name in {"search_web", "search_files"}:
+            return "search"
+        if tool_name == "run_command":
+            command = _normalized(arguments.get("command"))
+            if re.search(r"\b(start|start-process|open|explorer)\b", command):
+                return "open"
+        return ""
+
+    def _tool_application(self, tool_name: str, arguments: dict) -> str:
+        if tool_name == "open_application":
+            return _normalized(arguments.get("name"))
+        if tool_name == "open_uri":
+            return _uri_identity(arguments.get("uri", ""))[0]
+        if tool_name in _DOM_ACTION_TOOLS:
+            url = arguments.get("url") or arguments.get("target_url") or ""
+            return _url_identity(url)[0]
+        if tool_name == "run_command":
+            command = _normalized(arguments.get("command"))
+            mission_applications = [
+                _normalized(node.required_application)
+                for node in self.mission.action_nodes
+                if node.required_application
+            ]
+            command_aliases = {
+                "calculator": ("calc",),
+                "character map": ("charmap",),
+                "file explorer": ("explorer",),
+            }
+            for node_name in (*mission_applications, *_KNOWN_APPLICATIONS):
+                normalized = _normalized(node_name)
+                aliases = (normalized, *command_aliases.get(normalized, ()))
+                if any(
+                    re.search(
+                        rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])",
+                        command,
+                    )
+                    for alias in aliases
+                ):
+                    return "vscode" if normalized == "visual studio code" else normalized
+        return ""
+
+    def match_action_node(
+        self,
+        tool_name: str,
+        arguments: dict | None = None,
+        *,
+        include_completed: bool = False,
+    ) -> SemanticActionNode | None:
+        arguments = arguments if isinstance(arguments, dict) else {}
+        candidates = (
+            list(self.mission.action_nodes) if include_completed else self.pending_nodes()
+        )
+        candidates = [node for node in candidates if node.status != "blocked"]
+        executable = [node for node in candidates if node.requires_execution]
+        if executable:
+            candidates = executable
+        if not candidates:
+            return None
+        tool_app = self._tool_application(tool_name, arguments)
+        tool_action = self._tool_action(tool_name, arguments)
+        serialized = _normalized(json.dumps(arguments, sort_keys=True, default=str))
+        scored: list[tuple[int, int, SemanticActionNode]] = []
+        for node in candidates:
+            if (
+                tool_app
+                and node.required_application
+                and tool_app != _normalized(node.required_application)
+            ):
+                continue
+            score = 0
+            if tool_app and tool_app == _normalized(node.required_application):
+                score += 20
+            if tool_action and tool_action == node.requested_action:
+                score += 8
+            target_tokens = [
+                token for token in _normalized(node.target_object).split()
+                if len(token) >= 3
+            ]
+            score += sum(1 for token in target_tokens[:6] if token in serialized)
+            if node.status in {"active", "unknown"}:
+                score += 4
+            scored.append((score, -node.order, node))
+        if not scored:
+            return None
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return scored[0][2]
+
+    def postcondition_for_tool(self, tool_name: str, arguments: dict | None = None) -> str:
+        node = self.match_action_node(tool_name, arguments)
+        return node.observable_success_postcondition if node is not None else ""
+
+    def prove_informational_nodes(self, evidence: str) -> tuple[str, ...]:
+        proven = []
+        for node in self.pending_nodes():
+            if node.requires_execution:
+                continue
+            for postcondition in node.required_postconditions:
+                if self.verify_postcondition(evidence, postcondition=postcondition):
+                    proven.append(postcondition)
+        return tuple(proven)
+
+    def record_external_event(
+        self,
+        tool_name: str,
+        arguments: dict | None,
+        *,
+        outcome: str,
+        evidence: str,
+    ) -> SemanticActionNode | None:
+        node = self.match_action_node(tool_name, arguments)
+        if node is None:
+            return None
+        normalized = _normalized(outcome).replace(" ", "_")
+        link = _bounded(evidence, 180)
+        if link and link not in node.evidence_links:
+            node.evidence_links = tuple((*node.evidence_links, link)[-16:])
+        if normalized == "success_verified":
+            for postcondition in node.required_postconditions:
+                self.verify_postcondition(link or outcome, postcondition=postcondition)
+            node.status = "succeeded"
+        elif normalized in {"outcome_unknown", "unknown_after_start"}:
+            node.status = "unknown"
+            self._frozen_node_id = node.node_id
+            self.frozen_reason = "effect_possible_postcondition_unknown"
+        elif normalized in {"dispatch_started", "read_only", "permission_pending"}:
+            node.status = "active"
+        elif normalized in {
+            "permission_user_denied",
+        }:
+            node.status = "blocked"
+            self.terminal_blocker = normalized
+        elif normalized in {
+            "failed_before_effect", "confirmed_failure_before_effect",
+            "rejected_before_execution",
+            "permission_presentation_failed", "permission_timeout",
+            "permission_disconnected", "permission_internal_failure",
+        }:
+            node.status = "pending"
+        return node
 
     def register(self, mechanism: StrategyMechanism) -> None:
         with self._lock:
             self._mechanisms.setdefault(mechanism.mechanism_id, mechanism)
 
-    def _semantic_error(self, mechanism: StrategyMechanism) -> str:
-        goal = self.goal
+    def _node_for_mechanism(
+        self,
+        mechanism: StrategyMechanism,
+        action: object | None = None,
+    ) -> SemanticActionNode | None:
+        if mechanism.node_id:
+            node = self.node_by_id(mechanism.node_id)
+            return (
+                node
+                if node in self.pending_nodes() and node.status != "blocked"
+                else None
+            )
+        action_payload = action if isinstance(action, dict) else {}
+        tool_name = str(action_payload.get("tool") or "")
+        arguments = action_payload.get("arguments")
+        if tool_name:
+            matched = self.match_action_node(
+                tool_name,
+                arguments if isinstance(arguments, dict) else action_payload,
+            )
+            if matched is not None:
+                return matched
+        candidates = self.pending_nodes()
+        if mechanism.application:
+            normalized = _normalized(mechanism.application)
+            for node in candidates:
+                if _normalized(node.required_application) == normalized:
+                    return node
+        return candidates[0] if candidates else None
+
+    def _semantic_error(
+        self,
+        mechanism: StrategyMechanism,
+        node: SemanticActionNode | None = None,
+    ) -> str:
+        goal = node or self._node_for_mechanism(mechanism)
+        if goal is None:
+            return "no_pending_action_node"
+        pending = [node for node in self.pending_nodes() if node.requires_execution]
+        if pending and goal.requires_execution and goal.order != pending[0].order:
+            return "earlier_action_node_pending"
         if (
             goal.required_application
             and mechanism.application
@@ -396,7 +928,10 @@ class ExecutionStrategy:
                 (
                     mechanism for mechanism in self._mechanisms.values()
                     if mechanism.applicable
-                    and not self._semantic_error(mechanism)
+                    and self._node_for_mechanism(mechanism) is not None
+                    and not self._semantic_error(
+                        mechanism, self._node_for_mechanism(mechanism),
+                    )
                     and not self._exhausted(mechanism.mechanism_id)
                 ),
                 key=lambda item: (int(item.layer), item.mechanism_id),
@@ -419,7 +954,11 @@ class ExecutionStrategy:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
-    def preview(self, mechanism: StrategyMechanism) -> StrategyDecision:
+    def preview(
+        self,
+        mechanism: StrategyMechanism,
+        action: object | None = None,
+    ) -> StrategyDecision:
         with self._lock:
             if self.succeeded:
                 return StrategyDecision(False, "postcondition_already_satisfied")
@@ -432,9 +971,12 @@ class ExecutionStrategy:
                 return StrategyDecision(False, "stale_target_requires_reresolution")
             if not mechanism.applicable:
                 return StrategyDecision(False, "mechanism_not_applicable")
-            semantic_error = self._semantic_error(mechanism)
+            node = self._node_for_mechanism(mechanism, action)
+            semantic_error = self._semantic_error(mechanism, node)
             if semantic_error:
-                return StrategyDecision(False, semantic_error)
+                return StrategyDecision(
+                    False, semantic_error, node_id=(node.node_id if node else ""),
+                )
             higher = self._higher_unexhausted(mechanism.layer)
             if higher:
                 return StrategyDecision(
@@ -443,12 +985,17 @@ class ExecutionStrategy:
                         item.mechanism_id for item in higher[:8]
                     ),
                 )
-            return StrategyDecision(True, "strategy_selected", mechanism_id=mechanism.mechanism_id)
+            return StrategyDecision(
+                True,
+                "strategy_selected",
+                mechanism_id=mechanism.mechanism_id,
+                node_id=(node.node_id if node else ""),
+            )
 
     def select(self, mechanism: StrategyMechanism, action: object) -> StrategyDecision:
         with self._lock:
             self.register(mechanism)
-            preview = self.preview(mechanism)
+            preview = self.preview(mechanism, action)
             signature = self.action_signature(mechanism.mechanism_id, action)
             if not preview.allowed:
                 duplicate = next(
@@ -477,11 +1024,12 @@ class ExecutionStrategy:
                     alternatives_still_applicable=[
                         item.mechanism_id for item in self.remaining_mechanisms()
                     ],
+                    node_id=preview.node_id,
                 )
                 self.attempts.append(attempt)
                 return StrategyDecision(
                     False, preview.reason_code, attempt.attempt_id,
-                    mechanism.mechanism_id,
+                    mechanism.mechanism_id, preview.node_id,
                 )
             if (
                 self._signature_attempt_counts.get(signature, 0)
@@ -505,6 +1053,7 @@ class ExecutionStrategy:
                     item.mechanism_id for item in self.remaining_mechanisms()
                     if item.mechanism_id != mechanism.mechanism_id
                 ],
+                node_id=preview.node_id,
             )
             self.attempts.append(attempt)
             self._signature_attempt_counts[signature] = (
@@ -512,9 +1061,12 @@ class ExecutionStrategy:
             )
             self.current_mechanism = mechanism.mechanism_id
             self.current_layer = int(mechanism.layer)
+            node = self.node_by_id(preview.node_id)
+            if node is not None:
+                node.status = "active"
             return StrategyDecision(
                 True, "strategy_selected", attempt.attempt_id,
-                mechanism.mechanism_id,
+                mechanism.mechanism_id, preview.node_id,
             )
 
     def observe(self, observation: str, *, evidence_token: str = "") -> None:
@@ -544,6 +1096,7 @@ class ExecutionStrategy:
             if attempt is None or not decision.allowed:
                 return attempt
             mechanism = self._mechanisms[attempt.mechanism_id]
+            node = self.node_by_id(attempt.node_id) or self.goal
             normalized_outcome = _normalized(outcome).replace(" ", "_")
             if observation:
                 attempt.observations_gained.append(_bounded(observation, 160))
@@ -554,6 +1107,8 @@ class ExecutionStrategy:
                     _bounded(failure_reason, 120) or "effect_possible_postcondition_unknown"
                 )
                 self.frozen_reason = attempt.failure_or_stagnation_reason
+                self._frozen_node_id = node.node_id
+                node.status = "unknown"
             elif normalized_outcome == "stale":
                 attempt.status = AttemptStatus.STALE.value
                 attempt.failure_or_stagnation_reason = (
@@ -561,42 +1116,54 @@ class ExecutionStrategy:
                 )
                 self._stale_mechanisms[attempt.mechanism_id] = self._evidence_revision
                 self._failed_signatures[attempt.action_signature] = self._evidence_revision
+                node.status = "pending"
             elif normalized_outcome in {"stagnated", "stagnation"}:
                 attempt.status = AttemptStatus.STAGNATED.value
                 attempt.failure_or_stagnation_reason = (
                     _bounded(failure_reason, 120) or "strategy_stagnated"
                 )
                 self._failed_signatures[attempt.action_signature] = self._evidence_revision
+                node.status = "pending"
             elif normalized_outcome in {"failed", "failure", "rejected"}:
                 attempt.status = AttemptStatus.FAILED.value
                 attempt.failure_or_stagnation_reason = (
                     _bounded(failure_reason, 120) or "strategy_failed"
                 )
                 self._failed_signatures[attempt.action_signature] = self._evidence_revision
+                node.status = "pending"
             elif normalized_outcome in {"progress", "progressed"}:
                 attempt.status = AttemptStatus.PROGRESSED.value
+                node.status = "pending"
             elif normalized_outcome in {"succeeded", "success"}:
                 evidence = _bounded(postcondition_evidence, 180)
                 if not evidence:
                     attempt.status = AttemptStatus.FAILED.value
                     attempt.failure_or_stagnation_reason = "postcondition_unverified"
                     self._failed_signatures[attempt.action_signature] = self._evidence_revision
-                elif mechanism.covers_goal and len(self.goal.required_postconditions) == 1:
+                elif mechanism.covers_goal:
                     attempt.status = AttemptStatus.SUCCEEDED.value
                     attempt.postcondition_evidence = evidence
                     self.postcondition_evidence.append(evidence)
-                    self.proven_postconditions[
-                        self.goal.required_postconditions[0]
-                    ] = evidence
-                    self.succeeded = True
+                    for postcondition in node.required_postconditions:
+                        self.proven_postconditions[postcondition] = evidence
+                    node.status = "succeeded"
+                    node.evidence_links = tuple(
+                        (*node.evidence_links, evidence)[-16:]
+                    )
+                    self.succeeded = all(
+                        item in self.proven_postconditions
+                        for item in self.required_postconditions
+                    )
                 else:
                     attempt.status = AttemptStatus.PROGRESSED.value
                     attempt.postcondition_evidence = evidence
                     self.postcondition_evidence.append(evidence)
+                    node.status = "pending"
             else:
                 attempt.status = AttemptStatus.FAILED.value
                 attempt.failure_or_stagnation_reason = "invalid_strategy_outcome"
                 self._failed_signatures[attempt.action_signature] = self._evidence_revision
+                node.status = "pending"
             attempt.alternatives_still_applicable = [
                 item.mechanism_id for item in self.remaining_mechanisms()
             ]
@@ -609,13 +1176,24 @@ class ExecutionStrategy:
             if succeeded and evidence:
                 bounded = _bounded(evidence, 180)
                 self.postcondition_evidence.append(bounded)
-                required = self.goal.required_postconditions or (
-                    self.goal.observable_success_postcondition,
-                )
-                if len(required) == 1:
-                    self.proven_postconditions[required[0]] = bounded
-                    self.succeeded = True
+                node = self.node_by_id(self._frozen_node_id)
+                if node is not None:
+                    for postcondition in node.required_postconditions:
+                        self.proven_postconditions[postcondition] = bounded
+                    node.status = "succeeded"
+                    node.evidence_links = tuple(
+                        (*node.evidence_links, bounded)[-16:]
+                    )
+                    self.succeeded = all(
+                        item in self.proven_postconditions
+                        for item in self.required_postconditions
+                    )
+            elif self._frozen_node_id:
+                node = self.node_by_id(self._frozen_node_id)
+                if node is not None:
+                    node.status = "pending"
             self.frozen_reason = ""
+            self._frozen_node_id = ""
             self._evidence_revision += 1
 
     def verify_postcondition(
@@ -630,9 +1208,7 @@ class ExecutionStrategy:
             bounded = _bounded(evidence, 180)
             if not bounded or self.frozen_reason:
                 return False
-            required = self.goal.required_postconditions or (
-                self.goal.observable_success_postcondition,
-            )
+            required = self.required_postconditions
             target = _bounded(postcondition, 320)
             if not target and len(required) == 1:
                 target = required[0]
@@ -640,6 +1216,16 @@ class ExecutionStrategy:
                 return False
             self.proven_postconditions[target] = bounded
             self.succeeded = all(item in self.proven_postconditions for item in required)
+            for node in self.mission.action_nodes:
+                if target in node.required_postconditions:
+                    node.status = "succeeded" if all(
+                        item in self.proven_postconditions
+                        for item in node.required_postconditions
+                    ) else node.status
+                    node.evidence_links = tuple(
+                        (*node.evidence_links, bounded)[-16:]
+                    )
+                    break
             self.postcondition_evidence.append(bounded)
             self._evidence_revision += 1
             return True
@@ -661,7 +1247,7 @@ class ExecutionStrategy:
                 next_action = "precise_failure_or_clarification"
             return {
                 "code": code,
-                "goal_fingerprint": self.goal.fingerprint,
+                "goal_fingerprint": self.mission.fingerprint,
                 "remaining": remaining,
                 "failure_reasons": [
                     item.failure_or_stagnation_reason
@@ -675,6 +1261,8 @@ class ExecutionStrategy:
     def snapshot(self) -> dict:
         with self._lock:
             return {
+                "mission": self.mission.public_dict(),
+                # Kept for restoring pre-WOR-256 ledgers and focused callers.
                 "goal": self.goal.public_dict(),
                 "current_mechanism": self.current_mechanism,
                 "current_layer": self.current_layer,
@@ -702,19 +1290,51 @@ class ExecutionStrategy:
                 "signature_attempt_counts": dict(self._signature_attempt_counts),
                 "stale_mechanisms": dict(self._stale_mechanisms),
                 "terminal_prompt_tokens": sorted(self._terminal_prompt_tokens)[-32:],
+                "frozen_node_id": self._frozen_node_id,
+                "terminal_blocker": self.terminal_blocker,
             }
 
     @classmethod
     def from_snapshot(cls, snapshot: dict) -> "ExecutionStrategy":
         """Restore the exact frontier for another provider segment."""
 
-        if not isinstance(snapshot, dict) or not isinstance(snapshot.get("goal"), dict):
+        if not isinstance(snapshot, dict):
             raise ValueError("invalid execution strategy snapshot")
-        goal_data = dict(snapshot["goal"])
-        goal_data["required_postconditions"] = tuple(
-            goal_data.get("required_postconditions") or ()
-        )
-        goal = SemanticGoal(**goal_data)
+        mission_data = snapshot.get("mission")
+        if isinstance(mission_data, dict):
+            nodes = []
+            for raw_node in mission_data.get("action_nodes") or []:
+                if not isinstance(raw_node, dict):
+                    continue
+                node_data = dict(raw_node)
+                node_data["required_postconditions"] = tuple(
+                    node_data.get("required_postconditions") or ()
+                )
+                node_data["evidence_links"] = tuple(
+                    node_data.get("evidence_links") or ()
+                )
+                nodes.append(SemanticActionNode(**node_data))
+            if not nodes:
+                raise ValueError("invalid execution mission snapshot")
+            mission = SemanticMission(
+                objective=str(mission_data.get("objective") or ""),
+                action_nodes=tuple(nodes),
+                fingerprint=str(mission_data.get("fingerprint") or ""),
+                execution_required_override=bool(
+                    mission_data.get("execution_required_override")
+                ),
+            )
+        elif isinstance(snapshot.get("goal"), dict):
+            goal_data = dict(snapshot["goal"])
+            goal_data["required_postconditions"] = tuple(
+                goal_data.get("required_postconditions") or ()
+            )
+            goal_data["evidence_links"] = tuple(
+                goal_data.get("evidence_links") or ()
+            )
+            mission = SemanticGoal(**goal_data)
+        else:
+            raise ValueError("invalid execution strategy snapshot")
         mechanisms = []
         for raw in snapshot.get("mechanisms") or []:
             if not isinstance(raw, dict):
@@ -722,7 +1342,7 @@ class ExecutionStrategy:
             data = dict(raw)
             data["layer"] = StrategyLayer(int(data["layer"]))
             mechanisms.append(StrategyMechanism(**data))
-        strategy = cls(goal, mechanisms)
+        strategy = cls(mission, mechanisms)
         strategy.attempts = [
             StrategyAttempt(**dict(item))
             for item in snapshot.get("attempts") or []
@@ -750,6 +1370,8 @@ class ExecutionStrategy:
             for key, value in (snapshot.get("stale_mechanisms") or {}).items()
         }
         strategy._terminal_prompt_tokens = set(snapshot.get("terminal_prompt_tokens") or [])
+        strategy._frozen_node_id = str(snapshot.get("frozen_node_id") or "")
+        strategy.terminal_blocker = str(snapshot.get("terminal_blocker") or "")
         return strategy
 
     def model_instruction(self) -> str:
@@ -763,13 +1385,15 @@ class ExecutionStrategy:
             for item in self.remaining_mechanisms()
         ]
         payload = {
-            "semantic_goal": self.goal.public_dict(),
+            "semantic_mission": self.mission.public_dict(),
             "available_strategy_layers": available,
         }
         return (
-            "[Internal deterministic execution contract. Preserve target, required "
-            "application/surface/account, action, and observable postcondition across "
-            "fallbacks. Inspect capabilities first and use the earliest applicable "
+            "[Internal deterministic execution contract. Preserve every ordered "
+            "action node, its application/surface/account, requested content, and "
+            "observable postcondition across fallbacks. Never replay completed nodes "
+            "or merge unresolved work into another node. Inspect capabilities first "
+            "and use the earliest applicable "
             "layer in this order: 0 exact direct provider/API/MCP/OSIA capability; "
             "1 deep link or deterministic route; 2 DOM/Playwright; 3 native "
             "accessibility; 4 keyboard with observable focus; 5 local/zoomed vision; "
@@ -794,7 +1418,7 @@ class ExecutionStrategy:
         """Return one bounded correction for each unchanged strategy state."""
 
         with self._lock:
-            if not self.goal.requires_execution or self.succeeded or self.frozen_reason:
+            if not self.requires_execution or self.succeeded or self.frozen_reason:
                 return ""
             remaining = self.remaining_mechanisms()
             if not remaining:
@@ -920,41 +1544,49 @@ def build_execution_strategy(
     postcondition: str = "",
     postconditions: Iterable[str] = (),
 ) -> ExecutionStrategy:
-    goal = derive_semantic_goal(
+    mission = derive_semantic_mission(
         request, postcondition=postcondition, postconditions=postconditions,
     )
     tools = frozenset(str(item) for item in available_tools)
     mechanisms: list[StrategyMechanism] = []
-    deep_link = _recommended_deep_link(goal)
-    if deep_link is not None and "open_uri" in tools:
-        mechanisms.append(deep_link)
-    if "desktop_click" in tools:
-        common = {
-            "application": goal.required_application,
-            "surface": goal.required_surface,
-            "account": goal.required_account,
-            "covers_goal": False,
-            "mutation": True,
-        }
-        mechanisms.extend((
-            StrategyMechanism(
-                "native_accessibility", StrategyLayer.NATIVE_ACCESSIBILITY,
-                "fresh native accessibility target", **common,
-            ),
-            StrategyMechanism(
-                "keyboard_focus", StrategyLayer.KEYBOARD,
-                "observable focus after accessibility direct action stagnates", **common,
-            ),
-            StrategyMechanism(
-                "local_vision", StrategyLayer.LOCAL_VISION,
-                "zoomed local target after deterministic native paths stagnate", **common,
-            ),
-            StrategyMechanism(
-                "global_vision", StrategyLayer.GLOBAL_VISION,
-                "global coordinates only after every higher applicable layer", **common,
-            ),
-        ))
-    return ExecutionStrategy(goal, mechanisms)
+    for node in mission.action_nodes:
+        if not node.requires_execution:
+            continue
+        deep_link = _recommended_deep_link(node)
+        if deep_link is not None and "open_uri" in tools:
+            mechanisms.append(StrategyMechanism(
+                **{**asdict(deep_link), "node_id": node.node_id},
+            ))
+        if "desktop_click" in tools:
+            suffix = "" if len(mission.action_nodes) == 1 else ":" + node.node_id
+            common = {
+                "application": node.required_application,
+                "surface": node.required_surface,
+                "account": node.required_account,
+                "covers_goal": False,
+                "mutation": True,
+                "node_id": node.node_id,
+            }
+            mechanisms.extend((
+                StrategyMechanism(
+                    "native_accessibility" + suffix,
+                    StrategyLayer.NATIVE_ACCESSIBILITY,
+                    "fresh native accessibility target", **common,
+                ),
+                StrategyMechanism(
+                    "keyboard_focus" + suffix, StrategyLayer.KEYBOARD,
+                    "observable focus after accessibility direct action stagnates", **common,
+                ),
+                StrategyMechanism(
+                    "local_vision" + suffix, StrategyLayer.LOCAL_VISION,
+                    "zoomed local target after deterministic native paths stagnate", **common,
+                ),
+                StrategyMechanism(
+                    "global_vision" + suffix, StrategyLayer.GLOBAL_VISION,
+                    "global coordinates only after every higher applicable layer", **common,
+                ),
+            ))
+    return ExecutionStrategy(mission, mechanisms)
 
 
 def mechanism_for_tool(
@@ -962,7 +1594,9 @@ def mechanism_for_tool(
     tool_name: str,
     arguments: dict,
 ) -> StrategyMechanism | None:
-    goal = strategy.goal
+    matched_goal = strategy.match_action_node(tool_name, arguments)
+    goal = matched_goal or strategy.goal
+    node_id = goal.node_id
     if tool_name in _OBSERVATION_TOOLS:
         return None
     if tool_name == "open_application":
@@ -972,7 +1606,7 @@ def mechanism_for_tool(
             f"direct:open_application:{app}", StrategyLayer.DIRECT_CAPABILITY,
             "exact native application launch capability", application=app,
             surface="", account=goal.required_account, covers_goal=covers,
-            mutation=True,
+            mutation=True, node_id=node_id,
         )
     if tool_name == "open_uri":
         app, surface, account = _uri_identity(arguments.get("uri", ""))
@@ -985,7 +1619,7 @@ def mechanism_for_tool(
                 goal.requested_action in {"open", "navigate"}
                 or (goal.requested_action == "search" and "search" in _normalized(arguments.get("uri")))
             ),
-            mutation=True,
+            mutation=True, node_id=node_id,
         )
     if tool_name in _DOM_ACTION_TOOLS:
         url = arguments.get("url") or arguments.get("target_url") or ""
@@ -1007,7 +1641,7 @@ def mechanism_for_tool(
             f"dom:{app or 'web'}:{surface or 'current'}",
             StrategyLayer.DOM, "structured DOM/Playwright action",
             application=app, surface=surface, account=account,
-            covers_goal=True, mutation=True,
+            covers_goal=True, mutation=True, node_id=node_id,
         )
     if tool_name == "desktop_click":
         # The composite owns DOM/UIA/keyboard/local/global selection internally.
@@ -1018,17 +1652,40 @@ def mechanism_for_tool(
             "keyboard action requiring observable focus",
             application=goal.required_application, surface=goal.required_surface,
             account=goal.required_account, covers_goal=False, mutation=True,
+            node_id=node_id,
+        )
+    if tool_name == "run_command":
+        application = strategy._tool_application(tool_name, arguments)
+        action = strategy._tool_action(tool_name, arguments)
+        return StrategyMechanism(
+            "direct:run_command", StrategyLayer.DIRECT_CAPABILITY,
+            "exact local command capability",
+            application=application,
+            surface=goal.required_surface,
+            account=goal.required_account,
+            covers_goal=bool(
+                matched_goal is not None
+                and (not action or action == goal.requested_action)
+            ),
+            mutation=True,
+            node_id=node_id,
         )
     return StrategyMechanism(
         f"direct:{_bounded(tool_name, 80)}", StrategyLayer.DIRECT_CAPABILITY,
         "provider/API/MCP/OSIA structured direct capability",
         application=goal.required_application, surface=goal.required_surface,
         account=goal.required_account, covers_goal=True, mutation=True,
+        node_id=node_id,
     )
 
 
-def tool_preflight(tool_name: str, arguments: dict) -> StrategyDecision | None:
-    strategy = current_execution_strategy()
+def tool_preflight(
+    tool_name: str,
+    arguments: dict,
+    *,
+    strategy: ExecutionStrategy | None = None,
+) -> StrategyDecision | None:
+    strategy = strategy or current_execution_strategy()
     if strategy is None:
         return None
     if tool_name == "desktop_click":
@@ -1041,6 +1698,7 @@ def tool_preflight(tool_name: str, arguments: dict) -> StrategyDecision | None:
             account=strategy.goal.required_account,
             covers_goal=False,
             mutation=True,
+            node_id=strategy.goal.node_id,
         ))
         return preview
     mechanism = mechanism_for_tool(strategy, tool_name, arguments)
@@ -1066,13 +1724,24 @@ def record_tool_observation(
         r"\b(no|false|unknown|unavailable|not found|not installed|cannot verify)\b",
         text,
     )
+    candidate_nodes = strategy.pending_nodes()
+    goal = strategy.node_by_id(strategy._frozen_node_id) if strategy.frozen_reason else None
+    if goal is None:
+        ranked = []
+        for candidate in candidate_nodes:
+            tokens = [
+                token for token in _normalized(candidate.target_object).split()
+                if len(token) >= 3
+            ]
+            ranked.append((sum(1 for token in tokens[:6] if token in text), -candidate.order, candidate))
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        goal = ranked[0][2] if ranked else strategy.goal
     target_tokens = [
-        token for token in _normalized(strategy.goal.target_object).split()
+        token for token in _normalized(goal.target_object).split()
         if len(token) >= 3
     ]
     target_visible = bool(target_tokens) and all(token in text for token in target_tokens[:6])
     affirmative = bool(re.search(r"\b(yes|true|verified|visible|running)\b", text))
-    goal = strategy.goal
     page_proves_goal = (
         tool_name in {"read_page", "get_page_text", "inspect_browser_page"}
         and target_visible
@@ -1120,7 +1789,10 @@ def record_tool_observation(
             strategy.reconcile(succeeded=False, evidence=f"{tool_name}:{digest}")
         return False
     if proves_goal:
-        return strategy.verify_postcondition(f"{tool_name}:{digest}")
+        return strategy.verify_postcondition(
+            f"{tool_name}:{digest}",
+            postcondition=goal.observable_success_postcondition,
+        )
     return False
 
 
@@ -1183,11 +1855,14 @@ def record_tool_outcome(
     is_error: bool,
     reason_code: str,
     result: object,
+    strategy: ExecutionStrategy | None = None,
 ) -> None:
-    strategy = current_execution_strategy()
+    strategy = strategy or current_execution_strategy()
     if strategy is None:
         return
-    record_tool_observation(tool_name, result, is_error=is_error)
+    record_tool_observation(
+        tool_name, result, is_error=is_error, strategy=strategy,
+    )
     if decision is None or not decision.allowed or not decision.attempt_id:
         if _normalized(outcome) in {"pending", "outcome_unknown", "unknown_after_start"}:
             synthetic = StrategyMechanism(
@@ -1209,6 +1884,11 @@ def record_tool_outcome(
         return
     if is_error:
         strategy.record(decision, "failed", failure_reason=reason_code or "tool_failed")
+        if reason_code == "permission_user_denied":
+            node = strategy.node_by_id(decision.node_id)
+            if node is not None:
+                node.status = "blocked"
+            strategy.terminal_blocker = "permission_user_denied"
         return
     evidence = hashlib.sha256(
         _bounded(result, 4000).encode("utf-8", errors="replace")
