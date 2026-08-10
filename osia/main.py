@@ -1537,6 +1537,7 @@ def wake_mode():
         tts_session_id: int | None = None,
         voice_cancelled=None,
         emit_voice_state=None,
+        turn_directives=None,
     ) -> None:
         """Run the agent in the current thread, persist + mirror the result.
 
@@ -1555,11 +1556,18 @@ def wake_mode():
         settings = load_settings()
         selected_model = settings.get("selected_model")
         selected_provider = settings.get("selected_model_provider") or None
-        if selected_model:
+        if selected_model and not (
+            turn_directives is not None
+            and turn_directives.model_override is not None
+        ):
             try:
                 turn_agent.set_model(selected_model, provider=selected_provider)
             except Exception as e:
                 print(f"[DEBUG] set_model({selected_model!r}) failed: {e}")
+        if turn_directives is not None:
+            from osia.slash_commands import apply_to_agent
+
+            apply_to_agent(turn_agent, turn_directives)
 
         authoritative_text = (
             language_text
@@ -1983,7 +1991,10 @@ def wake_mode():
         *,
         attachment_turn: bool = False,
         language_text: str | None = None,
+        turn_directives=None,
     ) -> bool:
+        from osia.slash_commands import SlashDirectiveError
+
         conv = _ensure_active_conversation(display_text)
         conv_id = conv["id"]
         if attachment_turn:
@@ -1996,11 +2007,30 @@ def wake_mode():
         tts_stop()
         history = _history_for_conversation(conv_id)
         try:
+            persistence_metadata = None
+            if turn_directives is not None:
+                from osia.slash_commands import validate_live
+
+                turn_directives.require_sendable(
+                    body=display_text,
+                    has_attachment=attachment_turn,
+                )
+                validate_live(
+                    turn_directives,
+                    current_conversation_id=conv_id,
+                    has_attachment=attachment_turn,
+                )
+                persistence_metadata = {
+                    "_turn_directives_v1": turn_directives.to_wire(),
+                }
             turn_meta = _persist_desktop_user_turn(
                 conv_id,
                 display_text,
+                metadata=persistence_metadata,
             )
         except Exception as exc:
+            if isinstance(exc, SlashDirectiveError):
+                popup._chat.show_notice(exc.message(i18n.get_language()))
             print(
                 "[OSIA] desktop text turn rejected before dispatch: "
                 f"{type(exc).__name__}"
@@ -2019,6 +2049,7 @@ def wake_mode():
                 user_display_text=display_text,
                 language_text=language_text,
                 lock_provider=attachment_turn,
+                turn_directives=turn_directives,
             )
 
         threading.Thread(target=process, daemon=True).start()
@@ -2331,6 +2362,138 @@ def wake_mode():
         ):
             popup.accept_draft_submission(prepared.attachment_ids)
 
+    def handle_submit_directive_draft(
+        prompt: str, attachments, raw_directives,
+    ) -> None:
+        from osia.action_policy import get_default_permission_policy
+        from osia.desktop_attachments import (
+            DesktopAttachmentError,
+            prepare_desktop_turn,
+        )
+        from osia.slash_commands import (
+            SlashDirectiveError,
+            SlashTurnDirectivesV1,
+            validate_live,
+        )
+
+        try:
+            directives = SlashTurnDirectivesV1.from_wire(raw_directives)
+            directives.require_sendable(
+                body=prompt,
+                has_attachment=bool(attachments),
+            )
+            conv = _ensure_active_conversation(prompt)
+            validate_live(
+                directives,
+                current_conversation_id=conv["id"],
+                has_attachment=bool(attachments),
+            )
+        except SlashDirectiveError as error:
+            popup._chat.show_notice(error.message(i18n.get_language()))
+            return
+
+        if attachments:
+            provider = (
+                directives.model_override.provider_id
+                if directives.model_override is not None else agent.provider
+            )
+            model = (
+                directives.model_override.model_id
+                if directives.model_override is not None else agent.model
+            )
+            try:
+                prepared = prepare_desktop_turn(
+                    prompt,
+                    list(attachments or ()),
+                    provider=provider,
+                    model=model,
+                    owner_id=conv["id"],
+                    permission_epoch=int(
+                        get_default_permission_policy().store.load_state().policy_epoch
+                    ),
+                )
+            except DesktopAttachmentError as error:
+                popup.show_attachment_error(error)
+                return
+            if _send_user_input(
+                prepared.provider_content,
+                prepared.display_text,
+                attachment_turn=True,
+                language_text=prompt,
+                turn_directives=directives,
+            ):
+                popup.accept_directive_submission(prepared.attachment_ids)
+            return
+
+        if _send_user_input(
+            prompt,
+            prompt,
+            language_text=prompt,
+            turn_directives=directives,
+        ):
+            popup.accept_directive_submission()
+
+    def handle_slash_information(command_id: str) -> None:
+        from osia.reasoning import resolve_reasoning_option_id
+        from osia.slash_commands import informational_payload, model_availability
+
+        try:
+            from osia.action_policy import (
+                PermissionMode,
+                get_default_permission_policy,
+            )
+
+            permission_mode = (
+                "Full"
+                if get_default_permission_policy().store.load_state().permission_mode
+                == PermissionMode.FULL_ACCESS
+                else "Standard"
+            )
+        except Exception:
+            permission_mode = "Unavailable"
+        settings = load_settings() or {}
+        provider_id = str(
+            settings.get("selected_model_provider") or agent.provider or ""
+        )
+        model_id = str(settings.get("selected_model") or agent.model or "")
+        selected = next(
+            (
+                item for item in model_availability(refresh=False)
+                if str(item.get("providerId") or "") == provider_id
+                and str(item.get("id") or "") == model_id
+            ),
+            {},
+        )
+        provider_label = str(
+            selected.get("providerDisplayName")
+            or selected.get("providerLabel")
+            or ("Indisponible" if i18n.get_language() == "fr" else "Unavailable")
+        )
+        model_label = str(
+            selected.get("label")
+            or selected.get("displayName")
+            or (
+                "Sélection indisponible"
+                if i18n.get_language() == "fr" else "Unavailable selection"
+            )
+        )
+        payload = informational_payload(
+            command_id,
+            locale=i18n.get_language(),
+            surface="PC",
+            provider_id=provider_id,
+            model_id=model_id,
+            provider_label=provider_label,
+            model_label=model_label,
+            reasoning=resolve_reasoning_option_id(provider_id, model_id),
+            permission_mode=permission_mode,
+            provider_ready=bool(selected),
+            routing_mode=(
+                "automatic" if settings.get("ai_hierarchy_enabled") else "exact"
+            ),
+        )
+        popup.show_slash_information(payload)
+
     # ── Signal wiring ───────────────────────────────────────────────────
 
     bridge.wake_detected.connect(handle_wake)
@@ -2354,6 +2517,8 @@ def wake_mode():
 
     popup.send_text.connect(handle_send_text)
     popup.submit_draft.connect(handle_submit_draft)
+    popup.submit_directive_draft.connect(handle_submit_directive_draft)
+    popup.informational_requested.connect(handle_slash_information)
     popup.new_conversation.connect(handle_new_conversation)
     popup.open_conversation.connect(handle_open_conversation)
     popup.rename_conversation.connect(handle_rename_conversation)

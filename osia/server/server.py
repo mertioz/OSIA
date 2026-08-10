@@ -1918,12 +1918,22 @@ async def _send_existing_turn_status(
     channel: "_OutboundChannel",
     conv_id: str,
     client_request_id: str | None,
+    *,
+    expected_user_content=None,
 ) -> bool:
     if not client_request_id or not _is_conversation_busy(conv_id):
         return False
     meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
     if not meta or meta.get("client_request_id") != client_request_id:
         return False
+    if (
+        expected_user_content is not None
+        and str(meta.get("client_content_hash") or "")
+        != hashlib.sha256(
+            str(expected_user_content).encode("utf-8")
+        ).hexdigest()
+    ):
+        raise ValueError("request id was already used with different content")
     await channel.send_json(_turn_accepted_frame(meta))
     await channel.send_json(
         _turn_status_frame(meta, _active_turn_working_status(conv_id))
@@ -1934,13 +1944,20 @@ async def _send_existing_turn_status(
 async def _send_existing_turn_status_for_request(
     channel: "_OutboundChannel",
     client_request_id: str | None,
+    *,
+    expected_user_content=None,
 ) -> bool:
     if not client_request_id:
         return False
     conv_id = _ACTIVE_CONV_BY_REQUEST.get(client_request_id)
     if not conv_id:
         return False
-    return await _send_existing_turn_status(channel, conv_id, client_request_id)
+    return await _send_existing_turn_status(
+        channel,
+        conv_id,
+        client_request_id,
+        expected_user_content=expected_user_content,
+    )
 
 
 _RESUME_VERIFICATION_SUFFIXES = frozenset({
@@ -2422,6 +2439,9 @@ def _persist_accepted_user_message(
         attachment_metadata = turn_meta.get("attachment_metadata")
         if isinstance(attachment_metadata, list) and attachment_metadata:
             metadata["_attachments"] = attachment_metadata
+        turn_directives = turn_meta.get("_turn_directives_v1")
+        if isinstance(turn_directives, dict):
+            metadata["_turn_directives_v1"] = turn_directives
         receipt = conversations.commit_message(
             conv_id,
             "user",
@@ -3137,6 +3157,18 @@ def _build_config_snapshot() -> dict:
     cfg["reasoning"] = _normalize_mobile_reasoning_setting(cfg.get("reasoning"))
     cfg["mcp_servers"] = _sanitize_mobile_mcp_servers(cfg.get("mcp_servers"))
     cfg["gmail_rest"] = _gmail_rest_config_snapshot()
+    try:
+        from osia.slash_commands import safe_availability_overlay
+
+        cfg["slash_commands"] = safe_availability_overlay(
+            str(cfg.get("selected_model_provider") or "")
+        )
+    except Exception:
+        cfg["slash_commands"] = {
+            "schema_version": 1,
+            "current_web_available": False,
+            "connectors": [],
+        }
     # api_key_fallbacks holds the raw ordered fallback keys per provider (WOR-29).
     # The mobile fallback-keys editor needs the actual keys, so ship them as-is —
     # the connection is already authenticated + TLS, identical to get_api_keys.
@@ -10615,6 +10647,25 @@ async def websocket_endpoint(ws: WebSocket):
                 user_text = msg.get("content", "").strip()
                 if not user_text:
                     continue
+                raw_turn_directives = msg.get("turn_directives")
+                turn_directives = None
+                canonical_turn_directives = ""
+                if raw_turn_directives is not None:
+                    try:
+                        from osia.slash_commands import SlashTurnDirectivesV1
+
+                        turn_directives = SlashTurnDirectivesV1.from_wire(
+                            raw_turn_directives
+                        )
+                        canonical_turn_directives = turn_directives.canonical_json()
+                    except Exception as exc:
+                        error_code = getattr(exc, "code", "invalid_directives")
+                        await out.send_json({
+                            "type": "status",
+                            "content": "error",
+                            "error": error_code,
+                        })
+                        continue
                 client_request_id = _clean_client_request_id(
                     msg.get("request_id") or msg.get("client_request_id"),
                 )
@@ -10628,6 +10679,7 @@ async def websocket_endpoint(ws: WebSocket):
                         continue
                     client_request_id = _legacy_request_id()
                 attachment_batch_id = str(msg.get("attachment_batch_id") or "")
+                validated_attachment_batch = None
                 requested_conversation_id = str(
                     msg.get("conversation_id") or ""
                 ).strip()
@@ -10636,10 +10688,21 @@ async def websocket_endpoint(ws: WebSocket):
                     f"{user_text}\0{attachment_batch_id}"
                     if attachment_batch_id else user_text
                 )
-                if await _send_existing_turn_status_for_request(
-                    out,
-                    client_request_id,
-                ):
+                if raw_turn_directives is not None:
+                    content_identity += "\0" + canonical_turn_directives
+                try:
+                    if await _send_existing_turn_status_for_request(
+                        out,
+                        client_request_id,
+                        expected_user_content=content_identity,
+                    ):
+                        continue
+                except ValueError:
+                    await out.send_json({
+                        "type": "status",
+                        "content": "error",
+                        "error": "request_id_conflict",
+                    })
                     continue
                 # A completed attachment turn has already released its
                 # temporary batch.  Replay it from canonical persistence before
@@ -10664,7 +10727,7 @@ async def websocket_endpoint(ws: WebSocket):
                         continue
                 if attachment_batch_id:
                     try:
-                        attachment_batches.validate_turn_reference(
+                        validated_attachment_batch = attachment_batches.validate_turn_reference(
                             attachment_batch_id,
                             requested_conversation_id,
                             client_request_id,
@@ -10705,6 +10768,45 @@ async def websocket_endpoint(ws: WebSocket):
                             "conversation_id": _conv,
                         })
                         continue
+                    if turn_directives is not None:
+                        try:
+                            from osia.slash_commands import validate_live
+
+                            turn_directives.require_sendable(
+                                body=user_text,
+                                has_attachment=bool(attachment_batch_id),
+                            )
+                            validate_live(
+                                turn_directives,
+                                current_conversation_id=_conv,
+                                has_attachment=bool(attachment_batch_id),
+                                requires_image_attachment=bool(
+                                    validated_attachment_batch is not None
+                                    and any(
+                                        item.detected_category == "image"
+                                        for item in validated_attachment_batch.files.values()
+                                    )
+                                ),
+                            )
+                        except Exception as exc:
+                            error_code = getattr(
+                                exc, "code", "invalid_directives"
+                            )
+                            locale = normalize_locale(msg.get("locale")) or "en"
+                            message_fn = getattr(exc, "message", None)
+                            safe_message = (
+                                message_fn(locale)
+                                if callable(message_fn) else
+                                "Invalid slash directives."
+                            )
+                            await out.send_json({
+                                "type": "status",
+                                "content": "error",
+                                "error": error_code,
+                                "message": safe_message,
+                                "conversation_id": _conv,
+                            })
+                            continue
                     if _is_conversation_busy(_conv):
                         if await _handle_waiting_tool_command(
                             out, _conv, user_text,
@@ -10793,6 +10895,11 @@ async def websocket_endpoint(ws: WebSocket):
                     turn_meta["client_content_hash"] = hashlib.sha256(
                         content_identity.encode("utf-8")
                     ).hexdigest()
+                    if turn_directives is not None:
+                        turn_meta["turn_directives"] = turn_directives
+                        turn_meta["_turn_directives_v1"] = (
+                            turn_directives.to_wire()
+                        )
                     if committed_attachments:
                         turn_meta["persisted_user_content"] = persisted_user_content
                         turn_meta["attachment_metadata"] = [
@@ -11877,7 +11984,17 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         # message. Fall back to a throwaway agent only when no accessor was
         # supplied (a direct/legacy call); the live text/audio/vision paths
         # always pass get_agent, keyed by this turn's conversation.
-        agent = get_agent(active_conv_id) if get_agent is not None else OSIAAgent()
+        turn_directives = (
+            turn_meta.get("turn_directives")
+            if isinstance(turn_meta, dict) else None
+        )
+        # Directive-bearing turns use a throwaway agent so exact model and
+        # reasoning choices can never leak into the next ordinary turn.
+        agent = (
+            OSIAAgent()
+            if turn_directives is not None
+            else (get_agent(active_conv_id) if get_agent is not None else OSIAAgent())
+        )
         if isinstance(turn_meta, dict):
             cancel_turn = getattr(agent, "request_turn_cancellation", None)
             if callable(cancel_turn):
@@ -11892,7 +12009,19 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         # primary client for this model — the user switched models, a prior
         # turn's router/key/endpoint fallback drifted it, or it's this agent's
         # first turn. Otherwise skip the costly rebuild and reuse the client.
-        if selected_model and _agent_needs_model_apply(agent, selected_model):
+        if turn_directives is not None:
+            from osia.slash_commands import apply_to_agent
+
+            apply_to_agent(agent, turn_directives)
+            if turn_directives.model_override is not None:
+                agent._applied_selected_model = (
+                    turn_directives.model_override.model_id
+                )
+        if (
+            turn_directives is None
+            and selected_model
+            and _agent_needs_model_apply(agent, selected_model)
+        ):
             try:
                 agent.set_model(selected_model)
                 agent._applied_selected_model = selected_model

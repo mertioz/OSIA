@@ -707,7 +707,9 @@ def _usage_from_schema(full: str, schema) -> str:
     return usage
 
 
-def mcp_tool_prompt_block(lang: str = "en") -> str:
+def mcp_tool_prompt_block(
+    lang: str = "en", *, server_id: str | None = None,
+) -> str:
     """Render the ``## Connected MCP tools`` system-prompt section from the
     currently-registered MCP tools, or ``""`` when none are connected (so no
     empty section is ever emitted).
@@ -723,9 +725,16 @@ def mcp_tool_prompt_block(lang: str = "en") -> str:
     At most ``_MAX_PROMPT_TOOLS`` tools are listed (with a "(+N more)" note);
     the agent maps stay COMPLETE, so every connected tool remains callable even
     when the listing is trimmed (SEC-02).
+
+    ``server_id`` narrows only the rendered per-turn inventory. It never
+    mutates registration, connection state, permissions, or dispatch maps.
     """
     with _lock:
-        items = sorted(_tool_meta.items())
+        items = sorted(
+            (full, meta)
+            for full, meta in _tool_meta.items()
+            if server_id is None or str(meta.get("server") or "") == server_id
+        )
     if not items:
         return ""
     del lang

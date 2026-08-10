@@ -25,7 +25,7 @@ import shlex
 import sys
 import threading
 import webbrowser
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -91,6 +91,18 @@ from osia.desktop_attachments import (
     DraftAttachment,
     readable_file_size,
     stage_attachment,
+)
+from osia.gui.slash_palette import SlashCommandPalette
+from osia.slash_commands import (
+    CapabilityRequirements,
+    ConnectorHint,
+    ConversationRef,
+    EMPTY_DIRECTIVES,
+    ModelOverride,
+    SlashDirectiveError,
+    SlashTurnDirectivesV1,
+    consume_palette_prefix,
+    escaped_literal_text,
 )
 
 # sip lets us detect widgets whose C++ side has already been destroyed
@@ -521,6 +533,8 @@ class _ComposerInput(QTextEdit):
         self.setFixedHeight(42)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setTabChangesFocus(True)
+        self.palette_key_handler = None
 
     def text(self) -> str:
         """Compatibility accessor for the former QLineEdit composer."""
@@ -528,6 +542,9 @@ class _ComposerInput(QTextEdit):
         return self.toPlainText()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt method name)
+        if callable(self.palette_key_handler) and self.palette_key_handler(event):
+            event.accept()
+            return
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
                 self.send_requested.emit()
@@ -610,10 +627,37 @@ class _AttachmentChip(QFrame):
         self._refresh_elision()
 
 
+class _DirectiveChip(QFrame):
+    """Removable display-only chip for one structured turn modifier."""
+
+    remove_requested = pyqtSignal(str)
+
+    def __init__(self, identity: str, label: str) -> None:
+        super().__init__()
+        self.setObjectName("directiveChip")
+        self.setAccessibleName(label)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(8, 3, 4, 3)
+        row.setSpacing(5)
+        text = QLabel(label)
+        text.setObjectName("directiveChipLabel")
+        remove = QPushButton("×")
+        remove.setObjectName("directiveChipRemove")
+        remove.setFixedSize(22, 22)
+        remove.setAccessibleName(
+            ("Retirer " if i18n.get_language() == "fr" else "Remove ") + label
+        )
+        remove.clicked.connect(
+            lambda _checked=False: self.remove_requested.emit(identity)
+        )
+        row.addWidget(text)
+        row.addWidget(remove)
+
 @dataclass
 class _ComposerDraft:
     text: str = ""
     attachments: list[DraftAttachment] = field(default_factory=list)
+    directives: SlashTurnDirectivesV1 = EMPTY_DIRECTIVES
 
 
 class _ChatPage(QWidget):
@@ -621,6 +665,8 @@ class _ChatPage(QWidget):
 
     send_text = pyqtSignal(str)
     submit_draft = pyqtSignal(str, object)
+    submit_directive_draft = pyqtSignal(str, object, object)
+    informational_requested = pyqtSignal(str)
     # Kept as a compatibility signal. Selecting a file no longer emits it.
     pick_file = pyqtSignal(str, str)
     _BUSY_TEXT = "OSIA is still working in this conversation."
@@ -637,6 +683,7 @@ class _ChatPage(QWidget):
         self._draft_context: str | None = None
         self._drafts: dict[str | None, _ComposerDraft] = {}
         self._pending_attachments: list[DraftAttachment] = []
+        self._directives = EMPTY_DIRECTIVES
         self._motion = MotionController(
             self,
             reduced_motion=lambda: (
@@ -698,12 +745,31 @@ class _ChatPage(QWidget):
         input_layout.setContentsMargins(10, 8, 10, 10)
         input_layout.setSpacing(4)
 
+        self._slash_palette = SlashCommandPalette()
+        settings = load_settings() or {}
+        self._slash_palette.set_context(
+            locale=i18n.get_language(),
+            provider_id=str(settings.get("selected_model_provider") or ""),
+            model_id=str(settings.get("selected_model") or ""),
+        )
+        self._slash_palette.item_selected.connect(self._on_slash_selection)
+        input_layout.addWidget(self._slash_palette)
+
         self._notice = QLabel("")
         self._notice.setObjectName("chatNotice")
         self._notice.setWordWrap(True)
         self._notice.hide()
         self._notice_timer.timeout.connect(self._notice.hide)
         input_layout.addWidget(self._notice)
+
+        self._directive_host = QFrame()
+        self._directive_host.setObjectName("directiveHost")
+        self._directive_layout = QGridLayout(self._directive_host)
+        self._directive_layout.setContentsMargins(0, 0, 0, 0)
+        self._directive_layout.setHorizontalSpacing(4)
+        self._directive_layout.setVerticalSpacing(4)
+        self._directive_host.hide()
+        input_layout.addWidget(self._directive_host)
 
         self._attachment_scroll = QScrollArea()
         self._attachment_scroll.setObjectName("attachmentScroll")
@@ -741,6 +807,7 @@ class _ChatPage(QWidget):
         self._input.setPlaceholderText(i18n.t("chat.input_placeholder"))
         self._input.setAccessibleName(i18n.t("chat.input_placeholder"))
         self._input.send_requested.connect(self._on_send)
+        self._input.palette_key_handler = self._slash_palette.handle_key
 
         self._send_btn = _ComposerButton("send")
         self._send_btn.setObjectName("sendBtn")
@@ -748,7 +815,7 @@ class _ChatPage(QWidget):
         self._send_btn.setToolTip(i18n.t("chat.send"))
         self._send_btn.setAccessibleName(i18n.t("chat.send"))
         self._send_btn.clicked.connect(self._on_send)
-        self._input.textChanged.connect(self._sync_send_state)
+        self._input.textChanged.connect(self._on_input_changed)
         self._sync_send_state()
 
         row.addWidget(self._file_btn)
@@ -769,6 +836,7 @@ class _ChatPage(QWidget):
         self._send_btn.setToolTip(i18n.t("chat.send"))
         self._send_btn.setAccessibleName(i18n.t("chat.send"))
         self._rebuild_attachment_chips()
+        self._rebuild_directive_chips()
         if not _is_deleted(self._empty):
             self._empty.setText(i18n.t("chat.empty"))
 
@@ -784,6 +852,13 @@ class _ChatPage(QWidget):
             return
         self._save_current_draft()
         self._draft_context = conversation_id
+        settings = load_settings() or {}
+        self._slash_palette.set_context(
+            locale=i18n.get_language(),
+            provider_id=str(settings.get("selected_model_provider") or ""),
+            model_id=str(settings.get("selected_model") or ""),
+            conversation_id=str(conversation_id or ""),
+        )
         self._load_current_draft()
 
     def bind_unbound_draft(self, conversation_id: str) -> None:
@@ -802,7 +877,9 @@ class _ChatPage(QWidget):
         if self._draft_context == conversation_id:
             self._input.clear()
             self._pending_attachments = []
+            self._directives = EMPTY_DIRECTIVES
             self._rebuild_attachment_chips()
+            self._rebuild_directive_chips()
             self._sync_send_state()
 
     def accept_draft_submission(self, attachment_ids) -> bool:
@@ -811,8 +888,10 @@ class _ChatPage(QWidget):
             return False
         self._input.clear()
         self._pending_attachments = []
+        self._directives = EMPTY_DIRECTIVES
         self._drafts.pop(self._draft_context, None)
         self._rebuild_attachment_chips()
+        self._rebuild_directive_chips()
         self._sync_send_state()
         self._input.setFocus()
         return True
@@ -831,10 +910,11 @@ class _ChatPage(QWidget):
 
     def _save_current_draft(self) -> None:
         text = self._input.toPlainText()
-        if text or self._pending_attachments:
+        if text or self._pending_attachments or not self._directives.is_empty:
             self._drafts[self._draft_context] = _ComposerDraft(
                 text=text,
                 attachments=list(self._pending_attachments),
+                directives=self._directives,
             )
         else:
             self._drafts.pop(self._draft_context, None)
@@ -845,7 +925,172 @@ class _ChatPage(QWidget):
         self._input.setPlainText(draft.text)
         self._input.blockSignals(False)
         self._pending_attachments = list(draft.attachments)
+        self._directives = draft.directives
+        if self._directives.model_override is not None:
+            self._slash_palette.set_context(
+                locale=i18n.get_language(),
+                provider_id=self._directives.model_override.provider_id,
+                model_id=self._directives.model_override.model_id,
+                conversation_id=str(self._draft_context or ""),
+            )
         self._rebuild_attachment_chips()
+        self._rebuild_directive_chips()
+        self._sync_send_state()
+
+    def accept_directive_submission(self, attachment_ids=()) -> bool:
+        expected = tuple(item.draft_id for item in self._pending_attachments)
+        if expected != tuple(attachment_ids or ()):
+            return False
+        self._input.clear()
+        self._pending_attachments = []
+        self._directives = EMPTY_DIRECTIVES
+        self._drafts.pop(self._draft_context, None)
+        self._rebuild_attachment_chips()
+        self._rebuild_directive_chips()
+        self._sync_send_state()
+        self._input.setFocus()
+        return True
+
+    def _on_input_changed(self) -> None:
+        self._slash_palette.update_from_text(
+            self._input.toPlainText(), enabled=not self._busy,
+        )
+        self._sync_send_state()
+
+    def _on_slash_selection(self, row: dict) -> None:
+        handler = str(row.get("handler_contract") or "")
+        selection_type = str(row.get("selection_type") or "")
+        alias = str(row.get("canonical_alias") or "")
+        next_directives = self._directives
+        if handler in {
+            "show_safe_tools_v1",
+            "show_safe_status_v1",
+            "show_available_help_v1",
+        }:
+            command_id = str(row.get("id") or "")
+            remaining = consume_palette_prefix(self._input.text())
+            if not self._directives.is_empty or remaining.strip():
+                self.show_notice(
+                    "Les commandes d’information doivent être utilisées seules."
+                    if i18n.get_language() == "fr" else
+                    "Informational commands must be used alone."
+                )
+                self._slash_palette.close_palette()
+                return
+            self._input.setPlainText(remaining)
+            self.informational_requested.emit(command_id)
+            return
+        if handler == "set_current_web_requirement_v1":
+            next_directives = replace(
+                next_directives,
+                capability_requirements=CapabilityRequirements(current_web=True),
+            )
+        elif handler == "select_connector_hint_v1":
+            next_directives = replace(
+                next_directives,
+                connector_hints=(ConnectorHint(str(row["connector_id"])),),
+            )
+        elif selection_type == "model":
+            alias = "model"
+            if row.get("remove_override") is True:
+                next_directives = replace(next_directives, model_override=None)
+                settings = load_settings() or {}
+                self._slash_palette.set_context(
+                    locale=i18n.get_language(),
+                    provider_id=str(settings.get("selected_model_provider") or ""),
+                    model_id=str(settings.get("selected_model") or ""),
+                    conversation_id=str(self._draft_context or ""),
+                )
+            else:
+                next_directives = replace(
+                    next_directives,
+                    model_override=ModelOverride(
+                        str(row["provider_id"]), str(row["model_id"]),
+                    ),
+                )
+                self._slash_palette.set_context(
+                    locale=i18n.get_language(),
+                    provider_id=str(row["provider_id"]),
+                    model_id=str(row["model_id"]),
+                    conversation_id=str(self._draft_context or ""),
+                )
+        elif selection_type == "conversation":
+            alias = "conversation"
+            next_directives = replace(
+                next_directives,
+                conversation_refs=(ConversationRef(
+                    str(row["conversation_id"]),
+                    str(row.get("display_title") or "")[:120],
+                    str(row.get("display_project") or "")[:80],
+                ),),
+            )
+        elif selection_type == "reasoning":
+            alias = "reasoning"
+            next_directives = replace(
+                next_directives,
+                reasoning_override=str(row["reasoning_level"]),
+            )
+        else:
+            return
+        try:
+            next_directives._validate_bounds()
+        except SlashDirectiveError as error:
+            self.show_notice(error.message(i18n.get_language()))
+            return
+        self._directives = next_directives
+        self._input.setPlainText(consume_palette_prefix(self._input.text()))
+        self._rebuild_directive_chips()
+        self._sync_send_state()
+        self._input.setFocus()
+
+    def _directive_rows(self) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        if self._directives.connector_hints:
+            value = self._directives.connector_hints[0].connector_id
+            rows.append(("connector", "/gmail" if value == "gmail-rest" else f"/{value}"))
+        if self._directives.capability_requirements.current_web:
+            rows.append(("web", "/web"))
+        if self._directives.conversation_refs:
+            ref = self._directives.conversation_refs[0]
+            rows.append(("conversation", ref.display_title or "/conversation"))
+        if self._directives.model_override is not None:
+            rows.append(("model", self._directives.model_override.model_id))
+        if self._directives.reasoning_override is not None:
+            rows.append(("reasoning", self._directives.reasoning_override))
+        return rows
+
+    def _rebuild_directive_chips(self) -> None:
+        while self._directive_layout.count():
+            item = self._directive_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for index, (identity, label) in enumerate(self._directive_rows()):
+            chip = _DirectiveChip(identity, label)
+            chip.remove_requested.connect(self._remove_directive)
+            self._directive_layout.addWidget(chip, index // 2, index % 2)
+        self._directive_host.setVisible(not self._directives.is_empty)
+
+    def _remove_directive(self, identity: str) -> None:
+        changes = {
+            "connector": {"connector_hints": ()},
+            "web": {"capability_requirements": CapabilityRequirements()},
+            "conversation": {"conversation_refs": ()},
+            "model": {"model_override": None},
+            "reasoning": {"reasoning_override": None},
+        }.get(identity)
+        if changes is None:
+            return
+        self._directives = replace(self._directives, **changes)
+        if identity == "model":
+            settings = load_settings() or {}
+            self._slash_palette.set_context(
+                locale=i18n.get_language(),
+                provider_id=str(settings.get("selected_model_provider") or ""),
+                model_id=str(settings.get("selected_model") or ""),
+                conversation_id=str(self._draft_context or ""),
+            )
+        self._rebuild_directive_chips()
         self._sync_send_state()
 
     def _rebuild_attachment_chips(self) -> None:
@@ -1011,6 +1256,8 @@ class _ChatPage(QWidget):
         )
         self._input.setEnabled(not self._busy or waiting)
         self._file_btn.setEnabled(not self._busy)
+        if self._busy:
+            self._slash_palette.close_palette()
         key = {
             "action_starting": "chat.tool_action_starting",
             "action_in_progress": "chat.tool_action_in_progress",
@@ -1182,7 +1429,7 @@ class _ChatPage(QWidget):
         if self._busy and not waiting:
             self.show_notice(self._BUSY_TEXT)
             return
-        text = self._input.toPlainText().strip()
+        text = escaped_literal_text(self._input.toPlainText()).strip()
         if waiting and (not text or len(text) > 160):
             self.show_notice(i18n.t("chat.tool_command_limit"))
             self._sync_send_state()
@@ -1196,6 +1443,27 @@ class _ChatPage(QWidget):
             # controls such as status/resume/cancel.
             self._input.clear()
             self.send_text.emit(text)
+            return
+        if not self._directives.is_empty:
+            try:
+                self._directives.require_sendable(
+                    body=text,
+                    has_attachment=bool(self._pending_attachments),
+                )
+                self._directives._validate_bounds()
+            except SlashDirectiveError as error:
+                self.show_notice(error.message(i18n.get_language()))
+                return
+            for item in self._pending_attachments:
+                item.validation_state = "pending"
+                item.error_code = None
+            self._rebuild_attachment_chips()
+            self.submit_directive_draft.emit(
+                text,
+                list(self._pending_attachments),
+                self._directives.to_wire(),
+            )
+            self._sync_send_state()
             return
         if self._pending_attachments:
             for item in self._pending_attachments:
@@ -10596,6 +10864,8 @@ class MainPopup(QWidget):
 
     send_text = pyqtSignal(str)
     submit_draft = pyqtSignal(str, object)
+    submit_directive_draft = pyqtSignal(str, object, object)
+    informational_requested = pyqtSignal(str)
     pick_file = pyqtSignal(str, str)
     new_conversation = pyqtSignal()
     open_conversation = pyqtSignal(str)
@@ -10788,6 +11058,12 @@ class MainPopup(QWidget):
         self._chat = _ChatPage()
         self._chat.send_text.connect(self.send_text.emit)
         self._chat.submit_draft.connect(self.submit_draft.emit)
+        self._chat.submit_directive_draft.connect(
+            self.submit_directive_draft.emit
+        )
+        self._chat.informational_requested.connect(
+            self.informational_requested.emit
+        )
         self._chat.pick_file.connect(self.pick_file.emit)
 
         self._convs = _ConversationsPanel()
@@ -11179,6 +11455,63 @@ class MainPopup(QWidget):
 
     def accept_draft_submission(self, attachment_ids) -> bool:
         return self._chat.accept_draft_submission(attachment_ids)
+
+    def accept_directive_submission(self, attachment_ids=()) -> bool:
+        return self._chat.accept_directive_submission(attachment_ids)
+
+    def show_slash_information(self, payload: dict) -> None:
+        """Show safe informational data without appending a chat turn."""
+        title = str(payload.get("title") or "OSIA")
+        french = i18n.get_language() == "fr"
+        labels = {
+            "commands": "Commandes" if french else "Commands",
+            "families": "Familles" if french else "Families",
+            "connectors": "Connecteurs" if french else "Connectors",
+            "surface": "Surface",
+            "routing_mode": "Routage" if french else "Routing",
+            "provider": "Fournisseur" if french else "Provider",
+            "model": "Mod\u00e8le" if french else "Model",
+            "reasoning": "Raisonnement" if french else "Reasoning",
+            "permission_mode": "Autorisation" if french else "Permission",
+            "provider_ready": (
+                "Fournisseur pr\u00eat" if french else "Provider ready"
+            ),
+            "connector_count": (
+                "Nombre de connecteurs" if french else "Connector count"
+            ),
+            "transport": "Transport",
+        }
+        lines = []
+        for key, value in payload.items():
+            if key == "title":
+                continue
+            label = labels.get(key, key.replace("_", " ").title())
+            if isinstance(value, list):
+                rendered = []
+                for item in value:
+                    if isinstance(item, dict):
+                        if key == "commands":
+                            hint = str(item.get("argument_hint") or "")
+                            alias = str(item.get("alias") or "")
+                            rendered.append(
+                                f"{alias}{f' <{hint}>' if hint else ''} \u2014 "
+                                f"{str(item.get('description') or '')}"
+                            )
+                        else:
+                            rendered.append(
+                                " · ".join(str(v) for v in item.values())
+                            )
+                    else:
+                        rendered.append(str(item))
+                value = "\n".join(rendered)
+            elif isinstance(value, bool):
+                value = (
+                    "oui" if value and french else
+                    "non" if french else
+                    "yes" if value else "no"
+                )
+            lines.append(f"{label}: {value}")
+        QMessageBox.information(self, title, "\n\n".join(lines))
 
     def show_attachment_error(self, error: DesktopAttachmentError) -> None:
         self._chat.show_attachment_error(error)

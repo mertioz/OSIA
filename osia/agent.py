@@ -201,6 +201,7 @@ def get_system_prompt(
     model: str = None,
     provider: str = None,
     turn_context: TurnContext | None = None,
+    connector_id: str | None = None,
 ) -> str:
     """Return the system prompt for the given language, with the active
     model and provider injected at the start so the agent knows what it's
@@ -302,7 +303,7 @@ def get_system_prompt(
     if surface != "scheduled":
         try:
             from osia.mcp_client.registry import mcp_tool_prompt_block
-            mcp_block = mcp_tool_prompt_block()
+            mcp_block = mcp_tool_prompt_block(server_id=connector_id)
             if mcp_block:
                 body = body + "\n\n" + mcp_block
         except Exception:
@@ -6929,6 +6930,10 @@ class OSIAAgent:
         self.last_run_diagnostic: dict | None = None
         self.last_execution_strategy_snapshot: dict | None = None
         self.last_context_receipt: dict | None = None
+        self._slash_turn_directives = None
+        self._reasoning_override_for_turn: str | None = None
+        self.last_slash_capability_receipt: dict | None = None
+        self.last_slash_connector_receipt: dict | None = None
         self.last_run_artifacts: list[dict] = []
         self._prior_run_document_artifacts: list[dict] = []
         self.last_run_document_activity = False
@@ -7943,6 +7948,13 @@ class OSIAAgent:
                 getattr(self, "turn_context", None), "turn_ref", None,
             ),
             metadata_messages=self.messages,
+            explicit_conversation_id=(
+                getattr(self, "_slash_turn_directives", None)
+                .conversation_refs[0].conversation_id
+                if getattr(self, "_slash_turn_directives", None) is not None
+                and getattr(self, "_slash_turn_directives", None).conversation_refs
+                else None
+            ),
         )
         self.last_context_receipt = record_context_receipt(result.receipt)
         return adapt_messages_for_provider(result.messages, self.provider)
@@ -7951,7 +7963,13 @@ class OSIAAgent:
         """Return exact reasoning kwargs and a sanitized adapter receipt."""
         try:
             from osia.reasoning import build_reasoning_request
-            return build_reasoning_request(self.provider, self.model)
+            override = getattr(self, "_reasoning_override_for_turn", None)
+            settings = None
+            if override is not None:
+                settings = {"default": override, "providers": {}, "models": {}}
+            return build_reasoning_request(
+                self.provider, self.model, settings=settings,
+            )
         except Exception:
             return {
                 "kwargs": {},
@@ -8526,6 +8544,19 @@ class OSIAAgent:
             semantic_postcondition = str(
                 getattr(event, "semantic_postcondition", "") or ""
             )
+
+            if (
+                phase == "completed"
+                and outcome == "success_verified"
+                and (identity == "webSearch" or tool_name == "webSearch")
+            ):
+                self.last_slash_capability_receipt = {
+                    "schema_version": 1,
+                    "capability": "current_web",
+                    "source": source or "provider_hosted",
+                    "identity": "webSearch",
+                    "outcome": "success_verified",
+                }
 
             if phase in {"accepted", "started"}:
                 from osia.execution_trace import display_key_for_tool
@@ -9151,9 +9182,15 @@ class OSIAAgent:
             str(item).strip() for item in required_postconditions
             if str(item).strip()
         )
+        from osia.slash_commands import tool_allowed_for_directives
+
+        turn_tool_names = tuple(
+            name for name in TOOL_MAP
+            if tool_allowed_for_directives(name, self._slash_turn_directives)
+        )
         strategy = _execution_strategy.build_execution_strategy(
             user_input,
-            TOOL_MAP.keys(),
+            turn_tool_names,
             postconditions=postconditions,
         )
         requires_execution = (
@@ -9233,6 +9270,7 @@ class OSIAAgent:
         never per tool call, so stickiness is never reset mid-turn.
         """
         from osia import document_artifacts as _document_artifacts
+        from osia.slash_commands import tool_allowed_for_directives
         from osia.utils.key_chain import task_scope
 
         self.last_run_diagnostic = None
@@ -9281,7 +9319,12 @@ class OSIAAgent:
             with task_scope():
                 with _execution_strategy.execution_strategy_scope(
                     user_input,
-                    TOOL_MAP.keys(),
+                    tuple(
+                        name for name in TOOL_MAP
+                        if tool_allowed_for_directives(
+                            name, self._slash_turn_directives,
+                        )
+                    ),
                     strategy=self._terminality_strategy,
                 ) as active_strategy:
                     try:
@@ -9451,6 +9494,11 @@ class OSIAAgent:
                     sanitized.append(clean)
             self.messages = [{"role": "system", "content": get_system_prompt(
                 self.lang, self.model, self.provider, self.turn_context,
+                connector_id=(
+                    self._slash_turn_directives.connector_hints[0].connector_id
+                    if self._slash_turn_directives is not None
+                    and self._slash_turn_directives.connector_hints else None
+                ),
             )}] + sanitized
         else:
             # Reusing an in-process agent starts from canonical conversational
@@ -9467,6 +9515,11 @@ class OSIAAgent:
                     "role": "system",
                     "content": get_system_prompt(
                         self.lang, self.model, self.provider, self.turn_context,
+                        connector_id=(
+                            self._slash_turn_directives.connector_hints[0].connector_id
+                            if self._slash_turn_directives is not None
+                            and self._slash_turn_directives.connector_hints else None
+                        ),
                     ),
                 },
                 *canonical_history,
@@ -10321,6 +10374,47 @@ class OSIAAgent:
                     tool_name = tc.get("tool", "")
                     if guard.check_time():
                         break
+
+                    from osia.slash_commands import tool_allowed_for_directives
+                    if not tool_allowed_for_directives(
+                        tool_name, self._slash_turn_directives,
+                    ):
+                        mismatch = (
+                            "ERROR: selected connector does not authorize this "
+                            "connector tool; nothing was executed"
+                        )
+                        tool_results.append(
+                            localized_text(
+                                "tool_result_header", self.lang, tool=tool_name,
+                            ) + "\n" + mismatch
+                        )
+                        guard.record(
+                            tool_name,
+                            {k: v for k, v in tc.items() if k != "tool"},
+                            mismatch,
+                            True,
+                        )
+                        break
+                    if (
+                        self._slash_turn_directives is not None
+                        and self._slash_turn_directives.connector_hints
+                    ):
+                        connector_id = (
+                            self._slash_turn_directives.connector_hints[0].connector_id
+                        )
+                        if (
+                            tool_name.startswith(f"mcp__{connector_id}__")
+                            or (
+                                connector_id == "gmail-rest"
+                                and tool_name.startswith("gmail_")
+                            )
+                        ):
+                            self.last_slash_connector_receipt = {
+                                "schema_version": 1,
+                                "connector_id": connector_id,
+                                "tool": tool_name,
+                                "outcome": "selected",
+                            }
                     if tool_name not in TOOL_MAP:
                         safe_tool_name = guard._safe_tool_name(tool_name)
                         print(
@@ -10481,6 +10575,29 @@ class OSIAAgent:
                         )
 
                     if tool_name == _chat_routing.ROUTING_TOOL_NAME:
+                        if (
+                            self._slash_turn_directives is not None
+                            and not self._slash_turn_directives.is_empty
+                        ):
+                            rejected = json.dumps(
+                                {
+                                    "ok": False,
+                                    "route": "normal",
+                                    "status": "rejected",
+                                    "reason_code": "slash_directives_chat_only",
+                                },
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                            tool_results.append(
+                                localized_text(
+                                    "tool_result_header", self.lang,
+                                    tool=tool_name,
+                                ) + "\n" + rejected
+                            )
+                            guard.record(tool_name, kwargs, rejected, True)
+                            chat_route_redirect = "normal"
+                            break
                         # Starting the planner is the routing boundary itself,
                         # not a normal tool side effect. Execute it synchronously
                         # so a timeout wrapper can never leave a background start
@@ -10949,6 +11066,52 @@ class OSIAAgent:
                         )
                     if execution_record.dispatched:
                         any_tool_executed = True
+                    if (
+                        execution_record.dispatched
+                        and not execution_record.is_error
+                        and execution_record.outcome
+                        == ExecutionOutcome.SUCCESS_VERIFIED
+                    ):
+                        from osia.slash_commands import tool_is_current_web_evidence
+                        if tool_is_current_web_evidence(tool_name):
+                            self.last_slash_capability_receipt = {
+                                "schema_version": 1,
+                                "capability": "current_web",
+                                "source": "osia_tool",
+                                "identity": tool_name,
+                                "outcome": getattr(
+                                    execution_record.outcome,
+                                    "value",
+                                    str(execution_record.outcome),
+                                ),
+                            }
+                    if (
+                        execution_record.dispatched
+                        and not execution_record.is_error
+                        and self._slash_turn_directives is not None
+                        and self._slash_turn_directives.connector_hints
+                    ):
+                        connector_id = (
+                            self._slash_turn_directives.connector_hints[0].connector_id
+                        )
+                        connector_match = (
+                            tool_name.startswith(f"mcp__{connector_id}__")
+                            or (
+                                connector_id == "gmail-rest"
+                                and tool_name.startswith("gmail_")
+                            )
+                        )
+                        if connector_match:
+                            self.last_slash_connector_receipt = {
+                                "schema_version": 1,
+                                "connector_id": connector_id,
+                                "tool": tool_name,
+                                "outcome": getattr(
+                                    execution_record.outcome,
+                                    "value",
+                                    str(execution_record.outcome),
+                                ),
+                            }
                     if (
                         execution_record.dispatched
                         and execution_record.contract.commits_fallback_barrier
@@ -11656,6 +11819,39 @@ class OSIAAgent:
                     "stage": "task_execution",
                     "error_category": "tool_timeout",
                     "reason_code": "tool_timeout",
+                }
+            if (
+                self._slash_turn_directives is not None
+                and self._slash_turn_directives.capability_requirements.current_web
+                and not self.last_slash_capability_receipt
+            ):
+                content = (
+                    "ERROR: aucune preuve web actuelle vérifiée n’a été "
+                    "obtenue pour ce tour."
+                    if self.lang == "fr" else
+                    "ERROR: no verified current web evidence was obtained for "
+                    "this turn."
+                )
+                self.last_run_diagnostic = {
+                    "stage": "slash_directives",
+                    "error_category": "capability_evidence_missing",
+                    "reason_code": "current_web_evidence_required",
+                }
+            if (
+                self._slash_turn_directives is not None
+                and self._slash_turn_directives.connector_hints
+                and not self.last_slash_connector_receipt
+            ):
+                content = (
+                    "ERROR: le connecteur sélectionné n’a pas été utilisé "
+                    "pour ce tour."
+                    if self.lang == "fr" else
+                    "ERROR: the selected connector was not used for this turn."
+                )
+                self.last_run_diagnostic = {
+                    "stage": "slash_directives",
+                    "error_category": "connector_evidence_missing",
+                    "reason_code": "selected_connector_required",
                 }
             content = self._redact_semantic_form_values(content)
             if canonical_output:
