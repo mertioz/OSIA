@@ -332,17 +332,24 @@ def _load_folder_state_unlocked() -> dict:
 
 
 def _recover_bulk_transactions_unlocked(state: dict) -> None:
-    """Finish or roll back an interrupted bulk-delete transaction."""
+    """Finish or roll back interrupted Project conversation transactions."""
 
     root = _folder_state_path().parent
     if not root.exists():
         return
     completed = {
-        str(item.get("id") or "")
+        (
+            str(item.get("id") or ""),
+            str(item.get("kind") or ""),
+        )
         for item in state.get("recent_operations") or []
-        if item.get("kind") == "delete_ungrouped"
     }
-    for transaction in root.glob("bulk-*"):
+    transactions = [
+        *root.glob("bulk-*"),
+        *root.glob("project-create-*"),
+        *root.glob("project-delete-*"),
+    ]
+    for transaction in transactions:
         if not transaction.is_dir():
             continue
         manifest_path = transaction / "manifest.json"
@@ -352,10 +359,19 @@ def _recover_bulk_transactions_unlocked(state: dict) -> None:
             # Unknown data under the metadata directory is never destroyed.
             continue
         operation_id = str(manifest.get("operation_id") or "")
+        kind = str(manifest.get("kind") or "delete_ungrouped")
         names = manifest.get("files") or []
-        if not operation_id or not isinstance(names, list):
+        if (
+            not operation_id
+            or kind not in {
+                "create_in_folder",
+                "delete_folder",
+                "delete_ungrouped",
+            }
+            or not isinstance(names, list)
+        ):
             continue
-        committed = operation_id in completed
+        committed = (operation_id, kind) in completed
         recovered = True
         for raw_name in names:
             name = Path(str(raw_name or "")).name
@@ -363,13 +379,27 @@ def _recover_bulk_transactions_unlocked(state: dict) -> None:
                 recovered = False
                 continue
             staged = transaction / name
+            original = CONVERSATIONS_DIR / name
+            if kind == "create_in_folder":
+                try:
+                    if committed:
+                        if original.exists():
+                            staged.unlink(missing_ok=True)
+                        elif staged.exists():
+                            os.replace(staged, original)
+                        else:
+                            recovered = False
+                    else:
+                        staged.unlink(missing_ok=True)
+                except OSError:
+                    recovered = False
+                continue
             if not staged.exists():
                 continue
             try:
                 if committed:
                     staged.unlink()
                 else:
-                    original = CONVERSATIONS_DIR / name
                     if original.exists():
                         recovered = False
                         continue
@@ -783,6 +813,17 @@ def apply_folder_mutation(message: dict) -> dict:
             msg.get("folder_id"),
             operation_id=operation_id,
         )
+    if msg_type == "new_conversation_in_project":
+        return create_conversation_in_folder(
+            str(msg.get("folder_id") or ""),
+            operation_id=operation_id,
+        )
+    if msg_type == "delete_conversation_project":
+        return delete_folder_with_conversations(
+            str(msg.get("folder_id") or ""),
+            msg.get("expected_count"),
+            operation_id=operation_id,
+        )
     return {
         "success": False,
         "error": "unsupported_folder_mutation",
@@ -925,6 +966,292 @@ def move_conversation_to_folder(
         }
 
     return _mutate_folder_state(operation_id, "move_conversation", mutate)
+
+
+def create_conversation_in_folder(
+    folder_id: str,
+    *,
+    operation_id: str | None = None,
+) -> dict:
+    """Atomically create one empty conversation inside an existing Project."""
+
+    target = str(folder_id or "").strip()
+    op_id = str(operation_id or "").strip()[:200] or f"op_{uuid.uuid4().hex}"
+    with _store_lock():
+        state = _load_folder_state_unlocked()
+        for previous in state.get("recent_operations") or []:
+            if previous.get("id") != op_id:
+                continue
+            if previous.get("kind") != "create_in_folder":
+                return _folder_receipt(
+                    state,
+                    operation_id=op_id,
+                    result={"success": False, "error": "operation_id_conflict"},
+                    replayed=True,
+                )
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result=previous.get("result") or {},
+                replayed=True,
+            )
+
+        folder = next(
+            (
+                item
+                for item in state.get("folders") or []
+                if str(item.get("id") or "") == target
+            ),
+            None,
+        )
+        if folder is None:
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result={"success": False, "error": "folder_not_found"},
+                replayed=False,
+            )
+
+        conv_id = uuid.uuid4().hex
+        now = _now_iso()
+        conv = {
+            "id": conv_id,
+            "title": DEFAULT_TITLE,
+            "created_at": now,
+            "updated_at": now,
+            "revision": 1,
+            "last_operation_id": op_id,
+            "messages": [],
+        }
+        transaction = (
+            _folder_state_path().parent / f"project-create-{uuid.uuid4().hex}"
+        )
+        staged = transaction / f"{conv_id}.json"
+        manifest = transaction / "manifest.json"
+        try:
+            _write_atomic(manifest, {
+                "operation_id": op_id,
+                "kind": "create_in_folder",
+                "files": [staged.name],
+            })
+            _write_atomic(staged, conv)
+            state.setdefault("memberships", {})[conv_id] = target
+            folder["collapsed"] = False
+            result = {
+                "success": True,
+                "conversation": dict(conv),
+                "conversation_id": conv_id,
+                "folder_id": target,
+            }
+            state["revision"] = int(state.get("revision") or 0) + 1
+            state["last_operation_id"] = op_id
+            state.setdefault("recent_operations", []).append({
+                "id": op_id,
+                "kind": "create_in_folder",
+                "result": dict(result),
+            })
+            state["recent_operations"] = state["recent_operations"][
+                -_RECENT_FOLDER_OPERATIONS:
+            ]
+            _write_folder_state_unlocked(state)
+        except OSError:
+            try:
+                staged.unlink(missing_ok=True)
+                manifest.unlink(missing_ok=True)
+                transaction.rmdir()
+            except OSError:
+                pass
+            current = _load_folder_state_unlocked()
+            return _folder_receipt(
+                current,
+                operation_id=op_id,
+                result={"success": False, "error": "conversation_create_failed"},
+                replayed=False,
+            )
+
+        try:
+            os.replace(staged, _path_for(conv_id))
+            manifest.unlink(missing_ok=True)
+            transaction.rmdir()
+        except OSError:
+            _recover_bulk_transactions_unlocked(state)
+        return _folder_receipt(
+            state,
+            operation_id=op_id,
+            result=result,
+            replayed=False,
+        )
+
+
+def delete_folder_with_conversations(
+    folder_id: str,
+    expected_count,
+    *,
+    operation_id: str | None = None,
+) -> dict:
+    """Atomically delete one Project and every conversation assigned to it."""
+
+    target = str(folder_id or "").strip()
+    op_id = str(operation_id or "").strip()[:200] or f"op_{uuid.uuid4().hex}"
+    try:
+        expected = int(expected_count)
+    except (TypeError, ValueError):
+        return {
+            "success": False,
+            "error": "invalid_expected_count",
+            "operation_id": op_id,
+            "revision": 0,
+            "replayed": False,
+        }
+    if isinstance(expected_count, bool) or expected < 0:
+        return {
+            "success": False,
+            "error": "invalid_expected_count",
+            "operation_id": op_id,
+            "revision": 0,
+            "replayed": False,
+        }
+
+    with _store_lock():
+        state = _load_folder_state_unlocked()
+        for previous in state.get("recent_operations") or []:
+            if previous.get("id") != op_id:
+                continue
+            if previous.get("kind") != "delete_folder":
+                return _folder_receipt(
+                    state,
+                    operation_id=op_id,
+                    result={"success": False, "error": "operation_id_conflict"},
+                    replayed=True,
+                )
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result=previous.get("result") or {},
+                replayed=True,
+            )
+
+        folder = next(
+            (
+                item
+                for item in state.get("folders") or []
+                if str(item.get("id") or "") == target
+            ),
+            None,
+        )
+        if folder is None:
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result={"success": False, "error": "folder_not_found"},
+                replayed=False,
+            )
+
+        memberships = state.get("memberships") or {}
+        assigned_ids = {
+            str(conv_id)
+            for conv_id, assigned in memberships.items()
+            if str(assigned or "") == target
+        }
+        candidates = sorted(
+            (conv_id, _path_for(conv_id))
+            for conv_id in assigned_ids
+            if _path_for(conv_id).is_file()
+        )
+        if len(candidates) != expected:
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result={
+                    "success": False,
+                    "error": "folder_count_changed",
+                    "expected_count": expected,
+                    "actual_count": len(candidates),
+                },
+                replayed=False,
+            )
+
+        transaction = (
+            _folder_state_path().parent / f"project-delete-{uuid.uuid4().hex}"
+        )
+        moved: list[tuple[Path, Path]] = []
+        try:
+            transaction.mkdir(parents=True, exist_ok=False)
+            _write_atomic(transaction / "manifest.json", {
+                "operation_id": op_id,
+                "kind": "delete_folder",
+                "files": [path.name for _conv_id, path in candidates],
+            })
+            for _conv_id, source in candidates:
+                staged = transaction / source.name
+                os.replace(source, staged)
+                moved.append((source, staged))
+
+            state["folders"] = [
+                item
+                for item in state.get("folders") or []
+                if str(item.get("id") or "") != target
+            ]
+            for order, item in enumerate(state["folders"]):
+                item["order"] = order
+            state["memberships"] = {
+                conv_id: assigned
+                for conv_id, assigned in memberships.items()
+                if str(assigned or "") != target
+            }
+            result = {
+                "success": True,
+                "folder_id": target,
+                "folder_name": str(folder.get("name") or ""),
+                "deleted_count": len(candidates),
+                "deleted_ids": [conv_id for conv_id, _path in candidates],
+            }
+            state["revision"] = int(state.get("revision") or 0) + 1
+            state["last_operation_id"] = op_id
+            state.setdefault("recent_operations", []).append({
+                "id": op_id,
+                "kind": "delete_folder",
+                "result": dict(result),
+            })
+            state["recent_operations"] = state["recent_operations"][
+                -_RECENT_FOLDER_OPERATIONS:
+            ]
+            _write_folder_state_unlocked(state)
+        except OSError:
+            for source, staged in reversed(moved):
+                try:
+                    os.replace(staged, source)
+                except OSError:
+                    pass
+            try:
+                (transaction / "manifest.json").unlink(missing_ok=True)
+                transaction.rmdir()
+            except OSError:
+                pass
+            current = _load_folder_state_unlocked()
+            return _folder_receipt(
+                current,
+                operation_id=op_id,
+                result={"success": False, "error": "folder_delete_failed"},
+                replayed=False,
+            )
+
+        for _source, staged in moved:
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            (transaction / "manifest.json").unlink(missing_ok=True)
+            transaction.rmdir()
+        except OSError:
+            pass
+        return _folder_receipt(
+            state,
+            operation_id=op_id,
+            result=result,
+            replayed=False,
+        )
 
 
 def _delete_all_ungrouped_conversations(

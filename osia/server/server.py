@@ -8205,6 +8205,42 @@ async def websocket_endpoint(ws: WebSocket):
                 })
                 continue
 
+            if msg_type == "get_conversation_snapshot":
+                # Project deletion confirmations on Mobile must use a freshly
+                # read PC-canonical count, never a Mobile-only cached count.
+                snapshot = conversations.conversation_snapshot()
+                snapshot["operation_id"] = str(msg.get("operation_id") or "")
+                await out.send_json(snapshot)
+                continue
+
+            if msg_type == "new_conversation_in_project":
+                result = conversations.apply_folder_mutation(msg)
+                await out.send_json({
+                    "type": "conversation_folder_mutated",
+                    "mutation": msg_type,
+                    **result,
+                })
+                if result.get("success"):
+                    session_history = []
+                    conv = result.get("conversation") or {}
+                    active_conv_id = str(conv.get("id") or "")
+                    await _broadcast_canonical_conversation_change(
+                        active_conv_id,
+                        revision=int(conv.get("revision") or 0),
+                        operation_id=str(result.get("operation_id") or ""),
+                        exclude=out,
+                    )
+                    await out.send_json({
+                        "type": "active_conversation",
+                        "id": active_conv_id,
+                        "title": conv.get("title") or conversations.DEFAULT_TITLE,
+                        "operation_id": str(result.get("operation_id") or ""),
+                    })
+                snapshot = conversations.conversation_snapshot()
+                snapshot["operation_id"] = result.get("operation_id", "")
+                await out.send_json(snapshot)
+                continue
+
             if msg_type == "new_conversation":
                 # Reset session history, create a fresh conversation, and
                 # promote it to active. Notify the client with BOTH the
@@ -8444,6 +8480,38 @@ async def websocket_endpoint(ws: WebSocket):
                     snapshot = conversations.conversation_snapshot()
                     snapshot["operation_id"] = result.get("operation_id", "")
                     await out.send_json(snapshot)
+                    await _broadcast_conversations(exclude=out)
+                continue
+
+            if msg_type == "delete_conversation_project":
+                result = conversations.apply_folder_mutation(msg)
+                if result.get("success"):
+                    for conv_id in result.get("deleted_ids") or []:
+                        doomed = streaming_tasks.pop(conv_id, None)
+                        if doomed is None:
+                            doomed = _ACTIVE_TURNS_BY_CONV.get(conv_id)
+                        if doomed is not None:
+                            doomed.cancel()
+                        media_task = _POST_TURN_MEDIA_BY_CONV.pop(conv_id, None)
+                        if media_task is not None:
+                            media_task.cancel()
+                        dead_agent = conn_agents.pop(conv_id, None)
+                        if dead_agent is not None and not getattr(
+                            dead_agent, "_in_use", False,
+                        ):
+                            _close_agent_client(dead_agent)
+                        if active_conv_id == conv_id:
+                            active_conv_id = None
+                            session_history = []
+                await out.send_json({
+                    "type": "conversation_folder_mutated",
+                    "mutation": msg_type,
+                    **result,
+                })
+                snapshot = conversations.conversation_snapshot()
+                snapshot["operation_id"] = result.get("operation_id", "")
+                await out.send_json(snapshot)
+                if result.get("success"):
                     await _broadcast_conversations(exclude=out)
                 continue
 

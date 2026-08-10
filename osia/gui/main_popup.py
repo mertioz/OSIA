@@ -1372,9 +1372,11 @@ class _FolderRow(QFrame):
     """Visually distinct canonical folder header and its compact settings."""
 
     collapsed_changed = pyqtSignal(str, bool)
+    new_conversation_clicked = pyqtSignal(str)
     rename_clicked = pyqtSignal(str, str)
     context_policy_changed = pyqtSignal(str, bool)
     reorder_clicked = pyqtSignal(str, int)
+    delete_clicked = pyqtSignal(str, int)
 
     def __init__(self, folder: dict, count: int, index: int, total: int):
         super().__init__()
@@ -1417,6 +1419,10 @@ class _FolderRow(QFrame):
 
     def _show_settings(self, anchor: QWidget, index: int, total: int) -> None:
         menu = QMenu(self)
+        new_chat = menu.addAction(i18n.t("conversations.new_chat"))
+        new_chat.triggered.connect(
+            lambda: self.new_conversation_clicked.emit(self._folder_id)
+        )
         rename = menu.addAction(i18n.t("conversations.rename_folder"))
         rename.triggered.connect(self._prompt_rename)
         settings_menu = menu.addMenu(i18n.t("conversations.folder_settings"))
@@ -1441,7 +1447,53 @@ class _FolderRow(QFrame):
         move_down.triggered.connect(
             lambda: self.reorder_clicked.emit(self._folder_id, 1)
         )
+        menu.addSeparator()
+        delete = menu.addAction(i18n.t("conversations.delete_project"))
+        delete.triggered.connect(self._confirm_delete)
         menu.exec(anchor.mapToGlobal(anchor.rect().bottomRight()))
+
+    def _confirm_delete(self) -> None:
+        snapshot = conversations.conversation_snapshot()
+        folder = next(
+            (
+                item
+                for item in snapshot.get("folders") or []
+                if str(item.get("id") or "") == self._folder_id
+            ),
+            None,
+        )
+        if folder is None:
+            return
+        count = sum(
+            1
+            for item in snapshot.get("items") or []
+            if item.get("folder_id") == self._folder_id
+        )
+        confirm_key = (
+            "conversations.delete_project_confirm_one"
+            if count == 1
+            else "conversations.delete_project_confirm"
+        )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(i18n.t("conversations.delete_project"))
+        box.setText(i18n.t(
+            confirm_key,
+            name=str(folder.get("name") or self._folder_name),
+            count=count,
+        ))
+        delete_button = box.addButton(
+            i18n.t("deletion.confirm.allow"),
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        cancel_button = box.addButton(
+            i18n.t("deletion.confirm.cancel"),
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        box.setDefaultButton(cancel_button)
+        box.exec()
+        if box.clickedButton() is delete_button:
+            self.delete_clicked.emit(self._folder_id, count)
 
     def _prompt_rename(self) -> None:
         name, accepted = QInputDialog.getText(
@@ -1617,6 +1669,19 @@ class _ConversationsPanel(QWidget):
             "collapsed": collapsed,
         })
 
+    def _emit_new_in_folder(self, folder_id: str) -> None:
+        self.folder_mutation_requested.emit({
+            "action": "new_conversation",
+            "folder_id": folder_id,
+        })
+
+    def _emit_delete_folder(self, folder_id: str, expected_count: int) -> None:
+        self.folder_mutation_requested.emit({
+            "action": "delete",
+            "folder_id": folder_id,
+            "expected_count": expected_count,
+        })
+
     def _emit_folder_rename(self, folder_id: str, name: str) -> None:
         self.folder_mutation_requested.emit({
             "action": "rename",
@@ -1708,9 +1773,13 @@ class _ConversationsPanel(QWidget):
             ]
             folder_row = _FolderRow(folder, len(members), index, len(folders))
             folder_row.collapsed_changed.connect(self._emit_folder_state)
+            folder_row.new_conversation_clicked.connect(
+                self._emit_new_in_folder
+            )
             folder_row.rename_clicked.connect(self._emit_folder_rename)
             folder_row.context_policy_changed.connect(self._emit_folder_context)
             folder_row.reorder_clicked.connect(self._emit_folder_reorder)
+            folder_row.delete_clicked.connect(self._emit_delete_folder)
             self._host_layout.insertWidget(insert_at, folder_row)
             insert_at += 1
             if not folder.get("collapsed", False):

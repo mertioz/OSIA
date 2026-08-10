@@ -2156,6 +2156,7 @@ def wake_mode():
         popup.refresh_conversations(active_conv["id"] if active_conv else None)
 
     def handle_folder_mutation(request: dict):
+        nonlocal active_conv
         action = str((request or {}).get("action") or "")
         operation_id = f"desktop_folder_{uuid.uuid4().hex}"
         if action == "create":
@@ -2191,16 +2192,51 @@ def wake_mode():
                 request.get("folder_id"),
                 operation_id=operation_id,
             )
+        elif action == "new_conversation":
+            result = conversations.create_conversation_in_folder(
+                str(request.get("folder_id") or ""),
+                operation_id=operation_id,
+            )
+            if result.get("success"):
+                tts_stop()
+                agent.reset()
+                active_conv = result.get("conversation") or None
+                popup.set_messages([])
+        elif action == "delete":
+            result = conversations.delete_folder_with_conversations(
+                str(request.get("folder_id") or ""),
+                request.get("expected_count"),
+                operation_id=operation_id,
+            )
+            if result.get("success"):
+                deleted_ids = set(result.get("deleted_ids") or [])
+                for conv_id in deleted_ids:
+                    _set_conversation_busy(conv_id, False)
+                    popup.discard_conversation_draft(conv_id)
+                if active_conv and active_conv.get("id") in deleted_ids:
+                    tts_stop()
+                    agent.reset()
+                    active_conv = None
+                    popup.set_messages([])
         else:
             return
         if result.get("success"):
-            _notify_mobile_conversation_changed(
-                "",
-                revision=result.get("revision", 0),
-                operation_id=result.get("operation_id", ""),
-                action="folders",
-            )
+            if action == "new_conversation" and active_conv:
+                _notify_mobile_conversation_changed(
+                    active_conv["id"],
+                    revision=active_conv.get("revision", 0),
+                    operation_id=result.get("operation_id", ""),
+                )
+            else:
+                _notify_mobile_conversation_changed(
+                    "",
+                    revision=result.get("revision", 0),
+                    operation_id=result.get("operation_id", ""),
+                    action="folders",
+                )
         popup.refresh_conversations(active_conv["id"] if active_conv else None)
+        if result.get("success") and action == "new_conversation":
+            popup.show_chat()
 
     def handle_bulk_delete_ungrouped(expected_count: int):
         nonlocal active_conv

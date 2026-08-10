@@ -1960,6 +1960,26 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Project settings", "fr": "Paramètres du projet", "zh": "项目设置",
         "ja": "プロジェクト設定", "de": "Projekteinstellungen", "es": "Ajustes del proyecto",
     },
+    "conversations.delete_project": {
+        "en": "Delete project", "fr": "Supprimer le projet", "zh": "删除项目",
+        "ja": "プロジェクトを削除", "de": "Projekt löschen", "es": "Eliminar proyecto",
+    },
+    "conversations.delete_project_confirm": {
+        "en": "Delete project “{name}” and its {count} conversations? This action is permanent.",
+        "fr": "Supprimer le projet « {name} » et ses {count} conversations ? Cette action est définitive.",
+        "zh": "删除项目“{name}”及其中的 {count} 个对话？此操作无法撤销。",
+        "ja": "プロジェクト「{name}」とその {count} 件の会話を削除しますか？この操作は取り消せません。",
+        "de": "Projekt „{name}“ und seine {count} Unterhaltungen löschen? Diese Aktion ist endgültig.",
+        "es": "¿Eliminar el proyecto «{name}» y sus {count} conversaciones? Esta acción es permanente.",
+    },
+    "conversations.delete_project_confirm_one": {
+        "en": "Delete project “{name}” and its 1 conversation? This action is permanent.",
+        "fr": "Supprimer le projet « {name} » et sa conversation ? Cette action est définitive.",
+        "zh": "删除项目“{name}”及其中的 1 个对话？此操作无法撤销。",
+        "ja": "プロジェクト「{name}」とその 1 件の会話を削除しますか？この操作は取り消せません。",
+        "de": "Projekt „{name}“ und seine 1 Unterhaltung löschen? Diese Aktion ist endgültig.",
+        "es": "¿Eliminar el proyecto «{name}» y su conversación? Esta acción es permanente.",
+    },
     "conversations.allow_folder_context": {
         "en": "Allow OSIA to use other conversations in this project as context",
         "fr": "Autoriser OSIA à utiliser les autres conversations de ce projet comme contexte",
