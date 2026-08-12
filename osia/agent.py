@@ -2288,7 +2288,7 @@ _browser_tools = None
 def _get_browser_tools():
     global _browser_tools
     if _browser_tools is None:
-        from osia.tools.browser import (
+        from osia.tools.browser_controller import (
             navigate, click, fill, read_page,
             get_current_url, scroll, go_back, go_forward, open_new_tab,
             find_and_click, wait_for_load, get_page_text, scroll_down,
@@ -3095,7 +3095,7 @@ def tool_desktop_click(description: str) -> str:
                 {"target": description},
             )
     try:
-        from osia.tools import browser as _browser
+        from osia.tools import browser_controller as _browser
         dom_res = (
             _browser.dom_click(description)
             if dom_decision is None or dom_decision.allowed else None
@@ -6932,6 +6932,7 @@ class OSIAAgent:
         self.last_context_receipt: dict | None = None
         self._slash_turn_directives = None
         self._reasoning_override_for_turn: str | None = None
+        self._browser_backend_override_for_turn: str | None = None
         self.last_slash_capability_receipt: dict | None = None
         self.last_slash_connector_receipt: dict | None = None
         self.last_run_artifacts: list[dict] = []
@@ -7303,7 +7304,7 @@ class OSIAAgent:
         if not isinstance(wait_spec, dict):
             return None
         try:
-            from osia.tools import browser as browser_tools
+            from osia.tools import browser_controller as browser_tools
             from osia.tool_contracts import (
                 ExecutionOutcome,
                 ToolExecutionRecord,
@@ -9273,6 +9274,8 @@ class OSIAAgent:
         from osia.slash_commands import tool_allowed_for_directives
         from osia.utils.key_chain import task_scope
 
+        browser_override = self._browser_backend_override_for_turn
+        self._browser_backend_override_for_turn = None
         self.last_run_diagnostic = None
         self.last_execution_strategy_snapshot = None
         prior_artifacts = self.last_run_artifacts
@@ -9316,7 +9319,9 @@ class OSIAAgent:
         self.set_turn_context(turn_context)
 
         def _run_scoped():
-            with task_scope():
+            from osia.tools.browser_controller import browser_turn_scope
+
+            with task_scope(), browser_turn_scope(browser_override):
                 with _execution_strategy.execution_strategy_scope(
                     user_input,
                     tuple(

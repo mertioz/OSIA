@@ -3353,7 +3353,7 @@ def wake_mode():
         except Exception:
             pass
         try:
-            from osia.tools.browser import close_browser
+            from osia.tools.browser_controller import close_browser
             close_browser()
         except Exception:
             pass

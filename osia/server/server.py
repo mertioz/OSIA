@@ -5918,7 +5918,7 @@ def _browser_progress_frame(payload: dict | None = None, *, snapshot=False) -> d
     safe_site = ""
     browser_session_id = ""
     try:
-        from osia.tools.browser import _browser_owner_snapshot
+        from osia.tools.browser_controller import _browser_owner_snapshot
         from osia.tools.browser_state import safe_origin
 
         owner_snapshot = _browser_owner_snapshot()
@@ -8091,7 +8091,7 @@ async def websocket_endpoint(ws: WebSocket):
                     # install the value-free progress bridge on first auth.
                     _autonomous["loop"] = asyncio.get_running_loop()
                     try:
-                        from osia.tools.browser import set_browser_progress_callback
+                        from osia.tools.browser_controller import set_browser_progress_callback
                         set_browser_progress_callback(_on_browser_progress)
                     except Exception:
                         pass

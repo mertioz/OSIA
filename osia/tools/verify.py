@@ -129,7 +129,7 @@ def web_state(expect_url=None, expect_text=None, expect_selector=None) -> dict:
     Never raises.
     """
     try:
-        from osia.tools import browser as _b
+        from osia.tools import browser_controller as _b
     except Exception:
         return {"available": False, "reason": "browser module unavailable"}
 

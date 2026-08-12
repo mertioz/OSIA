@@ -777,7 +777,7 @@ class Orchestrator:
         if pending.get("kind") == "upload":
             return "browser_state_stale"
         try:
-            from osia.tools.browser import get_browser_state
+            from osia.tools.browser_controller import get_browser_state
 
             observed = get_browser_state()
             data = observed.get("data") if isinstance(observed, dict) else None

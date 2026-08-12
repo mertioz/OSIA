@@ -25,6 +25,7 @@ from osia.runtime import (
 )
 
 BROWSER_SMOKE_MODE = "--osia-browser-smoke"
+REMOVE_PERSONAL_BROWSER_MODE = "--osia-remove-personal-browser-registration"
 _PACKAGE_SMOKE_REPORT_ENV = "OSIA_PACKAGE_SMOKE_REPORT"
 
 
@@ -421,6 +422,11 @@ def main(args: list[str] | None = None) -> int:
         return _package_smoke()
     if mode == BROWSER_SMOKE_MODE:
         return _browser_smoke()
+    if mode == REMOVE_PERSONAL_BROWSER_MODE:
+        from osia.personal_browser.registration import remove_personal_browser
+
+        result = remove_personal_browser()
+        return 0 if result.get("removed") or result.get("state") == "setup_required" else 1
     if mode == RELAUNCH_MODE:
         if len(argv) != 2:
             return 2
@@ -437,6 +443,13 @@ def main(args: list[str] | None = None) -> int:
     mutex = _acquire_gui_mutex()
     if mutex is False:
         return 0
+    if is_frozen() and sys.platform == "win32":
+        try:
+            from osia.personal_browser.registration_windows import repair_owned_registration
+
+            repair_owned_registration()
+        except Exception:
+            pass
     from osia.main import main as desktop_main
 
     original = sys.argv

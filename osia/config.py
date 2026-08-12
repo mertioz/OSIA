@@ -182,6 +182,12 @@ DEFAULT_SETTINGS = {
     "lan_direct_v1": True,
     "webrtc_direct_v1": True,
     "webrtc_stun_urls": [PRODUCTION_STUN_URL],
+    # Personal Browser is setup/readiness state only.  It never changes the
+    # default turn backend: ordinary turns remain isolated unless the typed
+    # /browser personal directive is present on that exact turn.
+    "personal_browser_enabled": False,
+    "personal_browser_preference": "automatic",
+    "personal_browser_instance_hint": "",
     # Skills (Bloc 6): enabled/disabled flag per skill file. The skill prose
     # itself lives as Markdown under ``~/.osia/skills/*.md``; only the on/off
     # state is stored here. Shape: ``{"<name>.md": true}``. A skill with no

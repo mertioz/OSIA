@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "OSIA Personal Browser",
+  "version": "1.0.0",
+  "description": "Explicitly authorize one tab for one OSIA Personal Browser turn.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4AaAYT1X9mxHLw9wA/LlJAEEAT99RBDAS0+3u9UIvtq3jlc+pf90ES2Z14dSZDK151rBBrU8p8RFYyp4eM+4tY93iC5HYlJREETYU2T+mEzzAbv2QAiwiGV6ucDjWMkfzBlt0t3ztFrVuf8/q440u6KnIFfy28o3a51Vn+s4Mm/b3Vu3Fih31mAzSLSlQduCokeojB68sbhxtxmmKw1y1KKAxUrFicJi9RsJshspcfd6my0sxrJ3HSzWqr48e8lWI2Bt7xUvrkQICp+SDkNTm9KgdVcG17P+UYh4cQi0JZuu0Q36LVRrv1l0EhH15BkKsz3bXZpgY8KfqUFfBlQAPwIDAQAB",
+  "permissions": ["activeTab", "scripting", "nativeMessaging", "storage"],
+  "incognito": "not_allowed",
+  "action": {
+    "default_title": "Authorize this tab for OSIA"
+  },
+  "background": {
+    "service_worker": "service_worker.js",
+    "type": "module"
+  }
+}

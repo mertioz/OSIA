@@ -102,6 +102,7 @@ from osia.slash_commands import (
     SlashDirectiveError,
     SlashTurnDirectivesV1,
     consume_palette_prefix,
+    consume_browser_selector,
     escaped_literal_text,
 )
 
@@ -952,6 +953,18 @@ class _ChatPage(QWidget):
         return True
 
     def _on_input_changed(self) -> None:
+        cleaned, browser_backend = consume_browser_selector(
+            self._input.toPlainText()
+        )
+        if browser_backend is not None:
+            self._directives = replace(
+                self._directives,
+                browser_backend_override=browser_backend,
+            )
+            self._input.blockSignals(True)
+            self._input.setPlainText(cleaned)
+            self._input.blockSignals(False)
+            self._rebuild_directive_chips()
         self._slash_palette.update_from_text(
             self._input.toPlainText(), enabled=not self._busy,
         )
@@ -1030,6 +1043,12 @@ class _ChatPage(QWidget):
                 next_directives,
                 reasoning_override=str(row["reasoning_level"]),
             )
+        elif selection_type == "browser_backend":
+            alias = "browser"
+            next_directives = replace(
+                next_directives,
+                browser_backend_override=str(row["browser_backend"]),
+            )
         else:
             return
         try:
@@ -1057,6 +1076,11 @@ class _ChatPage(QWidget):
             rows.append(("model", self._directives.model_override.model_id))
         if self._directives.reasoning_override is not None:
             rows.append(("reasoning", self._directives.reasoning_override))
+        if self._directives.browser_backend_override is not None:
+            rows.append((
+                "browser",
+                f"/browser {self._directives.browser_backend_override}",
+            ))
         return rows
 
     def _rebuild_directive_chips(self) -> None:
@@ -1078,6 +1102,7 @@ class _ChatPage(QWidget):
             "conversation": {"conversation_refs": ()},
             "model": {"model_override": None},
             "reasoning": {"reasoning_override": None},
+            "browser": {"browser_backend_override": None},
         }.get(identity)
         if changes is None:
             return
@@ -3529,6 +3554,7 @@ class _SettingsPanel(QWidget):
     getting_started_requested = pyqtSignal()
     permissions_changed = pyqtSignal(dict)
     _shutdown_finished = pyqtSignal(bool)
+    _personal_browser_status_ready = pyqtSignal(dict)
 
     # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
     # last as an info-only row).
@@ -3616,6 +3642,10 @@ class _SettingsPanel(QWidget):
         self._startup_last_probe = datetime.min
         self._startup_status_ready.connect(self._apply_startup_status)
         self._shutdown_finished.connect(self._on_shutdown_finished)
+        self._personal_browser_status_ready.connect(
+            self._apply_personal_browser_status
+        )
+        self._personal_browser_probe_busy = False
         self._gmail_rest_status = {
             "status": "disconnected",
             "connected": False,
@@ -3716,6 +3746,7 @@ class _SettingsPanel(QWidget):
         sec_restart   = self._build_restart_section()       # Controlled relaunch
         sec_guide     = self._build_getting_started_section()
         sec_permissions = self._build_permissions_section()
+        sec_browser   = self._build_browser_section()
         sec_ai_prov   = self._build_ai_providers_section()  # Section 1
         sec_voice     = self._build_voice_section()         # Section 2 (TTS)
         sec_wake      = self._build_wake_section()           # Wake-word greeting
@@ -3742,6 +3773,7 @@ class _SettingsPanel(QWidget):
         self._settings_pages = [
             ("settings.cat.general",  [sec_language, sec_theme, sec_capsule, sec_restart, sec_guide]),
             ("settings.cat.permissions", [sec_permissions]),
+            ("settings.cat.browser",  [sec_browser]),
             ("settings.cat.models",   [sec_ai_prov, sec_hierarchy, sec_apikeys]),
             ("settings.cat.voice",    [sec_voice, sec_stt, sec_liveapi]),
             ("settings.cat.wake",     [sec_wake]),
@@ -4333,6 +4365,189 @@ class _SettingsPanel(QWidget):
             self._startup_rows.append((unit, dot, toggle))
 
         return wrap
+
+    def _build_browser_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        self._personal_browser_title = QLabel(i18n.t("settings.personal_browser"))
+        self._personal_browser_title.setObjectName("sectionTitle")
+        self._personal_browser_sub = QLabel(i18n.t("settings.personal_browser_sub"))
+        self._personal_browser_sub.setObjectName("sectionSub")
+        self._personal_browser_sub.setWordWrap(True)
+        self._personal_browser_desc = QLabel(i18n.t("settings.personal_browser_desc"))
+        self._personal_browser_desc.setObjectName("sectionDesc")
+        self._personal_browser_desc.setWordWrap(True)
+        layout.addWidget(self._personal_browser_title)
+        layout.addWidget(self._personal_browser_sub)
+        layout.addWidget(self._personal_browser_desc)
+
+        self._personal_browser_family = QComboBox()
+        self._personal_browser_family.setObjectName("voiceCombo")
+        for key, label in (
+            ("automatic", "Automatic"), ("chrome", "Chrome"),
+            ("edge", "Edge"), ("brave", "Brave"),
+        ):
+            self._personal_browser_family.addItem(label, key)
+        self._personal_browser_family.currentIndexChanged.connect(
+            self._on_personal_browser_family_changed
+        )
+        layout.addWidget(self._personal_browser_family)
+
+        self._personal_browser_session = QComboBox()
+        self._personal_browser_session.setObjectName("voiceCombo")
+        self._personal_browser_session.currentIndexChanged.connect(
+            self._on_personal_browser_session_changed
+        )
+        self._personal_browser_session.hide()
+        layout.addWidget(self._personal_browser_session)
+
+        self._personal_browser_status = QLabel(i18n.t("browser.state.setup_required"))
+        self._personal_browser_status.setObjectName("sectionDesc")
+        self._personal_browser_status.setWordWrap(True)
+        layout.addWidget(self._personal_browser_status)
+
+        buttons = QHBoxLayout()
+        self._personal_browser_setup = QPushButton(i18n.t("browser.setup"))
+        self._personal_browser_setup.setObjectName("saveBtn")
+        self._personal_browser_setup.clicked.connect(self._setup_personal_browser)
+        self._personal_browser_test = QPushButton(i18n.t("browser.test"))
+        self._personal_browser_test.setObjectName("ghostBtn")
+        self._personal_browser_test.clicked.connect(
+            lambda: self._refresh_personal_browser_status(force=True)
+        )
+        self._personal_browser_revoke = QPushButton(i18n.t("browser.revoke"))
+        self._personal_browser_revoke.setObjectName("ghostBtn")
+        self._personal_browser_revoke.clicked.connect(self._revoke_personal_browser)
+        buttons.addWidget(self._personal_browser_setup)
+        buttons.addWidget(self._personal_browser_test)
+        buttons.addWidget(self._personal_browser_revoke)
+        layout.addLayout(buttons)
+
+        self._personal_browser_remove = QPushButton(i18n.t("browser.remove"))
+        self._personal_browser_remove.setObjectName("ghostBtn")
+        self._personal_browser_remove.clicked.connect(self._remove_personal_browser)
+        layout.addWidget(self._personal_browser_remove)
+        return wrap
+
+    def _on_personal_browser_family_changed(self, _index: int) -> None:
+        value = self._personal_browser_family.currentData()
+        if value in {"automatic", "chrome", "edge", "brave"}:
+            set_setting("personal_browser_preference", value)
+            set_setting("personal_browser_instance_hint", "")
+            self._refresh_personal_browser_status(force=True)
+
+    def _on_personal_browser_session_changed(self, _index: int) -> None:
+        hint = self._personal_browser_session.currentData()
+        if isinstance(hint, str) and hint:
+            set_setting("personal_browser_instance_hint", hint)
+
+    def _run_personal_browser_action(self, action: str) -> None:
+        if self._personal_browser_probe_busy:
+            return
+        self._personal_browser_probe_busy = True
+        for button in (
+            self._personal_browser_setup, self._personal_browser_test,
+            self._personal_browser_revoke, self._personal_browser_remove,
+        ):
+            button.setEnabled(False)
+
+        def worker() -> None:
+            result = {}
+            try:
+                if action == "setup":
+                    from osia.personal_browser.registration import (
+                        development_extension_path, setup_personal_browser,
+                    )
+                    result = setup_personal_browser()
+                    if result.get("registered") and result.get("development"):
+                        try:
+                            webbrowser.open(development_extension_path().as_uri())
+                        except Exception:
+                            pass
+                elif action == "revoke":
+                    from osia.personal_browser.broker import get_personal_browser_broker
+                    result = get_personal_browser_broker().revoke_all()
+                elif action == "remove":
+                    from osia.personal_browser.registration import remove_personal_browser
+                    result = remove_personal_browser()
+                from osia.personal_browser.broker import get_personal_browser_broker
+                status = get_personal_browser_broker().status()
+                if result.get("reason"):
+                    status = dict(status, reason=result["reason"])
+            except Exception:
+                status = {"state": "disconnected", "targets": []}
+            try:
+                self._personal_browser_status_ready.emit(status)
+            except RuntimeError:
+                pass
+
+        threading.Thread(
+            target=worker, name=f"osia-personal-browser-{action}", daemon=True,
+        ).start()
+
+    def _setup_personal_browser(self) -> None:
+        self._run_personal_browser_action("setup")
+
+    def _revoke_personal_browser(self) -> None:
+        self._run_personal_browser_action("revoke")
+
+    def _remove_personal_browser(self) -> None:
+        self._run_personal_browser_action("remove")
+
+    def _refresh_personal_browser_status(self, force: bool = False) -> None:
+        del force
+        self._run_personal_browser_action("status")
+
+    def _apply_personal_browser_status(self, status: dict) -> None:
+        self._personal_browser_probe_busy = False
+        for button in (
+            self._personal_browser_setup, self._personal_browser_test,
+            self._personal_browser_revoke, self._personal_browser_remove,
+        ):
+            button.setEnabled(True)
+        state = str(status.get("state") or "disconnected")
+        reason = str(status.get("reason") or "")
+        text = i18n.t(f"browser.state.{state}")
+        if reason == "production_store_ids_missing":
+            text = i18n.t("browser.production_ids_missing")
+        self._personal_browser_status.setText(text)
+        targets = status.get("targets")
+        targets = targets if isinstance(targets, list) else []
+        self._personal_browser_session.blockSignals(True)
+        self._personal_browser_session.clear()
+        selected_hint = str(load_settings().get("personal_browser_instance_hint") or "")
+        available_hints = {
+            str(target.get("target_handle") or "")
+            for target in targets if isinstance(target, dict)
+        }
+        needs_explicit_choice = len(targets) > 1 or bool(
+            selected_hint and selected_hint not in available_hints and targets
+        )
+        if needs_explicit_choice:
+            self._personal_browser_session.addItem(
+                i18n.t("browser.choose_session"), "",
+            )
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            family = str(target.get("browser_family") or "").title()
+            instance = str(target.get("install_instance_id") or "")
+            label = (
+                f"{family} · instance {instance[-4:].upper()} · "
+                f"Window {target.get('window_id')} · {target.get('safe_origin')}"
+            )
+            hint = str(target.get("target_handle") or "")
+            self._personal_browser_session.addItem(label[:180], hint)
+            if hint == selected_hint:
+                self._personal_browser_session.setCurrentIndex(
+                    self._personal_browser_session.count() - 1
+                )
+        self._personal_browser_session.blockSignals(False)
+        self._personal_browser_session.setVisible(needs_explicit_choice)
 
     # ── Section 2: voice providers (text-to-speech) ────────────────────────
 
@@ -8715,6 +8930,15 @@ class _SettingsPanel(QWidget):
 
         settings = load_settings()
 
+        preference = str(settings.get("personal_browser_preference") or "automatic")
+        self._personal_browser_family.blockSignals(True)
+        for index in range(self._personal_browser_family.count()):
+            if self._personal_browser_family.itemData(index) == preference:
+                self._personal_browser_family.setCurrentIndex(index)
+                break
+        self._personal_browser_family.blockSignals(False)
+        self._refresh_personal_browser_status(force=True)
+
         lang = settings.get("language", i18n.DEFAULT_LANG) or i18n.DEFAULT_LANG
         self._language_combo.blockSignals(True)
         for i in range(self._language_combo.count()):
@@ -9150,6 +9374,14 @@ class _SettingsPanel(QWidget):
         self._permissions_desc.setText(i18n.t("permissions.settings_desc"))
         self._permissions_page.retranslate()
         self._refresh_permissions_summary()
+        self._personal_browser_title.setText(i18n.t("settings.personal_browser"))
+        self._personal_browser_sub.setText(i18n.t("settings.personal_browser_sub"))
+        self._personal_browser_desc.setText(i18n.t("settings.personal_browser_desc"))
+        self._personal_browser_family.setItemText(0, i18n.t("browser.family.automatic"))
+        self._personal_browser_setup.setText(i18n.t("browser.setup"))
+        self._personal_browser_test.setText(i18n.t("browser.test"))
+        self._personal_browser_revoke.setText(i18n.t("browser.revoke"))
+        self._personal_browser_remove.setText(i18n.t("browser.remove"))
 
         self._ai_title.setText(i18n.t("settings.ai_providers"))
         self._ai_sub.setText(i18n.t("settings.ai_providers_sub"))

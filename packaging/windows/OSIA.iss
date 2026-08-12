@@ -256,6 +256,7 @@ Filename: "{app}\OSIA.exe"; Description: "{cm:LaunchOSIA}"; Flags: nowait postin
 Filename: "{app}\OSIA.exe"; Parameters: "--wake"; Flags: nowait; Check: IsUpdateMode
 
 [UninstallRun]
+Filename: "{app}\OSIA.exe"; Parameters: "--osia-remove-personal-browser-registration"; Flags: runhidden waituntilterminated; RunOnceId: "OSIAPersonalBrowser"
 Filename: "{app}\OSIA.exe"; Parameters: "--osia-remove-integration"; Flags: runhidden waituntilterminated; RunOnceId: "OSIAIntegration"; Check: ShouldRemoveIntegration
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\tools\configure_lan_firewall.ps1"" -Action Remove"; Flags: runhidden waituntilterminated; RunOnceId: "OSIAFirewall"; Tasks: firewall; Check: ShouldRemoveIntegration
 

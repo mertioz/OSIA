@@ -50,6 +50,18 @@
       "handler_contract": "select_conversation_reference_v1"
     },
     {
+      "id": "browser.backend",
+      "canonical_alias": "browser",
+      "name": {"en": "Browser", "fr": "Navigateur"},
+      "description": {"en": "Choose isolated or Personal Browser for this turn", "fr": "Choisir le navigateur isolé ou personnel pour ce tour"},
+      "argument_hint": {"en": "personal|isolated", "fr": "personal|isolated"},
+      "kind": "selector",
+      "availability_predicate": "always",
+      "icon_semantic": "globe",
+      "chip_behavior": "removable",
+      "handler_contract": "select_browser_backend_v1"
+    },
+    {
       "id": "tools.info",
       "canonical_alias": "tools",
       "name": {"en": "Tools", "fr": "Outils"},

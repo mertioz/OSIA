@@ -10,6 +10,7 @@ from osia.slash_commands import (
     ModelOverride,
     SlashDirectiveError,
     SlashTurnDirectivesV1,
+    consume_browser_selector,
     consume_selected_alias,
     consume_palette_prefix,
     escaped_literal_text,
@@ -28,12 +29,46 @@ from osia.slash_commands import (
 def test_static_catalog_is_bilingual_bounded_and_byte_identical():
     entries = load_catalog()
     assert [entry["canonical_alias"] for entry in entries] == [
-        "web", "model", "reasoning", "conversation", "tools", "status", "help",
+        "web", "model", "reasoning", "conversation", "browser", "tools", "status", "help",
     ]
     assert all(entry["name"]["en"] and entry["name"]["fr"] for entry in entries)
     pc = Path("assets/slash_commands/catalog.v1.json").read_bytes()
     mobile = Path("../osia-mobile/assets/slash_commands/catalog.v1.json").read_bytes()
     assert pc == mobile
+
+
+def test_browser_selector_is_typed_turn_metadata_without_privilege_effect():
+    cleaned, backend = consume_browser_selector(
+        "  /browser personal vérifie cette page"
+    )
+    assert (cleaned, backend) == ("  vérifie cette page", "personal")
+    assert consume_browser_selector("utilise ma session navigateur") == (
+        "utilise ma session navigateur", None,
+    )
+    directives = SlashTurnDirectivesV1.from_wire({
+        "schema_version": 1,
+        "connector_hints": [],
+        "capability_requirements": {"current_web": False},
+        "conversation_refs": [],
+        "browser_backend_override": "personal",
+    })
+    assert directives.browser_backend_override == "personal"
+    assert SlashTurnDirectivesV1.from_wire(
+        directives.to_wire()
+    ).canonical_json() == directives.canonical_json()
+    with pytest.raises(SlashDirectiveError) as invalid:
+        SlashTurnDirectivesV1.from_wire({
+            **directives.to_wire(), "browser_backend_override": "automatic",
+        })
+    assert invalid.value.code == "unsupported_browser_backend"
+
+    class Agent:
+        permission_mode = "Standard"
+
+    agent = Agent()
+    apply_to_agent(agent, directives)
+    assert agent.permission_mode == "Standard"
+    assert agent._browser_backend_override_for_turn == "personal"
 
 
 @pytest.mark.parametrize(

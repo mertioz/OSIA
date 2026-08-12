@@ -888,7 +888,7 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
 
     if tool == "activate_browser_element":
         try:
-            from osia.tools.browser import prepare_browser_action_authorization
+            from osia.tools.browser_controller import prepare_browser_action_authorization
 
             prepared_action = prepare_browser_action_authorization(values)
         except Exception:
@@ -918,7 +918,7 @@ def guard_tool_call(user_request: str, tool_name: str, kwargs: dict) -> str | No
     # opaque or safe metadata and replace any model-supplied binding values.
     if tool == "upload_browser_file":
         try:
-            from osia.tools.browser import prepare_upload_authorization
+            from osia.tools.browser_controller import prepare_upload_authorization
 
             prepared = prepare_upload_authorization(values)
         except Exception:

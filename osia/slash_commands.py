@@ -23,6 +23,7 @@ MAX_RESULTS_PER_CATEGORY = 8
 MAX_TITLE_CHARS = 120
 MAX_PROJECT_CHARS = 80
 REASONING_LEVELS = frozenset({"auto", "off", "low", "medium", "high"})
+BROWSER_BACKENDS = frozenset({"personal", "isolated"})
 ALIAS_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _PARTIAL_ALIAS_RE = re.compile(r"^(?:[a-z][a-z0-9-]{0,31})?$")
 _CATALOG_PATH = (
@@ -39,6 +40,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "conversation_refs",
         "model_override",
         "reasoning_override",
+        "browser_backend_override",
     }
 )
 
@@ -192,6 +194,7 @@ class SlashTurnDirectivesV1:
     conversation_refs: tuple[ConversationRef, ...] = field(default_factory=tuple)
     model_override: ModelOverride | None = None
     reasoning_override: str | None = None
+    browser_backend_override: str | None = None
 
     @classmethod
     def from_wire(cls, raw: Any) -> "SlashTurnDirectivesV1":
@@ -233,12 +236,21 @@ class SlashTurnDirectivesV1:
                     "Unsupported reasoning level.",
                     "Niveau de raisonnement non pris en charge.",
                 )
+        browser_backend = value.get("browser_backend_override")
+        if browser_backend is not None:
+            if not isinstance(browser_backend, str) or browser_backend not in BROWSER_BACKENDS:
+                raise SlashDirectiveError(
+                    "unsupported_browser_backend",
+                    "Unsupported browser backend.",
+                    "Backend navigateur non pris en charge.",
+                )
         result = cls(
             connector_hints=connectors,
             capability_requirements=requirements,
             conversation_refs=refs,
             model_override=model,
             reasoning_override=reasoning,
+            browser_backend_override=browser_backend,
         )
         result._validate_bounds()
         return result
@@ -250,6 +262,7 @@ class SlashTurnDirectivesV1:
             + int(self.capability_requirements.current_web)
             + int(self.model_override is not None)
             + int(self.reasoning_override is not None)
+            + int(self.browser_backend_override is not None)
         )
         if count > MAX_MODIFIERS:
             raise SlashDirectiveError(
@@ -271,6 +284,7 @@ class SlashTurnDirectivesV1:
             or self.capability_requirements.current_web
             or self.model_override
             or self.reasoning_override is not None
+            or self.browser_backend_override is not None
         )
 
     def to_wire(self) -> dict[str, Any]:
@@ -284,6 +298,8 @@ class SlashTurnDirectivesV1:
             out["model_override"] = self.model_override.to_wire()
         if self.reasoning_override is not None:
             out["reasoning_override"] = self.reasoning_override
+        if self.browser_backend_override is not None:
+            out["browser_backend_override"] = self.browser_backend_override
         return out
 
     def canonical_json(self) -> str:
@@ -415,6 +431,17 @@ def consume_palette_prefix(text: str) -> str:
         return source
     token_end = 1 + len(query)
     return source[:leading] + tail[token_end:].lstrip()
+
+
+def consume_browser_selector(text: str) -> tuple[str, str | None]:
+    """Consume only the exact typed ``/browser personal|isolated`` prefix."""
+    source = str(text or "")
+    leading = len(source) - len(source.lstrip())
+    tail = source[leading:]
+    match = re.match(r"^/browser\s+(personal|isolated)(?:\s+|$)", tail)
+    if match is None:
+        return source, None
+    return source[:leading] + tail[match.end():], match.group(1)
 
 
 def _legacy_gmail(entry: Mapping[str, Any]) -> bool:
@@ -770,6 +797,7 @@ def apply_to_agent(agent: Any, directives: SlashTurnDirectivesV1) -> None:
             provider=directives.model_override.provider_id,
         )
     agent._reasoning_override_for_turn = directives.reasoning_override
+    agent._browser_backend_override_for_turn = directives.browser_backend_override
 
 
 def tool_allowed_for_directives(

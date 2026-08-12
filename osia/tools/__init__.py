@@ -65,8 +65,8 @@ def verify_tools() -> dict:
     # Importing osia.tools.browser also imports playwright; if either the
     # import or the binary detection fails, browser tools are unusable.
     try:
-        from osia.tools.browser import _detect_chromium_browser
-        results["browser"] = _detect_chromium_browser() is not None
+        from osia.tools.browser_controller import isolated_browser_available
+        results["browser"] = isolated_browser_available()
     except Exception:
         results["browser"] = False
 
