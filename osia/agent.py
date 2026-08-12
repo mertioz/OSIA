@@ -1600,6 +1600,41 @@ def tool_take_screenshot() -> str:
             pass
 
 
+def tool_inspect_desktop_surfaces(target: str = "") -> dict:
+    """Return opaque structured refs for the exact foreground desktop window."""
+
+    from osia.desktop_scene import inspect_desktop_surfaces
+
+    return inspect_desktop_surfaces(str(target or ""))
+
+
+def tool_request_visual_observation(
+    surface_ref: str,
+    reason: str,
+    target: str = "",
+) -> dict:
+    """Capture bounded visual evidence only for a proven Vision route."""
+
+    from osia.desktop_scene import request_visual_observation
+
+    return request_visual_observation(
+        str(surface_ref or ""),
+        str(reason or ""),
+        str(target or ""),
+    )
+
+
+def tool_activate_desktop_surface(surface_ref: str, objective: str) -> dict:
+    """Activate a fresh opaque surface through native accessibility patterns."""
+
+    from osia.desktop_scene import activate_desktop_surface
+
+    return activate_desktop_surface(
+        str(surface_ref or ""),
+        str(objective or ""),
+    )
+
+
 # Prompt sent to the vision model alongside a captured screenshot. FR-first to
 # match OSIA's default UX; the main model reformulates for the user's language.
 _SCREENSHOT_VISION_PROMPT = (
@@ -3688,6 +3723,8 @@ TOOL_MAP = {
     "open_application": tool_open_application,
     "open_uri": tool_open_uri,
     "take_screenshot": tool_take_screenshot,
+    "inspect_desktop_surfaces": tool_inspect_desktop_surfaces,
+    "request_visual_observation": tool_request_visual_observation,
     # Files
     "read_file": tool_read_file,
     "read_document": tool_read_document,
@@ -3754,6 +3791,7 @@ TOOL_MAP = {
     "upload_browser_file": tool_upload_browser_file,
     "download_browser_file": tool_download_browser_file,
     # Desktop automation (native apps — OS-level mouse/keyboard, WOR-42)
+    "activate_desktop_surface": tool_activate_desktop_surface,
     "desktop_click": tool_desktop_click,
     "desktop_type": tool_desktop_type,
     "desktop_press": tool_desktop_press,
@@ -9320,33 +9358,38 @@ class OSIAAgent:
 
         def _run_scoped():
             from osia.tools.browser_controller import browser_turn_scope
+            from osia import desktop_scene as _desktop_scene
 
-            with task_scope(), browser_turn_scope(browser_override):
-                with _execution_strategy.execution_strategy_scope(
-                    user_input,
-                    tuple(
-                        name for name in TOOL_MAP
-                        if tool_allowed_for_directives(
-                            name, self._slash_turn_directives,
-                        )
-                    ),
-                    strategy=self._terminality_strategy,
-                ) as active_strategy:
-                    try:
-                        return self._run_turn(
-                            user_input,
-                            max_tool_rounds=max_tool_rounds,
-                            on_sentence=on_sentence,
-                            history=history,
-                            max_tokens=max_tokens,
-                            on_first_token=on_first_token,
-                            current_conversation_id=current_conversation_id,
-                            canonical_output=canonical_output,
-                        )
-                    finally:
-                        self.last_execution_strategy_snapshot = (
-                            active_strategy.snapshot()
-                        )
+            desktop_tokens = _desktop_scene.begin_desktop_turn()
+            try:
+                with task_scope(), browser_turn_scope(browser_override):
+                    with _execution_strategy.execution_strategy_scope(
+                        user_input,
+                        tuple(
+                            name for name in TOOL_MAP
+                            if tool_allowed_for_directives(
+                                name, self._slash_turn_directives,
+                            )
+                        ),
+                        strategy=self._terminality_strategy,
+                    ) as active_strategy:
+                        try:
+                            return self._run_turn(
+                                user_input,
+                                max_tool_rounds=max_tool_rounds,
+                                on_sentence=on_sentence,
+                                history=history,
+                                max_tokens=max_tokens,
+                                on_first_token=on_first_token,
+                                current_conversation_id=current_conversation_id,
+                                canonical_output=canonical_output,
+                            )
+                        finally:
+                            self.last_execution_strategy_snapshot = (
+                                active_strategy.snapshot()
+                            )
+            finally:
+                _desktop_scene.end_desktop_turn(desktop_tokens)
 
         routing_token = _CHAT_ROUTING_CONTEXT.set(
             dict(self._chat_autonomous_context)
@@ -10936,31 +10979,43 @@ class OSIAAgent:
                                                 "identical_failed_read_only_call_blocked"
                                             ),
                                         )
-                                record = _execute_tool_with_policy(
-                                    tool_name,
-                                    dispatch_kwargs,
-                                    hard_deadline=(
-                                        guard.started_at + guard.hard_limit
-                                    ),
-                                    allow_retry=not final_external_call,
-                                    user_request=user_text,
-                                    lang=self.lang,
-                                    enforce_execution_permit=(
-                                        (
-                                            effective.confirmation in {
-                                                ConfirmationPolicy.CONFIRMATION_REQUIRED,
-                                                ConfirmationPolicy.FINAL_COMMIT_CONFIRMATION,
-                                            }
-                                            or final_external_call
-                                            or explicit_execution_permit
-                                        )
-                                        and not tool_name.startswith("gmail_")
-                                        and not tool_name.startswith("mcp__")
-                                    ),
-                                    attempt_context=self._new_tool_attempt_context(
-                                        repair_count=argument_repair_used,
-                                    ),
+                                from osia import desktop_scene as _desktop_scene
+
+                                model_route_token = (
+                                    _desktop_scene.bind_effective_model(
+                                        self.provider, self.model,
+                                    )
                                 )
+                                try:
+                                    record = _execute_tool_with_policy(
+                                        tool_name,
+                                        dispatch_kwargs,
+                                        hard_deadline=(
+                                            guard.started_at + guard.hard_limit
+                                        ),
+                                        allow_retry=not final_external_call,
+                                        user_request=user_text,
+                                        lang=self.lang,
+                                        enforce_execution_permit=(
+                                            (
+                                                effective.confirmation in {
+                                                    ConfirmationPolicy.CONFIRMATION_REQUIRED,
+                                                    ConfirmationPolicy.FINAL_COMMIT_CONFIRMATION,
+                                                }
+                                                or final_external_call
+                                                or explicit_execution_permit
+                                            )
+                                            and not tool_name.startswith("gmail_")
+                                            and not tool_name.startswith("mcp__")
+                                        ),
+                                        attempt_context=self._new_tool_attempt_context(
+                                            repair_count=argument_repair_used,
+                                        ),
+                                    )
+                                finally:
+                                    _desktop_scene.reset_effective_model(
+                                        model_route_token,
+                                    )
                                 if read_only_fingerprint and record.is_error:
                                     failed_read_only_calls.add(read_only_fingerprint)
                                 return record

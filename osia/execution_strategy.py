@@ -708,7 +708,10 @@ class ExecutionStrategy:
             return "type"
         if tool_name in {"open_uri", "navigate", "navigate_browser", "open_browser_tab"}:
             return "navigate"
-        if tool_name in {"click", "find_and_click", "desktop_click", "activate_browser_element"}:
+        if tool_name in {
+            "click", "find_and_click", "desktop_click",
+            "activate_desktop_surface", "activate_browser_element",
+        }:
             return "activate"
         if tool_name in {"search_web", "search_files"}:
             return "search"
@@ -1449,7 +1452,8 @@ class ExecutionStrategy:
 
 
 _OBSERVATION_TOOLS = frozenset({
-    "take_screenshot", "is_running", "is_installed", "has_window",
+    "take_screenshot", "inspect_desktop_surfaces", "request_visual_observation",
+    "is_running", "is_installed", "has_window",
     "steam_game_state", "web_state", "get_current_url", "read_page",
     "get_page_text", "inspect_browser_page", "inspect_form_fields",
     "list_browser_tabs", "get_browser_download", "read_file", "list_files",
@@ -1646,6 +1650,14 @@ def mechanism_for_tool(
     if tool_name == "desktop_click":
         # The composite owns DOM/UIA/keyboard/local/global selection internally.
         return None
+    if tool_name == "activate_desktop_surface":
+        return StrategyMechanism(
+            "native_accessibility", StrategyLayer.NATIVE_ACCESSIBILITY,
+            "fresh opaque native accessibility target",
+            application=goal.required_application, surface=goal.required_surface,
+            account=goal.required_account, covers_goal=False, mutation=True,
+            node_id=node_id,
+        )
     if tool_name in {"desktop_press", "desktop_type"}:
         return StrategyMechanism(
             "keyboard_focus", StrategyLayer.KEYBOARD,
@@ -1716,6 +1728,27 @@ def record_tool_observation(
 ) -> bool:
     strategy = strategy or current_execution_strategy()
     if strategy is None or tool_name not in _OBSERVATION_TOOLS or is_error:
+        return False
+    if tool_name in {"inspect_desktop_surfaces", "request_visual_observation"}:
+        receipt = result.get("receipt") if isinstance(result, dict) else None
+        receipt = receipt if isinstance(receipt, dict) else {}
+        safe_reason = _bounded(receipt.get("reason_code"), 64)
+        safe_outcome = _bounded(receipt.get("outcome"), 32)
+        safe_surface = _bounded(
+            receipt.get("surface_ref") or receipt.get("window_surface_ref"), 80,
+        )
+        safe_epoch = receipt.get("structural_epoch")
+        token = ":".join(str(item or "") for item in (
+            tool_name,
+            safe_reason,
+            safe_outcome,
+            safe_surface,
+            safe_epoch if isinstance(safe_epoch, int) else "",
+        ))
+        strategy.observe(
+            "bounded semantic desktop observation",
+            evidence_token=token,
+        )
         return False
     digest = hashlib.sha256(_bounded(result, 2000).encode("utf-8", errors="replace")).hexdigest()[:16]
     strategy.observe(f"read-only observation from {tool_name}", evidence_token=f"{tool_name}:{digest}")

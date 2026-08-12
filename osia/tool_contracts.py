@@ -743,6 +743,30 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               result=ResultPolicy.BOUNDED_MODEL_AND_SCREENSHOT,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               real=RealValidationRequirement.USER_VISIBLE),
+        _spec(
+              "inspect_desktop_surfaces",
+              "Observe the exact foreground native app as opaque window/view/tab/pane/control references; use before native actuation when focus, selection, panes, dialogs, or candidates matter",
+              _object({"target": _string(maximum=1000)}), R, I, NC,
+              preconditions=("foreground_desktop_surface_available",), timeout=12.0,
+              result=ResultPolicy.BOUNDED_MODEL_ONLY,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              progress=state, real=read_real),
+        _spec(
+              "request_visual_observation",
+              "Request one bounded window/region screenshot only when semantic desktop evidence is ambiguous, incomplete, custom-rendered, modal, small, conflicting, or needs visual verification; visual evidence never authorizes coordinate action",
+              _object({
+                  "surface_ref": IDENTIFIER,
+                  "reason": _string(enum=(
+                      "ambiguity", "incomplete_accessibility", "custom_rendered",
+                      "popup_or_overlay", "small_target", "state_conflict",
+                      "verification",
+                  ), maximum=32),
+                  "target": _string(maximum=1000),
+              }, required=("surface_ref", "reason")), R, I, NC,
+              preconditions=("effective_model_native_vision", "fresh_desktop_surface_ref"),
+              timeout=30.0, result=ResultPolicy.BOUNDED_MODEL_AND_SCREENSHOT,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              progress=state, real=RealValidationRequirement.USER_VISIBLE),
         _spec("read_file", "Read bounded local text", _object({"path": PATH}, required=("path",)),
               R, I, NC, preconditions=("readable_file",), progress=state, real=read_real,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),
@@ -976,6 +1000,16 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
         _spec("desktop_click", "Click one described native desktop target",
               _object({"description": _string(maximum=1000)}, required=("description",)),
               DY, D, FC, timeout=120.0, result=ResultPolicy.BOUNDED_MODEL_AND_SCREENSHOT,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              real=RealValidationRequirement.USER_VISIBLE),
+        _spec(
+              "activate_desktop_surface",
+              "Activate one fresh opaque native desktop surface through UIA Invoke/SelectionItem/Toggle/ExpandCollapse; objective must exactly match its current safe accessible label",
+              _object({
+                  "surface_ref": IDENTIFIER,
+                  "objective": _string(maximum=240),
+              }, required=("surface_ref", "objective")),
+              DY, D, FC, timeout=30.0,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               real=RealValidationRequirement.USER_VISIBLE),
         _spec("desktop_type", "Type text into the focused native application",
@@ -1717,6 +1751,7 @@ def is_final_browser_commit(tool_name: str, arguments: Mapping[str, Any]) -> boo
     field = {
         "click": "selector", "find_and_click": "text",
         "desktop_click": "description",
+        "activate_desktop_surface": "objective",
     }.get(name)
     return bool(field and _FINAL_COMMIT_RE.search(str(values.get(field) or "")))
 

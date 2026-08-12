@@ -304,7 +304,8 @@ def action_policy_prompt_block(lang: str | None = None) -> str:
 _LOCAL_CONFIRM_TOOLS = frozenset({"delete_file", "delete_directory", "kill_process"})
 _READ_ONLY_TOOLS = frozenset({
     "read_file", "list_files", "get_file_info", "search_files",
-    "take_screenshot", "get_system_info", "list_running_processes",
+    "take_screenshot", "inspect_desktop_surfaces", "request_visual_observation",
+    "get_system_info", "list_running_processes",
     "get_clipboard", "is_running", "is_installed", "has_window",
     "steam_game_state", "web_state", "read_page", "get_page_text",
     "get_current_url", "inspect_form_fields", "list_memories", "list_scheduled_tasks",
@@ -352,6 +353,7 @@ def _is_final_external_step(
         "find_and_click": "text",
         "click": "selector",
         "desktop_click": "description",
+        "activate_desktop_surface": "objective",
     }.get(tool)
     return bool(field and _FINAL_LABEL_RE.search(_normal(values.get(field, ""))))
 
@@ -2681,6 +2683,8 @@ def _tool_category(tool_name: str, confirmation_domain: str) -> str:
         return "filesystem"
     if tool_name in {
         "click", "find_and_click", "press_key", "desktop_click",
+        "activate_desktop_surface", "inspect_desktop_surfaces",
+        "request_visual_observation",
         "desktop_press", "desktop_type", "fill", "fill_form_field",
         "navigate", "open_browser", "type_text", "get_browser_state",
         "navigate_browser", "inspect_browser_page",
