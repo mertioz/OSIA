@@ -1,0 +1,41 @@
+{
+  "locale": "fr",
+  "extension_name": "OSIA Personal Browser",
+  "short_description": "Autorisez temporairement un onglet pour les tours OSIA Personal Browser explicites.",
+  "full_description": "OSIA Personal Browser relie un onglet que vous choisissez délibérément à l'application OSIA Desktop installée localement. Cliquez sur le bouton de l'extension dans l'onglet courant pour autoriser exactement cet onglet. L'extension permet alors à OSIA d'inspecter le texte visible et les éléments interactifs, puis d'effectuer l'opération de navigation que vous avez explicitement demandée.\n\nPersonal Browser n'est jamais le moteur de navigation par défaut. Vous devez sélectionner /browser personal pour le tour OSIA en cours. Les tours de navigation ordinaires d'OSIA continuent d'utiliser le profil navigateur isolé distinct d'OSIA. Sélectionner Personal Browser n'autorise pas un onglet à lui seul.\n\nL'autorisation est étroite et temporaire. Elle ne s'étend pas aux onglets voisins ou dupliqués, aux fenêtres contextuelles ni aux autres fenêtres. Une navigation vers une autre origine la révoque. Un redémarrage du navigateur ou d'OSIA ne restaure pas une ancienne autorisation, et vous pouvez révoquer immédiatement l'accès depuis OSIA. Les surfaces de connexion, d'authentification, de paiement, internes au navigateur et des boutiques d'extensions sont bloquées et restent manuelles.\n\nL'extension ne demande ni ne lit les cookies du navigateur, les mots de passe enregistrés, l'historique de navigation ou les bases de données du profil. Elle n'a aucune permission <all_urls>, aucune surveillance continue de la navigation en arrière-plan, aucun suivi ou outil d'analyse, et aucun code hébergé à distance. Elle communique avec l'hôte OSIA Desktop installé via Native Messaging local ; elle ne dépend d'aucun protocole navigateur localhost, TCP, WebSocket, Worker ou relais. OSIA Desktop peut inclure les observations nécessaires au tour demandé dans le contexte envoyé au fournisseur IA choisi par l'utilisateur, conformément à la politique de confidentialité OSIA.",
+  "single_purpose_statement": "Fournir à OSIA Desktop installé localement un accès temporaire et autorisé par l'utilisateur à un seul onglet explicitement sélectionné, pour un tour Personal Browser explicitement sélectionné.",
+  "setup_explanation": "Installez OSIA Desktop et son hôte Native Messaging Personal Browser. Installez et activez cette extension. Ouvrez la page qu'OSIA doit utiliser, cliquez sur le bouton OSIA Personal Browser dans cet onglet exact et vérifiez le badge ON. Dans OSIA, sélectionnez /browser personal pour le tour en cours. La configuration rend le bridge local disponible ; elle n'accorde aucun accès ambiant ni accès aux futurs onglets.",
+  "privacy_security_explanation": "L'extension traite uniquement le contenu du site, l'URL sans requête ni fragment, le titre de page, les métadonnées des éléments interactifs et les saisies de formulaire non sensibles nécessaires à l'opération Personal Browser demandée par l'utilisateur. Elle envoie ces éléments à OSIA Desktop via Native Messaging local et ne les envoie pas à un service réseau exploité par l'extension. Le contenu des pages et les valeurs de formulaire ne sont pas stockés par l'extension. OSIA peut transmettre au fournisseur de modèle choisi les observations nécessaires au tour, selon sa politique de confidentialité. Aucune donnée n'est utilisée pour l'analyse, la publicité, le profilage ou le suivi. L'autorisation est visible, limitée à un onglet et une origine exacts, révocable, et supprimée lors d'une navigation inter-origine, d'une perte de l'hôte ou d'un redémarrage. Les pages sensibles et les champs de mot de passe, code à usage unique, connexion, paiement, surfaces internes au navigateur et boutiques d'extensions sont bloqués.",
+  "support_text": "Support : contact@osia.space. Indiquez le nom et la version du navigateur, la version d'OSIA Desktop et l'état Personal Browser affiché. N'envoyez aucun mot de passe, code à usage unique, détail de paiement, contenu de page privée ou capture d'écran non expurgée.",
+  "reviewer_notes": "Cette extension accompagne OSIA Desktop et nécessite son hôte Native Messaging installé localement. Aucun compte privé ni identifiant n'est nécessaire pour la revue. Utilisez https://example.com. L'extension n'a pas de popup : cliquer sur son icône autorise l'onglet courant et affiche un badge ON. Le mode personnel est explicitement sélectionné pour un tour avec /browser personal ; le tour ordinaire suivant revient au moteur isolé. Une version distribuable d'OSIA Desktop destinée à la revue, dont la liste Native Messaging autorise l'identifiant final Chrome/Edge, est une dépendance de revue et doit être fournie avant la soumission.",
+  "permission_justifications": {
+    "activeTab": {
+      "used_for": "Accorder un accès temporaire uniquement après le clic de l'utilisateur sur le bouton de l'extension dans l'onglet courant sélectionné.",
+      "not_used_for": "Elle ne sert pas à un accès ambiant, aux onglets voisins ou dupliqués, à l'historique ou à une surveillance continue."
+    },
+    "scripting": {
+      "used_for": "Injecter l'agent de contenu OSIA fourni dans l'onglet explicitement autorisé afin d'exécuter l'inspection ou l'interaction demandée.",
+      "not_used_for": "Elle ne sert pas à une injection automatique sur tous les sites, à du code distant, aux surfaces de connexion/paiement ou aux onglets non autorisés."
+    },
+    "nativeMessaging": {
+      "used_for": "Échanger le protocole Personal Browser borné et versionné avec l'hôte Native Messaging OSIA installé localement.",
+      "not_used_for": "Elle ne sert pas à un service Internet, un endpoint localhost/TCP/WebSocket, un Worker, un relais ou une autre application native."
+    },
+    "storage": {
+      "used_for": "Conserver un identifiant d'installation borné ainsi que les métadonnées de session navigateur et d'autorisation de l'onglet exact nécessaires au cycle de vie local.",
+      "not_used_for": "Elle ne sert pas à stocker le contenu des pages, les valeurs de formulaire, cookies, mots de passe, historique, mesures d'audience, identifiants publicitaires ou profils de suivi."
+    }
+  },
+  "reviewer_test_instructions": [
+    "Installez la version OSIA Desktop de revue et vérifiez que Réglages > Personal Browser indique que l'hôte Native Messaging est disponible.",
+    "Installez et activez l'extension dans le navigateur de revue.",
+    "Ouvrez https://example.com dans un nouvel onglet.",
+    "Cliquez sur l'icône OSIA Personal Browser dans cet onglet exact et observez le badge ON/l'état autorisé.",
+    "Dans OSIA Desktop, sélectionnez /browser personal pour le tour en cours et demandez à OSIA d'inspecter le titre et le texte visible sans modifier la page.",
+    "Vérifiez qu'OSIA rapporte Example Domain depuis l'onglet explicitement autorisé.",
+    "Envoyez une nouvelle demande de navigation ordinaire sans /browser personal et vérifiez qu'OSIA utilise une session de navigateur isolée distincte.",
+    "Ouvrez un onglet voisin https://example.com sans cliquer sur l'extension dans celui-ci et vérifiez que Personal Browser ne l'expose pas.",
+    "Revenez à l'onglet autorisé et révoquez-le depuis OSIA ; vérifiez que le badge/la cible autorisée disparaît.",
+    "Demandez de nouveau /browser personal et vérifiez le blocage exact indiquant qu'aucun onglet n'est autorisé, sans repli vers le navigateur isolé."
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "locale": "en",
+  "extension_name": "OSIA Personal Browser",
+  "short_description": "Temporarily authorize one tab for explicit OSIA Personal Browser turns.",
+  "full_description": "OSIA Personal Browser connects one tab that you deliberately choose to the locally installed OSIA Desktop application. Click the extension button on the current tab to authorize that exact tab. The extension then lets OSIA inspect visible page text and interactive elements and perform the browser operation that you explicitly requested.\n\nPersonal Browser is never the default browser backend. You must select /browser personal for the current OSIA turn. Ordinary OSIA browser turns continue to use OSIA's separate isolated browser profile. Selecting Personal Browser does not authorize a tab by itself.\n\nAuthorization is narrow and temporary. It does not spread to sibling tabs, duplicated tabs, popups, or other windows. Cross-origin navigation revokes it. A browser or OSIA restart does not restore stale authorization, and you can revoke access immediately from OSIA. Login, authentication, payment, browser-internal, and extension-store surfaces are blocked for manual handling.\n\nThe extension does not request or read browser cookies, saved passwords, browsing history, or browser profile databases. It has no <all_urls> permission, no continuous background browsing surveillance, no analytics or tracking, and no remotely hosted code. It communicates with the installed OSIA Desktop host through local Native Messaging; it has no localhost, TCP, WebSocket, Worker, or relay browser-protocol dependency. OSIA Desktop may include observations needed for the requested turn in the context sent to the AI provider selected by the user, as described in the OSIA privacy policy.",
+  "single_purpose_statement": "Provide temporary, user-authorized access from locally installed OSIA Desktop to one explicitly selected browser tab for an explicitly selected Personal Browser turn.",
+  "setup_explanation": "Install OSIA Desktop and its Personal Browser Native Messaging host. Install and enable this extension. Open the page you want OSIA to use, click the OSIA Personal Browser toolbar button on that exact tab, and confirm the ON badge. In OSIA, select /browser personal for the current turn. Setup makes the local bridge available; it does not grant ambient or future-tab access.",
+  "privacy_security_explanation": "The extension handles only the website content, page URL without query or fragment, page title, interactive-element metadata, and non-sensitive form input needed for the user's requested Personal Browser operation. The extension sends this material over local Native Messaging to OSIA Desktop and does not send it to an extension-operated network service. Page content and form values are not stored by the extension. OSIA may pass necessary turn observations to the model provider selected by the user under OSIA's privacy policy. No data is used for analytics, advertising, profiling, or tracking. Authorization is visible, scoped to one exact tab and origin, revocable, and cleared on cross-origin navigation, host loss, or restart. Sensitive pages and password, one-time-code, login, payment, browser-internal, and extension-store surfaces are blocked.",
+  "support_text": "Support: contact@osia.space. Include the browser name/version, OSIA Desktop version, and the displayed Personal Browser status. Do not send passwords, one-time codes, payment details, private page content, or unredacted screenshots.",
+  "reviewer_notes": "This extension is a companion to OSIA Desktop and requires its locally installed Native Messaging host. No private account or credentials are required for review. Use https://example.com. The extension has no popup: clicking its toolbar icon authorizes the current tab and displays an ON badge. Personal mode is explicitly selected for one turn with /browser personal; the following ordinary turn returns to the isolated backend. A review-ready distributable OSIA Desktop build whose Native Messaging allowlist contains the final Chrome/Edge store ID is a release-review dependency and must be supplied before submission.",
+  "permission_justifications": {
+    "activeTab": {
+      "used_for": "Grant temporary access only after the user clicks the extension button on the selected current tab.",
+      "not_used_for": "It is not used for ambient access, sibling or duplicate tabs, browsing history, or continuous monitoring."
+    },
+    "scripting": {
+      "used_for": "Inject the bundled OSIA content agent into the explicitly authorized tab so the requested inspection or interaction can run.",
+      "not_used_for": "It is not used for automatic all-site injection, remote code, login/payment surfaces, or tabs the user did not authorize."
+    },
+    "nativeMessaging": {
+      "used_for": "Exchange the bounded, versioned Personal Browser protocol with the locally installed OSIA Native Messaging host.",
+      "not_used_for": "It is not used for an internet service, localhost/TCP/WebSocket endpoint, Worker, relay, or another native application."
+    },
+    "storage": {
+      "used_for": "Store a bounded installation identifier plus current browser-session and exact-tab authorization metadata required by the local lifecycle.",
+      "not_used_for": "It is not used to store page content, form values, cookies, passwords, history, analytics, advertising identifiers, or tracking profiles."
+    }
+  },
+  "reviewer_test_instructions": [
+    "Install the review OSIA Desktop build and verify that Settings > Personal Browser reports the Native Messaging host available.",
+    "Install and enable the extension in the review browser.",
+    "Open https://example.com in a new tab.",
+    "Click the OSIA Personal Browser extension icon on that exact tab and observe the ON badge/authorized status.",
+    "In OSIA Desktop, select /browser personal for the current turn and ask OSIA to inspect the page title and visible text without changing the page.",
+    "Verify that OSIA reports Example Domain from the explicitly authorized tab.",
+    "Send a new ordinary browser request without /browser personal and verify that OSIA uses a distinct isolated-browser session.",
+    "Open a sibling https://example.com tab without clicking the extension there and verify that Personal Browser does not expose it.",
+    "Return to the authorized tab and revoke it from OSIA; verify that the badge/authorized target disappears.",
+    "Request /browser personal again and verify the truthful no-authorized-tab blocker with no isolated fallback."
+  ]
+}

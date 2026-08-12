@@ -1,0 +1,11 @@
+{
+  "extensionName": {
+    "message": "OSIA Personal Browser"
+  },
+  "extensionDescription": {
+    "message": "Temporarily authorize one tab for explicit OSIA Personal Browser turns."
+  },
+  "actionTitle": {
+    "message": "Authorize this tab for OSIA"
+  }
+}
