@@ -575,6 +575,7 @@ class AttemptStatus(str, Enum):
     STALE = "stale_target"
     AMBIGUOUS = "ambiguous_effect"
     BLOCKED = "blocked"
+    INAPPLICABLE = "inapplicable"
 
 
 @dataclass
@@ -612,6 +613,7 @@ _TERMINAL_FOR_ESCALATION = frozenset({
     AttemptStatus.STAGNATED.value,
     AttemptStatus.STALE.value,
     AttemptStatus.AMBIGUOUS.value,
+    AttemptStatus.INAPPLICABLE.value,
 })
 
 
@@ -821,8 +823,12 @@ class ExecutionStrategy:
         *,
         outcome: str,
         evidence: str,
+        semantic_node_id: str = "",
     ) -> SemanticActionNode | None:
-        node = self.match_action_node(tool_name, arguments)
+        if semantic_node_id:
+            node = self.node_by_id(str(semantic_node_id))
+        else:
+            node = self.match_action_node(tool_name, arguments)
         if node is None:
             return None
         normalized = _normalized(outcome).replace(" ", "_")
@@ -856,6 +862,63 @@ class ExecutionStrategy:
     def register(self, mechanism: StrategyMechanism) -> None:
         with self._lock:
             self._mechanisms.setdefault(mechanism.mechanism_id, mechanism)
+
+    def mechanism_for_layer(
+        self,
+        layer: StrategyLayer,
+        *,
+        node_id: str = "",
+    ) -> StrategyMechanism | None:
+        with self._lock:
+            matches = [
+                item for item in self._mechanisms.values()
+                if item.layer is layer
+                and (not node_id or item.node_id == node_id)
+            ]
+            matches.sort(key=lambda item: item.mechanism_id)
+            return matches[0] if matches else None
+
+    def mark_inapplicable(
+        self,
+        mechanism: StrategyMechanism,
+        *,
+        reason_code: str,
+    ) -> StrategyAttempt | None:
+        """Retire one mechanism only with explicit applicability evidence."""
+
+        with self._lock:
+            self.register(mechanism)
+            if self._exhausted(mechanism.mechanism_id):
+                return next(
+                    (
+                        item for item in reversed(self.attempts)
+                        if item.mechanism_id == mechanism.mechanism_id
+                        and item.status == AttemptStatus.INAPPLICABLE.value
+                    ),
+                    None,
+                )
+            node = self._node_for_mechanism(mechanism)
+            attempt = StrategyAttempt(
+                attempt_id=f"strategy_{len(self.attempts) + 1:03d}",
+                mechanism_id=mechanism.mechanism_id,
+                layer=int(mechanism.layer),
+                mechanism=mechanism.label,
+                reason_selected=mechanism.reason_selected,
+                action_signature=self.action_signature(
+                    mechanism.mechanism_id,
+                    {"inapplicable": _bounded(reason_code, 120)},
+                ),
+                status=AttemptStatus.INAPPLICABLE.value,
+                failure_or_stagnation_reason=(
+                    _bounded(reason_code, 120) or "mechanism_inapplicable"
+                ),
+                node_id=node.node_id if node is not None else mechanism.node_id,
+            )
+            self.attempts.append(attempt)
+            attempt.alternatives_still_applicable = [
+                item.mechanism_id for item in self.remaining_mechanisms()
+            ]
+            return attempt
 
     def _node_for_mechanism(
         self,

@@ -210,7 +210,7 @@ def test_unverified_async_success_requires_read_only_reconciliation():
         assert decision.next_strategy == "reconcile_unknown_read_only"
 
 
-def test_initial_provider_tuple_is_durable_and_not_replayed_on_reentry():
+def test_provider_invocation_is_not_persisted_as_a_strategy_attempt():
     with tempfile.TemporaryDirectory() as tmp:
         controller = _controller(tmp, turn="durable-initial")
         invocation = controller.begin_invocation(
@@ -222,11 +222,12 @@ def test_initial_provider_tuple_is_durable_and_not_replayed_on_reentry():
         controller.record_provider_invocation_completed(invocation)
 
         restored = _controller(tmp, turn="durable-initial")
-        assert not restored.begin_invocation(
+        assert restored.begin_invocation(
             provider_route="p:m",
             strategy_id="provider_initial",
             postcondition="done",
         )
+        assert restored.snapshot()["strategy_attempt_evidence"] == []
 
 
 def test_cross_process_interrupted_provider_enters_read_only_reconciliation():
@@ -414,14 +415,16 @@ def test_unknown_effect_reconciles_before_blocking_mutation_replay():
         )
         assert invocation
         controller.record_provider_invocation_completed(invocation)
-        blocked = controller.evaluate(provider_route="p:m")
-        assert blocked.terminal_state == "blocked_verified"
-        assert blocked.reason_code == "safe_reconciliation_frontier_exhausted"
-        assert controller.reserve_final(
-            blocked.terminal_state,
-            reason_code=blocked.reason_code,
+        preserved = controller.evaluate(provider_route="p:m")
+        assert preserved.action == "wait"
+        assert preserved.reason_code == (
+            "reconciliation_not_executed_frontier_preserved"
+        )
+        assert not controller.reserve_final(
+            "blocked_verified",
+            reason_code="safe_reconciliation_frontier_exhausted",
             provider_route="p:m",
-            final_text="The effect remains unknown; safe verification is exhausted.",
+            final_text="must not finalize without reconciliation evidence",
         )
 
 
@@ -450,8 +453,11 @@ def test_each_unknown_effect_gets_one_read_only_reconciliation_before_blocking()
             postcondition=second.postcondition,
         )
         controller.record_provider_invocation_completed(second_invocation)
-        blocked = controller.evaluate(provider_route="p:m")
-        assert blocked.terminal_state == "blocked_verified"
+        preserved = controller.evaluate(provider_route="p:m")
+        assert preserved.action == "wait"
+        assert preserved.reason_code == (
+            "reconciliation_not_executed_frontier_preserved"
+        )
 
 
 def test_verified_postcondition_retires_reconciled_unknown_effect():
@@ -498,7 +504,7 @@ def test_productive_long_mission_has_no_invocation_cap():
         assert controller.evaluate().terminal_state == "success_verified"
 
 
-def test_repeated_no_progress_tuple_runs_once_then_blocks():
+def test_repeated_no_progress_provider_invocation_preserves_frontier():
     with tempfile.TemporaryDirectory() as tmp:
         controller = _controller(tmp)
         controller.set_strategy_frontier(("only-safe-strategy",))
@@ -510,8 +516,14 @@ def test_repeated_no_progress_tuple_runs_once_then_blocks():
         )
         assert invocation
         controller.record_provider_invocation_completed(invocation)
-        blocked = controller.evaluate(provider_route="p:m")
-        assert blocked.terminal_state == "blocked_verified"
+        preserved = controller.evaluate(provider_route="p:m")
+        assert preserved.action == "wait"
+        assert preserved.reason_code == (
+            "provider_no_progress_strategy_frontier_preserved"
+        )
+        assert controller.snapshot()["strategy_frontier"] == [
+            "only-safe-strategy"
+        ]
 
 
 def test_new_correlation_id_without_new_semantic_evidence_does_not_unlock_retry():
@@ -702,7 +714,7 @@ def test_native_provider_completed_status_is_not_osia_goal_proof():
             execution_required=True,
         )
         result = agent.terminality_result("native-not-terminal")
-        assert result["terminal_state"] == "blocked_verified"
+        assert result is None
         assert len(calls) > 1
 
 
@@ -753,9 +765,7 @@ def test_scheduled_action_narration_alone_cannot_be_success_verified():
             required_postconditions=("application visibly open",),
             execution_required=True,
         )
-        assert agent.terminality_result(
-            "scheduled-narration"
-        )["terminal_state"] == "blocked_verified"
+        assert agent.terminality_result("scheduled-narration") is None
 
 
 def test_autonomous_numeric_budget_does_not_hide_new_semantic_frontier():

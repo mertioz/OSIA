@@ -9,7 +9,7 @@ import json
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -21,7 +21,9 @@ from osia.desktop_surface import (
     SurfaceKind,
 )
 from osia.desktop_vision_policy import (
+    AccessibilityQuality,
     DesktopEvidence,
+    classify_accessibility_quality,
     decide_visual_observation,
 )
 from osia.image_inputs import image_input_decision
@@ -34,6 +36,9 @@ from osia.visual_observation import (
 
 _MAX_UIA_NODES = 320
 _MAX_MODEL_SURFACES = 80
+_ACTIONABLE_PATTERNS = frozenset({
+    "ExpandCollapse", "Invoke", "SelectionItem", "Toggle", "Value",
+})
 _SECURE_DESKTOP_PROCESS_NAMES = frozenset({
     "consent", "credentialuibroker", "lockapp", "logonui", "winlogon",
 })
@@ -57,9 +62,68 @@ class DesktopScene:
     scene_signature: str
     accessibility_complete: bool
     observed_at: float
+    uia_tree_observed: bool = True
+
+    def target_evidence(
+        self,
+        target: str = "",
+        *,
+        requested: DesktopSurfaceRef | None = None,
+        scene_changed: bool = False,
+    ) -> DesktopEvidence:
+        candidates = rank_surface_candidates(self.surfaces, target)
+        actionable_patterns = sum(
+            bool(_ACTIONABLE_PATTERNS.intersection(item.patterns))
+            for item in self.surfaces
+            if item.surface_kind is not SurfaceKind.WINDOW
+        )
+        actionable_candidates = sum(
+            bool(
+                item.enabled
+                and _ACTIONABLE_PATTERNS.intersection(item.patterns)
+            )
+            for item in candidates
+        )
+        return DesktopEvidence(
+            candidate_count=len(candidates),
+            actionable_candidate_count=actionable_candidates,
+            accessible_node_count=max(0, len(self.surfaces) - 1),
+            custom_rendered=bool(
+                len(self.surfaces) > 1 and actionable_patterns == 0
+            ),
+            popup_suspected=any(
+                item.surface_kind is SurfaceKind.DIALOG
+                for item in self.surfaces
+            ),
+            small_target=bool(
+                requested
+                and requested.bounds
+                and (
+                    requested.bounds.width < 48
+                    or requested.bounds.height < 28
+                )
+            ),
+            local_region_available=bool(
+                (requested and requested.bounds) or self.window_ref.bounds
+            ),
+            scene_changed=bool(scene_changed),
+            target_requested=bool(str(target or "").strip()),
+            actionable_pattern_count=actionable_patterns,
+            focus_observable=any(
+                item.focused and item.surface_kind is not SurfaceKind.WINDOW
+                for item in self.surfaces
+            ),
+            tree_observed=self.uia_tree_observed,
+            scene_window_exact=True,
+        )
+
+    def accessibility_quality(self, target: str = "") -> AccessibilityQuality:
+        return classify_accessibility_quality(self.target_evidence(target))
 
     def safe_dict(self, *, target: str = "") -> dict:
         candidates = rank_surface_candidates(self.surfaces, target)
+        evidence = self.target_evidence(target)
+        quality = classify_accessibility_quality(evidence)
         by_ref = {item.ref_id: item for item in self.surfaces}
         projected: list[DesktopSurfaceRef] = []
         projected_refs: set[str] = set()
@@ -89,6 +153,12 @@ class DesktopScene:
             "window_generation": self.window_ref.window_generation,
             "structural_epoch": self.structural_epoch,
             "accessibility_complete": self.accessibility_complete,
+            "accessibility_quality": quality.value,
+            "target_candidate_count": evidence.candidate_count,
+            "target_actionable_candidate_count": (
+                evidence.actionable_candidate_count
+            ),
+            "focus_observable": evidence.focus_observable,
             "observed_at": round(self.observed_at, 3),
             "selected_views": [
                 item.ref_id for item in self.surfaces
@@ -153,6 +223,16 @@ def effective_model_supports_vision() -> bool:
         route.get("model", ""),
         ("image/png",),
     ).usable
+
+
+def effective_model_image_route() -> tuple[str, str]:
+    """Return the exact bound route; never resolve a companion Vision model."""
+
+    route = _MODEL_ROUTE.get() or {}
+    provider = str(route.get("provider") or "").lower()
+    model = str(route.get("model") or "")
+    decision = image_input_decision(provider, model, ("image/png",))
+    return (provider, model) if decision.usable else ("", "")
 
 
 def _safe_label(value: object, *, password: bool = False) -> str:
@@ -380,11 +460,13 @@ def observe_foreground_scene(*, target: str = "") -> DesktopScene | None:
     rows = []
     controls = []
     root_is_modal = False
+    uia_tree_observed = False
     auto = dc._load_uiautomation()
     if auto is not None:
         try:
             with auto.UIAutomationInitializerInThread():
                 root = auto.ControlFromHandle(int(hwnd))
+                uia_tree_observed = root is not None
                 root_is_modal = _bool_property(root, "IsModal", False)
                 try:
                     root_children = root.GetChildren() if root else ()
@@ -463,6 +545,7 @@ def observe_foreground_scene(*, target: str = "") -> DesktopScene | None:
             controls = []
             rows = []
             root_is_modal = False
+            uia_tree_observed = False
 
     signature = _scene_signature(
         rows or [(class_name, window_bounds.to_safe_dict(), root_is_modal)]
@@ -608,6 +691,7 @@ def observe_foreground_scene(*, target: str = "") -> DesktopScene | None:
             for item in controls
         ) >= 2,
         observed_at=time.time(),
+        uia_tree_observed=uia_tree_observed,
     )
     _LAST_SCENE.set(scene)
     return scene
@@ -700,6 +784,9 @@ def request_visual_observation(
     surface_ref: str,
     reason: str,
     target: str = "",
+    *,
+    expected_application: str = "",
+    expected_window_generation: str = "",
 ) -> dict:
     """Capture only a proven current surface for the exact effective model."""
 
@@ -716,6 +803,20 @@ def request_visual_observation(
         return {
             "text": "ERROR: exact foreground desktop surface is unavailable.",
             "receipt": {"reason_code": "desktop_surface_unavailable"},
+        }
+    if (
+        (expected_application and scene.application_id != expected_application)
+        or (
+            expected_window_generation
+            and scene.window_ref.window_generation != expected_window_generation
+        )
+    ):
+        return {
+            "text": (
+                "ERROR: exact desktop window changed before targeted visual "
+                "observation; no screenshot was captured or sent."
+            ),
+            "receipt": {"reason_code": "desktop_surface_identity_changed"},
         }
     requested = next(
         (item for item in scene.surfaces if item.ref_id == str(surface_ref)),
@@ -752,18 +853,11 @@ def request_visual_observation(
             "text": "ERROR: unsupported visual observation reason.",
             "receipt": {"reason_code": "invalid_observation_reason"},
         }
-    evidence = DesktopEvidence(
-        candidate_count=len(candidates),
-        actionable_candidate_count=sum(item.enabled for item in candidates),
-        accessible_node_count=len(scene.surfaces) - 1,
-        custom_rendered=not scene.accessibility_complete,
+    evidence = replace(
+        scene.target_evidence(target, requested=requested),
         popup_suspected=bool(
             observation_reason is ObservationReason.POPUP_OR_OVERLAY
             and any(item.surface_kind is SurfaceKind.DIALOG for item in scene.surfaces)
-        ),
-        small_target=bool(
-            requested.bounds
-            and (requested.bounds.width < 48 or requested.bounds.height < 28)
         ),
         state_conflict=observation_reason is ObservationReason.STATE_CONFLICT,
         ambiguous_view=(
@@ -772,7 +866,6 @@ def request_visual_observation(
         ),
         visual_postcondition=observation_reason is ObservationReason.VERIFICATION,
         structured_postcondition_complete=False,
-        local_region_available=requested.bounds is not None,
     )
     store = _SCENE_STORES.get()
     if store is None:
@@ -905,20 +998,93 @@ def _find_runtime_control(root, runtime_id: tuple[int, ...]):
     return None
 
 
+def _pre_dispatch_failure(
+    text: str,
+    reason_code: str,
+    *,
+    failure_class: str = "mechanism_failed_continue",
+    scene: DesktopScene | None = None,
+    target: str = "",
+) -> dict:
+    """Build one canonical no-effect receipt and optional same-turn evidence."""
+
+    receipt = {
+        "schema_version": 1,
+        "dispatch_state": "not_dispatched",
+        "outcome": "confirmed_failure_before_effect",
+        "reason_code": str(reason_code),
+        "failure_class": str(failure_class),
+    }
+    result = {"text": str(text), "receipt": receipt}
+    if scene is None:
+        return result
+
+    quality = scene.accessibility_quality(target)
+    receipt["accessibility_quality"] = quality.value
+    receipt["window_surface_ref"] = scene.window_ref.ref_id
+    receipt["structural_epoch"] = scene.structural_epoch
+    if (
+        failure_class != "mechanism_failed_continue"
+        or quality is AccessibilityQuality.RICH_TARGET_RESOLVED
+    ):
+        receipt["adaptive_visual_observation"] = "not_needed"
+        return result
+    if not effective_model_supports_vision():
+        receipt["adaptive_visual_observation"] = "effective_model_non_vision"
+        return result
+
+    if any(
+        item.surface_kind is SurfaceKind.DIALOG for item in scene.surfaces
+    ):
+        observation_reason = ObservationReason.POPUP_OR_OVERLAY
+    elif quality is AccessibilityQuality.CUSTOM_RENDERED:
+        observation_reason = ObservationReason.CUSTOM_RENDERED
+    elif len(rank_surface_candidates(scene.surfaces, target)) > 1:
+        observation_reason = ObservationReason.AMBIGUITY
+    else:
+        observation_reason = ObservationReason.INCOMPLETE_ACCESSIBILITY
+    observation = request_visual_observation(
+        scene.window_ref.ref_id,
+        observation_reason.value,
+        target,
+        expected_application=scene.application_id,
+        expected_window_generation=scene.window_ref.window_generation,
+    )
+    observation_receipt = (
+        observation.get("receipt") if isinstance(observation, dict) else None
+    )
+    observation_receipt = (
+        observation_receipt if isinstance(observation_receipt, dict) else {}
+    )
+    receipt["adaptive_visual_observation"] = str(
+        observation_receipt.get("outcome")
+        or observation_receipt.get("reason_code")
+        or "unavailable"
+    )
+    receipt["visual_reason_code"] = str(
+        observation_receipt.get("reason_code") or ""
+    )
+    for key in ("observation", "scene", "screenshot"):
+        if key in observation:
+            result[key] = observation[key]
+    return result
+
+
 def activate_desktop_surface(surface_ref: str, objective: str) -> dict:
     """Re-resolve an opaque ref and invoke/select it through UIA, never coordinates."""
 
     if sys.platform != "win32":
-        return {
-            "text": "ERROR: native semantic activation is unavailable on this platform.",
-            "receipt": {"reason_code": "native_accessibility_unavailable"},
-        }
+        return _pre_dispatch_failure(
+            "ERROR: native semantic activation is unavailable on this platform.",
+            "native_accessibility_unavailable",
+        )
     scene = observe_foreground_scene()
     if scene is None:
-        return {
-            "text": "ERROR: exact foreground desktop surface is unavailable.",
-            "receipt": {"reason_code": "desktop_surface_unavailable"},
-        }
+        return _pre_dispatch_failure(
+            "ERROR: exact foreground desktop surface is unavailable.",
+            "desktop_surface_unavailable",
+            failure_class="surface_unavailable",
+        )
     runtime_ids = {
         DESKTOP_SURFACE_REGISTRY.native_identity(item.ref_id).runtime_id
         for item in scene.surfaces
@@ -934,15 +1100,40 @@ def activate_desktop_surface(surface_ref: str, objective: str) -> dict:
         current_runtime_ids=runtime_ids,
         current_bounds=current.bounds if current is not None else None,
     )
+    reresolved_from = ""
     if not resolution.resolved or resolution.native is None:
-        return {
-            "text": "ERROR: stale_reference; re-observe and re-resolve the semantic target.",
-            "receipt": {
-                "outcome": "not_dispatched",
-                "reason_code": "stale_semantic_reference",
-                "stale_reason": resolution.reason,
-            },
-        }
+        replacement = DESKTOP_SURFACE_REGISTRY.prove_equivalent(
+            surface_ref,
+            scene.surfaces,
+            objective_label=str(objective or ""),
+        )
+        replacement_resolution = (
+            DESKTOP_SURFACE_REGISTRY.resolve(
+                replacement.ref_id,
+                current_generation=scene.window_ref.window_generation,
+                current_epoch=scene.structural_epoch,
+                current_runtime_ids=runtime_ids,
+                current_bounds=replacement.bounds,
+            )
+            if replacement is not None else None
+        )
+        if (
+            replacement_resolution is not None
+            and replacement_resolution.resolved
+            and replacement_resolution.native is not None
+        ):
+            reresolved_from = str(surface_ref)
+            surface_ref = replacement.ref_id
+            resolution = replacement_resolution
+        else:
+            failure = _pre_dispatch_failure(
+                "ERROR: stale_reference; re-observe and re-resolve the semantic target.",
+                "stale_semantic_reference",
+                scene=scene,
+                target=str(objective or ""),
+            )
+            failure["receipt"]["stale_reason"] = resolution.reason
+            return failure
     normalized_objective = " ".join(str(objective or "").lower().split())
     normalized_label = " ".join(
         str(resolution.surface.accessible_label or "").lower().split()
@@ -952,30 +1143,36 @@ def activate_desktop_surface(surface_ref: str, objective: str) -> dict:
         or not normalized_label
         or normalized_objective != normalized_label
     ):
-        return {
-            "text": (
+        failure = _pre_dispatch_failure(
+            (
                 "ERROR: stale_reference; the stated objective no longer exactly "
                 "matches the resolved semantic surface."
             ),
-            "receipt": {
-                "outcome": "not_dispatched",
-                "reason_code": "stale_semantic_reference",
-                "stale_reason": "objective_surface_mismatch",
-            },
-        }
+            "stale_semantic_reference",
+            scene=scene,
+            target=str(objective or ""),
+        )
+        failure["receipt"]["stale_reason"] = "objective_surface_mismatch"
+        return failure
     if not resolution.native.runtime_id:
-        return {
-            "text": "ERROR: surface has no actionable accessibility runtime identity.",
-            "receipt": {"reason_code": "uia_runtime_id_unavailable"},
-        }
+        return _pre_dispatch_failure(
+            "ERROR: surface has no actionable accessibility runtime identity.",
+            "uia_runtime_id_unavailable",
+            scene=scene,
+            target=str(objective or ""),
+        )
     from osia.tools import desktop_control as dc
 
     auto = dc._load_uiautomation()
     if auto is None:
-        return {
-            "text": "ERROR: native accessibility is unavailable.",
-            "receipt": {"reason_code": "native_accessibility_unavailable"},
-        }
+        return _pre_dispatch_failure(
+            "ERROR: native accessibility is unavailable.",
+            "native_accessibility_unavailable",
+            scene=scene,
+            target=str(objective or ""),
+        )
+    dispatch_started = False
+    pre_dispatch_failure = None
     try:
         with auto.UIAutomationInitializerInThread():
             root = auto.ControlFromHandle(int(resolution.native.native_window_id))
@@ -984,43 +1181,67 @@ def activate_desktop_surface(surface_ref: str, objective: str) -> dict:
                 DESKTOP_SURFACE_REGISTRY.mark_stale(
                     surface_ref, "accessibility_runtime_id_disappeared",
                 )
-                return {
-                    "text": "ERROR: stale_reference; accessibility target disappeared.",
-                    "receipt": {
-                        "outcome": "not_dispatched",
-                        "reason_code": "stale_semantic_reference",
-                        "stale_reason": "accessibility_runtime_id_disappeared",
-                    },
-                }
-            mechanism = ""
-            for pattern_name, method_name in (
-                ("GetInvokePattern", "Invoke"),
-                ("GetSelectionItemPattern", "Select"),
-                ("GetTogglePattern", "Toggle"),
-                ("GetExpandCollapsePattern", "Expand"),
-            ):
-                try:
-                    pattern = getattr(control, pattern_name)()
-                    method = getattr(pattern, method_name, None) if pattern else None
-                    if callable(method):
-                        method()
-                        mechanism = pattern_name[3:-7].lower()
-                        break
-                except Exception:
-                    continue
-            if not mechanism:
-                return {
-                    "text": "ERROR: accessibility control has no safe actionable pattern.",
-                    "receipt": {"reason_code": "uia_action_pattern_unavailable"},
-                }
+                pre_dispatch_failure = (
+                    "ERROR: stale_reference; accessibility target disappeared.",
+                    "stale_semantic_reference",
+                    "accessibility_runtime_id_disappeared",
+                )
+                mechanism = ""
+            else:
+                mechanism = ""
+                for pattern_name, method_name in (
+                    ("GetInvokePattern", "Invoke"),
+                    ("GetSelectionItemPattern", "Select"),
+                    ("GetTogglePattern", "Toggle"),
+                    ("GetExpandCollapsePattern", "Expand"),
+                ):
+                    try:
+                        getter = getattr(control, pattern_name, None)
+                        pattern = getter() if callable(getter) else None
+                        method = getattr(pattern, method_name, None) if pattern else None
+                    except Exception:
+                        continue
+                    if not callable(method):
+                        continue
+                    dispatch_started = True
+                    method()
+                    mechanism = pattern_name[3:-7].lower()
+                    break
+                if not mechanism:
+                    pre_dispatch_failure = (
+                        "ERROR: accessibility control has no safe actionable pattern.",
+                        "uia_action_pattern_unavailable",
+                        "",
+                    )
     except Exception:
+        if not dispatch_started:
+            return _pre_dispatch_failure(
+                "ERROR: native accessibility invocation was unavailable before dispatch.",
+                "native_accessibility_invocation_unavailable",
+                scene=scene,
+                target=str(objective or ""),
+            )
         return {
             "text": "ERROR: native semantic activation failed after possible effect.",
             "receipt": {
+                "schema_version": 1,
+                "dispatch_state": "effect_unknown",
                 "outcome": "outcome_unknown",
                 "reason_code": "uia_activation_outcome_unknown",
+                "failure_class": "effect_reconciliation_required",
             },
         }
+    if pre_dispatch_failure is not None:
+        text, reason_code, stale_reason = pre_dispatch_failure
+        failure = _pre_dispatch_failure(
+            text,
+            reason_code,
+            scene=scene,
+            target=str(objective or ""),
+        )
+        if stale_reason:
+            failure["receipt"]["stale_reason"] = stale_reason
+        return failure
     return {
         "text": "Desktop surface activated through native accessibility.",
         "receipt": {
@@ -1029,6 +1250,7 @@ def activate_desktop_surface(surface_ref: str, objective: str) -> dict:
             "surface_ref": surface_ref,
             "mechanism": mechanism,
             "structural_epoch": scene.structural_epoch,
+            "reresolved_from": reresolved_from,
         },
     }
 
@@ -1039,6 +1261,7 @@ __all__ = [
     "begin_desktop_turn",
     "bind_effective_model",
     "effective_model_supports_vision",
+    "effective_model_image_route",
     "end_desktop_turn",
     "inspect_desktop_surfaces",
     "observe_foreground_scene",

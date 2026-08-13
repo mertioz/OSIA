@@ -2616,17 +2616,21 @@ def _vision_locate(path: str, description: str) -> dict:
     """
     try:
         import base64
-        from osia.config import load_settings
-        from osia.vision_router import resolve_vision_model, build_vision_client
-        from osia.models import model_has_vision
+        from osia.desktop_scene import effective_model_image_route
+        from osia.vision_router import build_vision_client
         from osia.utils.key_chain import with_key_rotation, KeyChainEmpty
 
-        settings = load_settings()
-        provider, model = resolve_vision_model(settings)
-        if not provider or not model or not model_has_vision(provider, model):
+        provider, model = effective_model_image_route()
+        if not provider or not model:
             return {"error": (
-                "ERROR: desktop_click needs a vision model to locate the target on "
-                "screen, but none is configured. Set a vision model in the settings."
+                "ERROR: the effective turn route has no proven native Vision "
+                "capability; no screenshot was sent for coordinate localization."
+            )}
+        if provider == "chatgpt_account":
+            return {"error": (
+                "ERROR: the effective account route supports in-turn visual "
+                "observation but no independent coordinate-Vision subcall; no "
+                "screenshot was sent by the legacy locator."
             )}
 
         try:
@@ -2889,14 +2893,12 @@ def _vision_refine_crop(path: str, description: str, x0: int, y0: int,
     call site rotates keys via ``with_key_rotation``)."""
     try:
         import base64
-        from osia.config import load_settings
-        from osia.vision_router import resolve_vision_model, build_vision_client
-        from osia.models import model_has_vision
+        from osia.desktop_scene import effective_model_image_route
+        from osia.vision_router import build_vision_client
         from osia.utils.key_chain import with_key_rotation
 
-        settings = load_settings()
-        provider, model = resolve_vision_model(settings)
-        if not provider or not model or not model_has_vision(provider, model):
+        provider, model = effective_model_image_route()
+        if not provider or not model or provider == "chatgpt_account":
             return None
         with open(path, "rb") as fh:
             b64 = base64.b64encode(fh.read()).decode("ascii")
@@ -2983,29 +2985,76 @@ def _vision_refine_crop(path: str, description: str, x0: int, y0: int,
         return None
 
 
-def _refine_click_target(x: int, y: int, description: str, _dc):
+def _capture_exact_foreground_window(path: str):
+    """Capture the exact current window and return its physical-pixel bounds."""
+
+    try:
+        from osia import desktop_scene
+
+        scene = desktop_scene.observe_foreground_scene()
+        bounds = scene.window_ref.bounds if scene is not None else None
+        if bounds is None:
+            return None
+        native = desktop_scene.DESKTOP_SURFACE_REGISTRY.native_identity(
+            scene.window_ref.ref_id,
+        )
+        if native is None:
+            return None
+        png_bytes, _capture_ms, _preparation_ms = (
+            desktop_scene._capture_bounds_timed(bounds)
+        )
+        from osia.tools import desktop_control as _desktop_control
+
+        foreground = _desktop_control._foreground_window_win32()
+        if (
+            not foreground
+            or int(foreground[0] or 0) != native.native_window_id
+            or int(foreground[2] or 0) != native.pid
+            or desktop_scene._window_bounds(native.native_window_id) != bounds
+        ):
+            return None
+        Path(path).write_bytes(png_bytes)
+        return bounds
+    except Exception:
+        return None
+
+
+def _refine_click_target(
+    x: int,
+    y: int,
+    description: str,
+    _dc,
+    *,
+    source_path: str = "",
+    source_origin: tuple[int, int] = (0, 0),
+):
     """Second pass of the vision-guided click for precision on small targets.
 
-    Moves the cursor to the coarse point (NO click), re-captures the screen,
-    crops a ``_REFINE_CROP_PX`` square centred on that point, and asks the vision
-    model for the corrected element centre inside that crop (a zoomed view locates
-    small elements — text links, tiny icons — far more precisely than the full
-    screen). Returns ``(screen_x, screen_y, refined)``: the sharpened coordinates
-    and ``True``, or the untouched ``(x, y)`` and ``False`` on ANY failure, so the
-    caller still clicks the coarse point rather than failing the whole click."""
+    Crops a ``_REFINE_CROP_PX`` square from the proven local source when one is
+    supplied; the compatibility path moves without clicking and captures the
+    screen. The Vision route returns the corrected element centre in physical
+    screen coordinates. Returns ``(screen_x, screen_y, refined)`` and ``True``,
+    or the untouched ``(x, y)`` and ``False`` on any failure so the caller can
+    safely keep the coarse point.
+    """
     try:
-        # Move the cursor to the coarse target first (no click). If even the move
-        # fails, the backend is not ready -> let the caller's click surface it.
-        mv = _dc.move_to(x, y)
-        if isinstance(mv, str) and mv.upper().startswith("ERROR"):
-            return x, y, False
         try:
             from PIL import Image
         except Exception:
             return x, y, False   # no Pillow -> cannot crop; keep the coarse target
-        refine_shot = str(Path(tempfile.gettempdir()) / "osia_desktop_refine.png")
-        if _capture_screen(refine_shot) is not None:
-            return x, y, False
+        origin_x, origin_y = source_origin
+        refine_shot = str(source_path or "")
+        if not refine_shot:
+            # Compatibility path for callers without a proven local surface.
+            mv = _dc.move_to(x, y)
+            if isinstance(mv, str) and mv.upper().startswith("ERROR"):
+                return x, y, False
+            refine_shot = str(
+                Path(tempfile.gettempdir()) / "osia_desktop_refine.png"
+            )
+            if _capture_screen(refine_shot) is not None:
+                return x, y, False
+            origin_x = origin_y = 0
         crop_path = str(Path(tempfile.gettempdir()) / "osia_desktop_crop.png")
         try:
             # Pillow ≥9.1 moved the resampling enum to Image.Resampling; fall back
@@ -3013,9 +3062,14 @@ def _refine_click_target(x: int, y: int, description: str, _dc):
             _lanczos = getattr(Image, "Resampling", Image).LANCZOS
             with Image.open(refine_shot) as im:
                 iw, ih = im.size
-                x0, cw = _crop_window(x, _REFINE_CROP_PX, iw)
-                y0, ch = _crop_window(y, _REFINE_CROP_PX, ih)
-                crop = im.crop((x0, y0, x0 + cw, y0 + ch))
+                local_x = x - int(origin_x)
+                local_y = y - int(origin_y)
+                x0_local, cw = _crop_window(local_x, _REFINE_CROP_PX, iw)
+                y0_local, ch = _crop_window(local_y, _REFINE_CROP_PX, ih)
+                crop = im.crop((
+                    x0_local, y0_local,
+                    x0_local + cw, y0_local + ch,
+                ))
                 # Real ZOOM (WOR-46 vol2): upscale the crop so the element is
                 # genuinely larger to the vision model — the precision the 2nd
                 # pass needs. The remap in _vision_refine_crop divides by the same
@@ -3027,10 +3081,16 @@ def _refine_click_target(x: int, y: int, description: str, _dc):
                 crop.save(crop_path)
         except Exception:
             return x, y, False
+        x0 = int(origin_x) + x0_local
+        y0 = int(origin_y) + y0_local
         print(f"[DESKTOP-REFINE] coarse=({x},{y}) screenshot={iw}x{ih} "
               f"crop origin=({x0},{y0}) native={cw}x{ch} "
               f"upscaled={cw*_REFINE_ZOOM}x{ch*_REFINE_ZOOM} (Z={_REFINE_ZOOM})")
         refined = _vision_refine_crop(crop_path, description, x0, y0, cw, ch)
+        try:
+            Path(crop_path).unlink(missing_ok=True)
+        except OSError:
+            pass
         if refined is None:
             return x, y, False
         fx, fy = refined
@@ -3085,7 +3145,9 @@ def tool_desktop_click(description: str) -> str:
         if active_strategy is None:
             return None
         goal = active_strategy.goal
-        mechanism = _execution_strategy.StrategyMechanism(
+        mechanism = active_strategy.mechanism_for_layer(
+            layer, node_id=goal.node_id,
+        ) or _execution_strategy.StrategyMechanism(
             mechanism_id,
             layer,
             reason,
@@ -3094,8 +3156,31 @@ def tool_desktop_click(description: str) -> str:
             account=goal.required_account,
             covers_goal=False,
             mutation=True,
+            node_id=goal.node_id,
         )
         return active_strategy.select(mechanism, {"target": description})
+
+    def _strategy_mark_inapplicable(mechanism_id, layer, reason):
+        if active_strategy is None:
+            return
+        goal = active_strategy.goal
+        mechanism = active_strategy.mechanism_for_layer(
+            layer, node_id=goal.node_id,
+        ) or _execution_strategy.StrategyMechanism(
+            mechanism_id,
+            layer,
+            reason,
+            application=goal.required_application,
+            surface=goal.required_surface,
+            account=goal.required_account,
+            covers_goal=False,
+            mutation=True,
+            node_id=goal.node_id,
+        )
+        active_strategy.mark_inapplicable(
+            mechanism,
+            reason_code=reason,
+        )
 
     def _strategy_record(decision, outcome, reason="", evidence=""):
         if active_strategy is None or decision is None:
@@ -3232,6 +3317,43 @@ def tool_desktop_click(description: str) -> str:
         # byte-identical to today; a re-capture failure leaves the prior `shot`.
         if sys.platform == "win32":
             _capture_screen(shot)
+        from osia.desktop_scene import effective_model_image_route
+
+        effective_vision_provider, _effective_vision_model = (
+            effective_model_image_route()
+        )
+        if not effective_vision_provider:
+            _strategy_mark_inapplicable(
+                "local_vision",
+                _execution_strategy.StrategyLayer.LOCAL_VISION,
+                "effective_model_non_vision",
+            )
+            _strategy_mark_inapplicable(
+                "global_vision",
+                _execution_strategy.StrategyLayer.GLOBAL_VISION,
+                "effective_model_non_vision",
+            )
+            return (
+                "ERROR: deterministic desktop mechanisms did not resolve the "
+                "target and the effective turn route is non-Vision; no model "
+                "screenshot was captured or sent."
+            )
+        if effective_vision_provider == "chatgpt_account":
+            _strategy_mark_inapplicable(
+                "local_vision",
+                _execution_strategy.StrategyLayer.LOCAL_VISION,
+                "independent_coordinate_vision_subcall_unavailable",
+            )
+            _strategy_mark_inapplicable(
+                "global_vision",
+                _execution_strategy.StrategyLayer.GLOBAL_VISION,
+                "independent_coordinate_vision_subcall_unavailable",
+            )
+            return (
+                "ERROR: use targeted in-turn VisualObservation on the effective "
+                "account route; the legacy locator cannot open an independent "
+                "Vision model and sent no screenshot."
+            )
         local_vision_decision = _strategy_mechanism(
             "local_vision",
             _execution_strategy.StrategyLayer.LOCAL_VISION,
@@ -3245,56 +3367,71 @@ def tool_desktop_click(description: str) -> str:
                 "ERROR: local vision strategy blocked before dispatch "
                 f"({local_vision_decision.reason_code})."
             )
-        loc = _vision_locate(shot, description)
+        local_shot = str(
+            Path(tempfile.gettempdir()) / "osia_desktop_window_local.png"
+        )
+        local_bounds = _capture_exact_foreground_window(local_shot)
+        loc = (
+            _vision_locate(local_shot, description)
+            if local_bounds is not None else
+            {"found": False, "reason": "exact local window capture unavailable"}
+        )
         if loc.get("error"):
             _strategy_record(
                 local_vision_decision,
                 "failed",
                 reason="coarse_localization_unavailable",
             )
+            try:
+                Path(local_shot).unlink(missing_ok=True)
+            except OSError:
+                pass
             return loc["error"]
-        if not loc.get("found"):
+        local_failed = not bool(loc.get("found"))
+        if local_failed:
             _strategy_record(
                 local_vision_decision,
                 "failed",
-                reason="target_not_visible_for_local_refinement",
+                reason=(
+                    "local_surface_capture_unavailable"
+                    if local_bounds is None else
+                    "target_not_visible_in_exact_local_window"
+                ),
             )
-            return (
-                f"ERROR: could not find \"{description}\" on screen "
-                f"({loc.get('reason', 'not visible')}). Take a screenshot to see what "
-                "is currently displayed, then try a different description."
-            )
-        cx, cy = loc["x"], loc["y"]
+        else:
+            cx = int(local_bounds.left) + int(loc["x"])
+            cy = int(local_bounds.top) + int(loc["y"])
+            fx, fy, refined = cx, cy, False
 
-        # Two-pass precision refinement: coarse full-screen locate -> move the cursor
-        # there (no click) -> fine locate on a 300x300 crop around it -> click the
+        # Two-pass precision refinement: coarse exact-window locate -> move the
+        # cursor there (no click) -> fine locate on a 300x300 crop -> click the
         # corrected point. Sharpens small targets (text links, tiny icons). Best-
         # effort: any hiccup (quota, vision error, not-found) falls back to the coarse
         # coordinates rather than failing the whole click. Gated by the
         # DESKTOP_CLICK_REFINE defaults ON so zoomed/local vision is attempted
         # before the coarse global-coordinate fallback. The environment toggle
         # remains available for bounded diagnostics.
-        if DESKTOP_CLICK_REFINE:
-            fx, fy, refined = _refine_click_target(cx, cy, description, _dc)
-            if refined:
-                used_strategy_decision = local_vision_decision
-            else:
-                _strategy_record(
-                    local_vision_decision,
-                    "failed",
-                    reason="local_zoom_refinement_stagnated",
-                )
-        else:
-            _strategy_record(
-                local_vision_decision,
-                "stagnated",
-                reason="local_zoom_explicitly_disabled",
+        if not local_failed and DESKTOP_CLICK_REFINE:
+            fx, fy, refined = _refine_click_target(
+                cx,
+                cy,
+                description,
+                _dc,
+                source_path=local_shot,
+                source_origin=(local_bounds.left, local_bounds.top),
             )
+            used_strategy_decision = local_vision_decision
+        elif not local_failed:
             print(f"[DESKTOP-REFINE] disabled (DESKTOP_CLICK_REFINE=off) — "
-                  f"clicking coarse ({cx}, {cy})")
-            fx, fy, refined = cx, cy, False
+                  f"clicking local coarse ({cx}, {cy})")
+            used_strategy_decision = local_vision_decision
 
-        if not refined:
+        try:
+            Path(local_shot).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        if local_failed:
             global_vision_decision = _strategy_mechanism(
                 "global_vision",
                 _execution_strategy.StrategyLayer.GLOBAL_VISION,
@@ -3308,6 +3445,26 @@ def tool_desktop_click(description: str) -> str:
                     "ERROR: global vision strategy blocked before dispatch "
                     f"({global_vision_decision.reason_code})."
                 )
+            global_loc = _vision_locate(shot, description)
+            if global_loc.get("error"):
+                _strategy_record(
+                    global_vision_decision,
+                    "failed",
+                    reason="global_localization_unavailable",
+                )
+                return global_loc["error"]
+            if not global_loc.get("found"):
+                _strategy_record(
+                    global_vision_decision,
+                    "failed",
+                    reason="target_not_visible_after_local_and_global_observation",
+                )
+                return (
+                    f"ERROR: could not find \"{description}\" after exact-window "
+                    "and last-resort global localization; no coordinates were used."
+                )
+            cx, cy = int(global_loc["x"]), int(global_loc["y"])
+            fx, fy, refined = cx, cy, False
             used_strategy_decision = global_vision_decision
 
     # Click IMMEDIATELY once coordinates are resolved — no vision describe in
@@ -8562,6 +8719,14 @@ class OSIAAgent:
             events = tuple(consume())
         except Exception:
             events = ()
+        bindings = getattr(self, "_provider_event_node_bindings", None)
+        if not isinstance(bindings, dict):
+            bindings = {}
+            self._provider_event_node_bindings = bindings
+        seen_events = getattr(self, "_provider_capability_events_seen", None)
+        if not isinstance(seen_events, set):
+            seen_events = set()
+            self._provider_capability_events_seen = seen_events
         for event in events:
             terminality = self._terminality_controller
             strategy = (
@@ -8583,6 +8748,47 @@ class OSIAAgent:
             semantic_postcondition = str(
                 getattr(event, "semantic_postcondition", "") or ""
             )
+            arguments_fingerprint = hashlib.sha256(
+                json.dumps(
+                    arguments,
+                    sort_keys=True,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    default=lambda _value: "<unsupported>",
+                ).encode("utf-8")
+            ).hexdigest()[:20]
+            correlation_id = (
+                ("attempt:" + attempt_id) if attempt_id else
+                ("item:" + item_id) if item_id else
+                (
+                    "semantic:" + semantic_node_id + ":" + identity + ":"
+                    + tool_name + ":" + arguments_fingerprint
+                ) if semantic_node_id else
+                ""
+            )
+            action_identity = ":".join((
+                identity,
+                tool_name,
+                arguments_fingerprint,
+            ))
+            event_identity = (
+                source,
+                correlation_id or (
+                    action_identity
+                ),
+                phase,
+                outcome,
+            )
+            if event_identity in seen_events:
+                continue
+            bound_event = bindings.get(correlation_id) if correlation_id else None
+            if (
+                isinstance(bound_event, dict)
+                and bound_event.get("action_identity")
+                and bound_event.get("action_identity") != action_identity
+            ):
+                continue
+            seen_events.add(event_identity)
 
             if (
                 phase == "completed"
@@ -8637,18 +8843,35 @@ class OSIAAgent:
 
             node = None
             evidence_ref = ":".join(
-                item for item in ("provider_native", attempt_id, item_id, outcome)
+                item for item in (
+                    "provider_native", attempt_id, item_id, identity, outcome,
+                )
                 if item
             )
             if source == "provider_native" and strategy is not None:
+                bound_event = bindings.get(correlation_id) if correlation_id else None
+                bound_node_id = (
+                    str(bound_event.get("node_id") or "")
+                    if isinstance(bound_event, dict) else
+                    str(bound_event or "")
+                )
+                bound_node_id = bound_node_id or semantic_node_id
                 node = strategy.record_external_event(
                     tool_name,
                     arguments,
                     outcome=outcome,
                     evidence=evidence_ref,
+                    semantic_node_id=bound_node_id,
                 )
+                if node is None and bound_node_id:
+                    node = strategy.node_by_id(bound_node_id)
                 if node is None and semantic_node_id:
                     node = strategy.node_by_id(semantic_node_id)
+                if node is not None and correlation_id:
+                    bindings.setdefault(correlation_id, {
+                        "node_id": node.node_id,
+                        "action_identity": action_identity,
+                    })
             if source == "provider_native" and outcome == "outcome_unknown":
                 summary["unknown"] = True
                 summary["barrier"] = True

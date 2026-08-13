@@ -32,6 +32,11 @@ class TerminalState(str, Enum):
 
 
 TERMINAL_STATES = frozenset(item.value for item in TerminalState)
+_STRATEGY_ATTEMPT_EVIDENCE_STATUSES = frozenset({
+    "ambiguous_effect", "failed", "inapplicable", "progressed", "stagnated",
+    "stale_target", "succeeded",
+})
+_MAX_PROVIDER_GUIDANCE_WITHOUT_ATTEMPT = 1
 
 
 @dataclass(frozen=True)
@@ -145,6 +150,8 @@ class TurnTerminalityController:
                     "strategy_snapshot": {},
                     "strategy_frontier": [],
                     "attempted_strategy_tuples": [],
+                    "strategy_attempt_evidence": [],
+                    "strategy_attempt_revision": 0,
                     "invocations": [],
                     "evidence_revision": 0,
                     "progress_revision": 0,
@@ -280,7 +287,7 @@ class TurnTerminalityController:
         strategy_id: str,
         postcondition: str = "",
     ) -> str:
-        """Reserve a distinct provider segment and its no-progress tuple."""
+        """Reserve a provider segment without claiming a mechanism attempt."""
 
         route = _bounded(provider_route, 160) or "default"
         strategy = _bounded(strategy_id, 160) or "provider_initial"
@@ -310,11 +317,6 @@ class TurnTerminalityController:
             target = _bounded(postcondition, 512) or (
                 str((self._state.get("remaining_work") or required or [""])[0])
             )
-            attempt_tuple = [target, strategy, route, self.evidence_revision]
-            attempted = self._state.setdefault("attempted_strategy_tuples", [])
-            if attempt_tuple in attempted:
-                return ""
-            attempted.append(attempt_tuple)
             invocation_id = "inv_" + secrets.token_urlsafe(18)
             self._state.setdefault("invocations", []).append({
                 "invocation_id": invocation_id,
@@ -322,6 +324,9 @@ class TurnTerminalityController:
                 "strategy_id": strategy,
                 "postcondition": target,
                 "evidence_revision": self.evidence_revision,
+                "strategy_attempt_revision": int(
+                    self._state.get("strategy_attempt_revision") or 0
+                ),
                 "owner_pid": os.getpid(),
                 "status": "active",
                 "started_at": _now(),
@@ -364,8 +369,40 @@ class TurnTerminalityController:
             self._state["strategy_frontier"] = [
                 _bounded(item, 160) for item in frontier if _bounded(item, 160)
             ][:64]
-            if self.execution_required and not self._state["strategy_frontier"]:
+            if (
+                self.execution_required
+                and not safe.get("mechanisms")
+                and not self._state["strategy_frontier"]
+            ):
                 self._state["strategy_frontier"] = ["provider_capability_selection"]
+            attempt_evidence = self._state.setdefault(
+                "strategy_attempt_evidence", [],
+            )
+            added_attempts = 0
+            for item in safe.get("attempts") or []:
+                if not isinstance(item, dict):
+                    continue
+                status = _bounded(item.get("status"), 80)
+                if status not in _STRATEGY_ATTEMPT_EVIDENCE_STATUSES:
+                    continue
+                identity = {
+                    "attempt_id": _bounded(item.get("attempt_id"), 192),
+                    "mechanism_id": _bounded(item.get("mechanism_id"), 160),
+                    "node_id": _bounded(item.get("node_id"), 160),
+                    "status": status,
+                    "reason_code": _bounded(
+                        item.get("failure_or_stagnation_reason"), 160,
+                    ),
+                }
+                if identity in attempt_evidence:
+                    continue
+                attempt_evidence.append(identity)
+                added_attempts += 1
+            if added_attempts:
+                self._state["strategy_attempt_evidence"] = attempt_evidence[-128:]
+                self._state["strategy_attempt_revision"] = int(
+                    self._state.get("strategy_attempt_revision") or 0
+                ) + added_attempts
             proven = safe.get("proven_postconditions") or {}
             if isinstance(proven, dict):
                 for postcondition, evidence in proven.items():
@@ -613,27 +650,44 @@ class TurnTerminalityController:
             self._state["hard_safety_reason"] = _bounded(reason_code, 160) or "absolute_safety_barrier"
             self._persist()
 
+    def _provider_guidance_count(
+        self,
+        provider_route: str,
+        strategy_id: str,
+        postcondition: str,
+    ) -> int:
+        revision = int(self._state.get("strategy_attempt_revision") or 0)
+        return sum(
+            1
+            for item in self._state.get("invocations") or []
+            if item.get("status") == "provider_invocation_completed"
+            and str(item.get("provider_route") or "") == provider_route
+            and str(item.get("strategy_id") or "") == strategy_id
+            and str(item.get("postcondition") or "") == postcondition
+            and int(item.get("strategy_attempt_revision") or 0) == revision
+        )
+
     def _next_strategy(self, provider_route: str) -> tuple[str, str]:
         remaining_work = list(self._state.get("remaining_work") or [])
         if not remaining_work:
             return "", ""
-        attempted = self._state.get("attempted_strategy_tuples") or []
         frontier = list(self._state.get("strategy_frontier") or [])
         for postcondition in remaining_work:
             for strategy_id in frontier:
-                candidate = [postcondition, strategy_id, provider_route, self.evidence_revision]
-                if candidate not in attempted:
+                if self._provider_guidance_count(
+                    provider_route, str(strategy_id), str(postcondition),
+                ) < _MAX_PROVIDER_GUIDANCE_WITHOUT_ATTEMPT:
                     return str(strategy_id), str(postcondition)
         return "", ""
 
     def _next_reconciliation(self, provider_route: str) -> tuple[str, str]:
-        attempted = self._state.get("attempted_strategy_tuples") or []
         route = _bounded(provider_route, 160) or "default"
         strategy = "reconcile_unknown_read_only"
         for unknown_key in sorted(self._state.get("unknown_effects") or {}):
             target = "reconcile:" + unknown_key
-            candidate = [target, strategy, route, self.evidence_revision]
-            if candidate not in attempted:
+            if self._provider_guidance_count(
+                route, strategy, target,
+            ) < _MAX_PROVIDER_GUIDANCE_WITHOUT_ATTEMPT:
                 return strategy, target
         return "", ""
 
@@ -673,8 +727,8 @@ class TurnTerminalityController:
                         postcondition=target,
                     )
                 return TerminalityDecision(
-                    "terminal", TerminalState.BLOCKED_VERIFIED.value,
-                    "safe_reconciliation_frontier_exhausted",
+                    "wait",
+                    reason_code="reconciliation_not_executed_frontier_preserved",
                 )
             if not self.execution_required and informational_answer_satisfied:
                 postcondition = str(self._state["required_postconditions"][0])
@@ -689,6 +743,11 @@ class TurnTerminalityController:
                 return TerminalityDecision(
                     "continue", reason_code="safe_semantic_strategy_remains",
                     next_strategy=strategy, postcondition=postcondition,
+                )
+            if self._state.get("strategy_frontier"):
+                return TerminalityDecision(
+                    "wait",
+                    reason_code="provider_no_progress_strategy_frontier_preserved",
                 )
             return TerminalityDecision(
                 "terminal", TerminalState.BLOCKED_VERIFIED.value,
@@ -707,7 +766,9 @@ class TurnTerminalityController:
             "active_attempts": state.get("active_attempts") or {},
             "permission_state": state.get("permission_state") or "none",
             "unknown_effects": state.get("unknown_effects") or {},
-            "attempts_not_to_replay": (state.get("attempted_strategy_tuples") or [])[-32:],
+            "attempts_not_to_replay": (
+                state.get("strategy_attempt_evidence") or []
+            )[-32:],
             "next_strategy": decision.next_strategy,
             "target_postcondition": decision.postcondition,
         }
@@ -747,10 +808,8 @@ class TurnTerminalityController:
             if state == TerminalState.BLOCKED_VERIFIED.value and (
                 self._state.get("active_attempts")
                 or self._state.get("permission_state") == "pending"
-                or (
-                    self._state.get("unknown_effects")
-                    and self._next_reconciliation(provider_route) != ("", "")
-                )
+                or self._state.get("strategy_frontier")
+                or self._state.get("unknown_effects")
                 or self._next_strategy(
                     _bounded(provider_route, 160) or "default"
                 ) != ("", "")

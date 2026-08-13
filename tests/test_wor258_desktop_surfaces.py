@@ -68,6 +68,12 @@ def _public(
         parent_ref=parent,
         bounds=bounds,
         runtime_signature="runtime_fixture_" + ref_id,
+        patterns=(
+            ("SelectionItem",)
+            if role in {"ListItemControl", "TabItemControl"} else
+            ("Invoke",) if role == "ButtonControl" else
+            ()
+        ),
         structural_epoch=epoch,
         observed_at=100.0,
     )
@@ -303,6 +309,7 @@ def test_re_resolution_requires_one_semantically_equivalent_candidate():
         **{
             **candidate.__dict__,
             "application_id": original.application_id,
+            "process_ref": original.process_ref,
         }
     )
 

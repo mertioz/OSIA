@@ -412,7 +412,10 @@ class DesktopSurfaceRegistry:
             if (
                 candidate.ref_id != old.ref_id
                 and candidate.application_id == old.application_id
+                and candidate.process_ref == old.process_ref
+                and candidate.surface_kind is old.surface_kind
                 and candidate.role == old.role
+                and candidate.enabled
                 and label
                 and label == expected
             ):
