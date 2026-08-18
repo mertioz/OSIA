@@ -1,19 +1,16 @@
-# Proposed OSIA privacy-policy update — Personal Browser
+# OSIA draft privacy-policy synchronization — Personal Browser
 
-## Audit result
+## Synchronization result — 2026-08-18
 
-The public page at `https://osia.space/legal/privacy` returned HTTP 200 on 2026-08-12, but it is explicitly marked `2026-07-14-draft.1`, “not approved or in force,” and `noindex, nofollow`. It does not describe the Personal Browser extension, explicit tab authorization, or Native Messaging lifecycle. It is therefore not yet an adequate production store privacy-policy source.
+The canonical legal source now contains the factual Personal Browser disclosure in internal version `2026-08-18-draft.3`: optional/non-default use, exact-tab authorization, local Native Messaging, bounded page/form observations, selected-provider context, sensitive-surface exclusions, revocation and extension-side non-persistence. It also records that the extension is unpublished, Chrome/Edge store preparation is paused, and no store ID exists.
 
-The exact update point is after current section **13. Outils et contrôle de l'ordinateur**. Add the dedicated section below, then make the following related edits:
+This synchronization does not make that policy an adequate production store source. The legal pages remain unapproved, not in force, `noindex, nofollow`, without an effective date and with acceptance disabled. Before any store submission, the owner and legal reviewer must approve the complete policy and the store dashboards must match the final extension package.
 
-- section **23. Catégories de destinataires**: clarify that Personal Browser has no extension-operated server, Worker, or relay browser protocol, while necessary tool observations may reach the AI provider selected in OSIA;
-- section **27. Durées de conservation**: add installation identifier, browser-session identifier, exact-tab authorization metadata, and the non-persistence of page/form content by the extension;
-- section **29. Contrôles et effacement**: add exact-tab revoke, cross-origin revoke, browser/OSIA restart clearing, removal of extension data, and uninstall;
-- section **35. Date d'effet et version**: issue a new reviewed version before either store submission.
+The canonical draft now includes the dedicated section after **13. Outils, Gmail et contrôle de l’ordinateur** and related updates to recipients, retention, controls and version state. Extension-specific installation/session metadata remains detailed in `privacy-disclosures.md`; it must be reconciled again against the final store build before submission.
 
-The final public policy must be accessible, accurate, approved for publication, and consistent with both store dashboards. Do not use the current draft URL as a production disclosure until that gate is resolved.
+The final policy must be accessible, accurate, approved for publication and consistent with both store dashboards. Do not enter the current draft URL as an approved production disclosure until that gate is resolved.
 
-## Proposed English section
+## English store-review wording candidate
 
 ### Personal Browser extension and explicit tab access
 
@@ -25,7 +22,7 @@ The extension does not request or extract browser cookies, saved passwords, auth
 
 The extension stores a random installation identifier locally until extension data is removed. Browser-session and exact-tab authorization metadata remain in session storage only for the active browser session. Page content and form values are not persisted by the extension. Authorization ends on explicit revoke, cross-origin navigation, Native Messaging host loss, browser or OSIA restart, extension-data removal, or uninstall. The extension's data use is limited to providing the disclosed Personal Browser feature and follows the Chrome Web Store User Data Policy and its Limited Use requirements; it is not used or shared for advertising, tracking, data brokerage, credit decisions, or sale.
 
-## Proposition de section française
+## Texte français candidat pour la revue Store
 
 ### Extension Personal Browser et accès explicite à un onglet
 

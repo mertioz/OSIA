@@ -20,16 +20,16 @@ from pathlib import Path
 from osia.config import CONFIG_DIR
 
 PUBLICATION_STATE = "draftForLegalReview"
-TERMS_VERSION = "2026-07-14-draft.1"
-PRIVACY_VERSION = "2026-07-14-draft.1"
-LAST_UPDATED = "2026-07-14"
+TERMS_VERSION = "2026-08-18-draft.3"
+PRIVACY_VERSION = "2026-08-18-draft.3"
+LAST_UPDATED = "2026-08-18"
 PUBLIC_CONTACT_EMAIL = "contact@osia.space"
 GOVERNING_LAW = "France"
 PLANNED_EFFECTIVE_YEAR = 2026
 EFFECTIVE_DATE: str | None = None
-MATERIAL_CHANGE = False
+MATERIAL_CHANGE = True
 TERMS_ACCEPTANCE_REQUIRED = False
-MINIMUM_AGE: int | None = None
+MINIMUM_AGE: int | None = 18
 TERMS_URL = "https://osia.space/legal/terms"
 PRIVACY_URL = "https://osia.space/legal/privacy"
 LEGAL_MANIFEST_URL = "https://osia.space/legal-manifest.json"

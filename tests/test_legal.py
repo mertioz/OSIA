@@ -10,13 +10,17 @@ class LegalManifestTests(unittest.TestCase):
     def test_bundled_manifest_matches_site_urls_and_review_version(self):
         self.assertEqual(legal.TERMS_URL, "https://osia.space/legal/terms")
         self.assertEqual(legal.PRIVACY_URL, "https://osia.space/legal/privacy")
-        self.assertEqual(legal.TERMS_VERSION, "2026-07-14-draft.1")
-        self.assertEqual(legal.PRIVACY_VERSION, "2026-07-14-draft.1")
+        self.assertEqual(legal.TERMS_VERSION, "2026-08-18-draft.3")
+        self.assertEqual(legal.PRIVACY_VERSION, "2026-08-18-draft.3")
+        self.assertEqual(legal.LAST_UPDATED, "2026-08-18")
         self.assertEqual(legal.PUBLICATION_STATE, "draftForLegalReview")
         self.assertEqual(legal.PUBLIC_CONTACT_EMAIL, "contact@osia.space")
         self.assertEqual(legal.GOVERNING_LAW, "France")
         self.assertEqual(legal.PLANNED_EFFECTIVE_YEAR, 2026)
         self.assertIsNone(legal.EFFECTIVE_DATE)
+        self.assertTrue(legal.MATERIAL_CHANGE)
+        self.assertFalse(legal.TERMS_ACCEPTANCE_REQUIRED)
+        self.assertEqual(legal.MINIMUM_AGE, 18)
 
     def test_dev_and_review_builds_never_block(self):
         state = legal.AcceptanceState()

@@ -2,6 +2,8 @@
 
 This matrix describes the delivered extension and local OSIA Personal Browser path. “Transmitted locally” means the extension sends data to the same-user OSIA Desktop Native Messaging host; it does not mean that the extension opens a network connection. If the user selected a cloud AI provider in OSIA, OSIA Desktop may include the observations needed for the requested turn in that provider's model context. If the user selected a local model, that model processing can remain on the PC. This provider distinction must remain visible in the store disclosure and OSIA privacy policy.
 
+Distribution status on 2026-08-18: the extension is unpublished, Chrome Web Store and Microsoft Edge Add-ons preparation is paused, `chrome_store_id` and `edge_store_id` remain empty, and no store submission or visibility change is authorized by this document.
+
 | Category | Handled? | Processed locally? | Transmitted? | Persisted? | Purpose | Retention / sharing | User control and revocation |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Installation identifier | Yes | Yes | To the local OSIA host | `storage.local`, until extension data is removed | Bind the installed extension instance to the local protocol | Not used for analytics, advertising, or cross-site tracking; not shared by the extension with a network service | Remove extension data or uninstall the extension |
