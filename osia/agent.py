@@ -8157,16 +8157,75 @@ class OSIAAgent:
 
     def _reasoning_request(self) -> dict:
         """Return exact reasoning kwargs and a sanitized adapter receipt."""
+        legacy_request = None
         try:
             from osia.reasoning import build_reasoning_request
             override = getattr(self, "_reasoning_override_for_turn", None)
             settings = None
             if override is not None:
                 settings = {"default": override, "providers": {}, "models": {}}
-            return build_reasoning_request(
+            legacy_request = build_reasoning_request(
                 self.provider, self.model, settings=settings,
             )
+            if os.environ.get(
+                "OSIA_ADAPTIVE_REASONING_AUTO", "",
+            ).strip().lower() not in {"1", "true", "yes", "on"}:
+                return legacy_request
+
+            controller = getattr(self, "_terminality_controller", None)
+            strategy = getattr(self, "_terminality_strategy", None)
+            if controller is None or strategy is None:
+                return legacy_request
+
+            from osia.adaptive_reasoning_runtime import (
+                build_bound_reasoning_context,
+                integrate_adaptive_reasoning,
+                reasoning_context_revision,
+                validate_bound_reasoning_context,
+            )
+
+            terminality_snapshot = controller.snapshot()
+            strategy_snapshot = strategy.snapshot()
+            turn_id = str(terminality_snapshot.get("turn_id") or "").strip()
+            conversation_id = str(
+                getattr(self, "_chatgpt_conversation_id", None) or ""
+            ).strip()
+            revision = reasoning_context_revision(
+                terminality_snapshot, strategy_snapshot,
+            )
+            bound_context = getattr(self, "_adaptive_reasoning_context", None)
+            if not validate_bound_reasoning_context(
+                bound_context,
+                turn_id=turn_id,
+                revision=revision,
+                provider_id=self.provider,
+                model_id=self.model,
+                conversation_id=conversation_id,
+            ):
+                bound_context = build_bound_reasoning_context(
+                    semantic_mission=strategy.mission,
+                    terminality_snapshot=terminality_snapshot,
+                    strategy_snapshot=strategy_snapshot,
+                    provider_id=self.provider,
+                    model_id=self.model,
+                    conversation_id=conversation_id,
+                    previous_context=bound_context,
+                )
+            integration = integrate_adaptive_reasoning(
+                legacy_request,
+                provider_id=self.provider,
+                model_id=self.model,
+                bound_context=bound_context,
+                turn_id=turn_id,
+                revision=revision,
+                conversation_id=conversation_id,
+            )
+            if integration.bound_context is not None:
+                self._adaptive_reasoning_context = integration.bound_context
+            return dict(integration.request)
         except Exception:
+            if legacy_request is not None:
+                return legacy_request
             return {
                 "kwargs": {},
                 "diagnostic": {
@@ -9238,6 +9297,86 @@ class OSIAAgent:
             is_internal_tool_control_text,
         )
 
+        def continuation_context(decision) -> str:
+            legacy_context = controller.continuation_context(decision)
+            if os.environ.get(
+                "OSIA_ADAPTIVE_INTELLIGENCE_PHASE3", "",
+            ).strip().lower() not in {"1", "true", "yes", "on"}:
+                return legacy_context
+            try:
+                from osia.adaptive_runtime import phase3_continuation_context
+
+                terminality_snapshot = controller.snapshot()
+                strategy_snapshot = strategy.snapshot()
+                adaptive_context = phase3_continuation_context(
+                    legacy_context,
+                    semantic_mission=strategy.mission,
+                    terminality_snapshot=terminality_snapshot,
+                    strategy_snapshot=strategy_snapshot,
+                    legacy_next_strategy=decision.next_strategy,
+                    legacy_postcondition=decision.postcondition,
+                    available_capability_ids=tuple(TOOL_MAP),
+                    provider=self.provider,
+                    model_id=self.model,
+                )
+                try:
+                    if os.environ.get(
+                        "OSIA_ADAPTIVE_REASONING_AUTO", "",
+                    ).strip().lower() in {"1", "true", "yes", "on"}:
+                        from osia.adaptive_reasoning_runtime import (
+                            build_bound_reasoning_context,
+                        )
+
+                        bound_context = build_bound_reasoning_context(
+                            semantic_mission=strategy.mission,
+                            terminality_snapshot=terminality_snapshot,
+                            strategy_snapshot=strategy_snapshot,
+                            provider_id=self.provider,
+                            model_id=self.model,
+                            conversation_id=str(
+                                current_conversation_id or ""
+                            ).strip(),
+                            planner_context=adaptive_context,
+                            previous_context=getattr(
+                                self, "_adaptive_reasoning_context", None,
+                            ),
+                        )
+                        if bound_context is not None:
+                            self._adaptive_reasoning_context = bound_context
+                except Exception:
+                    pass
+                return adaptive_context
+            except Exception:
+                return legacy_context
+
+        def adaptive_success_eligible(decision) -> bool:
+            adaptive_gate_values = (
+                os.environ.get("OSIA_ADAPTIVE_INTELLIGENCE_PHASE3", ""),
+                os.environ.get("OSIA_ADAPTIVE_" "REASONING_AUTO", ""),
+            )
+            if (
+                decision.terminal_state != "success_verified"
+                or not any(
+                    value.strip().lower() in {"1", "true", "yes", "on"}
+                    for value in adaptive_gate_values
+                )
+            ):
+                return True
+            try:
+                from osia.adaptive_runtime import (
+                    assess_adaptive_terminal_success,
+                )
+
+                assessment = assess_adaptive_terminal_success(
+                    semantic_mission=strategy.mission,
+                    terminality_snapshot=controller.snapshot(),
+                    strategy_snapshot=strategy.snapshot(),
+                )
+                self._adaptive_terminal_success_assessment = assessment
+                return assessment.eligible
+            except Exception:
+                return False
+
         segment_input = initial_input
         segment_strategy = initial_strategy_id
         segment_postcondition = ""
@@ -9253,6 +9392,8 @@ class OSIAAgent:
             if not invocation_id:
                 decision = controller.evaluate(provider_route=provider_route)
                 if decision.terminal:
+                    if not adaptive_success_eligible(decision):
+                        return WAITING_TOOL_RESULT
                     return self._reserve_terminal_final(
                         controller, decision, last_candidate,
                         on_sentence=on_sentence,
@@ -9260,7 +9401,7 @@ class OSIAAgent:
                     )
                 if decision.action == "continue":
                     self._emit_execution_trace_continuation(decision)
-                    segment_input = controller.continuation_context(decision)
+                    segment_input = continuation_context(decision)
                     segment_strategy = decision.next_strategy
                     segment_postcondition = decision.postcondition
                     segment_history = None
@@ -9332,6 +9473,8 @@ class OSIAAgent:
                     decision.terminal_state
                     == "success_verified"
                 ):
+                    if not adaptive_success_eligible(decision):
+                        return WAITING_TOOL_RESULT
                     self._emit_execution_trace(
                         "continuation",
                         "execution.continuation.new_strategy",
@@ -9357,7 +9500,7 @@ class OSIAAgent:
                     )
                 if decision.action == "continue":
                     self._emit_execution_trace_continuation(decision)
-                    segment_input = controller.continuation_context(decision)
+                    segment_input = continuation_context(decision)
                     segment_strategy = decision.next_strategy
                     segment_postcondition = decision.postcondition
                     segment_history = None
@@ -9397,6 +9540,11 @@ class OSIAAgent:
                 provider_route=provider_route,
             )
             if decision.terminal:
+                if not adaptive_success_eligible(decision):
+                    self._mark_provisional_assistant_candidate(
+                        self.messages, last_candidate,
+                    )
+                    return WAITING_TOOL_RESULT
                 return self._reserve_terminal_final(
                     controller, decision, last_candidate,
                     on_sentence=on_sentence,
@@ -9411,7 +9559,7 @@ class OSIAAgent:
                 self.messages, last_candidate,
             )
             self._emit_execution_trace_continuation(decision)
-            segment_input = controller.continuation_context(decision)
+            segment_input = continuation_context(decision)
             segment_strategy = decision.next_strategy
             segment_postcondition = decision.postcondition
             segment_history = None
