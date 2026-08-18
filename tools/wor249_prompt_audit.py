@@ -55,7 +55,7 @@ def _prompt(*, lang: str, surface: str = "", rich: bool = False) -> str:
     with ExitStack() as stack:
         stack.enter_context(scope)
         stack.enter_context(patch.object(agent, "_PROJECT_DIR", "C:/OSIA/project"))
-        stack.enter_context(patch.object(agent, "get_desktop_path", return_value="C:/Users/Fixture/Desktop"))
+        stack.enter_context(patch.object(agent, "get_desktop_path", return_value="C:/OSIA/Desktop"))
         stack.enter_context(patch.object(
             personality,
             "load_personality",

@@ -714,7 +714,7 @@ def _local_secret_values() -> tuple[bytes, ...]:
 
 def _secret_scan(root: Path) -> None:
     forbidden_names = {
-        "api_keys.json", "oauth_tokens.json", "mobile_token.txt", "settings.json",
+        ".fingerprint.key", "api_keys.json", "oauth_tokens.json", "mobile_token.txt", "settings.json",
         "memory.json", "onboarding.json", "task_state.json", "task_state_mobile.json",
         "lan_direct_key.pem", "lan_direct_cert.pem",
     }

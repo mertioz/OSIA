@@ -43,6 +43,10 @@ config/memory.json.tmp*
 config/memory.json.bak
 config/memory.corrupt.*.json
 config/memory.sqlite*
+config/onboarding.json
+config/tool_attempts/
+config/turn_terminality/
+config/update-state.json
 config/*.db
 config/*.dump
 config/*.log

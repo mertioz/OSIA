@@ -131,6 +131,7 @@ LOCAL_HOME_RE = re.compile(
 SENSITIVE_FILE_NAMES = {
     ".dev.vars": "development-secret-store",
     ".env": "environment-secret-store",
+    ".fingerprint.key": "tool-attempt-fingerprint-key",
     "api_keys.json": "api-key-store",
     "key.properties": "signing-credential-store",
     "lan_direct_identity.json": "lan-identity-store",

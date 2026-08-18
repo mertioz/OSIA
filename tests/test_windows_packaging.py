@@ -886,6 +886,7 @@ def test_release_gate_runs_before_smoke_and_after_installer_manifest():
     final_gate = build.index("_validate_release_payload(RELEASE)", final_manifest)
     assert pyinstaller < bundle_manifest < payload_gate < secret_scan < smoke
     assert final_manifest < final_gate
+    assert '".fingerprint.key"' in build[:secret_scan]
 
 
 def test_build_uses_product_version_and_exact_installer_name():

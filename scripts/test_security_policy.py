@@ -40,11 +40,15 @@ IGNORED = {
         "config/lan_direct_key.pem",
         "config/memory.sqlite-wal",
         "config/mobile_token.txt",
+        "config/onboarding.json",
         "config/oauth_tokens.json",
         "config/relay_device.json",
         "config/settings.json",
         "config/task_state.json",
+        "config/tool_attempts/.fingerprint.key",
         "config/turn_credentials.json",
+        "config/turn_terminality/turn.json",
+        "config/update-state.json",
         "preferences.txt",
        "runtime.log",
         "scripts/__pycache__/scan_secrets.cpython-312.pyc",
@@ -178,6 +182,12 @@ class ScannerPolicyTests(unittest.TestCase):
         rules = self.rules_for('api_key = "<set-in-a-secret-store>"')
         self.assertNotIn("high-entropy-credential", rules)
         self.assertNotIn("api-compatible-key", rules)
+
+    def test_tool_attempt_fingerprint_key_is_a_sensitive_store(self):
+        self.assertIn(
+            "tool-attempt-fingerprint-key",
+            self.rules_for("", "config/tool_attempts/.fingerprint.key"),
+        )
 
     def test_osia_allowlist_is_exact_and_keeps_structured_rules_active(self):
         self.assertEqual(SCAN.OSIA_ALLOWLIST, EXPECTED_OSIA_ALLOWLISTS[KIND])
