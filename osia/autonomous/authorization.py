@@ -293,14 +293,14 @@ def _tool_for_path_text(text: str, paths: list[str]) -> tuple[str, dict] | None:
     low = str(text or "").lower()
     if not paths:
         return None
-    if any(word in low for word in ("rename", "move ", "renomm", "déplac", "deplac")):
-        if len(paths) >= 2:
-            return "rename_file", {"old_path": paths[0], "new_path": paths[1]}
-        return None
-    if any(word in low for word in ("copy", "copier", "dupli")):
-        if len(paths) >= 2:
-            return "copy_file", {"src": paths[0], "dst": paths[1]}
-        return None
+    if len(paths) >= 2 and any(word in low for word in (
+        "rename", "move ", "renomm", "déplac", "deplac",
+    )):
+        return "rename_file", {"old_path": paths[0], "new_path": paths[1]}
+    if len(paths) >= 2 and any(
+        word in low for word in ("copy", "copier", "dupli")
+    ):
+        return "copy_file", {"src": paths[0], "dst": paths[1]}
     if any(word in low for word in ("delete", "remove", "supprim", "effac")):
         directory = any(word in low for word in (
             "directory", "folder", "tree", "dossier", "répertoire", "repertoire",
@@ -531,6 +531,9 @@ def derive_capability_proposal(st: dict) -> tuple[list[dict], dict[str, dict]]:
     if not summary:
         summary.append({
             "capability_id": "cap_read_only_plan",
+            # This is a plan-only placeholder, not a capability grant. Runtime
+            # calls still have to prove their own ToolSpec + effective contract.
+            "proposal_kind": "runtime_contract_required",
             "label": "Read-only planning and inspection",
             "tool_category": "read_only",
             "effect_class": "read_only",
@@ -546,6 +549,13 @@ def derive_capability_proposal(st: dict) -> tuple[list[dict], dict[str, dict]]:
             "universal_barrier": "",
             "can_approve_mobile": True,
         })
+    elif not descriptors:
+        for item in summary:
+            # Advisory prose categories are not executable contracts and cannot
+            # be authorized exactly. Let planning continue with zero authority;
+            # the concrete runtime ToolSpec + effective contract remains the
+            # only permission signal.
+            item["proposal_kind"] = "runtime_contract_required"
     return summary, descriptors
 
 
@@ -563,6 +573,58 @@ def _authorization_request(st: dict, *, origin_ref: str, policy_epoch: int) -> d
         "expires_at": now + AUTHORIZATION_REQUEST_TTL_SECONDS,
         "responded": False,
     }
+
+
+def _proposal_requires_no_authority(
+    summary: Iterable[Any], descriptors: Mapping[str, Any],
+) -> bool:
+    """Return true only when plan review would grant no execution authority."""
+
+    entries = list(summary or ())
+    if not entries:
+        return False
+    if not descriptors and all(
+        isinstance(item, Mapping)
+        and item.get("proposal_kind") == "runtime_contract_required"
+        for item in entries
+    ):
+        # No concrete capability was derived, so there is nothing to authorize
+        # up front. This merely lets planning continue; every runtime call still
+        # traverses the central static + effective contract permission gate.
+        return not descriptors
+
+    try:
+        from osia.tool_contracts import (
+            ConfirmationPolicy,
+            SideEffectClass,
+            effective_contract,
+            get_tool_spec,
+        )
+
+        for item in entries:
+            if not isinstance(item, Mapping):
+                return False
+            descriptor = descriptors.get(str(item.get("capability_id") or ""))
+            if not isinstance(descriptor, Mapping):
+                return False
+            spec = get_tool_spec(str(descriptor.get("tool_identity") or ""))
+            if spec is None:
+                return False
+            contract = effective_contract(
+                spec, dict(descriptor.get("arguments") or {}),
+            )
+            if not (
+                item.get("effect_class") == SideEffectClass.READ_ONLY.value
+                and item.get("requires_later_scope_extension") is False
+                and not item.get("universal_barrier")
+                and spec.side_effect is SideEffectClass.READ_ONLY
+                and contract.side_effect is SideEffectClass.READ_ONLY
+                and contract.confirmation is ConfirmationPolicy.NO_CONFIRMATION
+            ):
+                return False
+    except Exception:
+        return False
+    return True
 
 
 def prepare_planned_state(
@@ -599,6 +661,14 @@ def prepare_planned_state(
     if permission_state.permission_mode == PermissionMode.FULL_ACCESS:
         st["authorization_status"] = "not_required_full_access"
         st["authorization_source"] = "full_access"
+        st["run_state"] = "ready"
+        st["authorization_request"] = None
+        _clear_private_run(str(st.get("run_id") or ""))
+    elif _proposal_requires_no_authority(summary, descriptors):
+        # This grants no authority. Every eventual tool call still has to prove
+        # its own static and effective READ_ONLY contracts at the central gate.
+        st["authorization_status"] = "authorized"
+        st["authorization_source"] = "none"
         st["run_state"] = "ready"
         st["authorization_request"] = None
         _clear_private_run(str(st.get("run_id") or ""))
@@ -979,6 +1049,7 @@ def _base_operation_record(request, decision) -> dict:
         "private_scope_hash": request.scope_hash,
         "grant_ref": decision.grant_ref,
         "authorization_source": decision.authorization_source.value,
+        "effect_class": request.effect_class,
         "policy_epoch": decision.policy_epoch,
         "status": "prepared",
         "dispatch_attempt_count": 0,
@@ -995,6 +1066,9 @@ def request_block_reason(request) -> str | None:
     runtime = current_runtime()
     if runtime is None:
         return None
+    from osia.action_policy import permission_request_is_genuinely_read_only
+
+    genuinely_read_only = permission_request_is_genuinely_read_only(request)
     st = runtime.task_state
     if state.equivalent_ambiguity_barrier(
         st,
@@ -1004,22 +1078,22 @@ def request_block_reason(request) -> str | None:
         autonomous_equivalence_hash=request.autonomous_equivalence_hash,
     ) is not None:
         return "duplicate_outcome_unknown"
-    completed = None
-    if request.effect_class != "read_only":
-        completed = state.equivalent_operation_record(
-            st,
-            tool_identity=request.tool_identity,
-            normalized_call_hash=request.normalized_call_hash,
-            private_scope_hash=request.scope_hash,
-            autonomous_equivalence_hash=request.autonomous_equivalence_hash,
-            statuses={"success_verified"},
-        )
-    if completed is not None:
+    completed = state.equivalent_operation_record(
+        st,
+        tool_identity=request.tool_identity,
+        normalized_call_hash=request.normalized_call_hash,
+        private_scope_hash=request.scope_hash,
+        autonomous_equivalence_hash=request.autonomous_equivalence_hash,
+        statuses={"success_verified"},
+    )
+    if completed is not None and (
+        not genuinely_read_only or completed.get("effect_class") != "read_only"
+    ):
         return "duplicate_success_verified"
     run_state = st.get("run_state")
     if run_state == "suspended_authorization_revoked":
         return "authorization_revoked"
-    if run_state == "blocked_outcome_unknown":
+    if run_state == "blocked_outcome_unknown" and not genuinely_read_only:
         return "outcome_unknown_blocked"
     if run_state == "authorization_pending":
         return "authorization_pending"
@@ -1575,6 +1649,27 @@ def revalidate_loaded_authorization(
         "completed", "failed", "cancelled", "blocked_outcome_unknown",
     }
     if terminal_or_barrier:
+        return st
+    if (
+        st.get("run_state") not in {
+            "suspended_scope_extension", "blocked_unknown_effect",
+        }
+        and _proposal_requires_no_authority(
+            st.get("capability_summary") or (),
+            st.get("_runtime_capability_descriptors") or {},
+        )
+    ):
+        st["policy_epoch"] = permission_state.policy_epoch
+        st["grant_refs"] = []
+        st["authorization_status"] = "authorized"
+        st["authorization_source"] = "none"
+        st["authorization_request"] = None
+        st["pending_scope_extension"] = None
+        if st.get("run_state") not in {
+            "waiting_tool", "verifying_tool", "resuming",
+            "cancellation_requested",
+        }:
+            st["run_state"] = "ready"
         return st
     refs_available = active_policy.store.autonomous_grant_refs_available(
         st.get("grant_refs"),

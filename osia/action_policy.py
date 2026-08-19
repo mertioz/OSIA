@@ -728,6 +728,7 @@ def autonomous_permission_gate(
     values: Mapping[str, Any],
     *,
     deletion_plan=None,
+    connector_boundary: bool = False,
 ) -> str | None:
     """Evaluate every native Autonomous call through the central facade."""
 
@@ -736,6 +737,7 @@ def autonomous_permission_gate(
         return None
     try:
         from osia.tool_contracts import (
+            SideEffectClass,
             get_tool_spec,
             tool_is_eligible_in_current_surface,
         )
@@ -748,7 +750,16 @@ def autonomous_permission_gate(
             return "ERROR: tool is not eligible for Autonomous execution"
     except Exception:
         return "ERROR: autonomous tool eligibility unavailable"
-    if tool_name.startswith("gmail_") or tool_name.startswith("mcp__"):
+    if (
+        (
+            tool_name.startswith("gmail_")
+            and (
+                spec is None
+                or spec.side_effect is not SideEffectClass.READ_ONLY
+            )
+        )
+        or (tool_name.startswith("mcp__") and not connector_boundary)
+    ):
         # Their wrappers own the same facade and consume permits at the actual
         # remote dispatch boundary.
         return None
@@ -797,6 +808,7 @@ def scheduled_permission_gate(
     values: Mapping[str, Any],
     *,
     deletion_plan=None,
+    connector_boundary: bool = False,
 ) -> str | None:
     """Evaluate every native Scheduled call through the central facade."""
 
@@ -804,14 +816,23 @@ def scheduled_permission_gate(
     if context is None or context.execution_type != ExecutionType.SCHEDULED:
         return None
     try:
-        from osia.tool_contracts import get_tool_spec
+        from osia.tool_contracts import SideEffectClass, get_tool_spec
 
         spec = get_tool_spec(tool_name)
         if spec is not None and not spec.scheduled_eligible:
             return "ERROR: tool is not eligible for Scheduled Task execution"
     except Exception:
         return "ERROR: scheduled tool eligibility unavailable"
-    if tool_name.startswith("gmail_") or tool_name.startswith("mcp__"):
+    if (
+        (
+            tool_name.startswith("gmail_")
+            and (
+                spec is None
+                or spec.side_effect is not SideEffectClass.READ_ONLY
+            )
+        )
+        or (tool_name.startswith("mcp__") and not connector_boundary)
+    ):
         # Their wrappers evaluate the same policy at the remote dispatch edge.
         return None
     if pending_execution_permit_matches(tool_name, values):
@@ -1345,6 +1366,18 @@ class PermissionRequest:
         }
 
 
+def permission_request_is_genuinely_read_only(request: PermissionRequest) -> bool:
+    """Require both the registered and runtime contracts to prove observation."""
+
+    from osia.tool_contracts import SideEffectClass
+
+    return bool(
+        isinstance(request, PermissionRequest)
+        and request.tool_spec.side_effect is SideEffectClass.READ_ONLY
+        and request.effective_contract.side_effect is SideEffectClass.READ_ONLY
+    )
+
+
 def automatic_permission_category(request: PermissionRequest) -> str | None:
     """Map one request from authoritative execution and tool metadata only."""
 
@@ -1352,9 +1385,16 @@ def automatic_permission_category(request: PermissionRequest) -> str | None:
 
     if not isinstance(request, PermissionRequest):
         raise ValueError("invalid_permission_request")
-    if request.execution_context.execution_type == ExecutionType.SCHEDULED:
+    genuinely_read_only = permission_request_is_genuinely_read_only(request)
+    if (
+        request.execution_context.execution_type == ExecutionType.SCHEDULED
+        and not genuinely_read_only
+    ):
         return "scheduled_actions"
-    if request.execution_context.execution_type == ExecutionType.AUTONOMOUS:
+    if (
+        request.execution_context.execution_type == ExecutionType.AUTONOMOUS
+        and not genuinely_read_only
+    ):
         return "autonomous_actions"
     if request.safe_category == "purchase" or any(
         name in request.optional_constraints
@@ -2173,6 +2213,31 @@ class PermissionPolicy:
                 request, DecisionType.DENY, "policy_epoch_mismatch", epoch=epoch,
             )
 
+        if (
+            request.tool_spec.side_effect is SideEffectClass.READ_ONLY
+            and request.effective_contract.side_effect
+            in {
+                SideEffectClass.UNKNOWN_HIGH_RISK,
+                SideEffectClass.DYNAMICALLY_CLASSIFIED,
+            }
+        ):
+            return _decision(
+                request,
+                DecisionType.DENY,
+                "unknown_effect_classification",
+                epoch=epoch,
+            )
+
+        genuinely_read_only = permission_request_is_genuinely_read_only(request)
+        if (
+            genuinely_read_only
+            and request.effective_contract.confirmation
+            == ConfirmationPolicy.NO_CONFIRMATION
+        ):
+            return _decision(
+                request, DecisionType.ALLOW, "structurally_safe", epoch=epoch,
+            )
+
         automatic_authority = _automatic_permission_enabled(state, request)
         if (
             automatic_authority
@@ -2255,14 +2320,10 @@ class PermissionPolicy:
         if (
             request.execution_context.execution_type
             in {ExecutionType.AUTONOMOUS, ExecutionType.SCHEDULED}
-            and request.effective_contract.side_effect != SideEffectClass.READ_ONLY
+            and not genuinely_read_only
         ):
             sensitive = True
-        if not sensitive or (
-            request.effective_contract.side_effect == SideEffectClass.READ_ONLY
-            and request.effective_contract.confirmation
-            == ConfirmationPolicy.NO_CONFIRMATION
-        ):
+        if not sensitive:
             return _decision(
                 request, DecisionType.ALLOW, "structurally_safe",
                 epoch=epoch,

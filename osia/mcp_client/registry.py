@@ -370,9 +370,11 @@ def _make_wrapper(
     ``is_write`` is baked in at registration. When set, the call passes through
     the confirmation gate (``_confirm_gate``) BEFORE ``manager.call_tool``: a
     block returns an ``ERROR: ...`` string (honouring the tool contract) and the
-    real call never happens. Read tools skip the gate entirely (one bool check),
-    so their hot path is unchanged. The gate reads its settings LIVE, so toggling
-    confirmation takes effect without re-registering tools.
+    real call never happens. Autonomous reads traverse the central permission
+    facade at this final connector boundary so durable anti-replay state cannot
+    be bypassed after a reconnect changes annotations. The gate reads its
+    settings LIVE, so toggling confirmation takes effect without re-registering
+    tools.
 
     Arguments are validated exactly as advertised. Invalid envelopes and
     unknown fields are rejected rather than silently coerced (WOR-178).
@@ -385,6 +387,28 @@ def _make_wrapper(
         except Exception:
             return "ERROR: invalid MCP tool arguments; the tool was not executed"
         deletion_dispatch = None
+        if not is_write:
+            try:
+                from osia.action_policy import (
+                    autonomous_permission_gate,
+                    scheduled_permission_gate,
+                )
+
+                blocked = autonomous_permission_gate(
+                    tool_full_name(server_id, tool_name),
+                    kwargs,
+                    connector_boundary=True,
+                )
+                if blocked is None:
+                    blocked = scheduled_permission_gate(
+                        tool_full_name(server_id, tool_name),
+                        kwargs,
+                        connector_boundary=True,
+                    )
+            except Exception:
+                blocked = "ERROR: MCP permission preflight unavailable"
+            if blocked is not None:
+                return blocked
         if is_write:
             try:
                 from osia.action_policy import system_mutation_barrier
