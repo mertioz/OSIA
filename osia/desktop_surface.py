@@ -259,12 +259,13 @@ class DesktopSurfaceRegistry:
         stable_identity: str,
         patterns: Iterable[str] = (),
     ) -> DesktopSurfaceRef:
+        stable_parent = "" if runtime_signature else parent_ref
         stable_key = _digest(
             generation,
             structural_epoch,
             stable_identity,
             role,
-            parent_ref,
+            stable_parent,
             size=40,
         )
         with self._lock:
@@ -289,6 +290,7 @@ class DesktopSurfaceRegistry:
                         selected=bool(selected),
                         focused=bool(focused),
                         enabled=bool(enabled),
+                        parent_ref=parent_ref,
                         bounds=bounds,
                         patterns=tuple(str(item) for item in patterns)[:16],
                         observed_at=time.time(),

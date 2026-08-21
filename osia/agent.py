@@ -7434,7 +7434,7 @@ class OSIAAgent:
     ) -> None:
         """Keep only the exact unfinished step; completed calls stay complete."""
 
-        from osia.tool_contracts import ExecutionOutcome
+        from osia.tool_contracts import ExecutionOutcome, SideEffectClass
 
         outcome = getattr(execution_record, "outcome", None)
         terminality = self._terminality_controller
@@ -7468,6 +7468,15 @@ class OSIAAgent:
                 postcondition = attempted_effect
             elif primitive_postcondition:
                 postcondition = primitive_postcondition
+            if (
+                execution_record.contract.side_effect
+                is SideEffectClass.READ_ONLY
+                and (
+                    strategy is None
+                    or postcondition not in strategy.proven_postconditions
+                )
+            ):
+                postcondition = ""
             terminality_record = execution_record
             strategy_attempt_id = str(
                 getattr(strategy_decision, "attempt_id", "") or ""
@@ -8115,6 +8124,30 @@ class OSIAAgent:
         )
         return coordinator.activate(attempt_id)
 
+    @staticmethod
+    def _resumed_tool_postcondition(strategy, execution_record=None) -> str:
+        """Keep a durable receipt bound to the exact dispatched effect."""
+
+        side_effect = getattr(
+            getattr(execution_record, "contract", None),
+            "side_effect",
+            None,
+        )
+        if getattr(side_effect, "value", side_effect) == "read_only":
+            return ""
+        latest_attempt = next((
+            item for item in reversed(strategy.attempts)
+            if item.dispatched_at > 0.0
+        ), None)
+        if latest_attempt is not None:
+            postcondition = (
+                latest_attempt.attempted_effect
+                or latest_attempt.primitive_postcondition
+            )
+            if postcondition:
+                return postcondition
+        return strategy.goal.observable_success_postcondition
+
     def _resume_suspended_tool(self, attempt_id: str, payload) -> str:
         from osia.tool_attempts import get_tool_attempt_store
         from osia.tool_contracts import ExecutionOutcome, ToolExecutionRecord
@@ -8182,8 +8215,9 @@ class OSIAAgent:
                     terminality.record_execution_record(
                         str(attempt.get("tool_name") or ""),
                         payload,
-                        postcondition=(
-                            self._terminality_strategy.goal.observable_success_postcondition
+                        postcondition=self._resumed_tool_postcondition(
+                            self._terminality_strategy,
+                            payload,
                         ),
                     )
                 else:
@@ -9606,6 +9640,13 @@ class OSIAAgent:
         from osia.turn_terminality import TerminalState
 
         snapshot = snapshot if isinstance(snapshot, dict) else {}
+        strategy_snapshot = snapshot.get("strategy_snapshot") or {}
+        mission = strategy_snapshot.get("mission") or {}
+        nodes = [
+            item for item in mission.get("action_nodes") or []
+            if isinstance(item, dict)
+        ]
+        proven = snapshot.get("proven_postconditions") or {}
         forbidden = (
             "postcondition", "terminality", "strategy frontier",
             "semantic equivalence", "evidence revision",
@@ -9613,6 +9654,52 @@ class OSIAAgent:
             "front de strat\u00e9gies", "\u00e9quivalence s\u00e9mantique",
         )
         clean_candidate = str(candidate or "").strip()
+        proven_calculation = next((
+            item for item in nodes
+            if item.get("requested_action") == "calculate"
+            and item.get("requested_content")
+            and item.get("required_postconditions")
+            and all(
+                postcondition in proven
+                for postcondition in item.get("required_postconditions") or []
+            )
+            and re.search(
+                r"\bexact result\s+([+-]?\d+(?:[.,]\d+)?)\b",
+                str(item.get("observable_success_postcondition") or ""),
+                re.IGNORECASE,
+            )
+        ), None)
+        if (
+            state == TerminalState.SUCCESS_VERIFIED.value
+            and proven_calculation is not None
+        ):
+            match = re.search(
+                r"\bexact result\s+([+-]?\d+(?:[.,]\d+)?)\b",
+                str(
+                    proven_calculation.get("observable_success_postcondition")
+                    or ""
+                ),
+                re.IGNORECASE,
+            )
+            exact_result = match.group(1) if match is not None else ""
+            normalized_candidate = clean_candidate.replace(",", ".")
+            if (
+                clean_candidate
+                and exact_result
+                and re.search(
+                    rf"(?<![\d.]){re.escape(exact_result.replace(',', '.'))}"
+                    r"(?![\d.])",
+                    normalized_candidate,
+                )
+                and not any(item in clean_candidate.lower() for item in forbidden)
+            ):
+                return clean_candidate
+            expression = str(proven_calculation.get("requested_content") or "")
+            return (
+                f"Calcul terminé : {expression} = {exact_result}."
+                if self.lang == "fr" else
+                f"Calculation complete: {expression} = {exact_result}."
+            )
         if (
             state == TerminalState.SUCCESS_VERIFIED.value
             and clean_candidate
@@ -9637,14 +9724,6 @@ class OSIAAgent:
                 if self.lang == "fr" else
                 "This action is blocked by an absolute safety barrier."
             )
-        strategy_snapshot = snapshot.get("strategy_snapshot") or {}
-        mission = strategy_snapshot.get("mission") or {}
-        nodes = [
-            item for item in mission.get("action_nodes") or []
-            if isinstance(item, dict)
-        ]
-        proven = snapshot.get("proven_postconditions") or {}
-
         def action_label(node: dict) -> str:
             action = str(node.get("requested_action") or "").strip()
             application = str(node.get("required_application") or "").strip()
@@ -9695,7 +9774,6 @@ class OSIAAgent:
             for item in recent[-12:]
             if isinstance(item, dict)
         )
-        reason_source = " ".join((permission_state, recent_reasons, reason_code))
         if unknown_effects or reason_code == "safe_reconciliation_frontier_exhausted":
             blocker = (
                 "Une action pr\u00e9c\u00e9dente a peut-\u00eatre eu lieu et doit \u00eatre "
@@ -9703,30 +9781,36 @@ class OSIAAgent:
                 if self.lang == "fr" else
                 "A previous action may have happened and must be checked before continuing."
             )
-        elif "user_denied" in reason_source:
+        elif permission_state == "user_denied":
             blocker = (
                 "L'autorisation n\u00e9cessaire a \u00e9t\u00e9 refus\u00e9e."
                 if self.lang == "fr" else
                 "The required permission was declined."
             )
-        elif "presentation_failed" in reason_source:
+        elif permission_state == "presentation_failed":
             blocker = (
                 "La demande d'autorisation n'a pas pu \u00eatre affich\u00e9e."
                 if self.lang == "fr" else
                 "The permission request could not be displayed."
             )
-        elif "disconnected" in reason_source:
+        elif permission_state == "disconnected":
             blocker = (
                 "La connexion a \u00e9t\u00e9 interrompue avant la d\u00e9cision "
                 "d'autorisation."
                 if self.lang == "fr" else
                 "The connection ended before the permission decision."
             )
-        elif "timeout" in reason_source:
+        elif permission_state == "timeout":
             blocker = (
                 "La demande d'autorisation a expir\u00e9 avant de recevoir une r\u00e9ponse."
                 if self.lang == "fr" else
                 "The permission request expired before a response arrived."
+            )
+        elif permission_state == "internal_failure":
+            blocker = (
+                "Une erreur interne du syst\u00e8me d'autorisation a emp\u00each\u00e9 l'action."
+                if self.lang == "fr" else
+                "An internal permission-system failure prevented the action."
             )
         elif "required_application_changed" in recent_reasons:
             blocker = (

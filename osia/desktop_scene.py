@@ -335,10 +335,16 @@ def _runtime_id(control) -> tuple[int, ...]:
         return ()
 
 
-def _runtime_signature(runtime_id: tuple[int, ...], role: str, ancestor: str) -> str:
-    if not runtime_id:
+def _runtime_signature(
+    runtime_id: tuple[int, ...],
+    role: str,
+    ancestor: str,
+    automation_id: str = "",
+) -> str:
+    if not runtime_id and not automation_id:
         return ""
-    material = f"{runtime_id!r}\x1f{role}\x1f{ancestor}"
+    identity = f"automation:{automation_id}" if automation_id else repr(runtime_id)
+    material = f"{identity}\x1f{role}\x1f{ancestor}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
 
 
@@ -929,7 +935,7 @@ def _observe_window_scene(
         role = item["role"]
         parent_ref = ref_by_index.get(item["parent_index"], window_ref.ref_id)
         runtime_signature = _runtime_signature(
-            runtime_id, role, item["ancestor"],
+            runtime_id, role, item["ancestor"], item["automation_id"],
         )
         bounds = item["bounds"]
         stable_identity = runtime_signature or hashlib.sha256(

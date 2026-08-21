@@ -33,6 +33,7 @@ import unicodedata
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
+from decimal import Decimal, InvalidOperation
 from enum import Enum, IntEnum
 from typing import Iterable
 from urllib.parse import urlparse
@@ -96,9 +97,82 @@ _ACTION_PATTERNS = (
 _KNOWN_APPLICATIONS = (
     "steam", "spotify", "vscode", "visual studio code", "discord",
     "brave", "chrome", "firefox", "edge", "outlook", "gmail",
-    "notepad", "bloc-notes", "calculator", "paint", "character map",
-    "xbox",
+    "notepad", "bloc-notes", "calculator", "calculatrice", "paint",
+    "character map", "xbox",
 )
+
+_APPLICATION_ALIASES = {
+    "visual studio code": "vscode",
+    "calculatrice": "calculator",
+}
+
+
+def _canonical_application(value: object) -> str:
+    normalized = _normalized(value)
+    return _APPLICATION_ALIASES.get(normalized, normalized)
+
+
+def _simple_calculation_result(value: object) -> str:
+    """Return the exact result of one bounded decimal arithmetic expression."""
+
+    match = re.fullmatch(
+        r"\s*([+-]?\d+(?:[.,]\d+)?)\s*([+\-*x\u00d7])\s*"
+        r"([+-]?\d+(?:[.,]\d+)?)\s*=?\s*",
+        str(value or ""),
+        re.IGNORECASE,
+    )
+    if match is None:
+        return ""
+    try:
+        left = Decimal(match.group(1).replace(",", "."))
+        right = Decimal(match.group(3).replace(",", "."))
+        operator = match.group(2).lower()
+        result = (
+            left + right
+            if operator == "+" else
+            left - right
+            if operator == "-" else
+            left * right
+        )
+    except (InvalidOperation, ValueError):
+        return ""
+    rendered = format(result, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return "0" if rendered in {"", "-0"} else rendered
+
+
+def _primitive_proves_calculation_result(
+    node: SemanticActionNode | None,
+    attempt: StrategyAttempt | None,
+) -> bool:
+    if (
+        node is None
+        or attempt is None
+        or node.requested_action != "calculate"
+    ):
+        return False
+    target = (
+        (attempt.primitive_receipt.get("before") or {}).get("target") or {}
+    )
+    target_label = _normalized(target.get("label"))
+    if target_label != "=" and not any(
+        token in target_label for token in ("equal", "egal")
+    ):
+        return False
+    expected = _simple_calculation_result(node.requested_content)
+    effect = normalize_desktop_observable_effect(attempt.observable_effect)
+    if not expected or not effect:
+        return False
+    observed = re.sub(
+        r"(?<=\d)[\s\u00a0\u202f'](?=\d)",
+        "",
+        _normalized(effect.get("expected_text")).replace(",", "."),
+    )
+    return bool(re.search(
+        rf"(?<![\d.]){re.escape(expected)}(?![\d.])",
+        observed,
+    ))
 
 
 @dataclass
@@ -176,7 +250,7 @@ def _derive_semantic_node(
     application = ""
     for candidate in _KNOWN_APPLICATIONS:
         if re.search(rf"(?<![a-z0-9]){re.escape(candidate)}(?![a-z0-9])", norm):
-            application = "vscode" if candidate == "visual studio code" else candidate
+            application = _canonical_application(candidate)
             break
 
     surface = ""
@@ -363,7 +437,7 @@ def _explicit_application(clause: str, node: SemanticActionNode) -> str:
     if node.requested_action == "open":
         target = _normalized(node.target_object)
         target = re.sub(r"^(?:the|a|an|le|la|les|un|une)\s+", "", target)
-        return _bounded(target, 80)
+        return _bounded(_canonical_application(target), 80)
     if node.requested_action in {"type", "send", "create"}:
         match = re.search(
             r"\b(?:in|into|inside|dans|sur)\s+([^,.;]{1,80})$", norm,
@@ -412,7 +486,7 @@ def _node_with_identity(
     postcondition: str = "",
 ) -> SemanticActionNode:
     if application:
-        node.required_application = _normalized(application)
+        node.required_application = _canonical_application(application)
         if node.requested_action == "open":
             node.target_object = _bounded(application, 160)
     if postcondition:
@@ -442,6 +516,16 @@ def _node_with_identity(
             node.requested_content = _bounded(quoted[-1], 320)
     elif node.requested_action == "calculate":
         node.requested_content = _bounded(node.target_object, 320)
+        exact_result = _simple_calculation_result(node.requested_content)
+        if exact_result and not postcondition:
+            node.observable_success_postcondition = _bounded(
+                f"{node.required_application or 'calculator'} visibly displays "
+                f"the exact result {exact_result}",
+                320,
+            )
+            node.required_postconditions = (
+                node.observable_success_postcondition,
+            )
     return node
 
 
@@ -998,7 +1082,7 @@ class ExecutionStrategy:
 
     def _tool_application(self, tool_name: str, arguments: dict) -> str:
         if tool_name == "open_application":
-            return _normalized(arguments.get("name"))
+            return _canonical_application(arguments.get("name"))
         if tool_name == "open_uri":
             return _uri_identity(arguments.get("uri", ""))[0]
         if tool_name in _DOM_ACTION_TOOLS:
@@ -2020,11 +2104,29 @@ class ExecutionStrategy:
                         return False
             if primitive_only and succeeded and evidence:
                 bounded = _bounded(evidence, 180)
-                attempt.status = AttemptStatus.PROGRESSED.value
+                completes_parent = _primitive_proves_calculation_result(
+                    node,
+                    attempt,
+                )
+                attempt.status = (
+                    AttemptStatus.SUCCEEDED.value
+                    if completes_parent else
+                    AttemptStatus.PROGRESSED.value
+                )
                 attempt.postcondition_evidence = bounded
                 attempt.observations_gained.append(bounded)
                 if node is not None:
-                    node.status = "pending"
+                    if completes_parent:
+                        for postcondition in node.required_postconditions:
+                            self.proven_postconditions[postcondition] = bounded
+                        self.postcondition_evidence.append(bounded)
+                        node.status = "succeeded"
+                        self.succeeded = all(
+                            item in self.proven_postconditions
+                            for item in self.required_postconditions
+                        )
+                    else:
+                        node.status = "pending"
                     node.evidence_links = tuple(
                         (*node.evidence_links, bounded)[-16:]
                     )
@@ -5356,9 +5458,7 @@ def _single_application_hint(*values: object) -> str:
                 normalized,
             ):
                 continue
-            canonical = (
-                "vscode" if candidate == "visual studio code" else candidate
-            )
+            canonical = _canonical_application(candidate)
             if canonical not in found:
                 found.append(canonical)
     return found[0] if len(found) == 1 else ""
@@ -5507,7 +5607,9 @@ def mechanism_for_tool(
     if tool_name in _OBSERVATION_TOOLS:
         return None
     if tool_name == "open_application":
-        app = _normalized(arguments.get("name")) or goal.required_application
+        app = _canonical_application(
+            arguments.get("name")
+        ) or goal.required_application
         covers = goal.requested_action == "open" and not goal.required_surface
         try:
             from osia.tool_contracts import get_tool_spec
