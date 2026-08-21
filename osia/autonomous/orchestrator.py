@@ -643,9 +643,10 @@ class Orchestrator:
         if task is None or not task.get("tool_attempt_id"):
             return False
         self._state = st
-        self._terminalize_recovered_tool_failure(
+        self._block_unknown_tool_effect(
             st, phase_index, task_index, task, reason_code,
         )
+        self._stop.set()
         return True
 
     def _terminalize_recovered_tool_failure(
@@ -669,8 +670,6 @@ class Orchestrator:
             self._block_unknown_tool_effect(
                 st, phase_index, task_index, task, safe_reason,
             )
-            self._stop.set()
-            return
         elif task is not None:
             state.set_task_status(
                 st, phase_index, task_index, "failed",
@@ -1290,9 +1289,10 @@ class Orchestrator:
             return
         identity_error = self._common_attempt_identity_error(st, task, attempt)
         if identity_error:
-            self._terminalize_recovered_tool_failure(
+            self._block_unknown_tool_effect(
                 st, phase_index, task_index, task, identity_error,
             )
+            self._stop.set()
             return
         self._recovered_tool_attempts.add(attempt_id)
         if status in RECOVERABLE_STATUSES:
