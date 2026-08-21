@@ -7281,6 +7281,8 @@ class OSIAAgent:
         self._turn_terminal_results: dict[str, dict] = {}
         self._queued_terminal_cancellations: dict[str, bool] = {}
         self._terminality_cancel_lock = threading.Lock()
+        self._chat_durable_binding: dict | None = None
+        self._chat_durable_lock = threading.Lock()
         self._tool_cancel_requested = False
         self._execution_trace_ledger = None
         self._execution_trace_callback = None
@@ -9309,6 +9311,98 @@ class OSIAAgent:
             return dict(result) if isinstance(result, dict) else None
         return None
 
+    def bind_chat_durable_execution(
+        self,
+        result: dict,
+        request: dict,
+        *,
+        cancel_callback=None,
+    ) -> bool:
+        """Bind one exact durable run to its originating Chat turn."""
+
+        binding = {
+            "conversation_id": str(request.get("conversation_id") or "")[:160],
+            "request_id": str(request.get("source_request_id") or "")[:160],
+            "turn_id": str(request.get("source_turn_id") or "")[:160],
+            "task_id": str(result.get("task_id") or "")[:160],
+            "run_id": str(result.get("run_id") or "")[:160],
+            "cancel_callback": cancel_callback,
+            "cancel_requested": False,
+        }
+        if not all(binding[key] for key in (
+            "conversation_id", "request_id", "turn_id", "run_id",
+        )):
+            return False
+        with self._chat_durable_lock:
+            current = self._chat_durable_binding
+            if isinstance(current, dict) and any(
+                current.get(key) != binding.get(key)
+                for key in ("conversation_id", "request_id", "turn_id", "run_id")
+            ):
+                return False
+            if isinstance(current, dict) and current.get("cancel_requested"):
+                binding["cancel_requested"] = True
+            self._chat_durable_binding = binding
+        return True
+
+    def _reserve_chat_durable_terminal(
+        self,
+        payload: dict,
+        final_text: str,
+    ) -> None:
+        """Project a durable terminal receipt into the existing Chat final gate."""
+
+        controller = self._terminality_controller
+        strategy = self._terminality_strategy
+        status = str(payload.get("status") or "")
+        if controller is None or status not in {
+            "completed", "blocked", "cancelled", "failed", "busy",
+            "unavailable", "outcome_unknown",
+        }:
+            return
+        provider_route = f"{self.provider}:{self.model}"
+        if status == "completed":
+            evidence = "durable_run:" + str(payload.get("run_id") or "verified")
+            required = tuple(
+                controller.snapshot().get("required_postconditions") or ()
+            )
+            for postcondition in required:
+                if strategy is not None:
+                    strategy.verify_postcondition(
+                        evidence,
+                        postcondition=str(postcondition),
+                    )
+                controller.prove_postcondition(str(postcondition), evidence)
+            if strategy is not None:
+                controller.set_strategy_snapshot(strategy.snapshot())
+            controller.reserve_final(
+                "success_verified",
+                reason_code="durable_execution_completed",
+                provider_route=provider_route,
+                final_text=final_text,
+            )
+            return
+        if status == "cancelled" and not payload.get("outcome_unknown"):
+            controller.request_cancellation(effect_possible=False)
+            controller.reserve_final(
+                "user_cancelled",
+                reason_code="authoritative_user_cancellation",
+                provider_route=provider_route,
+                final_text=final_text,
+            )
+            return
+        controller.set_strategy_frontier(())
+        controller.reserve_final(
+            "blocked_verified",
+            reason_code=(
+                "durable_outcome_unknown"
+                if payload.get("outcome_unknown") or status == "outcome_unknown" else
+                "durable_execution_blocked"
+            ),
+            provider_route=provider_route,
+            final_text=final_text,
+        )
+
     def request_turn_cancellation(
         self,
         turn_id: str,
@@ -9320,6 +9414,30 @@ class OSIAAgent:
         stable_turn_id = str(turn_id or "")
         if not stable_turn_id:
             return False
+        durable_cancel_result = None
+        with self._chat_durable_lock:
+            binding = self._chat_durable_binding
+            if (
+                isinstance(binding, dict)
+                and binding.get("turn_id") == stable_turn_id
+                and not binding.get("cancel_requested")
+            ):
+                binding["cancel_requested"] = True
+                durable_cancel = binding.get("cancel_callback")
+                durable_target = dict(binding)
+            else:
+                durable_cancel = None
+                durable_target = None
+        if callable(durable_cancel) and isinstance(durable_target, dict):
+            try:
+                durable_cancel_result = durable_cancel(durable_target)
+            except Exception:
+                durable_cancel_result = {"outcome_unknown": True}
+            if isinstance(durable_cancel_result, dict):
+                effect_possible = bool(
+                    effect_possible
+                    or durable_cancel_result.get("outcome_unknown")
+                )
         controller = self._terminality_controller
         if controller is None or controller.turn_id != stable_turn_id:
             with self._terminality_cancel_lock:
@@ -10938,6 +11056,7 @@ class OSIAAgent:
             content = self._redact_semantic_form_values(content)
             if canonical_output:
                 content = clean_response(content)
+            self._reserve_chat_durable_terminal(payload, content)
             if on_sentence is not None:
                 try:
                     on_sentence(content)
@@ -11418,6 +11537,25 @@ class OSIAAgent:
                     return _finish_chat_handoff(
                         {"status": "failed"}, round_number,
                     )
+                elif (
+                    not _chat_routing.looks_like_schedule_route(user_text)
+                    and (
+                        self._slash_turn_directives is None
+                        or self._slash_turn_directives.is_empty
+                    )
+                ):
+                    # Chat is the single user-facing entry point, while every
+                    # tool/computer effect is owned by the canonical durable
+                    # backend. The provider may still propose an ordinary tool;
+                    # replace the whole batch before dispatch so there is never
+                    # a parallel normal-Chat execution or a sibling side effect.
+                    tool_calls = [{
+                        "tool": _chat_routing.ROUTING_TOOL_NAME,
+                        "reason_code": "sustained_computer_work",
+                        "confidence": 1.0,
+                        "explicit_request": False,
+                    }]
+                    chat_handoff_tool_seen = True
             if tool_calls and language_consistency_retry_used:
                 # The bounded consistency retry is synthesis-only. A provider
                 # must not turn it into another dispatch or replay an earlier

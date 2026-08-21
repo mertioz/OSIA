@@ -131,6 +131,9 @@ _SERVER_AUTONOMOUS_PC_ACTION_URL = (
 _SERVER_CHAT_AUTONOMOUS_START_URL = (
     "http://127.0.0.1:8765/internal/chat_autonomous_start"
 )
+_SERVER_CHAT_AUTONOMOUS_CANCEL_URL = (
+    "http://127.0.0.1:8765/internal/chat_autonomous_cancel"
+)
 
 
 def _launch_server_autonomous_from_chat(request: dict) -> dict:
@@ -146,7 +149,7 @@ def _launch_server_autonomous_from_chat(request: dict) -> dict:
         key: request.get(key)
         for key in (
             "objective", "source_refs", "request_id", "conversation_id",
-            "source_request_id", "source_turn_id",
+            "source_request_id", "source_turn_id", "source_assistant_message_id",
             "provider_id", "model_id", "reason_code", "confidence",
             "explicit_request",
         )
@@ -197,6 +200,106 @@ def _load_server_autonomous_pc_state() -> dict | None:
         return None
     state = payload.get("state") if isinstance(payload, dict) else None
     return state if payload.get("ok") is True and isinstance(state, dict) else None
+
+
+def _cancel_server_autonomous_from_chat(binding: dict) -> dict:
+    """Request exact cancellation of one desktop-Chat-owned durable run."""
+
+    import json
+    import urllib.request
+
+    payload = json.dumps({
+        key: str(binding.get(key) or "")
+        for key in ("conversation_id", "request_id", "turn_id", "task_id", "run_id")
+    }).encode("utf-8")
+    try:
+        request = urllib.request.Request(
+            _SERVER_CHAT_AUTONOMOUS_CANCEL_URL,
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=5.0) as response:
+            decoded = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return {"accepted": False, "outcome_unknown": True}
+    return decoded if isinstance(decoded, dict) else {
+        "accepted": False,
+        "outcome_unknown": True,
+    }
+
+
+def _wait_server_autonomous_from_chat(
+    initial_result: dict,
+    request: dict,
+    *,
+    progress_callback=None,
+    bind_execution=None,
+) -> dict:
+    """Follow one exact server checkpoint through restarts until terminal."""
+
+    del initial_result
+    last_progress = None
+    while True:
+        state = _load_server_autonomous_pc_state()
+        execution = (
+            state.get("chat_execution")
+            if isinstance(state, dict) else None
+        )
+        if isinstance(execution, dict) and (
+            execution.get("conversation_id") == request.get("conversation_id")
+            and execution.get("request_id") == request.get("source_request_id")
+            and execution.get("turn_id") == request.get("source_turn_id")
+        ):
+            if callable(bind_execution) and execution.get("run_id"):
+                try:
+                    bind_execution(execution, request)
+                except Exception:
+                    pass
+            identity = tuple(sorted(execution.items()))
+            if identity != last_progress and callable(progress_callback):
+                try:
+                    progress_callback(dict(execution))
+                except Exception:
+                    pass
+            last_progress = identity
+            if execution.get("terminal"):
+                return dict(execution)
+        try:
+            persisted = conversations.find_correlated_turn(
+                str(request.get("conversation_id") or ""),
+                str(request.get("source_request_id") or ""),
+            )
+        except ValueError:
+            persisted = None
+        if (
+            isinstance(persisted, dict)
+            and persisted.get("assistant_message_id")
+            == request.get("source_assistant_message_id")
+            and persisted.get("durable_run_id")
+            and isinstance(persisted.get("assistant_content"), str)
+        ):
+            return {
+                "status": str(persisted.get("durable_status") or "blocked"),
+                "progress_status": str(
+                    persisted.get("durable_status") or "blocked"
+                ),
+                "terminal": True,
+                "outcome_unknown": bool(
+                    persisted.get("durable_outcome_unknown")
+                ),
+                "conversation_id": str(persisted.get("conversation_id") or ""),
+                "request_id": str(persisted.get("request_id") or ""),
+                "turn_id": str(persisted.get("turn_id") or ""),
+                "assistant_message_id": str(
+                    persisted.get("assistant_message_id") or ""
+                ),
+                "run_id": str(persisted.get("durable_run_id") or ""),
+                "provider_id": str(persisted.get("durable_provider_id") or ""),
+                "model_id": str(persisted.get("durable_model_id") or ""),
+                "final_text": str(persisted.get("assistant_content") or "")[:32_000],
+            }
+        time.sleep(0.25)
 
 
 def _send_server_autonomous_pc_action(action: str) -> dict | None:
@@ -1591,6 +1694,9 @@ def wake_mode():
             "request_id": str(turn_meta.get("turn_id") or ""),
             "source_request_id": str(turn_meta.get("request_id") or ""),
             "source_turn_id": str(turn_meta.get("turn_id") or ""),
+            "source_assistant_message_id": str(
+                turn_meta.get("assistant_message_id") or ""
+            ),
             "origin_ref": "desktop",
             "device_id": "",
             "turn_context": turn_context,
@@ -1675,6 +1781,35 @@ def wake_mode():
                 bridge.conversations_changed.emit(
                     active_conv["id"] if active_conv else ""
                 )
+
+        def _bind_chat_durable(result: dict, request: dict) -> bool:
+            return turn_agent.bind_chat_durable_execution(
+                result,
+                request,
+                cancel_callback=_cancel_server_autonomous_from_chat,
+            )
+
+        def _chat_durable_progress(payload: dict) -> None:
+            status = str(payload.get("status") or "executing")
+            attempt_status = {
+                "planning": "action_starting",
+                "executing": "action_in_progress",
+                "waiting": "waiting_tool_result",
+                "verifying": "verifying_tool_result",
+                "recovering": "resuming_tool_turn",
+                "cancelled": "cancellation_requested",
+                "blocked": "blocked_unknown_effect",
+            }.get(status, "action_in_progress")
+            on_tool_attempt_status(
+                attempt_status,
+                str(payload.get("run_id") or "durable_chat"),
+            )
+
+        turn_agent._chat_autonomous_context.update({
+            "waiter": _wait_server_autonomous_from_chat,
+            "bind_execution": _bind_chat_durable,
+            "progress_callback": _chat_durable_progress,
+        })
 
         turn_agent.configure_tool_attempts(
             conversation_id=conv_id,
@@ -3286,7 +3421,8 @@ def wake_mode():
             "failed": "failed",
             "cancelled": "aborted",
         }.get(run_state, run_state)
-        if not same_mobile_run:
+        is_chat_owned_run = st.get("chat_route_type") == "autonomous"
+        if not same_mobile_run and not is_chat_owned_run:
             popup.show_autonomous(st)
         else:
             popup.update_autonomous_progress({"event": event, **st})

@@ -114,7 +114,7 @@ import psutil
 import soundfile as sf
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 
-from osia import conversations, document_sources, i18n
+from osia import chat_routing, conversations, document_sources, i18n
 from osia.attachments import (
     ATTACHMENT_EVENT_TYPES,
     AttachmentBatchManager,
@@ -6152,7 +6152,12 @@ def _on_autonomous_progress(payload: dict) -> None:
             and event != "cancellation_requested"
         ):
             return
-        if event in ("done", "failed", "cancelled_proven"):
+        chat_blocked_terminal = bool(
+            event == "blocked_unknown_effect"
+            and isinstance(current_state, dict)
+            and current_state.get("chat_route_type") == "autonomous"
+        )
+        if event in ("done", "failed", "cancelled_proven") or chat_blocked_terminal:
             # ── Terminal: gate a paused/superseded orphan's late terminal ──
             if _autonomous.get("interrupting") or not _autonomous.get("active"):
                 print(f"[WOR-45] gating stale autonomous terminal {event!r} "
@@ -6160,6 +6165,8 @@ def _on_autonomous_progress(payload: dict) -> None:
                       f"active={_autonomous.get('active')}) — orphan-loop race; "
                       "drain/resume decides the real state from disk")
                 return
+            if isinstance(current_state, dict):
+                _persist_chat_durable_terminal(current_state)
             frame = _autonomous_frame(dict(payload), _autonomous.get("st"))
             _retire_document_scope(
                 "autonomous", str(frame.get("run_id") or ""),
@@ -6404,6 +6411,9 @@ def _autonomous_start_worker(
             st["source_request_id"] = str(
                 chat_route.get("source_request_id") or request_id
             )[:160]
+            st["source_assistant_message_id"] = str(
+                chat_route.get("source_assistant_message_id") or ""
+            )[:160]
             st["source_permission_epoch"] = int(
                 chat_route.get("permission_epoch") or 0
             )
@@ -6559,6 +6569,22 @@ def _chat_route_result_from_state(st: dict | None, *, active: bool) -> dict:
         base.update({"provider_id": provider, "model_id": model})
     run_state = str(st.get("run_state") or "")
     status = str(st.get("status") or "")
+    if status == "done" or run_state == "completed":
+        return {
+            **base,
+            **chat_routing.terminal_result_from_state(
+                st, str(st.get("language") or "en"),
+            ),
+        }
+    if status in {"aborted", "cancelled"} or run_state in {
+        "cancelled", "cancelled_proven",
+    }:
+        return {
+            **base,
+            **chat_routing.terminal_result_from_state(
+                st, str(st.get("language") or "en"),
+            ),
+        }
     if status in {"failed", "aborted"} or st.get("failure_diagnostic"):
         diagnostic = st.get("failure_diagnostic")
         code = (
@@ -6586,6 +6612,203 @@ def _chat_route_result_from_state(st: dict | None, *, active: bool) -> dict:
     if status == "in_progress":
         return {**base, "status": "outcome_unknown"}
     return {**base, "status": "failed", "error_code": "start_not_active"}
+
+
+def _chat_durable_state_matches(st: dict | None, request: dict) -> bool:
+    return bool(
+        isinstance(st, dict)
+        and st.get("chat_route_type") == "autonomous"
+        and str(st.get("source_conversation_id") or "")
+        == str(request.get("conversation_id") or "")
+        and str(st.get("source_request_id") or "")
+        == str(request.get("source_request_id") or "")
+        and str(st.get("source_turn_id") or "")
+        == str(request.get("source_turn_id") or "")
+    )
+
+
+def _persist_chat_durable_terminal(st: dict) -> dict | None:
+    """Commit one terminal durable result to its exact originating Chat turn."""
+
+    result = chat_routing.terminal_result_from_state(
+        st, str(st.get("language") or "en"),
+    )
+    if not result.get("terminal"):
+        return None
+    conv_id = str(st.get("source_conversation_id") or "")
+    request_id = str(st.get("source_request_id") or "")
+    turn_id = str(st.get("source_turn_id") or "")
+    message_id = str(st.get("source_assistant_message_id") or "")
+    if not all((conv_id, request_id, turn_id, message_id)):
+        return None
+    try:
+        receipt = conversations.commit_durable_assistant_message(
+            conv_id,
+            str(result.get("final_text") or ""),
+            metadata={
+                "_conversation_id": conv_id,
+                "_request_id": request_id,
+                "_client_request_id": request_id,
+                "_turn_id": turn_id,
+                "_message_id": message_id,
+                "_operation_id": message_id,
+                "_durable_run_id": str(st.get("run_id") or ""),
+                "_durable_status": str(result.get("status") or "blocked"),
+                "_durable_outcome_unknown": bool(
+                    result.get("outcome_unknown")
+                ),
+                "_durable_provider_id": str(st.get("provider") or ""),
+                "_durable_model_id": str(st.get("model") or ""),
+                "_language": str(st.get("language") or ""),
+            },
+        )
+    except (OSError, ValueError):
+        return None
+    if receipt and receipt.get("committed"):
+        loop = _autonomous.get("loop")
+        if loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _broadcast_canonical_conversation_change(
+                        conv_id,
+                        revision=int(receipt.get("revision") or 0),
+                        operation_id=str(receipt.get("operation_id") or ""),
+                    ),
+                    loop,
+                )
+            except Exception:
+                pass
+    return receipt
+
+
+def _wait_for_chat_autonomous_result(
+    initial_result: dict,
+    request: dict,
+    *,
+    progress_callback=None,
+    bind_execution=None,
+) -> dict:
+    """Wait on the canonical checkpoint until this exact Chat run terminates."""
+
+    last_progress = None
+    while True:
+        st = _current_autonomous_state()
+        if _chat_durable_state_matches(st, request):
+            progress = chat_routing.durable_progress_from_state(st)
+            if callable(bind_execution) and progress.get("run_id"):
+                try:
+                    bind_execution(progress, request)
+                except Exception:
+                    pass
+            identity = tuple(sorted(progress.items()))
+            if identity != last_progress and callable(progress_callback):
+                try:
+                    progress_callback(dict(progress))
+                except Exception:
+                    pass
+            last_progress = identity
+            if progress.get("terminal"):
+                return chat_routing.terminal_result_from_state(
+                    st, str(st.get("language") or "en"),
+                )
+        try:
+            persisted = conversations.find_correlated_turn(
+                str(request.get("conversation_id") or ""),
+                str(request.get("source_request_id") or ""),
+            )
+        except ValueError:
+            persisted = None
+        if (
+            isinstance(persisted, dict)
+            and persisted.get("assistant_message_id")
+            == request.get("source_assistant_message_id")
+            and persisted.get("durable_run_id")
+            and isinstance(persisted.get("assistant_content"), str)
+        ):
+            return {
+                "status": str(persisted.get("durable_status") or "blocked"),
+                "progress_status": str(
+                    persisted.get("durable_status") or "blocked"
+                ),
+                "terminal": True,
+                "outcome_unknown": bool(
+                    persisted.get("durable_outcome_unknown")
+                ),
+                "conversation_id": str(persisted.get("conversation_id") or ""),
+                "request_id": str(persisted.get("request_id") or ""),
+                "turn_id": str(persisted.get("turn_id") or ""),
+                "assistant_message_id": str(
+                    persisted.get("assistant_message_id") or ""
+                ),
+                "run_id": str(persisted.get("durable_run_id") or ""),
+                "provider_id": str(persisted.get("durable_provider_id") or ""),
+                "model_id": str(persisted.get("durable_model_id") or ""),
+                "final_text": str(persisted.get("assistant_content") or "")[:32_000],
+            }
+        time.sleep(0.2)
+
+
+def _cancel_chat_autonomous_execution(binding: dict) -> dict:
+    """Cancel only the exact durable run bound to one originating Chat turn."""
+
+    st = _current_autonomous_state()
+    if not isinstance(st, dict) or any(
+        str(st.get(state_key) or "") != str(binding.get(binding_key) or "")
+        for state_key, binding_key in (
+            ("run_id", "run_id"),
+            ("source_conversation_id", "conversation_id"),
+            ("source_request_id", "request_id"),
+            ("source_turn_id", "turn_id"),
+        )
+    ):
+        return {"accepted": False, "error_code": "target_mismatch"}
+    terminal = chat_routing.terminal_result_from_state(
+        st, str(st.get("language") or "en"),
+    )
+    if terminal.get("terminal"):
+        return {**terminal, "accepted": False}
+    if st.get("abandon_state") == "abandon_requested":
+        return {
+            "accepted": True,
+            "status": "cancellation_requested",
+            "outcome_unknown": (
+                st.get("abandon_effect_state") == "effect_possible_or_unknown"
+            ),
+        }
+    st["abandon_origin_status"] = str(st.get("status") or "")[:32]
+    st["abandon_origin_run_state"] = str(st.get("run_state") or "")[:64]
+    st["abandon_state"] = "abandon_requested"
+    st["abandon_effect_state"] = _autonomous_abandon_effect_state(st)
+    st["run_state"] = "cancellation_requested"
+    try:
+        _astate.save_task_state(st)
+    except Exception:
+        pass
+    _broadcast_autonomous(
+        _autonomous_frame({"event": "cancellation_requested"}, st)
+    )
+
+    def _cancel_worker() -> None:
+        terminalized = _terminalize_autonomous_abandon(
+            st, _autonomous.get("orch"),
+        )
+        _persist_chat_durable_terminal(st)
+        if terminalized:
+            _broadcast_autonomous(_autonomous_frame({"event": "aborted"}, st))
+        _release_single_runner()
+
+    threading.Thread(
+        target=_cancel_worker,
+        name="osia-chat-autonomous-cancel",
+        daemon=True,
+    ).start()
+    return {
+        "accepted": True,
+        "status": "cancellation_requested",
+        "outcome_unknown": (
+            st.get("abandon_effect_state") == "effect_possible_or_unknown"
+        ),
+    }
 
 
 def _remember_chat_route_result(
@@ -6616,6 +6839,9 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
         request.get("source_request_id") or request_id
     ).strip()
     source_turn_id = str(request.get("source_turn_id") or request_id).strip()
+    source_assistant_message_id = str(
+        request.get("source_assistant_message_id") or ""
+    ).strip()
     conversation_id = str(request.get("conversation_id") or "").strip()
     origin_ref = str(request.get("origin_ref") or "desktop").strip()[:160]
     device_id = str(request.get("device_id") or "").strip()[:128]
@@ -6633,6 +6859,12 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
         or not re.fullmatch(r"[A-Za-z0-9_.:-]{8,160}", request_id)
         or not re.fullmatch(r"[A-Za-z0-9_.:-]{8,160}", source_request_id)
         or not re.fullmatch(r"[A-Za-z0-9_.:-]{8,160}", source_turn_id)
+        or (
+            source_assistant_message_id
+            and not re.fullmatch(
+                r"[A-Za-z0-9_.:-]{8,160}", source_assistant_message_id
+            )
+        )
         or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", conversation_id)
         or not re.fullmatch(r"[a-z0-9_-]{1,48}", provider)
         or len(model) > 160
@@ -6650,6 +6882,7 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
             "conversation_id": conversation_id,
             "source_request_id": source_request_id,
             "source_turn_id": source_turn_id,
+            "source_assistant_message_id": source_assistant_message_id,
             "objective": objective,
             "provider_id": provider,
             "model_id": model,
@@ -6798,6 +7031,7 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
                 "request_id": request_id,
                 "source_request_id": source_request_id,
                 "source_turn_id": source_turn_id,
+                "source_assistant_message_id": source_assistant_message_id,
                 "conversation_id": conversation_id,
                 "permission_epoch": permission_epoch,
                 "tool_attempt_id": str(
@@ -7276,6 +7510,13 @@ def _autonomous_pc_snapshot(st: dict | None) -> dict:
         pc.get("private_scope_details") or {}
     )
     checkpoint["_server_mobile_run"] = True
+    if st.get("chat_route_type") == "autonomous":
+        chat_execution = chat_routing.durable_progress_from_state(st)
+        if chat_execution.get("terminal"):
+            chat_execution = chat_routing.terminal_result_from_state(
+                st, str(st.get("language") or "en"),
+            )
+        checkpoint["chat_execution"] = chat_execution
     return checkpoint
 
 
@@ -7368,7 +7609,7 @@ async def internal_chat_autonomous_start(request: Request):
         return {"status": "failed", "error_code": "invalid_request"}
     allowed = {
         "objective", "source_refs", "request_id", "conversation_id",
-        "source_request_id", "source_turn_id",
+        "source_request_id", "source_turn_id", "source_assistant_message_id",
         "provider_id", "model_id", "reason_code", "confidence",
         "explicit_request", "language",
     }
@@ -7379,6 +7620,26 @@ async def internal_chat_autonomous_start(request: Request):
     payload["device_id"] = ""
     _autonomous["loop"] = asyncio.get_running_loop()
     return await asyncio.to_thread(_launch_autonomous_from_chat, payload)
+
+
+@app.post("/internal/chat_autonomous_cancel")
+async def internal_chat_autonomous_cancel(request: Request):
+    """Loopback-only exact cancellation for a Chat-owned durable run."""
+
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"accepted": False, "error_code": "forbidden"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    allowed = {"conversation_id", "request_id", "turn_id", "task_id", "run_id"}
+    if not isinstance(body, dict) or set(body) - allowed:
+        return {"accepted": False, "error_code": "invalid_request"}
+    return await asyncio.to_thread(
+        _cancel_chat_autonomous_execution,
+        {key: str(body.get(key) or "")[:160] for key in allowed},
+    )
 
 
 @app.get("/internal/autonomous_authorization_state")
@@ -12276,9 +12537,38 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             if len(document_progress_futures) < 128:
                 document_progress_futures.append(future)
 
+        def _bind_chat_durable(result: dict, request: dict) -> bool:
+            binder = getattr(agent, "bind_chat_durable_execution", None)
+            if not callable(binder):
+                return False
+            return bool(binder(
+                result,
+                request,
+                cancel_callback=_cancel_chat_autonomous_execution,
+            ))
+
+        def _chat_durable_progress(payload: dict) -> None:
+            status = str(payload.get("status") or "executing")
+            attempt_status = {
+                "planning": "action_starting",
+                "executing": "action_in_progress",
+                "waiting": "waiting_tool_result",
+                "verifying": "verifying_tool_result",
+                "recovering": "resuming_tool_turn",
+                "cancelled": "cancelled_proven",
+                "blocked": "blocked_unknown_effect",
+            }.get(status, "action_in_progress")
+            _tool_attempt_status(
+                attempt_status,
+                str(payload.get("run_id") or "durable_chat"),
+            )
+
         _autonomous["loop"] = document_loop
         agent._chat_autonomous_context = {
             "launcher": _launch_autonomous_from_chat,
+            "waiter": _wait_for_chat_autonomous_result,
+            "bind_execution": _bind_chat_durable,
+            "progress_callback": _chat_durable_progress,
             "original_user_text": str(original_user_text or ""),
             "provider_input": text,
             "history": history,
@@ -12288,6 +12578,9 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 (turn_meta or {}).get("request_id") or ""
             ),
             "source_turn_id": str((turn_meta or {}).get("turn_id") or ""),
+            "source_assistant_message_id": str(
+                (turn_meta or {}).get("assistant_message_id") or ""
+            ),
             "origin_ref": str(
                 (turn_meta or {}).get("_autonomous_origin_ref") or "desktop"
             ),

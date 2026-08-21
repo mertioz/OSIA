@@ -1553,6 +1553,126 @@ def commit_message(
         )
 
 
+def commit_durable_assistant_message(
+    conv_id: str,
+    content: str,
+    *,
+    metadata: dict,
+) -> dict | None:
+    """Append one exactly correlated durable result after intervening turns.
+
+    Ordinary assistant commits retain their strict visible-tail guard. A durable
+    run may legitimately finish after a newer turn, so this narrow path validates
+    the original accepted user/request/turn and the one-assistant invariant while
+    deliberately allowing the result to append at the current tail.
+    """
+
+    with _store_lock():
+        conv = get_conversation(conv_id)
+        if conv is None:
+            return None
+        correlation = {
+            key: value
+            for key, value in (metadata or {}).items()
+            if isinstance(key, str) and key.startswith("_")
+        }
+        message_id = str(correlation.get("_message_id") or "")
+        turn_id = str(correlation.get("_turn_id") or "")
+        request_id = str(
+            correlation.get("_request_id")
+            or correlation.get("_client_request_id")
+            or ""
+        )
+        operation_id = str(correlation.get("_operation_id") or message_id or "")
+        if not all((message_id, turn_id, request_id, operation_id)):
+            raise ValueError("durable assistant correlation is incomplete")
+        correlated_conversation = str(
+            correlation.get("_conversation_id") or conv_id
+        )
+        if correlated_conversation != conv_id:
+            raise ValueError("durable assistant conversation mismatch")
+        messages = conv.setdefault("messages", [])
+        accepted_user = None
+        for existing in messages:
+            if not isinstance(existing, dict):
+                continue
+            existing_message_id = str(existing.get("_message_id") or "")
+            existing_turn_id = str(existing.get("_turn_id") or "")
+            existing_request_id = str(
+                existing.get("_request_id")
+                or existing.get("_client_request_id")
+                or ""
+            )
+            existing_operation_id = str(
+                existing.get("_operation_id") or existing_message_id or ""
+            )
+            if existing_message_id == message_id:
+                if (
+                    existing.get("role") != "assistant"
+                    or existing_turn_id != turn_id
+                    or existing_request_id != request_id
+                    or existing_operation_id != operation_id
+                    or existing.get("content") != content
+                ):
+                    raise ValueError("message id correlation conflict")
+                enriched = False
+                for key, value in correlation.items():
+                    if key in existing:
+                        if existing[key] != value:
+                            raise ValueError("durable message metadata conflict")
+                        continue
+                    existing[key] = value
+                    enriched = True
+                if enriched:
+                    conv["updated_at"] = _now_iso()
+                    conv["revision"] = _next_revision(conv)
+                    conv["last_operation_id"] = operation_id
+                    _write_atomic(_path_for(conv_id), conv)
+                return _commit_receipt(
+                    conv,
+                    committed=enriched,
+                    operation_id=operation_id,
+                    message_id=message_id,
+                )
+            if existing_operation_id == operation_id:
+                raise ValueError("operation id correlation conflict")
+            if (
+                existing_turn_id == turn_id
+                and existing.get("role") == "assistant"
+            ):
+                raise ValueError("one correlated message per role and turn")
+            if (
+                existing_turn_id == turn_id
+                and existing_request_id == request_id
+                and existing.get("role") == "user"
+            ):
+                accepted_user = existing
+        if accepted_user is None:
+            raise ValueError("assistant message has no accepted user turn")
+        accepted_operation_id = str(
+            accepted_user.get("_operation_id")
+            or accepted_user.get("_message_id")
+            or ""
+        )
+        if accepted_operation_id == operation_id:
+            raise ValueError("assistant operation id must differ from user operation id")
+        entry = {"role": "assistant", "content": content}
+        entry.update(correlation)
+        revision = _next_revision(conv)
+        entry["_sequence"] = revision
+        messages.append(entry)
+        conv["updated_at"] = _now_iso()
+        conv["revision"] = revision
+        conv["last_operation_id"] = operation_id
+        _write_atomic(_path_for(conv_id), conv)
+        return _commit_receipt(
+            conv,
+            committed=True,
+            operation_id=operation_id,
+            message_id=message_id,
+        )
+
+
 def add_message(
     conv_id: str,
     role: str,
@@ -1648,6 +1768,21 @@ def find_correlated_turn(conv_id: str, request_id: str) -> dict | None:
             ),
             "reason_code": str(
                 (assistant_message or {}).get("_reason_code") or ""
+            ),
+            "durable_run_id": str(
+                (assistant_message or {}).get("_durable_run_id") or ""
+            ),
+            "durable_status": str(
+                (assistant_message or {}).get("_durable_status") or ""
+            ),
+            "durable_outcome_unknown": bool(
+                (assistant_message or {}).get("_durable_outcome_unknown")
+            ),
+            "durable_provider_id": str(
+                (assistant_message or {}).get("_durable_provider_id") or ""
+            ),
+            "durable_model_id": str(
+                (assistant_message or {}).get("_durable_model_id") or ""
             ),
         }
 

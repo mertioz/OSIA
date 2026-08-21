@@ -881,8 +881,10 @@ def new_task_state(objective: str, provider: str, model: str, phases, *,
         "source_conversation_id": "",
         "source_turn_id": "",
         "source_request_id": "",
+        "source_assistant_message_id": "",
         "source_permission_epoch": 0,
         "attached_tool_attempt_id": "",
+        "terminal_response": "",
         "language": normalized_language,
         "language_mode": normalized_mode,
         "allowed_languages": normalized_allowed,
@@ -1345,12 +1347,17 @@ def execution_state_is_valid(st) -> bool:
             return False
     for name in (
         "source_conversation_id", "source_turn_id", "source_request_id",
-        "attached_tool_attempt_id",
+        "source_assistant_message_id", "attached_tool_attempt_id",
     ):
         if not isinstance(st.get(name, ""), str) or not re.fullmatch(
             r"[A-Za-z0-9_.:-]{0,160}", st.get(name, ""),
         ):
             return False
+    if (
+        not isinstance(st.get("terminal_response", ""), str)
+        or len(st.get("terminal_response", "")) > 32_000
+    ):
+        return False
     if (
         type(st.get("source_permission_epoch", 0)) is not int
         or st.get("source_permission_epoch", 0) < 0
@@ -1474,8 +1481,10 @@ def _migrate_loaded_state(loaded: dict) -> dict:
         "source_conversation_id": "",
         "source_turn_id": "",
         "source_request_id": "",
+        "source_assistant_message_id": "",
         "source_permission_epoch": 0,
         "attached_tool_attempt_id": "",
+        "terminal_response": "",
     }
     for key, value in defaults.items():
         loaded.setdefault(key, value)

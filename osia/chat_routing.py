@@ -88,13 +88,16 @@ def routing_prompt(language: str = "en") -> str:
         "## Chat / Autonomous routing\n"
         "Before any normal tool call, choose exactly one route for the current "
         "request: normal chat, Autonomous, Scheduled Tasks, or clarification. "
-        "Do not add a classification request. Simple questions and short actions "
-        "stay in normal chat. Every future or recurring request uses only the "
-        "Scheduled Tasks tools. For a natural explicit Autonomous request, or "
-        "genuinely long work requiring dependent phases, extended research, "
-        "iterative artifact work, sustained computer control, or work that cannot "
-        "reasonably fit one turn, call start_autonomous_mission BEFORE every other "
-        "tool. Supply only reason_code, confidence, and explicit_request; never "
+        "Do not add a classification request. Answer simple questions directly "
+        "only when no tool or computer action is needed. Every future or recurring "
+        "request uses only the Scheduled Tasks tools. For every request that needs "
+        "a tool, computer action, or multiple dependent steps, call "
+        "start_autonomous_mission BEFORE every other tool. Use reason_code "
+        "sustained_computer_work for tool or computer actions, whether bounded "
+        "or long; use the other reason codes for dependent phases, extended "
+        "research, iterative artifact work, or work that cannot reasonably fit "
+        "one turn. Supply "
+        "only reason_code, confidence, and explicit_request; never "
         "reveal private reasoning. Never combine this handoff with another tool "
         "in the same batch. If the essential objective is missing, ask one "
         "clarifying question."
@@ -249,8 +252,13 @@ def evaluate_route_request(
             "reason_code": "invalid_reason",
             "confidence": score,
         }
+    automatic_execution = bool(
+        reason == "sustained_computer_work" and objective and score >= 0.80
+    )
     if not explicit and (
-        bool(explicit_request) or score < 0.80 or not _looks_genuinely_long(objective, reason)
+        bool(explicit_request)
+        or score < 0.80
+        or (not automatic_execution and not _looks_genuinely_long(objective, reason))
     ):
         return {
             "ok": False,
@@ -317,6 +325,9 @@ def execute_route_request(
         "source_turn_id": str(
             ctx.get("source_turn_id") or ctx.get("request_id") or ""
         )[:160],
+        "source_assistant_message_id": str(
+            ctx.get("source_assistant_message_id") or ""
+        )[:160],
         "conversation_id": str(ctx.get("conversation_id") or "")[:160],
         "origin_ref": str(ctx.get("origin_ref") or "desktop")[:160],
         "device_id": str(ctx.get("device_id") or "")[:128],
@@ -326,6 +337,22 @@ def execute_route_request(
         "explicit_request": decision["explicit_request"],
         "turn_context": ctx.get("turn_context"),
     }
+    progress_callback = ctx.get("progress_callback")
+    if callable(progress_callback):
+        try:
+            progress_callback({
+                "status": "planning",
+                "progress_status": "planning",
+                "terminal": False,
+                "conversation_id": request["conversation_id"],
+                "request_id": request["source_request_id"],
+                "turn_id": request["source_turn_id"],
+                "assistant_message_id": request["source_assistant_message_id"],
+                "provider_id": request["provider_id"],
+                "model_id": request["model_id"],
+            })
+        except Exception:
+            pass
     try:
         result = launcher(request)
     except Exception:
@@ -342,14 +369,45 @@ def execute_route_request(
             "confidence": decision["confidence"],
             "error_code": "runner_transport_unavailable",
         }
+    initial_result = dict(result)
+    bind_execution = ctx.get("bind_execution")
+    if callable(bind_execution) and (
+        initial_result.get("run_id") or initial_result.get("task_id")
+    ):
+        try:
+            bind_execution(initial_result, request)
+        except Exception:
+            pass
+    waiter = ctx.get("waiter")
+    if callable(waiter) and str(initial_result.get("status") or "") in {
+        "running", "authorization_pending", "starting", "outcome_unknown",
+    }:
+        try:
+            waited = waiter(
+                initial_result,
+                request,
+                progress_callback=ctx.get("progress_callback"),
+                bind_execution=bind_execution,
+            )
+            if isinstance(waited, Mapping):
+                result = waited
+        except Exception:
+            result = {
+                **initial_result,
+                "status": "outcome_unknown",
+                "error_code": "durable_state_unavailable",
+            }
     status = str(result.get("status") or "failed")
     if status not in {
         "running", "authorization_pending", "starting", "busy",
-        "unavailable", "failed", "outcome_unknown",
+        "unavailable", "failed", "outcome_unknown", "completed",
+        "blocked", "cancelled",
     }:
         status = "failed"
     return {
-        "ok": status in {"running", "authorization_pending", "starting"},
+        "ok": status in {
+            "running", "authorization_pending", "starting", "completed",
+        },
         "route": "autonomous",
         "status": status,
         "reason_code": decision["reason_code"],
@@ -361,6 +419,80 @@ def execute_route_request(
             result.get("provider_id") or request["provider_id"]
         )[:48],
         "model_id": str(result.get("model_id") or request["model_id"])[:160],
+        "terminal": bool(result.get("terminal")) or status in {
+            "completed", "blocked", "cancelled", "failed",
+        },
+        "final_text": str(result.get("final_text") or "")[:32_000],
+        "outcome_unknown": bool(result.get("outcome_unknown")),
+        "progress_status": str(result.get("progress_status") or "")[:32],
+    }
+
+
+def durable_progress_from_state(st: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Project one durable run into bounded Chat progress without reasoning."""
+
+    if not isinstance(st, Mapping):
+        return {}
+    status = str(st.get("status") or "")
+    run_state = str(st.get("run_state") or "")
+    abandon_effect = str(st.get("abandon_effect_state") or "")
+    outcome_unknown = bool(
+        run_state in {"blocked_outcome_unknown", "blocked_unknown_effect"}
+        or abandon_effect == "effect_possible_or_unknown"
+    )
+    terminal = False
+    if status == "done" or run_state == "completed":
+        progress_status = "completed"
+        terminal = True
+    elif status in {"aborted", "cancelled"} or run_state in {
+        "cancelled", "cancelled_proven",
+    }:
+        progress_status = "blocked" if outcome_unknown else "cancelled"
+        terminal = True
+    elif status == "failed" or run_state in {
+        "failed", "blocked_unknown_effect",
+    }:
+        progress_status = "blocked"
+        terminal = True
+    elif run_state in {
+        "authorization_pending", "suspended_scope_extension",
+        "suspended_authorization_revoked", "waiting_tool",
+        "cancellation_requested", "suspended_browser_intervention",
+        "suspended_browser_state",
+    }:
+        progress_status = "waiting"
+    elif run_state == "verifying_tool":
+        progress_status = "verifying"
+    elif run_state in {"resuming", "blocked_outcome_unknown"}:
+        progress_status = "recovering"
+    elif run_state in {"planning", "ready"}:
+        progress_status = "planning"
+    else:
+        progress_status = "executing"
+    tasks = [
+        task
+        for phase in (st.get("phases") or [])
+        if isinstance(phase, Mapping)
+        for task in (phase.get("tasks") or [])
+        if isinstance(task, Mapping)
+    ]
+    return {
+        "status": progress_status,
+        "progress_status": progress_status,
+        "terminal": terminal,
+        "outcome_unknown": outcome_unknown,
+        "conversation_id": str(st.get("source_conversation_id") or "")[:160],
+        "request_id": str(st.get("source_request_id") or "")[:160],
+        "turn_id": str(st.get("source_turn_id") or "")[:160],
+        "assistant_message_id": str(
+            st.get("source_assistant_message_id") or ""
+        )[:160],
+        "task_id": str(st.get("task_id") or "")[:160],
+        "run_id": str(st.get("run_id") or "")[:160],
+        "provider_id": str(st.get("provider") or "")[:48],
+        "model_id": str(st.get("model") or "")[:160],
+        "tasks_done": sum(task.get("status") == "done" for task in tasks),
+        "tasks_total": len(tasks),
     }
 
 
@@ -440,6 +572,47 @@ _RESPONSES = {
 }
 
 
+_TERMINAL_RESPONSES = {
+    "en": {
+        "completed": "The durable execution completed.",
+        "blocked": "The durable execution stopped without a verified completion.",
+        "cancelled": "I cancelled this durable execution.",
+    },
+    "fr": {
+        "completed": "L’exécution durable est terminée.",
+        "blocked": "L’exécution durable s’est arrêtée sans résultat final vérifié.",
+        "cancelled": "J’ai annulé cette exécution durable.",
+    },
+}
+
+
+def terminal_result_from_state(
+    st: Mapping[str, Any] | None,
+    language: str = "en",
+) -> dict[str, Any]:
+    """Return the canonical terminal Chat result for one durable checkpoint."""
+
+    projected = durable_progress_from_state(st)
+    if not projected or not projected.get("terminal"):
+        return projected
+    lang = str(language or "en").lower()
+    localized = _TERMINAL_RESPONSES.get(lang, _TERMINAL_RESPONSES["en"])
+    status = str(projected.get("status") or "blocked")
+    final_text = str((st or {}).get("terminal_response") or "").strip()
+    if not final_text:
+        final_text = localized.get(status, localized["blocked"])
+    diagnostic = (st or {}).get("failure_diagnostic")
+    error_code = (
+        str(diagnostic.get("reason_code") or "")[:80]
+        if isinstance(diagnostic, Mapping) else ""
+    )
+    return {
+        **projected,
+        "final_text": final_text[:32_000],
+        "error_code": error_code,
+    }
+
+
 _CHAT_MODEL_ERROR_CODES = frozenset({
     "chat_model_identity_missing",
     "chat_model_unavailable",
@@ -462,13 +635,22 @@ def handoff_response_text(result: Mapping[str, Any], language: str = "en") -> st
         return _RESPONSES[lang]["chat_model_unavailable"]
     if error_code in _TRANSPORT_ERROR_CODES:
         return _RESPONSES[lang]["transport_unavailable"]
+    final_text = str(result.get("final_text") or "").strip()
+    if final_text and str(result.get("status") or "") in {
+        "completed", "blocked", "cancelled",
+    }:
+        return final_text
     status = str(result.get("status") or "failed")
+    if status in _TERMINAL_RESPONSES["en"]:
+        localized = _TERMINAL_RESPONSES.get(lang, _TERMINAL_RESPONSES["en"])
+        return localized.get(status, _TERMINAL_RESPONSES["en"][status])
     return _RESPONSES[lang].get(status, _RESPONSES[lang]["failed"])
 
 
 __all__ = [
     "AUTONOMOUS_REASON_CODES",
     "ROUTING_TOOL_NAME",
+    "durable_progress_from_state",
     "evaluate_route_request",
     "exact_objective",
     "execute_route_request",
@@ -477,4 +659,5 @@ __all__ = [
     "handoff_response_text",
     "looks_like_schedule_route",
     "routing_prompt",
+    "terminal_result_from_state",
 ]

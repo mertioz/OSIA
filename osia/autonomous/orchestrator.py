@@ -59,6 +59,12 @@ DIGEST_MAX_LINES = 6          # K — keep at most this many digest lines
 SUMMARY_MAX_CHARS = 300       # per-task distilled summary cap (cheap string trim)
 ARTIFACT_CONTEXT_MAX_CHARS = 4096
 DOCUMENT_FINAL_MAX_CHARS = 8000
+_RESULT_VALUE_RE = re.compile(
+    r"(?:result|r[eé]sultat|resultado|ergebnis|answer|r[eé]ponse|"
+    r"display|affichage|muestra|zeigt)\D{0,80}?"
+    r"([-+]?\d+(?:[.,]\d+)?)\b",
+    re.IGNORECASE,
+)
 
 # ── Verifier keyword heuristics (deterministic pre-check, layer 1) ───────────
 # Stems/words that mark a criterion as a *file-existence* claim. Stems (e.g.
@@ -82,6 +88,40 @@ _NONFILE_OBSERVABLE_KEYWORDS = (
     "ecran", "confirmation", "message", "says", "contains", "contient",
     "matches", "output", "console", "affich", "montre", "réponse", "reponse",
 )
+
+
+def _verified_chat_terminal_value(st: dict) -> str:
+    """Return one result value only when criterion and final UI evidence agree."""
+
+    for phase in reversed(st.get("phases") or []):
+        if not isinstance(phase, dict):
+            continue
+        for task in reversed(phase.get("tasks") or []):
+            if not isinstance(task, dict) or task.get("status") != "done":
+                continue
+            criterion = str(task.get("success_criterion") or "")
+            match = _RESULT_VALUE_RE.search(criterion)
+            if match is None:
+                continue
+            candidate = match.group(1)
+            normalized_candidate = candidate.replace(",", ".")
+            memory = task.get("execution_memory")
+            memory = memory if isinstance(memory, dict) else {}
+            observation = memory.get("desktop_observation")
+            observation = observation if isinstance(observation, dict) else {}
+            for surface in observation.get("uia_text_surfaces") or []:
+                if not isinstance(surface, dict):
+                    continue
+                observed = _RESULT_VALUE_RE.search(
+                    str(surface.get("label") or "")
+                )
+                if (
+                    observed is not None
+                    and observed.group(1).replace(",", ".")
+                    == normalized_candidate
+                ):
+                    return candidate
+    return ""
 
 
 class _VerificationOutcome(NamedTuple):
@@ -1501,6 +1541,28 @@ class Orchestrator:
                         **diagnostic,
                     })
                     return False
+            if st.get("chat_route_type") == "autonomous":
+                terminal_response = final_answer or _verified_chat_terminal_value(st)
+                if not terminal_response:
+                    summaries = [
+                        str(task.get("distilled_summary") or "").strip()
+                        for phase in (st.get("phases") or [])
+                        if isinstance(phase, dict)
+                        for task in (phase.get("tasks") or [])
+                        if isinstance(task, dict)
+                        and task.get("status") == "done"
+                        and str(task.get("distilled_summary") or "").strip()
+                    ]
+                    if len(summaries) == 1:
+                        terminal_response = summaries[0]
+                    elif summaries:
+                        terminal_response = "Completed:\n- " + "\n- ".join(
+                            summaries
+                        )
+                st["terminal_response"] = state.sanitize_autonomous_text(
+                    terminal_response or "The durable execution completed."
+                )[:32_000]
+                final_answer = st["terminal_response"]
             st["status"] = "done"
             st["run_state"] = "completed"
             diagnostics.clear_current(st)
