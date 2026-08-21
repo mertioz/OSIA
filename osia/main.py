@@ -2871,10 +2871,12 @@ def wake_mode():
             else:
                 st = None
             if not st:
+                planning_output_category = ""
                 if planning_failures:
                     failure = planning_failures[-1]
                     category = failure.error_category
                     reason_code = failure.reason
+                    planning_output_category = failure.output_category
                 else:
                     category = (
                         autonomous_diagnostics.FailureCategory
@@ -2895,6 +2897,7 @@ def wake_mode():
                     model=actual_model,
                     resumable=False,
                     checkpoint_present=True,
+                    planning_output_category=planning_output_category,
                 )
                 failed_state = new_failed_task_state(
                     actual_provider, actual_model, diagnostic,

@@ -84,6 +84,32 @@ def _safe_turn_key(turn_id: str) -> str:
     return hashlib.sha256(turn_id.encode("utf-8")).hexdigest()
 
 
+def _as_float(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _recorded_epoch(value: object) -> float:
+    try:
+        return datetime.fromisoformat(str(value or "")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _application_identity(value: object) -> str:
+    normalized = "".join(
+        char for char in str(value or "").lower()
+        if char.isalnum()
+    )
+    for suffix in ("application", "app", "exe"):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix) + 2:
+            normalized = normalized[:-len(suffix)]
+            break
+    return normalized
+
+
 class TurnTerminalityController:
     """Durable state machine for one stable user ``turn_id``.
 
@@ -147,6 +173,7 @@ class TurnTerminalityController:
                     "active_attempts": {},
                     "permission_state": "none",
                     "unknown_effects": {},
+                    "unknown_effect_resolutions": [],
                     "strategy_snapshot": {},
                     "strategy_frontier": [],
                     "attempted_strategy_tuples": [],
@@ -403,11 +430,403 @@ class TurnTerminalityController:
                 self._state["strategy_attempt_revision"] = int(
                     self._state.get("strategy_attempt_revision") or 0
                 ) + added_attempts
+            self._bind_strategy_unknown_effects(safe)
+            self._resolve_strategy_unknown_effects(safe)
             proven = safe.get("proven_postconditions") or {}
-            if isinstance(proven, dict):
+            if isinstance(proven, dict) and proven:
+                # Preserve reconciliation before nested proof calls refresh
+                # this controller from its durable file.
+                self._persist()
                 for postcondition, evidence in proven.items():
                     self.prove_postcondition(str(postcondition), str(evidence))
-            self._persist()
+            else:
+                self._persist()
+
+    @staticmethod
+    def _strategy_node(snapshot: dict, node_id: str) -> dict:
+        mission = snapshot.get("mission") or {}
+        nodes = mission.get("action_nodes") if isinstance(mission, dict) else []
+        for item in nodes or []:
+            if isinstance(item, dict) and str(item.get("node_id") or "") == node_id:
+                return item
+        goal = snapshot.get("goal")
+        if isinstance(goal, dict) and str(goal.get("node_id") or "") == node_id:
+            return goal
+        return {}
+
+    @staticmethod
+    def _strategy_attempt(snapshot: dict, attempt_id: str) -> dict:
+        for item in snapshot.get("attempts") or []:
+            if (
+                isinstance(item, dict)
+                and str(item.get("attempt_id") or "") == attempt_id
+            ):
+                return item
+        return {}
+
+    @staticmethod
+    def _desktop_resolution_kind(event: dict) -> str:
+        if (
+            str(event.get("schema_version") or "") != "1"
+            or str(event.get("evidence_kind") or "")
+            != "exact_independent_desktop_state"
+            or str(event.get("evidence_source") or "")
+            != "inspect_desktop_surfaces"
+            or not str(event.get("evidence") or "")
+        ):
+            return ""
+        resolution = str(event.get("resolution") or "")
+        outcome = str(event.get("evidence_outcome") or "")
+        reason = str(event.get("reason_code") or "")
+        if (
+            resolution == "completed"
+            and outcome == "confirmed_success"
+            and reason in {
+                "exact_final_state_observation",
+                "exact_desktop_target_focus_observed",
+            }
+        ):
+            return "completed"
+        if (
+            resolution == "primitive_completed"
+            and outcome == "confirmed_success"
+            and reason in {
+                "exact_desktop_primitive_state_change",
+                "exact_desktop_observable_effect_change",
+            }
+            and str(event.get("substep_id") or "")
+        ):
+            return "primitive_completed"
+        if (
+            resolution == "primitive_not_applied"
+            and outcome == "confirmed_absence"
+            and reason == "exact_desktop_primitive_absent_no_partial_effect"
+            and str(event.get("substep_id") or "")
+            and str(event.get("no_partial_effect") or "").lower() == "true"
+        ):
+            return "primitive_not_applied"
+        if (
+            resolution == "absent"
+            and outcome == "confirmed_absence"
+            and reason == "exact_postcondition_absent_no_partial_effect"
+            and str(event.get("no_partial_effect") or "").lower() == "true"
+        ):
+            return "not_applied"
+        return ""
+
+    def _strategy_effect_identities(self, snapshot: dict) -> list[dict]:
+        identities = []
+        frozen_attempt_id = str(snapshot.get("frozen_attempt_id") or "")
+        frozen_node_id = str(snapshot.get("frozen_node_id") or "")
+        frozen_mechanism_id = str(snapshot.get("frozen_mechanism_id") or "")
+        candidates = []
+        if frozen_attempt_id and frozen_node_id and frozen_mechanism_id:
+            candidates.append({
+                "attempt_id": frozen_attempt_id,
+                "node_id": frozen_node_id,
+                "mechanism_id": frozen_mechanism_id,
+            })
+        for event in snapshot.get("reconciliation_events") or []:
+            if isinstance(event, dict) and self._desktop_resolution_kind(event):
+                candidates.append(event)
+        seen = set()
+        for candidate in candidates:
+            attempt_id = str(candidate.get("attempt_id") or "")
+            node_id = str(candidate.get("node_id") or "")
+            mechanism_id = str(candidate.get("mechanism_id") or "")
+            identity_key = (attempt_id, node_id, mechanism_id)
+            if not all(identity_key) or identity_key in seen:
+                continue
+            attempt = self._strategy_attempt(snapshot, attempt_id)
+            node = self._strategy_node(snapshot, node_id)
+            if (
+                not attempt
+                or not node
+                or str(attempt.get("node_id") or "") != node_id
+                or str(attempt.get("mechanism_id") or "") != mechanism_id
+                or str(attempt.get("status") or "") not in {
+                    "selected", "ambiguous_effect", "progressed", "succeeded",
+                }
+            ):
+                continue
+            primitive_postcondition = _bounded(
+                attempt.get("primitive_postcondition"), 512,
+            )
+            attempted_effect = _bounded(
+                attempt.get("attempted_effect"), 512,
+            )
+            postconditions = (
+                (attempted_effect,)
+                if attempted_effect else
+                (primitive_postcondition,)
+                if primitive_postcondition else
+                tuple(
+                    _bounded(item, 512)
+                    for item in node.get("required_postconditions") or ()
+                    if _bounded(item, 512)
+                )
+            )
+            if not postconditions:
+                postcondition = _bounded(
+                    node.get("observable_success_postcondition"), 512,
+                )
+                postconditions = (postcondition,) if postcondition else ()
+            if not postconditions:
+                continue
+            identities.append({
+                "strategy_attempt_id": attempt_id,
+                "semantic_node_id": node_id,
+                "mechanism_id": mechanism_id,
+                "postconditions": postconditions,
+                "target_application": _bounded(
+                    attempt.get("target_application")
+                    or node.get("required_application"), 160,
+                ),
+                "target_surface": _bounded(
+                    attempt.get("target_surface")
+                    or node.get("required_surface"), 160,
+                ),
+                "strategy_dispatched_at": _as_float(
+                    attempt.get("dispatched_at")
+                    or candidate.get("dispatched_at")
+                ),
+                "strategy_dispatch_evidence_revision": int(
+                    _as_float(
+                        attempt.get("dispatch_evidence_revision")
+                        or candidate.get("dispatch_evidence_revision")
+                    )
+                ),
+                "composite_id": _bounded(attempt.get("composite_id"), 160),
+                "substep_id": _bounded(attempt.get("substep_id"), 160),
+                "substep_index": int(
+                    _as_float(attempt.get("substep_index"))
+                ),
+            })
+            seen.add(identity_key)
+        return identities
+
+    def _bind_strategy_unknown_effects(self, snapshot: dict) -> None:
+        unknown = self._state.setdefault("unknown_effects", {})
+        identities = self._strategy_effect_identities(snapshot)
+        possible: dict[str, list[dict]] = {}
+        for durable_attempt_id, item in unknown.items():
+            if not isinstance(item, dict) or item.get("semantic_node_id"):
+                continue
+            if (
+                not durable_attempt_id
+                or str(item.get("attempt_id") or "") != durable_attempt_id
+            ):
+                continue
+            postcondition = _bounded(item.get("postcondition"), 512)
+            matches = [
+                identity for identity in identities
+                if postcondition in identity["postconditions"]
+            ]
+            if len(matches) == 1:
+                possible[durable_attempt_id] = matches
+        identity_counts: dict[tuple[str, str, str], int] = {}
+        for matches in possible.values():
+            identity = matches[0]
+            key = (
+                identity["strategy_attempt_id"],
+                identity["semantic_node_id"],
+                identity["mechanism_id"],
+            )
+            identity_counts[key] = identity_counts.get(key, 0) + 1
+        for durable_attempt_id, matches in possible.items():
+            identity = matches[0]
+            key = (
+                identity["strategy_attempt_id"],
+                identity["semantic_node_id"],
+                identity["mechanism_id"],
+            )
+            if identity_counts.get(key) != 1:
+                continue
+            item = unknown[durable_attempt_id]
+            item.update({
+                "semantic_node_id": identity["semantic_node_id"],
+                "strategy_attempt_id": identity["strategy_attempt_id"],
+                "mechanism_id": identity["mechanism_id"],
+                "target_application": identity["target_application"],
+                "target_surface": identity["target_surface"],
+                "strategy_dispatched_at": identity["strategy_dispatched_at"],
+                "strategy_dispatch_evidence_revision": identity[
+                    "strategy_dispatch_evidence_revision"
+                ],
+                "composite_id": identity["composite_id"],
+                "substep_id": identity["substep_id"],
+                "substep_index": identity["substep_index"],
+                "strategy_bound_at": _now(),
+            })
+
+    def _resolve_strategy_unknown_effects(self, snapshot: dict) -> None:
+        unknown = self._state.setdefault("unknown_effects", {})
+        resolutions = self._state.setdefault("unknown_effect_resolutions", [])
+        resolved_strategy_attempts = {
+            str(item.get("strategy_attempt_id") or "")
+            for item in resolutions
+            if isinstance(item, dict)
+        }
+        proven = snapshot.get("proven_postconditions") or {}
+        proven = proven if isinstance(proven, dict) else {}
+        for event in snapshot.get("reconciliation_events") or []:
+            if not isinstance(event, dict):
+                continue
+            resolution = self._desktop_resolution_kind(event)
+            strategy_attempt_id = str(event.get("attempt_id") or "")
+            if not resolution or strategy_attempt_id in resolved_strategy_attempts:
+                continue
+            node_id = str(event.get("node_id") or "")
+            mechanism_id = str(event.get("mechanism_id") or "")
+            postcondition = _bounded(event.get("postcondition"), 512)
+            node = self._strategy_node(snapshot, node_id)
+            attempt = self._strategy_attempt(snapshot, strategy_attempt_id)
+            primitive_resolution = resolution in {
+                "primitive_completed", "primitive_not_applied",
+            }
+            required_postconditions = tuple(
+                _bounded(item, 512)
+                for item in node.get("required_postconditions") or ()
+            ) if node else ()
+            attempted_effect = _bounded(
+                attempt.get("attempted_effect"), 512,
+            ) if attempt else ""
+            if (
+                not node
+                or not attempt
+                or (
+                    primitive_resolution
+                    and (
+                        postcondition
+                        != _bounded(attempt.get("primitive_postcondition"), 512)
+                        or str(event.get("composite_id") or "")
+                        != str(attempt.get("composite_id") or "")
+                        or str(event.get("substep_id") or "")
+                        != str(attempt.get("substep_id") or "")
+                    )
+                )
+                or (
+                    not primitive_resolution
+                    and postcondition != attempted_effect
+                    and postcondition not in required_postconditions
+                )
+            ):
+                continue
+            candidates = [
+                (durable_attempt_id, item)
+                for durable_attempt_id, item in unknown.items()
+                if isinstance(item, dict)
+                and str(item.get("strategy_attempt_id") or "")
+                == strategy_attempt_id
+                and str(item.get("semantic_node_id") or "") == node_id
+                and str(item.get("mechanism_id") or "") == mechanism_id
+                and _bounded(item.get("postcondition"), 512) == postcondition
+                and (
+                    not primitive_resolution
+                    or str(item.get("substep_id") or "")
+                    == str(event.get("substep_id") or "")
+                )
+            ]
+            if len(candidates) != 1:
+                continue
+            durable_attempt_id, original = candidates[0]
+            target_application = _bounded(
+                original.get("target_application"), 160,
+            )
+            target_surface = _bounded(original.get("target_surface"), 160)
+            if (
+                _bounded(event.get("target_application"), 160)
+                != target_application
+                or _bounded(event.get("target_surface"), 160) != target_surface
+                or not _bounded(event.get("observed_surface"), 160)
+                or (
+                    target_application
+                    and _application_identity(
+                        event.get("observed_application"),
+                    ) != _application_identity(target_application)
+                )
+            ):
+                continue
+            dispatched_at = _as_float(original.get("strategy_dispatched_at"))
+            observed_at = _as_float(event.get("observed_at"))
+            recorded_at = _recorded_epoch(original.get("recorded_at"))
+            dispatch_revision = int(_as_float(
+                original.get("strategy_dispatch_evidence_revision"),
+            ))
+            evidence_revision = int(_as_float(event.get("evidence_revision")))
+            if (
+                dispatched_at <= 0.0
+                or _as_float(event.get("dispatched_at")) != dispatched_at
+                or int(_as_float(
+                    event.get("dispatch_evidence_revision"),
+                )) != dispatch_revision
+                or observed_at < max(dispatched_at, recorded_at)
+                or evidence_revision <= dispatch_revision
+            ):
+                continue
+            if (
+                resolution == "completed"
+                and postcondition != attempted_effect
+                and postcondition not in proven
+            ) or (
+                resolution == "not_applied"
+                and postcondition in proven
+            ):
+                continue
+            evidence_token = _fingerprint(event)
+            resolution_record = {
+                "resolution_id": "resolution_" + evidence_token,
+                "durable_attempt_id": durable_attempt_id,
+                "strategy_attempt_id": strategy_attempt_id,
+                "semantic_node_id": node_id,
+                "mechanism_id": mechanism_id,
+                "composite_id": str(event.get("composite_id") or ""),
+                "substep_id": str(event.get("substep_id") or ""),
+                "substep_index": int(_as_float(event.get("substep_index"))),
+                "postcondition": postcondition,
+                "target_application": target_application,
+                "target_surface": target_surface,
+                "resolution": resolution,
+                "reason_code": str(event.get("reason_code") or ""),
+                "evidence_token": evidence_token,
+                "observed_at": observed_at,
+                "resolved_at": _now(),
+                "original_unknown": dict(original),
+            }
+            resolutions.append(resolution_record)
+            self._state["unknown_effect_resolutions"] = resolutions[-128:]
+            typed = self._state.setdefault("typed_evidence", [])
+            typed.append({
+                "outcome": (
+                    "success_verified"
+                    if resolution in {"completed", "primitive_completed"} else
+                    "unknown_effect_reconciled_not_applied"
+                ),
+                "evidence_token": evidence_token,
+                "postcondition": postcondition,
+                "attempt_id": durable_attempt_id,
+                "reason_code": str(event.get("reason_code") or ""),
+                "recorded_at": _now(),
+                "semantic_node_id": node_id,
+                "strategy_attempt_id": strategy_attempt_id,
+                "composite_id": str(event.get("composite_id") or ""),
+                "substep_id": str(event.get("substep_id") or ""),
+            })
+            self._state["typed_evidence"] = typed[-128:]
+            tokens = self._state.setdefault("evidence_tokens", [])
+            if evidence_token not in tokens:
+                tokens.append(evidence_token)
+                self._state["evidence_tokens"] = tokens[-128:]
+                self._state["evidence_revision"] = self.evidence_revision + 1
+            self._state["progress_revision"] = self.progress_revision + 1
+            unknown.pop(durable_attempt_id, None)
+            self._state.setdefault("active_attempts", {}).pop(
+                durable_attempt_id, None,
+            )
+            cancellation = self._state.get("cancellation") or {}
+            if cancellation.get("requested") and not unknown:
+                cancellation["effect_possible"] = False
+            resolved_strategy_attempts.add(strategy_attempt_id)
 
     def set_strategy_frontier(self, strategy_ids: Iterable[str]) -> None:
         with self._lock:
@@ -610,8 +1029,13 @@ class TurnTerminalityController:
             reconciled_attempts = {
                 attempt_id
                 for attempt_id, item in unknown_effects.items()
-                if len(required) == 1
-                or str((item or {}).get("postcondition") or "") == target
+                if (
+                    not isinstance(item, dict)
+                    or not item.get("semantic_node_id")
+                ) and (
+                    len(required) == 1
+                    or str((item or {}).get("postcondition") or "") == target
+                )
             }
             for attempt_id in reconciled_attempts:
                 unknown_effects.pop(attempt_id, None)

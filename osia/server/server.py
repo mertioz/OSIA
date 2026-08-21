@@ -5451,7 +5451,8 @@ def _autonomous_snapshot(st) -> dict:
 def _autonomous_failure_state(*, stage, category, reason_code,
                               provider="", model="",
                               language: str | None = None,
-                              emit_log: bool = True) -> dict:
+                              emit_log: bool = True,
+                              planning_output_category: str = "") -> dict:
     """Build an objective-free terminal state carrying one safe diagnostic."""
     st = _astate.new_task_state(
         "", provider, model, [], language=language,
@@ -5468,6 +5469,7 @@ def _autonomous_failure_state(*, stage, category, reason_code,
         model=model,
         resumable=False,
         checkpoint_present=False,
+        planning_output_category=planning_output_category,
     )
     _adiagnostics.record_diagnostic(st, diagnostic, emit=emit_log)
     return st
@@ -6347,10 +6349,12 @@ def _autonomous_start_worker(
         else:
             st = None
         if not st:
+            planning_output_category = ""
             if planning_failures:
                 failure = planning_failures[-1]
                 category = failure.error_category
                 reason_code = failure.reason
+                planning_output_category = failure.output_category
             else:
                 category = _adiagnostics.FailureCategory.PLANNING_PROVIDER_FAILURE
                 if model_setup_failed:
@@ -6367,6 +6371,7 @@ def _autonomous_start_worker(
                 model=model,
                 language=language,
                 emit_log=False,
+                planning_output_category=planning_output_category,
             )
             if _establish_autonomous_failure(failed_state, my_gen):
                 _broadcast_autonomous(
@@ -7197,9 +7202,11 @@ def _autonomous_resume_worker(
             return
 
         orch.resume(st)
-        # Flip to "running" only AFTER resume() spawned the loop. The engine emits
-        # events only on task transitions, never on resume, so this won't double-fire.
-        _broadcast_autonomous(_autonomous_frame({"event": "running"}, st))
+        # A durable tool recovery can synchronously remain waiting or fail closed
+        # before spawning a loop. Publish running only when resume established
+        # that exact state; recovery already emitted its waiting/terminal event.
+        if st.get("status") == "in_progress" and st.get("run_state") == "running":
+            _broadcast_autonomous(_autonomous_frame({"event": "running"}, st))
     except Exception:
         # Any unexpected failure (engine build, orch.resume thread exhaustion)
         # must NOT wedge the slot at busy forever: release it (only if still ours)

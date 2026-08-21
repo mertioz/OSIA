@@ -2041,6 +2041,13 @@ def recover_orphaned_tool_attempts() -> list[dict]:
         if record.get("owner_scope") == "autonomous":
             # The Autonomous checkpoint owns its exact task continuation.  A
             # normal-chat assistant message here would duplicate that mission.
+            # If its fresh-process runtime is already reattached, deliver this
+            # terminal receipt through the same coordinator callback. This also
+            # closes the deadline race where the orphan timer wins the durable
+            # reconciliation claim while the restored verifier is waking.
+            get_tool_attempt_coordinator().notify_terminal(
+                str(record.get("tool_attempt_id") or ""), record,
+            )
             continue
         language = str((record.get("turn_context") or {}).get("language") or "en")
         status = ToolAttemptStatus(record["status"])

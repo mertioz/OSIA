@@ -507,9 +507,9 @@ def _provider_event(attempt_id: str, command: str) -> CapabilityEvent:
 
 def test_duplicate_and_late_provider_event_cannot_prove_second_node():
     strategy = build_execution_strategy(
-        "Open Calculator, then open Paint", {"run_command"},
+        "Create file alpha, then create file beta", {"run_command"},
     )
-    event = _provider_event("attempt-calculator", "Start-Process Calculator")
+    event = _provider_event("attempt-alpha", "New-Item alpha")
     batches = iter(((event,), (event,)))
     agent = OSIAAgent(model="fixture", lang="en")
     agent.client = SimpleNamespace(
@@ -523,15 +523,15 @@ def test_duplicate_and_late_provider_event_cannot_prove_second_node():
 
     assert len(strategy.proven_postconditions) == 1
     assert len(strategy.pending_nodes()) == 1
-    assert strategy.pending_nodes()[0].required_application == "paint"
+    assert "beta" in strategy.pending_nodes()[0].target_object
 
 
 def test_late_provider_event_keeps_original_attempt_node_binding():
     strategy = build_execution_strategy(
-        "Open Calculator, then open Paint", {"run_command"},
+        "Create file alpha, then create file beta", {"run_command"},
     )
-    calculator = strategy.mission.action_nodes[0]
-    paint = strategy.mission.action_nodes[1]
+    alpha = strategy.mission.action_nodes[0]
+    beta = strategy.mission.action_nodes[1]
     accepted = CapabilityEvent(
         source="provider_native",
         identity="commandExecution",
@@ -540,8 +540,8 @@ def test_late_provider_event_keeps_original_attempt_node_binding():
         item_id="item-stable",
         tool_attempt_id="attempt-stable",
         tool_name="run_command",
-        arguments={"command": "Start-Process Calculator"},
-        semantic_node_id=calculator.node_id,
+        arguments={"command": "New-Item alpha"},
+        semantic_node_id=alpha.node_id,
     )
     late = CapabilityEvent(
         source="provider_native",
@@ -551,8 +551,8 @@ def test_late_provider_event_keeps_original_attempt_node_binding():
         item_id="item-stable",
         tool_attempt_id="attempt-stable",
         tool_name="run_command",
-        arguments={"command": "Start-Process Calculator"},
-        semantic_node_id=paint.node_id,
+        arguments={"command": "New-Item alpha"},
+        semantic_node_id=beta.node_id,
     )
     batches = iter(((accepted,), (late,)))
     agent = OSIAAgent(model="fixture", lang="en")
@@ -565,16 +565,16 @@ def test_late_provider_event_keeps_original_attempt_node_binding():
     agent._consume_provider_capability_events()
     agent._consume_provider_capability_events()
 
-    assert calculator.status == "succeeded"
-    assert paint.status != "succeeded"
+    assert alpha.status == "succeeded"
+    assert beta.status != "succeeded"
     assert len(strategy.proven_postconditions) == 1
 
 
 def test_mismatched_late_event_does_not_poison_legitimate_completion():
     strategy = build_execution_strategy(
-        "Open Calculator, then open Paint", {"run_command"},
+        "Create file alpha, then create file beta", {"run_command"},
     )
-    calculator = strategy.mission.action_nodes[0]
+    alpha = strategy.mission.action_nodes[0]
     accepted = CapabilityEvent(
         source="provider_native",
         identity="commandExecution",
@@ -583,8 +583,8 @@ def test_mismatched_late_event_does_not_poison_legitimate_completion():
         item_id="item-stable",
         tool_attempt_id="attempt-stable",
         tool_name="run_command",
-        arguments={"command": "Start-Process Calculator"},
-        semantic_node_id=calculator.node_id,
+        arguments={"command": "New-Item alpha"},
+        semantic_node_id=alpha.node_id,
     )
     mismatched = CapabilityEvent(
         source="provider_native",
@@ -594,7 +594,7 @@ def test_mismatched_late_event_does_not_poison_legitimate_completion():
         item_id="item-stable",
         tool_attempt_id="attempt-stable",
         tool_name="run_command",
-        arguments={"command": "Start-Process Paint"},
+        arguments={"command": "New-Item beta"},
     )
     completed = CapabilityEvent(
         source="provider_native",
@@ -604,7 +604,7 @@ def test_mismatched_late_event_does_not_poison_legitimate_completion():
         item_id="item-stable",
         tool_attempt_id="attempt-stable",
         tool_name="run_command",
-        arguments={"command": "Start-Process Calculator"},
+        arguments={"command": "New-Item alpha"},
     )
     batches = iter(((accepted,), (mismatched,), (completed,)))
     agent = OSIAAgent(model="fixture", lang="en")
@@ -618,18 +618,18 @@ def test_mismatched_late_event_does_not_poison_legitimate_completion():
     agent._consume_provider_capability_events()
     agent._consume_provider_capability_events()
 
-    assert calculator.status == "succeeded"
+    assert alpha.status == "succeeded"
     assert len(strategy.proven_postconditions) == 1
-    assert strategy.pending_nodes()[0].required_application == "paint"
+    assert "beta" in strategy.pending_nodes()[0].target_object
 
 
 def test_two_semantic_nodes_need_two_distinct_provider_events():
     strategy = build_execution_strategy(
-        "Open Calculator, then open Paint", {"run_command"},
+        "Create file alpha, then create file beta", {"run_command"},
     )
     events = (
-        _provider_event("attempt-calculator", "Start-Process Calculator"),
-        _provider_event("attempt-paint", "Start-Process Paint"),
+        _provider_event("attempt-alpha", "New-Item alpha"),
+        _provider_event("attempt-beta", "New-Item beta"),
     )
     agent = OSIAAgent(model="fixture", lang="en")
     agent.client = SimpleNamespace(consume_capability_events=lambda: events)

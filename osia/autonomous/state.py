@@ -646,6 +646,19 @@ def _normalize_task(index: int, task, *, private_filenames=()) -> dict:
         )
     except (TypeError, ValueError, OverflowError):
         semantic_revision = 0
+    try:
+        from osia.execution_strategy import normalize_execution_memory
+
+        execution_memory = normalize_execution_memory(
+            task.get("execution_memory"),
+        )
+    except Exception:
+        execution_memory = {
+            "schema_version": 1,
+            "effects": [],
+            "desktop_observation": {},
+            "evidence_revision": 0,
+        }
     normalized = {
         "id": str(task.get("id") or f"t{index}"),
         "objective": sanitize_autonomous_text(
@@ -688,6 +701,7 @@ def _normalize_task(index: int, task, *, private_filenames=()) -> dict:
                 str(task.get("semantic_next_strategy") or ""),
             ) else ""
         ),
+        "execution_memory": execution_memory,
     }
     if normalized["objective"] != raw_objective:
         normalized["_runtime_objective"] = raw_objective

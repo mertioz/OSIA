@@ -15,7 +15,12 @@ from types import SimpleNamespace
 
 from osia.config import get_setting, set_setting
 
-from .app_server_client import AppServerClient, AppServerError, TurnResult
+from .app_server_client import (
+    AppServerClient,
+    AppServerError,
+    TurnResult,
+    _canonical_native_tools,
+)
 
 
 ACCOUNT_PROVIDER_ID = "chatgpt_account"
@@ -44,6 +49,17 @@ _DEVELOPER_INSTRUCTIONS = (
     "Act as OSIA's provider. Follow base instructions and capability federation. "
     "Native hosted tools and optional OSIA calls are available; choose one path "
     "and report only observed outcomes."
+)
+
+_PLANNING_BASE_INSTRUCTIONS = (
+    "You are OSIA's planning-only structured-output module. Return exactly the "
+    "single JSON value required by the current output schema. Never call, "
+    "select, describe, or simulate tools or actions."
+)
+
+_PLANNING_DEVELOPER_INSTRUCTIONS = (
+    "Planning-only turn: use no hosted, native, dynamic, command, file, web, "
+    "desktop, or OSIA tools. Produce only the schema-constrained final JSON."
 )
 
 _LANGUAGE_MARKER = "\n\n[AUTHORITATIVE TURN LANGUAGE]\n"
@@ -88,6 +104,7 @@ class _ConversationState:
     model: str
     system_fingerprint: str
     expected_messages: list[dict]
+    planning_only: bool = False
 
 
 def _text_content(content) -> str:
@@ -374,15 +391,43 @@ class ChatGPTAccountProvider:
         return _AccountChatClient(self, conversation_id=conversation_id)
 
     def _prepare(
-        self, conversation_id: str, model: str, messages: list[dict]
+        self, conversation_id: str, model: str, messages: list[dict],
+        *, planning_only: bool = False,
     ) -> tuple[_ConversationState, list[dict]]:
         public = [_public_message(message) for message in messages]
         system = next((m["content"] for m in public if m["role"] == "system"), "")
         system = _sanitized_system_prompt(system, public)
-        base_instructions = _insert_before_turn_language(
-            system, _CONTAINMENT_INSTRUCTIONS,
+        if planning_only:
+            base_instructions = _PLANNING_BASE_INSTRUCTIONS
+            developer_instructions = _PLANNING_DEVELOPER_INSTRUCTIONS
+        else:
+            base_instructions = _insert_before_turn_language(
+                system, _CONTAINMENT_INSTRUCTIONS,
+            )
+            developer_instructions = _DEVELOPER_INSTRUCTIONS
+        if planning_only:
+            dynamic_tools = ()
+        else:
+            try:
+                from osia.execution_strategy import current_execution_strategy
+
+                dynamic_tools = tuple(_canonical_native_tools(
+                    current_execution_strategy(),
+                ))
+            except Exception:
+                dynamic_tools = ()
+        frontier_names = [
+            str(item.get("name") or "")
+            for item in dynamic_tools
+            if isinstance(item, dict)
+        ]
+        fingerprint_input = (
+            f"{int(planning_only)}\0{system}\0"
+            + json.dumps(frontier_names, separators=(",", ":"))
         )
-        system_fingerprint = hashlib.sha256(system.encode("utf-8")).hexdigest()
+        system_fingerprint = hashlib.sha256(
+            fingerprint_input.encode("utf-8"),
+        ).hexdigest()
         public_non_system = [m for m in public if m["role"] != "system"]
         non_system = [message for message in messages if message.get("role") != "system"]
         with self._lock:
@@ -392,6 +437,7 @@ class ChatGPTAccountProvider:
                 and state.generation == self.client.generation
                 and state.model == model
                 and state.system_fingerprint == system_fingerprint
+                and state.planning_only is planning_only
                 and _same_messages(state.expected_messages, public_non_system)
             )
             delta = non_system[len(state.expected_messages):] if reusable and state else non_system
@@ -400,7 +446,8 @@ class ChatGPTAccountProvider:
                 thread_id=None,
                 model=model,
                 base_instructions=base_instructions,
-                developer_instructions=_DEVELOPER_INSTRUCTIONS,
+                developer_instructions=developer_instructions,
+                dynamic_tools=dynamic_tools,
             )
             state = _ConversationState(
                 thread_id=thread_id,
@@ -408,6 +455,7 @@ class ChatGPTAccountProvider:
                 model=model,
                 system_fingerprint=system_fingerprint,
                 expected_messages=[],
+                planning_only=planning_only,
             )
             delta = non_system
             with self._lock:
@@ -428,10 +476,15 @@ class ChatGPTAccountProvider:
         effort: str | None = None,
         on_delta=None,
         timeout: float = 300.0,
+        output_schema: dict | None = None,
+        planning_only: bool = False,
     ) -> TurnResult:
         state = None
         try:
-            state, delta_messages = self._prepare(conversation_id, model, messages)
+            state, delta_messages = self._prepare(
+                conversation_id, model, messages,
+                planning_only=planning_only,
+            )
             turn_input = _turn_input(delta_messages)
             run_kwargs = dict(
                 thread_id=state.thread_id,
@@ -443,6 +496,7 @@ class ChatGPTAccountProvider:
                 effort=effort,
                 on_delta=on_delta,
                 timeout=_bounded_turn_timeout(timeout),
+                output_schema=output_schema,
             )
             if isinstance(turn_input, list):
                 run_kwargs["content"] = turn_input
@@ -522,6 +576,8 @@ class _AccountCompletions:
         conversation_id = self._owner.conversation_id or f"ephemeral:{id(self._owner)}"
         effort = kwargs.get("effort")
         timeout = _bounded_turn_timeout(kwargs.get("timeout", 300.0))
+        output_schema = kwargs.get("output_schema")
+        planning_only = kwargs.get("planning_only") is True
         if not stream:
             try:
                 result = self._owner.provider.complete(
@@ -535,6 +591,8 @@ class _AccountCompletions:
                     ),
                     effort=effort,
                     timeout=timeout,
+                    output_schema=output_schema,
+                    planning_only=planning_only,
                 )
             except Exception as exc:
                 self._owner._preserve_exception_state(exc)
@@ -567,6 +625,8 @@ class _AccountCompletions:
                     effort=effort,
                     on_delta=lambda delta: events.put(("delta", delta)),
                     timeout=timeout,
+                    output_schema=output_schema,
+                    planning_only=planning_only,
                 )
                 self._owner._set_capability_events(
                     getattr(result, "capability_events", ()),

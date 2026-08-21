@@ -214,6 +214,8 @@ class ToolSpec:
     dispatcher: Callable[..., Any] | None = None
     dynamic: bool = False
     connector_id: str = ""
+    attempted_effect: str = ""
+    safe_reconciliation_descriptors: tuple[str, ...] = ()
 
     @property
     def fallback_barrier_on_dispatch(self) -> bool:
@@ -584,6 +586,8 @@ def _spec(
     chat_eligible: bool = True,
     autonomous_eligible: bool = True,
     scheduled_eligible: bool = True,
+    attempted_effect: str = "",
+    safe_reconciliation_descriptors: Iterable[str] = (),
 ) -> ToolSpec:
     if retry is None:
         retry = (
@@ -617,6 +621,12 @@ def _spec(
         chat_eligible=chat_eligible,
         autonomous_eligible=autonomous_eligible,
         scheduled_eligible=scheduled_eligible,
+        attempted_effect=str(attempted_effect or ""),
+        safe_reconciliation_descriptors=tuple(
+            str(item or "")
+            for item in safe_reconciliation_descriptors
+            if str(item or "")
+        ),
     )
 
 
@@ -734,7 +744,13 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               DY, D, CR, timeout=310.0, real=local_real),
         _spec("open_application", "Launch a local application",
               _object({"name": _string(maximum=512)}, required=("name",)), RL, C, NC,
-              preconditions=("application_resolvable",), real=RealValidationRequirement.USER_VISIBLE),
+              preconditions=("application_resolvable",),
+              attempted_effect="application_open",
+              postcondition_required=True,
+              safe_reconciliation_descriptors=(
+                  "local_desktop_application_observation",
+              ),
+              real=RealValidationRequirement.USER_VISIBLE),
         _spec("open_uri", "Open an allowlisted URI through the OS",
               _object({"uri": URL}, required=("uri",)), RL, N, NC,
               preconditions=("allowlisted_uri_scheme",), real=RealValidationRequirement.USER_VISIBLE),
@@ -745,7 +761,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               real=RealValidationRequirement.USER_VISIBLE),
         _spec(
               "inspect_desktop_surfaces",
-              "Observe the exact foreground native app as opaque window/view/tab/pane/control references; use before native actuation when focus, selection, panes, dialogs, or candidates matter",
+              "Observe an exact foreground or background native app as opaque window/view/tab/pane/control references with per-surface actuation preconditions; use before native actuation when focus, selection, panes, dialogs, or candidates matter",
               _object({"target": _string(maximum=1000)}), R, I, NC,
               preconditions=("foreground_desktop_surface_available",), timeout=12.0,
               result=ResultPolicy.BOUNDED_MODEL_ONLY,
@@ -1004,14 +1020,32 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               real=RealValidationRequirement.USER_VISIBLE),
         _spec(
               "activate_desktop_surface",
-              "Activate one fresh opaque native desktop surface through UIA Invoke/SelectionItem/Toggle/ExpandCollapse; objective must exactly match its current safe accessible label",
+              "Activate one fresh opaque native desktop candidate/pattern pair through background-safe UIA Invoke/SelectionItem/Toggle/ExpandCollapse when that exact pattern is currently actionable, or use action_pattern=Window for an exact window when foreground is a proven downstream precondition; objective must exactly match its current safe accessible label. action_pattern must come from the candidate's fresh structured actuation patterns, never from name guessing. For a stateless Invoke, observable_effect must identify a different observed surface and the exact independently observable text expected after this one activation; invocation alone is never proof",
               _object({
                   "surface_ref": IDENTIFIER,
                   "objective": _string(maximum=240),
-              }, required=("surface_ref", "objective")),
+                  "action_pattern": _string(
+                      enum=(
+                          "Invoke", "SelectionItem", "Toggle",
+                          "ExpandCollapse", "Window",
+                      ),
+                      maximum=32,
+                  ),
+                  "observable_effect": _object({
+                      "kind": _string(
+                          enum=("exact_surface_text",), maximum=48,
+                      ),
+                      "surface_ref": IDENTIFIER,
+                      "expected_text": _string(maximum=240),
+                  }, required=("kind", "surface_ref", "expected_text")),
+              }, required=("surface_ref", "objective", "action_pattern")),
               DY, D, FC, timeout=30.0,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
-              real=RealValidationRequirement.USER_VISIBLE),
+              real=RealValidationRequirement.USER_VISIBLE,
+              postcondition_required=True,
+              safe_reconciliation_descriptors=(
+                  "local_desktop_application_observation",
+              )),
         _spec("desktop_type", "Type text into the focused native application",
               _object({"text": TEXT}, required=("text",)), EM, N, NC,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
@@ -1844,14 +1878,14 @@ def persistence_contract(
         inactivity = owner_timeout + 2.0
         hard = max(inactivity + 15.0, owner_timeout * 1.1)
         delays = (1.0, 2.0, 5.0, 10.0, 20.0)
-        alternatives = ()
+        alternatives = spec.safe_reconciliation_descriptors
     else:
         family = ToolPersistenceFamily.GENERIC
         release_after = min(owner_timeout, 2.0)
         inactivity = owner_timeout + 2.0
         hard = max(inactivity + 10.0, owner_timeout * 1.5)
         delays = (1.0, 2.0, 5.0)
-        alternatives = ()
+        alternatives = spec.safe_reconciliation_descriptors
 
     return ToolPersistenceContract(
         family=family,
@@ -2022,10 +2056,32 @@ def tool_is_eligible_in_current_surface(spec_or_name: ToolSpec | str) -> bool:
 def effective_static_tool_specs() -> tuple[ToolSpec, ...]:
     """Return the exact ordered static specs exposed in the current turn."""
 
-    return tuple(
+    specs = tuple(
         spec for spec in get_static_registry().values()
         if tool_is_eligible_in_current_surface(spec)
     )
+    try:
+        from osia.execution_strategy import (
+            current_execution_strategy,
+            tool_applicability,
+        )
+
+        strategy = current_execution_strategy()
+    except Exception:
+        strategy = None
+    if strategy is None:
+        return specs
+    filtered = []
+    for spec in specs:
+        try:
+            applicable, _reason = tool_applicability(
+                strategy, spec.name, {},
+            )
+        except Exception:
+            applicable = False
+        if applicable:
+            filtered.append(spec)
+    return tuple(filtered)
 
 
 def static_tool_prompt_block(lang: str = "en") -> str:

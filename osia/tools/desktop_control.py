@@ -783,6 +783,40 @@ def move_to(x, y):
     return ok
 
 
+def _intended_foreground_error():
+    """Reject focused input when the active strategy's app is not observable."""
+
+    if sys.platform != "win32":
+        return None
+    try:
+        from osia.execution_strategy import current_execution_strategy
+
+        strategy = current_execution_strategy()
+    except Exception:
+        return None
+    if strategy is None or not strategy.goal.required_application:
+        return None
+    try:
+        from osia.desktop_scene import (
+            observe_foreground_scene,
+            scene_matches_application,
+        )
+
+        scene = observe_foreground_scene()
+    except Exception:
+        return "ERROR: intended foreground application is not observable"
+    if scene is None:
+        return "ERROR: intended foreground application is not observable"
+    if not scene_matches_application(
+        scene,
+        strategy.goal.required_application,
+    ):
+        return "ERROR: intended application is not in the foreground"
+    if not scene.target_evidence("").focus_observable:
+        return "ERROR: intended foreground keyboard focus is not observable"
+    return None
+
+
 def type_text(text):
     """Type ``text`` into the currently focused element."""
     if text is None:
@@ -790,6 +824,9 @@ def type_text(text):
     text = str(text)
     if text == "":
         return "type_text: empty string — nothing to type"
+    foreground_error = _intended_foreground_error()
+    if foreground_error:
+        return foreground_error
     ok = f"typed {len(text)} characters"
     backend = _backend()
 
@@ -836,6 +873,9 @@ def press_key(key):
     parts = _split_combo(key)
     if not parts:
         return "ERROR: press_key: no key provided"
+    foreground_error = _intended_foreground_error()
+    if foreground_error:
+        return foreground_error
     ok = f"pressed {str(key).strip()}"
     backend = _backend()
 
@@ -1770,6 +1810,64 @@ def _resolve_common_locations(name):
     return None
 
 
+_PACKAGED_APP_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*![A-Za-z0-9][A-Za-z0-9._-]*$"
+)
+
+
+def _safe_apps_folder_id(app_id) -> bool:
+    """Whether a Start Apps identifier is safe as one AppsFolder path segment."""
+
+    aid = str(app_id or "")
+    return bool(
+        aid
+        and len(aid) <= 1024
+        and aid == aid.strip()
+        and all(ord(char) >= 0x20 and ord(char) != 0x7F for char in aid)
+    )
+
+
+def _packaged_app_identity_score(name, app_id) -> float:
+    """Return a conservative match score against a packaged app's stable AUMID.
+
+    ``Get-StartApps.Name`` is localized, while the package-family/application
+    identity in ``AppID`` is stable.  Match only exact identity aliases or exact
+    word tokens extracted from that structured identity; never fuzzy-match the
+    publisher hash or arbitrary substrings.
+    """
+
+    query = (name or "").strip()
+    aid = (app_id or "").strip()
+    if not query or not _PACKAGED_APP_ID_RE.fullmatch(aid):
+        return 0.0
+    if query.casefold() == aid.casefold():
+        return 1.0
+
+    family, application_id = aid.split("!", 1)
+    package_name = family.rsplit("_", 1)[0]
+    aliases = [package_name, application_id]
+    aliases.extend(part for part in package_name.split(".") if part)
+    query_norm = _norm_alnum(query)
+    if query_norm and any(query_norm == _norm_alnum(alias) for alias in aliases):
+        return 1.0
+
+    identity_words = []
+    for alias in aliases:
+        for chunk in re.split(r"[^A-Za-z0-9]+", alias):
+            if not chunk:
+                continue
+            words = re.findall(
+                r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+",
+                chunk,
+            )
+            identity_words.extend((words or [chunk]))
+    identity_tokens = {word.casefold() for word in identity_words if word}
+    query_tokens = [token.casefold() for token in _name_tokens(query)]
+    if query_tokens and all(token in identity_tokens for token in query_tokens):
+        return 0.98
+    return 0.0
+
+
 def _resolve_uwp(name):
     """Tier 4 — UWP / Store apps via PowerShell Get-StartApps. Returns
     ``("explorer.exe", ["shell:AppsFolder\\<AUMID>"])`` for the best name match, or
@@ -1796,19 +1894,31 @@ def _resolve_uwp(name):
         return None
     if isinstance(data, dict):
         data = [data]
-    best, best_sc = None, 0.0
+    candidates = {}
     for item in data:
         if not isinstance(item, dict):
             continue
-        aid = item.get("AppID") or ""
-        if not aid:
+        aid = str(item.get("AppID") or "").strip()
+        if not _safe_apps_folder_id(aid):
             continue
-        sc = _fuzzy_score(name, item.get("Name") or "")
-        if sc > best_sc:
-            best, best_sc = aid, sc
-    if best and best_sc >= _FUZZY_MIN:
-        return ("explorer.exe", ["shell:AppsFolder\\" + best])
-    return None
+        identity_sc = _packaged_app_identity_score(name, aid)
+        display_sc = _fuzzy_score(name, item.get("Name") or "")
+        if identity_sc:
+            rank = (2, identity_sc)
+        elif display_sc >= _FUZZY_MIN:
+            rank = (1, display_sc)
+        else:
+            continue
+        previous = candidates.get(aid)
+        if previous is None or rank > previous:
+            candidates[aid] = rank
+    if not candidates:
+        return None
+    best_rank = max(candidates.values())
+    best_ids = sorted(aid for aid, rank in candidates.items() if rank == best_rank)
+    if len(best_ids) != 1:
+        return None
+    return ("explorer.exe", ["shell:AppsFolder\\" + best_ids[0]])
 
 
 def resolve_windows_app(name):

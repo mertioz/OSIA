@@ -8,6 +8,7 @@ import io
 import json
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -39,6 +40,19 @@ _MAX_MODEL_SURFACES = 80
 _ACTIONABLE_PATTERNS = frozenset({
     "ExpandCollapse", "Invoke", "SelectionItem", "Toggle", "Value",
 })
+_BACKGROUND_SAFE_UIA_PATTERNS = frozenset({
+    "ExpandCollapse", "Invoke", "SelectionItem", "Toggle",
+})
+_UIA_ACTION_PATTERN_METHODS = (
+    ("Invoke", "GetInvokePattern", "Invoke"),
+    ("SelectionItem", "GetSelectionItemPattern", "Select"),
+    ("Toggle", "GetTogglePattern", "Toggle"),
+    ("ExpandCollapse", "GetExpandCollapsePattern", "Expand"),
+)
+_PRIMITIVE_STATE_ROLES = frozenset({
+    "DocumentControl", "EditControl", "PaneControl", "TextControl",
+})
+_MAX_PRIMITIVE_STATE_ROWS = 32
 _SECURE_DESKTOP_PROCESS_NAMES = frozenset({
     "consent", "credentialuibroker", "lockapp", "logonui", "winlogon",
 })
@@ -63,6 +77,11 @@ class DesktopScene:
     accessibility_complete: bool
     observed_at: float
     uia_tree_observed: bool = True
+    foreground: bool = True
+    host_application_id: str = ""
+    content_application_id: str = ""
+    packaged_application_id: str = ""
+    minimized: bool = False
 
     def target_evidence(
         self,
@@ -149,8 +168,12 @@ class DesktopScene:
             include_with_ancestors(item)
         return {
             "application": self.application_id,
+            "host_application": self.host_application_id or self.application_id,
+            "content_application": self.content_application_id,
             "window_surface_ref": self.window_ref.ref_id,
             "window_generation": self.window_ref.window_generation,
+            "target_foreground": bool(self.foreground),
+            "target_minimized": bool(self.minimized),
             "structural_epoch": self.structural_epoch,
             "accessibility_complete": self.accessibility_complete,
             "accessibility_quality": quality.value,
@@ -182,9 +205,68 @@ class DesktopScene:
             ],
             "candidate_surface_refs": [item.ref_id for item in candidates[:12]],
             "surfaces": [
-                item.to_safe_dict() for item in projected
+                {
+                    **item.to_safe_dict(),
+                    "actuation": _surface_actuation_contract(
+                        item,
+                        target_foreground=self.foreground,
+                        target_minimized=self.minimized,
+                    ),
+                }
+                for item in projected
             ],
         }
+
+
+def _surface_actuation_contract(
+    surface: DesktopSurfaceRef,
+    *,
+    target_foreground: bool,
+    target_minimized: bool,
+) -> dict:
+    """Describe exact per-surface preconditions without application heuristics."""
+
+    if surface.surface_kind in {SurfaceKind.WINDOW, SurfaceKind.DIALOG}:
+        return {
+            "available": True,
+            "attempted_effect": "application_foreground",
+            "preconditions": ["exact_target_exists", "target_restorable"],
+            "background_safe": False,
+            "foreground_required": False,
+            "keyboard_focus_required": False,
+        }
+    safe_patterns = tuple(
+        item for item in (
+            "Invoke", "SelectionItem", "Toggle", "ExpandCollapse",
+        )
+        if item in surface.patterns
+    )
+    if safe_patterns and surface.enabled and not target_minimized:
+        return {
+            "available": True,
+            "attempted_effect": "desktop_uia_primitive",
+            "preconditions": [
+                "exact_target_exists", "target_visible_not_minimized",
+                "fresh_runtime_identity",
+            ],
+            "background_safe": True,
+            "foreground_required": False,
+            "keyboard_focus_required": False,
+            "patterns": list(safe_patterns),
+        }
+    return {
+        "available": False,
+        "attempted_effect": "",
+        "preconditions": [
+            "exact_target_exists",
+            *([] if target_foreground else ["target_foreground"]),
+            *([] if not target_minimized else ["target_restored"]),
+        ],
+        "background_safe": False,
+        "foreground_required": not target_foreground,
+        "keyboard_focus_required": False,
+        "reason_code": "safe_uia_pattern_unavailable",
+    }
 
 
 def bind_effective_model(provider: str, model: str):
@@ -272,6 +354,112 @@ def _process_details(pid: int) -> tuple[str, float]:
         return f"process-{int(pid or 0)}", time.time()
 
 
+def _semantic_application_id(
+    window_application_id: str,
+    window_pid: int,
+    controls: Iterable[dict],
+) -> str:
+    """Resolve the real app behind the generic Windows UWP frame host."""
+
+    if str(window_application_id or "").lower() != "applicationframehost":
+        return str(window_application_id or "")
+    process_counts: dict[int, int] = {}
+    for item in controls:
+        try:
+            process_id = int(item.get("process_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if process_id <= 0 or process_id == int(window_pid):
+            continue
+        process_counts[process_id] = process_counts.get(process_id, 0) + 1
+    for process_id, _count in sorted(
+        process_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    ):
+        candidate, _started_at = _process_details(process_id)
+        if candidate and not candidate.startswith("process-"):
+            return candidate
+    return str(window_application_id or "")
+
+
+def _application_identity(value: object) -> str:
+    normalized = "".join(
+        char for char in str(value or "").lower()
+        if char.isalnum()
+    )
+    for suffix in ("application", "app", "exe"):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix) + 2:
+            normalized = normalized[:-len(suffix)]
+            break
+    return normalized
+
+
+def _application_words(value: object) -> tuple[str, ...]:
+    return tuple(re.findall(r"[a-z0-9]+", str(value or "").lower()))
+
+
+def _scene_application_identity(
+    scene: DesktopScene,
+    expected: str,
+) -> tuple[int, str]:
+    """Return one structured target-identity rank and its bounded evidence."""
+
+    target = _application_identity(expected)
+    observed = _application_identity(scene.application_id)
+    host = _application_identity(
+        scene.host_application_id or scene.application_id,
+    )
+    if not target:
+        return 0, ""
+    content = _application_identity(scene.content_application_id)
+    if host == "applicationframehost" and content == target:
+        return 400, f"uia_content_application:{scene.content_application_id}"
+    packaged_application_id = str(scene.packaged_application_id or "")
+    if packaged_application_id:
+        try:
+            from osia.tools import desktop_control as dc
+
+            packaged_match = bool(
+                dc._packaged_app_identity_score(expected, packaged_application_id)
+            )
+        except Exception:
+            packaged_match = False
+        if packaged_match:
+            return 350, (
+                "packaged_application_id:"
+                + _safe_label(packaged_application_id)
+            )
+    if observed == target:
+        if host == "applicationframehost" and observed != host:
+            return 400, f"uia_content_application:{scene.application_id}"
+        return 400, f"executable_application:{scene.application_id}"
+    # A generic UWP frame is never application identity by itself.  Only the
+    # content-process identity projected above can turn it into an exact app.
+    if host == "applicationframehost" or observed == "applicationframehost":
+        return 0, ""
+    title = scene.window_ref.accessible_label
+    if _application_identity(title) == target:
+        return 300, f"exact_window_title:{_safe_label(title)}"
+    expected_words = _application_words(expected)
+    title_words = _application_words(title)
+    if not expected_words or len(expected_words) > len(title_words):
+        return 0, ""
+    width = len(expected_words)
+    if any(
+        title_words[index:index + width] == expected_words
+        for index in range(len(title_words) - width + 1)
+    ):
+        return 200, f"structured_window_title:{_safe_label(title)}"
+    return 0, ""
+
+
+def scene_matches_application(scene: DesktopScene, expected: str) -> bool:
+    """Match one scene to the intended app without trusting PID alone."""
+
+    rank, _evidence = _scene_application_identity(scene, expected)
+    return rank > 0
+
+
 def _ensure_thread_physical_pixels() -> None:
     """Use the same physical-pixel coordinate space as UIA and ImageGrab."""
 
@@ -316,6 +504,36 @@ def _window_bounds(hwnd: object) -> SurfaceBounds | None:
         return bounds if bounds.valid() else None
     except Exception:
         return None
+
+
+def _window_is_minimized(hwnd: object) -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        from osia.tools import desktop_control as dc
+
+        loaded = dc._load_win32()
+        return bool(loaded and loaded[0].IsIconic(int(hwnd)))
+    except Exception:
+        return False
+
+
+def _window_packaged_application_id(hwnd: object) -> str:
+    """Return one window-bound stable AUMID, never a localized display name."""
+
+    if sys.platform != "win32":
+        return ""
+    try:
+        from osia.tools import desktop_control as dc
+        from win32com.propsys import propsys, pscon
+
+        value = propsys.SHGetPropertyStoreForWindow(int(hwnd)).GetValue(
+            pscon.PKEY_AppUserModel_ID
+        )
+        app_id = str(value.GetValue() if value is not None else "").strip()
+        return app_id if dc._safe_apps_folder_id(app_id) else ""
+    except Exception:
+        return ""
 
 
 def _window_metadata(hwnd: object) -> tuple[str, int, str, SurfaceBounds | None]:
@@ -391,6 +609,11 @@ def _supported_patterns(control) -> tuple[str, ...]:
     """Expose only pattern names, never Value/Text/password contents."""
 
     supported = []
+    action_methods = {
+        pattern_name: action_method
+        for pattern_name, _getter_name, action_method
+        in _UIA_ACTION_PATTERN_METHODS
+    }
     for safe_name, method_name in (
         ("Selection", "GetSelectionPattern"),
         ("SelectionItem", "GetSelectionItemPattern"),
@@ -403,11 +626,32 @@ def _supported_patterns(control) -> tuple[str, ...]:
     ):
         try:
             getter = getattr(control, method_name, None)
-            if callable(getter) and getter() is not None:
-                supported.append(safe_name)
+            pattern = getter() if callable(getter) else None
+            if pattern is None:
+                continue
+            action_method = action_methods.get(safe_name)
+            if action_method and not callable(getattr(pattern, action_method, None)):
+                continue
+            supported.append(safe_name)
         except Exception:
             continue
     return tuple(supported)
+
+
+def _fresh_uia_action_methods(control) -> dict[str, object]:
+    """Return only canonical UIA actions callable on this fresh reference."""
+
+    available = {}
+    for pattern_name, getter_name, method_name in _UIA_ACTION_PATTERN_METHODS:
+        try:
+            getter = getattr(control, getter_name, None)
+            pattern = getter() if callable(getter) else None
+            method = getattr(pattern, method_name, None) if pattern else None
+        except Exception:
+            continue
+        if callable(method):
+            available[pattern_name] = method
+    return available
 
 
 def _surface_kind(role: str, *, modal: bool = False) -> SurfaceKind:
@@ -432,30 +676,36 @@ def _scene_signature(rows: Iterable[tuple]) -> str:
     return hashlib.sha256(material.encode("utf-8", errors="replace")).hexdigest()[:32]
 
 
-def observe_foreground_scene(*, target: str = "") -> DesktopScene | None:
-    """Observe one exact foreground window without exposing its native handle."""
+def _observe_window_scene(
+    window: tuple[object, str, int],
+    *,
+    target: str = "",
+    foreground: bool,
+    class_name_hint: str = "",
+) -> DesktopScene | None:
+    """Observe one exact top-level window without exposing its native handle."""
 
     if sys.platform != "win32":
         return None
     _ensure_thread_physical_pixels()
     from osia.tools import desktop_control as dc
 
-    foreground = dc._foreground_window_win32()
-    if not foreground:
-        return None
-    hwnd, title, pid = foreground
+    hwnd, title, pid = window
     if not hwnd or not pid:
         return None
+    minimized = _window_is_minimized(hwnd)
     window_bounds = _window_bounds(hwnd)
-    if window_bounds is None:
+    if window_bounds is None and not minimized:
         return None
-    application_id, process_started_at = _process_details(pid)
-    class_name = ""
-    try:
-        loaded = dc._load_win32()
-        class_name = loaded[0].GetClassName(hwnd) if loaded else ""
-    except Exception:
-        class_name = ""
+    host_application_id, process_started_at = _process_details(pid)
+    packaged_application_id = _window_packaged_application_id(hwnd)
+    class_name = str(class_name_hint or "")
+    if not class_name:
+        try:
+            loaded = dc._load_win32()
+            class_name = loaded[0].GetClassName(hwnd) if loaded else ""
+        except Exception:
+            class_name = ""
 
     rows = []
     controls = []
@@ -498,6 +748,10 @@ def observe_foreground_scene(*, target: str = "") -> DesktopScene | None:
                         automation_id = _safe_label(control.AutomationId)
                     except Exception:
                         automation_id = ""
+                    try:
+                        control_process_id = int(control.ProcessId)
+                    except Exception:
+                        control_process_id = int(pid)
                     runtime_id = _runtime_id(control)
                     bounds = _control_bounds(control, window_bounds)
                     selected = _selection_state(control)
@@ -513,6 +767,7 @@ def observe_foreground_scene(*, target: str = "") -> DesktopScene | None:
                         "role": role or "CustomControl",
                         "label": label or automation_id,
                         "automation_id": automation_id,
+                        "process_id": control_process_id,
                         "runtime_id": runtime_id,
                         "bounds": bounds,
                         "selected": selected,
@@ -547,8 +802,46 @@ def observe_foreground_scene(*, target: str = "") -> DesktopScene | None:
             root_is_modal = False
             uia_tree_observed = False
 
+    application_id = _semantic_application_id(
+        host_application_id,
+        int(pid),
+        controls,
+    )
+    content_application_id = (
+        application_id
+        if (
+            _application_identity(host_application_id) == "applicationframehost"
+            and _application_identity(application_id) != "applicationframehost"
+        ) else ""
+    )
+    application_hint = _strategy_required_application() or str(target or "")
+    if (
+        _application_identity(host_application_id) == "applicationframehost"
+        and packaged_application_id
+        and application_hint
+    ):
+        try:
+            packaged_match = bool(
+                dc._packaged_app_identity_score(
+                    application_hint,
+                    packaged_application_id,
+                )
+            )
+        except Exception:
+            packaged_match = False
+        if packaged_match:
+            application_id = _application_identity(application_hint)
+
     signature = _scene_signature(
-        rows or [(class_name, window_bounds.to_safe_dict(), root_is_modal)]
+        rows or [(
+            class_name,
+            (
+                window_bounds.to_safe_dict()
+                if window_bounds is not None else {"minimized": True}
+            ),
+            root_is_modal,
+            packaged_application_id,
+        )]
     )
     process_ref, generation, epoch = DESKTOP_SURFACE_REGISTRY.observe_window_scene(
         application_id=application_id,
@@ -617,8 +910,8 @@ def observe_foreground_scene(*, target: str = "") -> DesktopScene | None:
         ),
         role="WindowControl",
         accessible_label=_safe_label(title),
-        selected=True,
-        focused=True,
+        selected=bool(foreground),
+        focused=bool(foreground),
         enabled=True,
         parent_ref=owner_ref_id,
         bounds=window_bounds,
@@ -660,7 +953,7 @@ def observe_foreground_scene(*, target: str = "") -> DesktopScene | None:
             role=role,
             accessible_label=item["label"],
             selected=item["selected"],
-            focused=item["focused"],
+            focused=bool(foreground and item["focused"]),
             enabled=item["enabled"],
             parent_ref=parent_ref,
             bounds=bounds,
@@ -692,29 +985,523 @@ def observe_foreground_scene(*, target: str = "") -> DesktopScene | None:
         ) >= 2,
         observed_at=time.time(),
         uia_tree_observed=uia_tree_observed,
+        foreground=bool(foreground),
+        host_application_id=host_application_id,
+        content_application_id=content_application_id,
+        packaged_application_id=packaged_application_id,
+        minimized=bool(minimized),
     )
-    _LAST_SCENE.set(scene)
     return scene
+
+
+def observe_foreground_scene(*, target: str = "") -> DesktopScene | None:
+    """Observe one exact foreground window without exposing its native handle."""
+
+    if sys.platform != "win32":
+        return None
+    from osia.tools import desktop_control as dc
+
+    foreground = dc._foreground_window_win32()
+    if not foreground:
+        return None
+    scene = _observe_window_scene(
+        foreground,
+        target=target,
+        foreground=True,
+    )
+    if scene is not None:
+        _LAST_SCENE.set(scene)
+    return scene
+
+
+@dataclass(frozen=True)
+class TargetSurfaceSelection:
+    requested_application: str
+    status: str
+    foreground_scene: DesktopScene | None
+    target_scene: DesktopScene | None
+    identity_strength: int = 0
+    identity_evidence: str = ""
+    candidate_count: int = 0
+    top_level_surfaces: tuple[dict, ...] = ()
+
+
+@dataclass(frozen=True)
+class _LaunchTargetCorrelation:
+    application_id: str
+    process_ref: str
+    window_generation: str
+    correlated_at: float
+
+
+_LAUNCH_TARGET_TTL_SECONDS = 90.0
+_LAUNCH_TARGETS: dict[str, _LaunchTargetCorrelation] = {}
+_LAUNCH_TARGETS_LOCK = threading.Lock()
+
+
+def _remember_launch_target(scene: DesktopScene) -> None:
+    application = _application_identity(scene.application_id)
+    if not application:
+        return
+    correlation = _LaunchTargetCorrelation(
+        application_id=application,
+        process_ref=scene.window_ref.process_ref,
+        window_generation=scene.window_ref.window_generation,
+        correlated_at=time.time(),
+    )
+    with _LAUNCH_TARGETS_LOCK:
+        _LAUNCH_TARGETS[application] = correlation
+
+
+def _current_launch_target(application: str) -> _LaunchTargetCorrelation | None:
+    identity = _application_identity(application)
+    if not identity:
+        return None
+    now = time.time()
+    with _LAUNCH_TARGETS_LOCK:
+        correlation = _LAUNCH_TARGETS.get(identity)
+        if (
+            correlation is not None
+            and now - correlation.correlated_at > _LAUNCH_TARGET_TTL_SECONDS
+        ):
+            _LAUNCH_TARGETS.pop(identity, None)
+            return None
+        return correlation
+
+
+def _collapse_exact_scene_duplicates(
+    scenes: Iterable[DesktopScene],
+) -> tuple[DesktopScene, ...]:
+    """Collapse exact native records and one proven UWP host/content pair."""
+
+    grouped: dict[tuple[str, str], list[DesktopScene]] = {}
+    for scene in scenes:
+        resolution = DESKTOP_SURFACE_REGISTRY.resolve(scene.window_ref.ref_id)
+        if resolution.status == "stale":
+            continue
+        key = (
+            str(scene.window_ref.process_ref or ""),
+            str(scene.window_ref.window_generation or ""),
+        )
+        if not all(key):
+            key = ("scene", scene.window_ref.ref_id)
+        grouped.setdefault(key, []).append(scene)
+    collapsed = []
+    for records in grouped.values():
+        collapsed.append(max(
+            records,
+            key=lambda scene: (
+                bool(scene.content_application_id),
+                bool(scene.uia_tree_observed),
+                len(scene.surfaces),
+                float(scene.observed_at),
+            ),
+        ))
+    logical = []
+    for scene in collapsed:
+        duplicate_index = next((
+            index for index, existing in enumerate(logical)
+            if _same_packaged_host_content_window(existing, scene)
+        ), None)
+        if duplicate_index is None:
+            logical.append(scene)
+            continue
+        logical[duplicate_index] = max(
+            (logical[duplicate_index], scene),
+            key=lambda candidate: (
+                bool(candidate.content_application_id),
+                bool(candidate.packaged_application_id),
+                bool(candidate.uia_tree_observed),
+                len(candidate.surfaces),
+                float(candidate.observed_at),
+            ),
+        )
+    return tuple(logical)
+
+
+def _same_packaged_host_content_window(
+    first: DesktopScene,
+    second: DesktopScene,
+) -> bool:
+    """Correlate one UWP frame and its inset content HWND, never peers."""
+
+    for host, content in ((first, second), (second, first)):
+        if (
+            _application_identity(
+                host.host_application_id or host.application_id
+            ) != "applicationframehost"
+            or not host.packaged_application_id
+            or not host.content_application_id
+            or _application_identity(host.content_application_id)
+            != _application_identity(content.application_id)
+            or _application_identity(
+                content.host_application_id or content.application_id
+            ) == "applicationframehost"
+            or _normalized_surface_text(
+                host.window_ref.accessible_label
+            ) != _normalized_surface_text(
+                content.window_ref.accessible_label
+            )
+        ):
+            continue
+        outer = host.window_ref.bounds
+        inner = content.window_ref.bounds
+        if outer is None or inner is None:
+            continue
+        insets = (
+            inner.left - outer.left,
+            inner.top - outer.top,
+            outer.right - inner.right,
+            outer.bottom - inner.bottom,
+        )
+        if all(0 <= value <= 32 for value in insets):
+            return True
+    return False
+
+
+def _strategy_required_application() -> str:
+    try:
+        from osia.execution_strategy import current_execution_strategy
+
+        strategy = current_execution_strategy()
+    except Exception:
+        strategy = None
+    if strategy is None:
+        return ""
+    node = (
+        strategy.node_by_id(strategy._frozen_node_id)
+        if strategy.frozen_reason else None
+    ) or strategy.goal
+    return str(node.required_application or "").strip()
+
+
+def _requested_application(target: str) -> str:
+    required = _strategy_required_application()
+    if required:
+        return required
+    value = " ".join(str(target or "").split())
+    if not value or re.fullmatch(r"[\d\s\u00a0\u202f.,'*/+\-=×÷−]+", value):
+        return ""
+    return value[:160]
+
+
+def _window_title_matches_application(title: str, expected: str) -> bool:
+    target = _application_identity(expected)
+    if not target:
+        return False
+    if _application_identity(title) == target:
+        return True
+    expected_words = _application_words(expected)
+    title_words = _application_words(title)
+    if not expected_words or len(expected_words) > len(title_words):
+        return False
+    width = len(expected_words)
+    return any(
+        title_words[index:index + width] == expected_words
+        for index in range(len(title_words) - width + 1)
+    )
+
+
+def _safe_top_level_surface(
+    *,
+    application: str,
+    title: str,
+    class_name: str,
+    foreground: bool,
+) -> dict:
+    return {
+        "application": str(application or "")[:160],
+        "title": _safe_label(title),
+        "window_class": _safe_label(class_name),
+        "foreground": bool(foreground),
+    }
+
+
+def _resolve_target_scene(
+    scenes: Iterable[DesktopScene],
+    requested_application: str,
+    *,
+    foreground_scene: DesktopScene | None,
+    top_level_surfaces: Iterable[dict] = (),
+) -> TargetSurfaceSelection:
+    ranked = []
+    for scene in _collapse_exact_scene_duplicates(scenes):
+        rank, evidence = _scene_application_identity(
+            scene, requested_application,
+        )
+        if rank > 0:
+            ranked.append((rank, evidence, scene))
+    if not ranked:
+        return TargetSurfaceSelection(
+            requested_application=requested_application,
+            status="target_missing",
+            foreground_scene=foreground_scene,
+            target_scene=None,
+            top_level_surfaces=tuple(top_level_surfaces),
+        )
+    correlation = _current_launch_target(requested_application)
+    if correlation is not None:
+        correlated = [
+            item for item in ranked
+            if (
+                item[2].window_ref.process_ref == correlation.process_ref
+                and item[2].window_ref.window_generation
+                == correlation.window_generation
+            )
+        ]
+        if len(correlated) == 1:
+            rank, evidence, scene = correlated[0]
+            return TargetSurfaceSelection(
+                requested_application=requested_application,
+                status="exact_target",
+                foreground_scene=foreground_scene,
+                target_scene=scene,
+                identity_strength=rank,
+                identity_evidence="current_open_attempt:" + evidence,
+                candidate_count=1,
+                top_level_surfaces=tuple(top_level_surfaces),
+            )
+    best_rank = max(item[0] for item in ranked)
+    best = [item for item in ranked if item[0] == best_rank]
+    if len(best) != 1:
+        return TargetSurfaceSelection(
+            requested_application=requested_application,
+            status="target_ambiguous",
+            foreground_scene=foreground_scene,
+            target_scene=None,
+            identity_strength=best_rank,
+            candidate_count=len(best),
+            top_level_surfaces=tuple(top_level_surfaces),
+        )
+    rank, evidence, scene = best[0]
+    return TargetSurfaceSelection(
+        requested_application=requested_application,
+        status="exact_target",
+        foreground_scene=foreground_scene,
+        target_scene=scene,
+        identity_strength=rank,
+        identity_evidence=evidence,
+        candidate_count=1,
+        top_level_surfaces=tuple(top_level_surfaces),
+    )
+
+
+def _select_desktop_target(target: str = "") -> TargetSurfaceSelection:
+    foreground_scene = observe_foreground_scene(target=target)
+    requested_application = _requested_application(target)
+    if foreground_scene is None:
+        return TargetSurfaceSelection(
+            requested_application=requested_application,
+            status="desktop_surface_unavailable",
+            foreground_scene=None,
+            target_scene=None,
+        )
+    foreground_summary = _safe_top_level_surface(
+        application=foreground_scene.application_id,
+        title=foreground_scene.window_ref.accessible_label,
+        class_name=(
+            DESKTOP_SURFACE_REGISTRY.native_identity(
+                foreground_scene.window_ref.ref_id,
+            ).class_name
+            if DESKTOP_SURFACE_REGISTRY.native_identity(
+                foreground_scene.window_ref.ref_id,
+            ) is not None else ""
+        ),
+        foreground=True,
+    )
+    if not requested_application:
+        return TargetSurfaceSelection(
+            requested_application="",
+            status="current_foreground",
+            foreground_scene=foreground_scene,
+            target_scene=foreground_scene,
+            identity_strength=100,
+            identity_evidence="current_foreground_without_application_target",
+            candidate_count=1,
+            top_level_surfaces=(foreground_summary,),
+        )
+    foreground_rank, foreground_evidence = _scene_application_identity(
+        foreground_scene, requested_application,
+    )
+    foreground_is_packaged_frame = bool(
+        _application_identity(
+            foreground_scene.host_application_id
+            or foreground_scene.application_id
+        ) == "applicationframehost"
+        or foreground_scene.packaged_application_id
+    )
+    if foreground_rank > 0 and (
+        sys.platform != "win32" or not foreground_is_packaged_frame
+    ):
+        return TargetSurfaceSelection(
+            requested_application=requested_application,
+            status="exact_target",
+            foreground_scene=foreground_scene,
+            target_scene=foreground_scene,
+            identity_strength=foreground_rank,
+            identity_evidence=foreground_evidence,
+            candidate_count=1,
+            top_level_surfaces=(foreground_summary,),
+        )
+    if sys.platform != "win32":
+        return _resolve_target_scene(
+            (), requested_application,
+            foreground_scene=foreground_scene,
+            top_level_surfaces=(foreground_summary,),
+        )
+
+    from osia.tools import desktop_control as dc
+
+    foreground_native = DESKTOP_SURFACE_REGISTRY.native_identity(
+        foreground_scene.window_ref.ref_id,
+    )
+    foreground_hwnd = (
+        foreground_native.native_window_id if foreground_native is not None else None
+    )
+    candidates = [foreground_scene]
+    summaries = [foreground_summary]
+    for hwnd, title, pid, class_name in dc._enum_app_windows_win32()[:80]:
+        if foreground_hwnd is not None and int(hwnd) == int(foreground_hwnd):
+            continue
+        host_application, _started_at = _process_details(pid)
+        summaries.append(_safe_top_level_surface(
+            application=host_application,
+            title=title,
+            class_name=class_name,
+            foreground=False,
+        ))
+        host_identity = _application_identity(host_application)
+        if not (
+            host_identity == _application_identity(requested_application)
+            or host_identity == "applicationframehost"
+            or _window_title_matches_application(title, requested_application)
+        ):
+            continue
+        observed = _observe_window_scene(
+            (hwnd, title, pid),
+            target=target,
+            foreground=False,
+            class_name_hint=class_name,
+        )
+        if observed is not None:
+            candidates.append(observed)
+    selection = _resolve_target_scene(
+        candidates,
+        requested_application,
+        foreground_scene=foreground_scene,
+        top_level_surfaces=summaries[:80],
+    )
+    if selection.target_scene is not None:
+        _LAST_SCENE.set(selection.target_scene)
+    return selection
+
+
+def focus_existing_application_window(application: str) -> tuple[str, str]:
+    """Focus one uniquely resolved existing app window without launching another."""
+
+    if sys.platform != "win32":
+        return "unavailable", ""
+    selection = _select_desktop_target(application)
+    scene = selection.target_scene
+    if scene is None:
+        return selection.status, ""
+    if not (
+        selection.identity_strength >= 350
+        and (
+            selection.identity_evidence.startswith("uia_content_application:")
+            or selection.identity_evidence.startswith("executable_application:")
+            or selection.identity_evidence.startswith("packaged_application_id:")
+            or selection.identity_evidence.startswith("current_open_attempt:")
+        )
+    ):
+        return "weak_identity", ""
+    native = DESKTOP_SURFACE_REGISTRY.native_identity(
+        scene.window_ref.ref_id,
+    )
+    if native is None:
+        return "stale", ""
+    detail = scene.window_ref.accessible_label
+    if scene.foreground:
+        _remember_launch_target(scene)
+        return "ready", detail
+    from osia.tools import desktop_control as dc
+
+    try:
+        status, focused_detail = dc.focus_app_window((
+            native.native_window_id,
+            detail,
+            native.pid,
+        ))
+    except Exception:
+        return "outcome_unknown", ""
+    if status == "ready":
+        _remember_launch_target(scene)
+    return status, str(focused_detail or detail)
+
+
+def _numeric_tokens(value: object) -> set[str]:
+    tokens = set()
+    for match in re.findall(
+        r"(?<!\d)\d(?:[\s\u00a0\u202f.,']*\d)*(?!\d)",
+        str(value or ""),
+    ):
+        normalized = re.sub(r"\D", "", match)
+        if normalized:
+            tokens.add(normalized)
+    return tokens
+
+
+def _contains_exact_integer(value: object, expected: str) -> bool:
+    """Match an integer, allowing only unambiguous locale grouping."""
+
+    for match in re.findall(
+        r"(?<!\d)\d(?:[\s\u00a0\u202f.,']*\d)*(?!\d)",
+        str(value or ""),
+    ):
+        compact = re.sub(r"[\s\u00a0\u202f']", "", match)
+        if compact == expected:
+            return True
+        if len(expected) < 5:
+            continue
+        if re.fullmatch(
+            r"\d{1,3}(?P<separator>[.,])\d{3}"
+            r"(?:(?P=separator)\d{3})*",
+            compact,
+        ) and re.sub(r"[.,]", "", compact) == expected:
+            return True
+    return False
 
 
 def rank_surface_candidates(
     surfaces: Iterable[DesktopSurfaceRef], target: str,
 ) -> tuple[DesktopSurfaceRef, ...]:
-    query = {token for token in re.findall(r"[\w]+", str(target or "").lower()) if len(token) > 1}
+    query_text = str(target or "").lower().strip()
+    query = {
+        token for token in re.findall(r"[\w]+", query_text)
+        if len(token) > 1
+    }
+    query_numbers = _numeric_tokens(query_text)
     ranked = []
     for surface in surfaces:
         if surface.surface_kind is SurfaceKind.WINDOW:
             continue
         label_tokens = set(re.findall(r"[\w]+", surface.accessible_label.lower()))
+        numeric_match = bool(
+            query_numbers
+            and query_numbers.intersection(
+                _numeric_tokens(surface.accessible_label),
+            )
+        )
         if query:
             overlap = len(query & label_tokens)
-            exact = surface.accessible_label.lower().strip() == str(target).lower().strip()
-            if not overlap and not exact:
+            exact = surface.accessible_label.lower().strip() == query_text
+            if not overlap and not exact and not numeric_match:
                 continue
         else:
             overlap, exact = 0, False
         score = (
             int(exact) * 100
+            + int(numeric_match) * 80
             + overlap * 10
             + int(surface.enabled) * 2
             + int(surface.focused)
@@ -725,21 +1512,744 @@ def rank_surface_candidates(
     return tuple(item[1] for item in ranked)
 
 
+def _exact_observed_postcondition(
+    scene: DesktopScene,
+    target: str,
+) -> tuple[str, str]:
+    """Return the active required postcondition only for exact UIA state."""
+
+    target_text = str(target or "").strip()
+    if not target_text:
+        return "", ""
+    try:
+        from osia.execution_strategy import current_execution_strategy
+
+        strategy = current_execution_strategy()
+    except Exception:
+        strategy = None
+    if strategy is None:
+        return "", ""
+    frozen_attempt = (
+        strategy.attempt_by_id(strategy._frozen_attempt_id)
+        if strategy.frozen_reason else None
+    )
+    if (
+        frozen_attempt is not None
+        and frozen_attempt.attempted_effect == "application_open"
+        and frozen_attempt.target_application
+        and scene_matches_application(
+            scene, frozen_attempt.target_application,
+        )
+    ):
+        expected = _application_identity(
+            frozen_attempt.target_application
+        )
+        requested = _application_identity(target_text)
+        if expected and (requested == expected or expected in requested):
+            return frozen_attempt.attempted_effect, "application_open"
+    goal = (
+        strategy.node_by_id(strategy._frozen_node_id)
+        if strategy.frozen_reason else None
+    ) or strategy.goal
+    postcondition = str(goal.observable_success_postcondition or "")
+    if (
+        not postcondition
+        or not scene_matches_application(scene, goal.required_application)
+    ):
+        return "", ""
+    if goal.requested_action == "open":
+        expected = _application_identity(goal.required_application)
+        requested = _application_identity(target_text)
+        if expected and (requested == expected or expected in requested):
+            return postcondition, "application_open"
+    target_integer = re.sub(r"[\s\u00a0\u202f']", "", target_text)
+    target_numbers = (
+        {target_integer} if re.fullmatch(r"\d+", target_integer) else set()
+    )
+    if target_numbers:
+        if not _contains_exact_integer(postcondition, target_integer):
+            return "", ""
+    elif target_text.lower() not in postcondition.lower():
+        return "", ""
+    for surface in scene.surfaces:
+        if (
+            not surface.enabled
+            or surface.role not in {
+                "DocumentControl", "EditControl", "PaneControl", "TextControl",
+            }
+        ):
+            continue
+        if target_numbers:
+            label = surface.accessible_label.strip()
+            label_is_number = bool(re.fullmatch(
+                r"\d(?:[\s\u00a0\u202f.,']*\d)*",
+                label,
+            ))
+            label_names_result = bool(re.search(
+                r"\b(display|result|affichage|resultat|résultat)\b",
+                label.lower(),
+            ))
+            if (
+                (label_is_number or label_names_result)
+                and _contains_exact_integer(label, target_integer)
+            ):
+                return postcondition, "exact_postcondition"
+        elif surface.accessible_label.strip().lower() == target_text.lower():
+            return postcondition, "exact_postcondition"
+    return "", ""
+
+
+def _exact_absent_postcondition(
+    scene: DesktopScene,
+    target: str,
+) -> tuple[str, tuple[str, ...]]:
+    """Prove a calculation absent only from a complete, neutral UIA state."""
+
+    try:
+        from osia.execution_strategy import current_execution_strategy
+
+        strategy = current_execution_strategy()
+    except Exception:
+        strategy = None
+    if strategy is None or not strategy.frozen_reason:
+        return "", ()
+    goal = strategy.node_by_id(strategy._frozen_node_id)
+    if (
+        goal is None
+        or goal.requested_action != "calculate"
+        or not scene.accessibility_complete
+        or not scene.uia_tree_observed
+        or not scene_matches_application(scene, goal.required_application)
+    ):
+        return "", ()
+    postcondition = str(goal.observable_success_postcondition or "")
+    target_integer = re.sub(
+        r"[\s\u00a0\u202f']", "", str(target or "").strip(),
+    )
+    if (
+        not postcondition
+        or not re.fullmatch(r"\d+", target_integer)
+        or not _contains_exact_integer(postcondition, target_integer)
+    ):
+        return "", ()
+    state_labels = []
+    for surface in scene.surfaces:
+        if (
+            not surface.enabled
+            or surface.role not in {
+                "DocumentControl", "EditControl", "PaneControl", "TextControl",
+            }
+        ):
+            continue
+        label = surface.accessible_label.strip()
+        if not label:
+            continue
+        numeric_only = bool(re.fullmatch(
+            r"\d(?:[\s\u00a0\u202f.,']*\d)*", label,
+        ))
+        names_state = bool(re.search(
+            r"\b(display|result|output|input|equation|expression|"
+            r"affichage|resultat|résultat)\b",
+            label.lower(),
+        ))
+        if numeric_only or names_state:
+            state_labels.append(label)
+    if not state_labels:
+        return "", ()
+    observed_numbers = set().union(*(
+        _numeric_tokens(label) for label in state_labels
+    ))
+    if target_integer in observed_numbers:
+        return "", ()
+    # A neutral zero-only state is the one generic calculation state that proves
+    # both the requested result and every non-zero partial operand are absent.
+    if not observed_numbers or any(number.strip("0") for number in observed_numbers):
+        return "", ()
+    if any(
+        marker in label
+        for label in state_labels
+        for marker in ("+", "-", "−", "*", "×", "/", "÷", "=")
+    ):
+        return "", ()
+    return postcondition, tuple(state_labels[:8])
+
+
+def _primitive_state_projection(
+    scene: DesktopScene,
+    target: DesktopSurfaceRef | None = None,
+    *,
+    witness_surface_refs: Iterable[str] = (),
+) -> dict:
+    """Return bounded exact UIA state suitable for one primitive receipt."""
+
+    state_rows = []
+    for surface in scene.surfaces:
+        if surface.role not in _PRIMITIVE_STATE_ROLES:
+            continue
+        label = surface.accessible_label.strip()
+        if not label:
+            continue
+        identity = surface.runtime_signature or surface.ref_id
+        state_rows.append({
+            "surface_ref": surface.ref_id,
+            "identity": identity,
+            "role": surface.role,
+            "label": label,
+            "selected": bool(surface.selected),
+            "focused": bool(surface.focused),
+        })
+    state_rows.sort(key=lambda item: (item["identity"], item["role"]))
+    witness_refs = {
+        str(item) for item in witness_surface_refs if str(item or "")
+    }
+    if witness_refs:
+        witness_rows = [
+            item for item in state_rows
+            if item["surface_ref"] in witness_refs
+        ][:_MAX_PRIMITIVE_STATE_ROWS]
+        other_rows = [
+            item for item in state_rows
+            if item["surface_ref"] not in witness_refs
+        ]
+        state_rows = (
+            witness_rows
+            + other_rows[:max(
+                0, _MAX_PRIMITIVE_STATE_ROWS - len(witness_rows),
+            )]
+        )
+        state_rows.sort(key=lambda item: (item["identity"], item["role"]))
+    else:
+        state_rows = state_rows[:_MAX_PRIMITIVE_STATE_ROWS]
+    encoded = json.dumps(
+        state_rows,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    payload = {
+        "application": scene.application_id,
+        "window_surface_ref": scene.window_ref.ref_id,
+        "window_generation": scene.window_ref.window_generation,
+        "target_foreground": bool(scene.foreground),
+        "structural_epoch": scene.structural_epoch,
+        "observed_at": scene.observed_at,
+        "state_signature": hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24],
+        "state_rows": state_rows,
+    }
+    if target is not None:
+        payload["target"] = target.to_safe_dict()
+    return payload
+
+
+def _normalized_surface_text(value: object) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _surface_text_matches(observed: object, expected: object) -> bool:
+    """Match one declared exact accessible-state value, never a fuzzy label."""
+
+    expected_text = " ".join(str(expected or "").split())
+    observed_text = " ".join(str(observed or "").split())
+    if not expected_text or not observed_text:
+        return False
+    expected_integer = re.sub(r"[\s\u00a0\u202f']", "", expected_text)
+    if re.fullmatch(r"\d+", expected_integer):
+        return _contains_exact_integer(observed_text, expected_integer)
+    return _normalized_surface_text(observed_text) == _normalized_surface_text(
+        expected_text,
+    )
+
+
+def _stale_primitive_continuity(
+    scene: DesktopScene,
+    attempt,
+    before: dict,
+    selection: TargetSurfaceSelection | None,
+) -> tuple[DesktopSurfaceRef | None, dict]:
+    """Rebind one stale UIA target only through unique structured identity."""
+
+    primitive = (
+        attempt.primitive_receipt
+        if isinstance(attempt.primitive_receipt, dict) else {}
+    )
+    if primitive.get("kind") != "desktop_uia_primitive":
+        return None, {}
+    identity = (
+        attempt.target_surface_identity
+        if isinstance(attempt.target_surface_identity, dict) else {}
+    )
+    target_before = before.get("target")
+    target_before = target_before if isinstance(target_before, dict) else {}
+    signature = str(
+        identity.get("runtime_signature")
+        or target_before.get("runtime_signature")
+        or ""
+    )
+    role = str(identity.get("role") or target_before.get("role") or "")
+    expected_kind = str(identity.get("surface_kind") or "")
+    expected_patterns = {
+        str(item) for item in (
+            identity.get("patterns") or target_before.get("patterns") or []
+        ) if str(item)
+    }
+    prior_surface = str(
+        target_before.get("surface_ref") or identity.get("surface_ref") or ""
+    )
+    prior_window = str(before.get("window_surface_ref") or "")
+    prior_generation = str(before.get("window_generation") or "")
+    raw_prior_epoch = before.get("structural_epoch")
+    prior_epoch_valid = bool(
+        isinstance(raw_prior_epoch, int)
+        and not isinstance(raw_prior_epoch, bool)
+        and raw_prior_epoch >= 0
+    )
+    prior_epoch = int(raw_prior_epoch) if prior_epoch_valid else 0
+    same_generation_epoch_advanced = bool(
+        prior_epoch_valid
+        and scene.window_ref.window_generation == prior_generation
+        and scene.structural_epoch > prior_epoch
+    )
+    strong_evidence = bool(
+        selection is not None
+        and selection.status == "exact_target"
+        and selection.target_scene is scene
+        and selection.candidate_count == 1
+        and selection.identity_strength >= 350
+        and str(selection.identity_evidence or "").startswith((
+            "uia_content_application:",
+            "executable_application:",
+            "packaged_application_id:",
+            "current_open_attempt:",
+        ))
+    )
+    if (
+        not strong_evidence
+        or not signature
+        or not role
+        or not prior_surface
+        or attempt.target_surface != prior_surface
+        or str(identity.get("window_surface_ref") or prior_window) != prior_window
+        or str(identity.get("window_generation") or prior_generation)
+        != prior_generation
+        or (
+            scene.window_ref.window_generation == prior_generation
+            and not same_generation_epoch_advanced
+        )
+        or scene.window_ref.ref_id == prior_window
+        or (
+            identity.get("process_ref")
+            and scene.window_ref.process_ref
+            != str(identity.get("process_ref") or "")
+        )
+    ):
+        return None, {}
+    candidates = [
+        surface for surface in scene.surfaces
+        if surface.enabled
+        and surface.application_id == scene.application_id
+        and surface.process_ref == scene.window_ref.process_ref
+        and surface.window_generation == scene.window_ref.window_generation
+        and surface.runtime_signature == signature
+        and surface.role == role
+        and (not expected_kind or surface.surface_kind.value == expected_kind)
+        and (
+            not expected_patterns
+            or expected_patterns.issubset(set(surface.patterns))
+        )
+    ]
+    if len(candidates) != 1:
+        return None, {}
+    target = candidates[0]
+    return target, {
+        "surface_continuity": "semantic_reresolution_proven",
+        "previous_window_surface_ref": prior_window,
+        "previous_window_generation": prior_generation,
+        "rebound_window_surface_ref": scene.window_ref.ref_id,
+        "rebound_window_generation": scene.window_ref.window_generation,
+        "rebound_target_surface_ref": target.ref_id,
+        "previous_structural_epoch": prior_epoch,
+        "rebound_structural_epoch": scene.structural_epoch,
+    }
+
+
+def _exact_primitive_reconciliation(
+    scene: DesktopScene,
+    *,
+    selection: TargetSurfaceSelection | None = None,
+) -> dict:
+    """Prove one UIA substep only from a fresh attributable state delta."""
+
+    try:
+        from osia.execution_strategy import current_execution_strategy
+
+        strategy = current_execution_strategy()
+    except Exception:
+        strategy = None
+    if strategy is None or not strategy.frozen_reason:
+        return {}
+    attempt = strategy.attempt_by_id(strategy._frozen_attempt_id)
+    primitive = (
+        attempt.primitive_receipt
+        if attempt is not None and isinstance(attempt.primitive_receipt, dict)
+        else {}
+    )
+    if (
+        attempt is None
+        or not attempt.substep_id
+        or primitive.get("kind") not in {
+            "desktop_uia_primitive", "desktop_window_focus",
+        }
+    ):
+        return {}
+    before = primitive.get("before")
+    before = before if isinstance(before, dict) else {}
+    dispatched_at = max(
+        float(attempt.dispatched_at or 0.0),
+        float(primitive.get("dispatched_at") or 0.0),
+    )
+    if dispatched_at <= 0.0 or scene.observed_at < dispatched_at:
+        return {}
+    if _application_identity(scene.application_id) != _application_identity(
+        before.get("application"),
+    ):
+        return {}
+
+    primitive_kind = str(primitive.get("kind") or "")
+    target_before = before.get("target")
+    target_before = target_before if isinstance(target_before, dict) else {}
+    target_signature = str(target_before.get("runtime_signature") or "")
+    target_surface_ref = str(target_before.get("surface_ref") or "")
+    target_now = next(
+        (
+            surface for surface in scene.surfaces
+            if target_signature
+            and surface.runtime_signature == target_signature
+            and (
+                not target_surface_ref
+                or surface.ref_id == target_surface_ref
+            )
+        ),
+        None,
+    )
+    expected_window = str(before.get("window_surface_ref") or "")
+    expected_generation = str(before.get("window_generation") or "")
+    continuity = {}
+    if (
+        scene.window_ref.ref_id == expected_window
+        and scene.window_ref.window_generation == expected_generation
+    ):
+        expected_target = str(
+            target_before.get("surface_ref") or attempt.target_surface or ""
+        )
+        if (
+            primitive_kind == "desktop_uia_primitive"
+            and (
+                target_now is None
+                or not expected_target
+                or target_now.ref_id != expected_target
+            )
+        ):
+            return {}
+        continuity = {
+            "surface_continuity": "exact_same_generation",
+            "previous_window_surface_ref": expected_window,
+            "previous_window_generation": expected_generation,
+            "rebound_window_surface_ref": scene.window_ref.ref_id,
+            "rebound_window_generation": scene.window_ref.window_generation,
+            "rebound_target_surface_ref": (
+                target_now.ref_id if target_now is not None else ""
+            ),
+        }
+    else:
+        target_now, continuity = _stale_primitive_continuity(
+            scene, attempt, before, selection,
+        )
+        if target_now is None:
+            return {}
+    try:
+        from osia.execution_strategy import normalize_desktop_observable_effect
+
+        declared_effect = normalize_desktop_observable_effect(
+            attempt.observable_effect,
+        )
+        receipt_effect = normalize_desktop_observable_effect(
+            primitive.get("observable_effect"),
+        )
+    except Exception:
+        declared_effect = {}
+        receipt_effect = {}
+    after = _primitive_state_projection(
+        scene,
+        target_now,
+        witness_surface_refs=(declared_effect.get("surface_ref") or "",),
+    )
+    before_rows = {
+        str(item.get("identity") or ""): item
+        for item in before.get("state_rows") or []
+        if isinstance(item, dict) and item.get("identity")
+    }
+    after_rows = {
+        str(item.get("identity") or ""): item
+        for item in after.get("state_rows") or []
+        if isinstance(item, dict) and item.get("identity")
+    }
+    common = set(before_rows).intersection(after_rows)
+    changed_state = [
+        identity for identity in sorted(common)
+        if any(
+            before_rows[identity].get(field) != after_rows[identity].get(field)
+            for field in ("label", "selected")
+        )
+    ]
+    mechanism = str(primitive.get("mechanism") or "")
+    effect_identity = next((
+        str(item.get("identity") or "")
+        for item in before_rows.values()
+        if item.get("surface_ref") == declared_effect.get("surface_ref")
+    ), "")
+    before_effect = before_rows.get(effect_identity) if effect_identity else None
+    after_effect = after_rows.get(effect_identity) if effect_identity else None
+    exact_declared_effect = bool(
+        mechanism in {
+            "invoke", "selectionitem", "toggle", "expandcollapse",
+        }
+        and declared_effect
+        and receipt_effect == declared_effect
+        and isinstance(before_effect, dict)
+        and isinstance(after_effect, dict)
+        and _normalized_surface_text(before_effect.get("label"))
+        != _normalized_surface_text(after_effect.get("label"))
+        and not _surface_text_matches(
+            before_effect.get("label"), declared_effect.get("expected_text"),
+        )
+        and _surface_text_matches(
+            after_effect.get("label"), declared_effect.get("expected_text"),
+        )
+    )
+    target_state_changed = bool(
+        target_now is not None
+        and target_before.get("selected") != target_now.selected
+    )
+    selection_mechanism = mechanism in {
+        "selectionitem", "toggle", "expandcollapse",
+    }
+    focus_completed = bool(
+        primitive_kind == "desktop_window_focus"
+        and before.get("target_foreground") is False
+        and scene.foreground
+        and scene.window_ref.focused
+    )
+    exact_local_effect = bool(
+        focus_completed
+        or exact_declared_effect
+        or (
+            selection_mechanism
+            and not declared_effect
+            and target_state_changed
+        )
+    )
+    if not exact_local_effect:
+        return {}
+    return {
+        "schema_version": 1,
+        "evidence_kind": "exact_independent_desktop_state",
+        "evidence_source": "inspect_desktop_surfaces",
+        "dispatch_state": "effect_confirmed",
+        "outcome": "confirmed_success",
+        "reason_code": (
+            "exact_desktop_target_focus_observed"
+            if focus_completed else
+            "exact_desktop_observable_effect_change"
+            if exact_declared_effect else
+            "exact_desktop_primitive_state_change"
+        ),
+        "semantic_postcondition": (
+            "application_foreground"
+            if focus_completed else
+            declared_effect.get("kind")
+            if exact_declared_effect else
+            "desktop_uia_primitive_completed"
+        ),
+        "postcondition": (
+            attempt.attempted_effect
+            if focus_completed else
+            attempt.primitive_postcondition
+        ),
+        "composite_id": attempt.composite_id,
+        "substep_id": attempt.substep_id,
+        "substep_index": attempt.substep_index,
+        "strategy_attempt_id": attempt.attempt_id,
+        "semantic_node_id": attempt.node_id,
+        "mechanism_id": attempt.mechanism_id,
+        "attempted_effect": attempt.attempted_effect,
+        "primitive_postcondition": attempt.primitive_postcondition,
+        "observable_effect": dict(declared_effect),
+        "observed_application": scene.application_id,
+        "observed_window_surface_ref": scene.window_ref.ref_id,
+        "window_generation": scene.window_ref.window_generation,
+        "structural_epoch": scene.structural_epoch,
+        "observed_at": scene.observed_at,
+        "changed_state_count": len(changed_state),
+        "target_state_changed": bool(target_state_changed or focus_completed),
+        "target_foreground": bool(scene.foreground),
+        **continuity,
+    }
+
+
 def inspect_desktop_surfaces(target: str = "") -> dict:
-    scene = observe_foreground_scene(target=target)
-    if scene is None:
+    selection = _select_desktop_target(target)
+    scene = selection.target_scene
+    foreground_scene = selection.foreground_scene
+    if scene is None and selection.status == "desktop_surface_unavailable":
         return {
             "text": "ERROR: exact foreground desktop surface is unavailable.",
             "receipt": {"reason_code": "desktop_surface_unavailable"},
         }
+    if scene is None:
+        foreground_payload = (
+            foreground_scene.safe_dict(target="")
+            if foreground_scene is not None else {}
+        )
+        scene_payload = {
+            "application": "",
+            "requested_application": selection.requested_application,
+            "target_resolution": selection.status,
+            "target_foreground": False,
+            "target_identity_strength": selection.identity_strength,
+            "target_candidate_count": selection.candidate_count,
+            "accessibility_quality": selection.status,
+            "window_surface_ref": "",
+            "window_generation": "",
+            "structural_epoch": 0,
+            "foreground_application": foreground_payload.get("application", ""),
+            "foreground_window_surface_ref": foreground_payload.get(
+                "window_surface_ref", "",
+            ),
+            "foreground_accessibility_quality": foreground_payload.get(
+                "accessibility_quality", "",
+            ),
+            "top_level_surfaces": list(selection.top_level_surfaces),
+            "surfaces": [],
+        }
+        reason_code = (
+            "semantic_target_surface_ambiguous"
+            if selection.status == "target_ambiguous" else
+            "semantic_target_surface_not_found"
+        )
+        projection = {
+            "instruction": (
+                "The requested application has no unique exact desktop surface. "
+                "Do not use foreground accessibility or Vision as target evidence."
+            ),
+            "scene": scene_payload,
+        }
+        return {
+            "text": json.dumps(
+                projection,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "scene": scene_payload,
+            "receipt": {
+                "outcome": "observed",
+                "reason_code": reason_code,
+                "requested_application": selection.requested_application,
+                "target_resolution": selection.status,
+                "target_candidate_count": selection.candidate_count,
+                "target_foreground": False,
+                "foreground_application": scene_payload[
+                    "foreground_application"
+                ],
+            },
+        }
     payload = scene.safe_dict(target=target)
+    payload.update({
+        "requested_application": selection.requested_application,
+        "target_resolution": selection.status,
+        "target_identity_strength": selection.identity_strength,
+        "target_identity_evidence": selection.identity_evidence,
+        "target_candidate_count": selection.candidate_count,
+        "target_foreground": bool(scene.foreground),
+        "foreground_application": (
+            foreground_scene.application_id if foreground_scene is not None else ""
+        ),
+        "foreground_window_surface_ref": (
+            foreground_scene.window_ref.ref_id
+            if foreground_scene is not None else ""
+        ),
+        "foreground_accessibility_quality": (
+            foreground_scene.accessibility_quality(target).value
+            if foreground_scene is not None else ""
+        ),
+        "top_level_surfaces": list(selection.top_level_surfaces),
+    })
     model_projection = {
         "instruction": (
-            "Use opaque refs as authority. Re-observe stale refs. Prefer native "
-            "accessibility or keyboard for action; visual evidence is observation."
+            "Use the exact requested target scene, not an unrelated foreground. "
+            "An enabled control whose actuation.background_safe is true may be "
+            "invoked directly while its exact application remains in the "
+            "background. Activate window_surface_ref only before a chosen "
+            "capability whose preconditions require target_foreground; keyboard "
+            "also requires fresh focus proof. Re-observe stale refs. Prefer native "
+            "accessibility; visual evidence is observation."
         ),
         "scene": payload,
     }
+    exact_postcondition, semantic_postcondition = (
+        _exact_observed_postcondition(scene, target)
+    )
+    receipt = {
+        "outcome": "observed",
+        "reason_code": "semantic_desktop_surface_observed",
+        "window_surface_ref": scene.window_ref.ref_id,
+        "structural_epoch": scene.structural_epoch,
+        "observed_at": scene.observed_at,
+        "requested_application": selection.requested_application,
+        "target_resolution": selection.status,
+        "target_identity_evidence": selection.identity_evidence,
+        "target_foreground": bool(scene.foreground),
+        "foreground_application": payload["foreground_application"],
+    }
+    if exact_postcondition:
+        receipt.update({
+            "schema_version": 1,
+            "evidence_kind": "exact_independent_desktop_state",
+            "evidence_source": "inspect_desktop_surfaces",
+            "dispatch_state": "effect_confirmed",
+            "outcome": "confirmed_success",
+            "reason_code": "exact_final_state_observation",
+            "observed_target": str(target or "").strip(),
+            "observed_application": scene.application_id,
+            "observed_process_ref": scene.window_ref.process_ref,
+            "observed_window_surface_ref": scene.window_ref.ref_id,
+            "window_generation": scene.window_ref.window_generation,
+            "semantic_postcondition": semantic_postcondition,
+            "observed_state": semantic_postcondition,
+            "postcondition": exact_postcondition,
+        })
+    else:
+        absent_postcondition, neutral_state = _exact_absent_postcondition(
+            scene, target,
+        )
+        if absent_postcondition:
+            receipt.update({
+                "schema_version": 1,
+                "dispatch_state": "effect_absent",
+                "outcome": "confirmed_absence",
+                "reason_code": "exact_postcondition_absent_no_partial_effect",
+                "observed_target": str(target or "").strip(),
+                "postcondition": absent_postcondition,
+                "no_partial_effect": True,
+                "neutral_state": list(neutral_state),
+            })
+        else:
+            primitive_reconciliation = _exact_primitive_reconciliation(
+                scene,
+                selection=selection,
+            )
+            if primitive_reconciliation:
+                receipt.update(primitive_reconciliation)
     return {
         "text": json.dumps(
             model_projection,
@@ -748,12 +2258,7 @@ def inspect_desktop_surfaces(target: str = "") -> dict:
             separators=(",", ":"),
         ),
         "scene": payload,
-        "receipt": {
-            "outcome": "observed",
-            "reason_code": "semantic_desktop_surface_observed",
-            "window_surface_ref": scene.window_ref.ref_id,
-            "structural_epoch": scene.structural_epoch,
-        },
+        "receipt": receipt,
     }
 
 
@@ -1070,7 +2575,13 @@ def _pre_dispatch_failure(
     return result
 
 
-def activate_desktop_surface(surface_ref: str, objective: str) -> dict:
+def activate_desktop_surface(
+    surface_ref: str,
+    objective: str,
+    *,
+    observable_effect: dict | None = None,
+    action_pattern: str = "",
+) -> dict:
     """Re-resolve an opaque ref and invoke/select it through UIA, never coordinates."""
 
     if sys.platform != "win32":
@@ -1078,11 +2589,19 @@ def activate_desktop_surface(surface_ref: str, objective: str) -> dict:
             "ERROR: native semantic activation is unavailable on this platform.",
             "native_accessibility_unavailable",
         )
-    scene = observe_foreground_scene()
+    prior_resolution = DESKTOP_SURFACE_REGISTRY.resolve(surface_ref)
+    prior_surface = prior_resolution.surface
+    if prior_surface is None:
+        return _pre_dispatch_failure(
+            "ERROR: stale_reference; re-observe and re-resolve the semantic target.",
+            "stale_semantic_reference",
+        )
+    selection = _select_desktop_target(prior_surface.application_id)
+    scene = selection.target_scene
     if scene is None:
         return _pre_dispatch_failure(
-            "ERROR: exact foreground desktop surface is unavailable.",
-            "desktop_surface_unavailable",
+            "ERROR: exact requested desktop surface is unavailable or ambiguous.",
+            "semantic_target_surface_unavailable",
             failure_class="surface_unavailable",
         )
     runtime_ids = {
@@ -1093,12 +2612,16 @@ def activate_desktop_surface(surface_ref: str, objective: str) -> dict:
     current = next(
         (item for item in scene.surfaces if item.ref_id == str(surface_ref)), None,
     )
-    resolution = DESKTOP_SURFACE_REGISTRY.resolve(
-        surface_ref,
-        current_generation=scene.window_ref.window_generation,
-        current_epoch=scene.structural_epoch,
-        current_runtime_ids=runtime_ids,
-        current_bounds=current.bounds if current is not None else None,
+    resolution = (
+        prior_resolution
+        if prior_resolution.status == "stale" else
+        DESKTOP_SURFACE_REGISTRY.resolve(
+            surface_ref,
+            current_generation=scene.window_ref.window_generation,
+            current_epoch=scene.structural_epoch,
+            current_runtime_ids=runtime_ids,
+            current_bounds=current.bounds if current is not None else None,
+        )
     )
     reresolved_from = ""
     if not resolution.resolved or resolution.native is None:
@@ -1154,6 +2677,123 @@ def activate_desktop_surface(surface_ref: str, objective: str) -> dict:
         )
         failure["receipt"]["stale_reason"] = "objective_surface_mismatch"
         return failure
+    is_window_target = bool(
+        resolution.surface.ref_id == scene.window_ref.ref_id
+        and resolution.surface.surface_kind in {
+            SurfaceKind.WINDOW, SurfaceKind.DIALOG,
+        }
+    )
+    selected_pattern = next((
+        pattern_name
+        for pattern_name, _getter_name, _method_name
+        in _UIA_ACTION_PATTERN_METHODS
+        if pattern_name.casefold() == str(action_pattern or "").casefold()
+    ), "")
+    window_pattern = (
+        is_window_target
+        and str(action_pattern or "").casefold() == "window"
+    )
+    if action_pattern and not selected_pattern and not window_pattern:
+        return _pre_dispatch_failure(
+            "ERROR: requested UIA action pattern is not supported by OSIA.",
+            "uia_action_pattern_unsupported",
+            scene=scene,
+            target=str(objective or ""),
+        )
+    if is_window_target:
+        if scene.foreground:
+            return _pre_dispatch_failure(
+                "ERROR: exact target window is already foreground; re-observe it.",
+                "target_already_foreground",
+                scene=scene,
+                target=str(objective or ""),
+            )
+        from osia.tools import desktop_control as dc
+
+        dispatched_at = time.time()
+        try:
+            focus_status, _focus_detail = dc.focus_app_window((
+                resolution.native.native_window_id,
+                resolution.surface.accessible_label,
+                resolution.native.pid,
+            ))
+        except Exception:
+            focus_status = "outcome_unknown"
+        if focus_status != "ready":
+            return {
+                "text": "ERROR: exact target-window focus is unverified after dispatch.",
+                "receipt": {
+                    "schema_version": 1,
+                    "dispatch_state": "effect_unknown",
+                    "outcome": "outcome_unknown",
+                    "reason_code": "desktop_target_focus_outcome_unknown",
+                    "failure_class": "effect_reconciliation_required",
+                    "surface_ref": surface_ref,
+                    "primitive": {
+                        "kind": "desktop_window_focus",
+                        "mechanism": "exact_window_focus",
+                        "dispatched_at": dispatched_at,
+                        "before": _primitive_state_projection(
+                            scene, resolution.surface,
+                        ),
+                    },
+                },
+            }
+        return {
+            "text": (
+                "Exact desktop target-window activation dispatched; read-only "
+                "re-observation is required before actuation."
+            ),
+            "receipt": {
+                "schema_version": 1,
+                "dispatch_state": "dispatched",
+                "outcome": "success_unverified",
+                "reason_code": "desktop_target_focus_dispatched",
+                "surface_ref": surface_ref,
+                "mechanism": "exact_window_focus",
+                "structural_epoch": scene.structural_epoch,
+                "reresolved_from": reresolved_from,
+                "primitive": {
+                    "kind": "desktop_window_focus",
+                    "mechanism": "exact_window_focus",
+                    "dispatched_at": dispatched_at,
+                    "before": _primitive_state_projection(
+                        scene, resolution.surface,
+                    ),
+                },
+            },
+        }
+    actuation_contract = _surface_actuation_contract(
+        resolution.surface,
+        target_foreground=scene.foreground,
+        target_minimized=scene.minimized,
+    )
+    if scene.minimized:
+        failure = _pre_dispatch_failure(
+            (
+                "ERROR: exact target is minimized; restore its window_surface_ref "
+                "and re-observe before control actuation."
+            ),
+            "target_restored_required",
+            failure_class="surface_unavailable",
+            scene=scene,
+            target=str(objective or ""),
+        )
+        failure["receipt"]["target_window_surface_ref"] = scene.window_ref.ref_id
+        return failure
+    if not scene.foreground and not actuation_contract.get("background_safe"):
+        failure = _pre_dispatch_failure(
+            (
+                "ERROR: exact target is background; activate its window_surface_ref "
+                "and re-observe focus before UIA actuation."
+            ),
+            "target_focus_verification_required",
+            failure_class="surface_unavailable",
+            scene=scene,
+            target=str(objective or ""),
+        )
+        failure["receipt"]["target_window_surface_ref"] = scene.window_ref.ref_id
+        return failure
     if not resolution.native.runtime_id:
         return _pre_dispatch_failure(
             "ERROR: surface has no actionable accessibility runtime identity.",
@@ -1171,8 +2811,51 @@ def activate_desktop_surface(surface_ref: str, objective: str) -> dict:
             scene=scene,
             target=str(objective or ""),
         )
+    try:
+        from osia.execution_strategy import normalize_desktop_observable_effect
+
+        declared_effect = normalize_desktop_observable_effect(
+            observable_effect,
+        )
+    except Exception:
+        declared_effect = {}
+    primitive_before = _primitive_state_projection(
+        scene,
+        resolution.surface,
+        witness_surface_refs=(declared_effect.get("surface_ref") or "",),
+    )
     dispatch_started = False
+    dispatch_started_at = 0.0
+    attempted_mechanism = ""
     pre_dispatch_failure = None
+    actionability = {
+        "candidate_identity": {
+            "surface_ref": resolution.surface.ref_id,
+            "runtime_signature": resolution.surface.runtime_signature,
+            "role": resolution.surface.role,
+            "label": resolution.surface.accessible_label,
+            "window_surface_ref": scene.window_ref.ref_id,
+            "window_generation": scene.window_ref.window_generation,
+            "structural_epoch": scene.structural_epoch,
+        },
+        "automation_id": "",
+        "semantic_match": True,
+        "observed_patterns": [
+            item for item in resolution.surface.patterns
+            if item in _BACKGROUND_SAFE_UIA_PATTERNS
+        ],
+        "fresh_supported_patterns": [],
+        "selected_pattern": selected_pattern,
+        "selected_pattern_available": False,
+        "actionable_match": False,
+        "candidate_applicable": False,
+        "dispatch_preflight_result": "pending_fresh_reference_check",
+        "failed_before_effect_reason": "",
+        "stale_rebind_status": (
+            "reresolved" if reresolved_from else "fresh_exact_reference"
+        ),
+        "retirement_state": "active",
+    }
     try:
         with auto.UIAutomationInitializerInThread():
             root = auto.ControlFromHandle(int(resolution.native.native_window_id))
@@ -1186,33 +2869,97 @@ def activate_desktop_surface(surface_ref: str, objective: str) -> dict:
                     "stale_semantic_reference",
                     "accessibility_runtime_id_disappeared",
                 )
+                actionability.update({
+                    "dispatch_preflight_result": "failed_before_effect",
+                    "failed_before_effect_reason": "stale_semantic_reference",
+                    "stale_rebind_status": "fresh_runtime_reference_missing",
+                    "retirement_state": "eligible_for_exact_pair_retirement",
+                })
                 mechanism = ""
             else:
-                mechanism = ""
-                for pattern_name, method_name in (
-                    ("GetInvokePattern", "Invoke"),
-                    ("GetSelectionItemPattern", "Select"),
-                    ("GetTogglePattern", "Toggle"),
-                    ("GetExpandCollapsePattern", "Expand"),
-                ):
-                    try:
-                        getter = getattr(control, pattern_name, None)
-                        pattern = getter() if callable(getter) else None
-                        method = getattr(pattern, method_name, None) if pattern else None
-                    except Exception:
-                        continue
-                    if not callable(method):
-                        continue
-                    dispatch_started = True
-                    method()
-                    mechanism = pattern_name[3:-7].lower()
-                    break
-                if not mechanism:
+                try:
+                    actionability["automation_id"] = _safe_label(
+                        control.AutomationId,
+                    )
+                except Exception:
+                    pass
+                fresh_actions = _fresh_uia_action_methods(control)
+                actionability["fresh_supported_patterns"] = list(
+                    fresh_actions,
+                )
+                if not selected_pattern:
+                    selected_pattern = next((
+                        pattern_name
+                        for pattern_name, _getter_name, _method_name
+                        in _UIA_ACTION_PATTERN_METHODS
+                        if pattern_name in fresh_actions
+                        and pattern_name in resolution.surface.patterns
+                    ), "")
+                    actionability["selected_pattern"] = selected_pattern
+                method = (
+                    fresh_actions.get(selected_pattern)
+                    if selected_pattern in resolution.surface.patterns else
+                    None
+                )
+                actionability["selected_pattern_available"] = bool(method)
+                actionability["actionable_match"] = bool(method)
+                actionability["candidate_applicable"] = bool(method)
+                if not callable(method):
                     pre_dispatch_failure = (
                         "ERROR: accessibility control has no safe actionable pattern.",
                         "uia_action_pattern_unavailable",
                         "",
                     )
+                    actionability.update({
+                        "dispatch_preflight_result": "failed_before_effect",
+                        "failed_before_effect_reason": (
+                            "uia_action_pattern_unavailable"
+                        ),
+                        "retirement_state": (
+                            "eligible_for_exact_pair_retirement"
+                        ),
+                    })
+                    mechanism = ""
+                else:
+                    attempted_mechanism = selected_pattern.casefold()
+                    if selected_pattern == "Invoke" and declared_effect:
+                        effect_surface = next((
+                            item for item in scene.surfaces
+                            if item.ref_id == declared_effect["surface_ref"]
+                            and item.role in _PRIMITIVE_STATE_ROLES
+                        ), None)
+                        if (
+                            effect_surface is None
+                            or effect_surface.ref_id == resolution.surface.ref_id
+                            or _surface_text_matches(
+                                effect_surface.accessible_label,
+                                declared_effect["expected_text"],
+                            )
+                        ):
+                            pre_dispatch_failure = (
+                                "ERROR: declared observable effect is not a fresh exact surface transition.",
+                                "observable_effect_precondition_unverified",
+                                "",
+                            )
+                            actionability.update({
+                                "dispatch_preflight_result": "failed_before_effect",
+                                "failed_before_effect_reason": (
+                                    "observable_effect_precondition_unverified"
+                                ),
+                                "retirement_state": (
+                                    "eligible_for_exact_pair_retirement"
+                                ),
+                            })
+                            mechanism = ""
+                        else:
+                            mechanism = attempted_mechanism
+                    else:
+                        mechanism = attempted_mechanism
+                    if mechanism:
+                        actionability["dispatch_preflight_result"] = "eligible"
+                        dispatch_started_at = time.time()
+                        dispatch_started = True
+                        method()
     except Exception:
         if not dispatch_started:
             return _pre_dispatch_failure(
@@ -1229,6 +2976,21 @@ def activate_desktop_surface(surface_ref: str, objective: str) -> dict:
                 "outcome": "outcome_unknown",
                 "reason_code": "uia_activation_outcome_unknown",
                 "failure_class": "effect_reconciliation_required",
+                "surface_ref": surface_ref,
+                "structural_epoch": scene.structural_epoch,
+                "reresolved_from": reresolved_from,
+                "actionability": {
+                    **actionability,
+                    "dispatch_preflight_result": "effect_unknown",
+                    "retirement_state": "reconciliation_required",
+                },
+                "primitive": {
+                    "kind": "desktop_uia_primitive",
+                    "mechanism": attempted_mechanism,
+                    "observable_effect": dict(declared_effect),
+                    "dispatched_at": dispatch_started_at,
+                    "before": primitive_before,
+                },
             },
         }
     if pre_dispatch_failure is not None:
@@ -1241,16 +3003,35 @@ def activate_desktop_surface(surface_ref: str, objective: str) -> dict:
         )
         if stale_reason:
             failure["receipt"]["stale_reason"] = stale_reason
+        failure["receipt"]["actionability"] = actionability
         return failure
+    actionability["dispatch_preflight_result"] = "dispatched"
+    actionability["retirement_state"] = "active_pending_verification"
     return {
         "text": "Desktop surface activated through native accessibility.",
         "receipt": {
+            "schema_version": 1,
+            "dispatch_state": "dispatched",
             "outcome": "success_unverified",
             "reason_code": "native_accessibility_dispatched",
             "surface_ref": surface_ref,
             "mechanism": mechanism,
+            "actionability": actionability,
+            "actuation_preconditions": list(
+                actuation_contract.get("preconditions") or []
+            ),
+            "background_safe": bool(
+                actuation_contract.get("background_safe")
+            ),
             "structural_epoch": scene.structural_epoch,
             "reresolved_from": reresolved_from,
+            "primitive": {
+                "kind": "desktop_uia_primitive",
+                "mechanism": mechanism,
+                "observable_effect": dict(declared_effect),
+                "dispatched_at": dispatch_started_at,
+                "before": primitive_before,
+            },
         },
     }
 
@@ -1263,9 +3044,11 @@ __all__ = [
     "effective_model_supports_vision",
     "effective_model_image_route",
     "end_desktop_turn",
+    "focus_existing_application_window",
     "inspect_desktop_surfaces",
     "observe_foreground_scene",
     "rank_surface_candidates",
     "request_visual_observation",
     "reset_effective_model",
+    "scene_matches_application",
 ]

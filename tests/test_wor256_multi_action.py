@@ -173,6 +173,13 @@ def test_three_sequential_permissions_share_turn_and_execute_each_node_once(
             assert event.outcome == "success_verified"
             node = strategy.node_by_id(event.semantic_node_id)
             assert node is not None
+            assert node.observable_success_postcondition not in (
+                strategy.proven_postconditions
+            )
+            assert strategy.verify_postcondition(
+                f"exact {app} window observation",
+                postcondition=node.observable_success_postcondition,
+            )
             controller.record_typed_evidence(
                 outcome=event.outcome,
                 evidence={"app": app},
@@ -361,10 +368,20 @@ def test_native_batch_rejects_completed_node_replay_before_permission(
     client._complete_native_item(
         attempt, {**verification, "status": "completed", "exitCode": 0},
     )
+    calculator_node = strategy.mission.action_nodes[0]
+    assert strategy.verify_postcondition(
+        "exact Calculator window observation",
+        postcondition=calculator_node.observable_success_postcondition,
+    )
     request("Calculator", "native-calculator-replay", 2)
     paint = request("Paint", "native-paint", 3)
     client._complete_native_item(
         attempt, {**paint, "status": "completed", "exitCode": 0},
+    )
+    paint_node = strategy.mission.action_nodes[1]
+    assert strategy.verify_postcondition(
+        "exact Paint window observation",
+        postcondition=paint_node.observable_success_postcondition,
     )
 
     assert sent == [
@@ -463,6 +480,13 @@ def test_mixed_permissionless_and_permissioned_actions_complete_in_order():
                     reason_code="",
                     result={"step": index, "verified": True},
                 )
+                if tool_name == "run_command":
+                    node = strategy.node_by_id(decision.node_id)
+                    assert node is not None
+                    assert strategy.verify_postcondition(
+                        f"exact window observation for step {index}",
+                        postcondition=node.observable_success_postcondition,
+                    )
     finally:
         loop.call_soon_threadsafe(loop.stop)
         loop_thread.join(timeout=2)

@@ -1019,9 +1019,37 @@ def tool_open_application(name: str) -> str:
     # the foreground instead of starting a second instance (WOR-50 follow-up #2).
     try:
         from osia.tools import desktop_control as _dc
-        _existing = _dc.find_app_window(name)
     except Exception:
-        _dc, _existing = None, None
+        _dc = None
+    if sys.platform == "win32" and _dc is not None:
+        try:
+            from osia.desktop_scene import focus_existing_application_window
+
+            _semantic_status, _semantic_detail = (
+                focus_existing_application_window(name)
+            )
+        except Exception:
+            _semantic_status, _semantic_detail = "unavailable", ""
+        if _semantic_status == "ready":
+            return (
+                f"'{name}' is already open — brought its exact semantic window "
+                f"'{_semantic_detail}' to the foreground and focused it (ready; "
+                "did not launch a second instance)."
+            )
+        if _semantic_status == "target_ambiguous":
+            return (
+                f"ERROR: multiple exact '{name}' windows remain equally valid; "
+                "did not launch another instance."
+            )
+        if _semantic_status in {"outcome_unknown", "stale"}:
+            return (
+                f"ERROR: exact existing '{name}' window activation is unverified; "
+                "did not launch another instance."
+            )
+    try:
+        _existing = _dc.find_app_window(name) if _dc is not None else None
+    except Exception:
+        _existing = None
     if _existing is not None:
         try:
             _st, _detail = _dc.focus_app_window(_existing)
@@ -1624,7 +1652,12 @@ def tool_request_visual_observation(
     )
 
 
-def tool_activate_desktop_surface(surface_ref: str, objective: str) -> dict:
+def tool_activate_desktop_surface(
+    surface_ref: str,
+    objective: str,
+    observable_effect: dict | None = None,
+    action_pattern: str = "",
+) -> dict:
     """Activate a fresh opaque surface through native accessibility patterns."""
 
     from osia.desktop_scene import activate_desktop_surface
@@ -1632,6 +1665,8 @@ def tool_activate_desktop_surface(surface_ref: str, objective: str) -> dict:
     return activate_desktop_surface(
         str(surface_ref or ""),
         str(objective or ""),
+        observable_effect=observable_effect,
+        action_pattern=str(action_pattern or ""),
     )
 
 
@@ -3558,11 +3593,37 @@ def tool_desktop_scroll(direction: str = "down", amount=3) -> str:
 # errors, so they never use the ``ERROR:`` prefix (a "no" is a successful check).
 # ---------------------------------------------------------------------------
 
-def tool_is_running(app: str) -> str:
+def tool_is_running(app: str) -> object:
     """Is the app's process currently running? Deterministic (psutil), no vision."""
     from osia.tools import verify
     yes = verify.app_running(app)
-    return f"running: {'yes' if yes else 'no'} — process for '{app}'"
+    text = f"running: {'yes' if yes else 'no'} — process for '{app}'"
+    if not yes:
+        return text
+    try:
+        from osia.desktop_scene import inspect_desktop_surfaces
+
+        observation = inspect_desktop_surfaces(str(app or ""))
+        receipt = (
+            observation.get("receipt")
+            if isinstance(observation, dict) else None
+        )
+        if (
+            isinstance(receipt, dict)
+            and receipt.get("evidence_kind")
+            == "exact_independent_desktop_state"
+            and receipt.get("evidence_source")
+            == "inspect_desktop_surfaces"
+            and receipt.get("semantic_postcondition") == "application_open"
+            and receipt.get("outcome") == "confirmed_success"
+            and receipt.get("reason_code") == "exact_final_state_observation"
+        ):
+            typed = dict(observation)
+            typed["text"] = text + " — exact target DesktopScene observed"
+            return typed
+    except Exception:
+        pass
+    return text
 
 
 def tool_is_installed(app: str) -> str:
@@ -4417,6 +4478,53 @@ def _same_unfinished_call(call: dict, state: dict) -> bool:
     return bool(isinstance(expected, dict) and call == expected)
 
 
+def _strategy_decision_for_unfinished_resume(state: dict):
+    """Rebind an exact unfinished call to its original semantic attempt."""
+
+    strategy = _execution_strategy.current_execution_strategy()
+    binding = state.get("strategy_binding") if isinstance(state, dict) else None
+    if strategy is None or not isinstance(binding, dict):
+        return None
+    attempt_id = str(binding.get("attempt_id") or "")
+    attempt = strategy.attempt_by_id(attempt_id)
+    if attempt is None:
+        return None
+    expected = (
+        attempt_id,
+        str(binding.get("mechanism_id") or ""),
+        str(binding.get("node_id") or ""),
+        str(binding.get("attempted_effect") or ""),
+    )
+    observed = (
+        str(attempt.attempt_id or ""),
+        str(attempt.mechanism_id or ""),
+        str(attempt.node_id or ""),
+        str(attempt.attempted_effect or ""),
+    )
+    call = state.get("call")
+    arguments = dict(call) if isinstance(call, dict) else {}
+    tool_name = str(arguments.pop("tool", "") or "")
+    expected_signature = strategy.action_signature(
+        attempt.mechanism_id,
+        {"tool": tool_name, "arguments": arguments},
+    )
+    if (
+        not attempt_id
+        or not tool_name
+        or expected != observed
+        or attempt.action_signature != expected_signature
+    ):
+        return None
+    return _execution_strategy.StrategyDecision(
+        True,
+        "exact_unfinished_strategy_resumed",
+        attempt_id=attempt.attempt_id,
+        mechanism_id=attempt.mechanism_id,
+        node_id=attempt.node_id,
+        attempted_effect=attempt.attempted_effect,
+    )
+
+
 def _apply_unfinished_execution_decision(agent, tool_calls):
     """Apply one model-selected semantic decision without parsing user phrases."""
 
@@ -4808,6 +4916,20 @@ def _late_completion_record(tool_name: str, kwargs: dict, future, contract, lang
     )
 
 
+def _record_owner_settled_progress(store, attempt_id: str) -> None:
+    """Start bounded reconciliation inactivity from the settled owner receipt."""
+
+    try:
+        store.record_progress(
+            attempt_id,
+            phase="owner_settled_unverified",
+            useful=True,
+            evidence_token="owner_settled_unverified",
+        )
+    except Exception:
+        pass
+
+
 def _persist_tool_attempt_terminal(
     store, attempt_id: str, record, *, reason_code: str = "tool_receipt",
 ):
@@ -4824,6 +4946,7 @@ def _persist_tool_attempt_terminal(
         current = store.get_attempt(attempt_id) or {}
         if current.get("status") in {status.value for status in TERMINAL_STATUSES}:
             return current, False
+        _record_owner_settled_progress(store, attempt_id)
         deadline = float(
             current.get("hard_deadline_at")
             or current.get("deadline_at")
@@ -5489,6 +5612,8 @@ def _execute_tool_with_policy(
             ) or requires_reconciliation:
                 now = time.time()
                 current = attempt_store.get_attempt(attempt_id) or {}
+                if not record.worker_may_be_active:
+                    _record_owner_settled_progress(attempt_store, attempt_id)
                 durable_deadline = float(
                     current.get("hard_deadline_at")
                     or current.get("deadline_at")
@@ -7327,10 +7452,52 @@ class OSIAAgent:
                 strategy.postcondition_for_tool(tool_name, kwargs)
                 if strategy is not None else ""
             )
+            primitive_postcondition = (
+                strategy.primitive_postcondition_for_attempt(
+                    str(getattr(strategy_decision, "attempt_id", "") or "")
+                )
+                if strategy is not None else ""
+            )
+            attempted_effect = (
+                strategy.attempted_effect_for_attempt(
+                    str(getattr(strategy_decision, "attempt_id", "") or "")
+                )
+                if strategy is not None else ""
+            )
+            if attempted_effect:
+                postcondition = attempted_effect
+            elif primitive_postcondition:
+                postcondition = primitive_postcondition
+            terminality_record = execution_record
+            strategy_attempt_id = str(
+                getattr(strategy_decision, "attempt_id", "") or ""
+            )
+            if (
+                not str(getattr(execution_record, "tool_attempt_id", "") or "")
+                and strategy_attempt_id
+                and bool(getattr(strategy_decision, "allowed", False))
+                and bool(getattr(execution_record, "dispatched", False))
+                and bool(
+                    getattr(
+                        getattr(execution_record, "contract", None),
+                        "commits_fallback_barrier",
+                        False,
+                    )
+                )
+            ):
+                # The strategy decision is the canonical identity already bound
+                # before dispatch. Preserve it in the terminality-only receipt
+                # when this execution surface has no common ToolAttemptStore ID.
+                from dataclasses import replace as replace_dataclass
+
+                terminality_record = replace_dataclass(
+                    execution_record,
+                    tool_attempt_id=strategy_attempt_id,
+                )
             try:
                 terminality.record_execution_record(
                     tool_name,
-                    execution_record,
+                    terminality_record,
                     postcondition=postcondition,
                 )
             except Exception as exc:
@@ -7403,6 +7570,18 @@ class OSIAAgent:
             ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT,
             ExecutionOutcome.OUTCOME_UNKNOWN,
         }:
+            strategy_binding = None
+            if (
+                strategy_decision is not None
+                and bool(getattr(strategy_decision, "allowed", False))
+                and str(getattr(strategy_decision, "attempt_id", "") or "")
+            ):
+                strategy_binding = {
+                    "attempt_id": str(strategy_decision.attempt_id),
+                    "mechanism_id": str(strategy_decision.mechanism_id),
+                    "node_id": str(strategy_decision.node_id),
+                    "attempted_effect": str(strategy_decision.attempted_effect),
+                }
             self._unfinished_execution = {
                 "call": call,
                 "outcome": (
@@ -7417,6 +7596,8 @@ class OSIAAgent:
                     getattr(execution_record, "tool_attempt_id", "") or ""
                 )[:160],
             }
+            if strategy_binding is not None:
+                self._unfinished_execution["strategy_binding"] = strategy_binding
             return
         if matches_current and outcome in {
             ExecutionOutcome.SUCCESS_VERIFIED,
@@ -7489,14 +7670,283 @@ class OSIAAgent:
     def _mark_existing_attempt_attached(self, attempt_id: str) -> None:
         self._pending_tool_attached_existing = bool(attempt_id)
 
+    def _verify_local_reconciliation_probe(
+        self,
+        attempt_id: str,
+        runtime: dict,
+        durable: dict,
+        store,
+    ):
+        """Gather canonical read-only evidence for one exact uncertain effect."""
+
+        if runtime.get("local_reconciliation_probe_attempted") is True:
+            return None
+        strategy = runtime.get("reconciliation_strategy")
+        if not isinstance(strategy, _execution_strategy.ExecutionStrategy):
+            strategy = getattr(self, "_terminality_strategy", None)
+        if not isinstance(strategy, _execution_strategy.ExecutionStrategy):
+            try:
+                strategy = _execution_strategy.ExecutionStrategy.from_snapshot(
+                    runtime.get("strategy_snapshot"),
+                )
+            except (AttributeError, KeyError, TypeError, ValueError):
+                return None
+        runtime["reconciliation_strategy"] = strategy
+        probe = _execution_strategy.select_local_reconciliation_probe(
+            strategy,
+            TOOL_MAP,
+            user_request=strategy.mission.objective,
+        )
+        if not isinstance(probe, dict):
+            return None
+        tool_name = str(probe.get("tool") or "")
+        arguments = dict(probe.get("arguments") or {})
+        try:
+            from osia.action_policy import guard_tool_call
+            from osia.tool_contracts import (
+                ExecutionOutcome,
+                SideEffectClass,
+                ToolExecutionRecord,
+            )
+
+            _spec, effective = _tool_spec_and_contract(
+                tool_name,
+                arguments,
+                strategy.mission.objective,
+            )
+            if (
+                _spec.side_effect is not SideEffectClass.READ_ONLY
+                or effective.side_effect is not SideEffectClass.READ_ONLY
+            ):
+                return None
+            policy_error = guard_tool_call(
+                strategy.mission.objective,
+                tool_name,
+                arguments,
+            )
+            if policy_error:
+                return None
+            preflight = _execution_strategy.tool_preflight(
+                tool_name,
+                arguments,
+                strategy=strategy,
+            )
+            if preflight is not None and not preflight.allowed:
+                return None
+        except Exception:
+            return None
+
+        # Claim the one bounded probe before dispatch.  An ambiguous or failed
+        # observation is exhausted evidence and must not be repeated by each
+        # progressive durable check.
+        runtime["local_reconciliation_probe_attempted"] = True
+        try:
+            store.record_safe_alternative(
+                attempt_id,
+                "local_desktop_application_observation",
+            )
+        except Exception:
+            pass
+        try:
+            store.record_progress(
+                attempt_id,
+                phase="local_reconciliation_probe_dispatched",
+            )
+        except Exception:
+            pass
+
+        controller = self._terminality_controller
+        reconciliation_event_count = len(
+            strategy.snapshot().get("reconciliation_events") or []
+        )
+        postcondition = str(probe.get("postcondition") or "")
+        if controller is not None:
+            controller.record_typed_evidence(
+                outcome="outcome_unknown",
+                evidence={
+                    "event": "deterministic_local_reconciliation_required",
+                    "tool": tool_name,
+                },
+                postcondition=postcondition,
+                attempt_id=attempt_id,
+                reason_code="local_reconciliation_probe_pending",
+            )
+            controller.set_strategy_snapshot(strategy.snapshot())
+
+        remaining = min(
+            float(durable.get("hard_deadline_at") or float("inf")),
+            float(durable.get("inactivity_deadline_at") or float("inf")),
+        ) - time.time()
+        hard_deadline = time.monotonic() + max(0.05, remaining)
+        from osia import desktop_scene as _desktop_scene
+
+        route_token = _desktop_scene.bind_effective_model(
+            self.provider,
+            self.model,
+        )
+        try:
+            with _execution_strategy.execution_strategy_scope(
+                strategy.mission.objective,
+                strategy=strategy,
+            ):
+                probe_record = _execute_tool_with_policy(
+                    tool_name,
+                    arguments,
+                    hard_deadline=hard_deadline,
+                    allow_retry=False,
+                    user_request=strategy.mission.objective,
+                    lang=self.lang,
+                )
+        finally:
+            _desktop_scene.reset_effective_model(route_token)
+
+        if probe_record.contract.side_effect is not SideEffectClass.READ_ONLY:
+            return None
+        if not probe_record.is_error:
+            from dataclasses import replace as replace_dataclass
+
+            probe_record = replace_dataclass(
+                probe_record,
+                reason_code="local_reconciliation_probe",
+            )
+        _execution_strategy.record_tool_observation(
+            tool_name,
+            probe_record.result,
+            is_error=probe_record.is_error,
+            strategy=strategy,
+        )
+        if controller is not None:
+            controller.record_execution_record(
+                tool_name,
+                probe_record,
+            )
+            controller.set_strategy_snapshot(strategy.snapshot())
+
+        resolution = {}
+        if controller is not None:
+            resolution = next(
+                (
+                    item for item in reversed(
+                        controller.snapshot().get(
+                            "unknown_effect_resolutions",
+                        ) or []
+                    )
+                    if str(item.get("durable_attempt_id") or "") == attempt_id
+                    and str(item.get("strategy_attempt_id") or "")
+                    == str(probe.get("strategy_attempt_id") or "")
+                ),
+                {},
+            )
+        else:
+            from osia.turn_terminality import TurnTerminalityController
+
+            event = next(
+                (
+                    item for item in reversed(
+                        (
+                            strategy.snapshot().get("reconciliation_events")
+                            or []
+                        )[reconciliation_event_count:]
+                    )
+                    if str(item.get("attempt_id") or "")
+                    == str(probe.get("strategy_attempt_id") or "")
+                    and str(item.get("node_id") or "")
+                    == str(probe.get("semantic_node_id") or "")
+                    and str(item.get("mechanism_id") or "")
+                    == str(probe.get("mechanism_id") or "")
+                    and str(item.get("postcondition") or "") == postcondition
+                    and str(item.get("target_application") or "")
+                    == str(probe.get("target_application") or "")
+                    and str(item.get("target_surface") or "")
+                    == str(probe.get("target_surface") or "")
+                    and str(item.get("observed_surface") or "")
+                    and TurnTerminalityController._desktop_resolution_kind(item)
+                    in {
+                        "completed", "not_applied",
+                        "primitive_completed", "primitive_not_applied",
+                    }
+                ),
+                {},
+            )
+            if event:
+                desktop_resolution = (
+                    TurnTerminalityController._desktop_resolution_kind(event)
+                )
+                resolution = {
+                    **event,
+                    "durable_attempt_id": attempt_id,
+                    "strategy_attempt_id": str(
+                        probe.get("strategy_attempt_id") or ""
+                    ),
+                    "semantic_node_id": str(
+                        probe.get("semantic_node_id") or ""
+                    ),
+                    "mechanism_id": str(probe.get("mechanism_id") or ""),
+                    "resolution": desktop_resolution,
+                }
+        resolution_kind = str(resolution.get("resolution") or "")
+        completed = resolution_kind in {"completed", "primitive_completed"}
+        resolved = completed or resolution_kind in {
+            "not_applied", "primitive_not_applied",
+        }
+        try:
+            store.record_progress(
+                attempt_id,
+                phase=(
+                    "local_reconciliation_probe_resolved"
+                    if resolved else
+                    "local_reconciliation_probe_ambiguous"
+                ),
+                useful=resolved,
+                evidence_token=(
+                    json.dumps(
+                        resolution,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    if resolved else ""
+                ),
+            )
+        except Exception:
+            pass
+        if not resolved:
+            return None
+        runtime["reconciliation_resolution"] = dict(resolution)
+
+        original = runtime["record"]
+        reconciled = ToolExecutionRecord(
+            probe_record.result,
+            not completed,
+            (
+                ExecutionOutcome.SUCCESS_VERIFIED
+                if completed else
+                ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
+            ),
+            original.attempts,
+            True,
+            False,
+            original.contract,
+            attempt_id,
+            False,
+            (
+                "local_reconciliation_completed"
+                if completed else
+                "local_reconciliation_not_applied"
+            ),
+        )
+        _persist_tool_attempt_terminal(
+            store,
+            attempt_id,
+            reconciled,
+            reason_code=reconciled.reason_code,
+        )
+        return reconciled
+
     def _verify_suspended_tool(self, attempt_id: str):
-        """Run only a read-only browser postcondition; never replay the action."""
+        """Run one canonical read-only verifier; never replay the action."""
 
         runtime = self._pending_tool_runtime
         if not isinstance(runtime, dict) or runtime.get("attempt_id") != attempt_id:
-            return None
-        wait_spec = runtime.get("wait_spec")
-        if not isinstance(wait_spec, dict):
             return None
         try:
             from osia.tools import browser_controller as browser_tools
@@ -7511,6 +7961,17 @@ class OSIAAgent:
             if durable.get("dispatch_state") in {
                 "dispatch_started", "worker_may_be_active",
             }:
+                return None
+            local = self._verify_local_reconciliation_probe(
+                attempt_id,
+                runtime,
+                durable,
+                store,
+            )
+            if local is not None:
+                return local
+            wait_spec = runtime.get("wait_spec")
+            if not isinstance(wait_spec, dict):
                 return None
             store.record_safe_alternative(
                 attempt_id, "fresh_browser_postcondition",
@@ -7572,6 +8033,87 @@ class OSIAAgent:
             return record
         except Exception:
             return None
+
+    def _restore_suspended_tool_runtime(self, attempt: dict, strategy) -> bool:
+        """Reattach one durable verifier after restart without redispatch."""
+
+        from osia.tool_attempts import (
+            RECOVERABLE_STATUSES,
+            ToolAttemptStatus,
+            get_tool_attempt_coordinator,
+            get_tool_attempt_store,
+        )
+        from osia.tool_contracts import ExecutionOutcome, ToolExecutionRecord
+
+        attempt_id = str((attempt or {}).get("tool_attempt_id") or "")
+        metadata = self._tool_attempt_metadata or {}
+        if (
+            not attempt_id
+            or str(metadata.get("owner_scope") or "") != "autonomous"
+            or not isinstance(strategy, _execution_strategy.ExecutionStrategy)
+        ):
+            return False
+        try:
+            durable = get_tool_attempt_store().get_attempt(attempt_id) or {}
+            status = ToolAttemptStatus(durable.get("status"))
+            tool_name = str(durable.get("tool_name") or "")
+            if status not in RECOVERABLE_STATUSES or tool_name not in TOOL_MAP:
+                return False
+            _spec, contract = _tool_spec_and_contract(
+                tool_name, {}, strategy.mission.objective,
+            )
+        except Exception:
+            return False
+        dispatched = str(durable.get("dispatch_state") or "") not in {
+            "not_dispatched", "cancelled_before_effect",
+        }
+        record = ToolExecutionRecord(
+            "", True, ExecutionOutcome.PENDING,
+            max(0, int(durable.get("dispatch_attempt_count") or 0)),
+            dispatched, False, contract, attempt_id,
+            str(durable.get("dispatch_state") or "") in {
+                "dispatch_started", "worker_may_be_active",
+            },
+            str(durable.get("reason_code") or ""),
+        )
+        attempted_alternatives = {
+            str(item) for item in durable.get("attempted_safe_alternatives") or []
+        }
+        self.last_pending_tool_attempt_id = attempt_id
+        self._pending_tool_attached_existing = False
+        self._pending_tool_runtime = {
+            "attempt_id": attempt_id,
+            "tool_name": tool_name,
+            "wait_spec": None,
+            "worker_may_be_active": record.worker_may_be_active,
+            "record": record,
+            "attached_existing": False,
+            "strategy_snapshot": strategy.snapshot(),
+            "reconciliation_strategy": strategy,
+            "local_reconciliation_probe_attempted": (
+                "local_desktop_application_observation" in attempted_alternatives
+            ),
+            "restored_after_restart": True,
+        }
+        final_callback = metadata.get("final_callback")
+        status_callback = metadata.get("status_callback")
+
+        def _finalize(callback_attempt_id, final_text, error):
+            if callable(final_callback):
+                return final_callback(callback_attempt_id, final_text, error)
+            return False
+
+        coordinator = get_tool_attempt_coordinator()
+        coordinator.register_suspended(
+            attempt_id,
+            # Autonomous advances only through its durable checkpoint callback.
+            # The original provider action and provider turn are never replayed.
+            resume=lambda _attempt_id, _payload: "",
+            finalize=_finalize,
+            status=status_callback if callable(status_callback) else None,
+            verify=self._verify_suspended_tool,
+        )
+        return coordinator.activate(attempt_id)
 
     def _resume_suspended_tool(self, attempt_id: str, payload) -> str:
         from osia.tool_attempts import get_tool_attempt_store
@@ -7702,6 +8244,7 @@ class OSIAAgent:
         if not attempt_id:
             return ""
         metadata = self._tool_attempt_metadata or {}
+        strategy = _execution_strategy.current_execution_strategy()
         self.last_pending_tool_attempt_id = attempt_id
         self._pending_tool_runtime = {
             "attempt_id": attempt_id,
@@ -7713,6 +8256,9 @@ class OSIAAgent:
             "worker_may_be_active": bool(record.worker_may_be_active),
             "record": record,
             "attached_existing": self._pending_tool_attached_existing,
+            "strategy_snapshot": (
+                strategy.snapshot() if strategy is not None else None
+            ),
         }
         final_callback = metadata.get("final_callback")
         status_callback = metadata.get("status_callback")
@@ -7734,9 +8280,34 @@ class OSIAAgent:
             ):
                 return ""
         else:
+            resume = self._resume_suspended_tool
+            if str(metadata.get("owner_scope") or "") == "autonomous":
+                # Autonomous owns continuation through its durable task
+                # checkpoint.  Its final callback projects the reconciled
+                # strategy before the orchestrator starts another provider
+                # turn; resuming the provider here would bypass that boundary.
+                def _resume_after_checkpoint(callback_attempt_id, payload):
+                    runtime = self._pending_tool_runtime
+                    resolution = (
+                        runtime.get("reconciliation_resolution")
+                        if isinstance(runtime, dict)
+                        and runtime.get("attempt_id") == callback_attempt_id
+                        else None
+                    )
+                    if (
+                        isinstance(resolution, dict)
+                        and resolution.get("durable_attempt_id")
+                        == callback_attempt_id
+                    ):
+                        return ""
+                    return self._resume_suspended_tool(
+                        callback_attempt_id, payload,
+                    )
+
+                resume = _resume_after_checkpoint
             coordinator.register_suspended(
                 attempt_id,
-                resume=self._resume_suspended_tool,
+                resume=resume,
                 finalize=_finalize,
                 status=status_callback if callable(status_callback) else None,
                 verify=self._verify_suspended_tool,
@@ -9660,6 +10231,56 @@ class OSIAAgent:
             client_locale=client_locale,
         )
 
+    def run_planning(
+        self,
+        user_input: str,
+        *,
+        output_schema: dict,
+        turn_context: TurnContext | None = None,
+    ) -> str:
+        """Run one planning-only completion without entering the action loop.
+
+        The ChatGPT Account adapter maps ``output_schema`` to the app-server's
+        authoritative ``outputSchema`` turn field and starts the planning thread
+        without OSIA dynamic tools. Other providers retain the legacy planner
+        behavior until they expose an equivalent supported structured boundary.
+        """
+
+        if self.provider != "chatgpt_account":
+            return self.run(
+                user_input,
+                turn_context=turn_context,
+                canonical_output=False,
+            )
+        if turn_context is not None:
+            self.set_turn_context(turn_context)
+
+        from osia.utils.key_chain import task_scope
+
+        self.messages.append({"role": "user", "content": user_input})
+        create_kwargs = {
+            "model": self.model,
+            "messages": self._wire_messages(),
+            "output_schema": output_schema,
+            "planning_only": True,
+        }
+        with task_scope():
+            response = self.client.chat.completions.create(**create_kwargs)
+        provider_events = ()
+        consume_events = getattr(self.client, "consume_capability_events", None)
+        if callable(consume_events):
+            provider_events = tuple(consume_events() or ())
+        if provider_events:
+            raise RuntimeError(
+                "planning-only provider turn emitted a capability event"
+            )
+        message = response.choices[0].message
+        content = message.content
+        if not isinstance(content, str):
+            return ""
+        self.messages.append({"role": "assistant", "content": content})
+        return content
+
     def run(self, user_input: str, max_tool_rounds: int | None = None, on_sentence=None,
             history: list | None = None, max_tokens: int | None = None,
             on_first_token=None, current_conversation_id: str | None = None,
@@ -9731,6 +10352,10 @@ class OSIAAgent:
             from osia.tools.browser_controller import browser_turn_scope
             from osia import desktop_scene as _desktop_scene
 
+            inherited_strategy = (
+                _execution_strategy.current_execution_strategy()
+                or self._terminality_strategy
+            )
             desktop_tokens = _desktop_scene.begin_desktop_turn()
             try:
                 with task_scope(), browser_turn_scope(browser_override):
@@ -9742,7 +10367,7 @@ class OSIAAgent:
                                 name, self._slash_turn_directives,
                             )
                         ),
-                        strategy=self._terminality_strategy,
+                        strategy=inherited_strategy,
                     ) as active_strategy:
                         try:
                             return self._run_turn(
@@ -10965,8 +11590,31 @@ class OSIAAgent:
                             self._unfinished_execution,
                         )
                     ):
-                        strategy_decision = None
+                        strategy_decision = (
+                            _strategy_decision_for_unfinished_resume(
+                                self._unfinished_execution,
+                            )
+                        )
+                        if (
+                            strategy_decision is None
+                            and _execution_strategy.current_execution_strategy()
+                            is not None
+                            and effective.side_effect != SideEffectClass.READ_ONLY
+                        ):
+                            strategy_decision = _execution_strategy.StrategyDecision(
+                                False,
+                                "unfinished_strategy_binding_required",
+                            )
                     else:
+                        if (
+                            (self._resume_unknown_effect or turn_has_unknown_outcome)
+                            and effective.commits_fallback_barrier
+                        ):
+                            return self._finish_execution_barrier_stop(
+                                outcome_unknown=True,
+                                tool_name=tool_name,
+                                on_sentence=on_sentence,
+                            )
                         strategy_decision = _execution_strategy.tool_preflight(
                             tool_name, kwargs,
                         )
@@ -10981,16 +11629,6 @@ class OSIAAgent:
                             f"{strategy_decision.reason_code}). Preserve the exact "
                             "goal and use the earliest safe semantically equivalent "
                             "alternative reported in execution_strategy."
-                        )
-
-                    if (
-                        self._resume_unknown_effect
-                        and effective.commits_fallback_barrier
-                    ):
-                        return self._finish_execution_barrier_stop(
-                            outcome_unknown=True,
-                            tool_name=tool_name,
-                            on_sentence=on_sentence,
                         )
 
                     if tool_name == _chat_routing.ROUTING_TOOL_NAME:
@@ -11553,6 +12191,12 @@ class OSIAAgent:
                         turn_has_unknown_outcome = True
                         if execution_record.timed_out:
                             turn_has_tool_timeout = True
+                    elif (
+                        tool_name == "activate_desktop_surface"
+                        and _requires_postcondition_reconciliation(execution_record)
+                    ):
+                        tool_execution_barrier_committed = True
+                        turn_has_unknown_outcome = True
                     text_part = _model_result_text(result, tool_name)
                     document_reference = _document_reference_from_result(
                         tool_name, result,
@@ -11680,7 +12324,11 @@ class OSIAAgent:
                         break
                     if guard.useful_progress_count > progress_before:
                         unresolved_tool_timeout = False
-                    if is_error:
+                    if (
+                        is_error
+                        and execution_record.outcome
+                        != ExecutionOutcome.OUTCOME_UNKNOWN
+                    ):
                         remaining = tool_calls[i + 1:]
                         if remaining:
                             names = [t.get("tool", "?") for t in remaining]

@@ -211,7 +211,7 @@ def test_unverified_postcondition_mutation_suspends_before_provider_continuation
     monkeypatch.setattr(
         "osia.action_policy.is_final_external_tool_call", lambda *_a, **_k: False,
     )
-    from osia.tools import browser as browser_tools
+    from osia.tools import browser_controller as browser_tools
 
     monkeypatch.setattr(
         browser_tools,

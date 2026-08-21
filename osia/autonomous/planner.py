@@ -4,9 +4,10 @@
 The planner turns a single top-level *objective* into the ``phases``/``tasks``
 structure consumed by :func:`osia.autonomous.state.new_task_state`. It does so
 with **ONE** LLM planning run (plus, at most, ONE corrective retry), reusing a
-ready :class:`osia.agent.OSIAAgent` as a black box — it only ever calls
-``agent.reset()`` and ``agent.run(...)``; it never touches the agent loop, the
-tool-call parser, ``_AntiLoopGuard`` or any protected internals (see CLAUDE.md).
+ready :class:`osia.agent.OSIAAgent` through its planning-only completion surface
+when available. Legacy/fake agents keep the ``reset()`` + ``run(...)`` contract.
+The planner never touches the tool-call parser, ``_AntiLoopGuard`` or any other
+protected action-loop internals (see AGENTS.md).
 
 This is **Phase 2 — the planner ONLY**. There is no execution loop here (that is
 Phase 3). The module is also **pure**: no disk I/O, no GUI, no network of its
@@ -27,11 +28,12 @@ Design notes
   plain-language ``success_criterion`` — an *observable* test of doneness — so a
   later execution phase can verify a task instead of trusting a self-reported
   "done". The planning prompt makes this mandatory.
-* **Robust JSON extraction.** Models wrap JSON in prose / markdown fences despite
-  instructions, so we strip fences, brace-match the first complete ``{...}``
-  object (string-aware), and validate the exact shape. On any parse/shape
-  failure we retry the run ONCE with a corrective "raw JSON only" message; if it
-  still fails we return ``None`` — the planner never raises on bad model output.
+* **Unambiguous structured output.** Account-provider planning uses the native
+  JSON-schema output contract. The local decoder accepts exactly one raw JSON
+  value and rejects fences, prose and competing objects instead of guessing.
+  On any parse/shape failure we retry ONCE with a bounded corrective message;
+  if it still fails we return ``None`` — the planner never raises on bad model
+  output.
 * **Language-aware (trivially).** The instructions are in English (the model
   follows them reliably), but the prompt tells the model to write the phase
   names, task objectives and success criteria in the SAME language as the
@@ -70,6 +72,16 @@ _SCHEMA_HINT = (
     '[{"objective":"...","success_criterion":"..."}]}]}'
 )
 
+NO_PLANNING_PAYLOAD = "NO_PLANNING_PAYLOAD"
+MALFORMED_JSON = "MALFORMED_JSON"
+WRAPPED_JSON = "WRAPPED_JSON"
+MULTIPLE_PAYLOADS = "MULTIPLE_PAYLOADS"
+TRUNCATED_JSON = "TRUNCATED_JSON"
+VALID_JSON_INVALID_SCHEMA = "VALID_JSON_INVALID_SCHEMA"
+WRONG_CONTENT_PART = "WRONG_CONTENT_PART"
+PROVIDER_EVENT_AGGREGATION = "PROVIDER_EVENT_AGGREGATION"
+OTHER_EXACT_CAUSE = "OTHER_EXACT_CAUSE"
+
 
 def _schema_hint(requirement_ids=()) -> str:
     if requirement_ids:
@@ -79,6 +91,58 @@ def _schema_hint(requirement_ids=()) -> str:
             '"success_criterion":"..."}]}]}'
         )
     return _SCHEMA_HINT
+
+
+def _planning_output_schema(requirement_ids=()) -> dict:
+    """Return the authoritative JSON Schema for one provider planning turn.
+
+    The provider contract emits only canonical fields, as required by the
+    supported strict structured-output surface. The existing local validator
+    still ignores unknown fields from legacy/plain-text providers. Requirement
+    ids become required only for objectives that already have explicit stable
+    ids; exact membership/order stays a separate local semantic-validation gate.
+    """
+
+    task_required = ["objective", "success_criterion"]
+    task_properties = {
+        "objective": {"type": "string", "minLength": 1},
+        "success_criterion": {"type": "string", "minLength": 1},
+    }
+    if requirement_ids:
+        task_required.insert(0, "requirement_id")
+        task_properties["requirement_id"] = {
+            "type": "string",
+            "enum": [str(value) for value in requirement_ids],
+        }
+    return {
+        "type": "object",
+        "required": ["phases"],
+        "properties": {
+            "phases": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "required": ["name", "tasks"],
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1},
+                        "tasks": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "required": task_required,
+                                "properties": task_properties,
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "additionalProperties": False,
+    }
 
 
 class PlanFailure(NamedTuple):
@@ -92,6 +156,10 @@ class PlanFailure(NamedTuple):
     reason: str
     status_code: int | None = None
     provider_category: str = ""
+    output_category: str = ""
+    decoder_error: str = ""
+    decoder_position: int | None = None
+    schema_error: str = ""
 
     @property
     def error_category(self) -> diagnostics.FailureCategory:
@@ -195,11 +263,15 @@ _CORRECTIVE_PROMPT = (
 )
 
 
-def _corrective_prompt(requirement_ids=()) -> str:
+def _corrective_prompt(requirement_ids=(), failure_category: str = "") -> str:
+    failure_line = (
+        f"Previous output category: {failure_category}.\n"
+        if failure_category else ""
+    )
     if not requirement_ids:
-        return _CORRECTIVE_PROMPT
+        return failure_line + _CORRECTIVE_PROMPT
     ids = ", ".join(requirement_ids)
-    return (
+    return failure_line + (
         "Your previous response did not preserve the explicit numbered "
         "requirements. Return ONLY raw JSON in EXACTLY this schema:\n"
         f"{_schema_hint(requirement_ids)}\n"
@@ -209,19 +281,14 @@ def _corrective_prompt(requirement_ids=()) -> str:
     )
 
 
-# ── Robust JSON extraction ───────────────────────────────────────────────────
+# ── Strict JSON decoding ─────────────────────────────────────────────────────
 
-def _strip_code_fences(text: str) -> str:
-    """Remove a leading ```/```lang fence line and a trailing ``` fence.
 
-    Belt-and-suspenders: :func:`_find_brace_span` already ignores anything
-    outside the outer braces, but stripping fences first keeps pathological
-    inputs simple and mirrors the documented extraction steps.
-    """
-    t = text.strip()
-    t = re.sub(r"^```[^\n]*\n", "", t)
-    t = re.sub(r"\n```\s*$", "", t)
-    return t
+class _DecodeOutcome(NamedTuple):
+    value: object | None
+    category: str
+    error_type: str = ""
+    error_position: int | None = None
 
 
 def _find_brace_span(s: str):
@@ -260,37 +327,53 @@ def _find_brace_span(s: str):
     return None
 
 
-def _extract_json_object(text):
-    """Extract and parse the first JSON object from raw model output.
+def _decode_planning_value(text) -> _DecodeOutcome:
+    """Decode exactly one complete raw JSON value with a safe failure class.
 
-    Strips markdown fences, then tries (a) the string-aware brace-matched span
-    and (b) a first-``{``-to-last-``}`` fallback, parsing each with
-    :func:`json.loads`. Returns the parsed ``dict`` or ``None`` — never raises,
-    whatever the model produced (non-string, prose, truncated JSON, …).
+    No field, brace, quote or comma repair is attempted. Presentation wrappers
+    and competing values remain invalid because there is no authoritative local
+    rule for choosing among them.
     """
-    if not isinstance(text, str):
-        return None
-    s = _strip_code_fences(text)
-    candidates = []
-    span = _find_brace_span(s)
-    if span:
-        candidates.append(span)
-    start, end = s.find("{"), s.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidates.append(s[start:end + 1])
-    for cand in candidates:
+
+    if not isinstance(text, str) or not text.strip():
+        return _DecodeOutcome(None, NO_PLANNING_PAYLOAD)
+    s = text.strip()
+    if s.startswith("```") or s.endswith("```"):
+        return _DecodeOutcome(None, WRAPPED_JSON)
+    decoder = json.JSONDecoder()
+    try:
+        value, end = decoder.raw_decode(s)
+    except json.JSONDecodeError as exc:
+        if s.startswith("{") and _find_brace_span(s) is None:
+            category = TRUNCATED_JSON
+        else:
+            category = MALFORMED_JSON
+        return _DecodeOutcome(
+            None, category, type(exc).__name__, int(exc.pos),
+        )
+    except (TypeError, ValueError, RecursionError) as exc:
+        return _DecodeOutcome(None, MALFORMED_JSON, type(exc).__name__, None)
+
+    trailing = s[end:].strip()
+    if trailing:
         try:
-            obj = json.loads(cand)
-        except (ValueError, TypeError, RecursionError):
-            # RecursionError (a RuntimeError, NOT a ValueError/TypeError) is what
-            # json.loads raises on JSON nested thousands of levels deep — exactly
-            # the runaway model output this extractor must absorb. Caught so the
-            # function honors its "never raises" contract; the stack has fully
-            # unwound here, so trying the next candidate is safe.
-            continue
-        if isinstance(obj, dict):
-            return obj
-    return None
+            _second, second_end = decoder.raw_decode(trailing)
+        except (TypeError, ValueError, RecursionError):
+            category = MALFORMED_JSON
+        else:
+            category = (
+                MULTIPLE_PAYLOADS
+                if not trailing[second_end:].strip() else MALFORMED_JSON
+            )
+        return _DecodeOutcome(None, category)
+    return _DecodeOutcome(value, "")
+
+
+def _extract_json_object(text):
+    """Return one unwrapped raw JSON object, or ``None`` without guessing."""
+
+    decoded = _decode_planning_value(text)
+    return decoded.value if isinstance(decoded.value, dict) else None
 
 
 # ── Shape validation + normalization into the state schema ───────────────────
@@ -413,28 +496,52 @@ def _attempt(
         with permission_scope:
             if turn_context is not None and hasattr(agent, "set_turn_context"):
                 agent.set_turn_context(turn_context)
-                raw = agent.run(
-                    message,
-                    turn_context=turn_context,
-                    canonical_output=False,
-                )
+                planning_run = getattr(agent, "run_planning", None)
+                if callable(planning_run):
+                    raw = planning_run(
+                        message,
+                        output_schema=_planning_output_schema(requirement_ids),
+                        turn_context=turn_context,
+                    )
+                else:
+                    raw = agent.run(
+                        message,
+                        turn_context=turn_context,
+                        canonical_output=False,
+                    )
             else:
-                raw = agent.run(message)
+                planning_run = getattr(agent, "run_planning", None)
+                if callable(planning_run):
+                    raw = planning_run(
+                        message,
+                        output_schema=_planning_output_schema(requirement_ids),
+                    )
+                else:
+                    raw = agent.run(message)
     except Exception as exc:
         return _AttemptOutcome(None, _provider_failure(exc))
 
-    obj = _extract_json_object(raw)
-    if obj is None:
-        return _AttemptOutcome(None, PlanFailure("invalid_json"))
+    decoded = _decode_planning_value(raw)
+    if decoded.category:
+        return _AttemptOutcome(None, PlanFailure(
+            "invalid_json",
+            output_category=decoded.category,
+            decoder_error=decoded.error_type,
+            decoder_position=decoded.error_position,
+        ))
     try:
         phases = _validate_and_normalize(
-            obj, max_phases, max_tasks_per_phase, requirement_ids,
+            decoded.value, max_phases, max_tasks_per_phase, requirement_ids,
         )
     except Exception:
         # Fail closed on a pathological decoded object and discard all content.
         phases = None
     if phases is None:
-        return _AttemptOutcome(None, PlanFailure("invalid_schema"))
+        return _AttemptOutcome(None, PlanFailure(
+            "invalid_schema",
+            output_category=VALID_JSON_INVALID_SCHEMA,
+            schema_error="canonical_schema_mismatch",
+        ))
     return _AttemptOutcome(phases, None)
 
 
@@ -586,7 +693,8 @@ def plan_objective(objective: str, agent, *,
     outcome = _attempt(
         agent,
         language_instruction(turn_context) + "\n\n" + _corrective_prompt(
-            requirement_ids
+            requirement_ids,
+            outcome.failure.output_category if outcome.failure else "",
         ) + ((
             "\nPreserve exactly these document source_refs in the corrected "
             "plan: " + ", ".join(

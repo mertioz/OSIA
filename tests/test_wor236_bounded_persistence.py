@@ -441,9 +441,9 @@ def test_fresh_browser_state_reresolves_delayed_postcondition_read_only(
     monkeypatch.setattr(
         browser_tools,
         "wait_for_browser_condition",
-        lambda current, wait_spec: {
+        lambda state_ref, wait_spec: {
             "ok": True,
-            "data": {"state": current},
+            "data": {"state": state_ref},
             "receipt": {
                 "schema_version": 1,
                 "dispatch_state": "effect_confirmed",

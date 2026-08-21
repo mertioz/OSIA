@@ -64,6 +64,17 @@ _SAFE_TIMESTAMP = re.compile(r"^[0-9T:+.Z-]{10,40}$")
 
 _KNOWN_STAGES = {item.value for item in AutonomousStage}
 _KNOWN_CATEGORIES = {item.value for item in FailureCategory}
+_KNOWN_PLANNING_OUTPUT_CATEGORIES = {
+    "NO_PLANNING_PAYLOAD",
+    "MALFORMED_JSON",
+    "WRAPPED_JSON",
+    "MULTIPLE_PAYLOADS",
+    "TRUNCATED_JSON",
+    "VALID_JSON_INVALID_SCHEMA",
+    "WRONG_CONTENT_PART",
+    "PROVIDER_EVENT_AGGREGATION",
+    "OTHER_EXACT_CAUSE",
+}
 _KNOWN_REASON_CODES = {
     "provider_authentication",
     "provider_rate_limit",
@@ -230,6 +241,7 @@ def make_diagnostic(
     resumable=False,
     checkpoint_present=False,
     transition_at=None,
+    planning_output_category=None,
 ) -> dict:
     """Build one allow-listed diagnostic from explicit structured metadata."""
     st = st if isinstance(st, dict) else {}
@@ -258,7 +270,7 @@ def make_diagnostic(
     if not _SAFE_TIMESTAMP.fullmatch(timestamp):
         timestamp = _now_iso()
 
-    return {
+    diagnostic = {
         "run_ref": _run_ref(st.get("task_id")),
         "stage": stage_value,
         "error_category": category_value,
@@ -283,6 +295,14 @@ def make_diagnostic(
         "reason_code": reason_value,
         "transition_at": timestamp,
     }
+    output_category = _known_code(
+        planning_output_category,
+        _KNOWN_PLANNING_OUTPUT_CATEGORIES,
+        "",
+    )
+    if output_category:
+        diagnostic["planning_output_category"] = output_category
+    return diagnostic
 
 
 def normalize_diagnostic(raw) -> dict | None:
@@ -303,7 +323,7 @@ def normalize_diagnostic(raw) -> dict | None:
     timestamp = str(raw.get("transition_at") or "")
     if not _SAFE_TIMESTAMP.fullmatch(timestamp):
         timestamp = _now_iso()
-    return {
+    diagnostic = {
         "run_ref": run_ref,
         "stage": stage,
         "error_category": category,
@@ -318,6 +338,14 @@ def normalize_diagnostic(raw) -> dict | None:
         "reason_code": reason,
         "transition_at": timestamp,
     }
+    output_category = _known_code(
+        raw.get("planning_output_category"),
+        _KNOWN_PLANNING_OUTPUT_CATEGORIES,
+        "",
+    )
+    if output_category:
+        diagnostic["planning_output_category"] = output_category
+    return diagnostic
 
 
 def record_diagnostic(st: dict, diagnostic: dict, *, emit: bool = True) -> dict:

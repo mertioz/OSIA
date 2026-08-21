@@ -6,7 +6,7 @@ with a plain ``python3 osia/autonomous/test_planner.py`` (or
 ``python3 -m osia.autonomous.test_planner``). Confirms:
 
   * clean raw JSON           → valid normalized phases
-  * fenced ```json``` JSON    → fences stripped, parsed
+  * fenced ```json``` JSON    → rejected as an ambiguous wrapper
   * malformed JSON           → ONE corrective retry → None (run() called twice)
   * shape validation rejects a task missing ``success_criterion``
   * the planner does NO disk I/O (state.save_task_state / _write_atomic unused)
@@ -90,12 +90,10 @@ CLEAN_JSON = (
 )
 
 FENCED_JSON = (
-    "Voici le plan demandé :\n"
     "```json\n"
     '{"phases":[{"name":"Phase unique","tasks":['
     '{"objective":"Faire la chose","success_criterion":"La chose est faite et visible"}]}]}\n'
     "```\n"
-    "J'espère que cela convient."
 )
 
 MALFORMED_JSON = '{"phases": [ {"name": "oops", "tasks": [ {"objective":'  # truncated
@@ -150,12 +148,14 @@ def test_clean_json():
 
 def test_fenced_json():
     print("test_fenced_json")
-    agent = FakeAgent([FENCED_JSON])
+    agent = FakeAgent([FENCED_JSON, CLEAN_JSON])
     phases = planner.plan_objective("Faire quelque chose", agent)
-    check("run() called once (fenced parsed on first try)", len(agent.run_inputs) == 1)
-    check("fenced JSON parsed to one phase", isinstance(phases, list) and len(phases) == 1)
-    check("fenced phase name parsed", phases[0]["name"] == "Phase unique")
-    check("fenced task id is 0.0", phases[0]["tasks"][0]["id"] == "0.0")
+    check("fenced output consumed the one corrective retry",
+          len(agent.run_inputs) == 2)
+    check("raw corrective JSON parsed", isinstance(phases, list) and len(phases) == 2)
+    check("fence has a precise wrapper category",
+          planner._decode_planning_value(FENCED_JSON).category
+          == planner.WRAPPED_JSON)
 
 
 def test_malformed_then_none():

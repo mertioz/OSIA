@@ -39,7 +39,7 @@ import inspect
 import json
 import hashlib
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import NamedTuple
 
 from osia import document_artifacts, document_sources
@@ -134,10 +134,13 @@ class Orchestrator:
         self._resume_scope_extension = False
         self._resume_scope_tool = ""
         self._active_task = None
+        self._active_execution_strategy = None
+        self._execution_strategies = {}
         self._origin_ref = str(origin_ref or "desktop")
         self._tool_resume_lock = threading.RLock()
         self._pending_tool_completion = None
         self._resumed_tool_attempts: set[str] = set()
+        self._recovered_tool_attempts: set[str] = set()
         self._tool_cancel_lock = threading.RLock()
         self._cancel_before_dispatch_requested = False
         self._starting_tool_attempt_id = ""
@@ -373,6 +376,15 @@ class Orchestrator:
                 ToolAttemptStatus.FAILED_AFTER_EFFECT,
                 ToolAttemptStatus.UNKNOWN_AFTER_START,
             }:
+                if attempt_id in self._recovered_tool_attempts:
+                    self._terminalize_recovered_tool_failure(
+                        st,
+                        phase_index,
+                        task_index,
+                        task,
+                        task["tool_terminal_reason"],
+                    )
+                    return True
                 self._block_unknown_tool_effect(
                     st, phase_index, task_index, task,
                     task["tool_terminal_reason"],
@@ -631,12 +643,202 @@ class Orchestrator:
         if task is None or not task.get("tool_attempt_id"):
             return False
         self._state = st
-        self._block_unknown_tool_effect(
+        self._terminalize_recovered_tool_failure(
             st, phase_index, task_index, task, reason_code,
         )
         return True
 
-    def _agent_run(self, message: str, *, verification: bool = False):
+    def _terminalize_recovered_tool_failure(
+        self,
+        st: dict,
+        phase_index: int,
+        task_index: int,
+        task: dict | None,
+        reason_code: str,
+        *,
+        effect_unknown: bool = True,
+    ) -> None:
+        """End an unrunnable recovered checkpoint without replaying its effect."""
+
+        safe_reason = (
+            reason_code
+            if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", reason_code or "")
+            else "tool_recovery_unavailable"
+        )
+        if task is not None and effect_unknown:
+            self._block_unknown_tool_effect(
+                st, phase_index, task_index, task, safe_reason,
+            )
+            self._stop.set()
+            return
+        elif task is not None:
+            state.set_task_status(
+                st, phase_index, task_index, "failed",
+                last_error=safe_reason,
+                tool_durable_state="",
+                tool_terminal_reason=safe_reason,
+                tool_continuation_claimed=True,
+            )
+        st["status"] = "failed"
+        st["run_state"] = "failed"
+        self._stop.set()
+        diagnostic = self._record_failure(
+            st,
+            diagnostics.AutonomousStage.RESUME,
+            diagnostics.FailureCategory.INVALID_RESUME_STATE,
+            reason_code=safe_reason,
+            resumable=False,
+            checkpoint_present=True,
+        )
+        self._safe_save(st)
+        self._emit({"event": "failed", "reason": safe_reason, **diagnostic})
+
+    @staticmethod
+    def _execution_memories(st: dict) -> list[dict]:
+        return [
+            task.get("execution_memory")
+            for phase in st.get("phases") or []
+            if isinstance(phase, dict)
+            for task in phase.get("tasks") or []
+            if isinstance(task, dict)
+            and isinstance(task.get("execution_memory"), dict)
+        ]
+
+    def _strategy_for_task(self, st: dict, task: dict):
+        from osia import execution_strategy as strategy_module
+        from osia.agent import TOOL_MAP
+
+        runtime_key = id(task)
+        existing = self._execution_strategies.get(runtime_key)
+        if isinstance(existing, strategy_module.ExecutionStrategy):
+            return existing
+        objective = str(
+            task.get("_runtime_objective", task.get("objective", "")) or ""
+        )
+        criterion = str(task.get(
+            "_runtime_success_criterion", task.get("success_criterion", ""),
+        ) or "")
+        strategy = strategy_module.build_execution_strategy(
+            objective,
+            tuple(TOOL_MAP),
+            postcondition=criterion,
+            semantic_context="\n".join((
+                str(st.get("_runtime_objective", st.get("objective", "")) or ""),
+                criterion,
+            )),
+        )
+        strategy_module.rebind_execution_memory(
+            strategy,
+            self._execution_memories(st),
+        )
+        self._execution_strategies[runtime_key] = strategy
+        task["execution_memory"] = strategy_module.export_execution_memory(
+            strategy,
+        )
+        return strategy
+
+    @staticmethod
+    def _persist_execution_memory(task: dict | None, strategy) -> None:
+        if not isinstance(task, dict) or strategy is None:
+            return
+        try:
+            from osia.execution_strategy import export_execution_memory
+
+            task["execution_memory"] = export_execution_memory(strategy)
+        except Exception:
+            pass
+
+    def _strategy_reconciled_for_attempt(self, attempt_id: str, task: dict):
+        """Bind the exact locally reconciled runtime strategy to its task."""
+
+        from osia import execution_strategy as strategy_module
+
+        runtime = getattr(self.agent, "_pending_tool_runtime", None)
+        reconciled = (
+            runtime.get("reconciliation_strategy")
+            if isinstance(runtime, dict)
+            and str(runtime.get("attempt_id") or "") == str(attempt_id or "")
+            else None
+        )
+        unresolved_attempts = {
+            str(effect.get("unresolved_attempt_id") or "")
+            for effect in (
+                (task.get("execution_memory") or {}).get("effects") or []
+            )
+            if isinstance(effect, dict)
+            and str(effect.get("unresolved_attempt_id") or "")
+        }
+        if not unresolved_attempts:
+            return (
+                reconciled
+                if isinstance(reconciled, strategy_module.ExecutionStrategy)
+                else self._active_execution_strategy
+            )
+        resolution = (
+            runtime.get("reconciliation_resolution")
+            if isinstance(runtime, dict) else None
+        )
+        if (
+            not isinstance(reconciled, strategy_module.ExecutionStrategy)
+            or not isinstance(resolution, dict)
+            or str(resolution.get("durable_attempt_id") or "")
+            != str(attempt_id or "")
+            or str(resolution.get("resolution") or "")
+            not in {"completed", "primitive_completed"}
+        ):
+            return None
+        strategy_attempt_id = str(
+            resolution.get("strategy_attempt_id") or ""
+        )
+        strategy_attempt = reconciled.attempt_by_id(strategy_attempt_id)
+        try:
+            observed_at = float(resolution.get("observed_at") or 0.0)
+            dispatched_at = float(
+                strategy_attempt.dispatched_at if strategy_attempt is not None
+                else 0.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            strategy_attempt_id not in unresolved_attempts
+            or strategy_attempt is None
+            or strategy_attempt.node_id
+            != str(resolution.get("semantic_node_id") or "")
+            or strategy_attempt.mechanism_id
+            != str(resolution.get("mechanism_id") or "")
+            or strategy_attempt.attempted_effect
+            != str(resolution.get("postcondition") or "")
+            or str(strategy_attempt.target_application or "").casefold()
+            != str(resolution.get("target_application") or "").casefold()
+            or str(strategy_attempt.target_surface or "").casefold()
+            != str(resolution.get("target_surface") or "").casefold()
+            or observed_at < dispatched_at
+        ):
+            return None
+        if str(resolution.get("resolution") or "") == "primitive_completed":
+            if not any(
+                str(item.get("attempt_id") or "") == strategy_attempt_id
+                for item in reconciled._completed_substeps
+                if isinstance(item, dict)
+            ):
+                return None
+        elif not reconciled.effect_is_completed(
+            strategy_attempt.attempted_effect,
+            target_application=strategy_attempt.target_application,
+            target_surface=strategy_attempt.target_surface,
+        ):
+            return None
+        self._active_execution_strategy = reconciled
+        self._execution_strategies[id(task)] = reconciled
+        return reconciled
+
+    def _agent_run(
+        self,
+        message: str,
+        *,
+        verification: bool = False,
+        execution_strategy=None,
+    ):
         """Run one autonomous provider turn under the checkpoint language."""
 
         st = self._state if isinstance(self._state, dict) else {}
@@ -678,6 +880,15 @@ class Orchestrator:
             else "autonomous_web" if web_surface
             else "autonomous"
         )
+        if execution_strategy is not None:
+            from osia.execution_strategy import execution_strategy_scope
+
+            strategy_scope = execution_strategy_scope(
+                message,
+                strategy=execution_strategy,
+            )
+        else:
+            strategy_scope = nullcontext()
         with authorization.run_authorization_scope(
             st,
             save=state.save_task_state,
@@ -690,11 +901,34 @@ class Orchestrator:
             str(st.get("run_id") or st.get("task_id") or "autonomous"),
             revision=int(st.get("plan_revision", 0) or 0),
             sink=self._document_progress_cb,
-        ):
-            if hasattr(self.agent, "set_turn_context"):
-                self.agent.set_turn_context(context)
-                return self.agent.run(message, turn_context=context)
-            return self.agent.run(message)
+        ), strategy_scope:
+            try:
+                if hasattr(self.agent, "set_turn_context"):
+                    self.agent.set_turn_context(context)
+                    return self.agent.run(message, turn_context=context)
+                return self.agent.run(message)
+            finally:
+                self._persist_execution_memory(
+                    self._active_task,
+                    execution_strategy,
+                )
+
+    def _has_exact_pending_tool_wait(self, st: dict, task: dict) -> bool:
+        """Return whether the live agent owns this exact durable task wait."""
+
+        attempt_id = str(task.get("tool_attempt_id") or "")
+        runtime = getattr(self.agent, "_pending_tool_runtime", None)
+        return bool(
+            st.get("run_state") in {
+                "waiting_tool", "cancellation_requested",
+            }
+            and attempt_id
+            and str(
+                getattr(self.agent, "last_pending_tool_attempt_id", "") or ""
+            ) == attempt_id
+            and isinstance(runtime, dict)
+            and str(runtime.get("attempt_id") or "") == attempt_id
+        )
 
     @staticmethod
     def _uses_autonomous_web_surface(st: dict) -> bool:
@@ -890,6 +1124,10 @@ class Orchestrator:
         # Idempotent: never spawn a second loop over the same Orchestrator.
         if self._thread and self._thread.is_alive():
             return
+        if self._state is not st:
+            self._execution_strategies.clear()
+            self._active_task = None
+            self._active_execution_strategy = None
         if not isinstance(st, dict) or not state.execution_state_is_valid(st):
             invalid = st if isinstance(st, dict) else state.new_task_state("", "", "", [])
             self._state = invalid
@@ -1026,11 +1264,10 @@ class Orchestrator:
         phase_index, task_index, task = state.current_task(st)
         attempt_id = str((task or {}).get("tool_attempt_id") or "")
         if task is None or not attempt_id:
-            if task is not None:
-                self._block_unknown_tool_effect(
-                    st, phase_index, task_index, task,
-                    "common_tool_attempt_missing",
-                )
+            self._terminalize_recovered_tool_failure(
+                st, phase_index, task_index, task,
+                "common_tool_attempt_missing",
+            )
             return
         try:
             from osia.tool_attempts import (
@@ -1046,18 +1283,22 @@ class Orchestrator:
             attempt = None
             status = ToolAttemptStatus.UNKNOWN_AFTER_START
         if not attempt:
-            self._block_unknown_tool_effect(
+            self._terminalize_recovered_tool_failure(
                 st, phase_index, task_index, task,
                 "common_tool_attempt_unavailable",
             )
             return
         identity_error = self._common_attempt_identity_error(st, task, attempt)
         if identity_error:
-            self._block_unknown_tool_effect(
+            self._terminalize_recovered_tool_failure(
                 st, phase_index, task_index, task, identity_error,
             )
             return
+        self._recovered_tool_attempts.add(attempt_id)
         if status in RECOVERABLE_STATUSES:
+            # Publish the authoritative waiting checkpoint before arming any
+            # restored timer. A due verifier may terminalize immediately; no
+            # later recovery write may move that result back to waiting_tool.
             st["run_state"] = (
                 "cancellation_requested"
                 if status is ToolAttemptStatus.CANCELLATION_REQUESTED
@@ -1065,6 +1306,23 @@ class Orchestrator:
             )
             self._safe_save(st)
             self._emit({"event": st["run_state"]})
+            self._configure_common_tool_attempts(st)
+            try:
+                strategy = self._strategy_for_task(st, task)
+                restore = getattr(
+                    self.agent, "_restore_suspended_tool_runtime", None,
+                )
+                restored = bool(
+                    callable(restore) and restore(attempt, strategy)
+                )
+            except Exception:
+                restored = False
+            if not restored:
+                self._terminalize_recovered_tool_failure(
+                    st, phase_index, task_index, task,
+                    "common_tool_continuation_unrecoverable",
+                )
+                return
             get_tool_attempt_coordinator().trigger_recovery(
                 reason="autonomous_resume", overdue_only=False,
             )
@@ -1279,6 +1537,8 @@ class Orchestrator:
             self._safe_save(st)
             return True
 
+        self._active_execution_strategy = self._strategy_for_task(st, task)
+
         with self._tool_resume_lock:
             completion = self._pending_tool_completion
             if (
@@ -1388,12 +1648,23 @@ class Orchestrator:
                 self.agent.reset()
                 execution_prompt = self._compose(task, digest)
             with self._artifact_scope(st, task):
-                result = self._agent_run(execution_prompt)
+                run_parameters = inspect.signature(
+                    self._agent_run,
+                ).parameters
+                run_kwargs = (
+                    {"execution_strategy": self._active_execution_strategy}
+                    if "execution_strategy" in run_parameters
+                    else {}
+                )
+                result = self._agent_run(execution_prompt, **run_kwargs)
             if not isinstance(result, str):
                 result = "" if result is None else str(result)
             from osia.tool_attempts import WAITING_TOOL_RESULT
 
-            if result == WAITING_TOOL_RESULT:
+            if (
+                result == WAITING_TOOL_RESULT
+                or self._has_exact_pending_tool_wait(st, task)
+            ):
                 if st.get("run_state") not in {
                     "waiting_tool", "cancellation_requested",
                 }:
@@ -1736,6 +2007,52 @@ class Orchestrator:
         operation_id = str(task.get("tool_operation_id") or "")
         operation = state.operation_record(st, operation_id) if operation_id else None
         if status is ToolAttemptStatus.SUCCEEDED:
+            # The common verifier may have reconciled a snapshot after the
+            # provider turn returned.  Rebind that exact correlated strategy
+            # before advancing so the next node consumes the verified effect.
+            reconciled_strategy = self._strategy_reconciled_for_attempt(
+                attempt_id,
+                task,
+            )
+            unresolved_attempts = {
+                str(effect.get("unresolved_attempt_id") or "")
+                for effect in (
+                    (task.get("execution_memory") or {}).get("effects") or []
+                )
+                if isinstance(effect, dict)
+                and str(effect.get("unresolved_attempt_id") or "")
+            }
+            if unresolved_attempts and reconciled_strategy is None:
+                if attempt_id in self._recovered_tool_attempts:
+                    self._terminalize_recovered_tool_failure(
+                        st,
+                        phase_index,
+                        task_index,
+                        task,
+                        "correlated_reconciliation_not_projected",
+                        effect_unknown=False,
+                    )
+                    return False
+                state.set_task_status(
+                    st, phase_index, task_index, "waiting_tool",
+                    last_error="correlated_reconciliation_not_projected",
+                    tool_durable_state="waiting_tool",
+                    tool_terminal_reason=(
+                        "correlated_reconciliation_not_projected"
+                    ),
+                    tool_continuation_claimed=False,
+                )
+                st["run_state"] = "waiting_tool"
+                self._safe_save(st)
+                self._emit({
+                    "event": "waiting_tool",
+                    "reason": "correlated_reconciliation_not_projected",
+                })
+                return False
+            self._persist_execution_memory(
+                task,
+                reconciled_strategy,
+            )
             if operation is not None:
                 operation.update({
                     "status": "success_verified",
@@ -1748,6 +2065,39 @@ class Orchestrator:
                     "tool_attempt_id": attempt_id,
                 })
                 state.upsert_operation_record(st, operation)
+            remaining_mandatory = bool(
+                reconciled_strategy is not None
+                and not reconciled_strategy.succeeded
+                and reconciled_strategy.pending_nodes()
+            )
+            if remaining_mandatory:
+                # A durable receipt proves only the correlated child effect.
+                # Keep the composite task on the same cursor until its own
+                # postconditions are strongly verified; the strategy ledger
+                # retains the completed prerequisite and prevents replay.
+                state.set_task_status(
+                    st, phase_index, task_index, "in_progress",
+                    last_error=None,
+                    tool_attempt_id="",
+                    tool_operation_id="",
+                    tool_operation_revision=0,
+                    tool_durable_state="",
+                    tool_next_reconciliation_at=None,
+                    tool_terminal_reason="",
+                    tool_continuation_claimed=False,
+                )
+                st["run_state"] = "running"
+                self._append_log(
+                    st, "progress", ref=task.get("id"),
+                    note="common_tool_prerequisite_verified",
+                )
+                self._safe_save(st)
+                self._emit({
+                    "event": "running",
+                    "task_id": task.get("id"),
+                    "reason": "common_tool_prerequisite_verified",
+                })
+                return True
             state.set_task_status(
                 st, phase_index, task_index, "done",
                 distilled_summary="Durable tool result verified.",
@@ -2434,7 +2784,11 @@ class Orchestrator:
         try:
             self.agent.reset()
             with self._artifact_scope(self._state, self._active_task):
-                reply = self._agent_run(prompt, verification=True)
+                reply = self._agent_run(
+                    prompt,
+                    verification=True,
+                    execution_strategy=self._active_execution_strategy,
+                )
         except Exception:
             return _VerificationOutcome(
                 False, diagnostics.FailureCategory.VERIFICATION_ERROR,
@@ -2633,6 +2987,7 @@ class Orchestrator:
                     reason_code=failure.reason,
                     resumable=True,
                     checkpoint_present=True,
+                    planning_output_category=failure.output_category,
                 )
                 reason_code = failure.reason
             else:
@@ -2735,7 +3090,8 @@ class Orchestrator:
 
     def _record_failure(self, st, stage, category, *, reason_code,
                         attempt=None, resumable=False,
-                        checkpoint_present=True) -> dict:
+                        checkpoint_present=True,
+                        planning_output_category="") -> dict:
         """Record one failure using current agent/provider metadata only."""
         provider, model = diagnostics.actual_provider_model(
             self.agent,
@@ -2752,5 +3108,6 @@ class Orchestrator:
             model=model,
             resumable=resumable,
             checkpoint_present=checkpoint_present,
+            planning_output_category=planning_output_category,
         )
         return diagnostics.record_diagnostic(st, diagnostic)

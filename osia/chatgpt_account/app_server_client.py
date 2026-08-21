@@ -140,7 +140,7 @@ _CANONICAL_NATIVE_TOOL_NAMES = (
 )
 
 
-def _canonical_native_tools() -> list[dict]:
+def _canonical_native_tools(execution_strategy=None) -> list[dict]:
     """Expose only exact OSIA identities backed by authoritative schemas."""
 
     from osia.capability_federation import federated_capabilities
@@ -159,6 +159,17 @@ def _canonical_native_tools() -> list[dict]:
         spec = registry.get(name)
         if spec is None or not spec.chat_eligible:
             continue
+        if execution_strategy is not None:
+            try:
+                from osia.execution_strategy import tool_applicability
+
+                applicable, _reason = tool_applicability(
+                    execution_strategy, name, {},
+                )
+            except Exception:
+                applicable = False
+            if not applicable:
+                continue
         tools.append(
             {
                 "type": "function",
@@ -2055,6 +2066,7 @@ class AppServerClient:
         model: str,
         base_instructions: str,
         developer_instructions: str,
+        dynamic_tools=None,
     ) -> str:
         if thread_id:
             try:
@@ -2091,7 +2103,10 @@ class AppServerClient:
                 "serviceName": "osia_pc",
                 "baseInstructions": base_instructions,
                 "developerInstructions": developer_instructions,
-                "dynamicTools": _canonical_native_tools(),
+                "dynamicTools": (
+                    _canonical_native_tools()
+                    if dynamic_tools is None else list(dynamic_tools)
+                ),
             },
         )
         if result.get("instructionSources"):
@@ -2119,6 +2134,7 @@ class AppServerClient:
         effort: str | None = None,
         on_delta: Callable[[str], None] | None = None,
         timeout: float = 300.0,
+        output_schema: dict | None = None,
     ) -> TurnResult:
         turn_content = content if content is not None else text
         if turn_content is None:
@@ -2161,6 +2177,13 @@ class AppServerClient:
             }
             if effort:
                 params["effort"] = effort
+            if output_schema is not None:
+                if not isinstance(output_schema, dict):
+                    raise AppServerError(
+                        "ERROR: the structured output schema is invalid.",
+                        category="invalid_input",
+                    )
+                params["outputSchema"] = deepcopy(output_schema)
             response = self._request("turn/start", params)
             turn = response.get("turn") if isinstance(response.get("turn"), dict) else {}
             if turn.get("id"):
