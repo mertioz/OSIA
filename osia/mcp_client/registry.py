@@ -353,6 +353,42 @@ def _agent_maps():
         return None, None
 
 
+def _claim_current_tool_attempt_dispatch() -> str | None:
+    """Claim the exact durable boundary immediately before ``call_tool``.
+
+    Calls without a common ToolAttempt context retain the legacy wrapper path.
+    Once an exact attempt exists, any missing/corrupt boundary fails closed.
+    """
+
+    try:
+        from osia.tool_attempts import (
+            TOOL_DISPATCH_BOUNDARY_UNAVAILABLE_RESULT,
+            TOOL_DISPATCH_CANCELLED_RESULT,
+            ToolAttemptStatus,
+            current_tool_attempt_id,
+            current_tool_attempt_store,
+        )
+    except Exception:
+        return None
+    attempt_id = str(current_tool_attempt_id() or "")
+    store = current_tool_attempt_store()
+    if not attempt_id and store is None:
+        return None
+    if not attempt_id or store is None:
+        return TOOL_DISPATCH_BOUNDARY_UNAVAILABLE_RESULT
+    try:
+        record, claimed = store.claim_owner_dispatch(attempt_id)
+        if claimed:
+            return None
+        if ToolAttemptStatus(record.get("status")) is (
+            ToolAttemptStatus.CANCELLED_PROVEN
+        ):
+            return TOOL_DISPATCH_CANCELLED_RESULT
+    except Exception:
+        pass
+    return TOOL_DISPATCH_BOUNDARY_UNAVAILABLE_RESULT
+
+
 def _make_wrapper(
     manager: Any,
     server_id: str,
@@ -446,6 +482,9 @@ def _make_wrapper(
                 return (
                     f"ERROR: mcp/{server_id}/{tool_name}: execution permit unavailable"
                 )
+        dispatch_block = _claim_current_tool_attempt_dispatch()
+        if dispatch_block is not None:
+            return dispatch_block
         if is_deletion:
             try:
                 from osia.action_policy import begin_external_deletion_dispatch

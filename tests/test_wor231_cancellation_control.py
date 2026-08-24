@@ -22,6 +22,9 @@ def _create_attempt(
     conversation_id: str,
     turn_id: str,
     request_id: str,
+    provider_id: str = "fixture-provider",
+    model_id: str = "fixture-model",
+    final_response_message_id: str = "assistant_wor231",
 ) -> dict:
     return store.create_attempt(
         conversation_id=conversation_id,
@@ -29,8 +32,8 @@ def _create_attempt(
         request_id=request_id,
         tool_call_id="call_wor231",
         tool_name="find_and_click",
-        provider_id="fixture-provider",
-        model_id="fixture-model",
+        provider_id=provider_id,
+        model_id=model_id,
         turn_context={"language": "en", "source": "fixture"},
         argument_fingerprint=store.fingerprint_arguments(
             {"semantic_target": "synthetic"},
@@ -39,12 +42,14 @@ def _create_attempt(
         idempotence="non_idempotent",
         retry_policy="never_after_dispatch",
         deadline_at=time.time() + 120,
-        final_response_message_id="assistant_wor231",
+        final_response_message_id=final_response_message_id,
     )
 
 
 def _install_active_turn(conv_id: str, request_id: str):
     meta = server._new_turn_meta(conv_id, request_id)
+    meta["_terminality_objective"] = "Synthetic cancellation objective"
+    server._bind_pre_agent_cancellation_authority(meta)
     holder = asyncio.get_running_loop().create_future()
     server._ACTIVE_TURNS_BY_CONV[conv_id] = holder
     server._ACTIVE_TURN_META_BY_CONV[conv_id] = meta
@@ -77,6 +82,9 @@ def test_exact_chat_cancellation_before_dispatch_is_proven_and_deduplicated(
             conversation_id=conv_id,
             turn_id=meta["turn_id"],
             request_id=request_id,
+            provider_id=meta["provider_id"],
+            model_id=meta["model_id"],
+            final_response_message_id=meta["assistant_message_id"],
         )
         message = {
             "conversation_id": conv_id,
@@ -96,17 +104,28 @@ def test_exact_chat_cancellation_before_dispatch_is_proven_and_deduplicated(
             assert durable["status"] == ToolAttemptStatus.CANCELLED_PROVEN.value
             assert durable["dispatch_state"] == "cancelled_before_effect"
             assert channel.frames[0]["type"] == "turn_status"
-            assert channel.frames[0]["status"] == "cancelled_proven"
+            assert channel.frames[0]["status"] == "cancelled"
+            assert channel.frames[0]["terminal"] is True
             assert channel.frames[0]["request_id"] == request_id
             assert channel.frames[0]["turn_id"] == meta["turn_id"]
             assert channel.frames[0]["tool_attempt_id"] == attempt[
                 "tool_attempt_id"
             ]
-            assert channel.frames[1]["status"] == "cancelled_proven"
+            terminal_frames = [
+                frame for frame in channel.frames
+                if frame.get("status") == "cancelled"
+            ]
+            assert len(terminal_frames) == 2
+            assert channel.frames[1] == {
+                "type": "conversation_busy_changed",
+                "conversation_id": conv_id,
+                "busy": False,
+            }
             assert meta["_cancellation_control_target"] == (
                 conv_id,
                 request_id,
                 meta["turn_id"],
+                meta["run_id"],
                 attempt["tool_attempt_id"],
             )
         finally:
@@ -132,6 +151,9 @@ def test_chat_cancellation_after_dispatch_stays_requested_until_evidence(
             conversation_id=conv_id,
             turn_id=meta["turn_id"],
             request_id=request_id,
+            provider_id=meta["provider_id"],
+            model_id=meta["model_id"],
+            final_response_message_id=meta["assistant_message_id"],
         )
         accepted = store.mark_accepted(created["tool_attempt_id"])
         running = store.mark_running(accepted["tool_attempt_id"])
@@ -148,9 +170,17 @@ def test_chat_cancellation_after_dispatch_stays_requested_until_evidence(
             )
             durable = store.get_attempt(running["tool_attempt_id"])
             assert durable["status"] == "cancellation_requested"
-            assert durable["dispatch_state"] == "dispatch_started"
-            assert channel.frames[-1]["status"] == "cancellation_requested"
-            assert channel.frames[-1]["terminal"] is False
+            assert durable["dispatch_state"] == "owner_started"
+            terminal = next(
+                frame for frame in channel.frames
+                if frame.get("status") == "cancelled"
+            )
+            assert terminal["terminal"] is True
+            assert channel.frames[-1] == {
+                "type": "conversation_busy_changed",
+                "conversation_id": conv_id,
+                "busy": False,
+            }
         finally:
             _clear_active_turn(conv_id, request_id, holder)
 
@@ -189,8 +219,8 @@ def test_stale_chat_cancellation_is_rejected_without_touching_active_turn(
                 "request_id": "request.wor231.stale",
                 "client_request_id": "request.wor231.stale",
                 "turn_id": meta["turn_id"],
+                "run_id": meta["run_id"],
             }
-            assert any(frame["type"] == "turn_status" for frame in channel.frames)
             assert "_tool_cancel_requested" not in meta
             assert "_cancellation_control_target" not in meta
         finally:

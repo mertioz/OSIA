@@ -106,6 +106,7 @@ import traceback
 import unicodedata
 import wave
 from collections import OrderedDict, deque
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -129,6 +130,10 @@ from osia.permission_outcome import (
     normalize_permission_result,
 )
 from osia.document_progress import document_progress_scope
+from osia.durable_transport import (
+    InboxDisposition,
+    get_durable_transport_store,
+)
 from osia.version import current_product_version
 from osia.legacy_uploads import (
     LegacyUploadError,
@@ -756,6 +761,28 @@ def _permission_safe_id(value) -> str:
     return candidate if _PERMISSION_ID_RE.fullmatch(candidate) else ""
 
 
+def _permission_safe_binding_label(value, *, maximum: int = 160) -> str:
+    """Keep exact provider/model labels without treating them as opaque IDs."""
+
+    candidate = str(value or "").strip()
+    if (
+        not candidate
+        or len(candidate) > maximum
+        or any(ord(char) < 32 or ord(char) == 127 for char in candidate)
+    ):
+        return ""
+    return candidate
+
+
+def _permission_confirmation_value(key: str, value) -> str:
+    if key in {"provider_id", "model_id", "effective_reasoning"}:
+        return _permission_safe_binding_label(
+            value,
+            maximum=160 if key == "model_id" else 64,
+        )
+    return _permission_safe_id(value)
+
+
 def _mobile_document_owner(device_id: str) -> str:
     """Stable private owner identity for one authenticated mobile device."""
 
@@ -1324,6 +1351,9 @@ _ACTIVE_TURN_META_BY_CONV: dict[str, dict] = {}
 _ACTIVE_CONV_BY_REQUEST: dict[str, str] = {}
 _POST_TURN_MEDIA_TASKS: set["asyncio.Task"] = set()
 _POST_TURN_MEDIA_BY_CONV: dict[str, "asyncio.Task"] = {}
+_POST_TURN_MEDIA_META_BY_CONV: dict[str, dict] = {}
+_PENDING_FINAL_PERSIST_TASKS: set["asyncio.Task"] = set()
+_PENDING_SOURCE_CLEANUP_TASKS: set["asyncio.Task"] = set()
 _TTS_MAX_PENDING_SEGMENTS = 8
 _CONVERSATION_BUSY_MESSAGE = "OSIA is still working in this conversation."
 _TURN_ID_PREFIX = "turn-"
@@ -1331,6 +1361,9 @@ _EVENT_ID_PREFIX = "event-"
 _MESSAGE_ID_PREFIX = "message-"
 _CLIENT_REQUEST_ID_MAX = 128
 _TURN_PROGRESS_INTERVAL_SECONDS = 10.0
+_TURN_EVENT_SEQUENCE_DIR = CONFIG_DIR / "turn_event_sequences"
+_TURN_EVENT_SEQUENCE_LOCK = threading.RLock()
+_DURABLE_TRANSPORT = get_durable_transport_store()
 
 
 # Sentinel pushed onto an _OutboundChannel to tell its writer task to stop.
@@ -1358,12 +1391,17 @@ class _OutboundChannel:
     """
 
     __slots__ = (
-        "_closed", "_permission_device_id", "_queue", "_text_coalescer",
+        "_closed", "_durable_buffer", "_durable_client_id",
+        "_durable_ready", "_permission_device_id", "_queue",
+        "_text_coalescer",
     )
 
     def __init__(self) -> None:
         self._queue: asyncio.Queue = asyncio.Queue()
         self._closed = False
+        self._durable_buffer: list[dict] = []
+        self._durable_client_id = ""
+        self._durable_ready = False
         # Stable opaque identity bound only after Mobile authentication.  It
         # lets one pending approval follow the same device across a transport
         # reconnect without ever falling back to an unrelated connection.
@@ -1376,6 +1414,14 @@ class _OutboundChannel:
     async def send_json(self, obj) -> None:
         if self._closed:
             return
+        if (
+            isinstance(obj, dict)
+            and obj.get("event_id")
+            and obj.get("stream_id")
+            and not self._durable_ready
+        ):
+            self._durable_buffer.append(dict(obj))
+            return
         if self._text_coalescer.offer(obj):
             return
         await self._queue.put(("json", obj))
@@ -1383,9 +1429,44 @@ class _OutboundChannel:
     def send_json_nowait(self, obj) -> None:
         if self._closed:
             return
+        if (
+            isinstance(obj, dict)
+            and obj.get("event_id")
+            and obj.get("stream_id")
+            and not self._durable_ready
+        ):
+            self._durable_buffer.append(dict(obj))
+            return
         if self._text_coalescer.offer(obj):
             return
         self._queue.put_nowait(("json", obj))
+
+    def bind_durable_client(self, client_id: str) -> None:
+        self._durable_client_id = str(client_id or "")
+
+    async def send_durable_replay(self, frame: dict) -> None:
+        """Queue an already-persisted envelope without re-entering buffering."""
+
+        if self._closed:
+            return
+        self._text_coalescer.flush()
+        await self._queue.put(("json", dict(frame)))
+
+    async def activate_durable_delivery(self) -> None:
+        """Flush events created while the reconnect suffix was being replayed."""
+
+        if self._durable_ready:
+            return
+        self._durable_ready = True
+        buffered = list(self._durable_buffer)
+        self._durable_buffer.clear()
+        buffered.sort(key=lambda frame: (
+            float(frame.get("created_at") or 0.0),
+            str(frame.get("stream_id") or ""),
+            int(frame.get("sequence") or 0),
+        ))
+        for frame in buffered:
+            await self.send_durable_replay(frame)
 
     async def send_text(self, text: str) -> None:
         if self._closed:
@@ -1674,6 +1755,7 @@ def _active_conversation_busy_ids() -> list[str]:
     for conv_id, task in list(_POST_TURN_MEDIA_BY_CONV.items()):
         if task.done():
             _POST_TURN_MEDIA_BY_CONV.pop(conv_id, None)
+            _POST_TURN_MEDIA_META_BY_CONV.pop(conv_id, None)
             continue
         if conv_id not in busy:
             busy.append(conv_id)
@@ -1688,6 +1770,7 @@ def _is_conversation_busy(conv_id: str | None) -> bool:
         if not media_task.done():
             return True
         _POST_TURN_MEDIA_BY_CONV.pop(conv_id, None)
+        _POST_TURN_MEDIA_META_BY_CONV.pop(conv_id, None)
     task = _ACTIVE_TURNS_BY_CONV.get(conv_id)
     if task is None:
         return False
@@ -1710,6 +1793,127 @@ def _clean_client_request_id(value) -> str | None:
     return req_id
 
 
+_DURABLE_COMMAND_TYPES = frozenset({
+    "text", "audio", "cancel_active_work", "mcp_confirm_response",
+    "scheduled_task_authorization_response",
+    "autonomous_authorization_response",
+    "autonomous_scope_extension_response",
+})
+
+
+def _durable_command_identity(msg_type: str, msg: dict) -> tuple[str, dict] | None:
+    """Return a stable value-free command ID and its semantic binding."""
+
+    if msg_type not in _DURABLE_COMMAND_TYPES or not isinstance(msg, dict):
+        return None
+    if msg_type in {"text", "audio"}:
+        stable = _clean_client_request_id(
+            msg.get("request_id") or msg.get("client_request_id")
+        )
+        if not stable:
+            return None
+        raw_payload = (
+            str(msg.get("content") or "")
+            if msg_type == "text" else str(msg.get("data") or "")
+        )
+        if not raw_payload:
+            return None
+        payload_hash = hashlib.sha256(
+            raw_payload.encode("utf-8", errors="replace")
+        ).hexdigest()
+        directives = msg.get("turn_directives")
+        directives_hash = (
+            hashlib.sha256(json.dumps(
+                directives,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            if directives is not None else ""
+        )
+        identity = {
+            "request_id": stable,
+            "conversation_id": str(msg.get("conversation_id") or ""),
+            "command_kind": msg_type,
+        }
+        binding = {
+            **identity,
+            "payload_hash": payload_hash,
+            "directives_hash": directives_hash,
+            "attachment_batch_id": str(
+                msg.get("attachment_batch_id") or ""
+            ),
+            "format": str(msg.get("format") or "") if msg_type == "audio" else "",
+        }
+    elif msg_type == "cancel_active_work":
+        if msg.get("schema_version") != 1:
+            return None
+        binding = {
+            key: str(msg.get(key) or "")
+            for key in (
+                "scope", "conversation_id", "request_id", "turn_id", "run_id",
+                "tool_attempt_id", "task_id", "operation_id",
+            )
+        }
+        if not binding.get("scope") or not binding.get("run_id"):
+            return None
+        identity = dict(binding)
+    elif msg_type == "mcp_confirm_response":
+        if not isinstance(msg.get("approved"), bool):
+            return None
+        binding = {
+            "confirmation_id": str(msg.get("id") or ""),
+            "approved": msg.get("approved") is True,
+        }
+        if not binding["confirmation_id"]:
+            return None
+        identity = {"confirmation_id": binding["confirmation_id"]}
+    else:
+        binding = {
+            key: msg.get(key)
+            for key in (
+                "request_id", "task_id", "run_id", "plan_revision",
+                "authorization_revision", "operation_id", "action",
+            )
+            if key in msg
+        }
+        if not binding:
+            return None
+        identity = {
+            key: binding[key]
+            for key in (
+                "request_id", "task_id", "run_id", "plan_revision",
+                "authorization_revision", "operation_id",
+            )
+            if key in binding
+        }
+        if not identity:
+            return None
+    material = json.dumps(
+        {"type": msg_type, "identity": identity},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "command_" + hashlib.sha256(material).hexdigest()[:48], binding
+
+
+async def _complete_durable_command(msg: dict, result: dict) -> None:
+    command_id = str(msg.get("_durable_command_id") or "")
+    execution_epoch = str(msg.get("_durable_command_epoch") or "")
+    if not command_id or not execution_epoch:
+        return
+    try:
+        await asyncio.to_thread(
+            _DURABLE_TRANSPORT.complete_command,
+            command_id,
+            execution_epoch=execution_epoch,
+            result=result,
+        )
+    except (RuntimeError, TypeError, ValueError):
+        pass
+
+
 def _application_transport_coordination_enabled() -> bool:
     try:
         from osia.transport_coordinator import (
@@ -1729,18 +1933,209 @@ def _new_turn_id() -> str:
     return _TURN_ID_PREFIX + secrets.token_hex(16)
 
 
-def _new_turn_meta(conv_id: str, client_request_id: str | None) -> dict:
+@contextmanager
+def _turn_event_sequence_process_lock(path: Path):
+    """Serialize one sequence reservation across overlapping server processes."""
+
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _next_durable_turn_event_sequence(turn_meta: dict) -> int:
+    """Reserve one monotonic sequence before a canonical event can be sent."""
+
+    binding = {
+        key: str(turn_meta.get(key) or "").strip()
+        for key in (
+            "conversation_id", "request_id", "turn_id", "run_id",
+            "provider_id", "model_id", "effective_reasoning",
+        )
+    }
+    if any(not value for value in binding.values()):
+        raise ValueError("turn event sequence binding is incomplete")
+    digest = hashlib.sha256(
+        binding["turn_id"].encode("utf-8")
+    ).hexdigest()
+    path = _TURN_EVENT_SEQUENCE_DIR / f"{digest}.json"
+    with _TURN_EVENT_SEQUENCE_LOCK, _turn_event_sequence_process_lock(path):
+        stored_sequence = 0
+        try:
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            persisted = None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("turn event sequence state is unreadable") from exc
+        if isinstance(persisted, dict):
+            persisted_binding = persisted.get("binding")
+            if persisted_binding != binding:
+                raise ValueError("turn event sequence binding changed")
+            try:
+                stored_sequence = max(0, int(persisted.get("sequence") or 0))
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("turn event sequence state is invalid")
+        current_sequence = max(
+            0,
+            int(turn_meta.get("_event_sequence") or 0),
+            stored_sequence,
+        )
+        if current_sequence == 0:
+            # Legacy turns did not persist their last sequence. A microsecond
+            # epoch is above their small counters and remains within int64.
+            current_sequence = time.time_ns() // 1_000
+        sequence = current_sequence + 1
+        state = {"binding": binding, "sequence": sequence}
+        _TURN_EVENT_SEQUENCE_DIR.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(
+            path.name + f".{os.getpid()}.{secrets.token_hex(6)}.tmp"
+        )
+        temporary.write_text(
+            json.dumps(
+                state,
+                sort_keys=True,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+        turn_meta["_event_sequence"] = sequence
+        return sequence
+
+
+def _resolve_chat_route_binding(turn_directives=None) -> dict[str, str]:
+    """Resolve the exact provider route before a canonical Chat turn is accepted."""
+
+    from osia.agent import MODEL as DEFAULT_MODEL
+    from osia.config import load_settings
+    from osia.models import provider_for_model_cached
+    from osia.reasoning import resolve_reasoning_option_id
+
+    settings = load_settings()
+    model_override = getattr(turn_directives, "model_override", None)
+    if model_override is not None:
+        provider_id = str(model_override.provider_id or "").strip().lower()
+        model_id = str(model_override.model_id or "").strip()
+    else:
+        model_id = str(settings.get("selected_model") or DEFAULT_MODEL).strip()
+        provider_id = str(
+            settings.get("selected_model_provider") or ""
+        ).strip().lower()
+        if not provider_id and model_id:
+            provider_id = str(
+                provider_for_model_cached(model_id) or ""
+            ).strip().lower()
+    reasoning_override = getattr(turn_directives, "reasoning_override", None)
+    effective_reasoning = str(
+        reasoning_override
+        if reasoning_override is not None else
+        resolve_reasoning_option_id(provider_id, model_id, settings)
+    ).strip().lower()
+    binding = {
+        "provider_id": provider_id,
+        "model_id": model_id,
+        "effective_reasoning": effective_reasoning,
+    }
+    if any(not value for value in binding.values()):
+        raise RuntimeError("canonical Chat route binding is incomplete")
+    return binding
+
+
+def _new_turn_meta(
+    conv_id: str,
+    client_request_id: str | None,
+    *,
+    turn_directives=None,
+) -> dict:
     request_id = client_request_id or ""
+    turn_id = _new_turn_id()
+    route = _resolve_chat_route_binding(turn_directives)
+    from osia.turn_terminality import live_process_identity
+
+    _owner_alive, owner_process_identity = live_process_identity(os.getpid())
+    assistant_message_id = _MESSAGE_ID_PREFIX + secrets.token_hex(16)
     return {
         "conversation_id": conv_id,
         "request_id": request_id,
         "client_request_id": request_id,
-        "turn_id": _new_turn_id(),
+        "turn_id": turn_id,
+        "run_id": turn_id,
+        **route,
         "user_message_id": _MESSAGE_ID_PREFIX + secrets.token_hex(16),
-        "assistant_message_id": _MESSAGE_ID_PREFIX + secrets.token_hex(16),
+        "assistant_message_id": assistant_message_id,
         "_event_sequence": 0,
         "persisted": False,
+        "_pinned_provider_id": route["provider_id"],
+        "_pinned_model_id": route["model_id"],
+        "_pinned_effective_reasoning": route["effective_reasoning"],
+        "_route_bound_at_accept": True,
+        "_execution_owner": "server",
+        "_execution_owner_pid": os.getpid(),
+        "_execution_owner_process_identity": owner_process_identity,
+        "_post_turn_media_lease_id": f"media_{assistant_message_id}",
+        "_post_turn_media_owner_pid": os.getpid(),
+        "_post_turn_media_owner_process_identity": owner_process_identity,
     }
+
+
+def _bind_pre_agent_cancellation_authority(turn_meta: dict) -> None:
+    """Persist an exact Stop even before the per-turn Agent is constructed."""
+
+    binding = {
+        key: str(turn_meta.get(key) or "")
+        for key in (
+            "conversation_id", "request_id", "turn_id", "run_id",
+            "provider_id", "model_id", "effective_reasoning",
+        )
+    }
+    objective = str(turn_meta.get("_terminality_objective") or "").strip()
+    if any(not value for value in binding.values()) or not objective:
+        return
+
+    def _request(turn_id: str, *, effect_possible: bool = False) -> bool:
+        if str(turn_id or "") != binding["turn_id"]:
+            return False
+        from osia.turn_terminality import TurnTerminalityController
+
+        controller = TurnTerminalityController(
+            turn_id=binding["turn_id"],
+            objective=objective,
+            execution_required=True,
+        )
+        existing_binding = controller.snapshot().get("execution_binding")
+        if existing_binding:
+            if existing_binding != binding:
+                return False
+        else:
+            controller.set_execution_binding(binding)
+        return controller.try_request_cancellation(
+            effect_possible=bool(effect_possible),
+        )
+
+    turn_meta["_terminality_cancel_intent"] = _request
+    turn_meta["_terminality_cancel"] = _request
 
 
 def _turn_fields(turn_meta: dict | None) -> dict:
@@ -1753,11 +2148,20 @@ def _turn_fields(turn_meta: dict | None) -> dict:
         or ""
     )
     turn_id = str(turn_meta.get("turn_id") or "")
+    run_id = str(turn_meta.get("run_id") or turn_id)
     if req_id:
         fields["request_id"] = req_id
         fields["client_request_id"] = req_id
     if turn_id:
         fields["turn_id"] = turn_id
+    if run_id:
+        fields["run_id"] = run_id
+    route = {
+        key: str(turn_meta.get(key) or "").strip()
+        for key in ("provider_id", "model_id", "effective_reasoning")
+    }
+    if all(route.values()):
+        fields.update(route)
     language = normalize_locale(turn_meta.get("language"))
     if language:
         fields["language"] = language
@@ -1786,29 +2190,62 @@ def _turn_event_frame(
         or ""
     )
     turn_id = str(turn_meta.get("turn_id") or "")
-    if not conversation_id or not request_id or not turn_id:
-        raise ValueError("turn event correlation is incomplete")
-    sequence = int(turn_meta.get("_event_sequence") or 0) + 1
-    turn_meta["_event_sequence"] = sequence
-    frame = {
-        "type": event_type,
-        "conversation_id": conversation_id,
-        "request_id": request_id,
-        # Existing clients still read this additive compatibility alias.
-        "client_request_id": request_id,
-        "turn_id": turn_id,
-        "event_id": _EVENT_ID_PREFIX + secrets.token_hex(16),
-        "event_type": event_type,
-        "sequence": sequence,
-        "terminal": bool(terminal),
+    run_id = str(turn_meta.get("run_id") or turn_id)
+    provider_id = str(turn_meta.get("provider_id") or "").strip()
+    model_id = str(turn_meta.get("model_id") or "").strip()
+    effective_reasoning = str(
+        turn_meta.get("effective_reasoning") or ""
+    ).strip()
+    if not all((
+        conversation_id, request_id, turn_id, run_id,
+        provider_id, model_id, effective_reasoning,
+    )):
+        raise ValueError("turn event correlation or route binding is incomplete")
+    event_payload = {
+        "provider_id": provider_id,
+        "model_id": model_id,
+        "effective_reasoning": effective_reasoning,
     }
     language = normalize_locale(turn_meta.get("language"))
     if language:
-        frame["language"] = language
+        event_payload["language"] = language
     if message_id:
-        frame["message_id"] = message_id
+        event_payload["message_id"] = message_id
     if payload:
-        frame.update(payload)
+        event_payload.update(payload)
+    # Payloads are presentation data only; they cannot replace the immutable
+    # execution route accepted for this turn.
+    event_payload.update({
+        "provider_id": provider_id,
+        "model_id": model_id,
+        "effective_reasoning": effective_reasoning,
+    })
+    envelope = _DURABLE_TRANSPORT.append_event(
+        conversation_id=conversation_id,
+        request_id=request_id,
+        turn_id=turn_id,
+        run_id=run_id,
+        event_type=event_type,
+        payload=event_payload,
+        attempt_id=str(event_payload.get("tool_attempt_id") or ""),
+        execution_epoch=str(turn_meta.get("_execution_epoch") or ""),
+        terminal=bool(terminal),
+        idempotency_key=(
+            f"{turn_id}:{cache_key}" if cache_key else ""
+        ),
+        state_updates={
+            "last_event_type": event_type,
+            "terminal": bool(terminal),
+            "status": str(event_payload.get("status") or ""),
+        },
+    )
+    frame = envelope.to_frame()
+    if event_type == "audio" and isinstance(event_payload.get("data"), str):
+        # Binary media is live-only.  The durable envelope records ordering and
+        # metadata, never base64; conversation/media hydration owns reconnect.
+        frame["data"] = event_payload["data"]
+    turn_meta["_event_sequence"] = envelope.sequence
+    turn_meta["_execution_epoch"] = envelope.execution_epoch
     if cache_key:
         turn_meta[cache_key] = dict(frame)
     return frame
@@ -1838,6 +2275,23 @@ def _turn_status_frame(turn_meta: dict, status: str) -> dict:
         cache_key=f"_terminal_frame_{status}" if terminal else None,
         payload=payload,
     )
+
+
+def _terminal_status_from_result(result: dict | None) -> str:
+    terminal_state = str((result or {}).get("terminal_state") or "")
+    if terminal_state == "success_verified":
+        return "done"
+    if terminal_state == "user_cancelled":
+        return "cancelled"
+    return "error"
+
+
+def _turn_terminal_frame(turn_meta: dict, result: dict | None) -> dict:
+    frame = _turn_status_frame(turn_meta, _terminal_status_from_result(result))
+    reason_code = str((result or {}).get("reason_code") or "")[:160]
+    if reason_code:
+        frame["reason_code"] = reason_code
+    return frame
 
 
 async def _broadcast_turn_status(
@@ -1914,26 +2368,304 @@ async def _cancel_turn_progress_task(task: "asyncio.Task | None") -> None:
         pass
 
 
+_TURN_INPUT_IDENTITY_VERSION = "turn-input-v1"
+
+
+def _turn_input_identity(
+    base_content: str,
+    *,
+    kind: str,
+    manifest: list[dict] | None = None,
+) -> dict[str, str]:
+    """Return deterministic base/full hashes without local paths or random ids."""
+
+    stable_kind = str(kind or "chat").strip().lower()
+    if not stable_kind:
+        raise ValueError("turn input kind is required")
+    base_hash = hashlib.sha256(str(base_content).encode("utf-8")).hexdigest()
+    manifest_hash = ""
+    if manifest:
+        canonical_manifest = json.dumps(
+            manifest,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        manifest_hash = hashlib.sha256(
+            canonical_manifest.encode("utf-8")
+        ).hexdigest()
+    full_material = "\0".join((
+        _TURN_INPUT_IDENTITY_VERSION,
+        stable_kind,
+        base_hash,
+        manifest_hash,
+    ))
+    return {
+        "client_content_hash": hashlib.sha256(
+            full_material.encode("utf-8")
+        ).hexdigest(),
+        "client_base_content_hash": base_hash,
+        "attachment_manifest_hash": manifest_hash,
+        "input_identity_version": _TURN_INPUT_IDENTITY_VERSION,
+        "input_kind": stable_kind,
+    }
+
+
+def _apply_turn_input_identity(turn_meta: dict, identity: dict[str, str]) -> None:
+    for key in (
+        "client_content_hash",
+        "client_base_content_hash",
+        "attachment_manifest_hash",
+        "input_identity_version",
+        "input_kind",
+    ):
+        turn_meta[key] = str(identity.get(key) or "")
+
+
+def _assert_request_input_identity(
+    record: dict,
+    *,
+    expected_user_content=None,
+    expected_identity: dict[str, str] | None = None,
+    legacy_client_content_hash: str = "",
+    legacy_exact_user_content: str = "",
+) -> None:
+    """Reject a request-id replay whose exact supplied input has changed."""
+
+    if isinstance(expected_identity, dict):
+        expected_base_hash = str(
+            expected_identity.get("client_base_content_hash") or ""
+        )
+        expected_full_hash = str(
+            expected_identity.get("client_content_hash") or ""
+        )
+        expected_manifest_hash = str(
+            expected_identity.get("attachment_manifest_hash") or ""
+        )
+        expected_version = str(
+            expected_identity.get("input_identity_version") or ""
+        )
+        expected_kind = str(expected_identity.get("input_kind") or "")
+    elif expected_user_content is not None:
+        expected_base_hash = hashlib.sha256(
+            str(expected_user_content).encode("utf-8")
+        ).hexdigest()
+        expected_full_hash = expected_base_hash
+        expected_manifest_hash = ""
+        expected_version = ""
+        expected_kind = ""
+    else:
+        return
+    if not expected_base_hash or not expected_full_hash:
+        raise ValueError("request input identity is incomplete")
+
+    stored_full_hash = str(record.get("client_content_hash") or "")
+    stored_base_hash = str(record.get("client_base_content_hash") or "")
+    stored_manifest_hash = str(record.get("attachment_manifest_hash") or "")
+    stored_version = str(record.get("input_identity_version") or "")
+    stored_kind = str(record.get("input_kind") or "")
+    stored_user_content = str(
+        record.get("user_content")
+        or record.get("persisted_user_content")
+        or record.get("_original_user_text")
+        or ""
+    )
+    legacy_content_matches = bool(
+        legacy_exact_user_content
+        and stored_user_content == legacy_exact_user_content
+    )
+    persisted_attachments = (
+        record.get("attachments")
+        or record.get("attachment_metadata")
+        or []
+    )
+    if (
+        not legacy_content_matches
+        and legacy_exact_user_content
+        and isinstance(persisted_attachments, list)
+        and persisted_attachments
+    ):
+        ordered_attachments = sorted(
+            (
+                item for item in persisted_attachments
+                if isinstance(item, dict)
+            ),
+            key=lambda item: (
+                item.get("logical_order")
+                if type(item.get("logical_order")) is int else 0
+            ),
+        )
+        display_names = ", ".join(
+            str(item.get("display_name") or "")
+            for item in ordered_attachments
+            if str(item.get("display_name") or "")
+        )
+        legacy_content_matches = bool(
+            display_names
+            and stored_user_content
+            == f"📎 {display_names}\n{legacy_exact_user_content}".strip()
+        )
+    if expected_manifest_hash:
+        exact = bool(
+            stored_full_hash == expected_full_hash
+            and stored_base_hash == expected_base_hash
+            and stored_manifest_hash == expected_manifest_hash
+            and stored_version == expected_version
+            and stored_kind == expected_kind
+        )
+        legacy_exact = bool(
+            legacy_client_content_hash
+            and not stored_version
+            and stored_full_hash == legacy_client_content_hash
+            and legacy_content_matches
+        )
+        if not exact and not legacy_exact:
+            raise ValueError("request id was already used with different content")
+        return
+
+    if (
+        stored_version == expected_version
+        and stored_base_hash == expected_base_hash
+        and (
+            stored_kind == expected_kind
+            or (stored_kind, expected_kind) in {
+                ("legacy-attachments", "text"),
+                ("legacy-audio-attachments", "audio"),
+            }
+        )
+    ):
+        return
+    legacy_exact = bool(
+        legacy_client_content_hash
+        and not stored_version
+        and not stored_kind
+        and stored_full_hash == legacy_client_content_hash
+        and legacy_content_matches
+    )
+    if not legacy_exact:
+        raise ValueError("request id was already used with different content")
+
+
+def _legacy_audio_replay_record(
+    record: dict | None,
+    legacy_audio_hash: str,
+    *,
+    require_complete: bool,
+) -> bool:
+    """Recognize only the exact pre-version, attachment-free audio shape."""
+
+    if not isinstance(record, dict) or not legacy_audio_hash:
+        return False
+    if any(
+        str(record.get(key) or "")
+        for key in (
+            "client_base_content_hash",
+            "attachment_manifest_hash",
+            "input_identity_version",
+            "input_kind",
+        )
+    ):
+        return False
+    if str(record.get("client_content_hash") or "") != legacy_audio_hash:
+        return False
+    attachments = record.get("attachments") or record.get("attachment_metadata")
+    if attachments:
+        return False
+    stored_transcript = str(
+        record.get("user_content")
+        or record.get("persisted_user_content")
+        or ""
+    )
+    if (
+        not stored_transcript.strip()
+        or stored_transcript.startswith((
+            "📎 ",
+            "[Document/media attachments available",
+            "[Document image available",
+        ))
+    ):
+        return False
+    if not require_complete:
+        return True
+    try:
+        response_sequence = int(record.get("response_sequence") or 0)
+        terminal_sequence = int(record.get("terminal_sequence") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        isinstance(record.get("assistant_content"), str)
+        and str(record.get("assistant_content") or "").strip()
+        and str(record.get("assistant_message_id") or "")
+        and str(record.get("response_event_id") or "")
+        and response_sequence > 0
+        and str(record.get("terminal_event_id") or "")
+        and terminal_sequence > response_sequence
+    )
+
+
+def _transactional_attachment_manifest(batch) -> list[dict]:
+    return [
+        {
+            "logical_order": int(item.logical_order),
+            "display_name": str(item.display_name),
+            "byte_size": int(item.bytes_written),
+            "sha256": str(item.declared_sha256).lower(),
+            "category": str(item.detected_category).lower(),
+            "mime": str(item.detected_mime).lower(),
+        }
+        for item in sorted(
+            batch.files.values(), key=lambda value: value.logical_order,
+        )
+    ]
+
+
+def _legacy_attachment_manifest(
+    paths: list[str],
+    display_names: dict[str, str] | None = None,
+) -> list[dict]:
+    manifest = []
+    names = display_names or {}
+    for logical_order, raw_path in enumerate(paths):
+        path = Path(raw_path)
+        data = path.read_bytes()
+        image_mime = _image_mime_for(path)
+        manifest.append({
+            "logical_order": logical_order,
+            "display_name": str(names.get(str(path)) or path.suffix.lower()),
+            "byte_size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "category": "image" if image_mime else "file",
+            "mime": image_mime or "application/octet-stream",
+        })
+    return manifest
+
+
 async def _send_existing_turn_status(
     channel: "_OutboundChannel",
     conv_id: str,
     client_request_id: str | None,
     *,
     expected_user_content=None,
+    expected_identity: dict[str, str] | None = None,
+    legacy_client_content_hash: str = "",
+    legacy_exact_user_content: str = "",
 ) -> bool:
     if not client_request_id or not _is_conversation_busy(conv_id):
         return False
     meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
-    if not meta or meta.get("client_request_id") != client_request_id:
-        return False
     if (
-        expected_user_content is not None
-        and str(meta.get("client_content_hash") or "")
-        != hashlib.sha256(
-            str(expected_user_content).encode("utf-8")
-        ).hexdigest()
+        not meta
+        or meta.get("persisted") is not True
+        or meta.get("client_request_id") != client_request_id
     ):
-        raise ValueError("request id was already used with different content")
+        return False
+    _assert_request_input_identity(
+        meta,
+        expected_user_content=expected_user_content,
+        expected_identity=expected_identity,
+        legacy_client_content_hash=legacy_client_content_hash,
+        legacy_exact_user_content=legacy_exact_user_content,
+    )
     await channel.send_json(_turn_accepted_frame(meta))
     await channel.send_json(
         _turn_status_frame(meta, _active_turn_working_status(conv_id))
@@ -1946,6 +2678,9 @@ async def _send_existing_turn_status_for_request(
     client_request_id: str | None,
     *,
     expected_user_content=None,
+    expected_identity: dict[str, str] | None = None,
+    legacy_client_content_hash: str = "",
+    legacy_exact_user_content: str = "",
 ) -> bool:
     if not client_request_id:
         return False
@@ -1957,6 +2692,9 @@ async def _send_existing_turn_status_for_request(
         conv_id,
         client_request_id,
         expected_user_content=expected_user_content,
+        expected_identity=expected_identity,
+        legacy_client_content_hash=legacy_client_content_hash,
+        legacy_exact_user_content=legacy_exact_user_content,
     )
 
 
@@ -1997,7 +2735,11 @@ _WAITING_STATUS_COMMANDS = frozenset({
 def _active_turn_working_status(conv_id: str) -> str:
     """Return one additive non-terminal state for reconnect/status recovery."""
 
-    meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id) or {}
+    meta = (
+        _ACTIVE_TURN_META_BY_CONV.get(conv_id)
+        or _POST_TURN_MEDIA_META_BY_CONV.get(conv_id)
+        or {}
+    )
     remembered = str(meta.get("_tool_attempt_status") or "")
     try:
         from osia.tool_attempts import get_tool_attempt_store
@@ -2032,8 +2774,15 @@ async def _send_recovered_turn_state(
 ) -> bool:
     """Rebind a connected client to an existing turn with fresh event ids."""
 
-    meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
-    if not isinstance(meta, dict) or not _is_conversation_busy(conv_id):
+    meta = (
+        _ACTIVE_TURN_META_BY_CONV.get(conv_id)
+        or _POST_TURN_MEDIA_META_BY_CONV.get(conv_id)
+    )
+    if (
+        not isinstance(meta, dict)
+        or meta.get("persisted") is not True
+        or not _is_conversation_busy(conv_id)
+    ):
         return False
     accepted = _turn_event_frame(
         meta,
@@ -2098,7 +2847,8 @@ async def _handle_waiting_tool_command(
         "annule l action", "arrete l action",
     }
     coordinator = get_tool_attempt_coordinator()
-    if coordinator.store.find_compatible_suspended_turn(conv_id) is None:
+    suspended_attempt = coordinator.store.find_compatible_suspended_turn(conv_id)
+    if suspended_attempt is None:
         meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
         if (
             cancel_requested
@@ -2108,6 +2858,30 @@ async def _handle_waiting_tool_command(
             # The provider is still planning and no tool receipt exists yet.
             # Carry one bounded intent to the first accepted tool boundary;
             # this never creates a second turn or dispatches an action.
+            terminality_cancel = meta.get("_terminality_cancel")
+            accepted = False
+            if callable(terminality_cancel):
+                try:
+                    accepted = terminality_cancel(
+                        str(meta.get("turn_id") or ""),
+                        effect_possible=False,
+                    )
+                except Exception:
+                    accepted = False
+            if accepted is not True:
+                await _send_cancellation_rejection(
+                    channel,
+                    "chat",
+                    "cancellation_unavailable",
+                    **{
+                        key: str(meta.get(key) or "")
+                        for key in (
+                            "conversation_id", "request_id",
+                            "turn_id", "run_id",
+                        )
+                    },
+                )
+                return True
             meta["_tool_cancel_requested"] = True
             await channel.send_json(
                 _turn_status_frame(meta, "cancellation_requested")
@@ -2115,8 +2889,70 @@ async def _handle_waiting_tool_command(
             return True
         return False
     if cancel_requested:
-        handled = coordinator.request_cancellation(conv_id)
+        meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
+        if (
+            not isinstance(meta, dict)
+            or not _is_conversation_busy(conv_id)
+            or not _tool_attempt_matches_turn_meta(
+                suspended_attempt, meta, conversation_id=conv_id,
+            )
+        ):
+            await _send_cancellation_rejection(
+                channel,
+                "chat",
+                "active_receipt_mismatch",
+                conversation_id=conv_id,
+                **(
+                    {
+                        key: str(meta.get(key) or "")
+                        for key in ("request_id", "turn_id", "run_id")
+                    }
+                    if isinstance(meta, dict) else {}
+                ),
+            )
+            return True
+        terminality_cancel = (
+            meta.get("_terminality_cancel")
+            if isinstance(meta, dict) else None
+        )
+        accepted = False
+        if callable(terminality_cancel):
+            try:
+                accepted = terminality_cancel(
+                    str(meta.get("turn_id") or ""),
+                    effect_possible=True,
+                )
+            except Exception:
+                accepted = False
+        if accepted is not True:
+            await _send_cancellation_rejection(
+                channel,
+                "chat",
+                "cancellation_unavailable",
+                **(
+                    {
+                        key: str(meta.get(key) or "")
+                        for key in (
+                            "conversation_id", "request_id",
+                            "turn_id", "run_id",
+                        )
+                    }
+                    if isinstance(meta, dict) else
+                    {"conversation_id": conv_id}
+                ),
+            )
+            return True
+        meta["_tool_cancel_requested"] = True
+        try:
+            handled = coordinator.request_cancellation(conv_id)
+        except Exception:
+            handled = False
         status = "cancellation_requested"
+        if not handled:
+            # The terminality Stop CAS already won. Consume this control
+            # command and retain the durable intent for exact recovery.
+            await channel.send_json(_turn_status_frame(meta, status))
+            return True
     elif _is_resume_reconciliation_command(text):
         handled = coordinator.request_reconciliation(conv_id)
         status = "verifying"
@@ -2161,6 +2997,53 @@ def _request_exact_tool_attempt_cancellation(attempt_id: str) -> bool:
         return False
 
 
+def _tool_attempt_matches_turn_meta(
+    attempt: dict,
+    turn_meta: dict,
+    *,
+    conversation_id: str = "",
+) -> bool:
+    """Require one durable tool receipt to belong to this exact Chat turn."""
+
+    if not isinstance(attempt, dict) or not isinstance(turn_meta, dict):
+        return False
+    expected = {
+        "conversation_id": str(
+            turn_meta.get("conversation_id") or conversation_id or ""
+        ),
+        "request_id": str(
+            turn_meta.get("request_id")
+            or turn_meta.get("client_request_id")
+            or ""
+        ),
+        "turn_id": str(turn_meta.get("turn_id") or ""),
+        "provider_id": str(turn_meta.get("provider_id") or ""),
+        "model_id": str(turn_meta.get("model_id") or ""),
+        "final_response_message_id": str(
+            turn_meta.get("assistant_message_id") or ""
+        ),
+    }
+    remembered_attempt_id = str(
+        turn_meta.get("_tool_attempt_id")
+        or turn_meta.get("_existing_tool_attempt_id")
+        or ""
+    )
+    return bool(
+        all(expected.values())
+        and (not conversation_id or expected["conversation_id"] == conversation_id)
+        and str(attempt.get("owner_scope") or "chat") == "chat"
+        and all(
+            str(attempt.get(key) or "") == value
+            for key, value in expected.items()
+        )
+        and (
+            not remembered_attempt_id
+            or str(attempt.get("tool_attempt_id") or "")
+            == remembered_attempt_id
+        )
+    )
+
+
 def _apply_queued_tool_cancellation(turn_meta: dict, attempt_id: str) -> bool:
     """Apply one turn-scoped cancellation intent without consuming it."""
 
@@ -2196,6 +3079,61 @@ async def _send_cancellation_rejection(
     })
 
 
+async def _propagate_committed_turn_cancellation(
+    callback, turn_id: str, *, effect_possible: bool,
+) -> None:
+    """Run slower tool/provider shutdown after the durable terminal projection."""
+
+    try:
+        await asyncio.to_thread(
+            callback,
+            turn_id,
+            effect_possible=bool(effect_possible),
+        )
+    except Exception:
+        # The durable tombstone and generation fence already won. Provider
+        # shutdown is best-effort and cannot reactivate this execution owner.
+        pass
+
+
+def _durable_cancelled_chat_terminal_frame(
+    *,
+    conversation_id: str,
+    request_id: str,
+    turn_id: str,
+    run_id: str,
+    tool_attempt_id: str = "",
+) -> dict | None:
+    """Recover one exact historical Stop without reviving active ownership."""
+
+    try:
+        stream = _DURABLE_TRANSPORT.get_stream(conversation_id, run_id)
+        if stream.get("authority_state") != "cancelled":
+            return None
+        frames = _DURABLE_TRANSPORT.replay(
+            conversation_id=conversation_id,
+            run_id=run_id,
+        )
+    except Exception:
+        return None
+    for frame in reversed(frames):
+        if (
+            frame.get("terminal") is True
+            and frame.get("event_type") == "turn_status"
+            and frame.get("status") in {"cancelled", "canceled"}
+            and str(frame.get("conversation_id") or "") == conversation_id
+            and str(frame.get("request_id") or "") == request_id
+            and str(frame.get("turn_id") or "") == turn_id
+            and str(frame.get("run_id") or "") == run_id
+            and (
+                not tool_attempt_id
+                or str(frame.get("tool_attempt_id") or "") == tool_attempt_id
+            )
+        ):
+            return dict(frame)
+    return None
+
+
 async def _handle_correlated_chat_cancellation(
     channel: "_OutboundChannel", msg: dict,
 ) -> bool:
@@ -2206,6 +3144,11 @@ async def _handle_correlated_chat_cancellation(
         msg.get("request_id") or msg.get("client_request_id")
     )
     turn_id = _clean_cancellation_target_id(msg.get("turn_id"))
+    supplied_run_id = (
+        _clean_cancellation_target_id(msg.get("run_id"))
+        if msg.get("run_id") else ""
+    )
+    run_id = supplied_run_id or turn_id
     supplied_attempt_id = _clean_cancellation_target_id(
         msg.get("tool_attempt_id"), maximum=160,
     ) if msg.get("tool_attempt_id") else ""
@@ -2214,21 +3157,47 @@ async def _handle_correlated_chat_cancellation(
         "request_id": request_id or "",
         "client_request_id": request_id or "",
         "turn_id": turn_id,
+        "run_id": run_id,
         "tool_attempt_id": supplied_attempt_id,
     }
-    if not conv_id or request_id is None or not turn_id:
+    if (
+        not conv_id
+        or request_id is None
+        or not turn_id
+        or (msg.get("run_id") and not supplied_run_id)
+    ):
         await _send_cancellation_rejection(
             channel, "chat", "incomplete_target", **target,
         )
         return False
     meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
-    if not isinstance(meta, dict) or not _is_conversation_busy(conv_id):
+    active_target_matches = bool(
+        isinstance(meta, dict)
+        and str(meta.get("turn_id") or "") == turn_id
+        and str(meta.get("run_id") or meta.get("turn_id") or "") == run_id
+        and str(meta.get("request_id") or meta.get("client_request_id") or "")
+        == request_id
+    )
+    if not active_target_matches:
+        historical = _durable_cancelled_chat_terminal_frame(
+            conversation_id=conv_id,
+            request_id=request_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            tool_attempt_id=supplied_attempt_id,
+        )
+        if historical is not None:
+            await channel.send_json(historical)
+            return True
+    if not isinstance(meta, dict):
         await _send_cancellation_rejection(
             channel, "chat", "target_not_active", **target,
         )
         return False
+    active_run_id = str(meta.get("run_id") or meta.get("turn_id") or "")
     if (
         str(meta.get("turn_id") or "") != turn_id
+        or active_run_id != run_id
         or str(meta.get("request_id") or meta.get("client_request_id") or "")
         != request_id
     ):
@@ -2236,6 +3205,23 @@ async def _handle_correlated_chat_cancellation(
             channel, "chat", "target_mismatch", **target,
         )
         await _send_recovered_turn_state(channel, conv_id)
+        return False
+    remembered_control = meta.get("_cancellation_control_target")
+    if (
+        isinstance(remembered_control, tuple)
+        and len(remembered_control) == 5
+        and remembered_control[:4] == (conv_id, request_id, turn_id, run_id)
+        and (
+            not supplied_attempt_id
+            or supplied_attempt_id == remembered_control[4]
+        )
+    ):
+        await channel.send_json(_turn_status_frame(meta, "cancelled"))
+        return True
+    if not _is_conversation_busy(conv_id):
+        await _send_cancellation_rejection(
+            channel, "chat", "target_not_active", **target,
+        )
         return False
 
     from osia.tool_attempts import (
@@ -2246,9 +3232,8 @@ async def _handle_correlated_chat_cancellation(
 
     store = get_tool_attempt_store()
     attempt = store.find_compatible_suspended_turn(conv_id)
-    if isinstance(attempt, dict) and (
-        str(attempt.get("turn_id") or "") != turn_id
-        or str(attempt.get("request_id") or "") != request_id
+    if isinstance(attempt, dict) and not _tool_attempt_matches_turn_meta(
+        attempt, meta, conversation_id=conv_id,
     ):
         await _send_cancellation_rejection(
             channel, "chat", "active_receipt_mismatch", **target,
@@ -2264,13 +3249,9 @@ async def _handle_correlated_chat_cancellation(
         )
         return False
 
-    control_target = (conv_id, request_id, turn_id, active_attempt_id)
-    if meta.get("_cancellation_control_target") == control_target:
-        await channel.send_json(
-            _turn_status_frame(meta, _active_turn_working_status(conv_id))
-        )
-        return True
-
+    control_target = (
+        conv_id, request_id, turn_id, run_id, active_attempt_id,
+    )
     if attempt is None and remembered_attempt_id:
         remembered = store.get_attempt(remembered_attempt_id)
         if (
@@ -2282,27 +3263,34 @@ async def _handle_correlated_chat_cancellation(
             )
             return False
 
-    status = "cancellation_requested"
+    status = "cancelled"
+    terminality_intent = meta.get("_terminality_cancel_intent")
     terminality_cancel = meta.get("_terminality_cancel")
-    if callable(terminality_cancel):
-        try:
-            terminality_cancel(
-                turn_id,
-                effect_possible=bool(active_attempt_id),
-            )
-        except Exception:
-            pass
+    if not callable(terminality_intent):
+        terminality_intent = terminality_cancel
+    if not callable(terminality_intent):
+        await _send_cancellation_rejection(
+            channel, "chat", "cancellation_unavailable", **target,
+        )
+        return False
+    try:
+        terminality_accepted = terminality_intent(
+            turn_id,
+            effect_possible=bool(active_attempt_id),
+        )
+    except Exception:
+        await _send_cancellation_rejection(
+            channel, "chat", "cancellation_unavailable", **target,
+        )
+        return False
+    if terminality_accepted is not True:
+        await _send_cancellation_rejection(
+            channel, "chat", "target_not_cancellable", **target,
+        )
+        return False
+    meta["_tool_cancel_requested"] = True
     if isinstance(attempt, dict):
         attempt_id = str(attempt.get("tool_attempt_id") or "")
-        try:
-            requested = store.request_cancellation(attempt_id)
-        except Exception:
-            await _send_cancellation_rejection(
-                channel, "chat", "cancellation_unavailable", **target,
-            )
-            return False
-        if ToolAttemptStatus(requested["status"]) is ToolAttemptStatus.CANCELLED_PROVEN:
-            status = "cancelled_proven"
         meta["_tool_attempt_id"] = attempt_id
     else:
         # The provider is still planning. Carry the intent to the first exact
@@ -2313,7 +3301,784 @@ async def _handle_correlated_chat_cancellation(
     frame = _turn_status_frame(meta, status)
     await channel.send_json(frame)
     await _broadcast_turn_status(meta, status, exclude=channel, frame=frame)
+    if isinstance(attempt, dict):
+        try:
+            store.request_cancellation(active_attempt_id)
+        except Exception:
+            # Stop is already the terminal authority. A failed observer/tool
+            # shutdown is retained as possible evidence; it cannot undo Stop.
+            pass
+    if callable(terminality_cancel) and terminality_cancel is not terminality_intent:
+        propagation_task = asyncio.create_task(
+            _propagate_committed_turn_cancellation(
+            terminality_cancel,
+            turn_id,
+            effect_possible=bool(active_attempt_id),
+            )
+        )
+        meta["_cancellation_propagation_task"] = propagation_task
+    active_task = _ACTIVE_TURNS_BY_CONV.get(conv_id)
+    current_task = asyncio.current_task()
+    released = bool(
+        isinstance(active_task, asyncio.Future)
+        and _clear_conversation_turn(conv_id, active_task)
+    )
+    if released:
+        # The terminal Stop event is already durable.  Busy=false is an
+        # ephemeral ownership projection, deliberately not another event in
+        # the tombstoned execution stream.
+        busy_frame = _conversation_busy_changed_frame(conv_id, False)
+        await channel.send_json(busy_frame)
+        await _broadcast_conversation_busy_changed(
+            conv_id,
+            False,
+            frame=busy_frame,
+            exclude=channel,
+        )
+    if (
+        isinstance(active_task, asyncio.Future)
+        and active_task is not current_task
+        and not active_task.done()
+    ):
+        active_task.cancel()
     return True
+
+
+async def _resume_incomplete_persisted_chat_turn(
+    channel: "_OutboundChannel",
+    found: dict,
+    *,
+    owner_turn_meta: dict | None = None,
+) -> bool:
+    """Reattach one persisted direct-Chat turn without replaying its action."""
+
+    conv_id = str(found.get("conversation_id") or "")
+    request_id = str(found.get("request_id") or "")
+    turn_id = str(found.get("turn_id") or "")
+    conversation = conversations.get_conversation(conv_id)
+    messages = list((conversation or {}).get("messages") or [])
+    user_index = next((
+        index for index, item in enumerate(messages)
+        if isinstance(item, dict)
+        and item.get("role") == "user"
+        and str(item.get("_request_id") or item.get("_client_request_id") or "")
+        == request_id
+        and str(item.get("_turn_id") or "") == turn_id
+    ), -1)
+    if user_index < 0:
+        return False
+    user_message = messages[user_index]
+    objective = user_message.get("_terminality_objective")
+    if not isinstance(objective, str) or not objective.strip():
+        objective = user_message.get("content")
+    if not isinstance(objective, str) or not objective.strip():
+        return False
+    persisted_directives = user_message.get("_turn_directives_v1")
+    turn_directives = None
+    if persisted_directives is not None:
+        if not isinstance(persisted_directives, dict):
+            return False
+        try:
+            from osia.slash_commands import SlashTurnDirectivesV1
+
+            turn_directives = SlashTurnDirectivesV1.from_wire(
+                persisted_directives
+            )
+        except Exception:
+            return False
+
+    try:
+        from osia.turn_terminality import (
+            TurnTerminalityController,
+            load_persisted_terminal_result,
+        )
+
+        controller = TurnTerminalityController(
+            turn_id=turn_id,
+            objective=objective,
+            execution_required=True,
+        )
+        terminality_snapshot = controller.snapshot()
+        execution_binding = terminality_snapshot.get("execution_binding") or {}
+        persisted_terminal = load_persisted_terminal_result(turn_id)
+    except Exception:
+        return False
+    expected_binding = {
+        "conversation_id": conv_id,
+        "request_id": request_id,
+        "turn_id": turn_id,
+        "run_id": turn_id,
+    }
+    if (
+        not isinstance(execution_binding, dict)
+        or any(
+            str(execution_binding.get(key) or "") != value
+            for key, value in expected_binding.items()
+        )
+        or any(
+            not str(execution_binding.get(key) or "")
+            for key in ("provider_id", "model_id", "effective_reasoning")
+        )
+        or str(user_message.get("_run_id") or turn_id) != turn_id
+    ):
+        return False
+
+    assistant_message_id = str(
+        user_message.get("_assistant_message_id") or ""
+    )
+    try:
+        from osia.tool_attempts import (
+            RECOVERABLE_STATUSES,
+            TERMINAL_STATUSES,
+            ToolAttemptStatus,
+            get_tool_attempt_store,
+        )
+
+        continuation_store = get_tool_attempt_store()
+        suspended = continuation_store.find_resumable_chat_turn(conv_id)
+    except Exception:
+        return False
+    try:
+        suspended_status = (
+            ToolAttemptStatus(suspended.get("status"))
+            if isinstance(suspended, dict) else None
+        )
+    except (TypeError, ValueError):
+        suspended_status = None
+
+    if persisted_terminal is not None:
+        terminal_binding = persisted_terminal.get("execution_binding") or {}
+        if terminal_binding != execution_binding:
+            return False
+        if not _clean_cancellation_target_id(assistant_message_id):
+            return False
+        from osia.agent import strip_tool_artifacts
+        from osia.execution_trace import (
+            ExecutionTraceLedger,
+            terminal_display_key,
+            validate_persisted_trace,
+        )
+        from osia.tool_attempts import is_internal_tool_control_text
+
+        reserved_text = str(persisted_terminal.get("final_text") or "")
+        final_text = strip_tool_artifacts(reserved_text).strip()
+        if (
+            not final_text
+            or final_text != reserved_text.strip()
+            or is_internal_tool_control_text(final_text)
+        ):
+            return False
+        terminal_key = terminal_display_key(
+            str(persisted_terminal.get("terminal_state") or "")
+        )
+        if not terminal_key:
+            return False
+        safe_trace = validate_persisted_trace(
+            persisted_terminal.get("execution_trace")
+        )
+        if safe_trace is not None and (
+            any(
+                str(safe_trace.get(key) or "")
+                != str(execution_binding.get(key) or "")
+                for key in (
+                    "conversation_id", "request_id", "turn_id", "run_id",
+                    "provider_id", "model_id", "effective_reasoning",
+                )
+            )
+            or not any(
+                isinstance(event, dict) and event.get("terminal") is True
+                for event in safe_trace.get("events") or ()
+            )
+        ):
+            safe_trace = None
+        if safe_trace is None:
+            recovery_trace = ExecutionTraceLedger(**execution_binding)
+            recovery_trace.record(
+                kind="terminal",
+                display_key=terminal_key,
+                terminal=True,
+                dedupe_key="terminal",
+            )
+            safe_trace = validate_persisted_trace(recovery_trace.snapshot())
+        if safe_trace is None:
+            return False
+        recovered_turn_meta = {
+            "conversation_id": conv_id,
+            "request_id": request_id,
+            "client_request_id": request_id,
+            "turn_id": turn_id,
+            "run_id": str(execution_binding.get("run_id") or turn_id),
+            "provider_id": str(execution_binding.get("provider_id") or ""),
+            "model_id": str(execution_binding.get("model_id") or ""),
+            "effective_reasoning": str(
+                execution_binding.get("effective_reasoning") or ""
+            ),
+            "user_message_id": str(user_message.get("_message_id") or ""),
+            "assistant_message_id": assistant_message_id,
+            "_event_sequence": 0,
+            "persisted": True,
+            "_execution_trace_v1": safe_trace,
+        }
+        if isinstance(owner_turn_meta, dict):
+            exact_owner_binding = {
+                "conversation_id": conv_id,
+                "request_id": request_id,
+                "turn_id": turn_id,
+                "run_id": str(execution_binding.get("run_id") or turn_id),
+                "provider_id": str(execution_binding.get("provider_id") or ""),
+                "model_id": str(execution_binding.get("model_id") or ""),
+                "effective_reasoning": str(
+                    execution_binding.get("effective_reasoning") or ""
+                ),
+                "user_message_id": str(user_message.get("_message_id") or ""),
+                "assistant_message_id": assistant_message_id,
+            }
+            if any(
+                str(owner_turn_meta.get(key) or "") != value
+                for key, value in exact_owner_binding.items()
+            ):
+                return False
+            turn_meta = owner_turn_meta
+            turn_meta["persisted"] = True
+            turn_meta["_execution_trace_v1"] = safe_trace
+            turn_meta.setdefault("_event_sequence", 0)
+        else:
+            turn_meta = recovered_turn_meta
+        from osia.document_artifacts import normalize_references
+
+        artifact_refs = normalize_references(
+            persisted_terminal.get("artifact_refs")
+        )
+        if artifact_refs:
+            turn_meta["_artifact_refs"] = artifact_refs
+        language = normalize_locale(user_message.get("_language"))
+        if language:
+            turn_meta["language"] = language
+        response_frame = _turn_event_frame(
+            turn_meta,
+            "response",
+            message_id=assistant_message_id,
+            payload={"content": final_text},
+        )
+        terminal_frame = _turn_terminal_frame(turn_meta, persisted_terminal)
+        continuation_id = ""
+        continuation_claim = None
+        if suspended_status in TERMINAL_STATUSES:
+            continuation_id = str(suspended.get("tool_attempt_id") or "")
+            if (
+                continuation_store is None
+                or not continuation_id
+                or str(suspended.get("owner_scope") or "chat") != "chat"
+                or any(
+                    str(suspended.get(key) or "")
+                    != str(execution_binding.get(key) or "")
+                    for key in (
+                        "conversation_id", "request_id", "turn_id",
+                        "provider_id", "model_id",
+                    )
+                )
+                or str(suspended.get("final_response_message_id") or "")
+                != assistant_message_id
+            ):
+                return False
+            continuation_claim = await asyncio.to_thread(
+                continuation_store.claim_continuation, continuation_id,
+            )
+            if continuation_claim is None:
+                return False
+        release_continuation_claim = continuation_claim is not None
+        try:
+            if not _persist_completed_assistant_message(
+                conv_id,
+                final_text,
+                turn_meta,
+                response_frame,
+                terminal_frame,
+            ):
+                return False
+            if continuation_claim is not None:
+                completed = await asyncio.to_thread(
+                    continuation_store.complete_continuation,
+                    continuation_id,
+                    continuation_claim,
+                    final_response_message_id=assistant_message_id,
+                )
+                if not completed:
+                    return False
+                release_continuation_claim = False
+            await _broadcast_committed_receipt(
+                conv_id,
+                turn_meta.get("_assistant_commit"),
+            )
+            terminal_frame["persisted"] = True
+            await channel.send_json(response_frame)
+            await channel.send_json(terminal_frame)
+            return True
+        finally:
+            if release_continuation_claim:
+                try:
+                    await asyncio.to_thread(
+                        continuation_store.release_continuation,
+                        continuation_id,
+                        continuation_claim,
+                    )
+                except Exception:
+                    pass
+
+    if (
+        terminality_snapshot.get("terminal_state")
+        or terminality_snapshot.get("final_reservation")
+        or not isinstance(terminality_snapshot.get("strategy_snapshot"), dict)
+        or not terminality_snapshot.get("strategy_snapshot")
+    ):
+        return False
+
+    if not isinstance(suspended, dict):
+        return False
+    suspended_message_id = str(
+        suspended.get("final_response_message_id") or ""
+    )
+    if (
+        (
+            suspended_status not in RECOVERABLE_STATUSES
+            and not (
+                suspended_status in TERMINAL_STATUSES
+                and suspended.get("continuation_state") != "complete"
+            )
+        )
+        or str(suspended.get("owner_scope") or "chat") != "chat"
+        or any(
+            str(suspended.get(key) or "") != expected
+            for key, expected in (
+                ("conversation_id", conv_id),
+                ("request_id", request_id),
+                ("turn_id", turn_id),
+                ("provider_id", str(execution_binding["provider_id"])),
+                ("model_id", str(execution_binding["model_id"])),
+            )
+        )
+        or not str(suspended.get("tool_attempt_id") or "")
+        or not suspended_message_id
+        or (assistant_message_id and assistant_message_id != suspended_message_id)
+    ):
+        return False
+    assistant_message_id = suspended_message_id
+    attachment_manifest_hash = str(
+        user_message.get("_attachment_manifest_hash") or ""
+    )
+    durable_agent_input = user_message.get("_durable_agent_input_v1")
+    if attachment_manifest_hash and (
+        not isinstance(durable_agent_input, str)
+        or not durable_agent_input.strip()
+    ):
+        # Pre-migration attachment turns did not persist their opaque source
+        # bindings. Never continue them as text-only provider input.
+        return False
+    resume_input = (
+        durable_agent_input if attachment_manifest_hash else objective
+    )
+
+    run_id = str(execution_binding["run_id"])
+    turn_meta = {
+        "conversation_id": conv_id,
+        "request_id": request_id,
+        "client_request_id": request_id,
+        "turn_id": turn_id,
+        "run_id": run_id,
+        "provider_id": str(execution_binding.get("provider_id") or ""),
+        "model_id": str(execution_binding.get("model_id") or ""),
+        "effective_reasoning": str(
+            execution_binding.get("effective_reasoning") or ""
+        ),
+        "user_message_id": str(user_message.get("_message_id") or ""),
+        "assistant_message_id": assistant_message_id,
+        "client_content_hash": str(
+            user_message.get("_client_content_hash") or ""
+        ),
+        "client_base_content_hash": str(
+            user_message.get("_client_base_content_hash") or ""
+        ),
+        "attachment_manifest_hash": attachment_manifest_hash,
+        "input_identity_version": str(
+            user_message.get("_input_identity_version") or ""
+        ),
+        "input_kind": str(user_message.get("_input_kind") or ""),
+        "persisted_user_content": user_message.get("content"),
+        "_terminality_objective": objective,
+        "_accepted_user_already_persisted": True,
+        "_event_sequence": 0,
+        "persisted": True,
+        "_pinned_provider_id": str(
+            execution_binding.get("provider_id") or ""
+        ),
+        "_pinned_model_id": str(execution_binding.get("model_id") or ""),
+        "_pinned_effective_reasoning": str(
+            execution_binding.get("effective_reasoning") or ""
+        ),
+        "_existing_tool_attempt_id": str(
+            suspended.get("tool_attempt_id") or ""
+        ),
+    }
+    if attachment_manifest_hash:
+        turn_meta["_durable_agent_input_v1"] = durable_agent_input
+    if turn_directives is not None:
+        turn_meta["turn_directives"] = turn_directives
+        turn_meta["_turn_directives_v1"] = dict(persisted_directives)
+    language = normalize_locale(user_message.get("_language"))
+    if language:
+        turn_meta["language"] = language
+    _bind_pre_agent_cancellation_authority(turn_meta)
+
+    async def _resume() -> None:
+        try:
+            await _run_agent_and_respond(
+                channel,
+                resume_input,
+                messages[:user_index],
+                conv_id,
+                turn_meta=turn_meta,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(
+                "[OSIA Server] persisted Chat recovery failed "
+                f"category={type(exc).__name__}"
+            )
+            await _finalize_admitted_turn_after_worker_failure(
+                channel,
+                conv_id,
+                turn_meta,
+                messages[:user_index],
+            )
+
+    task = asyncio.create_task(_resume())
+    if not _claim_conversation_turn(conv_id, task, turn_meta):
+        task.cancel()
+        await _send_existing_turn_status(channel, conv_id, request_id)
+        return True
+    await channel.send_json(_turn_accepted_frame(turn_meta))
+    await channel.send_json(_turn_status_frame(turn_meta, "recovering"))
+    await _broadcast_conversation_busy_changed(conv_id, True, turn_meta)
+
+    def _clear(done_task) -> None:
+        meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
+        if _clear_conversation_turn(conv_id, done_task):
+            asyncio.create_task(
+                _broadcast_conversation_busy_changed(conv_id, False, meta)
+            )
+
+    task.add_done_callback(_clear)
+    return True
+
+
+def _reserve_failed_server_turn_terminal(
+    agent,
+    turn_meta: dict,
+    *,
+    objective: str,
+    language: str,
+) -> dict | None:
+    """Reserve/recover one setup failure without replaying provider or tools."""
+
+    from osia.turn_terminality import (
+        TerminalState,
+        TurnTerminalityController,
+        load_persisted_execution_binding,
+        load_persisted_terminal_result,
+    )
+
+    turn_id = str(turn_meta.get("turn_id") or "")
+    expected = {
+        "conversation_id": str(turn_meta.get("conversation_id") or ""),
+        "request_id": str(turn_meta.get("request_id") or ""),
+        "turn_id": turn_id,
+        "run_id": str(turn_meta.get("run_id") or turn_id),
+        "provider_id": str(
+            turn_meta.get("provider_id")
+            or turn_meta.get("_pinned_provider_id")
+            or ""
+        ),
+        "model_id": str(
+            turn_meta.get("model_id")
+            or turn_meta.get("_pinned_model_id")
+            or ""
+        ),
+        "effective_reasoning": str(
+            turn_meta.get("effective_reasoning")
+            or turn_meta.get("_pinned_effective_reasoning")
+            or ""
+        ),
+    }
+    stable_objective = str(objective or "").strip()[:32_000]
+    if not stable_objective or any(not value for value in expected.values()):
+        return None
+
+    binding = load_persisted_execution_binding(turn_id)
+    if binding is None:
+        trace_binding = getattr(agent, "execution_trace_binding", None)
+        if callable(trace_binding):
+            try:
+                binding = trace_binding(turn_id)
+            except Exception:
+                binding = None
+    if binding is None:
+        binding = dict(expected)
+    if not isinstance(binding, dict) or any(
+        str(binding.get(key) or "") != value
+        for key, value in expected.items()
+    ):
+        return None
+
+    persisted = load_persisted_terminal_result(turn_id)
+    if isinstance(persisted, dict):
+        return (
+            persisted
+            if persisted.get("execution_binding") == binding else
+            None
+        )
+
+    controller = getattr(agent, "_terminality_controller", None)
+    owns_controller = bool(
+        controller is not None
+        and str(getattr(controller, "turn_id", "") or "") == turn_id
+    )
+    if not owns_controller:
+        from osia.execution_strategy import derive_semantic_mission
+        from osia.goal_contract import (
+            goal_contract_from_dict,
+            goal_contract_from_semantic_mission,
+        )
+
+        controller = TurnTerminalityController(
+            turn_id=turn_id,
+            objective=stable_objective,
+            execution_required=True,
+        )
+        controller_snapshot = controller.snapshot()
+        persisted_contract = controller_snapshot.get("goal_contract")
+        contract = (
+            goal_contract_from_dict(persisted_contract)
+            if isinstance(persisted_contract, dict) and persisted_contract else
+            goal_contract_from_semantic_mission(
+                derive_semantic_mission(stable_objective),
+                execution_binding=binding,
+            )
+        )
+        controller.set_execution_binding(binding)
+        controller.set_goal_contract(contract)
+
+    snapshot = controller.snapshot()
+    cancellation = snapshot.get("cancellation") or {}
+    exact_attempt_id = str(
+        turn_meta.get("_tool_attempt_id")
+        or turn_meta.get("_existing_tool_attempt_id")
+        or ""
+    )
+    if cancellation.get("requested") and exact_attempt_id:
+        try:
+            from osia.tool_attempts import (
+                ToolAttemptStatus,
+                get_tool_attempt_store,
+            )
+
+            exact_attempt = get_tool_attempt_store().get_attempt(
+                exact_attempt_id
+            )
+            exact_cancelled_before_effect = bool(
+                _tool_attempt_matches_turn_meta(exact_attempt, turn_meta)
+                and ToolAttemptStatus(exact_attempt.get("status"))
+                is ToolAttemptStatus.CANCELLED_PROVEN
+                and str(exact_attempt.get("dispatch_state") or "")
+                == "cancelled_before_effect"
+            )
+        except Exception:
+            exact_attempt = None
+            exact_cancelled_before_effect = False
+        if exact_cancelled_before_effect:
+            evidence = {
+                "status": "cancelled_proven",
+                "dispatch_state": "cancelled_before_effect",
+                "terminal_outcome": str(
+                    exact_attempt.get("terminal_outcome") or ""
+                )[:80],
+                "reason_code": str(
+                    exact_attempt.get("reason_code") or ""
+                )[:160],
+            }
+            controller.set_attempt_state(
+                exact_attempt_id, status="completed",
+            )
+            controller.record_typed_evidence(
+                outcome="cancelled_proven",
+                evidence=evidence,
+                attempt_id=exact_attempt_id,
+                reason_code=(
+                    str(exact_attempt.get("reason_code") or "")
+                    or "cancellation_acknowledged_before_effect"
+                ),
+            )
+            controller.refine_cancellation_proven_before_effect()
+            snapshot = controller.snapshot()
+    if any(
+        str((snapshot.get("execution_binding") or {}).get(key) or "") != value
+        for key, value in expected.items()
+    ):
+        return None
+    blockers = bool(
+        snapshot.get("active_attempts")
+        or snapshot.get("permission_state") == "pending"
+    )
+    active_invocations = [
+        item for item in snapshot.get("invocations") or []
+        if isinstance(item, dict) and item.get("status") == "active"
+    ]
+    if active_invocations:
+        # The outer worker has returned with an exception. Only invocations on
+        # this exact in-memory controller, owned by this process, can therefore
+        # be closed as a failed provider boundary. Durable attempts/effects keep
+        # their own blockers above and are never guessed away.
+        if blockers or not owns_controller or any(
+            item.get("owner_pid") not in (None, os.getpid())
+            for item in active_invocations
+        ):
+            return None
+        for item in active_invocations:
+            invocation_id = str(item.get("invocation_id") or "")
+            if invocation_id:
+                controller.record_provider_invocation_completed(
+                    invocation_id,
+                    native_status="failed",
+                )
+                controller.record_typed_evidence(
+                    outcome="failed_before_effect",
+                    evidence="server_turn_worker_failed",
+                    reason_code="durable_turn_setup_failed",
+                )
+        snapshot = controller.snapshot()
+    if (
+        snapshot.get("active_attempts")
+        or snapshot.get("permission_state") == "pending"
+        or any(
+            isinstance(item, dict) and item.get("status") == "active"
+            for item in snapshot.get("invocations") or []
+        )
+    ):
+        return None
+
+    controller.set_strategy_frontier(())
+    cancellation = snapshot.get("cancellation") or {}
+    hard_safety_reason = str(snapshot.get("hard_safety_reason") or "")
+    if (
+        cancellation.get("requested")
+        and not cancellation.get("effect_possible")
+        and not snapshot.get("unknown_effects")
+    ):
+        terminal_state = TerminalState.USER_CANCELLED.value
+        reason_code = "authoritative_user_cancellation"
+        final_text = localized_text(
+            "autonomous.status_cancelled_proven", language,
+        )
+    elif cancellation.get("requested") and snapshot.get("unknown_effects"):
+        terminal_state = TerminalState.BLOCKED_VERIFIED.value
+        reason_code = "durable_outcome_unknown"
+        final_text = localized_text(
+            "autonomous.status_outcome_unknown", language,
+        )
+    elif hard_safety_reason:
+        terminal_state = TerminalState.HARD_SAFETY_BLOCK.value
+        reason_code = hard_safety_reason
+        final_text = (
+            "Cette action est bloquée par une barrière de sécurité absolue."
+            if language == "fr" else
+            "This action is blocked by an absolute safety barrier."
+        )
+    elif snapshot.get("unknown_effects"):
+        terminal_state = TerminalState.BLOCKED_VERIFIED.value
+        reason_code = "durable_outcome_unknown"
+        final_text = localized_text(
+            "autonomous.status_outcome_unknown", language,
+        )
+    else:
+        terminal_state = TerminalState.BLOCKED_VERIFIED.value
+        reason_code = "durable_turn_setup_failed"
+        final_text = localized_text("provider_failure", language)
+    if not controller.reserve_final(
+        terminal_state,
+        reason_code=reason_code,
+        provider_route=f"{binding['provider_id']}:{binding['model_id']}",
+        final_text=final_text,
+    ):
+        persisted = load_persisted_terminal_result(turn_id)
+        return (
+            persisted
+            if isinstance(persisted, dict)
+            and persisted.get("execution_binding") == binding else
+            None
+        )
+    try:
+        trace_getter = getattr(agent, "execution_trace_snapshot", None)
+        trace = trace_getter(turn_id) if callable(trace_getter) else None
+        controller.attach_final_projection(
+            execution_trace=trace,
+            artifact_refs=getattr(agent, "last_run_artifacts", None),
+        )
+    except Exception:
+        # The final reservation is already durable. Projection attachment can
+        # be reconstructed as a terminal-only compatibility trace on recovery.
+        pass
+    persisted = load_persisted_terminal_result(turn_id)
+    return (
+        persisted
+        if isinstance(persisted, dict)
+        and persisted.get("execution_binding") == binding else
+        None
+    )
+
+
+def _persisted_turn_route_binding(found: dict) -> dict[str, str] | None:
+    """Return one exact persisted seven-field binding for replay/media."""
+
+    conversation_id = str(found.get("conversation_id") or "")
+    request_id = str(found.get("request_id") or "")
+    turn_id = str(found.get("turn_id") or "")
+    run_id = str(found.get("run_id") or turn_id)
+    expected = {
+        "conversation_id": conversation_id,
+        "request_id": request_id,
+        "turn_id": turn_id,
+        "run_id": run_id,
+    }
+    if any(not value for value in expected.values()):
+        return None
+    try:
+        from osia.turn_terminality import load_persisted_execution_binding
+
+        binding = load_persisted_execution_binding(turn_id)
+    except Exception:
+        binding = None
+    if isinstance(binding, dict):
+        if any(str(binding.get(key) or "") != value for key, value in expected.items()):
+            return None
+        route = {
+            key: str(binding.get(key) or "")
+            for key in ("provider_id", "model_id", "effective_reasoning")
+        }
+    else:
+        # The accepted user receipt is durable before provider setup. It is the
+        # only available immutable route if the process stopped in that gap.
+        route = {
+            key: str(found.get(key) or "")
+            for key in ("provider_id", "model_id", "effective_reasoning")
+        }
+    if any(not value for value in route.values()):
+        return None
+    if any(
+        found.get(key) and str(found.get(key)) != value
+        for key, value in route.items()
+    ):
+        return None
+    return {**expected, **route}
 
 
 async def _send_persisted_turn_for_request(
@@ -2322,21 +4087,46 @@ async def _send_persisted_turn_for_request(
     request_id: str,
     *,
     expected_user_content=None,
+    expected_identity: dict[str, str] | None = None,
+    legacy_client_content_hash: str = "",
+    legacy_exact_user_content: str = "",
 ) -> bool:
     """Replay one completed request or reject an incomplete persisted request."""
 
     found = conversations.find_correlated_turn(conv_id, request_id)
     if found is None:
         return False
-    if (
-        expected_user_content is not None
-        and str(found.get("client_content_hash") or "")
-        != hashlib.sha256(
-            str(expected_user_content).encode("utf-8")
-        ).hexdigest()
+    _assert_request_input_identity(
+        found,
+        expected_user_content=expected_user_content,
+        expected_identity=expected_identity,
+        legacy_client_content_hash=legacy_client_content_hash,
+        legacy_exact_user_content=legacy_exact_user_content,
+    )
+    # A persisted user receipt is intentionally visible while its provider
+    # work is still live. Replays of that request must reattach to the exact
+    # active turn, never reinterpret the temporary lack of an assistant
+    # receipt as a terminally incomplete turn.
+    if await _send_existing_turn_status(
+        channel,
+        conv_id,
+        request_id,
+        expected_user_content=expected_user_content,
+        expected_identity=expected_identity,
+        legacy_client_content_hash=legacy_client_content_hash,
+        legacy_exact_user_content=legacy_exact_user_content,
     ):
-        raise ValueError("request id was already used with different content")
+        return True
     turn_id = str(found.get("turn_id") or "")
+    cancelled_terminal = _durable_cancelled_chat_terminal_frame(
+        conversation_id=conv_id,
+        request_id=request_id,
+        turn_id=turn_id,
+        run_id=str(found.get("run_id") or turn_id),
+    )
+    if cancelled_terminal is not None:
+        await channel.send_json(cancelled_terminal)
+        return True
     user_message_id = str(found.get("user_message_id") or "")
     assistant_message_id = str(found.get("assistant_message_id") or "")
     response_event_id = str(found.get("response_event_id") or "")
@@ -2345,11 +4135,20 @@ async def _send_persisted_turn_for_request(
     terminal_sequence = int(found.get("terminal_sequence") or 0)
     assistant_content = found.get("assistant_content")
     terminal_status = str(found.get("terminal_status") or "done")
+    persisted_binding = _persisted_turn_route_binding(found)
+    if persisted_binding is None:
+        await channel.send_json({
+            "type": "status",
+            "content": "error",
+            "error": "persisted_route_binding_unavailable",
+            "conversation_id": conv_id,
+            "request_id": request_id,
+            "client_request_id": request_id,
+        })
+        return True
     common = {
-        "conversation_id": conv_id,
-        "request_id": request_id,
+        **persisted_binding,
         "client_request_id": request_id,
-        "turn_id": turn_id,
     }
     replay_language = normalize_locale(found.get("language"))
     if replay_language:
@@ -2391,18 +4190,67 @@ async def _send_persisted_turn_for_request(
             },
         })
         return True
-    await channel.send_json({
-        "type": "turn_status",
-        **common,
-        "message_id": assistant_message_id or user_message_id,
-        "event_id": _EVENT_ID_PREFIX + secrets.token_hex(16),
-        "event_type": "turn_status",
-        "sequence": max(response_sequence, terminal_sequence, 0) + 1,
-        "terminal": True,
-        "status": "error",
-        "error": "persisted_turn_incomplete",
+    if await _resume_incomplete_persisted_chat_turn(channel, found):
+        return True
+    # A dead execution owner with no active effect can be closed through the
+    # same durable terminality CAS used by the live worker.  Never manufacture
+    # an ephemeral terminal event here: reconnect retries must replay the one
+    # persisted assistant receipt or remain non-terminal.
+    owner_pid = found.get("execution_owner_pid")
+    owner_identity = str(
+        found.get("execution_owner_process_identity") or ""
+    )
+    owner_alive = True
+    if isinstance(owner_pid, int) and not isinstance(owner_pid, bool) and owner_pid > 0:
+        from osia.turn_terminality import live_process_identity
+
+        process_alive, live_identity = live_process_identity(owner_pid)
+        owner_alive = bool(
+            process_alive
+            and (
+                not owner_identity
+                or not live_identity
+                or owner_identity == live_identity
+            )
+        )
+    if not owner_alive:
+        recovery_meta = {
+            **persisted_binding,
+            "assistant_message_id": assistant_message_id or user_message_id,
+        }
+        objective = str(
+            found.get("terminality_objective")
+            or found.get("user_content")
+            or ""
+        )
+        try:
+            await asyncio.to_thread(
+                _reserve_failed_server_turn_terminal,
+                None,
+                recovery_meta,
+                objective=objective,
+                language=replay_language or "en",
+            )
+        except Exception:
+            # Corrupt/indeterminate orphan state is not terminal evidence.
+            # Leave the request reattachable and report a non-terminal status.
+            pass
+        if await _resume_incomplete_persisted_chat_turn(channel, found):
+            return True
+    replay_meta = {
+        **persisted_binding,
+        "client_request_id": request_id,
+        "assistant_message_id": assistant_message_id or user_message_id,
         "persisted": True,
+    }
+    if replay_language:
+        replay_meta["language"] = replay_language
+    recovering_frame = _turn_status_frame(replay_meta, "recovering")
+    recovering_frame.update({
+        "error": "persisted_turn_incomplete",
+        "replayed": True,
     })
+    await channel.send_json(recovering_frame)
     return True
 
 
@@ -2413,6 +4261,8 @@ def _persist_accepted_user_message(
 ) -> bool:
     if not conv_id or not isinstance(turn_meta, dict):
         return False
+    if turn_meta.get("_accepted_user_already_persisted") is True:
+        return True
     request_id = str(
         turn_meta.get("request_id")
         or turn_meta.get("client_request_id")
@@ -2428,9 +4278,40 @@ def _persist_accepted_user_message(
             "_request_id": request_id,
             "_client_request_id": request_id,
             "_turn_id": turn_id,
+            "_run_id": str(turn_meta.get("run_id") or turn_id),
+            "_provider_id": str(turn_meta.get("provider_id") or ""),
+            "_model_id": str(turn_meta.get("model_id") or ""),
+            "_effective_reasoning": str(
+                turn_meta.get("effective_reasoning") or ""
+            ),
             "_message_id": message_id,
+            "_assistant_message_id": str(
+                turn_meta.get("assistant_message_id") or ""
+            ),
+            "_terminality_objective": str(
+                turn_meta.get("_terminality_objective") or ""
+            )[:32_000],
             "_client_content_hash": str(
                 turn_meta.get("client_content_hash") or ""
+            ),
+            "_client_base_content_hash": str(
+                turn_meta.get("client_base_content_hash") or ""
+            ),
+            "_attachment_manifest_hash": str(
+                turn_meta.get("attachment_manifest_hash") or ""
+            ),
+            "_input_identity_version": str(
+                turn_meta.get("input_identity_version") or ""
+            ),
+            "_input_kind": str(turn_meta.get("input_kind") or ""),
+            "_execution_owner": str(
+                turn_meta.get("_execution_owner") or "server"
+            ),
+            "_execution_owner_pid": int(
+                turn_meta.get("_execution_owner_pid") or os.getpid()
+            ),
+            "_execution_owner_process_identity": str(
+                turn_meta.get("_execution_owner_process_identity") or ""
             ),
         }
         language = normalize_locale(turn_meta.get("language"))
@@ -2439,6 +4320,13 @@ def _persist_accepted_user_message(
         attachment_metadata = turn_meta.get("attachment_metadata")
         if isinstance(attachment_metadata, list) and attachment_metadata:
             metadata["_attachments"] = attachment_metadata
+        durable_agent_input = turn_meta.get("_durable_agent_input_v1")
+        if (
+            str(turn_meta.get("attachment_manifest_hash") or "")
+            and isinstance(durable_agent_input, str)
+            and durable_agent_input.strip()
+        ):
+            metadata["_durable_agent_input_v1"] = durable_agent_input
         turn_directives = turn_meta.get("_turn_directives_v1")
         if isinstance(turn_directives, dict):
             metadata["_turn_directives_v1"] = turn_directives
@@ -2449,6 +4337,14 @@ def _persist_accepted_user_message(
             metadata=metadata,
         )
     except Exception as e:
+        error_text = str(e)
+        turn_meta["_user_commit_error"] = (
+            "conversation_busy"
+            if error_text.startswith("conversation has an active ")
+            else "request_id_conflict"
+            if "request" in error_text or "correlation conflict" in error_text
+            else "persistence_unavailable"
+        )
         print(
             "[OSIA Server] failed to persist accepted user turn: "
             f"{type(e).__name__}"
@@ -2476,6 +4372,10 @@ def _persist_completed_assistant_message(
     )
     turn_id = str(turn_meta.get("turn_id") or "")
     message_id = str(turn_meta.get("assistant_message_id") or "")
+    run_id = str(turn_meta.get("run_id") or turn_id)
+    provider_id = str(turn_meta.get("provider_id") or "")
+    model_id = str(turn_meta.get("model_id") or "")
+    effective_reasoning = str(turn_meta.get("effective_reasoning") or "")
     response_event_id = str(response_frame.get("event_id") or "")
     response_sequence = response_frame.get("sequence")
     event_id = str(terminal_frame.get("event_id") or "")
@@ -2484,6 +4384,10 @@ def _persist_completed_assistant_message(
         not request_id
         or not turn_id
         or not message_id
+        or not run_id
+        or not provider_id
+        or not model_id
+        or not effective_reasoning
         or not response_event_id
         or not isinstance(response_sequence, int)
         or response_sequence <= 0
@@ -2498,6 +4402,10 @@ def _persist_completed_assistant_message(
             "_request_id": request_id,
             "_client_request_id": request_id,
             "_turn_id": turn_id,
+            "_run_id": run_id,
+            "_provider_id": provider_id,
+            "_model_id": model_id,
+            "_effective_reasoning": effective_reasoning,
             "_message_id": message_id,
             "_response_event_id": response_event_id,
             "_response_sequence": response_sequence,
@@ -2511,7 +4419,33 @@ def _persist_completed_assistant_message(
                 terminal_frame.get("error_category") or ""
             ),
             "_reason_code": str(terminal_frame.get("reason_code") or ""),
+            "_execution_owner": str(
+                turn_meta.get("_execution_owner") or "server"
+            ),
+            "_execution_owner_pid": int(
+                turn_meta.get("_execution_owner_pid") or os.getpid()
+            ),
+            "_execution_owner_process_identity": str(
+                turn_meta.get("_execution_owner_process_identity") or ""
+            ),
         }
+        post_turn_media_lease_id = str(
+            turn_meta.get("_post_turn_media_lease_id") or ""
+        ).strip()
+        post_turn_media_owner_pid = int(
+            turn_meta.get("_post_turn_media_owner_pid") or os.getpid()
+        )
+        post_turn_media_owner_identity = str(
+            turn_meta.get("_post_turn_media_owner_process_identity") or ""
+        )
+        if post_turn_media_lease_id:
+            metadata.update({
+                "_post_turn_media_lease_id": post_turn_media_lease_id,
+                "_post_turn_media_owner_pid": post_turn_media_owner_pid,
+                "_post_turn_media_owner_process_identity": (
+                    post_turn_media_owner_identity
+                ),
+            })
         from osia.document_artifacts import normalize_references
         artifact_refs = normalize_references(turn_meta.get("_artifact_refs"))
         if artifact_refs:
@@ -2535,8 +4469,93 @@ def _persist_completed_assistant_message(
             f"{type(exc).__name__}"
         )
         return False
+    if not isinstance(receipt, dict):
+        return False
+    conversation = receipt.get("conversation")
+    messages = (
+        conversation.get("messages")
+        if isinstance(conversation, dict) else None
+    )
+    if not isinstance(messages, list):
+        return False
+    matching = [
+        item for item in messages
+        if isinstance(item, dict)
+        and str(item.get("_message_id") or "") == message_id
+    ]
+    if len(matching) != 1:
+        return False
+    persisted = matching[0]
+    persisted_media_lease = conversation.get("_post_turn_media_lease")
+    exact_values = {
+        "_conversation_id": conv_id,
+        "_request_id": request_id,
+        "_client_request_id": request_id,
+        "_turn_id": turn_id,
+        "_run_id": run_id,
+        "_provider_id": provider_id,
+        "_model_id": model_id,
+        "_effective_reasoning": effective_reasoning,
+        "_message_id": message_id,
+        "_operation_id": message_id,
+        "_response_event_id": response_event_id,
+        "_terminal_event_id": event_id,
+        "_terminal_status": str(terminal_frame.get("status") or "done"),
+    }
+    if (
+        persisted.get("role") != "assistant"
+        or persisted.get("content") != content
+        or any(
+            str(persisted.get(key) or "") != value
+            for key, value in exact_values.items()
+        )
+        or persisted.get("_response_sequence") != response_sequence
+        or persisted.get("_terminal_sequence") != sequence
+        or persisted.get("_terminal") is not True
+        or str(receipt.get("operation_id") or "") != message_id
+        or str(receipt.get("message_id") or "") != message_id
+        or (
+            receipt.get("committed") is True
+            and post_turn_media_lease_id
+            and (
+                not isinstance(persisted_media_lease, dict)
+                or str(persisted_media_lease.get("lease_id") or "")
+                != post_turn_media_lease_id
+                or str(persisted_media_lease.get("turn_id") or "")
+                != turn_id
+                or str(persisted_media_lease.get("message_id") or "")
+                != message_id
+                or persisted_media_lease.get("owner_pid")
+                != post_turn_media_owner_pid
+                or str(
+                    persisted_media_lease.get("owner_process_identity") or ""
+                ) != post_turn_media_owner_identity
+            )
+        )
+    ):
+        return False
     turn_meta["_assistant_commit"] = receipt
-    return receipt is not None
+    if post_turn_media_lease_id:
+        exact_media_lease = bool(
+            isinstance(persisted_media_lease, dict)
+            and (
+                str(persisted_media_lease.get("lease_id") or "")
+                == post_turn_media_lease_id
+                and str(persisted_media_lease.get("turn_id") or "")
+                == turn_id
+                and str(persisted_media_lease.get("message_id") or "")
+                == message_id
+                and persisted_media_lease.get("owner_pid")
+                == post_turn_media_owner_pid
+                and str(
+                    persisted_media_lease.get("owner_process_identity") or ""
+                ) == post_turn_media_owner_identity
+            )
+        )
+        turn_meta["_post_turn_media_lease_committed"] = exact_media_lease
+        if not exact_media_lease:
+            turn_meta["_post_turn_media_lease_released"] = True
+    return True
 
 
 def _claim_conversation_turn(
@@ -4282,7 +6301,13 @@ def _attach_confirmation_channel(device_id: str, channel, loop) -> int:
     return restored
 
 
-def _resolve_confirm(request_id: str, approved: bool, *, channel=None) -> bool:
+def _resolve_confirm(
+    request_id: str,
+    approved: bool,
+    *,
+    channel=None,
+    response_correlation: dict | None = None,
+) -> bool:
     """Resolve a pending confirmation Future by id and remove it. Returns True if
     a pending entry was found and resolved, False if the id was unknown/expired
     (a late / duplicate / foreign response — ignored cleanly). Thread-safe; never
@@ -4298,6 +6323,26 @@ def _resolve_confirm(request_id: str, approved: bool, *, channel=None) -> bool:
         elif channel is not None and entry.channel is not channel:
             # A stale transport cannot approve a request already rebound to the
             # same device's replacement channel.
+            return False
+        elif isinstance(response_correlation, dict) and any(
+            key in response_correlation
+            and (
+                not _permission_confirmation_value(
+                    key, response_correlation.get(key),
+                )
+                or _permission_confirmation_value(
+                    key, response_correlation.get(key),
+                )
+                != str(entry.frame.get(key) or "")
+            )
+            for key in (
+                "conversation_id", "request_id", "turn_id", "run_id",
+                "provider_id", "model_id", "effective_reasoning",
+            )
+            if entry.frame.get(key)
+        ):
+            # Legacy clients may omit additive correlation fields.  Any field
+            # they do send must match the immutable projected request exactly.
             return False
         else:
             _pending_confirms.pop(request_id, None)
@@ -4373,6 +6418,19 @@ def _ws_confirm_provider(
             or not loop.is_running()
             or bool(getattr(channel, "_closed", False))
         ):
+            device_id = _permission_safe_id(
+                getattr(channel, "_permission_device_id", "")
+            )
+            with _pending_confirms_lock:
+                replacement = _confirmation_channels_by_device.get(device_id)
+            if replacement is not None:
+                channel, loop = replacement
+        if (
+            channel is None
+            or loop is None
+            or not loop.is_running()
+            or bool(getattr(channel, "_closed", False))
+        ):
             return PermissionResult(PermissionOutcome.PRESENTATION_FAILED)
         with _pending_confirms_lock:
             request_id = secrets.token_hex(8)
@@ -4392,8 +6450,28 @@ def _ws_confirm_provider(
         }
         correlation = _turn_confirmation_correlation.get()
         if isinstance(correlation, dict):
-            for key in ("conversation_id", "request_id", "turn_id"):
-                value = _permission_safe_id(correlation.get(key))
+            values = {
+                key: _permission_confirmation_value(key, correlation.get(key))
+                for key in (
+                    "conversation_id", "request_id", "turn_id", "run_id",
+                    "provider_id", "model_id", "effective_reasoning",
+                )
+            }
+            # A run-bound normal Chat confirmation is fail-closed unless its
+            # exact provider/model route is available for projection. Legacy
+            # callers without run_id retain the earlier three-field contract.
+            if values["run_id"] and any(
+                not values[key]
+                for key in (
+                    "conversation_id", "request_id", "turn_id", "provider_id",
+                    "model_id",
+                )
+            ):
+                return PermissionResult(
+                    PermissionOutcome.PRESENTATION_FAILED,
+                    request_id,
+                )
+            for key, value in values.items():
                 if value:
                     frame[key] = value
         entry = _PendingConfirmation(
@@ -4510,9 +6588,39 @@ async def _recover_tool_attempts_at_startup() -> None:
     """Resolve orphaned durable attempts without replaying their action."""
 
     try:
-        from osia.tool_attempts import recover_orphaned_tool_attempts
+        from osia.provider_continuation import (
+            resume_or_reconcile_provider_attempt,
+        )
+        from osia.tool_attempts import (
+            get_tool_attempt_store,
+            recover_orphaned_tool_attempts,
+        )
 
         recovered = await asyncio.to_thread(recover_orphaned_tool_attempts)
+        attempt_store = get_tool_attempt_store()
+        await asyncio.to_thread(attempt_store.drain_action_outbox)
+        unresolved = await asyncio.to_thread(
+            attempt_store.list_unresolved_action_attempts
+        )
+        provider_terminalized = False
+        for attempt in unresolved:
+            if not (attempt.get("provider_references") or {}):
+                continue
+            continuation = await asyncio.to_thread(
+                resume_or_reconcile_provider_attempt,
+                str(attempt.get("tool_attempt_id") or ""),
+                store=attempt_store,
+            )
+            provider_terminalized = provider_terminalized or (
+                continuation.state.value in {
+                    "completed_with_receipt", "failed_before_effect",
+                    "explicit_not_applied",
+                }
+            )
+        if provider_terminalized:
+            recovered.extend(
+                await asyncio.to_thread(recover_orphaned_tool_attempts)
+            )
         if recovered:
             print(
                 f"[OSIA Server] reconciled {len(recovered)} orphaned "
@@ -5389,6 +7497,17 @@ def _autonomous_snapshot(st) -> dict:
     _phase_index, _task_index, current_task = _astate.current_task(st)
     current_task = current_task or {}
     run_id = str(st.get("run_id") or "")
+    chat_progress = chat_routing.durable_progress_from_state(st)
+    legacy_compatibility = not bool(
+        st.get("chat_route_type") == "autonomous"
+        and all(
+            str(chat_progress.get(field) or "").strip()
+            for field in (
+                "conversation_id", "request_id", "turn_id", "run_id",
+                "provider_id", "model_id", "effective_reasoning",
+            )
+        )
+    )
     abandon_state = str(st.get("abandon_state") or "")
     if abandon_state not in _AUTONOMOUS_ABANDON_STATES:
         abandon_state = ""
@@ -5396,6 +7515,8 @@ def _autonomous_snapshot(st) -> dict:
     if abandon_effect_state not in _AUTONOMOUS_ABANDON_EFFECT_STATES:
         abandon_effect_state = ""
     return {
+        "legacy_compatibility": legacy_compatibility,
+        "checkpoint_task_id": str(st.get("task_id") or "")[:160],
         "task_id": str(current_task.get("id") or "")[:160],
         "operation_id": str(current_task.get("tool_operation_id") or "")[:160],
         "tool_attempt_id": str(current_task.get("tool_attempt_id") or "")[:160],
@@ -5597,6 +7718,15 @@ def _autonomous_frame(payload: dict, st=_AUTO_UNSET) -> dict:
         "terminal": terminal,
         **snapshot,
     }
+    # A legacy Resume control is exposed only from a fresh/paused projection,
+    # never merely because a checkpoint file exists while its runner is live.
+    frame["resumable"] = bool(
+        _legacy_autonomous_resume_is_safe(st)
+        and (
+            requested_event == "interrupted"
+            or not bool(_autonomous.get("active"))
+        )
+    )
     final_answer = payload.get("final_answer")
     if (
         event == "done"
@@ -5749,6 +7879,8 @@ def _terminalize_autonomous_abandon(st: dict, orch) -> bool:
         _adiagnostics.record_diagnostic(st, diagnostic)
     st["abandon_effect_state"] = effect_state
     st["abandon_state"] = "abandoned_proven"
+    if not preserve_terminal:
+        _astate.establish_user_cancelled_terminal(st)
     if orch is not None and not preserve_terminal:
         try:
             orch.stop()
@@ -5812,6 +7944,46 @@ async def _prepare_correlated_autonomous_cancellation(
             channel, "autonomous", "target_not_active", **supplied,
         )
         return False
+    strict_keys = (
+        "checkpoint_task_id", "plan_revision", "authorization_revision",
+    )
+    strict_control = any(key in msg for key in strict_keys)
+    if strict_control:
+        checkpoint_task_id = msg.get("checkpoint_task_id")
+        plan_revision = msg.get("plan_revision")
+        authorization_revision = msg.get("authorization_revision")
+        clean_checkpoint_task_id = _clean_cancellation_target_id(
+            checkpoint_task_id, maximum=160,
+        )
+        if (
+            any(key not in msg for key in strict_keys)
+            or not isinstance(checkpoint_task_id, str)
+            or checkpoint_task_id != clean_checkpoint_task_id
+            or type(plan_revision) is not int
+            or plan_revision < 0
+            or type(authorization_revision) is not int
+            or authorization_revision < 0
+        ):
+            await _send_cancellation_rejection(
+                channel, "autonomous", "incomplete_target", **supplied,
+            )
+            return False
+        if (
+            checkpoint_task_id != str(st.get("task_id") or "")
+            or not _autonomous_resume_target_matches(
+                st,
+                supplied["run_id"],
+                plan_revision,
+                authorization_revision,
+            )
+        ):
+            await _send_cancellation_rejection(
+                channel, "autonomous", "target_mismatch", **supplied,
+            )
+            await channel.send_json(
+                _autonomous_frame({"event": "state_updated"}, st)
+            )
+            return False
     current = _autonomous_cancellation_correlation(st)
     if supplied["run_id"] != current["run_id"]:
         await _send_cancellation_rejection(
@@ -5831,6 +8003,20 @@ async def _prepare_correlated_autonomous_cancellation(
     if st.get("abandon_state") == "abandoned_proven":
         await _send_autonomous_abandon_ack(channel, st)
         return False
+    if _autonomous.get("interrupting"):
+        await _send_cancellation_rejection(
+            channel, "autonomous", "control_busy", **supplied,
+        )
+        return False
+    if (
+        st.get("status") in {"done", "failed", "aborted", "cancelled"}
+        or st.get("run_state") in {
+            "completed", "failed", "cancelled", "cancelled_proven",
+        }
+    ):
+        _terminalize_autonomous_abandon(st, _autonomous.get("orch"))
+        await _send_autonomous_abandon_ack(channel, st)
+        return False
 
     control_target = tuple(current[field] for field in (
         "run_id", "task_id", "operation_id", "tool_attempt_id",
@@ -5845,22 +8031,19 @@ async def _prepare_correlated_autonomous_cancellation(
         )
         return False
 
+    control_generation = _claim_autonomous_control_generation(st)
+    if control_generation is None:
+        await _send_cancellation_rejection(
+            channel, "autonomous", "single_runner_busy", **supplied,
+        )
+        return False
     _autonomous["cancellation_control_target"] = control_target
+    _autonomous["cancellation_control_generation"] = control_generation
     _autonomous["correlated_cancellation_published"] = True
     st["abandon_origin_status"] = str(st.get("status") or "")[:32]
     st["abandon_origin_run_state"] = str(st.get("run_state") or "")[:64]
     st["abandon_state"] = "abandon_requested"
     st["abandon_effect_state"] = _autonomous_abandon_effect_state(st)
-    if (
-        st.get("status") in {"done", "failed", "aborted", "cancelled"}
-        or st.get("run_state") in {
-            "completed", "failed", "cancelled", "cancelled_proven",
-        }
-    ):
-        _terminalize_autonomous_abandon(st, _autonomous.get("orch"))
-        await _send_autonomous_abandon_ack(channel, st)
-        _release_single_runner()
-        return False
     st["run_state"] = "cancellation_requested"
     try:
         _astate.save_task_state(st)
@@ -6052,6 +8235,7 @@ def _do_release_locked() -> None:
     owner's (the pid guard). MUST be called holding ``_autonomous_lock``."""
     _autonomous["active"] = False
     _autonomous.pop("cancellation_control_target", None)
+    _autonomous.pop("cancellation_control_generation", None)
     _autonomous.pop("correlated_cancellation_published", None)
     existing = _read_autonomous_lock()
     if isinstance(existing, dict) and existing.get("pid") != os.getpid():
@@ -6080,6 +8264,98 @@ def _release_single_runner_if_gen(my_gen: int) -> None:
         if int(_autonomous.get("gen", 0)) != my_gen:
             return  # a newer acquisition owns the slot now — don't touch it
         _do_release_locked()
+
+
+def _claim_autonomous_control_generation(st: dict) -> int | None:
+    """Own the exact legacy run while a stop/cancel control is terminalized.
+
+    A paused checkpoint has no active runner generation.  Claim one before the
+    asynchronous control worker starts so a later resume cannot be acquired and
+    then accidentally released by that older worker.  A live exact run already
+    owns its generation, which is captured instead of reacquired.
+    """
+
+    run_id = str(st.get("run_id") or "") if isinstance(st, dict) else ""
+    if not run_id:
+        return None
+    with _autonomous_lock:
+        current = _autonomous.get("st")
+        if (
+            _autonomous.get("active")
+            and isinstance(current, dict)
+            and str(current.get("run_id") or "") == run_id
+        ):
+            return int(_autonomous.get("gen", 0))
+    generation = _acquire_single_runner(task_id=st.get("task_id"))
+    if generation is None:
+        return None
+    keep = False
+    with _autonomous_lock:
+        current = _autonomous.get("st")
+        if (
+            not isinstance(current, dict)
+            or str(current.get("run_id") or "") == run_id
+        ):
+            _autonomous["st"] = st
+            _write_autonomous_lock(st.get("task_id"))
+            keep = True
+    if not keep:
+        _release_single_runner_if_gen(generation)
+        return None
+    return generation
+
+
+def _legacy_autonomous_resume_is_safe(st: dict) -> bool:
+    """Return whether an existing legacy checkpoint may be resumed safely."""
+
+    return bool(
+        isinstance(st, dict)
+        and _astate.resume_state_is_valid(st)
+        and str(st.get("run_id") or "")
+        and st.get("authorization_status") in {
+            "authorized", "not_required_full_access",
+        }
+        and st.get("run_state") in {
+            "ready", "running", "waiting_tool", "verifying_tool", "resuming",
+        }
+        and st.get("abandon_state") not in {
+            "abandon_requested", "abandoned_proven",
+        }
+        and st.get("abandon_effect_state") not in {
+            "effect_possible_or_unknown", "effect_confirmed",
+        }
+    )
+
+
+def _autonomous_resume_target_matches(
+    st: dict,
+    expected_run_id: str,
+    expected_plan_revision: int,
+    expected_authorization_revision: int,
+) -> bool:
+    """Validate the immutable legacy resume identity without coercing values."""
+
+    if (
+        not isinstance(st, dict)
+        or not expected_run_id
+        or str(st.get("run_id") or "") != expected_run_id
+        or not isinstance(expected_plan_revision, int)
+        or isinstance(expected_plan_revision, bool)
+        or not isinstance(expected_authorization_revision, int)
+        or isinstance(expected_authorization_revision, bool)
+    ):
+        return False
+    try:
+        plan_revision = int(st.get("plan_revision", 0) or 0)
+        authorization_revision = int(
+            st.get("authorization_revision", 0) or 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return bool(
+        plan_revision == expected_plan_revision
+        and authorization_revision == expected_authorization_revision
+    )
 
 
 def _finalize_terminal_release(orch, term_gen: int) -> None:
@@ -6775,6 +9051,9 @@ def _cancel_chat_autonomous_execution(binding: dict) -> dict:
                 st.get("abandon_effect_state") == "effect_possible_or_unknown"
             ),
         }
+    generation = _claim_autonomous_control_generation(st)
+    if generation is None:
+        return {"accepted": False, "error_code": "single_runner_busy"}
     st["abandon_origin_status"] = str(st.get("status") or "")[:32]
     st["abandon_origin_run_state"] = str(st.get("run_state") or "")[:64]
     st["abandon_state"] = "abandon_requested"
@@ -6795,7 +9074,7 @@ def _cancel_chat_autonomous_execution(binding: dict) -> dict:
         _persist_chat_durable_terminal(st)
         if terminalized:
             _broadcast_autonomous(_autonomous_frame({"event": "aborted"}, st))
-        _release_single_runner()
+        _release_single_runner_if_gen(generation)
 
     threading.Thread(
         target=_cancel_worker,
@@ -6928,6 +9207,14 @@ def _launch_autonomous_from_chat(request: dict) -> dict:
             fingerprint,
             _chat_route_result_from_state(current_state, active=current_active),
         )
+
+    # WOR-265: the old Chat -> Autonomous handoff is now compatibility-only.
+    # A previously persisted exact request may reattach above, but no request is
+    # allowed to create a new legacy plan/run after the Unified Chat migration.
+    return _remember_chat_route_result(request_id, fingerprint, {
+        "status": "failed",
+        "error_code": "unified_chat_only",
+    })
 
     from osia.mobile_model_catalogue import resolve_current_autonomous_selection
 
@@ -7131,7 +9418,11 @@ def _clear_interrupting_after_orphan_drained(timeout: float = 120.0) -> None:
 
 
 def _autonomous_resume_worker(
-    my_gen: int, origin_ref: str = "mobile_legacy",
+    my_gen: int,
+    origin_ref: str = "mobile_legacy",
+    expected_run_id: str = "",
+    expected_plan_revision: int | None = None,
+    expected_authorization_revision: int | None = None,
 ) -> None:
     """Resume a PAUSED autonomous run OFF the event loop, converging BYTE-FOR-BYTE
     onto the PROVEN GUI resume flow (``main.py``: ``load_task_state()`` → exact
@@ -7227,6 +9518,25 @@ def _autonomous_resume_worker(
             if _establish_autonomous_failure(failed_state, my_gen):
                 _broadcast_autonomous(
                     _autonomous_frame({"event": "idle"}, failed_state)
+                )
+            _release_single_runner_if_gen(my_gen)
+            return
+        has_expected_target = bool(
+            expected_run_id
+            or expected_plan_revision is not None
+            or expected_authorization_revision is not None
+        )
+        if has_expected_target and not _autonomous_resume_target_matches(
+            st,
+            expected_run_id,
+            expected_plan_revision,
+            expected_authorization_revision,
+        ):
+            # The checkpoint changed after the caller's validation. Never
+            # reinterpret that control as permission to resume the replacement.
+            if str(st.get("run_id") or "") == expected_run_id:
+                _broadcast_autonomous(
+                    _autonomous_frame({"event": "state_updated"}, st)
                 )
             _release_single_runner_if_gen(my_gen)
             return
@@ -7492,7 +9802,13 @@ def _schedule_durable_autonomous_recovery(
     _autonomous["document_owner_device"] = document_owner_device
     threading.Thread(
         target=_autonomous_resume_worker,
-        args=(generation, origin_ref),
+        args=(
+            generation,
+            origin_ref,
+            str(st.get("run_id") or ""),
+            st.get("plan_revision"),
+            st.get("authorization_revision"),
+        ),
         daemon=True,
     ).start()
     return True
@@ -7510,13 +9826,75 @@ def _autonomous_pc_snapshot(st: dict | None) -> dict:
         pc.get("private_scope_details") or {}
     )
     checkpoint["_server_mobile_run"] = True
+    # Projection-only fields are rebuilt from canonical state below; never let
+    # a stale/migrated checkpoint value impersonate either desktop surface.
+    checkpoint.pop("chat_execution", None)
+    checkpoint.pop("legacy_execution", None)
+    compatibility = {
+        "compatibility_mode": "legacy_autonomous_checkpoint",
+        "legacy_compatibility": True,
+    }
+    resumable = bool(
+        _legacy_autonomous_resume_is_safe(st)
+        and not bool(_autonomous.get("active"))
+    )
+    progress = chat_routing.durable_progress_from_state(st)
+    canonical_chat_execution = False
     if st.get("chat_route_type") == "autonomous":
-        chat_execution = chat_routing.durable_progress_from_state(st)
+        chat_execution = dict(progress)
         if chat_execution.get("terminal"):
             chat_execution = chat_routing.terminal_result_from_state(
                 st, str(st.get("language") or "en"),
             )
+        canonical_chat_execution = all(
+            str(chat_execution.get(field) or "").strip()
+            for field in (
+                "conversation_id", "request_id", "turn_id", "run_id",
+                "provider_id", "model_id", "effective_reasoning",
+            )
+        )
+        if not canonical_chat_execution:
+            chat_execution.update(compatibility)
+            chat_execution["resumable"] = resumable
         checkpoint["chat_execution"] = chat_execution
+    raw_run_id = str(st.get("run_id") or "")
+    raw_task_id = str(st.get("task_id") or "")
+    run_id = _clean_cancellation_target_id(raw_run_id)
+    task_id = _clean_cancellation_target_id(raw_task_id, maximum=160)
+    plan_revision = st.get("plan_revision")
+    authorization_revision = st.get("authorization_revision")
+    exact_identity = bool(
+        run_id
+        and task_id
+        and run_id == raw_run_id
+        and task_id == raw_task_id
+        and type(plan_revision) is int
+        and plan_revision >= 0
+        and type(authorization_revision) is int
+        and authorization_revision >= 0
+    )
+    if run_id and not canonical_chat_execution:
+        terminal = bool(progress.get("terminal"))
+        cancel_requested = bool(progress.get("cancel_requested"))
+        checkpoint["legacy_execution"] = {
+            "schema_version": 1,
+            **compatibility,
+            "run_id": run_id,
+            "task_id": task_id,
+            "plan_revision": plan_revision if exact_identity else None,
+            "authorization_revision": (
+                authorization_revision if exact_identity else None
+            ),
+            "status": str(progress.get("status") or "")[:32],
+            "run_state": str(st.get("run_state") or "")[:64],
+            "terminal": terminal,
+            "outcome_unknown": bool(progress.get("outcome_unknown")),
+            "cancel_requested": cancel_requested,
+            "cancellable": bool(
+                exact_identity and not terminal and not cancel_requested
+            ),
+            "resumable": bool(exact_identity and resumable),
+        }
     return checkpoint
 
 
@@ -7642,6 +10020,218 @@ async def internal_chat_autonomous_cancel(request: Request):
     )
 
 
+def _legacy_execution_control_target_matches(
+    st: dict | None,
+    body: dict | None,
+) -> bool:
+    """Validate one loopback control against an exact legacy checkpoint."""
+
+    if not isinstance(st, dict) or not isinstance(body, dict):
+        return False
+    if body.get("schema_version", 1) != 1:
+        return False
+    run_id = _clean_cancellation_target_id(body.get("run_id"))
+    task_id = _clean_cancellation_target_id(
+        body.get("task_id"), maximum=160,
+    )
+    plan_revision = body.get("plan_revision")
+    authorization_revision = body.get("authorization_revision")
+    return bool(
+        run_id
+        and task_id
+        and task_id == str(st.get("task_id") or "")
+        and _autonomous_resume_target_matches(
+            st,
+            run_id,
+            plan_revision,
+            authorization_revision,
+        )
+    )
+
+
+def _legacy_execution_control_result(
+    st: dict | None,
+    *,
+    accepted: bool,
+    error_code: str = "",
+) -> dict:
+    progress = chat_routing.durable_progress_from_state(st)
+    result = {
+        "accepted": bool(accepted),
+        "terminal": bool(progress.get("terminal")),
+        "outcome_unknown": bool(progress.get("outcome_unknown")),
+        "state": _autonomous_pc_snapshot(st),
+    }
+    if error_code:
+        result["error_code"] = str(error_code)[:80]
+    return result
+
+
+@app.post("/internal/legacy_execution_resume")
+async def internal_legacy_execution_resume(request: Request):
+    """Resume only the exact persisted legacy run shown in the Chat banner."""
+
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return _legacy_execution_control_result(
+            None, accepted=False, error_code="forbidden",
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    allowed = {
+        "schema_version", "run_id", "task_id", "plan_revision",
+        "authorization_revision",
+    }
+    if not isinstance(body, dict) or set(body) - allowed:
+        return _legacy_execution_control_result(
+            None, accepted=False, error_code="invalid_request",
+        )
+    st = _current_autonomous_state()
+    if not _legacy_execution_control_target_matches(st, body):
+        return _legacy_execution_control_result(
+            st, accepted=False, error_code="target_mismatch",
+        )
+    if not _legacy_autonomous_resume_is_safe(st):
+        return _legacy_execution_control_result(
+            st, accepted=False, error_code="resume_not_safe",
+        )
+    with _autonomous_lock:
+        if _autonomous.get("active"):
+            return _legacy_execution_control_result(
+                st, accepted=False, error_code="single_runner_busy",
+            )
+    generation = _acquire_single_runner(task_id=st.get("task_id"))
+    if generation is None:
+        return _legacy_execution_control_result(
+            st, accepted=False, error_code="single_runner_busy",
+        )
+    current = _current_autonomous_state()
+    if not _legacy_execution_control_target_matches(current, body):
+        _release_single_runner_if_gen(generation)
+        return _legacy_execution_control_result(
+            current, accepted=False, error_code="target_changed",
+        )
+    _autonomous["loop"] = asyncio.get_running_loop()
+    _autonomous["origin_ref"] = "desktop_legacy"
+    _autonomous["document_owner_device"] = ""
+    threading.Thread(
+        target=_autonomous_resume_worker,
+        args=(
+            generation,
+            "desktop_legacy",
+            str(body.get("run_id") or ""),
+            body.get("plan_revision"),
+            body.get("authorization_revision"),
+        ),
+        name="osia-legacy-execution-resume",
+        daemon=True,
+    ).start()
+    return _legacy_execution_control_result(current, accepted=True)
+
+
+@app.post("/internal/legacy_execution_cancel")
+async def internal_legacy_execution_cancel(request: Request):
+    """Stop only the exact persisted legacy run shown in the Chat banner."""
+
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return _legacy_execution_control_result(
+            None, accepted=False, error_code="forbidden",
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    allowed = {
+        "schema_version", "run_id", "task_id", "plan_revision",
+        "authorization_revision",
+    }
+    if not isinstance(body, dict) or set(body) - allowed:
+        return _legacy_execution_control_result(
+            None, accepted=False, error_code="invalid_request",
+        )
+    st = _current_autonomous_state()
+    if not _legacy_execution_control_target_matches(st, body):
+        return _legacy_execution_control_result(
+            st, accepted=False, error_code="target_mismatch",
+        )
+    progress = chat_routing.durable_progress_from_state(st)
+    if progress.get("terminal"):
+        return _legacy_execution_control_result(
+            st, accepted=False, error_code="run_terminal",
+        )
+    if st.get("abandon_state") in {
+        "abandon_requested", "abandoned_proven",
+    }:
+        return _legacy_execution_control_result(st, accepted=True)
+    if _autonomous.get("interrupting"):
+        return _legacy_execution_control_result(
+            st, accepted=False, error_code="control_busy",
+        )
+    generation = _claim_autonomous_control_generation(st)
+    if generation is None:
+        return _legacy_execution_control_result(
+            st, accepted=False, error_code="single_runner_busy",
+        )
+    current = _current_autonomous_state()
+    if not _legacy_execution_control_target_matches(current, body):
+        _release_single_runner_if_gen(generation)
+        return _legacy_execution_control_result(
+            current, accepted=False, error_code="target_changed",
+        )
+    if current.get("abandon_state") in {
+        "abandon_requested", "abandoned_proven",
+    }:
+        return _legacy_execution_control_result(current, accepted=True)
+    correlation = _autonomous_cancellation_correlation(current)
+    control_target = tuple(
+        correlation[field]
+        for field in ("run_id", "task_id", "operation_id", "tool_attempt_id")
+    )
+    _autonomous["cancellation_control_target"] = control_target
+    _autonomous["cancellation_control_generation"] = generation
+    current["abandon_origin_status"] = str(
+        current.get("status") or ""
+    )[:32]
+    current["abandon_origin_run_state"] = str(
+        current.get("run_state") or ""
+    )[:64]
+    current["abandon_state"] = "abandon_requested"
+    current["abandon_effect_state"] = _autonomous_abandon_effect_state(
+        current
+    )
+    current["run_state"] = "cancellation_requested"
+    try:
+        _astate.save_task_state(current)
+    except Exception:
+        pass
+    _broadcast_autonomous(
+        _autonomous_frame({"event": "cancellation_requested"}, current)
+    )
+
+    def _cancel_exact_legacy_run(
+        target=current,
+        orch=_autonomous.get("orch"),
+        owned_generation=generation,
+    ) -> None:
+        try:
+            if _terminalize_autonomous_abandon(target, orch):
+                _broadcast_autonomous(
+                    _autonomous_frame({"event": "aborted"}, target)
+                )
+        finally:
+            _release_single_runner_if_gen(owned_generation)
+
+    threading.Thread(
+        target=_cancel_exact_legacy_run,
+        name="osia-legacy-execution-cancel",
+        daemon=True,
+    ).start()
+    return _legacy_execution_control_result(current, accepted=True)
+
+
 @app.get("/internal/autonomous_authorization_state")
 async def internal_autonomous_authorization_state(request: Request):
     """Expose the canonical mobile run only to the local PC review panel."""
@@ -7667,6 +10257,12 @@ async def internal_autonomous_authorization_action(request: Request):
     except Exception:
         body = {}
     action = str(body.get("action") or "") if isinstance(body, dict) else ""
+    allowed = {
+        "action", "schema_version", "run_id", "task_id", "plan_revision",
+        "authorization_revision",
+    }
+    if not isinstance(body, dict) or set(body) - allowed:
+        return {"ok": False, "error": "invalid_request"}
     if action not in {
         "authorize", "scope_approve", "scope_deny", "revoke", "cancel",
     }:
@@ -7674,6 +10270,13 @@ async def internal_autonomous_authorization_action(request: Request):
     st = _current_autonomous_state()
     if not isinstance(st, dict):
         return {"ok": False, "error": "run_missing"}
+    if not _legacy_execution_control_target_matches(st, body):
+        return {
+            "ok": False,
+            "error": "target_mismatch",
+            "state": _autonomous_pc_snapshot(st),
+        }
+    cancel_generation = None
     try:
         prepared_engine = None
         if action in {"authorize", "scope_approve"}:
@@ -7684,6 +10287,17 @@ async def internal_autonomous_authorization_action(request: Request):
                     "error": "model_setup_failure",
                     "state": _autonomous_pc_snapshot(st),
                 }
+        if (
+            _current_autonomous_state() is not st
+            or not _legacy_execution_control_target_matches(st, body)
+        ):
+            return {
+                "ok": False,
+                "error": "target_changed",
+                "state": _autonomous_pc_snapshot(
+                    _current_autonomous_state()
+                ),
+            }
         if action == "authorize":
             origin_ref = _internal_autonomous_origin(st)
             response = _aauthorization.response_for_current_request(
@@ -7724,6 +10338,26 @@ async def internal_autonomous_authorization_action(request: Request):
             _astate.save_task_state(st)
             event = "suspended_authorization_revoked"
         else:
+            cancel_generation = _claim_autonomous_control_generation(st)
+            if cancel_generation is None:
+                return {
+                    "ok": False,
+                    "error": "single_runner_busy",
+                    "state": _autonomous_pc_snapshot(st),
+                }
+            if (
+                _current_autonomous_state() is not st
+                or not _legacy_execution_control_target_matches(st, body)
+            ):
+                _release_single_runner_if_gen(cancel_generation)
+                cancel_generation = None
+                return {
+                    "ok": False,
+                    "error": "target_changed",
+                    "state": _autonomous_pc_snapshot(
+                        _current_autonomous_state()
+                    ),
+                }
             run_state = str(st.get("run_state") or "")
             origin_ref = _internal_autonomous_origin(st)
             pending_request = (
@@ -7749,24 +10383,35 @@ async def internal_autonomous_authorization_action(request: Request):
                 _aauthorization.approve_scope_extension(
                     st, response, origin_ref=origin_ref,
                 )
-            _aauthorization.revoke_run_authorization(
-                st, save=_astate.save_task_state,
+            st["abandon_origin_status"] = str(
+                st.get("status") or ""
+            )[:32]
+            st["abandon_origin_run_state"] = str(
+                st.get("run_state") or ""
+            )[:64]
+            st["abandon_state"] = "abandon_requested"
+            st["abandon_effect_state"] = _autonomous_abandon_effect_state(st)
+            st["run_state"] = "cancellation_requested"
+            _astate.save_task_state(st)
+            await asyncio.to_thread(
+                _terminalize_autonomous_abandon,
+                st,
+                _autonomous.get("orch"),
             )
-            st["status"] = "aborted"
-            st["run_state"] = "cancelled"
-            orch = _autonomous.get("orch")
-            if orch is not None:
-                await asyncio.to_thread(orch.stop)
-            _astate.clear_task_state()
-            _release_single_runner()
+            _release_single_runner_if_gen(cancel_generation)
+            cancel_generation = None
             event = "aborted"
     except _aauthorization.AuthorizationError as exc:
+        if cancel_generation is not None:
+            _release_single_runner_if_gen(cancel_generation)
         return {
             "ok": False,
             "error": exc.code,
             "state": _autonomous_pc_snapshot(st),
         }
     except Exception:
+        if cancel_generation is not None:
+            _release_single_runner_if_gen(cancel_generation)
         return {
             "ok": False,
             "error": "authorization_internal_failure",
@@ -7812,6 +10457,13 @@ async def _stop_autonomous_on_shutdown() -> None:
         await asyncio.gather(*media_tasks, return_exceptions=True)
     _POST_TURN_MEDIA_TASKS.clear()
     _POST_TURN_MEDIA_BY_CONV.clear()
+    _POST_TURN_MEDIA_META_BY_CONV.clear()
+    source_cleanup_tasks = list(_PENDING_SOURCE_CLEANUP_TASKS)
+    for task in source_cleanup_tasks:
+        task.cancel()
+    if source_cleanup_tasks:
+        await asyncio.gather(*source_cleanup_tasks, return_exceptions=True)
+    _PENDING_SOURCE_CLEANUP_TASKS.clear()
 
 
 @app.websocket("/ws")
@@ -7875,6 +10527,7 @@ async def websocket_endpoint(ws: WebSocket):
     # Files uploaded by the client that haven't been consumed by a turn yet.
     # The next text/audio turn consumes and clears this list.
     pending_files: list[str] = []
+    pending_file_display_names: dict[str, str] = {}
     legacy_uploads = LegacyUploadManager(UPLOAD_DIR)
     attachment_batches = AttachmentBatchManager(ATTACHMENT_UPLOAD_DIR)
     autonomous_attachment_acks: dict[str, dict] = {}
@@ -8105,7 +10758,7 @@ async def websocket_endpoint(ws: WebSocket):
             if provider is None or getattr(_ag, "provider", None) == provider:
                 _ag._applied_selected_model = None
 
-    async def _ensure_active_conv(seed_text):
+    async def _ensure_active_conv(seed_text, client_request_id: str):
         """Resolve the conversation a turn will run in, creating it NOW
         (synchronously) when none is active.
 
@@ -8136,7 +10789,10 @@ async def websocket_endpoint(ws: WebSocket):
         try:
             seed_title = (conversations.smart_title(seed_text)
                           if isinstance(seed_text, str) else None)
-            conv = conversations.create_conversation(title=seed_title)
+            conv, created = conversations.resolve_request_conversation(
+                client_request_id,
+                title=seed_title,
+            )
         except Exception as e:
             print(
                 "[OSIA Server] create_conversation failed: "
@@ -8145,13 +10801,14 @@ async def websocket_endpoint(ws: WebSocket):
             await out.send_json({"type": "status", "content": "error"})
             return None
         active_conv_id = conv["id"]
-        session_history = []
-        await _broadcast_canonical_conversation_change(
-            active_conv_id,
-            revision=int(conv.get("revision") or 0),
-            operation_id=str(conv.get("last_operation_id") or ""),
-            exclude=out,
-        )
+        session_history = list(conv.get("messages") or [])
+        if created:
+            await _broadcast_canonical_conversation_change(
+                active_conv_id,
+                revision=int(conv.get("revision") or 0),
+                operation_id=str(conv.get("last_operation_id") or ""),
+                exclude=out,
+            )
         await out.send_json({
             "type": "active_conversation",
             "id": conv["id"],
@@ -8167,7 +10824,11 @@ async def websocket_endpoint(ws: WebSocket):
         await out.send_json(snapshot)
         return active_conv_id
 
-    async def _resolve_turn_conversation(msg: dict, seed_text):
+    async def _resolve_turn_conversation(
+        msg: dict,
+        seed_text,
+        client_request_id: str,
+    ):
         """Resolve only an explicit target, except for a brand-new chat."""
 
         requested = str(msg.get("conversation_id") or "").strip()
@@ -8190,33 +10851,117 @@ async def websocket_endpoint(ws: WebSocket):
                 "error": "missing_conversation_id",
             })
             return None
-        return await _ensure_active_conv(seed_text)
+        return await _ensure_active_conv(seed_text, client_request_id)
 
-    async def _run_turn(conv_id, prev, make_coro):
+    async def _accept_user_turn_before_spawn(
+        conv_id: str,
+        persisted_content,
+        turn_meta: dict,
+    ) -> bool:
+        """Win the durable acceptance CAS before publishing a turn identity."""
+
+        if not str(turn_meta.get("_terminality_objective") or "").strip():
+            turn_meta["_terminality_objective"] = str(
+                turn_meta.get("_original_user_text")
+                or persisted_content
+                or ""
+            )[:32_000]
+        _bind_pre_agent_cancellation_authority(turn_meta)
+        accepted = _persist_accepted_user_message(
+            conv_id, persisted_content, turn_meta,
+        )
+        turn_meta["persisted"] = accepted
+        if not accepted:
+            _release_unaccepted_turn_sources(
+                turn_meta, owner_id=conv_id,
+            )
+            await out.send_json({
+                "type": "status",
+                "content": "error",
+                "pre_accept_rejection": True,
+                "error": str(
+                    turn_meta.get("_user_commit_error")
+                    or "persistence_unavailable"
+                ),
+                "conversation_id": conv_id,
+                "request_id": str(turn_meta.get("request_id") or ""),
+                "client_request_id": str(
+                    turn_meta.get("request_id") or ""
+                ),
+            })
+            await _complete_durable_command(turn_meta, {
+                "accepted": False,
+                "state": "persistence_unavailable",
+            })
+            return False
+        receipt = turn_meta.get("_user_commit")
+        if isinstance(receipt, dict) and receipt.get("committed") is False:
+            _release_unaccepted_turn_sources(
+                turn_meta, owner_id=conv_id,
+            )
+            replayed = await _send_persisted_turn_for_request(
+                out,
+                conv_id,
+                str(turn_meta.get("request_id") or ""),
+            )
+            if not replayed:
+                await out.send_json({
+                    "type": "status",
+                    "content": "error",
+                    "error": "persisted_turn_replay_unavailable",
+                    "conversation_id": conv_id,
+                    "request_id": str(turn_meta.get("request_id") or ""),
+                    "client_request_id": str(
+                        turn_meta.get("request_id") or ""
+                    ),
+                })
+            await _complete_durable_command(turn_meta, {
+                "accepted": True,
+                "state": "duplicate_reattached",
+            })
+            return False
+        turn_meta["_accepted_user_already_persisted"] = True
+        await _broadcast_committed_receipt(conv_id, receipt)
+        await _complete_durable_command(turn_meta, {
+            "accepted": True,
+            "state": "turn_accepted",
+        })
+        return True
+
+    async def _run_turn(conv_id, prev, make_coro, turn_meta=None):
         nonlocal session_history, active_conv_id
-        # Serialise turns on the SAME conversation: wait for an earlier
-        # in-flight turn to finish so this one sees its result and the two
-        # never append to that conversation concurrently.
-        if prev is not None and not prev.done():
-            try:
-                await prev
-            except Exception:
-                pass
-        # Snapshot the working history for THIS conversation right before the
-        # turn runs — independent of whatever conversation is being viewed.
-        if active_conv_id == conv_id:
-            snapshot = list(session_history)
-        else:
-            conv = conversations.get_conversation(conv_id)
-            snapshot = list(conv.get("messages") or []) if conv else []
+        snapshot: list = []
         try:
+            # Serialise turns on the SAME conversation: wait for an earlier
+            # in-flight turn to finish so this one sees its result and the two
+            # never append to that conversation concurrently.
+            if prev is not None and not prev.done():
+                try:
+                    await prev
+                except Exception:
+                    pass
+            # Snapshot the working history for THIS conversation right before
+            # the turn runs — independent of whatever conversation is viewed.
+            if active_conv_id == conv_id:
+                snapshot = list(session_history)
+            else:
+                conv = conversations.get_conversation(conv_id)
+                snapshot = list(conv.get("messages") or []) if conv else []
             new_history, result_conv_id = await make_coro(snapshot)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             print(f"[OSIA Server] streaming turn failed: {e}")
             traceback.print_exc()
-            return
+            recovered = await _finalize_admitted_turn_after_worker_failure(
+                out,
+                conv_id,
+                turn_meta,
+                snapshot,
+            )
+            if recovered is None:
+                return
+            new_history, result_conv_id = recovered
         # Keep the in-memory pointer coherent ONLY when the user is still
         # viewing this conversation. Otherwise the new messages live on disk
         # and are reloaded on demand — the currently-viewed conversation is
@@ -8230,12 +10975,106 @@ async def websocket_endpoint(ws: WebSocket):
         # the same conversation is rejected before this function is called, and
         # delete/disconnect can find and cancel it.
         prev = streaming_tasks.get(conv_id)
-        task = asyncio.create_task(_run_turn(conv_id, prev, make_coro))
+        task = asyncio.create_task(
+            _run_turn(conv_id, prev, make_coro, turn_meta)
+        )
         if not _claim_conversation_turn(conv_id, task, turn_meta):
             task.cancel()
+            if isinstance(turn_meta, dict) and turn_meta.get("persisted") is True:
+                async def _recover_admitted_claim_conflict() -> None:
+                    nonlocal session_history
+
+                    current_task = asyncio.current_task()
+                    if current_task is None:
+                        return
+                    while True:
+                        incumbent = (
+                            _ACTIVE_TURNS_BY_CONV.get(conv_id)
+                            or _POST_TURN_MEDIA_BY_CONV.get(conv_id)
+                        )
+                        if incumbent is not None and incumbent is not current_task:
+                            try:
+                                await incumbent
+                            except BaseException:
+                                pass
+                        await asyncio.sleep(0)
+                        if _claim_conversation_turn(
+                            conv_id, current_task, turn_meta,
+                        ):
+                            break
+                        await asyncio.sleep(0.05)
+
+                    streaming_tasks[conv_id] = current_task
+                    turn_meta["_turn_publication_started"] = True
+                    out.send_json_nowait(_turn_accepted_frame(turn_meta))
+                    out.send_json_nowait(
+                        _turn_status_frame(turn_meta, "recovering")
+                    )
+                    busy_frame = _conversation_busy_changed_frame(
+                        conv_id, True, turn_meta,
+                    )
+                    out.send_json_nowait(busy_frame)
+                    asyncio.create_task(
+                        _broadcast_conversation_busy_changed(
+                            conv_id,
+                            True,
+                            turn_meta,
+                            frame=busy_frame,
+                            exclude=out,
+                        )
+                    )
+                    try:
+                        stored = conversations.get_conversation(conv_id)
+                        history = (
+                            list(stored.get("messages") or [])
+                            if isinstance(stored, dict) else []
+                        )
+                        recovered = (
+                            await _finalize_admitted_turn_after_worker_failure(
+                                out, conv_id, turn_meta, history,
+                            )
+                        )
+                        if recovered is not None and active_conv_id == conv_id:
+                            session_history = recovered[0]
+                    finally:
+                        if streaming_tasks.get(conv_id) is current_task:
+                            streaming_tasks.pop(conv_id, None)
+                        if _clear_conversation_turn(conv_id, current_task):
+                            asyncio.create_task(
+                                _broadcast_conversation_busy_changed(
+                                    conv_id, False, turn_meta,
+                                )
+                            )
+
+                recovery_task = asyncio.create_task(
+                    _recover_admitted_claim_conflict()
+                )
+                _PENDING_FINAL_PERSIST_TASKS.add(recovery_task)
+                recovery_task.add_done_callback(
+                    _PENDING_FINAL_PERSIST_TASKS.discard
+                )
+            elif isinstance(turn_meta, dict):
+                out.send_json_nowait({
+                    "type": "status",
+                    "content": "error",
+                    "error": "conversation_busy",
+                    "pre_accept_rejection": True,
+                    "conversation_id": conv_id,
+                    "request_id": str(
+                        turn_meta.get("request_id")
+                        or turn_meta.get("client_request_id")
+                        or ""
+                    ),
+                    "client_request_id": str(
+                        turn_meta.get("request_id")
+                        or turn_meta.get("client_request_id")
+                        or ""
+                    ),
+                })
             return False
         streaming_tasks[conv_id] = task
-        if isinstance(turn_meta, dict):
+        if isinstance(turn_meta, dict) and turn_meta.get("persisted") is True:
+            turn_meta["_turn_publication_started"] = True
             out.send_json_nowait(_turn_accepted_frame(turn_meta))
             out.send_json_nowait(_turn_status_frame(turn_meta, "working"))
             busy_frame = _conversation_busy_changed_frame(conv_id, True, turn_meta)
@@ -8249,7 +11088,7 @@ async def websocket_endpoint(ws: WebSocket):
                     exclude=out,
                 )
             )
-        else:
+        elif turn_meta is None:
             asyncio.create_task(
                 _broadcast_conversation_busy_changed(conv_id, True, turn_meta)
             )
@@ -8258,7 +11097,9 @@ async def websocket_endpoint(ws: WebSocket):
             if streaming_tasks.get(conv_id) is t:
                 streaming_tasks.pop(conv_id, None)
             meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
-            if _clear_conversation_turn(conv_id, t):
+            if _clear_conversation_turn(conv_id, t) and bool(
+                (meta or {}).get("_turn_publication_started")
+            ):
                 asyncio.create_task(
                     _broadcast_conversation_busy_changed(conv_id, False, meta)
                 )
@@ -8366,6 +11207,14 @@ async def websocket_endpoint(ws: WebSocket):
                     if permission_session.bind_device(msg.get("device_id")):
                         out._permission_device_id = permission_session.device_id
                     permission_session.activate()
+                    durable_client_material = (
+                        permission_session.device_id
+                        or permission_session.session_id
+                    )
+                    durable_client_id = "client_" + hashlib.sha256(
+                        durable_client_material.encode("utf-8")
+                    ).hexdigest()[:32]
+                    out.bind_durable_client(durable_client_id)
                     session_history = []
                     active_conv_id = None
                     # Track this client so server-initiated frames (e.g. a
@@ -8421,6 +11270,28 @@ async def websocket_endpoint(ws: WebSocket):
                             await ws.send_json(
                                 _conversation_busy_changed_frame(_busy_id, True)
                             )
+                    supplied_cursors = msg.get("event_cursors")
+                    if not isinstance(supplied_cursors, dict):
+                        supplied_cursors = {}
+                    server_cursors = await asyncio.to_thread(
+                        _DURABLE_TRANSPORT.client_cursors,
+                        durable_client_id,
+                    )
+                    await ws.send_json({
+                        "type": "event_transport_context",
+                        "schema_version": 1,
+                        "client_id": durable_client_id,
+                        "ack_mode": "contiguous_per_stream",
+                        "cursors": server_cursors,
+                    })
+                    replay_frames = await asyncio.to_thread(
+                        _DURABLE_TRANSPORT.replay_for_client,
+                        durable_client_id,
+                        supplied_cursors,
+                    )
+                    for replay_frame in replay_frames:
+                        await out.send_durable_replay(replay_frame)
+                    await out.activate_durable_delivery()
                     print("[OSIA Server] Mobile client authenticated.")
                     _attach_confirmation_channel(
                         permission_session.device_id,
@@ -8454,6 +11325,101 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "status", "content": "error"})
                 await ws.close(code=4001, reason="Not authenticated")
                 return
+
+            if msg_type == "event_ack":
+                stream_id = str(msg.get("stream_id") or "")
+                sequence = msg.get("sequence")
+                if (
+                    msg.get("schema_version") != 1
+                    or not out._durable_client_id
+                    or not isinstance(sequence, int)
+                    or isinstance(sequence, bool)
+                ):
+                    continue
+                try:
+                    await asyncio.to_thread(
+                        _DURABLE_TRANSPORT.ack,
+                        client_id=out._durable_client_id,
+                        stream_id=stream_id,
+                        sequence=sequence,
+                    )
+                except (RuntimeError, TypeError, ValueError):
+                    pass
+                continue
+
+            if msg_type == "event_replay_request":
+                stream_id = str(msg.get("stream_id") or "")
+                after_sequence = msg.get("after_sequence")
+                if (
+                    msg.get("schema_version") != 1
+                    or not isinstance(after_sequence, int)
+                    or isinstance(after_sequence, bool)
+                    or after_sequence < 0
+                ):
+                    continue
+                try:
+                    replay_frames = await asyncio.to_thread(
+                        _DURABLE_TRANSPORT.replay_stream,
+                        stream_id,
+                        after_sequence=after_sequence,
+                    )
+                except (RuntimeError, TypeError, ValueError):
+                    replay_frames = []
+                for replay_frame in replay_frames:
+                    await out.send_durable_replay(replay_frame)
+                continue
+
+            durable_command = _durable_command_identity(msg_type, msg)
+            if durable_command is not None:
+                command_id, command_binding = durable_command
+                try:
+                    command_claim = await asyncio.to_thread(
+                        _DURABLE_TRANSPORT.claim_command,
+                        command_id=command_id,
+                        command_type=msg_type,
+                        binding=command_binding,
+                    )
+                except (RuntimeError, TypeError, ValueError):
+                    await out.send_json({
+                        "type": "command_ack",
+                        "command_id": command_id,
+                        "state": "rejected",
+                        "reason_code": "inbox_unavailable",
+                    })
+                    continue
+                if command_claim.disposition is InboxDisposition.CONFLICT:
+                    await out.send_json({
+                        "type": "command_ack",
+                        "command_id": command_id,
+                        "state": "rejected",
+                        "reason_code": "duplicate_command_conflict",
+                    })
+                    continue
+                msg["_durable_command_id"] = command_id
+                msg["_durable_command_epoch"] = command_claim.execution_epoch
+                if (
+                    command_claim.disposition
+                    is InboxDisposition.DUPLICATE_COMPLETED
+                    and msg_type not in {"text", "audio"}
+                ):
+                    await out.send_json({
+                        "type": "command_ack",
+                        "command_id": command_id,
+                        "state": "duplicate_completed",
+                        "result": command_claim.result or {},
+                    })
+                    continue
+                if (
+                    command_claim.disposition
+                    is InboxDisposition.DUPLICATE_IN_PROGRESS
+                    and msg_type not in {"text", "audio"}
+                ):
+                    await out.send_json({
+                        "type": "command_ack",
+                        "command_id": command_id,
+                        "state": "duplicate_in_progress",
+                    })
+                    continue
 
             if msg_type == "get_permission_snapshot":
                 if msg.get("schema_version") != 1:
@@ -8719,33 +11685,58 @@ async def websocket_endpoint(ws: WebSocket):
 
             if msg_type == "delete_conversation":
                 conv_id = msg.get("id", "")
-                # Cancel an in-flight stream for this conversation (if any) so
-                # it stops persisting to a file we're about to remove.
-                doomed = streaming_tasks.pop(conv_id, None)
-                if doomed is None:
-                    doomed = _ACTIVE_TURNS_BY_CONV.get(conv_id)
-                if doomed is not None:
-                    doomed.cancel()
-                media_task = _POST_TURN_MEDIA_BY_CONV.pop(conv_id, None)
-                if media_task is not None:
-                    media_task.cancel()
-                # Drop this conversation's reused agent (perf fix #3) so the
-                # deleted conv can't pin a slot in the LRU cache for the rest of
-                # the connection. Its random UUID is never reused, so nothing
-                # will look it up again. Close the client only when idle — if a
-                # just-cancelled turn's uncancellable worker thread may still be
-                # using it (_in_use), leave the close to GC once that thread ends.
-                dead_agent = conn_agents.pop(conv_id, None)
-                if dead_agent is not None and not getattr(dead_agent, "_in_use", False):
-                    _close_agent_client(dead_agent)
+                if (
+                    conv_id in streaming_tasks
+                    or _is_conversation_busy(conv_id)
+                ):
+                    await out.send_json({
+                        "type": "conversation_deleted",
+                        "id": conv_id,
+                        "success": False,
+                        "error": "conversation_busy",
+                    })
+                    await _send_recovered_turn_state(out, conv_id)
+                    continue
+                existed_before_delete = (
+                    conversations.get_conversation(conv_id) is not None
+                )
                 ok = conversations.delete_conversation(conv_id)
-                if active_conv_id == conv_id:
-                    active_conv_id = None
-                    session_history = []
+                if ok:
+                    # The atomic store lease has now proved that no canonical
+                    # turn owns this conversation. Clear only local projections
+                    # for the file that was actually removed.
+                    doomed = streaming_tasks.pop(conv_id, None)
+                    if doomed is None:
+                        doomed = _ACTIVE_TURNS_BY_CONV.get(conv_id)
+                    if doomed is not None:
+                        doomed.cancel()
+                    media_task = _POST_TURN_MEDIA_BY_CONV.pop(conv_id, None)
+                    _POST_TURN_MEDIA_META_BY_CONV.pop(conv_id, None)
+                    if media_task is not None:
+                        media_task.cancel()
+                    dead_agent = conn_agents.pop(conv_id, None)
+                    if dead_agent is not None and not getattr(
+                        dead_agent, "_in_use", False,
+                    ):
+                        _close_agent_client(dead_agent)
+                    if active_conv_id == conv_id:
+                        active_conv_id = None
+                        session_history = []
                 await out.send_json({
                     "type": "conversation_deleted",
                     "id": conv_id,
                     "success": ok,
+                    **(
+                        {}
+                        if ok else
+                        {
+                            "error": (
+                                "conversation_busy"
+                                if existed_before_delete else
+                                "conversation_not_found"
+                            )
+                        }
+                    ),
                 })
                 if ok:
                     await _broadcast_canonical_conversation_change(
@@ -8810,7 +11801,31 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             if msg_type == "delete_conversation_project":
-                result = conversations.apply_folder_mutation(msg)
+                folder_id = str(msg.get("folder_id") or "")
+                snapshot_before_delete = conversations.conversation_snapshot()
+                deleting_ids = {
+                    str(item.get("id") or "")
+                    for item in snapshot_before_delete.get("items") or []
+                    if str(item.get("folder_id") or "") == folder_id
+                }
+                busy_delete_ids = {
+                    conv_id for conv_id in deleting_ids
+                    if conv_id in streaming_tasks
+                    or _is_conversation_busy(conv_id)
+                }
+                result = (
+                    {
+                        "success": False,
+                        "error": "conversation_busy",
+                        "operation_id": str(msg.get("operation_id") or ""),
+                        "deleted_ids": [],
+                    }
+                    if busy_delete_ids else
+                    conversations.apply_folder_mutation(msg)
+                )
+                if busy_delete_ids:
+                    for conv_id in sorted(busy_delete_ids):
+                        await _send_recovered_turn_state(out, conv_id)
                 if result.get("success"):
                     for conv_id in result.get("deleted_ids") or []:
                         doomed = streaming_tasks.pop(conv_id, None)
@@ -8819,6 +11834,7 @@ async def websocket_endpoint(ws: WebSocket):
                         if doomed is not None:
                             doomed.cancel()
                         media_task = _POST_TURN_MEDIA_BY_CONV.pop(conv_id, None)
+                        _POST_TURN_MEDIA_META_BY_CONV.pop(conv_id, None)
                         if media_task is not None:
                             media_task.cancel()
                         dead_agent = conn_agents.pop(conv_id, None)
@@ -8842,10 +11858,33 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             if msg_type == "bulk_delete_ungrouped_conversations":
-                result = conversations.delete_confirmed_ungrouped_conversations(
-                    msg.get("expected_count"),
-                    operation_id=str(msg.get("operation_id") or ""),
+                snapshot_before_delete = conversations.conversation_snapshot()
+                deleting_ids = {
+                    str(item.get("id") or "")
+                    for item in snapshot_before_delete.get("items") or []
+                    if not str(item.get("folder_id") or "")
+                }
+                busy_delete_ids = {
+                    conv_id for conv_id in deleting_ids
+                    if conv_id in streaming_tasks
+                    or _is_conversation_busy(conv_id)
+                }
+                result = (
+                    {
+                        "success": False,
+                        "error": "conversation_busy",
+                        "operation_id": str(msg.get("operation_id") or ""),
+                        "deleted_ids": [],
+                    }
+                    if busy_delete_ids else
+                    conversations.delete_confirmed_ungrouped_conversations(
+                        msg.get("expected_count"),
+                        operation_id=str(msg.get("operation_id") or ""),
+                    )
                 )
+                if busy_delete_ids:
+                    for conv_id in sorted(busy_delete_ids):
+                        await _send_recovered_turn_state(out, conv_id)
                 if result.get("success"):
                     for conv_id in result.get("deleted_ids") or []:
                         doomed = streaming_tasks.pop(conv_id, None)
@@ -8854,6 +11893,7 @@ async def websocket_endpoint(ws: WebSocket):
                         if doomed is not None:
                             doomed.cancel()
                         media_task = _POST_TURN_MEDIA_BY_CONV.pop(conv_id, None)
+                        _POST_TURN_MEDIA_META_BY_CONV.pop(conv_id, None)
                         if media_task is not None:
                             media_task.cancel()
                         dead_agent = conn_agents.pop(conv_id, None)
@@ -9048,6 +12088,14 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             if msg_type == "autonomous_start":
+                # WOR-265 compatibility boundary: understand the historical
+                # message name, but never create another legacy Autonomous run.
+                # Existing records remain observable/resumable/cancellable via
+                # their dedicated compatibility controls below.
+                await out.send_json(
+                    _autonomous_frame({"event": "plan_failed"}, None)
+                )
+                continue
                 objective = (msg.get("objective") or "").strip()
                 model = (msg.get("model") or "").strip()
                 autonomous_context = resolve_turn_context(
@@ -9185,6 +12233,10 @@ async def websocket_endpoint(ws: WebSocket):
                     "task_id": str(msg.get("task_id") or ""),
                     **result,
                 })
+                await _complete_durable_command(msg, {
+                    "accepted": bool(result.get("ok")),
+                    "state": str(result.get("code") or "resolved"),
+                })
                 continue
 
             if msg_type in {
@@ -9223,6 +12275,9 @@ async def websocket_endpoint(ws: WebSocket):
                     await out.send_json({
                         "type": "autonomous_authorization_state",
                         "event": "rejected", "reason_code": "run_missing",
+                    })
+                    await _complete_durable_command(msg, {
+                        "accepted": False, "state": "run_missing",
                     })
                     continue
                 response = {
@@ -9268,6 +12323,9 @@ async def websocket_endpoint(ws: WebSocket):
                         "event": "rejected", "reason_code": exc.code,
                         **_autonomous_snapshot(st),
                     })
+                    await _complete_durable_command(msg, {
+                        "accepted": False, "state": exc.code,
+                    })
                     continue
                 except Exception:
                     await out.send_json({
@@ -9276,11 +12334,18 @@ async def websocket_endpoint(ws: WebSocket):
                         "reason_code": "authorization_internal_failure",
                         **_autonomous_snapshot(st),
                     })
+                    await _complete_durable_command(msg, {
+                        "accepted": False,
+                        "state": "authorization_internal_failure",
+                    })
                     continue
                 _broadcast_autonomous(_autonomous_frame({
                     "type": "autonomous_authorization_state",
                     "event": event,
                 }, st))
+                await _complete_durable_command(msg, {
+                    "accepted": True, "state": event,
+                })
                 continue
 
             if msg_type == "autonomous_scope_extension_response":
@@ -9289,6 +12354,9 @@ async def websocket_endpoint(ws: WebSocket):
                     await out.send_json({
                         "type": "autonomous_authorization_state",
                         "event": "rejected", "reason_code": "run_missing",
+                    })
+                    await _complete_durable_command(msg, {
+                        "accepted": False, "state": "run_missing",
                     })
                     continue
                 response = {
@@ -9326,6 +12394,9 @@ async def websocket_endpoint(ws: WebSocket):
                         "event": "rejected", "reason_code": exc.code,
                         **_autonomous_snapshot(st),
                     })
+                    await _complete_durable_command(msg, {
+                        "accepted": False, "state": exc.code,
+                    })
                     continue
                 except Exception:
                     await out.send_json({
@@ -9334,11 +12405,18 @@ async def websocket_endpoint(ws: WebSocket):
                         "reason_code": "scope_extension_internal_failure",
                         **_autonomous_snapshot(st),
                     })
+                    await _complete_durable_command(msg, {
+                        "accepted": False,
+                        "state": "scope_extension_internal_failure",
+                    })
                     continue
                 _broadcast_autonomous(_autonomous_frame({
                     "type": "autonomous_authorization_state",
                     "event": event,
                 }, st))
+                await _complete_durable_command(msg, {
+                    "accepted": True, "state": event,
+                })
                 continue
 
             if msg_type == "autonomous_authorization_revoke":
@@ -9411,18 +12489,35 @@ async def websocket_endpoint(ws: WebSocket):
                     )
                     continue
                 if scope == "chat":
-                    await _handle_correlated_chat_cancellation(out, msg)
+                    cancellation_accepted = (
+                        await _handle_correlated_chat_cancellation(out, msg)
+                    )
+                    await _complete_durable_command(msg, {
+                        "accepted": cancellation_accepted,
+                        "state": (
+                            "cancellation_requested"
+                            if cancellation_accepted else "rejected"
+                        ),
+                    })
                     continue
                 if scope == "autonomous":
                     if not await _prepare_correlated_autonomous_cancellation(
                         out, msg,
                     ):
+                        await _complete_durable_command(msg, {
+                            "accepted": False,
+                            "state": "rejected",
+                        })
                         continue
                     # Reuse the established abort worker after exact target
                     # validation. The legacy name remains compatible below,
                     # but it must now carry the same exact run correlation.
                     correlated_autonomous_abandon = True
                     msg_type = "autonomous_abort"
+                    await _complete_durable_command(msg, {
+                        "accepted": True,
+                        "state": "cancellation_requested",
+                    })
                 else:
                     await _send_cancellation_rejection(
                         out, scope or "unknown", "unsupported_scope",
@@ -9435,9 +12530,53 @@ async def websocket_endpoint(ws: WebSocket):
                 # re-acquire normally succeeds; if a DIFFERENT run now holds it,
                 # refuse (busy) — unicast to the requester, exactly like
                 # autonomous_start (NOT a broadcast: only this client asked).
-                _gen = _acquire_single_runner()
+                resume_state = _current_autonomous_state()
+                expected_run_id = msg.get("run_id")
+                expected_task_id = msg.get("task_id")
+                expected_plan_revision = msg.get("plan_revision")
+                expected_authorization_revision = msg.get(
+                    "authorization_revision"
+                )
+                exact_task_supplied = "task_id" in msg
+                if (
+                    msg.get("schema_version") != 1
+                    or not isinstance(expected_run_id, str)
+                    or (
+                        exact_task_supplied
+                        and (
+                            not isinstance(expected_task_id, str)
+                            or not expected_task_id
+                            or expected_task_id
+                            != str((resume_state or {}).get("task_id") or "")
+                        )
+                    )
+                    or not isinstance(expected_plan_revision, int)
+                    or isinstance(expected_plan_revision, bool)
+                    or not isinstance(expected_authorization_revision, int)
+                    or isinstance(expected_authorization_revision, bool)
+                    or not _autonomous_resume_target_matches(
+                        resume_state,
+                        expected_run_id,
+                        expected_plan_revision,
+                        expected_authorization_revision,
+                    )
+                    or not _legacy_autonomous_resume_is_safe(resume_state)
+                ):
+                    await out.send_json(
+                        _autonomous_frame(
+                            {"event": "state_updated"}, resume_state,
+                        )
+                        if isinstance(resume_state, dict)
+                        else _autonomous_frame({"event": "idle"}, None)
+                    )
+                    continue
+                _gen = _acquire_single_runner(
+                    task_id=resume_state.get("task_id")
+                )
                 if _gen is None:
-                    await out.send_json(_autonomous_frame({"event": "busy"}))
+                    await out.send_json(
+                        _autonomous_frame({"event": "busy"}, resume_state)
+                    )
                     continue
                 # Capture THIS event loop so the orchestrator's daemon thread can
                 # hop progress frames back onto each connection's writer.
@@ -9448,31 +12587,78 @@ async def websocket_endpoint(ws: WebSocket):
                 # joins ≤2 s on its first checkpoint save — never block the loop).
                 threading.Thread(
                     target=_autonomous_resume_worker,
-                    args=(_gen, authorization_origin_ref),
+                    args=(
+                        _gen,
+                        authorization_origin_ref,
+                        expected_run_id,
+                        expected_plan_revision,
+                        expected_authorization_revision,
+                    ),
                     daemon=True,
                 ).start()
                 continue
 
             if msg_type == "autonomous_interrupt":
+                interrupt_state = _current_autonomous_state()
+                if (
+                    not _legacy_execution_control_target_matches(
+                        interrupt_state, msg,
+                    )
+                    or chat_routing.durable_progress_from_state(
+                        interrupt_state
+                    ).get("terminal")
+                    or interrupt_state.get("abandon_state") in {
+                        "abandon_requested", "abandoned_proven",
+                    }
+                ):
+                    await out.send_json(
+                        _autonomous_frame(
+                            {"event": "state_updated"}, interrupt_state,
+                        )
+                        if isinstance(interrupt_state, dict)
+                        else _autonomous_frame({"event": "idle"}, None)
+                    )
+                    continue
+                with _autonomous_lock:
+                    if (
+                        _autonomous.get("interrupting")
+                        or not _autonomous.get("active")
+                        or _autonomous.get("st") is not interrupt_state
+                    ):
+                        interrupt_generation = 0
+                        interrupt_orch = None
+                    else:
+                        interrupt_generation = int(
+                            _autonomous.get("gen", 0)
+                        )
+                        interrupt_orch = _autonomous.get("orch")
+                        # Raise the orphan-terminal gate before the worker can
+                        # race an exact Stop control or a late engine callback.
+                        _autonomous["interrupting"] = True
+                if not interrupt_generation:
+                    await out.send_json(
+                        _autonomous_frame(
+                            {"event": "state_updated"}, interrupt_state,
+                        )
+                    )
+                    continue
+
                 # Pause (resumable): stop() joins ≤2 s, so run it off the loop.
-                # The persisted state stays in_progress ⇒ resumable on relaunch.
-                def _interrupt_worker():
-                    # ORPHAN-LOOP RACE (WOR-45) — RAISE the gate BEFORE stop():
-                    # stop()'s 2 s join can TIME OUT mid _verify/_replan, leaving
-                    # the old loop draining to a terminal emit. While the gate is
-                    # up, that terminal is dropped (not broadcast as the outcome,
-                    # not allowed to stop/free a newer run) — see
-                    # _on_autonomous_progress.
-                    _autonomous["interrupting"] = True
+                # Every mutable reference and the generation are captured now;
+                # a stale frame can never re-read or release a replacement run.
+                def _interrupt_worker(
+                    st=interrupt_state,
+                    orch=interrupt_orch,
+                    generation=interrupt_generation,
+                ):
                     try:
-                        orch = _autonomous.get("orch")
                         if orch is not None:
                             try:
                                 orch.stop()
                             except Exception:
                                 _adiagnostics.emit_diagnostic_log(
                                     _adiagnostics.make_diagnostic(
-                                        _autonomous.get("st"),
+                                        st,
                                         stage=_adiagnostics.AutonomousStage.CONTROL,
                                         category=(
                                             _adiagnostics.FailureCategory
@@ -9483,50 +12669,52 @@ async def websocket_endpoint(ws: WebSocket):
                                         checkpoint_present=True,
                                     )
                                 )
-                        st = _autonomous.get("st")
-                        if isinstance(st, dict):
-                            agent = _autonomous.get("agent")
-                            provider_now, model_now = (
-                                _adiagnostics.actual_provider_model(
-                                    agent,
-                                    st.get("provider", ""),
-                                    st.get("model", ""),
-                                )
+                        with _autonomous_lock:
+                            still_owned = bool(
+                                int(_autonomous.get("gen", 0)) == generation
+                                and _autonomous.get("st") is st
                             )
-                            diagnostic = _adiagnostics.make_diagnostic(
-                                st,
-                                stage=_adiagnostics.AutonomousStage.CONTROL,
-                                category=_adiagnostics.FailureCategory.INTERRUPTED,
-                                reason_code="user_interrupted",
-                                provider=provider_now,
-                                model=model_now,
-                                resumable=_astate.resume_state_is_valid(st),
-                                checkpoint_present=True,
+                        if not still_owned:
+                            return
+                        agent = _autonomous.get("agent")
+                        provider_now, model_now = (
+                            _adiagnostics.actual_provider_model(
+                                agent,
+                                st.get("provider", ""),
+                                st.get("model", ""),
                             )
-                            _adiagnostics.record_diagnostic(st, diagnostic)
-                            try:
-                                _astate.save_task_state(st)
-                            except Exception:
-                                _adiagnostics.set_checkpoint_present(st, False)
-                        _broadcast_autonomous(
-                            _autonomous_frame({"event": "interrupted"},
-                                              st)
                         )
-                        _release_single_runner()
+                        diagnostic = _adiagnostics.make_diagnostic(
+                            st,
+                            stage=_adiagnostics.AutonomousStage.CONTROL,
+                            category=_adiagnostics.FailureCategory.INTERRUPTED,
+                            reason_code="user_interrupted",
+                            provider=provider_now,
+                            model=model_now,
+                            resumable=_astate.resume_state_is_valid(st),
+                            checkpoint_present=True,
+                        )
+                        _adiagnostics.record_diagnostic(st, diagnostic)
+                        try:
+                            _astate.save_task_state(st)
+                        except Exception:
+                            _adiagnostics.set_checkpoint_present(st, False)
+                        _broadcast_autonomous(
+                            _autonomous_frame({"event": "interrupted"}, st)
+                        )
                     finally:
-                        # ALWAYS arm the backstop that clears the gate once the
-                        # (possibly still-draining) orphan is confirmed dead — even
-                        # if stop/broadcast/release raised. Otherwise the gate could
-                        # stick True and swallow a FUTURE run's terminal (the
-                        # NO-RESUME case; a resume/start would also clear it via its
-                        # own drain). The clear is gated on the orphan being dead;
-                        # the poller is bounded so it never blocks forever.
+                        _release_single_runner_if_gen(generation)
+                        # Clear only after a possibly draining orphan is dead.
                         threading.Thread(
                             target=_clear_interrupting_after_orphan_drained,
                             daemon=True,
                         ).start()
 
-                threading.Thread(target=_interrupt_worker, daemon=True).start()
+                threading.Thread(
+                    target=_interrupt_worker,
+                    name="osia-legacy-execution-interrupt",
+                    daemon=True,
+                ).start()
                 continue
 
             if msg_type == "autonomous_abort":
@@ -9535,12 +12723,21 @@ async def websocket_endpoint(ws: WebSocket):
                         out, msg,
                     ):
                         continue
+                with _autonomous_lock:
+                    abort_state = _autonomous.get("st")
+                    abort_orch = _autonomous.get("orch")
+                    abort_generation = int(
+                        _autonomous.get("cancellation_control_generation")
+                        or _autonomous.get("gen", 0)
+                    )
                 # Terminalize the workflow while retaining the exact durable
                 # receipt. A late engine callback cannot revive this run, and
                 # an external effect is never replayed to prove abandonment.
-                def _abort_worker():
-                    st = _autonomous.get("st")
-                    orch = _autonomous.get("orch")
+                def _abort_worker(
+                    st=abort_state,
+                    orch=abort_orch,
+                    generation=abort_generation,
+                ):
                     _autonomous.pop("correlated_cancellation_published", None)
                     if isinstance(st, dict) and not st.get("abandon_state"):
                         st["abandon_origin_status"] = str(
@@ -9555,7 +12752,8 @@ async def websocket_endpoint(ws: WebSocket):
                         _broadcast_autonomous(
                             _autonomous_frame({"event": "aborted"}, st)
                         )
-                    _release_single_runner()
+                    if generation:
+                        _release_single_runner_if_gen(generation)
 
                 threading.Thread(target=_abort_worker, daemon=True).start()
                 continue
@@ -10413,7 +13611,16 @@ async def websocket_endpoint(ws: WebSocket):
                 cid = raw_cid.strip() if isinstance(raw_cid, str) else ""
                 approved = msg.get("approved") is True
                 if cid:
-                    _resolve_confirm(cid, approved, channel=out)
+                    resolved = _resolve_confirm(
+                        cid,
+                        approved,
+                        channel=out,
+                        response_correlation=msg,
+                    )
+                    await _complete_durable_command(msg, {
+                        "accepted": bool(resolved),
+                        "state": "resolved" if resolved else "expired",
+                    })
                 continue
 
             # --- Heartbeat config (mobile live-metrics screen) ---
@@ -10579,6 +13786,10 @@ async def websocket_endpoint(ws: WebSocket):
                     ):
                         print("[OSIA Server] speak rejected: correlation mismatch")
                         continue
+                    source_binding = _persisted_turn_route_binding(persisted)
+                    if source_binding is None:
+                        print("[OSIA Server] speak rejected: route binding unavailable")
+                        continue
                     speak_text = str(persisted["assistant_content"])
                     speak_language = normalize_locale(persisted.get("language"))
                     speak_meta = {
@@ -10586,6 +13797,12 @@ async def websocket_endpoint(ws: WebSocket):
                         "request_id": speak_request_id,
                         "client_request_id": speak_request_id,
                         "turn_id": speak_turn_id,
+                        "run_id": speak_turn_id,
+                        "provider_id": source_binding["provider_id"],
+                        "model_id": source_binding["model_id"],
+                        "effective_reasoning": source_binding[
+                            "effective_reasoning"
+                        ],
                         "assistant_message_id": speak_message_id,
                         "_event_sequence": 0,
                     }
@@ -10772,11 +13989,15 @@ async def websocket_endpoint(ws: WebSocket):
                 safe_name = upload.display_name
                 ownership_transferred = False
                 ack_sent = False
+                created_chat_source_refs: list[str] = []
+                chat_sources_accepted = False
+                chat_source_owner_id = ""
                 try:
                     image_mime = _image_mime_for(upload.path)
                     if image_mime is None:
                         # Non-image: queue for the next text/audio turn.
                         pending_files.append(str(target))
+                        pending_file_display_names[str(target)] = safe_name
                         ownership_transferred = True
                     print(
                         f"[OSIA Server] file received "
@@ -10795,6 +14016,16 @@ async def websocket_endpoint(ws: WebSocket):
                         image_prompt = str(msg.get("prompt") or "").strip()
                         display_prompt = image_prompt or "Analyze the attached document image."
                         upload_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                        image_identity = _turn_input_identity(
+                            display_prompt,
+                            kind="legacy-image",
+                            manifest=_legacy_attachment_manifest(
+                                [str(target)], {str(target): safe_name},
+                            ),
+                        )
+                        legacy_image_hash = hashlib.sha256(
+                            upload_digest.encode("ascii")
+                        ).hexdigest()
                         # Run the OCR/document turn in its own task so the receive
                         # loop stays responsive while the model analyses the
                         # image (same head-of-line fix as text/audio). Resolve
@@ -10812,8 +14043,66 @@ async def websocket_endpoint(ws: WebSocket):
                                 })
                                 continue
                             client_request_id = _legacy_request_id()
-                        _conv = await _resolve_turn_conversation(msg, display_prompt)
+                        try:
+                            if await _send_existing_turn_status_for_request(
+                                out,
+                                client_request_id,
+                                expected_identity=image_identity,
+                                legacy_client_content_hash=legacy_image_hash,
+                                legacy_exact_user_content=display_prompt,
+                            ):
+                                continue
+                        except ValueError:
+                            await out.send_json({
+                                "type": "status",
+                                "content": "error",
+                                "error": "request_id_conflict",
+                            })
+                            continue
+                        _conv = await _resolve_turn_conversation(
+                            msg, display_prompt, client_request_id,
+                        )
                         if _conv is not None:
+                            chat_source_owner_id = _conv
+                            try:
+                                if await _send_persisted_turn_for_request(
+                                    out,
+                                    _conv,
+                                    client_request_id,
+                                    expected_identity=image_identity,
+                                    legacy_client_content_hash=legacy_image_hash,
+                                    legacy_exact_user_content=display_prompt,
+                                ):
+                                    continue
+                            except ValueError:
+                                await out.send_json({
+                                    "type": "status",
+                                    "content": "error",
+                                    "error": "request_id_conflict",
+                                    "conversation_id": _conv,
+                                })
+                                continue
+                            if _is_conversation_busy(_conv):
+                                try:
+                                    if await _send_existing_turn_status(
+                                        out,
+                                        _conv,
+                                        client_request_id,
+                                        expected_identity=image_identity,
+                                        legacy_client_content_hash=legacy_image_hash,
+                                        legacy_exact_user_content=display_prompt,
+                                    ):
+                                        continue
+                                except ValueError:
+                                    await out.send_json({
+                                        "type": "status",
+                                        "content": "error",
+                                        "error": "request_id_conflict",
+                                        "conversation_id": _conv,
+                                    })
+                                    continue
+                                await _send_conversation_busy(out, _conv)
+                                continue
                             from osia.document_sources import get_source_store
 
                             capability = get_source_store().create(
@@ -10826,22 +14115,15 @@ async def websocket_endpoint(ws: WebSocket):
                                     permission_session.store.load_state().policy_epoch
                                 ),
                             )
+                            created_chat_source_refs.append(
+                                str(capability["source_ref"])
+                            )
                             document_content = (
                                 "[Document image available through read_document: "
                                 f"source_ref={capability['source_ref']} "
                                 f"type={capability['type_label']} state={capability['state']}]"
                                 f"\n\n{display_prompt}"
                             )
-                            if await _send_persisted_turn_for_request(
-                                out,
-                                _conv,
-                                client_request_id,
-                                expected_user_content=upload_digest,
-                            ):
-                                continue
-                            if _is_conversation_busy(_conv):
-                                await _send_conversation_busy(out, _conv)
-                                continue
                             turn_meta = _new_turn_meta(_conv, client_request_id)
                             turn_meta["_document_owner_device"] = (
                                 permission_session.device_id
@@ -10854,10 +14136,19 @@ async def websocket_endpoint(ws: WebSocket):
                             turn_meta["tts_enabled"] = (
                                 msg.get("tts_enabled", True) is not False
                             )
-                            turn_meta["client_content_hash"] = hashlib.sha256(
-                                upload_digest.encode("ascii")
-                            ).hexdigest()
+                            _apply_turn_input_identity(turn_meta, image_identity)
+                            turn_meta["_durable_agent_input_v1"] = document_content
+                            turn_meta["_preaccept_source_refs"] = list(
+                                created_chat_source_refs
+                            )
                             turn_meta["persisted_user_content"] = display_prompt
+                            if not await _accept_user_turn_before_spawn(
+                                _conv,
+                                display_prompt,
+                                turn_meta,
+                            ):
+                                continue
+                            chat_sources_accepted = True
 
                             async def _run_legacy_image_turn(
                                 snap,
@@ -10906,6 +14197,11 @@ async def websocket_endpoint(ws: WebSocket):
                             "error": {"code": "legacy_file_processing_failed"},
                         })
                 finally:
+                    if created_chat_source_refs and not chat_sources_accepted:
+                        _release_unaccepted_source_refs(
+                            created_chat_source_refs,
+                            owner_id=chat_source_owner_id,
+                        )
                     if not ownership_transferred:
                         legacy_uploads.cleanup([target])
                 continue
@@ -10948,24 +14244,118 @@ async def websocket_endpoint(ws: WebSocket):
                     client_request_id = _legacy_request_id()
                 attachment_batch_id = str(msg.get("attachment_batch_id") or "")
                 validated_attachment_batch = None
+                attachment_validation_error = None
                 requested_conversation_id = str(
                     msg.get("conversation_id") or ""
                 ).strip()
                 waiting_turn_command = msg.get("waiting_turn_command") is True
-                content_identity = (
+                legacy_content_identity = (
                     f"{user_text}\0{attachment_batch_id}"
                     if attachment_batch_id else user_text
                 )
                 if raw_turn_directives is not None:
-                    content_identity += "\0" + canonical_turn_directives
+                    legacy_content_identity += "\0" + canonical_turn_directives
+                content_identity = json.dumps(
+                    {
+                        "attachment_batch_id": attachment_batch_id,
+                        "text": user_text,
+                        "turn_directives": (
+                            canonical_turn_directives
+                            if raw_turn_directives is not None else None
+                        ),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                legacy_candidate_files = (
+                    list(pending_files) if not attachment_batch_id else []
+                )
+                legacy_candidate_names = {
+                    path: pending_file_display_names.get(path, "")
+                    for path in legacy_candidate_files
+                }
+                if attachment_batch_id:
+                    try:
+                        validated_attachment_batch = (
+                            attachment_batches.validate_turn_reference(
+                                attachment_batch_id,
+                                requested_conversation_id,
+                                client_request_id,
+                            )
+                        )
+                    except AttachmentProtocolError as exc:
+                        if exc.code not in {
+                            "attachment_batch_not_committed",
+                            "attachment_batch_already_consumed",
+                        }:
+                            await out.send_json({
+                                "type": "attachment_batch_failed",
+                                "protocol_version": 1,
+                                "batch_id": attachment_batch_id,
+                                "conversation_id": requested_conversation_id,
+                                "client_request_id": client_request_id,
+                                "request_id": client_request_id,
+                                "event_id": f"event_{secrets.token_hex(16)}",
+                                "sequence": 0,
+                                "category": exc.code,
+                            })
+                            continue
+                        attachment_validation_error = exc
+                input_manifest = (
+                    _transactional_attachment_manifest(
+                        validated_attachment_batch
+                    )
+                    if validated_attachment_batch is not None else
+                    _legacy_attachment_manifest(
+                        legacy_candidate_files, legacy_candidate_names,
+                    )
+                    if legacy_candidate_files else
+                    None
+                )
+                input_identity = _turn_input_identity(
+                    content_identity,
+                    kind=(
+                        "transactional-attachments"
+                        if attachment_batch_id else
+                        "legacy-attachments"
+                        if legacy_candidate_files else
+                        "text"
+                    ),
+                    manifest=input_manifest,
+                )
+                legacy_text_hash = (
+                    ""
+                    if input_manifest else
+                    hashlib.sha256(
+                        legacy_content_identity.encode("utf-8")
+                    ).hexdigest()
+                )
+
+                def _discard_replayed_text_inputs() -> None:
+                    if validated_attachment_batch is not None:
+                        attachment_batches.release(attachment_batch_id)
+                    if legacy_candidate_files:
+                        legacy_uploads.cleanup(legacy_candidate_files)
+                        for path in legacy_candidate_files:
+                            try:
+                                pending_files.remove(path)
+                            except ValueError:
+                                pass
+                            pending_file_display_names.pop(path, None)
+
                 try:
                     if await _send_existing_turn_status_for_request(
                         out,
                         client_request_id,
-                        expected_user_content=content_identity,
+                        expected_identity=input_identity,
+                        legacy_client_content_hash=legacy_text_hash,
+                        legacy_exact_user_content=user_text,
                     ):
+                        _discard_replayed_text_inputs()
                         continue
                 except ValueError:
+                    _discard_replayed_text_inputs()
                     await out.send_json({
                         "type": "status",
                         "content": "error",
@@ -10982,10 +14372,14 @@ async def websocket_endpoint(ws: WebSocket):
                             out,
                             requested_conversation_id,
                             client_request_id,
-                            expected_user_content=content_identity,
+                            expected_identity=input_identity,
+                            legacy_client_content_hash=legacy_text_hash,
+                            legacy_exact_user_content=user_text,
                         ):
+                            _discard_replayed_text_inputs()
                             continue
                     except ValueError:
+                        _discard_replayed_text_inputs()
                         await out.send_json({
                             "type": "status",
                             "content": "error",
@@ -10993,15 +14387,8 @@ async def websocket_endpoint(ws: WebSocket):
                             "conversation_id": requested_conversation_id,
                         })
                         continue
-                if attachment_batch_id:
-                    try:
-                        validated_attachment_batch = attachment_batches.validate_turn_reference(
-                            attachment_batch_id,
-                            requested_conversation_id,
-                            client_request_id,
-                        )
-                    except AttachmentProtocolError as exc:
-                        await out.send_json({
+                if attachment_validation_error is not None:
+                    await out.send_json({
                             "type": "attachment_batch_failed",
                             "protocol_version": 1,
                             "batch_id": attachment_batch_id,
@@ -11010,25 +14397,31 @@ async def websocket_endpoint(ws: WebSocket):
                             "request_id": client_request_id,
                             "event_id": f"event_{secrets.token_hex(16)}",
                             "sequence": 0,
-                            "category": exc.code,
+                            "category": attachment_validation_error.code,
                         })
-                        continue
+                    continue
                 # Consume pending files synchronously (clears the shared list)
                 # so this turn — and only this turn — carries them. Resolve the
                 # conversation synchronously (creating it on the first message)
                 # so the turn is keyed by a real id, then run the agent in its
                 # own task so the receive loop stays free.
-                _conv = await _resolve_turn_conversation(msg, user_text)
+                _conv = await _resolve_turn_conversation(
+                    msg, user_text, client_request_id,
+                )
                 if _conv is not None:
                     try:
                         if await _send_persisted_turn_for_request(
                             out,
                             _conv,
                             client_request_id,
-                            expected_user_content=content_identity,
+                            expected_identity=input_identity,
+                            legacy_client_content_hash=legacy_text_hash,
+                            legacy_exact_user_content=user_text,
                         ):
+                            _discard_replayed_text_inputs()
                             continue
                     except ValueError:
+                        _discard_replayed_text_inputs()
                         await out.send_json({
                             "type": "status",
                             "content": "error",
@@ -11080,11 +14473,25 @@ async def websocket_endpoint(ws: WebSocket):
                             out, _conv, user_text,
                         ):
                             continue
-                        if await _send_existing_turn_status(
-                            out,
-                            _conv,
-                            client_request_id,
-                        ):
+                        try:
+                            if await _send_existing_turn_status(
+                                out,
+                                _conv,
+                                client_request_id,
+                                expected_identity=input_identity,
+                                legacy_client_content_hash=legacy_text_hash,
+                                legacy_exact_user_content=user_text,
+                            ):
+                                _discard_replayed_text_inputs()
+                                continue
+                        except ValueError:
+                            _discard_replayed_text_inputs()
+                            await out.send_json({
+                                "type": "status",
+                                "content": "error",
+                                "error": "request_id_conflict",
+                                "conversation_id": _conv,
+                            })
                             continue
                         await _send_conversation_busy(out, _conv)
                         continue
@@ -11100,6 +14507,7 @@ async def websocket_endpoint(ws: WebSocket):
                             )
                         continue
                     committed_attachments = []
+                    created_source_refs: list[str] = []
                     if attachment_batch_id:
                         try:
                             committed_attachments = attachment_batches.consume_for_turn(
@@ -11120,14 +14528,21 @@ async def websocket_endpoint(ws: WebSocket):
                                 "category": exc.code,
                             })
                             continue
-                        agent_input = build_agent_input(
-                            user_text,
-                            committed_attachments,
-                            owner_id=_conv,
-                            permission_epoch=int(
-                                permission_session.store.load_state().policy_epoch
-                            ),
-                        )
+                        try:
+                            agent_input = build_agent_input(
+                                user_text,
+                                committed_attachments,
+                                owner_id=_conv,
+                                permission_epoch=int(
+                                    permission_session.store.load_state().policy_epoch
+                                ),
+                                source_refs_out=created_source_refs,
+                            )
+                        except BaseException:
+                            _release_unaccepted_source_refs(
+                                created_source_refs, owner_id=_conv,
+                            )
+                            raise
                         display_names = ", ".join(
                             item.display_name for item in committed_attachments
                         )
@@ -11139,41 +14554,104 @@ async def websocket_endpoint(ws: WebSocket):
                         # ``pending_files`` until the turn metadata is ready,
                         # so a handler exception before spawn is still covered
                         # by connection teardown.
-                        agent_input = _consume_pending_files(
-                            user_text,
-                            list(pending_files),
-                            owner_id=_conv,
-                            permission_epoch=int(
-                                permission_session.store.load_state().policy_epoch
-                            ),
-                        )
+                        try:
+                            agent_input = _consume_pending_files(
+                                user_text,
+                                list(pending_files),
+                                display_names=pending_file_display_names,
+                                owner_id=_conv,
+                                permission_epoch=int(
+                                    permission_session.store.load_state().policy_epoch
+                                ),
+                                source_refs_out=created_source_refs,
+                            )
+                        except BaseException:
+                            _release_unaccepted_source_refs(
+                                created_source_refs, owner_id=_conv,
+                            )
+                            raise
                         persisted_user_content = user_text
-                    turn_meta = _new_turn_meta(_conv, client_request_id)
-                    turn_meta["_document_owner_device"] = (
-                        permission_session.device_id
-                    )
-                    turn_meta["_autonomous_origin_ref"] = (
-                        authorization_origin_ref
-                    )
-                    turn_meta["client_locale"] = msg.get("locale")
-                    turn_meta["_original_user_text"] = user_text
-                    turn_meta["tts_enabled"] = (
-                        msg.get("tts_enabled", True) is not False
-                    )
-                    turn_meta["client_content_hash"] = hashlib.sha256(
-                        content_identity.encode("utf-8")
-                    ).hexdigest()
-                    if turn_directives is not None:
-                        turn_meta["turn_directives"] = turn_directives
-                        turn_meta["_turn_directives_v1"] = (
-                            turn_directives.to_wire()
+                    turn_meta = None
+                    try:
+                        turn_meta = _new_turn_meta(
+                            _conv,
+                            client_request_id,
+                            turn_directives=turn_directives,
                         )
-                    if committed_attachments:
-                        turn_meta["persisted_user_content"] = persisted_user_content
-                        turn_meta["attachment_metadata"] = [
-                            item.persistence_metadata()
-                            for item in committed_attachments
-                        ]
+                        turn_meta["_document_owner_device"] = (
+                            permission_session.device_id
+                        )
+                        turn_meta["_autonomous_origin_ref"] = (
+                            authorization_origin_ref
+                        )
+                        turn_meta["client_locale"] = msg.get("locale")
+                        turn_meta["_original_user_text"] = user_text
+                        turn_meta["tts_enabled"] = (
+                            msg.get("tts_enabled", True) is not False
+                        )
+                        turn_meta["_durable_command_id"] = str(
+                            msg.get("_durable_command_id") or ""
+                        )
+                        turn_meta["_durable_command_epoch"] = str(
+                            msg.get("_durable_command_epoch") or ""
+                        )
+                        _apply_turn_input_identity(turn_meta, input_identity)
+                        if created_source_refs:
+                            turn_meta["_preaccept_source_refs"] = list(
+                                created_source_refs
+                            )
+                        if input_identity.get("attachment_manifest_hash"):
+                            turn_meta["_durable_agent_input_v1"] = str(agent_input)
+                        if turn_directives is not None:
+                            turn_meta["turn_directives"] = turn_directives
+                            turn_meta["_turn_directives_v1"] = (
+                                turn_directives.to_wire()
+                            )
+                        if committed_attachments:
+                            turn_meta["persisted_user_content"] = (
+                                persisted_user_content
+                            )
+                            turn_meta["attachment_metadata"] = [
+                                item.persistence_metadata()
+                                for item in committed_attachments
+                            ]
+                    except BaseException:
+                        if isinstance(turn_meta, dict):
+                            _release_unaccepted_turn_sources(
+                                turn_meta, owner_id=_conv,
+                            )
+                        else:
+                            _release_unaccepted_source_refs(
+                                created_source_refs, owner_id=_conv,
+                            )
+                        raise
+                    legacy_turn_files = (
+                        list(pending_files) if not attachment_batch_id else []
+                    )
+                    try:
+                        accepted_for_spawn = (
+                            await _accept_user_turn_before_spawn(
+                                _conv,
+                                persisted_user_content,
+                                turn_meta,
+                            )
+                        )
+                    except BaseException:
+                        _release_unaccepted_turn_sources(
+                            turn_meta, owner_id=_conv,
+                        )
+                        raise
+                    if not accepted_for_spawn:
+                        legacy_uploads.cleanup(legacy_turn_files)
+                        for path in legacy_turn_files:
+                            try:
+                                pending_files.remove(path)
+                            except ValueError:
+                                pass
+                            pending_file_display_names.pop(path, None)
+                        if attachment_batch_id:
+                            attachment_batches.release(attachment_batch_id)
+                        continue
 
                     async def _run_text_turn_with_attachment_cleanup(
                         snap,
@@ -11207,11 +14685,10 @@ async def websocket_endpoint(ws: WebSocket):
                             _operation,
                         )
 
-                    legacy_turn_files = (
-                        list(pending_files) if not attachment_batch_id else []
-                    )
                     if legacy_turn_files:
                         pending_files.clear()
+                        for path in legacy_turn_files:
+                            pending_file_display_names.pop(path, None)
 
                     try:
                         spawned = _spawn_turn(
@@ -11247,11 +14724,68 @@ async def websocket_endpoint(ws: WebSocket):
                         })
                         continue
                     client_request_id = _legacy_request_id()
-                if await _send_existing_turn_status_for_request(
-                    out,
-                    client_request_id,
-                ):
-                    continue
+                audio_candidate_files = list(pending_files)
+                audio_candidate_names = {
+                    path: pending_file_display_names.get(path, "")
+                    for path in audio_candidate_files
+                }
+                audio_identity = _turn_input_identity(
+                    b64_data,
+                    kind=(
+                        "legacy-audio-attachments"
+                        if audio_candidate_files else "audio"
+                    ),
+                    manifest=(
+                        _legacy_attachment_manifest(
+                            audio_candidate_files, audio_candidate_names,
+                        )
+                        if audio_candidate_files else None
+                    ),
+                )
+                legacy_audio_hash = hashlib.sha256(
+                    str(b64_data).encode("utf-8")
+                ).hexdigest()
+                active_legacy_audio_conv = str(
+                    _ACTIVE_CONV_BY_REQUEST.get(client_request_id) or ""
+                )
+                active_legacy_audio_meta = _ACTIVE_TURN_META_BY_CONV.get(
+                    active_legacy_audio_conv
+                )
+                active_legacy_audio_replay = bool(
+                    not audio_candidate_files
+                    and _legacy_audio_replay_record(
+                        active_legacy_audio_meta,
+                        legacy_audio_hash,
+                        require_complete=False,
+                    )
+                )
+
+                def _discard_replayed_audio_inputs() -> None:
+                    legacy_uploads.cleanup(audio_candidate_files)
+                    for path in audio_candidate_files:
+                        try:
+                            pending_files.remove(path)
+                        except ValueError:
+                            pass
+                        pending_file_display_names.pop(path, None)
+
+                if not active_legacy_audio_replay:
+                    try:
+                        if await _send_existing_turn_status_for_request(
+                            out,
+                            client_request_id,
+                            expected_identity=audio_identity,
+                        ):
+                            _discard_replayed_audio_inputs()
+                            continue
+                    except ValueError:
+                        _discard_replayed_audio_inputs()
+                        await out.send_json({
+                            "type": "status",
+                            "content": "error",
+                            "error": "request_id_conflict",
+                        })
+                        continue
                 # Snapshot + clear pending files at spawn time so they attach
                 # to THIS turn regardless of uploads that arrive during STT.
                 # Resolve the conversation synchronously (default title; the
@@ -11262,25 +14796,112 @@ async def websocket_endpoint(ws: WebSocket):
                 # STT runs. This is the cost of having a real id at spawn time
                 # (which fixes the duplicate-conversation race); the stray conv
                 # is harmless and reused by the next real message.
-                _conv = await _resolve_turn_conversation(msg, None)
+                _conv = await _resolve_turn_conversation(
+                    msg, None, client_request_id,
+                )
                 if _conv is not None:
-                    if await _send_persisted_turn_for_request(
-                        out,
-                        _conv,
-                        client_request_id,
-                        expected_user_content=b64_data,
+                    if (
+                        active_legacy_audio_replay
+                        and active_legacy_audio_conv != _conv
                     ):
+                        _discard_replayed_audio_inputs()
+                        await out.send_json({
+                            "type": "status",
+                            "content": "error",
+                            "error": "request_id_conflict",
+                            "conversation_id": _conv,
+                        })
                         continue
-                    if _is_conversation_busy(_conv):
-                        if await _send_existing_turn_status(
-                            out,
-                            _conv,
-                            client_request_id,
-                        ):
+                    try:
+                        persisted_audio_record = (
+                            conversations.find_correlated_turn(
+                                _conv, client_request_id,
+                            )
+                        )
+                    except ValueError:
+                        persisted_audio_record = None
+                        persisted_audio_conflict = True
+                    else:
+                        persisted_audio_conflict = False
+                    if persisted_audio_conflict:
+                        _discard_replayed_audio_inputs()
+                        await out.send_json({
+                            "type": "status",
+                            "content": "error",
+                            "error": "request_id_conflict",
+                            "conversation_id": _conv,
+                        })
+                        continue
+                    legacy_audio_shape = bool(
+                        not audio_candidate_files
+                        and _legacy_audio_replay_record(
+                            persisted_audio_record,
+                            legacy_audio_hash,
+                            require_complete=False,
+                        )
+                    )
+                    legacy_audio_complete = bool(
+                        legacy_audio_shape
+                        and _legacy_audio_replay_record(
+                            persisted_audio_record,
+                            legacy_audio_hash,
+                            require_complete=True,
+                        )
+                    )
+                    if not legacy_audio_shape:
+                        try:
+                            if await _send_persisted_turn_for_request(
+                                out,
+                                _conv,
+                                client_request_id,
+                                expected_identity=audio_identity,
+                            ):
+                                _discard_replayed_audio_inputs()
+                                continue
+                        except ValueError:
+                            _discard_replayed_audio_inputs()
+                            await out.send_json({
+                                "type": "status",
+                                "content": "error",
+                                "error": "request_id_conflict",
+                                "conversation_id": _conv,
+                            })
                             continue
+                    if _is_conversation_busy(_conv):
+                        if not (
+                            legacy_audio_shape or active_legacy_audio_replay
+                        ):
+                            try:
+                                if await _send_existing_turn_status(
+                                    out,
+                                    _conv,
+                                    client_request_id,
+                                    expected_identity=audio_identity,
+                                ):
+                                    _discard_replayed_audio_inputs()
+                                    continue
+                            except ValueError:
+                                _discard_replayed_audio_inputs()
+                                await out.send_json({
+                                    "type": "status",
+                                    "content": "error",
+                                    "error": "request_id_conflict",
+                                    "conversation_id": _conv,
+                                })
+                                continue
                         await _send_conversation_busy(out, _conv)
                         continue
-                    _pf = list(pending_files)
+                    if legacy_audio_shape and not legacy_audio_complete:
+                        _discard_replayed_audio_inputs()
+                        await out.send_json({
+                            "type": "status",
+                            "content": "error",
+                            "error": "request_id_conflict",
+                            "conversation_id": _conv,
+                        })
+                        continue
+                    _pf = list(audio_candidate_files)
+                    _pf_names = dict(audio_candidate_names)
                     turn_meta = _new_turn_meta(_conv, client_request_id)
                     turn_meta["_document_owner_device"] = (
                         permission_session.device_id
@@ -11292,9 +14913,17 @@ async def websocket_endpoint(ws: WebSocket):
                     turn_meta["tts_enabled"] = (
                         msg.get("tts_enabled", True) is not False
                     )
-                    turn_meta["client_content_hash"] = hashlib.sha256(
-                        b64_data.encode("ascii")
-                    ).hexdigest()
+                    turn_meta["_durable_command_id"] = str(
+                        msg.get("_durable_command_id") or ""
+                    )
+                    turn_meta["_durable_command_epoch"] = str(
+                        msg.get("_durable_command_epoch") or ""
+                    )
+                    _apply_turn_input_identity(turn_meta, audio_identity)
+                    if legacy_audio_complete:
+                        turn_meta["_legacy_audio_replay_v1"] = {
+                            "legacy_audio_hash": legacy_audio_hash,
+                        }
 
                     async def _run_legacy_audio_turn(
                         snap,
@@ -11302,6 +14931,7 @@ async def websocket_endpoint(ws: WebSocket):
                         _f=audio_format,
                         _c=_conv,
                         _files=_pf,
+                        _file_names=_pf_names,
                         _m=turn_meta,
                         _epoch=int(
                             permission_session.store.load_state().policy_epoch
@@ -11315,6 +14945,7 @@ async def websocket_endpoint(ws: WebSocket):
                                 snap,
                                 _c,
                                 pending_files=_files,
+                                pending_file_display_names=_file_names,
                                 get_agent=_get_conn_agent,
                                 turn_meta=_m,
                                 permission_epoch=_epoch,
@@ -11322,11 +14953,13 @@ async def websocket_endpoint(ws: WebSocket):
 
                         return await run_with_legacy_cleanup(
                             legacy_uploads,
-                            _files,
+                            list(_files),
                             _operation,
                         )
 
                     pending_files.clear()
+                    for path in _pf:
+                        pending_file_display_names.pop(path, None)
                     try:
                         spawned = _spawn_turn(
                             _conv,
@@ -11418,9 +15051,32 @@ async def websocket_endpoint(ws: WebSocket):
             # Text generation stays detached so it can persist, but media has no
             # live recipient on this channel. Invalidate its per-turn worker now;
             # late provider bytes can no longer reach a later connection.
-            _media_task = _POST_TURN_MEDIA_BY_CONV.pop(_cid, None)
-            if _media_task is not None:
-                _media_task.cancel()
+            _media_task = _POST_TURN_MEDIA_BY_CONV.get(_cid)
+            _media_meta = _POST_TURN_MEDIA_META_BY_CONV.get(_cid)
+            _release_task = (
+                _media_meta.get("_post_turn_media_release_task")
+                if isinstance(_media_meta, dict) else None
+            )
+            _release_inflight = bool(
+                isinstance(_release_task, asyncio.Task)
+                and _media_task is _release_task
+                and not _release_task.done()
+            )
+            if not _release_inflight:
+                if _POST_TURN_MEDIA_BY_CONV.get(_cid) is _media_task:
+                    _POST_TURN_MEDIA_BY_CONV.pop(_cid, None)
+                    _POST_TURN_MEDIA_META_BY_CONV.pop(_cid, None)
+                if isinstance(_media_meta, dict):
+                    _media_meta["_response_media_cancelled"] = True
+                if _media_task is not None:
+                    _media_task.cancel()
+                if (
+                    isinstance(_media_meta, dict)
+                    and _media_meta.get(
+                        "_post_turn_media_lease_committed"
+                    ) is True
+                ):
+                    _schedule_response_media_lease_release(_media_meta)
             _DETACHED_TURNS.add(_task)
             # Also index by conversation id (WOR-62 follow-up) so a reconnecting
             # client's load_conversation can await THIS turn before reading disk.
@@ -11540,8 +15196,6 @@ def _displayable_history(history: list) -> list[dict]:
         # prompt leaked into the conversation history.
         if "RÈGLES ABSOLUES" in text or "ABSOLUTE RULES" in text:
             continue
-        if text.lstrip().startswith("##"):
-            continue
         display = {"role": role, "content": text}
         request_id = str(
             msg.get("_request_id")
@@ -11558,6 +15212,16 @@ def _displayable_history(history: list) -> list[dict]:
                 "turn_id": turn_id,
                 "message_id": message_id,
             })
+            route = {
+                "run_id": str(msg.get("_run_id") or turn_id),
+                "provider_id": str(msg.get("_provider_id") or ""),
+                "model_id": str(msg.get("_model_id") or ""),
+                "effective_reasoning": str(
+                    msg.get("_effective_reasoning") or ""
+                ),
+            }
+            if all(route.values()):
+                display.update(route)
         if role == "assistant":
             from osia.execution_trace import validate_persisted_trace
 
@@ -11638,8 +15302,10 @@ def _consume_pending_files(
     user_text: str,
     pending_files: list[str],
     *,
+    display_names: dict[str, str] | None = None,
     owner_id: str | None = None,
     permission_epoch: int | None = None,
+    source_refs_out: list[str] | None = None,
 ) -> str:
     """Replace legacy pending paths with opaque sources before model access."""
     if not pending_files:
@@ -11650,22 +15316,27 @@ def _consume_pending_files(
 
     capabilities = []
     for path in paths:
+        display_name = str(
+            (display_names or {}).get(str(path)) or Path(path).name
+        )
         if owner_id:
             capability = get_source_store().create(
                 path,
                 owner_id=owner_id,
                 source_kind="legacy_mobile_attachment",
-                display_name=Path(path).name,
+                display_name=display_name,
                 permission_epoch=permission_epoch,
             )
         else:
             capability = get_source_store().create_for_current_owner(
                 path,
                 source_kind="legacy_mobile_attachment",
-                display_name=Path(path).name,
+                display_name=display_name,
                 permission_epoch=permission_epoch,
             )
         capabilities.append(capability)
+        if source_refs_out is not None:
+            source_refs_out.append(str(capability["source_ref"]))
     bullets = "\n".join(
         f"- source_ref={item['source_ref']} type={item['type_label']} state={item['state']}"
         + (f" category={item['category']}" if item.get("category") else "")
@@ -11677,9 +15348,188 @@ def _consume_pending_files(
     )
 
 
+def _release_unaccepted_source_refs(
+    source_refs: list[str] | tuple[str, ...],
+    *,
+    owner_id: str,
+) -> None:
+    """Drop only pre-accept document copies owned by the losing turn."""
+
+    refs = [str(value or "") for value in source_refs if str(value or "")]
+    if not refs or not owner_id:
+        return
+    store = document_sources.get_source_store()
+    try:
+        pending_refs = list(store.release_owned_confirmed(
+            refs, owner_id=owner_id,
+        ))
+    except document_sources.DocumentSourceError as exc:
+        print(
+            "[OSIA Server] unaccepted document source cleanup failed "
+            f"category={exc.category}"
+        )
+        return
+    except Exception as exc:
+        pending_refs = list(refs)
+        print(
+            "[OSIA Server] unaccepted document source cleanup deferred "
+            f"category={type(exc).__name__}"
+        )
+    if not pending_refs:
+        return
+
+    async def _retry_cleanup() -> None:
+        remaining = list(pending_refs)
+        delay = 0.25
+        while remaining:
+            await asyncio.sleep(delay)
+            try:
+                remaining = list(await asyncio.to_thread(
+                    store.release_owned_confirmed,
+                    remaining,
+                    owner_id=owner_id,
+                ))
+            except asyncio.CancelledError:
+                raise
+            except document_sources.DocumentSourceError as exc:
+                print(
+                    "[OSIA Server] unaccepted document source cleanup stopped "
+                    f"category={exc.category}"
+                )
+                return
+            except Exception:
+                pass
+            delay = min(30.0, delay * 2.0)
+
+    try:
+        cleanup_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        print(
+            "[OSIA Server] unaccepted document source cleanup remains deferred"
+        )
+        return
+    cleanup_task = cleanup_loop.create_task(_retry_cleanup())
+    _PENDING_SOURCE_CLEANUP_TASKS.add(cleanup_task)
+    cleanup_task.add_done_callback(_PENDING_SOURCE_CLEANUP_TASKS.discard)
+
+
+def _release_unaccepted_turn_sources(
+    turn_meta: dict | None,
+    *,
+    owner_id: str,
+) -> None:
+    if not isinstance(turn_meta, dict):
+        return
+    refs = turn_meta.pop("_preaccept_source_refs", [])
+    if isinstance(refs, list):
+        _release_unaccepted_source_refs(refs, owner_id=owner_id)
+
+
 # ---------------------------------------------------------------------------
 # Message handlers
 # ---------------------------------------------------------------------------
+def _ensure_response_media_lease(turn_meta: dict | None) -> None:
+    """Bind this process as the exact owner of the response-media phase."""
+
+    if not isinstance(turn_meta, dict):
+        return
+    assistant_message_id = str(
+        turn_meta.get("assistant_message_id") or ""
+    ).strip()
+    if not assistant_message_id:
+        return
+    from osia.turn_terminality import live_process_identity
+
+    _owner_alive, owner_process_identity = live_process_identity(os.getpid())
+    turn_meta.setdefault(
+        "_post_turn_media_lease_id", f"media_{assistant_message_id}",
+    )
+    turn_meta["_post_turn_media_owner_pid"] = os.getpid()
+    turn_meta["_post_turn_media_owner_process_identity"] = (
+        owner_process_identity
+    )
+
+
+def _schedule_response_media_lease_release(
+    turn_meta: dict | None,
+) -> "asyncio.Task | None":
+    """Retry the exact durable media-lease CAS until it is confirmed clear."""
+
+    if not isinstance(turn_meta, dict):
+        return None
+    if turn_meta.get("_post_turn_media_lease_released") is True:
+        return None
+    if turn_meta.get("_post_turn_media_lease_committed") is not True:
+        turn_meta["_post_turn_media_release_pending"] = True
+        return None
+    conv_id = str(turn_meta.get("conversation_id") or "")
+    lease_id = str(turn_meta.get("_post_turn_media_lease_id") or "")
+    if not conv_id or not lease_id:
+        return None
+    existing = turn_meta.get("_post_turn_media_release_task")
+    if isinstance(existing, asyncio.Task) and not existing.done():
+        return existing
+
+    async def _retry_exact_release() -> None:
+        delay = 0.25
+        logged_category = ""
+        while True:
+            try:
+                release_result = await asyncio.to_thread(
+                    conversations.release_post_turn_media_cas,
+                    conv_id,
+                    lease_id,
+                )
+                if release_result in {
+                    "released", "confirmed_absent_or_different",
+                }:
+                    turn_meta["_post_turn_media_lease_released"] = True
+                    turn_meta.pop("_post_turn_media_release_pending", None)
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                category = type(exc).__name__
+                if category != logged_category:
+                    logged_category = category
+                    print(
+                        "[OSIA Server] response media lease release deferred "
+                        f"category={category}"
+                    )
+            await asyncio.sleep(delay)
+            delay = min(30.0, delay * 2.0)
+
+    release_task = asyncio.create_task(_retry_exact_release())
+    turn_meta["_post_turn_media_release_task"] = release_task
+    _POST_TURN_MEDIA_TASKS.add(release_task)
+    if _application_transport_coordination_enabled():
+        _POST_TURN_MEDIA_BY_CONV[conv_id] = release_task
+        _POST_TURN_MEDIA_META_BY_CONV[conv_id] = turn_meta
+
+    def _release_done(done_task: "asyncio.Task") -> None:
+        _POST_TURN_MEDIA_TASKS.discard(done_task)
+        if turn_meta.get("_post_turn_media_release_task") is done_task:
+            turn_meta.pop("_post_turn_media_release_task", None)
+        if _POST_TURN_MEDIA_BY_CONV.get(conv_id) is done_task:
+            _POST_TURN_MEDIA_BY_CONV.pop(conv_id, None)
+            _POST_TURN_MEDIA_META_BY_CONV.pop(conv_id, None)
+            if not _is_conversation_busy(conv_id):
+                asyncio.create_task(
+                    _broadcast_conversation_busy_changed(
+                        conv_id, False, turn_meta,
+                    )
+                )
+
+    release_task.add_done_callback(_release_done)
+    return release_task
+
+
+async def _release_response_media_lease(turn_meta: dict | None) -> None:
+    release_task = _schedule_response_media_lease_release(turn_meta)
+    if release_task is not None:
+        await asyncio.shield(release_task)
+
+
 async def _send_response_media_terminal(
     ws: "_OutboundChannel",
     turn_meta: dict,
@@ -11687,18 +15537,28 @@ async def _send_response_media_terminal(
 ) -> None:
     """Close one correlated media phase without changing the text lifecycle."""
 
-    await ws.send_json(
-        _turn_event_frame(
-            turn_meta,
-            "media_status",
-            message_id=str(turn_meta.get("assistant_message_id") or ""),
-            payload={
-                "phase": "media",
-                "status": status,
-                "media_terminal": True,
-            },
+    if turn_meta.get("_response_media_terminal_emitted") is True:
+        await _release_response_media_lease(turn_meta)
+        return
+    if turn_meta.get("_response_media_terminal_claimed") is True:
+        return
+    turn_meta["_response_media_terminal_claimed"] = True
+    try:
+        await ws.send_json(
+            _turn_event_frame(
+                turn_meta,
+                "media_status",
+                message_id=str(turn_meta.get("assistant_message_id") or ""),
+                payload={
+                    "phase": "media",
+                    "status": status,
+                    "media_terminal": True,
+                },
+            )
         )
-    )
+    finally:
+        turn_meta["_response_media_terminal_emitted"] = True
+        await _release_response_media_lease(turn_meta)
 
 
 class _TTSSettingsChanged(RuntimeError):
@@ -11888,19 +15748,21 @@ class _ResponseTTSSession:
     ) -> bool:
         if self._cancelled:
             return False
-        frame = _turn_event_frame(
-            self.turn_meta,
-            "audio",
-            message_id=str(self.turn_meta.get("assistant_message_id") or ""),
-            payload={
-                "format": "mp3",
-                "data": base64.b64encode(mp3_bytes).decode("ascii"),
-                "source": "response",
-                "phase": "media",
-                "media_terminal": terminal,
-            },
-        )
         try:
+            frame = _turn_event_frame(
+                self.turn_meta,
+                "audio",
+                message_id=str(
+                    self.turn_meta.get("assistant_message_id") or ""
+                ),
+                payload={
+                    "format": "mp3",
+                    "data": base64.b64encode(mp3_bytes).decode("ascii"),
+                    "source": "response",
+                    "phase": "media",
+                    "media_terminal": terminal,
+                },
+            )
             await self.ws.send_json(frame)
         except Exception as exc:
             print(f"[OSIA Server] response audio send failed: {exc}")
@@ -11913,6 +15775,9 @@ class _ResponseTTSSession:
                 "first response audio queued",
                 f"({len(mp3_bytes)} bytes)",
             )
+        if terminal:
+            self.turn_meta["_response_media_terminal_emitted"] = True
+            await _release_response_media_lease(self.turn_meta)
         return True
 
     async def _run(self) -> None:
@@ -11979,11 +15844,19 @@ class _ResponseTTSSession:
             self._cancelled = True
             self._pending.clear()
             raise
+        except Exception as exc:
+            self._cancelled = True
+            self._pending.clear()
+            print(
+                "[OSIA Server] response media worker failed "
+                f"category={type(exc).__name__}"
+            )
 
 
 def _track_response_audio_task(
     task: "asyncio.Task",
     turn_meta: dict,
+    ws: "_OutboundChannel | None" = None,
 ) -> bool:
     """Track one media worker and keep per-conversation completion ordered."""
 
@@ -11992,26 +15865,242 @@ def _track_response_audio_task(
         task.cancel()
         return False
     _POST_TURN_MEDIA_TASKS.add(task)
-    if not _application_transport_coordination_enabled():
-        task.add_done_callback(_POST_TURN_MEDIA_TASKS.discard)
-        return True
-    if _POST_TURN_MEDIA_BY_CONV.get(conv_id) is not None:
+    coordinated = _application_transport_coordination_enabled()
+    if coordinated and _POST_TURN_MEDIA_BY_CONV.get(conv_id) is not None:
         task.cancel()
         _POST_TURN_MEDIA_TASKS.discard(task)
         return False
-    _POST_TURN_MEDIA_BY_CONV[conv_id] = task
+    if coordinated:
+        _POST_TURN_MEDIA_BY_CONV[conv_id] = task
+        _POST_TURN_MEDIA_META_BY_CONV[conv_id] = turn_meta
 
     def _media_done(done_task: "asyncio.Task") -> None:
         _POST_TURN_MEDIA_TASKS.discard(done_task)
-        if _POST_TURN_MEDIA_BY_CONV.get(conv_id) is done_task:
+        try:
+            if not done_task.cancelled():
+                done_task.exception()
+        except Exception:
+            pass
+        if coordinated and _POST_TURN_MEDIA_BY_CONV.get(conv_id) is done_task:
             _POST_TURN_MEDIA_BY_CONV.pop(conv_id, None)
-            if not _is_conversation_busy(conv_id):
-                asyncio.create_task(
-                    _broadcast_conversation_busy_changed(conv_id, False, turn_meta)
+            _POST_TURN_MEDIA_META_BY_CONV.pop(conv_id, None)
+        if turn_meta.get("_response_media_terminal_emitted") is not True:
+            turn_meta["_response_media_worker_finished_early"] = True
+            if (
+                turn_meta.get("_post_turn_media_lease_committed") is True
+                and ws is not None
+                and turn_meta.get("_response_media_terminal_claimed") is not True
+            ):
+                close_task = asyncio.create_task(
+                    _send_response_media_terminal(ws, turn_meta, "error")
                 )
+                _POST_TURN_MEDIA_TASKS.add(close_task)
+                if coordinated:
+                    _POST_TURN_MEDIA_BY_CONV[conv_id] = close_task
+                    _POST_TURN_MEDIA_META_BY_CONV[conv_id] = turn_meta
+
+                def _close_done(completed: "asyncio.Task") -> None:
+                    _POST_TURN_MEDIA_TASKS.discard(completed)
+                    if _POST_TURN_MEDIA_BY_CONV.get(conv_id) is completed:
+                        _POST_TURN_MEDIA_BY_CONV.pop(conv_id, None)
+                        _POST_TURN_MEDIA_META_BY_CONV.pop(conv_id, None)
+
+                close_task.add_done_callback(_close_done)
+        elif not _is_conversation_busy(conv_id):
+            asyncio.create_task(
+                _broadcast_conversation_busy_changed(conv_id, False, turn_meta)
+            )
 
     task.add_done_callback(_media_done)
     return True
+
+
+async def _complete_response_media_after_text(
+    ws: "_OutboundChannel",
+    turn_meta: dict,
+    tts_session: "_ResponseTTSSession | None",
+    status: str,
+) -> None:
+    """Hand off committed text only to a still-live exact media worker."""
+
+    if (
+        tts_session is not None
+        and turn_meta.get("_response_media_cancelled") is not True
+        and turn_meta.get("_response_media_worker_finished_early") is not True
+        and tts_session.task is not None
+        and not tts_session.task.done()
+    ):
+        tts_session.mark_text_final_sent()
+        return
+    media_status = (
+        "error"
+        if tts_session is not None
+        and turn_meta.get("_response_media_worker_finished_early") is True
+        else status
+    )
+    if tts_session is not None:
+        tts_session.cancel()
+    await _send_response_media_terminal(ws, turn_meta, media_status)
+
+
+async def _finalize_admitted_turn_after_worker_failure(
+    ws: "_OutboundChannel",
+    conv_id: str,
+    turn_meta: dict | None,
+    history: list,
+) -> tuple[list, str] | None:
+    """Close an accepted turn if setup failed outside the agent-run guard.
+
+    This path never invokes a provider or a tool.  It retains the current
+    conversation task as the live owner until the exact failure final is
+    reserved and persisted, so the durable canonical lease cannot be cleared
+    by a task callback while the accepted user message is still unterminated.
+    """
+
+    if not isinstance(turn_meta, dict) or turn_meta.get("persisted") is not True:
+        return None
+    receipt = turn_meta.get("_user_commit")
+    if not (
+        turn_meta.get("_accepted_user_already_persisted") is True
+        or (isinstance(receipt, dict) and receipt.get("committed") is True)
+    ):
+        return None
+    request_id = str(
+        turn_meta.get("request_id")
+        or turn_meta.get("client_request_id")
+        or ""
+    )
+    objective = str(
+        turn_meta.get("_terminality_objective")
+        or turn_meta.get("_original_user_text")
+        or turn_meta.get("persisted_user_content")
+        or ""
+    ).strip()[:32_000]
+    if not conv_id or not request_id or not objective:
+        return None
+    language = normalize_locale(turn_meta.get("language")) or i18n.DEFAULT_LANG
+    response_frame = None
+    terminal_frame = None
+    final_text = ""
+    delay = 0.25
+
+    while True:
+        try:
+            found = conversations.find_correlated_turn(conv_id, request_id)
+        except Exception:
+            found = None
+        if isinstance(found, dict) and found.get("assistant_content") is not None:
+            media_task = _POST_TURN_MEDIA_BY_CONV.get(conv_id)
+            turn_meta["_response_media_cancelled"] = True
+            if media_task is not None and not media_task.done():
+                media_task.cancel()
+                try:
+                    await media_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if _POST_TURN_MEDIA_BY_CONV.get(conv_id) is media_task:
+                _POST_TURN_MEDIA_BY_CONV.pop(conv_id, None)
+                _POST_TURN_MEDIA_META_BY_CONV.pop(conv_id, None)
+            try:
+                await _send_response_media_terminal(
+                    ws,
+                    turn_meta,
+                    str(found.get("terminal_status") or "error"),
+                )
+            except Exception:
+                pass
+            stored = conversations.get_conversation(conv_id)
+            return (
+                list(stored.get("messages") or [])
+                if isinstance(stored, dict) else list(history),
+                conv_id,
+            )
+
+        try:
+            terminal = await asyncio.to_thread(
+                _reserve_failed_server_turn_terminal,
+                object(),
+                turn_meta,
+                objective=objective,
+                language=language,
+            )
+        except Exception as reserve_error:
+            print(
+                "[OSIA Server] admitted-turn terminal recovery deferred "
+                f"category={type(reserve_error).__name__}"
+            )
+            terminal = None
+        if isinstance(terminal, dict):
+            try:
+                if response_frame is None or terminal_frame is None:
+                    from osia.agent import strip_tool_artifacts
+                    from osia.execution_trace import validate_persisted_trace
+
+                    final_text = strip_tool_artifacts(
+                        str(terminal.get("final_text") or "")
+                    ).strip() or localized_text("provider_failure", language)
+                    safe_trace = validate_persisted_trace(
+                        terminal.get("execution_trace")
+                    )
+                    if safe_trace is not None:
+                        turn_meta["_execution_trace_v1"] = safe_trace
+                    response_frame = _turn_event_frame(
+                        turn_meta,
+                        "response",
+                        message_id=str(
+                            turn_meta.get("assistant_message_id") or ""
+                        ),
+                        payload={"content": final_text},
+                    )
+                    terminal_frame = _turn_terminal_frame(
+                        turn_meta, terminal,
+                    )
+                committed = _persist_completed_assistant_message(
+                    conv_id,
+                    final_text,
+                    turn_meta,
+                    response_frame,
+                    terminal_frame,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as materialize_error:
+                print(
+                    "[OSIA Server] admitted-turn final materialization "
+                    "deferred category="
+                    f"{type(materialize_error).__name__}"
+                )
+                response_frame = None
+                terminal_frame = None
+                committed = False
+            if committed:
+                turn_meta["persisted"] = True
+                terminal_frame["persisted"] = True
+                try:
+                    await _broadcast_committed_receipt(
+                        conv_id, turn_meta.get("_assistant_commit"),
+                    )
+                except Exception:
+                    pass
+                try:
+                    await ws.send_json(response_frame)
+                    await ws.send_json(terminal_frame)
+                except Exception:
+                    pass
+                try:
+                    await _send_response_media_terminal(
+                        ws, turn_meta, "error",
+                    )
+                except Exception:
+                    pass
+                stored = conversations.get_conversation(conv_id)
+                return (
+                    list(stored.get("messages") or [])
+                    if isinstance(stored, dict) else list(history),
+                    conv_id,
+                )
+        await asyncio.sleep(delay)
+        delay = min(30.0, delay * 2.0)
 
 
 async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
@@ -12042,6 +16131,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # Import lazily so the module loads quickly, but capture TOOL_MAP
     # here too so the debug log proves it's reachable from this context.
     from osia.agent import OSIAAgent, TOOL_MAP
+
+    _ensure_response_media_lease(turn_meta)
 
     if t0 is None:
         t0 = time.perf_counter()
@@ -12114,25 +16205,130 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         turn_meta.get("persisted_user_content", text)
         if isinstance(turn_meta, dict) else text
     )
+    if isinstance(turn_meta, dict):
+        stable_semantic_objective = turn_meta.get("_terminality_objective")
+        if not isinstance(stable_semantic_objective, str) or not (
+            stable_semantic_objective.strip()
+        ):
+            stable_semantic_objective = next((
+                candidate
+                for candidate in (
+                    turn_meta.get("_original_user_text"),
+                    persisted_user_content,
+                    text,
+                )
+                if isinstance(candidate, str) and candidate.strip()
+            ), "")
+        if stable_semantic_objective:
+            turn_meta["_terminality_objective"] = (
+                stable_semantic_objective[:32_000]
+            )
+        _bind_pre_agent_cancellation_authority(turn_meta)
     accepted_user_persisted = _persist_accepted_user_message(
         active_conv_id,
         persisted_user_content,
         turn_meta,
     )
-    if accepted_user_persisted and isinstance(turn_meta, dict):
-        await _broadcast_committed_receipt(
-            active_conv_id,
-            turn_meta.get("_user_commit"),
-        )
     if isinstance(turn_meta, dict):
         turn_meta["persisted"] = accepted_user_persisted
+        if not accepted_user_persisted:
+            _release_unaccepted_turn_sources(
+                turn_meta, owner_id=str(active_conv_id or ""),
+            )
+            await ws.send_json({
+                "type": "status",
+                "content": "error",
+                "pre_accept_rejection": True,
+                "error": str(
+                    turn_meta.get("_user_commit_error")
+                    or "persistence_unavailable"
+                ),
+                "conversation_id": active_conv_id,
+                "request_id": str(turn_meta.get("request_id") or ""),
+                "client_request_id": str(
+                    turn_meta.get("request_id") or ""
+                ),
+            })
+            await _complete_durable_command(turn_meta, {
+                "accepted": False,
+                "state": "persistence_unavailable",
+            })
+            return history, active_conv_id
+        await _complete_durable_command(turn_meta, {
+            "accepted": True,
+            "state": "turn_accepted",
+        })
+        user_receipt = turn_meta.get("_user_commit")
+        if (
+            isinstance(user_receipt, dict)
+            and user_receipt.get("committed") is False
+            and turn_meta.get("_accepted_user_already_persisted") is not True
+        ):
+            # Another process won the durable request/conversation acceptance
+            # CAS. Reattach to that exact receipt; this worker must never call
+            # the provider or a tool for the replay.
+            _release_unaccepted_turn_sources(
+                turn_meta, owner_id=str(active_conv_id or ""),
+            )
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                _clear_conversation_turn(active_conv_id, current_task)
+            replayed = await _send_persisted_turn_for_request(
+                ws,
+                active_conv_id,
+                str(
+                    turn_meta.get("request_id")
+                    or turn_meta.get("client_request_id")
+                    or ""
+                ),
+            )
+            if not replayed:
+                await ws.send_json({
+                    "type": "status",
+                    "content": "error",
+                    "error": "persisted_turn_replay_unavailable",
+                    "conversation_id": active_conv_id,
+                    "request_id": str(turn_meta.get("request_id") or ""),
+                    "client_request_id": str(
+                        turn_meta.get("request_id") or ""
+                    ),
+                })
+            return history, active_conv_id
+        await _broadcast_committed_receipt(
+            active_conv_id,
+            user_receipt,
+        )
         if "_accepted_frame" not in turn_meta:
+            turn_meta["_turn_publication_started"] = True
             await ws.send_json(_turn_accepted_frame(turn_meta))
+            busy_frame = _conversation_busy_changed_frame(
+                active_conv_id, True, turn_meta,
+            )
+            await ws.send_json(busy_frame)
+            await _broadcast_conversation_busy_changed(
+                active_conv_id,
+                True,
+                turn_meta,
+                frame=busy_frame,
+                exclude=ws,
+            )
         else:
             await ws.send_json(_turn_status_frame(turn_meta, "running"))
-        if not accepted_user_persisted:
-            await ws.send_json(_turn_status_frame(turn_meta, "error"))
-            return history, active_conv_id
+
+        pending_transcript = turn_meta.pop("_pending_transcript", None)
+        if isinstance(pending_transcript, str) and pending_transcript:
+            # Audio decoding/STT is speculative input preparation.  Publish its
+            # result only after this exact request has won the durable user-turn
+            # CAS above; a concurrent losing worker must not leak a second turn
+            # identity or transcript before it reattaches to the winner.
+            await ws.send_json(
+                _turn_event_frame(
+                    turn_meta,
+                    "transcript",
+                    message_id=str(turn_meta.get("user_message_id") or ""),
+                    payload={"content": pending_transcript},
+                )
+            )
 
     # Status: thinking (single small send before the agent kicks off —
     # cheap, fire-and-forget effectively, mobile uses it for UI state).
@@ -12147,9 +16343,9 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         )
 
     # ── Canonical response plumbing ───────────────────────────────────
-    # Only explicitly validated prose callbacks are projected live as
-    # replaceable WebSocket drafts. Persistence and TTS still wait for the
-    # single cleaned canonical return value from agent.run().
+    # Provider callbacks are intentionally not used as a presentation transport:
+    # they are sentence-normalized for speech and are not lossless Markdown.
+    # Mobile progressively reveals the single verified canonical final instead.
     loop = asyncio.get_running_loop()
     chunk_queue: asyncio.Queue = asyncio.Queue()
     pending_puts: list = []
@@ -12166,11 +16362,14 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     tts_session: _ResponseTTSSession | None = None
     tts_enabled = (
         not isinstance(turn_meta, dict)
-        or turn_meta.get("tts_enabled", True) is not False
+        or (
+            turn_meta.get("tts_enabled", True) is not False
+            and turn_meta.get("_response_media_cancelled") is not True
+        )
     )
     if tts_enabled and isinstance(turn_meta, dict):
         candidate = _ResponseTTSSession(ws, turn_meta, t0)
-        if _track_response_audio_task(candidate.start(), turn_meta):
+        if _track_response_audio_task(candidate.start(), turn_meta, ws):
             tts_session = candidate
         else:
             candidate.cancel()
@@ -12180,6 +16379,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         else None
     )
     pending_turn_holder = [None]
+    pending_terminal_recovery_task = [None]
 
     def on_first_token() -> None:
         # Called from the agent worker thread the moment the first
@@ -12189,14 +16389,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             _ts(t0, "first model token received")
 
     def on_sentence(sentence: str) -> None:
-        safe_sentence = live_chunk_guard.accept(sentence)
-        if not safe_sentence:
-            return
-        provisional_chunks.append(safe_sentence)
-        future = asyncio.run_coroutine_threadsafe(
-            chunk_queue.put(safe_sentence), loop,
-        )
-        pending_puts.append(future)
+        del sentence
 
     async def sender() -> None:
         from osia.agent import strip_raw_tool_tags
@@ -12256,22 +16449,68 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             turn_meta.get("turn_directives")
             if isinstance(turn_meta, dict) else None
         )
+        pinned_provider = str(
+            (turn_meta or {}).get("_pinned_provider_id") or ""
+        ).strip().lower()
+        pinned_model = str(
+            (turn_meta or {}).get("_pinned_model_id") or ""
+        ).strip()
+        pinned_reasoning = str(
+            (turn_meta or {}).get("_pinned_effective_reasoning") or ""
+        ).strip().lower()
+        pinned_route = bool(
+            pinned_provider or pinned_model or pinned_reasoning
+        )
+        route_bound_at_accept = bool(
+            isinstance(turn_meta, dict)
+            and turn_meta.get("_route_bound_at_accept") is True
+        )
+        if pinned_route and not all(
+            (pinned_provider, pinned_model, pinned_reasoning)
+        ):
+            raise RuntimeError("incomplete persisted Chat route binding")
+        if pinned_route and any(
+            str((turn_meta or {}).get(public_key) or "").strip()
+            != pinned_value
+            for public_key, pinned_value in (
+                ("provider_id", pinned_provider),
+                ("model_id", pinned_model),
+                ("effective_reasoning", pinned_reasoning),
+            )
+        ):
+            raise RuntimeError("canonical Chat route binding changed after acceptance")
         # Directive-bearing turns use a throwaway agent so exact model and
-        # reasoning choices can never leak into the next ordinary turn.
+        # reasoning choices can never leak into the next ordinary turn. A
+        # recovered turn is also isolated: its immutable route/reasoning must
+        # not inherit from, or leak into, the conversation agent cache.
         agent = (
             OSIAAgent()
-            if turn_directives is not None
+            if turn_directives is not None or (
+                pinned_route and not route_bound_at_accept
+            )
             else (get_agent(active_conv_id) if get_agent is not None else OSIAAgent())
         )
         if isinstance(turn_meta, dict):
-            cancel_turn = getattr(agent, "request_turn_cancellation", None)
-            if callable(cancel_turn):
-                turn_meta["_terminality_cancel"] = cancel_turn
-                if turn_meta.get("_tool_cancel_requested") is True:
-                    cancel_turn(
-                        str(turn_meta.get("turn_id") or ""),
-                        effect_possible=bool(turn_meta.get("_tool_attempt_id")),
-                    )
+            configure_intent = getattr(
+                agent, "configure_turn_terminality_intent", None,
+            )
+            if callable(configure_intent):
+                configure_intent(
+                    objective=str(
+                        turn_meta.get("_terminality_objective")
+                        or turn_meta.get("_original_user_text")
+                        or turn_meta.get("persisted_user_content")
+                        or text
+                        or ""
+                    ),
+                    execution_binding={
+                        key: str(turn_meta.get(key) or "")
+                        for key in (
+                            "conversation_id", "request_id", "turn_id", "run_id",
+                            "provider_id", "model_id", "effective_reasoning",
+                        )
+                    },
+                )
         selected_model = load_settings().get("selected_model")
         # Only (re)build the client when the agent isn't already on a clean
         # primary client for this model — the user switched models, a prior
@@ -12285,7 +16524,32 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 agent._applied_selected_model = (
                     turn_directives.model_override.model_id
                 )
-        if (
+        if pinned_route:
+            from osia.models import PROVIDERS
+            from osia.reasoning import resolve_reasoning_option_id
+
+            if pinned_provider not in PROVIDERS:
+                raise RuntimeError("persisted Chat provider is unavailable")
+            if agent.provider != pinned_provider or agent.model != pinned_model:
+                agent.set_model(pinned_model, provider=pinned_provider)
+            if agent.provider != pinned_provider or agent.model != pinned_model:
+                raise RuntimeError("persisted Chat route could not be restored")
+            resolved_reasoning = resolve_reasoning_option_id(
+                pinned_provider,
+                pinned_model,
+                settings={
+                    "default": pinned_reasoning,
+                    "providers": {},
+                    "models": {},
+                },
+            )
+            if resolved_reasoning != pinned_reasoning:
+                raise RuntimeError(
+                    "persisted Chat reasoning route is unavailable"
+                )
+            agent._reasoning_override_for_turn = pinned_reasoning
+            agent._applied_selected_model = pinned_model
+        elif (
             turn_directives is None
             and selected_model
             and _agent_needs_model_apply(agent, selected_model)
@@ -12329,6 +16593,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         document_loop = asyncio.get_running_loop()
         document_progress_futures = []
         execution_trace_futures = []
+        execution_trace_binding = [None]
 
         def _execution_trace_event(frame: dict) -> None:
             if not isinstance(frame, dict) or frame.get("type") != "execution_trace":
@@ -12339,6 +16604,15 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 != str((turn_meta or {}).get("request_id") or "")
                 or frame.get("turn_id")
                 != str((turn_meta or {}).get("turn_id") or "")
+            ):
+                return
+            binding = execution_trace_binding[0]
+            if isinstance(binding, dict) and any(
+                frame.get(key) != binding.get(key)
+                for key in (
+                    "conversation_id", "request_id", "turn_id", "run_id",
+                    "provider_id", "model_id", "effective_reasoning",
+                )
             ):
                 return
             future = asyncio.run_coroutine_threadsafe(
@@ -12357,14 +16631,62 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 except Exception:
                     pass
 
-        async def _finalize_pending_tool_attempt(
+        async def _close_committed_cancelled_projection(
+            terminal: dict | None,
+        ) -> bool:
+            """Abandon late output after the exact durable Stop tombstone."""
+
+            if str((terminal or {}).get("terminal_state") or "") != (
+                "user_cancelled"
+            ):
+                return False
+            provisional_chunks.clear()
+            turn_meta["_response_media_cancelled"] = True
+            if tts_session is not None:
+                tts_session.cancel()
+            for future in list(pending_puts):
+                try:
+                    await asyncio.wrap_future(future)
+                except Exception:
+                    pass
+            if not sender_task.done():
+                await chunk_queue.put(_SENTINEL)
+                try:
+                    await sender_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            await _drain_execution_trace()
+            active_holder = _ACTIVE_TURNS_BY_CONV.get(active_conv_id)
+            if (
+                _ACTIVE_TURN_META_BY_CONV.get(active_conv_id) is turn_meta
+                and active_holder is not None
+            ):
+                if (
+                    active_holder is not asyncio.current_task()
+                    and not active_holder.done()
+                ):
+                    active_holder.cancel()
+                _clear_conversation_turn(active_conv_id, active_holder)
+                if not _is_conversation_busy(active_conv_id):
+                    try:
+                        await _broadcast_conversation_busy_changed(
+                            active_conv_id, False, turn_meta,
+                        )
+                    except Exception:
+                        pass
+            return True
+
+        async def _finalize_pending_tool_attempt_once(
             attempt_id: str,
             final_text: str,
             error,
+            *,
+            terminal_override: dict | None = None,
         ) -> bool:
-            del attempt_id
             terminal_result = getattr(agent, "terminality_result", None)
             terminal = (
+                terminal_override
+                if isinstance(terminal_override, dict) else
                 terminal_result(str((turn_meta or {}).get("turn_id") or ""))
                 if callable(terminal_result) else
                 {"terminal_state": "success_verified", "final_text": final_text}
@@ -12375,19 +16697,19 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     "verified terminal reservation"
                 )
                 return False
+            turn_meta["_pending_tool_finalizer_active"] = True
+            if await _close_committed_cancelled_projection(terminal):
+                turn_meta.pop("_pending_tool_finalizer_active", None)
+                return True
             from osia.execution_trace import validate_persisted_trace
 
             safe_trace = validate_persisted_trace(terminal.get("execution_trace"))
             if safe_trace is not None:
                 turn_meta["_execution_trace_v1"] = safe_trace
             final_text = str(terminal.get("final_text") or final_text or "")
-            if error is not None:
-                error = None
-            from osia.agent import clean_response, strip_raw_tool_tags
+            from osia.agent import clean_response, strip_tool_artifacts
 
-            final_text = clean_response(
-                strip_raw_tool_tags(final_text or "")
-            ).strip()
+            final_text = strip_tool_artifacts(final_text or "").strip()
             if not final_text:
                 final_text = localized_text(
                     "empty_completion", turn_context.language,
@@ -12397,8 +16719,10 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     await asyncio.wrap_future(future)
                 except Exception:
                     pass
-            tail = _tail_not_sent(
-                final_text, _join_sent_chunks(sent_chunks),
+            tail = (
+                final_text
+                if not sent_chunks else
+                _tail_not_sent(final_text, _join_sent_chunks(sent_chunks))
             )
             if tail:
                 await chunk_queue.put(tail)
@@ -12412,61 +16736,215 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 message_id=str(turn_meta.get("assistant_message_id") or ""),
                 payload={"content": final_text},
             )
-            terminal_frame = _turn_status_frame(
-                turn_meta, "done" if error is None else "error",
-            )
-            if error is not None:
+            final_status = _terminal_status_from_result(terminal)
+            terminal_frame = _turn_terminal_frame(turn_meta, terminal)
+            if error is not None or final_status == "error":
                 terminal_frame.update({
                     "stage": "tool_continuation",
                     "error_category": "same_provider_continuation_failed",
-                    "reason_code": "same_provider_continuation_failed",
+                    "reason_code": str(
+                        terminal.get("reason_code")
+                        or "same_provider_continuation_failed"
+                    )[:160],
                 })
-            persisted = _persist_completed_assistant_message(
-                active_conv_id,
-                final_text,
-                turn_meta,
-                response_frame,
-                terminal_frame,
-            )
-            if persisted:
-                await _broadcast_committed_receipt(
-                    active_conv_id, turn_meta.get("_assistant_commit"),
-                )
+            async def _deliver_persisted_final() -> None:
                 turn_meta["persisted"] = True
                 terminal_frame["persisted"] = True
-            try:
-                await ws.send_json(response_frame)
-                await ws.send_json(terminal_frame)
-            except Exception as send_error:
-                print(
-                    "[OSIA Server] pending tool final delivery failed "
-                    f"category={type(send_error).__name__}"
+                try:
+                    await _broadcast_committed_receipt(
+                        active_conv_id, turn_meta.get("_assistant_commit"),
+                    )
+                    try:
+                        await ws.send_json(response_frame)
+                        await ws.send_json(terminal_frame)
+                    except Exception as send_error:
+                        print(
+                            "[OSIA Server] pending tool final delivery failed "
+                            f"category={type(send_error).__name__}"
+                        )
+                    if (
+                        turn_meta.get("tts_enabled", True) is not False
+                        and turn_meta.get("_response_media_cancelled") is not True
+                    ):
+                        resumed_tts = _ResponseTTSSession(
+                            ws, turn_meta, t0, language=turn_context.language,
+                        )
+                        if _track_response_audio_task(
+                            resumed_tts.start(), turn_meta, ws,
+                        ):
+                            speech_text = clean_response(final_text)
+                            resumed_tts.enqueue(speech_text)
+                            resumed_tts.finish_input(speech_text)
+                            resumed_tts.mark_text_final_sent()
+                        else:
+                            resumed_tts.cancel()
+                            await _send_response_media_terminal(
+                                ws, turn_meta, final_status,
+                            )
+                    else:
+                        await _send_response_media_terminal(
+                            ws, turn_meta, final_status,
+                        )
+                    log_final(turn_context, final_text)
+                finally:
+                    turn_meta.pop("_pending_tool_finalizer_active", None)
+                    holder = pending_turn_holder[0]
+                    if holder is not None:
+                        _clear_conversation_turn(active_conv_id, holder)
+                        if not holder.done():
+                            holder.set_result(None)
+                    if not _is_conversation_busy(active_conv_id):
+                        try:
+                            await _broadcast_conversation_busy_changed(
+                                active_conv_id, False, turn_meta,
+                            )
+                        except Exception:
+                            pass
+                    clear_attempts = getattr(agent, "clear_tool_attempts", None)
+                    if callable(clear_attempts):
+                        try:
+                            clear_attempts()
+                        except Exception:
+                            pass
+
+            def _commit_final() -> bool:
+                return _persist_completed_assistant_message(
+                    active_conv_id,
+                    final_text,
+                    turn_meta,
+                    response_frame,
+                    terminal_frame,
                 )
-            if turn_meta.get("tts_enabled", True) is not False:
-                resumed_tts = _ResponseTTSSession(
-                    ws, turn_meta, t0, language=turn_context.language,
-                )
-                if _track_response_audio_task(resumed_tts.start(), turn_meta):
-                    resumed_tts.enqueue(final_text)
-                    resumed_tts.finish_input(final_text)
-                    resumed_tts.mark_text_final_sent()
-                else:
-                    resumed_tts.cancel()
-            else:
-                await _send_response_media_terminal(ws, turn_meta, "done")
-            holder = pending_turn_holder[0]
-            if holder is not None:
-                _clear_conversation_turn(active_conv_id, holder)
-                if not holder.done():
-                    holder.set_result(None)
-            await _broadcast_conversation_busy_changed(
-                active_conv_id, False, turn_meta,
+
+            if _commit_final():
+                await _deliver_persisted_final()
+                return True
+
+            async def _retry_reserved_final_commit() -> None:
+                delay = 0.25
+                while (
+                    _ACTIVE_TURN_META_BY_CONV.get(active_conv_id) is turn_meta
+                    and _is_conversation_busy(active_conv_id)
+                ):
+                    await asyncio.sleep(delay)
+                    if _commit_final():
+                        await _deliver_persisted_final()
+                        return
+                    delay = min(30.0, delay * 2.0)
+
+            retry_task = asyncio.create_task(_retry_reserved_final_commit())
+            _PENDING_FINAL_PERSIST_TASKS.add(retry_task)
+            retry_task.add_done_callback(_PENDING_FINAL_PERSIST_TASKS.discard)
+            print(
+                "[TERMINALITY] pending Mobile final reserved; canonical "
+                "persistence retry scheduled"
             )
-            clear_attempts = getattr(agent, "clear_tool_attempts", None)
-            if callable(clear_attempts):
-                clear_attempts()
-            log_final(turn_context, final_text)
-            return bool(persisted)
+            # Provider/tool continuation is terminal and must release its claim;
+            # only the exact assistant commit remains pending and keeps Chat busy.
+            return True
+
+        async def _pending_tool_terminal_reservation(
+            attempt_id: str,
+            final_text: str,
+        ) -> dict | None:
+            terminal_result = getattr(agent, "terminality_result", None)
+            terminal = (
+                terminal_result(str((turn_meta or {}).get("turn_id") or ""))
+                if callable(terminal_result) else
+                None
+            )
+            if isinstance(terminal, dict):
+                return terminal
+            receipt_recorder = getattr(
+                agent, "record_failed_tool_continuation_receipt", None,
+            )
+            if callable(receipt_recorder):
+                await asyncio.to_thread(receipt_recorder, attempt_id)
+            return await asyncio.to_thread(
+                _reserve_failed_server_turn_terminal,
+                agent,
+                turn_meta,
+                objective=str(
+                    (turn_meta or {}).get("_terminality_objective")
+                    or (turn_meta or {}).get("persisted_user_content")
+                    or text
+                    or ""
+                ),
+                language=turn_context.language,
+            )
+
+        async def _finalize_pending_tool_attempt(
+            attempt_id: str,
+            final_text: str,
+            error,
+        ) -> bool:
+            """Own terminal recovery until one persisted final is deliverable."""
+
+            turn_meta["_pending_tool_finalizer_active"] = True
+
+            async def _attempt_once() -> bool:
+                terminal = await _pending_tool_terminal_reservation(
+                    attempt_id, final_text,
+                )
+                if not isinstance(terminal, dict):
+                    return False
+                return await _finalize_pending_tool_attempt_once(
+                    attempt_id,
+                    final_text,
+                    error,
+                    terminal_override=terminal,
+                )
+
+            try:
+                if await _attempt_once():
+                    return True
+            except Exception as finalize_error:
+                print(
+                    "[TERMINALITY] pending Mobile final recovery deferred "
+                    f"category={type(finalize_error).__name__}"
+                )
+
+            current_retry = pending_terminal_recovery_task[0]
+            if current_retry is None or current_retry.done():
+                async def _retry_terminal_reservation() -> None:
+                    delay = 0.25
+                    try:
+                        while (
+                            _ACTIVE_TURN_META_BY_CONV.get(active_conv_id)
+                            is turn_meta
+                            and _is_conversation_busy(active_conv_id)
+                        ):
+                            await asyncio.sleep(delay)
+                            try:
+                                if await _attempt_once():
+                                    return
+                            except Exception:
+                                pass
+                            delay = min(30.0, delay * 2.0)
+                    finally:
+                        if pending_terminal_recovery_task[0] is asyncio.current_task():
+                            pending_terminal_recovery_task[0] = None
+                        if not _is_conversation_busy(active_conv_id):
+                            turn_meta.pop(
+                                "_pending_tool_finalizer_active", None,
+                            )
+
+                retry_task = asyncio.create_task(
+                    _retry_terminal_reservation()
+                )
+                pending_terminal_recovery_task[0] = retry_task
+                _PENDING_FINAL_PERSIST_TASKS.add(retry_task)
+                retry_task.add_done_callback(
+                    _PENDING_FINAL_PERSIST_TASKS.discard
+                )
+            print(
+                "[TERMINALITY] pending Mobile continuation retained; "
+                "durable terminal reservation retry scheduled"
+            )
+            # The coordinator may release its continuation claim. This exact
+            # retry owns only terminal reservation/persistence and never calls
+            # the provider or replays the tool.
+            return True
 
         def _tool_attempt_status(status: str, attempt_id: str) -> None:
             turn_meta["_tool_attempt_id"] = str(attempt_id or "")
@@ -12537,58 +17015,6 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             if len(document_progress_futures) < 128:
                 document_progress_futures.append(future)
 
-        def _bind_chat_durable(result: dict, request: dict) -> bool:
-            binder = getattr(agent, "bind_chat_durable_execution", None)
-            if not callable(binder):
-                return False
-            return bool(binder(
-                result,
-                request,
-                cancel_callback=_cancel_chat_autonomous_execution,
-            ))
-
-        def _chat_durable_progress(payload: dict) -> None:
-            status = str(payload.get("status") or "executing")
-            attempt_status = {
-                "planning": "action_starting",
-                "executing": "action_in_progress",
-                "waiting": "waiting_tool_result",
-                "verifying": "verifying_tool_result",
-                "recovering": "resuming_tool_turn",
-                "cancelled": "cancelled_proven",
-                "blocked": "blocked_unknown_effect",
-            }.get(status, "action_in_progress")
-            _tool_attempt_status(
-                attempt_status,
-                str(payload.get("run_id") or "durable_chat"),
-            )
-
-        _autonomous["loop"] = document_loop
-        agent._chat_autonomous_context = {
-            "launcher": _launch_autonomous_from_chat,
-            "waiter": _wait_for_chat_autonomous_result,
-            "bind_execution": _bind_chat_durable,
-            "progress_callback": _chat_durable_progress,
-            "original_user_text": str(original_user_text or ""),
-            "provider_input": text,
-            "history": history,
-            "conversation_id": active_conv_id,
-            "request_id": str((turn_meta or {}).get("turn_id") or ""),
-            "source_request_id": str(
-                (turn_meta or {}).get("request_id") or ""
-            ),
-            "source_turn_id": str((turn_meta or {}).get("turn_id") or ""),
-            "source_assistant_message_id": str(
-                (turn_meta or {}).get("assistant_message_id") or ""
-            ),
-            "origin_ref": str(
-                (turn_meta or {}).get("_autonomous_origin_ref") or "desktop"
-            ),
-            "device_id": str(
-                (turn_meta or {}).get("_document_owner_device") or ""
-            ),
-            "turn_context": turn_context,
-        }
         configure_attempts = getattr(agent, "configure_tool_attempts", None)
         if callable(configure_attempts):
             configure_attempts(
@@ -12602,15 +17028,63 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 final_callback=_tool_attempt_final,
                 on_sentence=on_sentence,
                 on_first_token=on_first_token,
+                existing_attempt_id=str(
+                    (turn_meta or {}).get("_existing_tool_attempt_id") or ""
+                ),
             )
         configure_trace = getattr(agent, "configure_execution_trace", None)
         if callable(configure_trace):
+            stable_trace_turn_id = str(
+                (turn_meta or {}).get("turn_id") or ""
+            )
+            stable_trace_run_id = str(
+                (turn_meta or {}).get("run_id") or stable_trace_turn_id
+            )
             configure_trace(
                 conversation_id=str(active_conv_id or ""),
                 request_id=str((turn_meta or {}).get("request_id") or ""),
-                turn_id=str((turn_meta or {}).get("turn_id") or ""),
+                turn_id=stable_trace_turn_id,
+                run_id=stable_trace_run_id,
+                provider_id=str(getattr(agent, "provider", "") or ""),
+                model_id=str(getattr(agent, "model", "") or ""),
+                effective_reasoning=pinned_reasoning,
                 callback=_execution_trace_event,
             )
+            trace_binding = getattr(agent, "execution_trace_binding", None)
+            if callable(trace_binding):
+                execution_trace_binding[0] = trace_binding(stable_trace_turn_id)
+        if isinstance(turn_meta, dict):
+            cancel_intent = getattr(
+                agent, "request_turn_cancellation_intent", None,
+            )
+            cancel_turn = getattr(agent, "request_turn_cancellation", None)
+            if callable(cancel_intent):
+                turn_meta["_terminality_cancel_intent"] = cancel_intent
+            if callable(cancel_turn):
+                # Retain the pre-agent durable callback until the exact route,
+                # tool receipt and trace bindings are installed. Then transfer
+                # authority and replay any Stop that won during setup.
+                turn_meta["_terminality_cancel"] = cancel_turn
+                if turn_meta.get("_tool_cancel_requested") is True:
+                    cancel_turn(
+                        str(turn_meta.get("turn_id") or ""),
+                        effect_possible=bool(
+                            turn_meta.get("_tool_attempt_id")
+                            or turn_meta.get("_existing_tool_attempt_id")
+                        ),
+                    )
+                    exact_attempt_id = str(
+                        turn_meta.get("_tool_attempt_id")
+                        or turn_meta.get("_existing_tool_attempt_id")
+                        or ""
+                    )
+                    consume_terminal_receipt = getattr(
+                        agent,
+                        "record_failed_tool_continuation_receipt",
+                        None,
+                    )
+                    if exact_attempt_id and callable(consume_terminal_receipt):
+                        consume_terminal_receipt(exact_attempt_id)
 
         def _run_agent_busy_tracked():
             # ChatGPT App Server native approvals arrive while agent.run is
@@ -12619,10 +17093,33 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             # and thread bridge. MCP workers copy this same context, so native
             # and MCP approvals share one presentation target and broker path.
             target_token = _turn_target.set((ws, document_loop))
+            trace_correlation = (
+                execution_trace_binding[0]
+                if isinstance(execution_trace_binding[0], dict) else {}
+            )
             correlation_token = _turn_confirmation_correlation.set({
                 "conversation_id": str(active_conv_id or ""),
                 "request_id": str((turn_meta or {}).get("request_id") or ""),
                 "turn_id": str((turn_meta or {}).get("turn_id") or ""),
+                "run_id": str(
+                    trace_correlation.get("run_id")
+                    or (turn_meta or {}).get("run_id")
+                    or (turn_meta or {}).get("turn_id")
+                    or ""
+                ),
+                "provider_id": str(
+                    trace_correlation.get("provider_id")
+                    or getattr(agent, "provider", "")
+                    or ""
+                ),
+                "model_id": str(
+                    trace_correlation.get("model_id")
+                    or getattr(agent, "model", "")
+                    or ""
+                ),
+                "effective_reasoning": str(
+                    trace_correlation.get("effective_reasoning") or ""
+                ),
             })
             try:
                 with document_progress_scope(
@@ -12635,6 +17132,10 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                         return terminal_runner(
                             text,
                             turn_id=str((turn_meta or {}).get("turn_id") or ""),
+                            semantic_objective=str(
+                                (turn_meta or {}).get("_terminality_objective")
+                                or ""
+                            ),
                             history=history,
                             on_sentence=on_sentence,
                             on_first_token=on_first_token,
@@ -12653,7 +17154,6 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 _turn_confirmation_correlation.reset(correlation_token)
                 _turn_target.reset(target_token)
                 agent._in_use = False
-                agent._chat_autonomous_context = None
 
         # Off-thread so the event loop stays free to flush response_chunks.
         response_text = await asyncio.to_thread(_run_agent_busy_tracked)
@@ -12744,11 +17244,35 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 await asyncio.wrap_future(future)
             except Exception:
                 pass
-        terminality_result = getattr(locals().get("agent"), "terminality_result", None)
+        error_agent = locals().get("agent")
+        terminality_result = getattr(error_agent, "terminality_result", None)
         verified_terminal = (
             terminality_result(str((turn_meta or {}).get("turn_id") or ""))
             if callable(terminality_result) else None
         )
+        if (
+            callable(terminality_result)
+            and not verified_terminal
+            and isinstance(turn_meta, dict)
+        ):
+            try:
+                verified_terminal = await asyncio.to_thread(
+                    _reserve_failed_server_turn_terminal,
+                    error_agent,
+                    turn_meta,
+                    objective=str(
+                        turn_meta.get("_terminality_objective")
+                        or original_user_text
+                        or text
+                        or ""
+                    ),
+                    language=turn_context.language,
+                )
+            except Exception as reserve_error:
+                print(
+                    "[OSIA Server] failed terminal reservation deferred "
+                    f"category={type(reserve_error).__name__}"
+                )
         if isinstance(verified_terminal, dict) and isinstance(turn_meta, dict):
             from osia.execution_trace import validate_persisted_trace
 
@@ -12757,17 +17281,38 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             )
             if safe_trace is not None:
                 turn_meta["_execution_trace_v1"] = safe_trace
+        if await _close_committed_cancelled_projection(verified_terminal):
+            return history + [
+                {"role": "user", "content": text},
+            ], active_conv_id
         if callable(terminality_result) and not verified_terminal:
             provisional_chunks.clear()
             if tts_session is not None:
                 tts_session.cancel()
+                cancelled_media_task = tts_session.task
+                if (
+                    cancelled_media_task is not None
+                    and cancelled_media_task is not asyncio.current_task()
+                    and not cancelled_media_task.done()
+                ):
+                    try:
+                        await cancelled_media_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+            working_frame = None
             if isinstance(turn_meta, dict):
-                await ws.send_json(
-                    _turn_status_frame(
-                        turn_meta, _active_turn_working_status(active_conv_id),
-                    )
+                working_frame = _turn_status_frame(
+                    turn_meta, _active_turn_working_status(active_conv_id),
+                )
+                await ws.send_json(working_frame)
+                await _broadcast_turn_status(
+                    turn_meta,
+                    _active_turn_working_status(active_conv_id),
+                    exclude=ws,
+                    frame=working_frame,
                 )
             current_task = asyncio.current_task()
+            holder = None
             if (
                 active_conv_id
                 and current_task is not None
@@ -12776,16 +17321,154 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 holder = document_loop.create_future()
                 _ACTIVE_TURNS_BY_CONV[active_conv_id] = holder
                 pending_turn_holder[0] = holder
+            if holder is not None and isinstance(turn_meta, dict):
+                retry_objective = str(
+                    turn_meta.get("_terminality_objective")
+                    or original_user_text
+                    or text
+                    or ""
+                )
+                retry_found = {
+                    "conversation_id": str(active_conv_id or ""),
+                    "request_id": str(turn_meta.get("request_id") or ""),
+                    "turn_id": str(turn_meta.get("turn_id") or ""),
+                }
+
+                async def _retry_failed_terminal_reservation() -> None:
+                    delay = 0.25
+                    while (
+                        _ACTIVE_TURNS_BY_CONV.get(active_conv_id) is holder
+                        and _ACTIVE_TURN_META_BY_CONV.get(active_conv_id)
+                        is turn_meta
+                    ):
+                        await asyncio.sleep(delay)
+                        if turn_meta.get("_pending_tool_finalizer_active") is True:
+                            return
+                        try:
+                            persisted_terminal = await asyncio.to_thread(
+                                _reserve_failed_server_turn_terminal,
+                                error_agent,
+                                turn_meta,
+                                objective=retry_objective,
+                                language=turn_context.language,
+                            )
+                        except Exception:
+                            persisted_terminal = None
+                        if not isinstance(persisted_terminal, dict):
+                            delay = min(30.0, delay * 2.0)
+                            continue
+                        try:
+                            committed = await _resume_incomplete_persisted_chat_turn(
+                                ws,
+                                retry_found,
+                                owner_turn_meta=turn_meta,
+                            )
+                        except Exception as recovery_error:
+                            print(
+                                "[OSIA Server] failed terminal recovery deferred "
+                                f"category={type(recovery_error).__name__}"
+                            )
+                            committed = False
+                        if not committed:
+                            delay = min(30.0, delay * 2.0)
+                            continue
+                        final_text = str(
+                            persisted_terminal.get("final_text") or ""
+                        )
+                        try:
+                            _retire_document_scope(
+                                "chat", str(turn_meta.get("turn_id") or ""),
+                            )
+                            turn_meta.pop(
+                                "_response_media_worker_finished_early", None,
+                            )
+                            if (
+                                turn_meta.get("tts_enabled", True) is not False
+                                and turn_meta.get("_response_media_cancelled") is not True
+                                and turn_meta.get(
+                                    "_post_turn_media_lease_committed"
+                                ) is True
+                            ):
+                                from osia.agent import clean_response
+
+                                resumed_tts = _ResponseTTSSession(
+                                    ws,
+                                    turn_meta,
+                                    t0,
+                                    language=turn_context.language,
+                                )
+                                if _track_response_audio_task(
+                                    resumed_tts.start(), turn_meta, ws,
+                                ):
+                                    speech_text = clean_response(final_text)
+                                    resumed_tts.enqueue(speech_text)
+                                    resumed_tts.finish_input(speech_text)
+                                    resumed_tts.mark_text_final_sent()
+                                else:
+                                    resumed_tts.cancel()
+                                    await _send_response_media_terminal(
+                                        ws, turn_meta, "error",
+                                    )
+                            else:
+                                requested_tts_without_lease = bool(
+                                    turn_meta.get("tts_enabled", True) is not False
+                                    and turn_meta.get(
+                                        "_response_media_cancelled"
+                                    ) is not True
+                                    and turn_meta.get(
+                                        "_post_turn_media_lease_committed"
+                                    ) is not True
+                                )
+                                await _send_response_media_terminal(
+                                    ws,
+                                    turn_meta,
+                                    (
+                                        "error"
+                                        if requested_tts_without_lease else
+                                        "done"
+                                    ),
+                                )
+                            log_final(turn_context, final_text)
+                        finally:
+                            _clear_conversation_turn(active_conv_id, holder)
+                            if not holder.done():
+                                holder.set_result(None)
+                            if not _is_conversation_busy(active_conv_id):
+                                try:
+                                    await _broadcast_conversation_busy_changed(
+                                        active_conv_id, False, turn_meta,
+                                    )
+                                except Exception:
+                                    pass
+                            clear_attempts = getattr(
+                                error_agent, "clear_tool_attempts", None,
+                            )
+                            if callable(clear_attempts):
+                                try:
+                                    clear_attempts()
+                                except Exception:
+                                    pass
+                        return
+
+                retry_task = asyncio.create_task(
+                    _retry_failed_terminal_reservation()
+                )
+                _PENDING_FINAL_PERSIST_TASKS.add(retry_task)
+                retry_task.add_done_callback(
+                    _PENDING_FINAL_PERSIST_TASKS.discard
+                )
             return history + [{"role": "user", "content": text}], active_conv_id
         if isinstance(turn_meta, dict):
-            _retire_document_scope(
-                "chat", str(turn_meta.get("turn_id") or ""),
-            )
             provisional_chunks.clear()
             error_text = (
                 str(verified_terminal.get("final_text") or "")
                 if isinstance(verified_terminal, dict) else
                 localized_text("provider_failure", turn_context.language)
+            )
+            from osia.agent import clean_response, strip_tool_artifacts
+
+            error_text = strip_tool_artifacts(error_text).strip() or localized_text(
+                "provider_failure", turn_context.language,
             )
             chunk_frame = _turn_event_frame(
                 turn_meta,
@@ -12795,17 +17478,18 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             )
             await ws.send_json(chunk_frame)
             if tts_session is not None:
-                tts_session.enqueue(error_text)
-                tts_session.finish_input(error_text)
+                speech_text = clean_response(error_text)
+                tts_session.enqueue(speech_text)
+                tts_session.finish_input(speech_text)
             response_frame = _turn_event_frame(
                 turn_meta,
                 "response",
                 message_id=str(turn_meta.get("assistant_message_id") or ""),
                 payload={"content": error_text},
             )
-            terminal_frame = _turn_status_frame(
+            terminal_frame = _turn_terminal_frame(
                 turn_meta,
-                "done" if isinstance(verified_terminal, dict) else "error",
+                verified_terminal if isinstance(verified_terminal, dict) else None,
             )
             if not isinstance(verified_terminal, dict):
                 terminal_frame.update({
@@ -12813,6 +17497,16 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                     "error_category": "provider_failure",
                     "reason_code": "provider_failure",
                 })
+            try:
+                from osia.document_artifacts import normalize_references
+
+                artifact_refs = normalize_references(
+                    getattr(locals().get("agent"), "last_run_artifacts", None)
+                )
+            except Exception:
+                artifact_refs = []
+            if artifact_refs:
+                turn_meta["_artifact_refs"] = artifact_refs
             if accepted_user_persisted and _persist_completed_assistant_message(
                 active_conv_id,
                 error_text,
@@ -12820,22 +17514,139 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 response_frame,
                 terminal_frame,
             ):
+                turn_meta["persisted"] = True
+                terminal_frame["persisted"] = True
+                _retire_document_scope(
+                    "chat", str(turn_meta.get("turn_id") or ""),
+                )
                 await _broadcast_committed_receipt(
                     active_conv_id,
                     turn_meta.get("_assistant_commit"),
                 )
-                turn_meta["persisted"] = True
-                terminal_frame["persisted"] = True
                 await ws.send_json(response_frame)
                 await ws.send_json(terminal_frame)
-                if tts_session is not None:
-                    tts_session.mark_text_final_sent()
-                else:
-                    await _send_response_media_terminal(ws, turn_meta, "done")
+                await _complete_response_media_after_text(
+                    ws, turn_meta, tts_session, "done",
+                )
                 log_final(turn_context, error_text)
                 return history + [
                     {"role": "user", "content": text},
                     {"role": "assistant", "content": error_text},
+                ], active_conv_id
+            if accepted_user_persisted:
+                if tts_session is not None:
+                    tts_session.cancel()
+                current_task = asyncio.current_task()
+                holder = None
+                if (
+                    active_conv_id
+                    and current_task is not None
+                    and _ACTIVE_TURNS_BY_CONV.get(active_conv_id)
+                    is current_task
+                ):
+                    holder = document_loop.create_future()
+                    _ACTIVE_TURNS_BY_CONV[active_conv_id] = holder
+                    pending_turn_holder[0] = holder
+
+                if holder is not None:
+                    async def _retry_error_final_commit() -> None:
+                        delay = 0.25
+                        while (
+                            _ACTIVE_TURNS_BY_CONV.get(active_conv_id) is holder
+                            and _ACTIVE_TURN_META_BY_CONV.get(active_conv_id)
+                            is turn_meta
+                        ):
+                            await asyncio.sleep(delay)
+                            if not _persist_completed_assistant_message(
+                                active_conv_id,
+                                error_text,
+                                turn_meta,
+                                response_frame,
+                                terminal_frame,
+                            ):
+                                delay = min(30.0, delay * 2.0)
+                                continue
+                            turn_meta["persisted"] = True
+                            terminal_frame["persisted"] = True
+                            _retire_document_scope(
+                                "chat", str(turn_meta.get("turn_id") or ""),
+                            )
+                            try:
+                                await _broadcast_committed_receipt(
+                                    active_conv_id,
+                                    turn_meta.get("_assistant_commit"),
+                                )
+                                try:
+                                    await ws.send_json(response_frame)
+                                    await ws.send_json(terminal_frame)
+                                except Exception as send_error:
+                                    print(
+                                        "[OSIA Server] retried error final "
+                                        "delivery failed category="
+                                        f"{type(send_error).__name__}"
+                                    )
+                                if (
+                                    turn_meta.get("tts_enabled", True) is not False
+                                    and turn_meta.get("_response_media_cancelled") is not True
+                                ):
+                                    resumed_tts = _ResponseTTSSession(
+                                        ws,
+                                        turn_meta,
+                                        t0,
+                                        language=turn_context.language,
+                                    )
+                                    if _track_response_audio_task(
+                                        resumed_tts.start(), turn_meta, ws,
+                                    ):
+                                        speech_text = clean_response(error_text)
+                                        resumed_tts.enqueue(speech_text)
+                                        resumed_tts.finish_input(speech_text)
+                                        resumed_tts.mark_text_final_sent()
+                                    else:
+                                        resumed_tts.cancel()
+                                        await _send_response_media_terminal(
+                                            ws, turn_meta, "error",
+                                        )
+                                else:
+                                    await _send_response_media_terminal(
+                                        ws, turn_meta, "done",
+                                    )
+                                log_final(turn_context, error_text)
+                            finally:
+                                _clear_conversation_turn(
+                                    active_conv_id, holder,
+                                )
+                                if not holder.done():
+                                    holder.set_result(None)
+                                if not _is_conversation_busy(active_conv_id):
+                                    try:
+                                        await _broadcast_conversation_busy_changed(
+                                            active_conv_id, False, turn_meta,
+                                        )
+                                    except Exception:
+                                        pass
+                                clear_attempts = getattr(
+                                    error_agent,
+                                    "clear_tool_attempts",
+                                    None,
+                                )
+                                if callable(clear_attempts):
+                                    try:
+                                        clear_attempts()
+                                    except Exception:
+                                        pass
+                            return
+
+                    retry_task = asyncio.create_task(
+                        _retry_error_final_commit()
+                    )
+                    _PENDING_FINAL_PERSIST_TASKS.add(retry_task)
+                    retry_task.add_done_callback(
+                        _PENDING_FINAL_PERSIST_TASKS.discard
+                    )
+                    _ts(t0, "error final persistence retry scheduled")
+                return history + [
+                    {"role": "user", "content": text},
                 ], active_conv_id
             await ws.send_json(terminal_frame)
             if tts_session is not None:
@@ -12876,10 +17687,14 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     safe_trace = validate_persisted_trace(terminal.get("execution_trace"))
     if safe_trace is not None:
         turn_meta["_execution_trace_v1"] = safe_trace
+    if await _close_committed_cancelled_projection(terminal):
+        return history + [
+            {"role": "user", "content": text},
+        ], active_conv_id
     response_text = str(terminal.get("final_text") or response_text or "")
+    from osia.agent import clean_response, strip_tool_artifacts
     if response_text:
-        from osia.agent import clean_response, strip_raw_tool_tags
-        response_text = clean_response(strip_raw_tool_tags(response_text)).strip()
+        response_text = strip_tool_artifacts(response_text).strip()
     print(
         f"[DEBUG] cleaned response ({len(response_text or '')} chars)",
         flush=True,
@@ -12903,7 +17718,11 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         sent_concat = _join_sent_chunks(sent_chunks)
         cleaned_full = response_text
         if cleaned_full:
-            tail = _tail_not_sent(cleaned_full, sent_concat)
+            tail = (
+                cleaned_full
+                if not sent_chunks else
+                _tail_not_sent(cleaned_full, sent_concat)
+            )
             if tail:
                 try:
                     print(
@@ -13006,7 +17825,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             )
 
     if tts_session is not None:
-        tts_session.finish_input(response_text)
+        tts_session.finish_input(clean_response(response_text))
 
     # Send the canonical full text once (clients that don't track chunks
     # can rely on this; clients that do can ignore it).
@@ -13022,7 +17841,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         message_id=str(turn_meta.get("assistant_message_id") or ""),
         payload={"content": response_text},
     )
-    terminal_frame = _turn_status_frame(turn_meta, "done")
+    terminal_frame = _turn_terminal_frame(turn_meta, terminal)
     if run_diagnostic is not None:
         terminal_frame.update({
             key: str(run_diagnostic.get(key) or "")
@@ -13036,24 +17855,104 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         response_frame,
         terminal_frame,
     ):
-        _retire_document_scope(
-            "chat", str(turn_meta.get("turn_id") or ""),
-        )
         if tts_session is not None:
             tts_session.cancel()
-        await ws.send_json(_turn_status_frame(turn_meta, "error"))
         current_task = asyncio.current_task()
+        holder = document_loop.create_future()
         if (
             active_conv_id
             and current_task is not None
-            and _clear_conversation_turn(active_conv_id, current_task)
+            and _ACTIVE_TURNS_BY_CONV.get(active_conv_id) is current_task
         ):
-            await _broadcast_conversation_busy_changed(
-                active_conv_id,
-                False,
-                turn_meta,
-            )
-        _ts(t0, "assistant persistence failed")
+            _ACTIVE_TURNS_BY_CONV[active_conv_id] = holder
+            pending_turn_holder[0] = holder
+
+        async def _retry_completed_final_commit() -> None:
+            delay = 0.25
+            while (
+                _ACTIVE_TURNS_BY_CONV.get(active_conv_id) is holder
+                and _ACTIVE_TURN_META_BY_CONV.get(active_conv_id) is turn_meta
+            ):
+                await asyncio.sleep(delay)
+                if not _persist_completed_assistant_message(
+                    active_conv_id,
+                    response_text,
+                    turn_meta,
+                    response_frame,
+                    terminal_frame,
+                ):
+                    delay = min(30.0, delay * 2.0)
+                    continue
+                turn_meta["persisted"] = True
+                terminal_frame["persisted"] = True
+                _retire_document_scope(
+                    "chat", str(turn_meta.get("turn_id") or ""),
+                )
+                try:
+                    await _broadcast_committed_receipt(
+                        active_conv_id,
+                        turn_meta.get("_assistant_commit"),
+                    )
+                    try:
+                        await ws.send_json(response_frame)
+                        await ws.send_json(terminal_frame)
+                    except Exception as send_error:
+                        print(
+                            "[OSIA Server] retried final delivery failed "
+                            f"category={type(send_error).__name__}"
+                        )
+                    if (
+                        turn_meta.get("tts_enabled", True) is not False
+                        and turn_meta.get("_response_media_cancelled") is not True
+                    ):
+                        resumed_tts = _ResponseTTSSession(
+                            ws,
+                            turn_meta,
+                            t0,
+                            language=turn_context.language,
+                        )
+                        if _track_response_audio_task(
+                            resumed_tts.start(), turn_meta, ws,
+                        ):
+                            speech_text = clean_response(response_text)
+                            resumed_tts.enqueue(speech_text)
+                            resumed_tts.finish_input(speech_text)
+                            resumed_tts.mark_text_final_sent()
+                        else:
+                            resumed_tts.cancel()
+                            await _send_response_media_terminal(
+                                ws, turn_meta, "error",
+                            )
+                    else:
+                        await _send_response_media_terminal(
+                            ws, turn_meta, "done",
+                        )
+                    log_final(turn_context, response_text)
+                finally:
+                    _clear_conversation_turn(active_conv_id, holder)
+                    if not holder.done():
+                        holder.set_result(None)
+                    if not _is_conversation_busy(active_conv_id):
+                        try:
+                            await _broadcast_conversation_busy_changed(
+                                active_conv_id,
+                                False,
+                                turn_meta,
+                            )
+                        except Exception:
+                            pass
+                    clear_attempts = getattr(agent, "clear_tool_attempts", None)
+                    if callable(clear_attempts):
+                        try:
+                            clear_attempts()
+                        except Exception:
+                            pass
+                return
+
+        retry_task = asyncio.create_task(_retry_completed_final_commit())
+        _PENDING_FINAL_PERSIST_TASKS.add(retry_task)
+        retry_task.add_done_callback(_PENDING_FINAL_PERSIST_TASKS.discard)
+        _ts(t0, "assistant persistence retry scheduled")
         return new_history, active_conv_id
     await _broadcast_committed_receipt(
         active_conv_id,
@@ -13074,10 +17973,9 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     # its correlated terminal event.
     await ws.send_json(terminal_frame)
     log_final(turn_context, response_text)
-    if tts_session is not None:
-        tts_session.mark_text_final_sent()
-    else:
-        await _send_response_media_terminal(ws, turn_meta, "done")
+    await _complete_response_media_after_text(
+        ws, turn_meta, tts_session, "done",
+    )
     current_task = asyncio.current_task()
     if (
         active_conv_id
@@ -13094,7 +17992,10 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     _ts(t0, "request complete")
     clear_attempts = getattr(agent, "clear_tool_attempts", None)
     if callable(clear_attempts):
-        clear_attempts()
+        try:
+            clear_attempts()
+        except Exception:
+            pass
     return new_history, active_conv_id
 
 
@@ -13102,6 +18003,7 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
                         history: list,
                         active_conv_id: str | None,
                         *, pending_files: list[str] | None = None,
+                        pending_file_display_names: dict[str, str] | None = None,
                         get_agent=None,
                         turn_meta: dict | None = None,
                         permission_epoch: int | None = None) -> tuple[list, str | None]:
@@ -13117,10 +18019,9 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
     Latency-optimized:
       * Whisper inference runs off-thread (``asyncio.to_thread``) so
         the event loop keeps serving other clients during STT.
-      * The ``transcript`` message is fired with ``asyncio.create_task``
-        WITHOUT awaiting, so the agent starts in parallel with the
-        WebSocket send — mobile receives the transcript while the LLM
-        is already warming up.
+      * STT remains speculative input preparation, but its canonical
+        ``transcript`` event is emitted only after the transcribed user turn
+        wins the durable request CAS in ``_run_agent_and_respond``.
     """
     from osia.voice.stt import transcribe, WHISPER_SAMPLE_RATE, resample_audio
 
@@ -13129,22 +18030,19 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
     if not isinstance(turn_meta, dict):
         raise ValueError("audio command has no turn correlation")
 
-    # Status: thinking
-    await ws.send_json(_turn_status_frame(turn_meta, "thinking"))
-
     try:
         # Decode and resample
         audio, sr = decode_base64_wav(b64_data)
         if audio.size == 0 or float(np.max(np.abs(audio))) < 0.01:
-            await ws.send_json(
-                _turn_event_frame(
-                    turn_meta,
-                    "transcript",
-                    message_id=str(turn_meta.get("user_message_id") or ""),
-                    payload={"content": ""},
-                )
-            )
-            await ws.send_json(_turn_status_frame(turn_meta, "rejected"))
+            await ws.send_json({
+                "type": "status",
+                "content": "error",
+                "pre_accept_rejection": True,
+                "error": "empty_transcript",
+                "conversation_id": str(active_conv_id or ""),
+                "request_id": str(turn_meta.get("request_id") or ""),
+                "client_request_id": str(turn_meta.get("request_id") or ""),
+            })
             _ts(t0, "silent audio — short-circuit done")
             return history, active_conv_id
 
@@ -13158,61 +18056,175 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
             f"({len(transcript)} chars)")
 
         if not transcript.strip():
-            await ws.send_json(
-                _turn_event_frame(
-                    turn_meta,
-                    "transcript",
-                    message_id=str(turn_meta.get("user_message_id") or ""),
-                    payload={"content": ""},
-                )
-            )
-            await ws.send_json(_turn_status_frame(turn_meta, "rejected"))
+            await ws.send_json({
+                "type": "status",
+                "content": "error",
+                "pre_accept_rejection": True,
+                "error": "empty_transcript",
+                "conversation_id": str(active_conv_id or ""),
+                "request_id": str(turn_meta.get("request_id") or ""),
+                "client_request_id": str(turn_meta.get("request_id") or ""),
+            })
             return history, active_conv_id
 
-        # Fire transcript send in parallel with the agent start — don't
-        # await it. The send is just an enqueue onto the outbound channel,
-        # so it lands long before the agent's first response_chunk, but
-        # starting the agent immediately saves the ~1-50 ms a real-network
-        # round-trip would otherwise cost.
-        transcript_send = asyncio.create_task(
-            ws.send_json(
-                _turn_event_frame(
-                    turn_meta,
-                    "transcript",
-                    message_id=str(turn_meta.get("user_message_id") or ""),
-                    payload={"content": transcript},
-                )
+        legacy_replay = turn_meta.get("_legacy_audio_replay_v1")
+        if isinstance(legacy_replay, dict):
+            legacy_audio_hash = str(
+                legacy_replay.get("legacy_audio_hash") or ""
             )
-        )
+            request_id = str(
+                turn_meta.get("request_id")
+                or turn_meta.get("client_request_id")
+                or ""
+            )
+            replay_record = None
+            try:
+                replay_record = conversations.find_correlated_turn(
+                    str(active_conv_id or ""), request_id,
+                )
+            except Exception:
+                replay_record = None
+            stored_transcript = str(
+                (replay_record or {}).get("user_content") or ""
+            )
+            exact_transcript = bool(
+                transcript == stored_transcript
+                and transcript != str(b64_data)
+                and not transcript.startswith((
+                    "📎 ",
+                    "[Document/media attachments available",
+                    "[Document image available",
+                ))
+            )
+            exact_legacy_record = _legacy_audio_replay_record(
+                replay_record,
+                legacy_audio_hash,
+                require_complete=True,
+            )
+            if not exact_transcript or not exact_legacy_record:
+                await ws.send_json({
+                    "type": "status",
+                    "content": "error",
+                    "pre_accept_rejection": True,
+                    "error": "request_id_conflict",
+                    "conversation_id": str(active_conv_id or ""),
+                    "request_id": request_id,
+                    "client_request_id": request_id,
+                })
+                return history, active_conv_id
+            if _persisted_turn_route_binding(replay_record) is None:
+                replay_conversation = conversations.get_conversation(
+                    str(active_conv_id or "")
+                )
+                if not isinstance(replay_conversation, dict):
+                    await ws.send_json({
+                        "type": "status",
+                        "content": "error",
+                        "pre_accept_rejection": True,
+                        "error": "request_id_conflict",
+                        "conversation_id": str(active_conv_id or ""),
+                        "request_id": request_id,
+                        "client_request_id": request_id,
+                    })
+                    return history, active_conv_id
+                history_frame = _conversation_history_frame(
+                    replay_conversation
+                )
+                history_frame.update({
+                    "replayed": True,
+                    "legacy_route_unavailable": True,
+                    "request_id": request_id,
+                    "client_request_id": request_id,
+                })
+                await ws.send_json(history_frame)
+                return history, active_conv_id
+            expected_identity = {
+                key: str(turn_meta.get(key) or "")
+                for key in (
+                    "client_content_hash",
+                    "client_base_content_hash",
+                    "attachment_manifest_hash",
+                    "input_identity_version",
+                    "input_kind",
+                )
+            }
+            try:
+                replayed = await _send_persisted_turn_for_request(
+                    ws,
+                    str(active_conv_id or ""),
+                    request_id,
+                    expected_identity=expected_identity,
+                    legacy_client_content_hash=legacy_audio_hash,
+                    legacy_exact_user_content=transcript,
+                )
+            except ValueError:
+                replayed = False
+            if not replayed:
+                await ws.send_json({
+                    "type": "status",
+                    "content": "error",
+                    "pre_accept_rejection": True,
+                    "error": "request_id_conflict",
+                    "conversation_id": str(active_conv_id or ""),
+                    "request_id": request_id,
+                    "client_request_id": request_id,
+                })
+            return history, active_conv_id
 
         agent_input = transcript
         turn_meta["_original_user_text"] = transcript
+        turn_meta["persisted_user_content"] = transcript
+        turn_meta["_pending_transcript"] = transcript
         if pending_files:
-            agent_input = _consume_pending_files(
-                agent_input,
-                pending_files,
-                owner_id=active_conv_id,
-                permission_epoch=permission_epoch,
-            )
-
-        try:
-            return await _run_agent_and_respond(
-                ws, agent_input, history, active_conv_id, t0=t0,
-                get_agent=get_agent,
-                turn_meta=turn_meta,
-            )
-        finally:
-            # Make sure the transcript frame finished going out before
-            # this handler returns (almost certainly already done by now).
+            created_source_refs: list[str] = []
             try:
-                await transcript_send
-            except Exception as e:
-                print(f"[OSIA Server] transcript send failed: {e}")
+                agent_input = _consume_pending_files(
+                    agent_input,
+                    pending_files,
+                    display_names=pending_file_display_names,
+                    owner_id=active_conv_id,
+                    permission_epoch=permission_epoch,
+                    source_refs_out=created_source_refs,
+                )
+            except BaseException:
+                _release_unaccepted_source_refs(
+                    created_source_refs, owner_id=str(active_conv_id or ""),
+                )
+                raise
+            if created_source_refs:
+                turn_meta["_preaccept_source_refs"] = created_source_refs
+        if turn_meta.get("attachment_manifest_hash"):
+            turn_meta["_durable_agent_input_v1"] = str(agent_input)
 
+        return await _run_agent_and_respond(
+            ws, agent_input, history, active_conv_id, t0=t0,
+            get_agent=get_agent,
+            turn_meta=turn_meta,
+        )
+
+    except asyncio.CancelledError:
+        if turn_meta.get("persisted") is not True:
+            _release_unaccepted_turn_sources(
+                turn_meta, owner_id=str(active_conv_id or ""),
+            )
+        raise
     except Exception as e:
         print(f"[OSIA Server] Audio processing error: {e}")
         traceback.print_exc()
-        await ws.send_json(_turn_status_frame(turn_meta, "error"))
+        if turn_meta.get("persisted") is True:
+            raise
+        _release_unaccepted_turn_sources(
+            turn_meta, owner_id=str(active_conv_id or ""),
+        )
+        await ws.send_json({
+            "type": "status",
+            "content": "error",
+            "pre_accept_rejection": True,
+            "error": "audio_processing_failed",
+            "conversation_id": str(active_conv_id or ""),
+            "request_id": str(turn_meta.get("request_id") or ""),
+            "client_request_id": str(turn_meta.get("request_id") or ""),
+        })
         return history, active_conv_id
 
 

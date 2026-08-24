@@ -871,6 +871,34 @@ class Orchestrator:
         self._execution_strategies[id(task)] = reconciled
         return reconciled
 
+    def _retire_failed_before_effect_continuation(self) -> bool:
+        """Drop a proven no-effect call at an Autonomous segment boundary.
+
+        The execution strategy owns retries inside Autonomous.  Keeping the
+        agent's cross-turn continuation for a call that is already proven not
+        to have executed would force the same stale arguments ahead of that
+        strategy on every isolated execution and verification segment.
+        """
+
+        unfinished = getattr(self.agent, "_unfinished_execution", None)
+        if (
+            not isinstance(unfinished, dict)
+            or str(unfinished.get("outcome") or "")
+            != "failed_before_effect"
+        ):
+            return False
+        self.agent._unfinished_execution = None
+        for name in (
+            "_continuation_resolution_pending",
+            "_continuation_resume_selected",
+            "_continuation_reconcile_required",
+            "_continuation_reconciled",
+            "_continuation_control_retry_used",
+        ):
+            if hasattr(self.agent, name):
+                setattr(self.agent, name, False)
+        return True
+
     def _agent_run(
         self,
         message: str,
@@ -881,6 +909,7 @@ class Orchestrator:
         """Run one autonomous provider turn under the checkpoint language."""
 
         st = self._state if isinstance(self._state, dict) else {}
+        self._retire_failed_before_effect_continuation()
         self._configure_common_tool_attempts(st)
         language = normalize_locale(st.get("language")) or i18n.DEFAULT_LANG
         from osia.action_policy import (
@@ -968,6 +997,57 @@ class Orchestrator:
             and isinstance(runtime, dict)
             and str(runtime.get("attempt_id") or "") == attempt_id
         )
+
+    def _suspend_exact_pending_tool_wait(
+        self,
+        st: dict,
+        phase_index: int,
+        task_index: int,
+        task: dict,
+        *,
+        attempts: int,
+        restore_attempt: bool,
+        wait_observed: bool = False,
+    ) -> bool:
+        """Checkpoint one exact durable wait instead of treating it as a retry."""
+
+        if not wait_observed and not self._has_exact_pending_tool_wait(st, task):
+            return False
+        if st.get("run_state") not in {
+            "waiting_tool", "cancellation_requested",
+        }:
+            self._block_unknown_tool_effect(
+                st,
+                phase_index,
+                task_index,
+                task,
+                "common_tool_attempt_not_checkpointed",
+            )
+            return True
+        waiting_attempts = max(0, attempts - (1 if restore_attempt else 0))
+        waiting_status = (
+            "cancellation_requested"
+            if st.get("run_state") == "cancellation_requested"
+            else "waiting_tool"
+        )
+        state.set_task_status(
+            st,
+            phase_index,
+            task_index,
+            waiting_status,
+            attempts=waiting_attempts,
+        )
+        self._safe_save(st)
+        self._emit({"event": waiting_status})
+        if not self.agent.activate_pending_tool_attempt():
+            self._block_unknown_tool_effect(
+                st,
+                phase_index,
+                task_index,
+                task,
+                "common_tool_attempt_not_activated",
+            )
+        return True
 
     @staticmethod
     def _uses_autonomous_web_surface(st: dict) -> bool:
@@ -1630,6 +1710,18 @@ class Orchestrator:
                 verification = self._verify_outcome(
                     task, task.get("distilled_summary", "") or "",
                 )
+                if self._suspend_exact_pending_tool_wait(
+                    st,
+                    p,
+                    t,
+                    task,
+                    attempts=int(task.get("attempts", 0) or 0),
+                    restore_attempt=False,
+                    wait_observed=(
+                        verification.reason_code == "verification_waiting_tool"
+                    ),
+                ):
+                    return False
                 if verification.ok:
                     self._salvage(st, p, t, task, verification.reason_code)
                     return True
@@ -1656,6 +1748,18 @@ class Orchestrator:
             verification = self._verify_outcome(
                 task, task.get("distilled_summary", "") or "",
             )
+            if self._suspend_exact_pending_tool_wait(
+                st,
+                p,
+                t,
+                task,
+                attempts=int(task.get("attempts", 0) or 0),
+                restore_attempt=False,
+                wait_observed=(
+                    verification.reason_code == "verification_waiting_tool"
+                ),
+            ):
+                return False
             if verification.ok:
                 self._resume_scope_extension = False
                 self._salvage(
@@ -1727,31 +1831,15 @@ class Orchestrator:
                 result == WAITING_TOOL_RESULT
                 or self._has_exact_pending_tool_wait(st, task)
             ):
-                if st.get("run_state") not in {
-                    "waiting_tool", "cancellation_requested",
-                }:
-                    self._block_unknown_tool_effect(
-                        st, p, t, task, "common_tool_attempt_not_checkpointed",
-                    )
-                    return False
-                # A durable wait is neither a failed try nor a retry.  Keep the
-                # pre-dispatch task budget unchanged while this exact external
-                # operation is reconciled by the common attempt engine.
-                attempts = max(0, attempts - 1)
-                waiting_status = (
-                    "cancellation_requested"
-                    if st.get("run_state") == "cancellation_requested"
-                    else "waiting_tool"
+                self._suspend_exact_pending_tool_wait(
+                    st,
+                    p,
+                    t,
+                    task,
+                    attempts=attempts,
+                    restore_attempt=True,
+                    wait_observed=(result == WAITING_TOOL_RESULT),
                 )
-                state.set_task_status(
-                    st, p, t, waiting_status, attempts=attempts,
-                )
-                self._safe_save(st)
-                self._emit({"event": waiting_status})
-                if not self.agent.activate_pending_tool_attempt():
-                    self._block_unknown_tool_effect(
-                        st, p, t, task, "common_tool_attempt_not_activated",
-                    )
                 return False
             clear_attempts = getattr(self.agent, "clear_tool_attempts", None)
             if callable(clear_attempts):
@@ -1887,6 +1975,18 @@ class Orchestrator:
 
         # (E) Verify doneness (fail-closed).
         verification = self._verify_outcome(task, result)
+        if self._suspend_exact_pending_tool_wait(
+            st,
+            p,
+            t,
+            task,
+            attempts=attempts,
+            restore_attempt=True,
+            wait_observed=(
+                verification.reason_code == "verification_waiting_tool"
+            ),
+        ):
+            return False
 
         if verification.ok:
             # (F1) Success — distil, mark done, grow+cap the digest, CHECKPOINT B.
@@ -2855,6 +2955,14 @@ class Orchestrator:
             return _VerificationOutcome(
                 False, diagnostics.FailureCategory.VERIFICATION_ERROR,
                 "verification_error",
+            )
+        from osia.tool_attempts import WAITING_TOOL_RESULT
+
+        if reply == WAITING_TOOL_RESULT:
+            return _VerificationOutcome(
+                False,
+                diagnostics.FailureCategory.VERIFICATION_NOT_COMPLETED,
+                "verification_waiting_tool",
             )
         ok, reason_code = self._parse_verdict(reply)
         return _VerificationOutcome(

@@ -6,6 +6,7 @@ import inspect
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 _TEMP_HOME = tempfile.TemporaryDirectory(prefix="osia-wor129-tests-")
@@ -82,6 +83,26 @@ def _blend(foreground: QColor, background: QColor, alpha: float) -> QColor:
     )
 
 
+def _chat_binding(suffix: str) -> dict:
+    return {
+        "conversation_id": "wor129-conversation",
+        "request_id": f"wor129-request-{suffix}",
+        "turn_id": f"wor129-turn-{suffix}",
+        "run_id": f"wor129-turn-{suffix}",
+        "provider_id": "chatgpt_account",
+        "model_id": "gpt-5.6-luna",
+        "effective_reasoning": "high",
+    }
+
+
+def _finish_reveal(controller: DesktopTextStreamController) -> None:
+    for _ in range(256):
+        if not controller.active:
+            return
+        controller._on_tick()
+    raise AssertionError("desktop presentation stream did not settle")
+
+
 class ThemeTests(unittest.TestCase):
     def test_default_palette_is_the_established_pc_palette(self):
         palette = PALETTES[DEFAULT_THEME_KEY]
@@ -152,7 +173,7 @@ class ThemeTests(unittest.TestCase):
 
 
 class StreamingControllerTests(unittest.TestCase):
-    def test_large_chunk_is_progressive_and_final_is_immediately_exact(self):
+    def test_large_chunk_and_provider_final_are_progressively_exact(self):
         controller = DesktopTextStreamController(
             reduced_motion=lambda: False
         )
@@ -167,6 +188,8 @@ class StreamingControllerTests(unittest.TestCase):
         self.assertLess(len(partial), len(text))
         final = text + " final exact tail"
         controller.finalize(final)
+        self.assertTrue(controller.active)
+        _finish_reveal(controller)
         self.assertEqual(seen[-1][0], final)
         self.assertEqual(controller.displayed_text, final)
         self.assertFalse(controller.timer_active)
@@ -184,8 +207,10 @@ class StreamingControllerTests(unittest.TestCase):
         self.assertFalse(controller.timer_active)
         self.assertFalse(controller.active)
 
+        controller.begin()
         controller.append_chunk("partial")
         controller.error("Error: stopped safely")
+        _finish_reveal(controller)
         self.assertEqual(seen[-1][0], "Error: stopped safely")
         self.assertFalse(controller.timer_active)
 
@@ -203,7 +228,24 @@ class QtUiLifecycleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-        cls.popup = MainPopup()
+        cls._startup_probe_patches = (
+            patch(
+                "osia.gui.main_popup._SettingsPanel._probe_chatgpt_account",
+                lambda _self, force=False: None,
+            ),
+            patch(
+                "osia.gui.main_popup._SettingsPanel._refresh_startup_status",
+                lambda _self, force=False: None,
+            ),
+        )
+        for startup_patch in cls._startup_probe_patches:
+            startup_patch.start()
+        try:
+            cls.popup = MainPopup()
+        except Exception:
+            for startup_patch in reversed(cls._startup_probe_patches):
+                startup_patch.stop()
+            raise
 
     @classmethod
     def tearDownClass(cls):
@@ -211,6 +253,8 @@ class QtUiLifecycleTests(unittest.TestCase):
         cls.popup.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         cls.app.processEvents()
+        for startup_patch in reversed(cls._startup_probe_patches):
+            startup_patch.stop()
 
     def setUp(self):
         self.popup._window_opacity_anim.stop()
@@ -246,7 +290,6 @@ class QtUiLifecycleTests(unittest.TestCase):
             self.popup.PAGE_CONVS,
             self.popup.PAGE_MODELS,
             self.popup.PAGE_OSIA,
-            self.popup.PAGE_AUTONOMOUS,
         ):
             self.popup._stack.setCurrentIndex(page)
             self.popup._animate_width(POPUP_W)
@@ -260,7 +303,8 @@ class QtUiLifecycleTests(unittest.TestCase):
             (320, 52, 60, 28, 80),
         )
         self.assertEqual(MORPH_MS, 300)
-        island = DynamicIsland()
+        with patch("osia.config.load_settings", return_value={}):
+            island = DynamicIsland()
         self.app.processEvents()
         self.assertEqual((island.width(), island.height()), (320, 52))
         self.assertEqual(island._morph_anim.duration(), 300)
@@ -294,7 +338,9 @@ class QtUiLifecycleTests(unittest.TestCase):
 
     def test_conversation_switch_clears_pending_render(self):
         chat = self.popup._chat
-        chat.append_assistant_stream_chunk("old conversation partial")
+        binding = _chat_binding("switch")
+        self.assertTrue(chat.begin_turn(binding))
+        chat.append_assistant_stream_chunk("old conversation partial", binding)
         self.assertTrue(chat._stream.active)
         chat.set_messages([{"role": "user", "content": "new conversation"}])
         self.assertFalse(chat._stream.active)
@@ -305,26 +351,36 @@ class QtUiLifecycleTests(unittest.TestCase):
     def test_chat_final_is_exact_and_error_stops_rendering(self):
         chat = self.popup._chat
         chunk = "A substantial streamed sentence for the desktop."
-        chat.append_assistant_stream_chunk(chunk)
+        final_binding = _chat_binding("final")
+        self.assertTrue(chat.begin_turn(final_binding))
+        chat.append_assistant_stream_chunk(chunk, final_binding)
         chat._stream._on_tick()
         bubble = chat._stream_bubble
         self.assertIsNotNone(bubble)
         final = chunk + " Canonical final tail."
-        chat.finalize_assistant_stream(final)
+        chat.finalize_assistant_stream(final, final_binding)
+        _finish_reveal(chat._stream)
         self.assertEqual(bubble.text(), final)
         self.assertFalse(chat._stream.timer_active)
 
-        chat.append_assistant_stream_chunk("partial replaced by empty final")
+        empty_binding = _chat_binding("empty")
+        self.assertTrue(chat.begin_turn(empty_binding))
+        chat.append_assistant_stream_chunk(
+            "partial replaced by empty final", empty_binding,
+        )
         chat._stream._on_tick()
-        chat.finalize_assistant_stream("")
+        chat.finalize_assistant_stream("", empty_binding)
         self.assertEqual(chat._stream.displayed_text, "")
         self.assertIsNone(chat._stream_bubble)
         self.assertFalse(chat._stream.timer_active)
 
-        chat.append_assistant_stream_chunk("partial before failure")
+        error_binding = _chat_binding("error")
+        self.assertTrue(chat.begin_turn(error_binding))
+        chat.append_assistant_stream_chunk("partial before failure", error_binding)
         chat._stream._on_tick()
         error_bubble = chat._stream_bubble
-        chat.fail_assistant_stream("Error: simulated")
+        chat.fail_assistant_stream("Error: simulated", error_binding)
+        _finish_reveal(chat._stream)
         self.assertEqual(error_bubble.text(), "Error: simulated")
         self.assertFalse(chat._stream.timer_active)
 

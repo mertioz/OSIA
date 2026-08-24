@@ -65,6 +65,44 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def live_process_identity(pid: object) -> tuple[bool, str]:
+    """Return liveness plus a PID-reuse-safe process identity when available."""
+
+    try:
+        numeric_pid = int(pid or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False, ""
+    if numeric_pid <= 0:
+        return False, ""
+    try:
+        import psutil
+
+        process = psutil.Process(numeric_pid)
+        if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+            return False, ""
+        return True, f"{numeric_pid}:{process.create_time():.6f}"
+    except (ImportError, OSError):
+        # No reliable death proof is available. A platform-level existence
+        # probe may still establish liveness without guessing an identity.
+        try:
+            os.kill(numeric_pid, 0)
+        except ProcessLookupError:
+            return False, ""
+        except (PermissionError, OSError):
+            return True, ""
+        return True, ""
+    except Exception as exc:
+        try:
+            import psutil
+
+            if isinstance(exc, psutil.NoSuchProcess):
+                return False, ""
+        except ImportError:
+            pass
+        # AccessDenied and other indeterminate probes are not proof of death.
+        return True, ""
+
+
 def _bounded(value: object, maximum: int = 512) -> str:
     return " ".join(str(value or "").split())[:maximum]
 
@@ -82,6 +120,162 @@ def _fingerprint(value: object) -> str:
 
 def _safe_turn_key(turn_id: str) -> str:
     return hashlib.sha256(turn_id.encode("utf-8")).hexdigest()
+
+
+def load_persisted_execution_binding(
+    turn_id: str,
+    *,
+    storage_dir: str | Path | None = None,
+) -> dict | None:
+    """Read one atomic immutable execution binding without reopening a turn."""
+
+    stable_turn_id = _bounded(turn_id, 256)
+    if not stable_turn_id:
+        return None
+    root = (
+        Path(storage_dir)
+        if storage_dir is not None else
+        Path(CONFIG_DIR) / "turn_terminality"
+    )
+    path = root / f"{_safe_turn_key(stable_turn_id)}.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    binding = state.get("execution_binding") if isinstance(state, dict) else None
+    if not isinstance(binding, dict) or set(binding) != {
+        "conversation_id", "request_id", "turn_id", "run_id",
+        "provider_id", "model_id", "effective_reasoning",
+    }:
+        return None
+    safe = {
+        key: _bounded(binding.get(key), maximum)
+        for key, maximum in (
+            ("conversation_id", 256),
+            ("request_id", 256),
+            ("turn_id", 256),
+            ("run_id", 256),
+            ("provider_id", 64),
+            ("model_id", 160),
+            ("effective_reasoning", 64),
+        )
+    }
+    if (
+        any(not value for value in safe.values())
+        or safe["turn_id"] != stable_turn_id
+        or any(str(binding.get(key) or "") != value for key, value in safe.items())
+    ):
+        return None
+    return safe
+
+
+def persisted_turn_state_exists(
+    turn_id: str,
+    *,
+    storage_dir: str | Path | None = None,
+) -> bool:
+    """Return whether any durable state exists, even when it is unreadable."""
+
+    stable_turn_id = _bounded(turn_id, 256)
+    if not stable_turn_id:
+        return False
+    root = (
+        Path(storage_dir)
+        if storage_dir is not None else
+        Path(CONFIG_DIR) / "turn_terminality"
+    )
+    path = root / f"{_safe_turn_key(stable_turn_id)}.json"
+    try:
+        path.stat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # Recovery must not classify an indeterminate canonical state as legacy.
+        return True
+
+
+def load_persisted_terminal_result(
+    turn_id: str,
+    *,
+    storage_dir: str | Path | None = None,
+) -> dict | None:
+    """Return only a complete durable final reservation for receipt recovery."""
+
+    stable_turn_id = _bounded(turn_id, 256)
+    binding = load_persisted_execution_binding(
+        stable_turn_id,
+        storage_dir=storage_dir,
+    )
+    if binding is None:
+        return None
+    root = (
+        Path(storage_dir)
+        if storage_dir is not None else
+        Path(CONFIG_DIR) / "turn_terminality"
+    )
+    path = root / f"{_safe_turn_key(stable_turn_id)}.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    terminal_state = str(
+        state.get("terminal_state") if isinstance(state, dict) else ""
+    )
+    reservation = (
+        state.get("final_reservation") if isinstance(state, dict) else None
+    )
+    if terminal_state not in TERMINAL_STATES or not isinstance(reservation, dict):
+        return None
+    reservation_id = _bounded(reservation.get("reservation_id"), 256)
+    final_text = reservation.get("final_text")
+    reserved_state = str(
+        reservation.get("terminal_state") or terminal_state
+    )
+    empty_cancelled_final = bool(
+        terminal_state == TerminalState.USER_CANCELLED.value
+        and isinstance(final_text, str)
+        and not final_text
+    )
+    if (
+        not reservation_id
+        or not isinstance(final_text, str)
+        or (not final_text.strip() and not empty_cancelled_final)
+        or reserved_state != terminal_state
+    ):
+        return None
+    result = {
+        "execution_binding": binding,
+        "terminal_state": terminal_state,
+        "reason_code": _bounded(state.get("terminal_reason"), 160),
+        "reservation_id": reservation_id,
+        "final_text": final_text,
+    }
+    try:
+        from osia.execution_trace import validate_persisted_trace
+
+        execution_trace = validate_persisted_trace(
+            reservation.get("execution_trace")
+        )
+    except Exception:
+        execution_trace = None
+    if execution_trace is not None and all(
+        str(execution_trace.get(key) or "") == str(binding.get(key) or "")
+        for key in (
+            "conversation_id", "request_id", "turn_id", "run_id",
+            "provider_id", "model_id", "effective_reasoning",
+        )
+    ):
+        result["execution_trace"] = execution_trace
+    try:
+        from osia.document_artifacts import normalize_references
+
+        artifact_refs = normalize_references(reservation.get("artifact_refs"))
+    except Exception:
+        artifact_refs = []
+    if artifact_refs:
+        result["artifact_refs"] = artifact_refs
+    return result
 
 
 def _as_float(value: object) -> float:
@@ -132,7 +326,7 @@ class TurnTerminalityController:
         stable_turn_id = _bounded(turn_id, 256)
         if not stable_turn_id:
             raise ValueError("turn_id is required")
-        semantic_objective = _bounded(objective, 4000)
+        semantic_objective = _bounded(objective, 32_000)
         if not semantic_objective:
             raise ValueError("objective is required")
         postconditions = [
@@ -165,6 +359,9 @@ class TurnTerminalityController:
                     "objective": semantic_objective,
                     "objective_fingerprint": _fingerprint(semantic_objective),
                     "execution_required": bool(execution_required),
+                    "execution_binding": {},
+                    "goal_contract": {},
+                    "goal_contract_fingerprint": "",
                     "required_postconditions": postconditions,
                     "proven_postconditions": {},
                     "remaining_work": list(postconditions),
@@ -223,6 +420,81 @@ class TurnTerminalityController:
     def snapshot(self) -> dict:
         with self._lock:
             return json.loads(json.dumps(self._state))
+
+    def set_execution_binding(self, binding: dict | None) -> None:
+        """Persist the immutable Chat run/provider/model/reasoning identity."""
+
+        source = binding if isinstance(binding, dict) else {}
+        safe = {
+            key: _bounded(source.get(key), maximum)
+            for key, maximum in (
+                ("conversation_id", 256),
+                ("request_id", 256),
+                ("turn_id", 256),
+                ("run_id", 256),
+                ("provider_id", 64),
+                ("model_id", 160),
+                ("effective_reasoning", 64),
+            )
+        }
+        if any(not value for value in safe.values()) or safe["turn_id"] != self.turn_id:
+            raise ValueError("execution binding is incomplete")
+        with self._lock, self._process_lock():
+            self._refresh()
+            existing = self._state.get("execution_binding") or {}
+            if existing and existing != safe:
+                raise ValueError("turn execution binding is immutable")
+            self._state["execution_binding"] = safe
+            self._persist()
+
+    def set_goal_contract(self, contract) -> None:
+        """Persist one validated immutable semantic authority for this turn."""
+
+        from osia.goal_contract import GoalContract, validate_goal_contract
+
+        if not isinstance(contract, GoalContract):
+            raise TypeError("goal contract is required")
+        validated = validate_goal_contract(contract)
+        if _bounded(validated.root_objective, 32_000) != self.objective:
+            raise ValueError("goal contract objective does not match turn")
+        safe = json.loads(json.dumps(
+            validated.to_dict(),
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ))
+        encoded = json.dumps(
+            safe, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > 128 * 1024:
+            raise ValueError("goal contract is too large")
+        fingerprint = _bounded(validated.fingerprint, 128)
+        if not fingerprint:
+            raise ValueError("goal contract fingerprint is required")
+        with self._lock, self._process_lock():
+            self._refresh()
+            execution_binding = self._state.get("execution_binding") or {}
+            contract_binding = safe.get("execution_binding") or {}
+            specified_contract_binding = {
+                key: value
+                for key, value in contract_binding.items()
+                if value != "not_specified"
+            }
+            if execution_binding != specified_contract_binding:
+                raise ValueError(
+                    "goal contract execution binding does not match turn"
+                )
+            existing = self._state.get("goal_contract") or {}
+            existing_fingerprint = str(
+                self._state.get("goal_contract_fingerprint") or ""
+            )
+            if existing and (
+                existing != safe or existing_fingerprint != fingerprint
+            ):
+                raise ValueError("turn goal contract is immutable")
+            self._state["goal_contract"] = safe
+            self._state["goal_contract_fingerprint"] = fingerprint
+            self._persist()
 
     def _load(self) -> dict | None:
         try:
@@ -288,24 +560,74 @@ class TurnTerminalityController:
         changed = False
         unknown = self._state.setdefault("unknown_effects", {})
         for item in self._state.get("invocations") or []:
-            if (
-                item.get("status") == "active"
-                and int(item.get("owner_pid") or 0) != os.getpid()
+            if item.get("status") != "active":
+                continue
+            owner_pid = int(item.get("owner_pid") or 0)
+            owner_identity = str(item.get("owner_process_identity") or "")
+            owner_alive, live_identity = live_process_identity(owner_pid)
+            if owner_alive and (
+                not owner_identity
+                or not live_identity
+                or owner_identity == live_identity
             ):
-                item["status"] = "interrupted_outcome_unknown"
-                item["completed_at"] = _now()
-                invocation_id = str(item.get("invocation_id") or "")
-                if invocation_id and invocation_id not in unknown:
-                    unknown[invocation_id] = {
-                        "outcome": "outcome_unknown",
-                        "reason_code": "provider_process_interrupted",
-                        "recorded_at": _now(),
-                    }
-                    self._state["evidence_revision"] = int(
-                        self._state.get("evidence_revision") or 0
-                    ) + 1
-                changed = True
+                # Another OSIA process may legitimately own this invocation.
+                # A different PID alone is never restart/death evidence.
+                continue
+            item["status"] = "interrupted_outcome_unknown"
+            item["completed_at"] = _now()
+            invocation_id = str(item.get("invocation_id") or "")
+            if invocation_id and invocation_id not in unknown:
+                unknown[invocation_id] = {
+                    "outcome": "outcome_unknown",
+                    "reason_code": "provider_process_interrupted",
+                    "recorded_at": _now(),
+                }
+                self._state["evidence_revision"] = int(
+                    self._state.get("evidence_revision") or 0
+                ) + 1
+            changed = True
         return changed
+
+    def prepare_durable_tool_resume(self, attempt_id: str) -> None:
+        """Bind restart continuation to one exact active durable receipt.
+
+        An interrupted provider invocation is not a second external effect when
+        the terminality state already owns an exact active ToolAttemptStore ID.
+        Remove only that redundant provider-process barrier; uncertainty about
+        the action itself remains owned by the durable attempt and its bounded
+        read-only reconciliation path.
+        """
+
+        key = _bounded(attempt_id, 192)
+        if not key:
+            raise ValueError("tool attempt id is required")
+        with self._lock, self._process_lock():
+            self._refresh()
+            if (
+                self.terminal_state
+                or self._state.get("final_reservation")
+                or key not in (self._state.get("active_attempts") or {})
+            ):
+                raise ValueError("durable tool attempt is not resumable")
+            unknown = self._state.setdefault("unknown_effects", {})
+            interrupted_ids = {
+                str(item.get("invocation_id") or "")
+                for item in self._state.get("invocations") or []
+                if item.get("status") == "interrupted_outcome_unknown"
+            }
+            removable = {
+                unknown_id
+                for unknown_id, value in unknown.items()
+                if unknown_id in interrupted_ids
+                and isinstance(value, dict)
+                and value.get("reason_code") == "provider_process_interrupted"
+            }
+            for unknown_id in removable:
+                unknown.pop(unknown_id, None)
+            for item in self._state.get("invocations") or []:
+                if str(item.get("invocation_id") or "") in removable:
+                    item["status"] = "interrupted_waiting_durable_attempt"
+            self._persist()
 
     def begin_invocation(
         self,
@@ -345,6 +667,9 @@ class TurnTerminalityController:
                 str((self._state.get("remaining_work") or required or [""])[0])
             )
             invocation_id = "inv_" + secrets.token_urlsafe(18)
+            _owner_alive, owner_process_identity = live_process_identity(
+                os.getpid()
+            )
             self._state.setdefault("invocations", []).append({
                 "invocation_id": invocation_id,
                 "provider_route": route,
@@ -355,6 +680,7 @@ class TurnTerminalityController:
                     self._state.get("strategy_attempt_revision") or 0
                 ),
                 "owner_pid": os.getpid(),
+                "owner_process_identity": owner_process_identity,
                 "status": "active",
                 "started_at": _now(),
                 "completed_at": "",
@@ -433,6 +759,24 @@ class TurnTerminalityController:
             self._bind_strategy_unknown_effects(safe)
             self._resolve_strategy_unknown_effects(safe)
             proven = safe.get("proven_postconditions") or {}
+            completed = safe.get("completed_effects") or []
+            required = set(self._state.get("required_postconditions") or [])
+            completed_proofs: list[tuple[str, object]] = []
+            for item in completed if isinstance(completed, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                attempted_effect = _bounded(item.get("attempted_effect"), 160)
+                if attempted_effect not in required:
+                    continue
+                evidence = item.get("evidence") or {
+                    "attempted_effect": attempted_effect,
+                    "target_application": _bounded(
+                        item.get("target_application"), 80,
+                    ),
+                    "target_surface": _bounded(item.get("target_surface"), 80),
+                    "observed_at": item.get("observed_at") or 0.0,
+                }
+                completed_proofs.append((attempted_effect, evidence))
             if isinstance(proven, dict) and proven:
                 # Preserve reconciliation before nested proof calls refresh
                 # this controller from its durable file.
@@ -441,6 +785,11 @@ class TurnTerminalityController:
                     self.prove_postcondition(str(postcondition), str(evidence))
             else:
                 self._persist()
+            # A completed-effect fact is durable execution evidence, but it may
+            # only discharge the exact terminality requirement it names.  It
+            # must never widen or replace the turn's required work.
+            for postcondition, evidence in completed_proofs:
+                self.prove_postcondition(postcondition, evidence)
 
     @staticmethod
     def _strategy_node(snapshot: dict, node_id: str) -> dict:
@@ -876,6 +1225,13 @@ class TurnTerminalityController:
             if normalized in {"outcome_unknown", "unknown_after_start"}:
                 key = entry["attempt_id"] or evidence_token or "unknown_effect"
                 self._state.setdefault("unknown_effects", {})[key] = entry
+                if entry["reason_code"] in {
+                    "reconciliation_exhausted",
+                    "semantic_settle_exhausted",
+                }:
+                    self._state.setdefault("active_attempts", {}).pop(
+                        key, None,
+                    )
             elif normalized == "success_unverified":
                 key = entry["attempt_id"] or evidence_token or "unverified_effect"
                 self._state.setdefault("active_attempts", {}).pop(key, None)
@@ -969,6 +1325,18 @@ class TurnTerminalityController:
         reason_code = str(getattr(execution_record, "reason_code", "") or "")
         attempt_id = str(getattr(execution_record, "tool_attempt_id", "") or "")
         result = getattr(execution_record, "result", "")
+        contract = getattr(execution_record, "contract", None)
+        side_effect = str(
+            getattr(
+                getattr(contract, "side_effect", None),
+                "value",
+                getattr(contract, "side_effect", ""),
+            )
+            or ""
+        )
+        if outcome == "success_unverified" and side_effect == "read_only":
+            outcome = "success_verified"
+            reason_code = reason_code or "read_only_result_returned"
         self.require_execution(postcondition)
         if "BLOCK_SYSTEM_DESTRUCTION" in str(result) or reason_code in {
             "block_system_destruction", "system_destruction_absolute",
@@ -1049,16 +1417,37 @@ class TurnTerminalityController:
             self._persist()
         return True
 
-    def request_cancellation(self, *, effect_possible: bool) -> None:
-        with self._lock:
+    def try_request_cancellation(self, *, effect_possible: bool) -> bool:
+        """Atomically install the authoritative no-answer cancellation tombstone."""
+
+        with self._lock, self._process_lock():
             self._refresh()
             cancellation = self._state.setdefault("cancellation", {})
+            if (
+                self._state.get("terminal_state")
+                == TerminalState.USER_CANCELLED.value
+                and cancellation.get("requested")
+                and isinstance(self._state.get("final_reservation"), dict)
+                and self._state.get("final_reservation")
+            ):
+                return True
+            if (
+                self._state.get("terminal_state")
+                or self._state.get("final_reservation")
+            ):
+                return False
+            possible = bool(
+                effect_possible
+                or cancellation.get("effect_possible")
+                or self._state.get("active_attempts")
+                or self._state.get("unknown_effects")
+            )
             cancellation.update({
                 "requested": True,
-                "effect_possible": bool(effect_possible),
+                "effect_possible": possible,
                 "requested_at": _now(),
             })
-            if effect_possible and not self._state.get("unknown_effects"):
+            if possible and not self._state.get("unknown_effects"):
                 self._state.setdefault("unknown_effects", {})[
                     "cancellation_possible_effect"
                 ] = {
@@ -1066,10 +1455,51 @@ class TurnTerminalityController:
                     "reason_code": "cancelled_effect_requires_reconciliation",
                     "recorded_at": _now(),
                 }
+            # Stop is the terminal execution authority even when a prior effect
+            # still requires evidence.  The empty reservation is deliberate:
+            # cancellation never fabricates an assistant answer, while late
+            # mutation/observer evidence can continue to enrich the durable
+            # receipt without reopening execution or final generation.
+            self._state["terminal_state"] = TerminalState.USER_CANCELLED.value
+            self._state["terminal_reason"] = "authoritative_user_cancellation"
+            self._state["final_reservation"] = {
+                "reservation_id": "final_" + secrets.token_urlsafe(18),
+                "reserved_at": _now(),
+                "terminal_state": TerminalState.USER_CANCELLED.value,
+                "final_text": "",
+            }
             self._persist()
+            return True
+
+    def request_cancellation(self, *, effect_possible: bool) -> None:
+        self.try_request_cancellation(effect_possible=effect_possible)
+
+    def refine_cancellation_proven_before_effect(self) -> bool:
+        """Remove only the synthetic Stop uncertainty after exact proof."""
+
+        with self._lock, self._process_lock():
+            self._refresh()
+            if (
+                self._state.get("terminal_state")
+                not in {"", TerminalState.USER_CANCELLED.value, None}
+            ):
+                return False
+            cancellation = self._state.get("cancellation") or {}
+            if not cancellation.get("requested"):
+                return False
+            unknown = self._state.setdefault("unknown_effects", {})
+            synthetic = unknown.get("cancellation_possible_effect")
+            if isinstance(synthetic, dict) and synthetic.get(
+                "reason_code"
+            ) == "cancelled_effect_requires_reconciliation":
+                unknown.pop("cancellation_possible_effect", None)
+            if not unknown:
+                cancellation["effect_possible"] = False
+            self._persist()
+            return True
 
     def mark_hard_safety_block(self, reason_code: str) -> None:
-        with self._lock:
+        with self._lock, self._process_lock():
             self._refresh()
             self._state["hard_safety_reason"] = _bounded(reason_code, 160) or "absolute_safety_barrier"
             self._persist()
@@ -1115,23 +1545,72 @@ class TurnTerminalityController:
                 return strategy, target
         return "", ""
 
+    def _all_unknown_reconciliation_exhausted(self) -> bool:
+        unknown = list((self._state.get("unknown_effects") or {}).values())
+        return bool(unknown) and all(
+            isinstance(item, dict)
+            and str(item.get("reason_code") or "") in {
+                "reconciliation_exhausted",
+                "semantic_settle_exhausted",
+            }
+            for item in unknown
+        )
+
+    def mark_reconciliation_exhausted(
+        self, attempt_id: str, *, evidence: object = "",
+    ) -> bool:
+        """Close only a read-only reconciliation frontier, never the effect."""
+
+        key = _bounded(attempt_id, 192)
+        with self._lock:
+            self._refresh()
+            unknown = self._state.setdefault("unknown_effects", {})
+            item = unknown.get(key)
+            if not key or not isinstance(item, dict):
+                return False
+            item["reason_code"] = "reconciliation_exhausted"
+            item["reconciliation_evidence_token"] = (
+                _fingerprint(evidence) if evidence not in (None, "") else ""
+            )
+            item["reconciliation_exhausted_at"] = _now()
+            self._state.setdefault("active_attempts", {}).pop(key, None)
+            if (
+                self._state.get("permission_state") == "pending"
+                and not self._state.get("active_attempts")
+            ):
+                self._state["permission_state"] = "resolved"
+            self._persist()
+            return True
+
     def evaluate(self, *, informational_answer_satisfied: bool = False, provider_route: str = "default") -> TerminalityDecision:
         with self._lock:
             self._refresh()
             if self.terminal_state:
                 return TerminalityDecision("terminal", self.terminal_state, self._state.get("terminal_reason", ""))
-            if self._state.get("hard_safety_reason"):
-                return TerminalityDecision(
-                    "terminal", TerminalState.HARD_SAFETY_BLOCK.value,
-                    str(self._state["hard_safety_reason"]),
-                )
             cancellation = self._state.get("cancellation") or {}
             if cancellation.get("requested"):
-                if not cancellation.get("effect_possible") and not self._state.get("unknown_effects"):
+                if (
+                    not cancellation.get("effect_possible")
+                    and not self._state.get("unknown_effects")
+                    and not self._state.get("active_attempts")
+                    and self._state.get("permission_state") != "pending"
+                    and not any(
+                        item.get("status") == "active"
+                        for item in self._state.get("invocations") or []
+                    )
+                ):
                     return TerminalityDecision(
                         "terminal", TerminalState.USER_CANCELLED.value,
                         "authoritative_user_cancellation",
                     )
+            if (
+                not cancellation.get("requested")
+                and self._state.get("hard_safety_reason")
+            ):
+                return TerminalityDecision(
+                    "terminal", TerminalState.HARD_SAFETY_BLOCK.value,
+                    str(self._state["hard_safety_reason"]),
+                )
             if (
                 any(
                     item.get("status") == "active"
@@ -1142,6 +1621,15 @@ class TurnTerminalityController:
             ):
                 return TerminalityDecision("wait", reason_code="operation_or_permission_active")
             if self._state.get("unknown_effects"):
+                if (
+                    self._all_unknown_reconciliation_exhausted()
+                    and not self._state.get("strategy_frontier")
+                ):
+                    return TerminalityDecision(
+                        "terminal",
+                        TerminalState.BLOCKED_VERIFIED.value,
+                        "safe_reconciliation_frontier_exhausted",
+                    )
                 strategy, target = self._next_reconciliation(provider_route)
                 if strategy:
                     return TerminalityDecision(
@@ -1153,6 +1641,11 @@ class TurnTerminalityController:
                 return TerminalityDecision(
                     "wait",
                     reason_code="reconciliation_not_executed_frontier_preserved",
+                )
+            if cancellation.get("requested"):
+                return TerminalityDecision(
+                    "wait",
+                    reason_code="cancellation_effect_requires_reconciliation",
                 )
             if not self.execution_required and informational_answer_satisfied:
                 postcondition = str(self._state["required_postconditions"][0])
@@ -1184,6 +1677,10 @@ class TurnTerminalityController:
             "event": "continue_same_user_turn",
             "turn_id": self.turn_id,
             "objective": state["objective"],
+            "goal_contract": state.get("goal_contract") or {},
+            "goal_contract_fingerprint": str(
+                state.get("goal_contract_fingerprint") or ""
+            ),
             "proven_postconditions": state.get("proven_postconditions") or {},
             "remaining_work": state.get("remaining_work") or [],
             "recent_typed_evidence": (state.get("typed_evidence") or [])[-8:],
@@ -1217,10 +1714,29 @@ class TurnTerminalityController:
 
         if state not in TERMINAL_STATES:
             return False
+        bounded_reason = _bounded(reason_code, 160)
         with self._lock, self._process_lock():
             self._refresh()
             if self._state.get("final_reservation"):
                 return False
+            cancellation = self._state.get("cancellation") or {}
+            if cancellation.get("requested"):
+                cancellation_terminal = bool(
+                    state == TerminalState.USER_CANCELLED.value
+                    and not cancellation.get("effect_possible")
+                    and not self._state.get("unknown_effects")
+                )
+                unknown_terminal = bool(
+                    state == TerminalState.BLOCKED_VERIFIED.value
+                    and self._state.get("unknown_effects")
+                    and bounded_reason in {
+                        "durable_outcome_unknown",
+                        "safe_reconciliation_frontier_exhausted",
+                    }
+                    and self._all_unknown_reconciliation_exhausted()
+                )
+                if not cancellation_terminal and not unknown_terminal:
+                    return False
             if state == TerminalState.SUCCESS_VERIFIED.value and self._state.get("remaining_work"):
                 return False
             if state == TerminalState.USER_CANCELLED.value and not (
@@ -1229,18 +1745,33 @@ class TurnTerminalityController:
                 return False
             if state == TerminalState.HARD_SAFETY_BLOCK.value and not self._state.get("hard_safety_reason"):
                 return False
-            if state == TerminalState.BLOCKED_VERIFIED.value and (
-                self._state.get("active_attempts")
-                or self._state.get("permission_state") == "pending"
-                or self._state.get("strategy_frontier")
-                or self._state.get("unknown_effects")
-                or self._next_strategy(
-                    _bounded(provider_route, 160) or "default"
-                ) != ("", "")
-            ):
-                return False
+            if state == TerminalState.BLOCKED_VERIFIED.value:
+                unknown_terminal = bool(
+                    self._state.get("unknown_effects")
+                    and bounded_reason in {
+                        "durable_outcome_unknown",
+                        "safe_reconciliation_frontier_exhausted",
+                    }
+                    and self._all_unknown_reconciliation_exhausted()
+                )
+                if (
+                    self._state.get("active_attempts")
+                    or self._state.get("permission_state") == "pending"
+                    or self._state.get("strategy_frontier")
+                    or (
+                        self._state.get("unknown_effects")
+                        and not unknown_terminal
+                    )
+                    or (
+                        not unknown_terminal
+                        and self._next_strategy(
+                            _bounded(provider_route, 160) or "default"
+                        ) != ("", "")
+                    )
+                ):
+                    return False
             self._state["terminal_state"] = state
-            self._state["terminal_reason"] = _bounded(reason_code, 160)
+            self._state["terminal_reason"] = bounded_reason
             self._state["final_reservation"] = {
                 "reservation_id": "final_" + secrets.token_urlsafe(18),
                 "reserved_at": _now(),
@@ -1249,10 +1780,61 @@ class TurnTerminalityController:
             self._persist()
             return True
 
+    def attach_final_projection(
+        self,
+        *,
+        execution_trace: dict | None = None,
+        artifact_refs=None,
+    ) -> None:
+        """Durably bind sanitized UI/evidence metadata to the reserved final."""
+
+        from osia.document_artifacts import normalize_references
+        from osia.execution_trace import validate_persisted_trace
+
+        safe_trace = validate_persisted_trace(execution_trace)
+        safe_artifacts = normalize_references(artifact_refs)
+        with self._lock, self._process_lock():
+            self._refresh()
+            reservation = self._state.get("final_reservation")
+            binding = self._state.get("execution_binding") or {}
+            if not isinstance(reservation, dict) or not reservation:
+                raise ValueError("final reservation is required")
+            if safe_trace is not None and any(
+                str(safe_trace.get(key) or "") != str(binding.get(key) or "")
+                for key in (
+                    "conversation_id", "request_id", "turn_id", "run_id",
+                    "provider_id", "model_id", "effective_reasoning",
+                )
+            ):
+                raise ValueError("final execution trace binding mismatch")
+            existing_trace = reservation.get("execution_trace")
+            if (
+                existing_trace is not None
+                and safe_trace is not None
+                and existing_trace != safe_trace
+            ):
+                raise ValueError("final execution trace is immutable")
+            existing_artifacts = normalize_references(
+                reservation.get("artifact_refs")
+            )
+            if (
+                existing_artifacts
+                and safe_artifacts
+                and existing_artifacts != safe_artifacts
+            ):
+                raise ValueError("final artifact references are immutable")
+            if safe_trace is not None:
+                reservation["execution_trace"] = safe_trace
+            if safe_artifacts:
+                reservation["artifact_refs"] = safe_artifacts
+            self._persist()
+
 
 __all__ = [
     "TERMINAL_STATES",
     "TerminalState",
     "TerminalityDecision",
     "TurnTerminalityController",
+    "live_process_identity",
+    "persisted_turn_state_exists",
 ]

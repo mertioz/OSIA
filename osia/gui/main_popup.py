@@ -37,7 +37,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap, QIcon,
-    QTextOption, QImage,
+    QTextDocument, QTextOption, QImage,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -68,7 +68,6 @@ from osia.reasoning import get_reasoning_options
 from osia.mobile_model_catalogue import (
     build_model_inventory,
     configured_api_providers,
-    resolve_autonomous_selection,
 )
 from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
@@ -352,8 +351,9 @@ class _MessageText(QTextBrowser):
 
     metrics_changed = pyqtSignal()
 
-    def __init__(self, text: str):
+    def __init__(self, text: str, *, markdown: bool = False):
         super().__init__()
+        self._markdown = bool(markdown)
         self.setObjectName("msgText")
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(
@@ -364,7 +364,9 @@ class _MessageText(QTextBrowser):
         self.setReadOnly(True)
         self.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByMouse
         )
+        self.setOpenExternalLinks(True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.viewport().setAutoFillBackground(False)
         self.document().setDocumentMargin(0)
@@ -373,7 +375,17 @@ class _MessageText(QTextBrowser):
             QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
         )
         self.document().setDefaultTextOption(option)
-        self.setPlainText(text)
+        self.set_source_text(text)
+
+    def set_source_text(self, text: str) -> None:
+        if not self._markdown:
+            self.setPlainText(text)
+            return
+        features = (
+            QTextDocument.MarkdownFeature.MarkdownDialectGitHub
+            | QTextDocument.MarkdownFeature.MarkdownNoHTML
+        )
+        self.document().setMarkdown(text, features)
 
     def changeEvent(self, event) -> None:  # noqa: N802 (Qt method name)
         super().changeEvent(event)
@@ -414,7 +426,7 @@ class _Bubble(QFrame):
 
         self._source_text = text or ""
         self._available_width = _BUBBLE_MAX_WIDTH
-        label = _MessageText(self._source_text)
+        label = _MessageText(self._source_text, markdown=role == "assistant")
         self._label = label
         label.metrics_changed.connect(self._layout_text)
         layout.addWidget(label)
@@ -457,7 +469,7 @@ class _Bubble(QFrame):
 
     def set_text(self, text: str) -> None:
         self._source_text = text
-        self._label.setPlainText(text)
+        self._label.set_source_text(text)
         self._layout_text()
 
     def text(self) -> str:
@@ -654,6 +666,713 @@ class _DirectiveChip(QFrame):
         row.addWidget(text)
         row.addWidget(remove)
 
+
+class _ChatThinkingTrace(QFrame):
+    """Compact, real-only public trace bound to one exact Chat run."""
+
+    cancel_requested = pyqtSignal(dict)
+    _ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
+    _DISPLAY_KEYS = {
+        "execution.action.browser": "chat.thinking.action_browser",
+        "execution.action.document": "chat.thinking.action_document",
+        "execution.action.filesystem": "chat.thinking.action_filesystem",
+        "execution.action.shell": "chat.thinking.action_shell",
+        "execution.action.connector": "chat.thinking.action_connector",
+        "execution.action.memory": "chat.thinking.action_memory",
+        "execution.action.scheduled_task": "chat.thinking.action_scheduled",
+        "execution.action.capability": "chat.thinking.action_capability",
+        "execution.permission.waiting": "chat.thinking.waiting_permission",
+        "execution.result.completed": "chat.thinking.result_completed",
+        "execution.result.needs_attention": "chat.thinking.result_attention",
+        "execution.result.cancelled": "chat.thinking.result_cancelled",
+        "execution.continuation.new_strategy": "chat.thinking.recovering",
+        "execution.reconciliation.verifying": "chat.thinking.verifying",
+        "execution.terminal.success": "chat.thinking.terminal_success",
+        "execution.terminal.blocked": "chat.thinking.terminal_blocked",
+        "execution.terminal.cancelled": "chat.thinking.terminal_cancelled",
+        "execution.terminal.safety_block": "chat.thinking.terminal_safety",
+    }
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._binding: dict[str, object] = {}
+        self._source_payload: dict[str, object] = {}
+        self._cancel_pending = False
+        self._expanded = False
+        self.setObjectName("chatThinkingTrace")
+        self.setAccessibleName(i18n.t("chat.thinking.title"))
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(2, 1, 2, 2)
+        outer.setSpacing(2)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
+        self._toggle = QPushButton()
+        self._toggle.setObjectName("chatThinkingToggle")
+        self._toggle.setFlat(True)
+        self._toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._toggle.clicked.connect(self._toggle_expanded)
+        self._stop = QPushButton(i18n.t("chat.thinking.stop"))
+        self._stop.setObjectName("chatThinkingStop")
+        self._stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._stop.clicked.connect(self._request_cancel)
+        header.addWidget(self._toggle, 0)
+        header.addStretch(1)
+        header.addWidget(self._stop, 0)
+        outer.addLayout(header)
+
+        self._detail = QTextEdit()
+        self._detail.setObjectName("chatThinkingDetail")
+        self._detail.setReadOnly(True)
+        self._detail.setAcceptRichText(False)
+        self._detail.setFrameShape(QFrame.Shape.NoFrame)
+        self._detail.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self._detail.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._detail.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._detail.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._detail.setMaximumHeight(0)
+        self._detail.hide()
+        outer.addWidget(self._detail)
+        self._detail_anim = QPropertyAnimation(
+            self._detail, b"maximumHeight", self,
+        )
+        self._detail_anim.setDuration(MOTION.state_ms)
+        self._detail_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._detail_anim.finished.connect(self._on_detail_animation_finished)
+        self._refresh_toggle()
+
+    @property
+    def key(self) -> tuple[str, str, str, str]:
+        return tuple(
+            str(self._binding.get(name) or "")
+            for name in ("conversation_id", "request_id", "turn_id", "run_id")
+        )
+
+    @property
+    def terminal(self) -> bool:
+        return bool(self._binding.get("terminal"))
+
+    @property
+    def cancelled_terminal(self) -> bool:
+        return bool(self._binding.get("cancelled_terminal"))
+
+    @classmethod
+    def _safe_id(cls, value: object, *, required: bool = True) -> str:
+        text = str(value or "")
+        if not text and not required:
+            return ""
+        return text if cls._ID_RE.fullmatch(text) else ""
+
+    @staticmethod
+    def _safe_label(value: object, *, maximum: int) -> str:
+        text = str(value or "").strip()
+        if not text or len(text) > maximum:
+            return ""
+        if any(ord(char) < 32 or ord(char) == 127 for char in text):
+            return ""
+        if any(
+            ord(char) in {
+                0x061C, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C,
+                0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069,
+            }
+            for char in text
+        ):
+            return ""
+        return text
+
+    @staticmethod
+    def _safe_summary(value: object) -> str:
+        from osia.execution_trace import sanitize_public_reasoning_summary
+
+        return sanitize_public_reasoning_summary(value)
+
+    @classmethod
+    def _safe_payload(cls, payload: dict | None) -> dict[str, object]:
+        raw = payload if isinstance(payload, dict) else {}
+        conversation_id = cls._safe_id(raw.get("conversation_id"))
+        request_id = cls._safe_id(raw.get("request_id"))
+        turn_id = cls._safe_id(raw.get("turn_id"))
+        run_id = cls._safe_id(raw.get("run_id"))
+        if not all((conversation_id, request_id, turn_id, run_id)):
+            return {}
+        safe: dict[str, object] = {
+            "conversation_id": conversation_id,
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "run_id": run_id,
+            "provider_id": cls._safe_label(
+                raw.get("provider_id"), maximum=64,
+            ),
+            "model_id": cls._safe_label(raw.get("model_id"), maximum=160),
+            "effective_reasoning": cls._safe_label(
+                raw.get("effective_reasoning"), maximum=64,
+            ),
+            "assistant_message_id": cls._safe_id(
+                raw.get("assistant_message_id"), required=False,
+            ),
+            "cancel_requested": bool(raw.get("cancel_requested")),
+            "outcome_unknown": bool(raw.get("outcome_unknown")),
+            "terminal": bool(raw.get("terminal")),
+            "cancelled_terminal": False,
+            "event_revisions": {},
+            "max_sequence": 0,
+            "lines": [],
+        }
+        route_values = tuple(
+            str(safe.get(name) or "")
+            for name in ("provider_id", "model_id", "effective_reasoning")
+        )
+        if any(route_values) and not all(route_values):
+            return {}
+        events = raw.get("snapshot")
+        if not isinstance(events, list):
+            events = raw.get("events")
+        if isinstance(events, list):
+            latest: dict[str, tuple[int, int, str]] = {}
+            terminal = False
+            for item in events[:32]:
+                if not isinstance(item, dict):
+                    continue
+                if any(
+                    str(item.get(name) or safe[name]) != str(safe[name])
+                    for name in ("conversation_id", "request_id", "turn_id", "run_id")
+                ):
+                    continue
+                if all(route_values) and any(
+                    str(item.get(name) or "") != str(safe.get(name) or "")
+                    for name in (
+                        "provider_id", "model_id", "effective_reasoning",
+                    )
+                ):
+                    continue
+                try:
+                    sequence = int(item.get("sequence") or 0)
+                    revision = int(item.get("revision") or 0)
+                except (TypeError, ValueError):
+                    continue
+                event_id = cls._safe_id(item.get("event_id"))
+                kind = str(item.get("kind") or "")
+                if not event_id or sequence < 1 or revision < 1:
+                    continue
+                line = ""
+                if kind == "public_reasoning_summary":
+                    line = cls._safe_summary(item.get("summary"))
+                else:
+                    display = item.get("display")
+                    display_key = (
+                        str(display.get("key") or "")
+                        if isinstance(display, dict) else ""
+                    )
+                    text_key = cls._DISPLAY_KEYS.get(display_key, "")
+                    if text_key:
+                        line = i18n.t(text_key)
+                    if display_key == "execution.terminal.cancelled":
+                        safe["cancelled_terminal"] = True
+                if line:
+                    previous = latest.get(event_id)
+                    if previous is None or revision > previous[1]:
+                        latest[event_id] = (sequence, revision, line)
+                terminal = terminal or bool(item.get("terminal"))
+            safe["lines"] = [
+                value[2] for value in sorted(
+                    latest.values(), key=lambda value: value[0],
+                )
+            ]
+            safe["event_revisions"] = {
+                event_id: value[1] for event_id, value in latest.items()
+            }
+            safe["max_sequence"] = max(
+                (value[0] for value in latest.values()), default=0,
+            )
+            safe["terminal"] = bool(safe["terminal"] or terminal)
+            return safe
+
+        # Legacy persisted Autonomous activity remains cancellable/readable, but
+        # plan/task counts and generic planning/executing filler are not shown.
+        status = str(raw.get("status") or "")
+        if status not in {
+            "planning", "executing", "waiting", "verifying", "recovering",
+            "completed", "blocked", "cancelled",
+        }:
+            return {}
+        safe["terminal"] = bool(safe["terminal"] or status in {
+            "completed", "blocked", "cancelled",
+        })
+        safe["cancelled_terminal"] = status == "cancelled"
+        legacy_key = {
+            "waiting": "chat.thinking.waiting",
+            "verifying": "chat.thinking.verifying",
+            "recovering": "chat.thinking.recovering",
+            "completed": "chat.thinking.terminal_success",
+            "blocked": "chat.thinking.terminal_blocked",
+            "cancelled": "chat.thinking.terminal_cancelled",
+        }.get(status, "")
+        lines = [i18n.t(legacy_key)] if legacy_key else []
+        if safe["outcome_unknown"]:
+            lines = [i18n.t("chat.thinking.outcome_unknown")]
+        safe["lines"] = lines
+        return safe
+
+    def apply_trace(self, payload: dict) -> bool:
+        safe = self._safe_payload(payload)
+        if not safe or (self._binding and self.key != tuple(
+            str(safe[name])
+            for name in ("conversation_id", "request_id", "turn_id", "run_id")
+        )):
+            return False
+        if self._binding:
+            previous_route = tuple(
+                str(self._binding.get(name) or "")
+                for name in (
+                    "provider_id", "model_id", "effective_reasoning",
+                )
+            )
+            current_route = tuple(
+                str(safe.get(name) or "")
+                for name in (
+                    "provider_id", "model_id", "effective_reasoning",
+                )
+            )
+            if any((*previous_route, *current_route)) and (
+                not all(previous_route)
+                or not all(current_route)
+                or previous_route != current_route
+            ):
+                return False
+            if self.terminal:
+                return bool(safe.get("terminal")) and all(
+                    int(revision) >= int(
+                        (self._binding.get("event_revisions") or {}).get(
+                            event_id, 0,
+                        )
+                    )
+                    for event_id, revision in (
+                        safe.get("event_revisions") or {}
+                    ).items()
+                )
+            if int(safe.get("max_sequence") or 0) < int(
+                self._binding.get("max_sequence") or 0
+            ):
+                return False
+            prior_revisions = self._binding.get("event_revisions") or {}
+            for event_id, revision in (safe.get("event_revisions") or {}).items():
+                if int(revision) < int(prior_revisions.get(event_id) or 0):
+                    return False
+        safe["cancel_requested"] = bool(
+            safe.get("cancel_requested") or self._cancel_pending
+        )
+        self._binding = safe
+        self._source_payload = dict(payload)
+        if safe["cancel_requested"]:
+            self._source_payload["cancel_requested"] = True
+        self._cancel_pending = bool(safe["cancel_requested"])
+        detail = "\n".join(str(line) for line in safe.get("lines") or ())
+        self._detail.setPlainText(detail)
+        self._toggle.setEnabled(bool(detail))
+        if not detail and self._expanded:
+            self._expanded = False
+            self._detail.hide()
+            self._detail.setMaximumHeight(0)
+        elif detail and self._expanded:
+            self._detail.setMaximumHeight(
+                min(180, max(1, self._detail.sizeHint().height()))
+            )
+        cancellable = not self.terminal and not self._cancel_pending
+        self._stop.setVisible(cancellable)
+        self._stop.setEnabled(cancellable)
+        self._refresh_toggle()
+        return True
+
+    def mark_inactive(self) -> None:
+        self._stop.hide()
+        self._stop.setEnabled(False)
+
+    def retranslate(self) -> None:
+        self.setAccessibleName(i18n.t("chat.thinking.title"))
+        self._stop.setText(i18n.t("chat.thinking.stop"))
+        if self._source_payload:
+            self.apply_trace(dict(self._source_payload))
+        self._refresh_toggle()
+
+    def _refresh_toggle(self) -> None:
+        chevron = "⌄" if self._expanded else "›"
+        self._toggle.setText(f"{i18n.t('chat.thinking.title')} {chevron}")
+        self._toggle.setAccessibleName(i18n.t("chat.thinking.title"))
+        self._toggle.setAccessibleDescription(
+            i18n.t(
+                "chat.thinking.collapse"
+                if self._expanded else "chat.thinking.expand"
+            )
+        )
+
+    def _toggle_expanded(self) -> None:
+        if not self._detail.toPlainText():
+            return
+        self._expanded = not self._expanded
+        self._detail_anim.stop()
+        self._detail.show()
+        start = self._detail.maximumHeight()
+        end = min(180, max(1, self._detail.sizeHint().height())) if self._expanded else 0
+        if reduced_motion_requested(self):
+            self._detail.setMaximumHeight(end)
+            if not self._expanded:
+                self._detail.hide()
+            self._refresh_toggle()
+            return
+        self._detail_anim.setStartValue(start)
+        self._detail_anim.setEndValue(end)
+        self._detail_anim.start()
+        self._refresh_toggle()
+
+    def _on_detail_animation_finished(self) -> None:
+        if not self._expanded:
+            self._detail.hide()
+
+    def _request_cancel(self) -> None:
+        if not self._binding or self._cancel_pending or self.terminal:
+            return
+        self._cancel_pending = True
+        self._binding["cancel_requested"] = True
+        self._stop.hide()
+        lines = list(self._binding.get("lines") or ())
+        lines.append(i18n.t("chat.thinking.cancelling"))
+        self._binding["lines"] = lines
+        self._source_payload["cancel_requested"] = True
+        self._detail.setPlainText("\n".join(str(line) for line in lines))
+        self.cancel_requested.emit(dict(self._binding))
+
+
+class _LegacyExecutionBanner(QFrame):
+    """Thin, non-Chat-bound control for one persisted legacy checkpoint."""
+
+    cancel_requested = pyqtSignal(dict)
+    resume_requested = pyqtSignal(dict)
+    _STATUSES = frozenset({
+        "planning", "executing", "waiting", "verifying", "recovering",
+        "completed", "blocked", "cancelled",
+    })
+    _RUN_STATES = frozenset({
+        "planning", "authorization_pending", "ready", "running",
+        "suspended_scope_extension", "suspended_authorization_revoked",
+        "blocked_outcome_unknown", "completed", "failed", "cancelled",
+        "suspended_browser_intervention", "suspended_browser_state",
+        "waiting_tool", "verifying_tool", "resuming",
+        "blocked_unknown_effect", "cancellation_requested",
+        "cancelled_proven",
+    })
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._binding: dict[str, object] = {}
+        self._pending_action = ""
+        self.setObjectName("legacyExecutionBanner")
+        self.setMaximumHeight(42)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(9, 5, 7, 5)
+        row.setSpacing(6)
+        self._status = QLabel()
+        self._status.setObjectName("legacyExecutionStatus")
+        self._status.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self._cancel = QPushButton()
+        self._cancel.setObjectName("legacyExecutionCancel")
+        self._cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cancel.clicked.connect(self._request_cancel)
+        self._resume = QPushButton()
+        self._resume.setObjectName("legacyExecutionResume")
+        self._resume.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._resume.clicked.connect(self._request_resume)
+        row.addWidget(self._status, 1)
+        row.addWidget(self._resume, 0)
+        row.addWidget(self._cancel, 0)
+        self.hide()
+
+    @classmethod
+    def _safe_payload(cls, payload: dict | None) -> dict[str, object]:
+        raw = payload if isinstance(payload, dict) else {}
+        if (
+            raw.get("schema_version") != 1
+            or raw.get("compatibility_mode") != "legacy_autonomous_checkpoint"
+            or raw.get("legacy_compatibility") is not True
+        ):
+            return {}
+        run_id = _ChatThinkingTrace._safe_id(raw.get("run_id"))
+        raw_task_id = str(raw.get("task_id") or "")
+        task_id = _ChatThinkingTrace._safe_id(
+            raw_task_id, required=False,
+        )
+        plan_revision = raw.get("plan_revision")
+        authorization_revision = raw.get("authorization_revision")
+        status = str(raw.get("status") or "")
+        run_state = str(raw.get("run_state") or "")
+        if (
+            not run_id
+            or (raw_task_id and not task_id)
+            or status not in cls._STATUSES
+            or run_state not in cls._RUN_STATES
+        ):
+            return {}
+        exact_identity = bool(
+            task_id
+            and type(plan_revision) is int
+            and plan_revision >= 0
+            and type(authorization_revision) is int
+            and authorization_revision >= 0
+        )
+        terminal = bool(raw.get("terminal"))
+        cancel_requested = bool(raw.get("cancel_requested"))
+        return {
+            "schema_version": 1,
+            "compatibility_mode": "legacy_autonomous_checkpoint",
+            "legacy_compatibility": True,
+            "run_id": run_id,
+            "task_id": task_id,
+            "plan_revision": plan_revision,
+            "authorization_revision": authorization_revision,
+            "status": status,
+            "run_state": run_state,
+            "terminal": terminal,
+            "outcome_unknown": bool(raw.get("outcome_unknown")),
+            "cancel_requested": cancel_requested,
+            "cancellable": bool(
+                exact_identity
+                and raw.get("cancellable")
+                and not terminal
+                and not cancel_requested
+            ),
+            "resumable": bool(
+                exact_identity
+                and raw.get("resumable")
+                and not terminal
+                and not cancel_requested
+            ),
+        }
+
+    @staticmethod
+    def _identity(payload: dict[str, object]) -> tuple[object, ...]:
+        return tuple(payload.get(name) for name in (
+            "run_id", "task_id", "plan_revision", "authorization_revision",
+        ))
+
+    def clear_projection(self) -> None:
+        self._binding = {}
+        self._pending_action = ""
+        self.hide()
+
+    def apply_projection(self, payload: dict | None) -> bool:
+        if not payload:
+            self.clear_projection()
+            return True
+        safe = self._safe_payload(payload)
+        if not safe:
+            self.clear_projection()
+            return False
+        if safe["terminal"]:
+            self.clear_projection()
+            return True
+        if self._binding and self._identity(self._binding) != self._identity(safe):
+            self._pending_action = ""
+        elif self._pending_action == "cancel" and (
+            safe["terminal"] or safe["cancel_requested"] or not safe["cancellable"]
+        ):
+            self._pending_action = ""
+        elif self._pending_action == "resume" and (
+            safe["terminal"] or not safe["resumable"]
+        ):
+            self._pending_action = ""
+        self._binding = safe
+        self._refresh()
+        self.show()
+        return True
+
+    def retranslate(self) -> None:
+        if self._binding:
+            self._refresh()
+
+    def _refresh(self) -> None:
+        french = i18n.get_language() == "fr"
+        if self._pending_action == "cancel" or self._binding.get(
+            "cancel_requested"
+        ):
+            text = "Arrêt de l’exécution précédente…" if french else (
+                "Stopping previous execution…"
+            )
+        elif self._pending_action == "resume":
+            text = "Reprise de l’exécution précédente…" if french else (
+                "Resuming previous execution…"
+            )
+        else:
+            status = str(self._binding.get("status") or "")
+            status_text = ({
+                "planning": "préparation",
+                "executing": "en cours",
+                "waiting": "en attente",
+                "verifying": "vérification",
+                "recovering": "récupération",
+                "completed": "terminée",
+                "blocked": "bloquée",
+                "cancelled": "annulée",
+            } if french else {
+                "planning": "preparing",
+                "executing": "running",
+                "waiting": "waiting",
+                "verifying": "verifying",
+                "recovering": "recovering",
+                "completed": "completed",
+                "blocked": "blocked",
+                "cancelled": "cancelled",
+            }).get(status, "")
+            if self._binding.get("outcome_unknown"):
+                status_text = "résultat incertain" if french else "outcome unknown"
+            prefix = "Exécution précédente" if french else "Previous execution"
+            text = f"{prefix} · {status_text}"
+        self._status.setText(text)
+        self._status.setAccessibleName(text)
+        self._resume.setText(i18n.t("guide.resume"))
+        self._resume.setAccessibleName(i18n.t("guide.resume"))
+        self._cancel.setText(i18n.t("chat.thinking.stop"))
+        self._cancel.setAccessibleName(i18n.t("chat.thinking.stop"))
+        controls_enabled = not self._pending_action
+        self._resume.setVisible(bool(
+            self._binding.get("resumable") and controls_enabled
+        ))
+        self._resume.setEnabled(bool(
+            self._binding.get("resumable") and controls_enabled
+        ))
+        self._cancel.setVisible(bool(
+            self._binding.get("cancellable") and controls_enabled
+        ))
+        self._cancel.setEnabled(bool(
+            self._binding.get("cancellable") and controls_enabled
+        ))
+
+    def _request_cancel(self) -> None:
+        if not self._binding.get("cancellable") or self._pending_action:
+            return
+        self._pending_action = "cancel"
+        payload = dict(self._binding)
+        self._refresh()
+        self.cancel_requested.emit(payload)
+
+    def _request_resume(self) -> None:
+        if not self._binding.get("resumable") or self._pending_action:
+            return
+        self._pending_action = "resume"
+        payload = dict(self._binding)
+        self._refresh()
+        self.resume_requested.emit(payload)
+
+
+class _InlinePermissionPrompt(QFrame):
+    """One exact, single-use permission decision rendered inside Chat."""
+
+    decision = pyqtSignal(str, bool)
+
+    def __init__(
+        self,
+        permission_request_id: str,
+        server_id: str,
+        tool_name: str,
+        summary: str,
+        *,
+        timeout_ms: int,
+    ) -> None:
+        super().__init__()
+        self._permission_request_id = str(permission_request_id)
+        self._settled = False
+        self.setObjectName("chatInlinePermission")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 9, 10, 9)
+        layout.setSpacing(6)
+
+        title = QLabel(i18n.t("mcp.confirm.title"))
+        title.setObjectName("chatInlinePermissionTitle")
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(title)
+
+        body = QLabel(
+            i18n.t(
+                "mcp.confirm.body",
+                server=str(server_id or "")[:160],
+                tool=str(tool_name or "")[:160],
+            )
+        )
+        body.setObjectName("chatInlinePermissionText")
+        body.setTextFormat(Qt.TextFormat.PlainText)
+        body.setWordWrap(True)
+        layout.addWidget(body)
+
+        detail = str(summary or "").strip()
+        if len(detail) > 300:
+            detail = detail[:299] + "\u2026"
+        if detail:
+            detail_label = QLabel(detail)
+            detail_label.setObjectName("chatInlinePermissionText")
+            detail_label.setTextFormat(Qt.TextFormat.PlainText)
+            detail_label.setWordWrap(True)
+            layout.addWidget(detail_label)
+
+        warning = QLabel(i18n.t("mcp.confirm.warn"))
+        warning.setObjectName("chatInlinePermissionText")
+        warning.setTextFormat(Qt.TextFormat.PlainText)
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
+        self._result = QLabel("")
+        self._result.setObjectName("chatInlinePermissionResult")
+        self._result.setTextFormat(Qt.TextFormat.PlainText)
+        self._result.hide()
+        layout.addWidget(self._result)
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        buttons.setSpacing(7)
+        buttons.addStretch(1)
+        self._decline = QPushButton(i18n.t("mcp.confirm.decline"))
+        self._decline.setObjectName("chatInlinePermissionDecline")
+        self._decline.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._decline.setDefault(True)
+        self._approve = QPushButton(i18n.t("mcp.confirm.approve"))
+        self._approve.setObjectName("chatInlinePermissionApprove")
+        self._approve.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._approve.setAutoDefault(False)
+        buttons.addWidget(self._decline)
+        buttons.addWidget(self._approve)
+        layout.addLayout(buttons)
+
+        self._decline.clicked.connect(lambda: self.settle(False, notify=True))
+        self._approve.clicked.connect(lambda: self.settle(True, notify=True))
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(lambda: self.settle(False, notify=True))
+        self._timer.start(max(1, int(timeout_ms)))
+
+    def settle(self, approved: bool, *, notify: bool) -> bool:
+        if self._settled:
+            return False
+        self._settled = True
+        self._timer.stop()
+        self._decline.setEnabled(False)
+        self._approve.setEnabled(False)
+        self._result.setText(
+            i18n.t(
+                "mcp.confirm.approve" if approved else "mcp.confirm.decline"
+            )
+        )
+        self._result.show()
+        if notify:
+            self.decision.emit(self._permission_request_id, bool(approved))
+        return True
+
+
 @dataclass
 class _ComposerDraft:
     text: str = ""
@@ -668,6 +1387,10 @@ class _ChatPage(QWidget):
     submit_draft = pyqtSignal(str, object)
     submit_directive_draft = pyqtSignal(str, object, object)
     informational_requested = pyqtSignal(str)
+    execution_cancel_requested = pyqtSignal(dict)
+    legacy_execution_cancel_requested = pyqtSignal(dict)
+    legacy_execution_resume_requested = pyqtSignal(dict)
+    inline_permission_decision = pyqtSignal(str, bool)
     # Kept as a compatibility signal. Selecting a file no longer emits it.
     pick_file = pyqtSignal(str, str)
     _BUSY_TEXT = "OSIA is still working in this conversation."
@@ -698,8 +1421,20 @@ class _ChatPage(QWidget):
             ),
         )
         self._stream.text_changed.connect(self._on_stream_text_changed)
+        self._stream.completed.connect(self._on_stream_completed)
         self._stream_bubble: _Bubble | None = None
         self._stream_wrap: QWidget | None = None
+        self._stream_key: tuple[str, str, str, str] | None = None
+        self._stream_binding: dict[str, str] = {}
+        self._cancelled_stream_keys: set[tuple[str, str, str, str]] = set()
+        self._completed_stream_keys: set[tuple[str, str, str, str]] = set()
+        self._stream_finish_error = False
+        self._discard_stream_on_complete = False
+        self._thinking_widgets: dict[
+            tuple[str, str, str, str], _ChatThinkingTrace
+        ] = {}
+        self._permission_widgets: dict[str, _InlinePermissionPrompt] = {}
+        self._active_thinking_key: tuple[str, str, str, str] | None = None
         self._scroll_timer = QTimer(self)
         self._scroll_timer.setSingleShot(True)
         self._scroll_timer.timeout.connect(self._scroll_to_bottom)
@@ -733,6 +1468,15 @@ class _ChatPage(QWidget):
         self._syncing_bubble_geometry = False
         self._scroll.viewport().installEventFilter(self)
         outer.addWidget(self._scroll, 1)
+
+        self._legacy_execution = _LegacyExecutionBanner()
+        self._legacy_execution.cancel_requested.connect(
+            self.legacy_execution_cancel_requested.emit
+        )
+        self._legacy_execution.resume_requested.connect(
+            self.legacy_execution_resume_requested.emit
+        )
+        outer.addWidget(self._legacy_execution, 0)
 
         # Empty-state placeholder, swapped out as soon as a message arrives.
         self._empty = self._build_empty_label()
@@ -840,11 +1584,19 @@ class _ChatPage(QWidget):
         self._rebuild_directive_chips()
         if not _is_deleted(self._empty):
             self._empty.setText(i18n.t("chat.empty"))
+        for trace in self._thinking_widgets.values():
+            trace.retranslate()
+        self._legacy_execution.retranslate()
 
     # ── Public API ────────────────────────────────────────────────────────
 
     def pending_attachments(self) -> tuple[DraftAttachment, ...]:
         return tuple(self._pending_attachments)
+
+    def set_legacy_execution_activity(self, payload: dict | None) -> bool:
+        """Render a server-owned legacy checkpoint without creating a Chat turn."""
+
+        return self._legacy_execution.apply_projection(payload)
 
     def set_draft_context(self, conversation_id: str | None) -> None:
         """Save and restore text plus attachments for one conversation."""
@@ -1165,7 +1917,14 @@ class _ChatPage(QWidget):
         self._stream.clear()
         self._stream_bubble = None
         self._stream_wrap = None
+        self._stream_key = None
+        self._stream_binding = {}
+        self._stream_finish_error = False
+        self._discard_stream_on_complete = False
         self._motion.settle()
+        self._thinking_widgets.clear()
+        self._permission_widgets.clear()
+        self._active_thinking_key = None
         # Remove every widget except the trailing stretch + empty label.
         # Every Qt access is guarded: widgets can already be deleted on the
         # C++ side (e.g. when the last conversation is removed), and touching
@@ -1201,13 +1960,30 @@ class _ChatPage(QWidget):
                 continue
             text = _display_text(m.get("content"))
             if text:
-                renderable.append((m["role"], text))
+                renderable.append((m["role"], text, m))
         if not renderable:
             return
         try:
             if not _is_deleted(self._empty):
                 self._empty.hide()
-            for role, text in renderable:
+            for role, text, message in renderable:
+                trace = message.get("_execution_trace_v1")
+                if role == "assistant" and isinstance(trace, dict):
+                    historical = dict(trace)
+                    historical.setdefault(
+                        "conversation_id", message.get("_conversation_id"),
+                    )
+                    historical.setdefault(
+                        "request_id", message.get("_request_id"),
+                    )
+                    historical.setdefault("turn_id", message.get("_turn_id"))
+                    historical.setdefault(
+                        "run_id", historical.get("turn_id"),
+                    )
+                    historical.setdefault(
+                        "assistant_message_id", message.get("_message_id"),
+                    )
+                    self.set_thinking_trace(historical, historical=True)
                 self._append_bubble(role, text)
             self._scroll_timer.start(0)
         except RuntimeError:
@@ -1223,38 +1999,254 @@ class _ChatPage(QWidget):
         self._append_bubble(role, text)
         self._scroll_timer.start(0)
 
-    def append_assistant_stream_chunk(self, text: str) -> None:
-        """Extend the active assistant target with one cleaned sentence chunk."""
-        self._stream.append_chunk(_display_text(text), separator=" ")
+    @classmethod
+    def _binding_key(
+        cls, binding: dict | None,
+    ) -> tuple[str, str, str, str] | None:
+        raw = binding if isinstance(binding, dict) else {}
+        conversation_id = _ChatThinkingTrace._safe_id(raw.get("conversation_id"))
+        request_id = _ChatThinkingTrace._safe_id(raw.get("request_id"))
+        turn_id = _ChatThinkingTrace._safe_id(raw.get("turn_id"))
+        run_id = _ChatThinkingTrace._safe_id(raw.get("run_id"))
+        if not all((conversation_id, request_id, turn_id, run_id)):
+            return None
+        return conversation_id, request_id, turn_id, run_id
 
-    def finalize_assistant_stream(self, text: str) -> None:
-        """Synchronously replace the presentation with the canonical final."""
+    def begin_turn(self, binding: dict) -> bool:
+        """Tombstone prior active presentation before accepting a new turn."""
+
+        key = self._binding_key(binding)
+        route = {
+            "provider_id": _ChatThinkingTrace._safe_label(
+                (binding or {}).get("provider_id"), maximum=64,
+            ),
+            "model_id": _ChatThinkingTrace._safe_label(
+                (binding or {}).get("model_id"), maximum=160,
+            ),
+            "effective_reasoning": _ChatThinkingTrace._safe_label(
+                (binding or {}).get("effective_reasoning"), maximum=64,
+            ),
+        }
+        if key is None or not all(route.values()):
+            return False
+        if key in self._completed_stream_keys:
+            return False
+        if key in self._cancelled_stream_keys:
+            trace = self._thinking_widgets.get(key)
+            if trace is None or not trace.cancelled_terminal:
+                return False
+        same_stream = self._stream_key == key
+        if same_stream and self._stream_binding != route:
+            return False
+        if self._active_thinking_key not in (None, key):
+            previous = self._thinking_widgets.get(self._active_thinking_key)
+            if previous is not None:
+                previous.mark_inactive()
+        if self._stream_key not in (None, key):
+            if self._stream_key in self._cancelled_stream_keys:
+                self._stream.clear()
+                self._discard_stream_bubble()
+            elif self._stream.provider_complete:
+                # A completed reveal has already detached its bubble while the
+                # controller intentionally retains the canonical final.  Do
+                # not flush that retained target again for the next turn: the
+                # text_changed signal would create a new bubble containing the
+                # previous answer.  Only an in-progress final reveal still
+                # needs one last flush into its existing turn-A bubble.
+                if self._stream.active or self._stream_bubble is not None:
+                    self._stream.cancel(flush=True)
+                else:
+                    self._stream.clear()
+            else:
+                self._stream.clear()
+                self._discard_stream_bubble()
+        self._active_thinking_key = key
+        self._stream_key = key
+        self._stream_binding = route
+        if not same_stream:
+            self._stream.begin()
+        return True
+
+    def set_thinking_trace(
+        self, payload: dict | None, *, historical: bool = False,
+    ) -> bool:
+        """Render a validated trace without projecting another turn as active."""
+
+        safe = _ChatThinkingTrace._safe_payload(payload)
+        if not safe:
+            return False
+        key = tuple(
+            str(safe[name])
+            for name in ("conversation_id", "request_id", "turn_id", "run_id")
+        )
+        widget = self._thinking_widgets.get(key)
+        if not historical and self._active_thinking_key not in (None, key):
+            return False
+        if widget is None:
+            if historical is False and self._active_thinking_key is None:
+                self._active_thinking_key = key
+            widget = _ChatThinkingTrace()
+            if not widget.apply_trace(payload):
+                widget.deleteLater()
+                return False
+            widget.cancel_requested.connect(self.execution_cancel_requested.emit)
+            self._messages_layout.insertWidget(
+                self._messages_layout.count() - 1, widget,
+            )
+            self._thinking_widgets[key] = widget
+            self._empty.hide()
+        elif not widget.apply_trace(payload):
+            return False
+        if historical:
+            widget.mark_inactive()
+        elif widget.terminal:
+            if self._active_thinking_key == key:
+                self._active_thinking_key = None
+        else:
+            self._active_thinking_key = key
+        self._scroll_timer.start(0)
+        return True
+
+    # Compatibility entry point for old hosts/tests. It now renders the same
+    # compact Thinking projection and never exposes task counters or a plan.
+    def set_execution_activity(self, payload: dict | None) -> None:
+        legacy = dict(payload or {})
+        legacy.setdefault("run_id", legacy.get("turn_id"))
+        self.set_thinking_trace(legacy)
+
+    def _accept_stream_binding(self, binding: dict | None) -> bool:
+        if binding is None:
+            return False
+        key = self._binding_key(binding)
+        if key is None:
+            return False
+        if key in self._completed_stream_keys:
+            return False
+        if key in self._cancelled_stream_keys:
+            trace = self._thinking_widgets.get(key)
+            if trace is None or not trace.cancelled_terminal:
+                return False
+        if self._stream_key not in (None, key):
+            return False
+        if self._active_thinking_key not in (None, key):
+            return False
+        supplied_route = {
+            "provider_id": _ChatThinkingTrace._safe_label(
+                (binding or {}).get("provider_id"), maximum=64,
+            ),
+            "model_id": _ChatThinkingTrace._safe_label(
+                (binding or {}).get("model_id"), maximum=160,
+            ),
+            "effective_reasoning": _ChatThinkingTrace._safe_label(
+                (binding or {}).get("effective_reasoning"), maximum=64,
+            ),
+        }
+        if supplied_route != self._stream_binding:
+            return False
+        self._stream_key = key
+        return True
+
+    def append_assistant_stream_chunk(
+        self, text: str, binding: dict | None = None,
+    ) -> bool:
+        """Extend the active assistant target with one cleaned sentence chunk."""
+        if not self._accept_stream_binding(binding):
+            return False
+        self._stream.append_chunk(_display_text(text), separator=" ")
+        return True
+
+    def finalize_assistant_stream(
+        self, text: str, binding: dict | None = None,
+    ) -> bool:
+        """Mark provider completion and progressively drain the canonical final."""
+        if not self._accept_stream_binding(binding):
+            return False
         final = _display_text(text)
+        self._stream_finish_error = False
+        self._discard_stream_on_complete = not bool(final)
         if not final:
             if self._stream.active or self._stream_bubble is not None:
                 self._stream.finalize("")
-                self._discard_stream_bubble()
-            return
+            return True
         if not self._stream.active and self._stream_bubble is None:
-            self.append_message("assistant", final)
-            return
+            self._stream.begin()
         self._stream.finalize(final)
-        self._mark_stream_finished()
+        return True
 
-    def fail_assistant_stream(self, text: str) -> None:
+    def fail_assistant_stream(
+        self, text: str, binding: dict | None = None,
+    ) -> bool:
+        if not self._accept_stream_binding(binding):
+            return False
         error = _display_text(text)
         if not error:
             self.cancel_assistant_stream(flush=True)
-            return
+            return True
+        self._stream_finish_error = True
+        self._discard_stream_on_complete = False
         if not self._stream.active and self._stream_bubble is None:
-            self.append_message("assistant", error)
-            return
+            self._stream.begin()
         self._stream.error(error)
-        self._mark_stream_finished(error=True)
+        return True
 
     def cancel_assistant_stream(self, *, flush: bool = True) -> None:
+        if not flush and self._stream_key is not None:
+            self._cancelled_stream_keys.add(self._stream_key)
+        self._discard_stream_on_complete = not flush
         self._stream.cancel(flush=flush)
-        self._mark_stream_finished()
+
+    def tombstone_cancelled_turn(self, binding: dict) -> bool:
+        key = self._binding_key(binding)
+        if key is None:
+            return False
+        self._cancelled_stream_keys.add(key)
+        trace = self._thinking_widgets.get(key)
+        if trace is not None:
+            trace.mark_inactive()
+            trace.hide()
+        if self._active_thinking_key == key:
+            self._active_thinking_key = None
+        return True
+
+    def present_inline_permission(
+        self, payload: dict, *, timeout_ms: int,
+    ) -> bool:
+        permission_id = _ChatThinkingTrace._safe_id(
+            (payload or {}).get("permission_request_id")
+        )
+        key = self._binding_key(payload)
+        if (
+            not permission_id
+            or key is None
+            or key != self._active_thinking_key
+            or permission_id in self._permission_widgets
+        ):
+            return False
+        prompt = _InlinePermissionPrompt(
+            permission_id,
+            str(payload.get("server_id") or ""),
+            str(payload.get("tool_name") or ""),
+            str(payload.get("summary") or ""),
+            timeout_ms=timeout_ms,
+        )
+        prompt.decision.connect(self.inline_permission_decision.emit)
+        self._messages_layout.insertWidget(
+            self._messages_layout.count() - 1, prompt,
+        )
+        self._permission_widgets[permission_id] = prompt
+        self._empty.hide()
+        self._fit_messages_host_to_viewport()
+        self._motion.fade_in(prompt, MOTION.appearance_ms)
+        self._scroll_timer.start(0)
+        return True
+
+    def settle_inline_permission(
+        self, permission_request_id: str, approved: bool,
+    ) -> bool:
+        prompt = self._permission_widgets.get(str(permission_request_id or ""))
+        if prompt is None:
+            return False
+        return prompt.settle(bool(approved), notify=False)
 
     # ── Internals ─────────────────────────────────────────────────────────
 
@@ -1420,6 +2412,16 @@ class _ChatPage(QWidget):
         else:
             self._stream_bubble.set_text(text)
         self._scroll_to_bottom()
+
+    def _on_stream_completed(self) -> None:
+        if self._discard_stream_on_complete:
+            self._discard_stream_bubble()
+        else:
+            self._mark_stream_finished(error=self._stream_finish_error)
+            if self._stream_key is not None:
+                self._completed_stream_keys.add(self._stream_key)
+        self._stream_finish_error = False
+        self._discard_stream_on_complete = False
 
     def _discard_stream_bubble(self) -> None:
         wrap = self._stream_wrap
@@ -10838,7 +11840,6 @@ class _NavButton(QPushButton):
     * ``models``     — a four-point sparkle/star (Models)
     * ``settings``   — a gear (Settings)
     * ``osia``       — a person/identity silhouette (OSIA personality + skills)
-    * ``autonomous`` — an infinity symbol / lemniscate (Autonomous agent)
 
     The active tab gets a rounded violet pill behind the icon and the icon
     itself switches to the violet accent; hover shows a softer violet wash.
@@ -10939,8 +11940,6 @@ class _NavButton(QPushButton):
             self._paint_gear(p, cx, cy, s, color)
         elif self._kind == "osia":
             self._paint_person(p, cx, cy, s, color)
-        elif self._kind == "autonomous":
-            self._paint_infinity(p, cx, cy, s, color)
         p.end()
 
     # ── Icon glyphs ───────────────────────────────────────────────────────
@@ -11026,27 +12025,6 @@ class _NavButton(QPushButton):
         path.closeSubpath()           # flat bottom
         p.drawPath(path)
 
-    def _paint_infinity(self, p, cx, cy, s, color) -> None:
-        """A lemniscate (∞) — two small loops meeting at a central crossing,
-        traced as one continuous stroke. Marks the Autonomous-agent section
-        and mirrors the infinity glyph now used by the mobile app."""
-        ox = s * 0.42      # half-width: centre → outer edge of each loop
-        oy = s * 0.28      # vertical control reach (true height ≈ 1.5·oy)
-        ix = s * 0.20      # inner control reach — sets loop fullness & crossing
-        path = QPainterPath()
-        path.moveTo(cx, cy)
-        # Right loop: over the top out to the far-right point, back under to centre.
-        path.cubicTo(cx + ix, cy - oy, cx + ox, cy - oy, cx + ox, cy)
-        path.cubicTo(cx + ox, cy + oy, cx + ix, cy + oy, cx, cy)
-        # Left loop: continues smoothly through the crossing, mirrored on x.
-        path.cubicTo(cx - ix, cy - oy, cx - ox, cy - oy, cx - ox, cy)
-        path.cubicTo(cx - ox, cy + oy, cx - ix, cy + oy, cx, cy)
-        # Stroked like the speech-bubble glyph: same pen width, no fill.
-        p.setPen(QPen(color, 2.0))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(path)
-
-
 # ── Central page stack ────────────────────────────────────────────────────────
 
 class _CentralStack(QStackedWidget):
@@ -11114,15 +12092,9 @@ class MainPopup(QWidget):
     # Compatibility signal retained for older hosts; the disabled settings row
     # can only emit False in this release.
     wake_word_enabled_changed = pyqtSignal(bool)
-    # Re-emitted from the autonomous panel (WOR-45 Phase 4). The host wires these
-    # to the dedicated Orchestrator: start (objective, provider, model), pause
-    # (resumable next launch) and discard.
-    autonomous_start_requested = pyqtSignal(str, str, str)
-    autonomous_authorize_requested = pyqtSignal()
-    autonomous_scope_extension_response = pyqtSignal(str)
-    autonomous_revoke_requested = pyqtSignal()
-    autonomous_interrupt_requested = pyqtSignal()
-    autonomous_abort_requested = pyqtSignal()
+    chat_execution_cancel_requested = pyqtSignal(dict)
+    legacy_execution_cancel_requested = pyqtSignal(dict)
+    legacy_execution_resume_requested = pyqtSignal(dict)
     _ollama_models_ready = pyqtSignal(list)
     _permission_epoch_changed = pyqtSignal(int)
 
@@ -11132,7 +12104,6 @@ class MainPopup(QWidget):
     PAGE_MODELS = 2
     PAGE_SETTINGS = 3
     PAGE_OSIA = 4
-    PAGE_AUTONOMOUS = 5
 
     def __init__(self):
         super().__init__()
@@ -11296,6 +12267,18 @@ class MainPopup(QWidget):
         self._chat.informational_requested.connect(
             self.informational_requested.emit
         )
+        self._chat.execution_cancel_requested.connect(
+            self._on_chat_execution_cancel_requested
+        )
+        self._chat.legacy_execution_cancel_requested.connect(
+            self.legacy_execution_cancel_requested.emit
+        )
+        self._chat.legacy_execution_resume_requested.connect(
+            self.legacy_execution_resume_requested.emit
+        )
+        self._chat.inline_permission_decision.connect(
+            self._on_inline_permission_decision
+        )
         self._chat.pick_file.connect(self.pick_file.emit)
 
         self._convs = _ConversationsPanel()
@@ -11370,28 +12353,6 @@ class MainPopup(QWidget):
 
         self._osia = _OsiaPanel()
 
-        self._autonomous = _AutonomousPanel()
-        self._autonomous.selection_changed.connect(
-            self._on_autonomous_model_selected
-        )
-        self._autonomous.start_requested.connect(
-            self.autonomous_start_requested.emit
-        )
-        self._autonomous.authorize_requested.connect(
-            self.autonomous_authorize_requested.emit
-        )
-        self._autonomous.scope_extension_response.connect(
-            self.autonomous_scope_extension_response.emit
-        )
-        self._autonomous.revoke_requested.connect(
-            self.autonomous_revoke_requested.emit
-        )
-        self._autonomous.interrupt_requested.connect(
-            self.autonomous_interrupt_requested.emit
-        )
-        self._autonomous.abort_requested.connect(
-            self.autonomous_abort_requested.emit
-        )
         self._refresh_model_inventory()
 
         self._stack.addWidget(self._chat)
@@ -11399,11 +12360,29 @@ class MainPopup(QWidget):
         self._stack.addWidget(self._models)
         self._stack.addWidget(self._settings)
         self._stack.addWidget(self._osia)
-        self._stack.addWidget(self._autonomous)
         outer.addWidget(self._stack, 1)
         self._active_conversation_id: str | None = None
         self._busy_conversation_ids: set[str] = set()
-        self._tool_status_by_conversation: dict[str, str] = {}
+        self._tool_status_by_turn: dict[tuple[str, str, str, str], str] = {}
+        self._thinking_by_key: dict[tuple[str, str, str, str], dict] = {}
+        self._thinking_safe_by_key: dict[
+            tuple[str, str, str, str], dict[str, object]
+        ] = {}
+        self._active_thinking_key_by_conversation: dict[
+            str, tuple[str, str, str, str]
+        ] = {}
+        self._turn_binding_by_key: dict[
+            tuple[str, str, str, str], dict[str, str]
+        ] = {}
+        self._pending_inline_permissions: dict[
+            str, tuple[tuple[str, str, str, str], object]
+        ] = {}
+        self._cancelled_thinking_keys: set[
+            tuple[str, str, str, str]
+        ] = set()
+        self._terminal_thinking_keys: set[
+            tuple[str, str, str, str]
+        ] = set()
         self._onboarding_dialog = None
 
         # Bottom nav
@@ -11420,7 +12399,6 @@ class MainPopup(QWidget):
             (self.PAGE_MODELS,     "models",     "nav.models"),
             (self.PAGE_SETTINGS,   "settings",   "nav.settings"),
             (self.PAGE_OSIA,       "osia",       None),
-            (self.PAGE_AUTONOMOUS, "autonomous", "nav.autonomous"),
         ]:
             tooltip = i18n.t(tip_key) if tip_key else "OSIA"
             btn = _NavButton(kind, tooltip)
@@ -11680,7 +12658,12 @@ class MainPopup(QWidget):
         self._animate_width(POPUP_W)
 
     def set_messages(self, messages: list[dict]) -> None:
+        if self._active_conversation_id:
+            self._deny_inline_permissions_for_conversation(
+                self._active_conversation_id
+            )
         self._chat.set_messages(messages)
+        self._apply_current_activity()
 
     def bind_unbound_draft(self, conversation_id: str) -> None:
         self._chat.bind_unbound_draft(conversation_id)
@@ -11764,20 +12747,252 @@ class MainPopup(QWidget):
     def append_message(self, role: str, text: str) -> None:
         self._chat.append_message(role, text)
 
-    def append_assistant_stream_chunk(self, text: str) -> None:
-        self._chat.append_assistant_stream_chunk(text)
+    def begin_chat_turn(self, binding: dict) -> bool:
+        key = _ChatPage._binding_key(binding)
+        if (
+            key is None
+            or key in self._terminal_thinking_keys
+            or key in self._cancelled_thinking_keys
+        ):
+            return False
+        conv_id = key[0]
+        previous = self._active_thinking_key_by_conversation.get(conv_id)
+        if previous is not None and previous != key:
+            # A different key can only become active after the previous turn's
+            # correlated terminal/busy-clear transition. Never let a stale
+            # signal evict a live Thinking block.
+            return False
+        provider_id = _ChatThinkingTrace._safe_label(
+            (binding or {}).get("provider_id"), maximum=64,
+        )
+        model_id = _ChatThinkingTrace._safe_label(
+            (binding or {}).get("model_id"), maximum=160,
+        )
+        effective_reasoning = _ChatThinkingTrace._safe_label(
+            (binding or {}).get("effective_reasoning"), maximum=64,
+        )
+        existing_binding = dict(self._turn_binding_by_key.get(key) or {})
+        supplied_binding = {
+            "conversation_id": key[0],
+            "request_id": key[1],
+            "turn_id": key[2],
+            "run_id": key[3],
+            "provider_id": provider_id,
+            "model_id": model_id,
+            "effective_reasoning": effective_reasoning,
+        }
+        if not all((provider_id, model_id, effective_reasoning)):
+            return False
+        if existing_binding and any(
+            existing_binding.get(name) != value
+            for name, value in supplied_binding.items()
+        ):
+            return False
+        self._turn_binding_by_key[key] = dict(supplied_binding)
+        self._active_thinking_key_by_conversation[conv_id] = key
+        if conv_id == self._active_conversation_id:
+            return self._chat.begin_turn(binding)
+        return True
 
-    def finalize_assistant_stream(self, text: str) -> None:
-        self._chat.finalize_assistant_stream(text)
+    def present_inline_mcp_confirmation(
+        self,
+        payload: dict,
+        resolver,
+        *,
+        timeout_ms: int,
+    ) -> bool:
+        """Present one trusted active-Chat permission request, or decline it."""
 
-    def fail_assistant_stream(self, text: str) -> None:
-        self._chat.fail_assistant_stream(text)
+        key = _ChatPage._binding_key(payload)
+        permission_id = _ChatThinkingTrace._safe_id(
+            (payload or {}).get("permission_request_id")
+        )
+        provider_id = _ChatThinkingTrace._safe_label(
+            (payload or {}).get("provider_id"), maximum=64,
+        )
+        model_id = _ChatThinkingTrace._safe_label(
+            (payload or {}).get("model_id"), maximum=160,
+        )
+        server_id = _ChatThinkingTrace._safe_label(
+            (payload or {}).get("server_id"), maximum=160,
+        )
+        tool_name = _ChatThinkingTrace._safe_label(
+            (payload or {}).get("tool_name"), maximum=160,
+        )
+        if (
+            key is None
+            or not permission_id
+            or not provider_id
+            or not model_id
+            or not server_id
+            or not tool_name
+            or not callable(resolver)
+            or permission_id in self._pending_inline_permissions
+            or self._active_conversation_id != key[0]
+            or self._active_thinking_key_by_conversation.get(key[0]) != key
+            or key in self._terminal_thinking_keys
+            or key in self._cancelled_thinking_keys
+            or key[0] not in self._busy_conversation_ids
+            or self._stack.currentIndex() != self.PAGE_CHAT
+            or not self.isVisible()
+        ):
+            return False
+        expected = self._turn_binding_by_key.get(key) or {}
+        if (
+            expected.get("provider_id") != provider_id
+            or expected.get("model_id") != model_id
+        ):
+            return False
+        supplied_reasoning = _ChatThinkingTrace._safe_label(
+            (payload or {}).get("effective_reasoning"), maximum=64,
+        )
+        if supplied_reasoning and (
+            expected.get("effective_reasoning") != supplied_reasoning
+        ):
+            return False
+        projected = {
+            **dict(payload or {}),
+            "permission_request_id": permission_id,
+            "provider_id": provider_id,
+            "model_id": model_id,
+            "server_id": server_id,
+            "tool_name": tool_name,
+        }
+        self._pending_inline_permissions[permission_id] = (key, resolver)
+        if not self._chat.present_inline_permission(
+            projected, timeout_ms=max(1, int(timeout_ms)),
+        ):
+            self._pending_inline_permissions.pop(permission_id, None)
+            return False
+        return True
+
+    def _resolve_inline_permission(
+        self,
+        permission_request_id: str,
+        approved: bool,
+        *,
+        from_widget: bool,
+    ) -> bool:
+        permission_id = str(permission_request_id or "")
+        pending = self._pending_inline_permissions.pop(permission_id, None)
+        if pending is None:
+            return False
+        if not from_widget:
+            self._chat.settle_inline_permission(permission_id, bool(approved))
+        _key, resolver = pending
+        try:
+            resolver(bool(approved))
+        except Exception:
+            pass
+        return True
+
+    def _on_inline_permission_decision(
+        self, permission_request_id: str, approved: bool,
+    ) -> None:
+        self._resolve_inline_permission(
+            permission_request_id, approved, from_widget=True,
+        )
+
+    def _deny_inline_permissions_for_key(
+        self, key: tuple[str, str, str, str],
+    ) -> None:
+        for permission_id, (owned_key, _resolver) in tuple(
+            self._pending_inline_permissions.items()
+        ):
+            if owned_key == key:
+                self._resolve_inline_permission(
+                    permission_id, False, from_widget=False,
+                )
+
+    def _deny_inline_permissions_for_conversation(self, conv_id: str) -> None:
+        for permission_id, (key, _resolver) in tuple(
+            self._pending_inline_permissions.items()
+        ):
+            if key[0] == conv_id:
+                self._resolve_inline_permission(
+                    permission_id, False, from_widget=False,
+                )
+
+    def restore_chat_execution_activity(self, payload: dict) -> bool:
+        """Explicitly reactivate one canonical durable-Chat exact key."""
+
+        safe = _ChatThinkingTrace._safe_payload(payload)
+        if not safe or bool(safe.get("terminal")):
+            return False
+        key = tuple(
+            str(safe[name])
+            for name in ("conversation_id", "request_id", "turn_id", "run_id")
+        )
+        if self._active_thinking_key_by_conversation.get(key[0]) is not None:
+            return False
+        if not self.begin_chat_turn({
+            "conversation_id": key[0],
+            "request_id": key[1],
+            "turn_id": key[2],
+            "run_id": key[3],
+            "provider_id": safe.get("provider_id"),
+            "model_id": safe.get("model_id"),
+            "effective_reasoning": safe.get("effective_reasoning"),
+        }):
+            return False
+        return self.update_chat_execution_activity(payload)
+
+    def _stream_binding_is_current(self, binding: dict | None) -> bool:
+        key = _ChatPage._binding_key(binding)
+        expected = self._turn_binding_by_key.get(key) if key is not None else None
+        supplied = {
+            "conversation_id": key[0] if key is not None else "",
+            "request_id": key[1] if key is not None else "",
+            "turn_id": key[2] if key is not None else "",
+            "run_id": key[3] if key is not None else "",
+            "provider_id": _ChatThinkingTrace._safe_label(
+                (binding or {}).get("provider_id"), maximum=64,
+            ),
+            "model_id": _ChatThinkingTrace._safe_label(
+                (binding or {}).get("model_id"), maximum=160,
+            ),
+            "effective_reasoning": _ChatThinkingTrace._safe_label(
+                (binding or {}).get("effective_reasoning"), maximum=64,
+            ),
+        }
+        return bool(
+            key is not None
+            and isinstance(expected, dict)
+            and supplied == expected
+            and key[0] == self._active_conversation_id
+            and self._active_thinking_key_by_conversation.get(key[0]) == key
+        )
+
+    def append_assistant_stream_chunk(
+        self, text: str, binding: dict | None = None,
+    ) -> bool:
+        if not self._stream_binding_is_current(binding):
+            return False
+        return self._chat.append_assistant_stream_chunk(text, binding)
+
+    def finalize_assistant_stream(
+        self, text: str, binding: dict | None = None,
+    ) -> bool:
+        if not self._stream_binding_is_current(binding):
+            return False
+        return self._chat.finalize_assistant_stream(text, binding)
+
+    def fail_assistant_stream(
+        self, text: str, binding: dict | None = None,
+    ) -> bool:
+        if not self._stream_binding_is_current(binding):
+            return False
+        return self._chat.fail_assistant_stream(text, binding)
 
     def cancel_assistant_stream(self, *, flush: bool = True) -> None:
         self._chat.cancel_assistant_stream(flush=flush)
 
     def refresh_conversations(self, active_id: str | None) -> None:
         if active_id != self._active_conversation_id:
+            if self._active_conversation_id:
+                self._deny_inline_permissions_for_conversation(
+                    self._active_conversation_id
+                )
             self._chat.set_draft_context(active_id)
         self._active_conversation_id = active_id
         self._convs.set_active(active_id)
@@ -11790,15 +13005,196 @@ class MainPopup(QWidget):
             self._busy_conversation_ids.add(conv_id)
         else:
             self._busy_conversation_ids.discard(conv_id)
-            self._tool_status_by_conversation.pop(conv_id, None)
+            self._deny_inline_permissions_for_conversation(conv_id)
+            for key in tuple(self._tool_status_by_turn):
+                if key[0] == conv_id:
+                    self._tool_status_by_turn.pop(key, None)
+            active_key = self._active_thinking_key_by_conversation.pop(
+                conv_id, None,
+            )
+            if conv_id == self._active_conversation_id and active_key is not None:
+                trace = self._chat._thinking_widgets.get(active_key)
+                if trace is not None:
+                    trace.mark_inactive()
         self._apply_current_busy()
 
     def set_conversation_tool_status(self, conv_id: str, status: str) -> None:
+        """Compatibility adapter for callers without a current turn key."""
         if not conv_id:
             return
-        self._tool_status_by_conversation[conv_id] = str(status or "")
+        key = self._active_thinking_key_by_conversation.get(conv_id)
+        if key is None:
+            return
+        self._tool_status_by_turn[key] = str(status or "")
         self._busy_conversation_ids.add(conv_id)
         self._apply_current_busy()
+
+    def set_conversation_tool_status_for_turn(
+        self, binding: dict, status: str,
+    ) -> bool:
+        key = _ChatPage._binding_key(binding)
+        if key is None:
+            return False
+        conv_id = key[0]
+        expected = self._turn_binding_by_key.get(key)
+        supplied = {
+            "conversation_id": key[0],
+            "request_id": key[1],
+            "turn_id": key[2],
+            "run_id": key[3],
+            "provider_id": _ChatThinkingTrace._safe_label(
+                (binding or {}).get("provider_id"), maximum=64,
+            ),
+            "model_id": _ChatThinkingTrace._safe_label(
+                (binding or {}).get("model_id"), maximum=160,
+            ),
+            "effective_reasoning": _ChatThinkingTrace._safe_label(
+                (binding or {}).get("effective_reasoning"), maximum=64,
+            ),
+        }
+        if (
+            self._active_thinking_key_by_conversation.get(conv_id) != key
+            or not isinstance(expected, dict)
+            or supplied != expected
+        ):
+            return False
+        self._tool_status_by_turn[key] = str(status or "")
+        self._busy_conversation_ids.add(conv_id)
+        self._apply_current_busy()
+        return True
+
+    def update_chat_execution_activity(self, payload: dict) -> bool:
+        safe = _ChatThinkingTrace._safe_payload(payload)
+        if not safe:
+            return False
+        key = tuple(
+            str(safe[name])
+            for name in ("conversation_id", "request_id", "turn_id", "run_id")
+        )
+        conv_id = key[0]
+        active_key = self._active_thinking_key_by_conversation.get(conv_id)
+        if active_key != key:
+            return False
+        expected = self._turn_binding_by_key.get(key)
+        if not isinstance(expected, dict) or any(
+            str(safe.get(name) or "") != str(expected.get(name) or "")
+            for name in (
+                "conversation_id", "request_id", "turn_id", "run_id",
+                "provider_id", "model_id", "effective_reasoning",
+            )
+        ):
+            return False
+        if key in self._terminal_thinking_keys and not bool(safe.get("terminal")):
+            return False
+        previous = self._thinking_safe_by_key.get(key)
+        if previous is not None:
+            if bool(previous.get("terminal")):
+                return bool(safe.get("terminal"))
+            if int(safe.get("max_sequence") or 0) < int(
+                previous.get("max_sequence") or 0
+            ):
+                return False
+            previous_revisions = previous.get("event_revisions") or {}
+            if any(
+                int(revision) < int(previous_revisions.get(event_id) or 0)
+                for event_id, revision in (
+                    safe.get("event_revisions") or {}
+                ).items()
+            ):
+                return False
+        if bool(safe.get("cancel_requested")):
+            self._cancelled_thinking_keys.add(key)
+            self._deny_inline_permissions_for_key(key)
+            self._chat.tombstone_cancelled_turn(safe)
+        projected = dict(payload)
+        if key in self._cancelled_thinking_keys:
+            projected["cancel_requested"] = True
+            safe["cancel_requested"] = True
+        if conv_id == self._active_conversation_id and active_key == key:
+            if not self._chat.set_thinking_trace(projected):
+                return False
+        self._thinking_by_key[key] = projected
+        self._thinking_safe_by_key[key] = safe
+        if bool(safe.get("terminal")):
+            self._terminal_thinking_keys.add(key)
+            self._deny_inline_permissions_for_key(key)
+        return True
+
+    def update_legacy_execution_activity(self, payload: dict | None) -> bool:
+        """Update the global legacy banner without binding it to a Chat turn."""
+
+        return self._chat.set_legacy_execution_activity(payload)
+
+    def _on_chat_execution_cancel_requested(self, payload: dict) -> None:
+        key = _ChatPage._binding_key(payload)
+        if key is None:
+            return
+        if self._active_thinking_key_by_conversation.get(key[0]) != key:
+            return
+        expected = self._turn_binding_by_key.get(key)
+        if not isinstance(expected, dict) or any(
+            str((payload or {}).get(name) or "")
+            != str(expected.get(name) or "")
+            for name in (
+                "conversation_id", "request_id", "turn_id", "run_id",
+                "provider_id", "model_id", "effective_reasoning",
+            )
+        ):
+            return
+        if key in self._terminal_thinking_keys:
+            return
+        self.chat_execution_cancel_requested.emit(dict(payload))
+
+    def confirm_chat_execution_cancellation(self, payload: dict) -> bool:
+        """Apply Stop presentation only after the durable intent was accepted."""
+
+        key = _ChatPage._binding_key(payload)
+        if key is None:
+            return False
+        if self._active_thinking_key_by_conversation.get(key[0]) != key:
+            return False
+        expected = self._turn_binding_by_key.get(key)
+        if not isinstance(expected, dict) or any(
+            str((payload or {}).get(name) or "")
+            != str(expected.get(name) or "")
+            for name in (
+                "conversation_id", "request_id", "turn_id", "run_id",
+                "provider_id", "model_id", "effective_reasoning",
+            )
+        ):
+            return False
+        self._cancelled_thinking_keys.add(key)
+        self._terminal_thinking_keys.add(key)
+        self._deny_inline_permissions_for_key(key)
+        self._chat.tombstone_cancelled_turn(payload)
+        projected = dict(self._thinking_by_key.get(key) or payload)
+        projected["cancel_requested"] = True
+        projected["terminal"] = True
+        projected["status"] = "cancelled"
+        self._thinking_by_key[key] = projected
+        safe = self._thinking_safe_by_key.get(key)
+        if isinstance(safe, dict):
+            safe["cancel_requested"] = True
+            safe["terminal"] = True
+            safe["cancelled_terminal"] = True
+        self._active_thinking_key_by_conversation.pop(key[0], None)
+        # The exact cancelled turn remains durable/historical, but it no
+        # longer owns the active conversation or composer.  This local release
+        # is intentionally tied to the committed tombstone, not the earlier
+        # optimistic Stop tap.
+        self.set_conversation_busy(key[0], False)
+        return True
+
+    def _apply_current_activity(self) -> None:
+        active_id = self._active_conversation_id
+        key = self._active_thinking_key_by_conversation.get(active_id or "")
+        payload = self._thinking_by_key.get(key) if key is not None else None
+        if key is not None:
+            binding = self._turn_binding_by_key.get(key)
+            if isinstance(binding, dict):
+                self._chat.begin_turn(dict(binding))
+        if payload is not None:
+            self._chat.set_thinking_trace(payload)
 
     def show_conversation_busy_notice(self) -> None:
         self._chat.show_notice(_ChatPage._BUSY_TEXT)
@@ -11847,37 +13243,7 @@ class MainPopup(QWidget):
             configured,
             self._model_account_status,
         )
-        settings = load_settings() or {}
-        resolution = resolve_autonomous_selection(
-            self._model_inventory,
-            autonomous_provider=settings.get("autonomous_model_provider") or "",
-            autonomous_model=settings.get("autonomous_model") or "",
-            main_provider=settings.get("selected_model_provider") or "",
-            main_model=settings.get("selected_model") or "",
-        )
-        account_status_pending = not bool(self._model_account_status)
-        # Until the first account snapshot arrives, a missing entry may still be
-        # a valid account model (including a legacy bare id). Render the safe
-        # fallback, but do not destroy the saved identity before that probe.
-        defer_account_fallback = bool(
-            account_status_pending and resolution.get("fallback_occurred")
-        )
-        if resolution.get("entry") and not defer_account_fallback:
-            provider_id = resolution["provider_id"]
-            model_id = resolution["model_id"]
-            if settings.get("autonomous_model_provider") != provider_id:
-                set_setting("autonomous_model_provider", provider_id)
-            if settings.get("autonomous_model") != model_id:
-                set_setting("autonomous_model", model_id)
         self._models.set_inventory(self._model_inventory)
-        self._autonomous.set_inventory(self._model_inventory, resolution)
-
-    def _on_autonomous_model_selected(self, provider: str, model: str) -> None:
-        settings = load_settings() or {}
-        if settings.get("autonomous_model_provider") != provider:
-            set_setting("autonomous_model_provider", provider)
-        if settings.get("autonomous_model") != model:
-            set_setting("autonomous_model", model)
 
     def _request_local_models_refresh(self) -> None:
         refresh_ollama_models_async(self._publish_local_models)
@@ -11888,27 +13254,6 @@ class MainPopup(QWidget):
     def _apply_local_models(self, _models: list) -> None:
         self._settings._apply_local_models_snapshot()
         self._refresh_model_inventory()
-
-    # ── Autonomous agent (WOR-45 Phase 4) ─────────────────────────────────
-
-    def show_autonomous(self, state) -> None:
-        """Switch to the autonomous page and seed it from a ``task_state`` dict
-        (used by the host when resuming an interrupted task). Surfaces the popup
-        if it is hidden so a resumed task is actually visible."""
-        self._stack.setCurrentIndex(self.PAGE_AUTONOMOUS)
-        btn = self._nav_buttons.get(self.PAGE_AUTONOMOUS)
-        if btn is not None:
-            btn.setChecked(True)
-        self._animate_width(POPUP_W)   # autonomous page uses the COMPACT width
-        self._settings._probe_chatgpt_account()
-        self._request_local_models_refresh()
-        self._autonomous.seed_from_state(state)
-        if not self.isVisible():
-            self._show_animated()
-
-    def update_autonomous_progress(self, payload) -> None:
-        """Forward a progress snapshot (already on the GUI thread) to the panel."""
-        self._autonomous.apply_progress(payload)
 
     # ── Internal handlers ─────────────────────────────────────────────────
 
@@ -11924,9 +13269,9 @@ class MainPopup(QWidget):
             bool(active_id and active_id in self._busy_conversation_ids)
         )
         if active_id:
-            self._chat.set_tool_status(
-                self._tool_status_by_conversation.get(active_id, "")
-            )
+            key = self._active_thinking_key_by_conversation.get(active_id)
+            self._chat.set_tool_status(self._tool_status_by_turn.get(key, ""))
+        self._apply_current_activity()
 
     def _on_nav_clicked(self, page_idx: int) -> None:
         with perf_timer(f"nav -> page {page_idx}"):
@@ -11947,9 +13292,6 @@ class MainPopup(QWidget):
                 self._convs.refresh()
             elif page_idx == self.PAGE_OSIA:
                 self._osia.refresh()
-            elif page_idx == self.PAGE_AUTONOMOUS:
-                self._settings._probe_chatgpt_account()
-                self._request_local_models_refresh()
 
     def _on_new_conv(self) -> None:
         self.new_conversation.emit()
@@ -12233,6 +13575,129 @@ class MainPopup(QWidget):
                 background: transparent;
                 border: none;
                 padding: 0px;
+            }
+            QFrame#legacyExecutionBanner {
+                background: rgba(196, 181, 245, 0.07);
+                border-top: 1px solid rgba(196, 181, 245, 0.18);
+                border-bottom: 1px solid rgba(196, 181, 245, 0.12);
+            }
+            QLabel#legacyExecutionStatus {
+                color: rgba(220, 217, 230, 0.88);
+                background: transparent;
+                border: none;
+                font-size: 10px;
+                font-weight: 600;
+            }
+            QPushButton#legacyExecutionResume,
+            QPushButton#legacyExecutionCancel {
+                background: transparent;
+                border-radius: 6px;
+                padding: 3px 7px;
+                font-size: 9px;
+            }
+            QPushButton#legacyExecutionResume {
+                border: 1px solid rgba(196, 181, 245, 0.38);
+                color: rgba(210, 200, 247, 0.94);
+            }
+            QPushButton#legacyExecutionResume:hover,
+            QPushButton#legacyExecutionResume:focus {
+                background: rgba(196, 181, 245, 0.10);
+                border-color: rgba(196, 181, 245, 0.62);
+                color: #ffffff;
+            }
+            QPushButton#legacyExecutionCancel {
+                border: 1px solid rgba(220, 140, 140, 0.32);
+                color: rgba(224, 163, 163, 0.88);
+            }
+            QPushButton#legacyExecutionCancel:hover,
+            QPushButton#legacyExecutionCancel:focus {
+                background: rgba(220, 80, 80, 0.10);
+                border-color: rgba(220, 120, 120, 0.58);
+                color: #ffffff;
+            }
+            QFrame#chatThinkingTrace {
+                background: transparent;
+                border: none;
+            }
+            QPushButton#chatThinkingToggle {
+                background: transparent;
+                border: none;
+                color: rgba(192, 189, 202, 0.82);
+                padding: 2px 1px;
+                font-size: 11px;
+                font-weight: 600;
+                text-align: left;
+            }
+            QPushButton#chatThinkingToggle:hover,
+            QPushButton#chatThinkingToggle:focus {
+                color: rgba(196, 181, 245, 0.96);
+                background: rgba(196, 181, 245, 0.035);
+                border-radius: 4px;
+            }
+            QTextEdit#chatThinkingDetail {
+                color: rgba(192, 189, 202, 0.76);
+                background: rgba(196, 181, 245, 0.025);
+                border-left: 1px solid rgba(196, 181, 245, 0.20);
+                padding: 3px 7px;
+                font-size: 10px;
+            }
+            QPushButton#chatThinkingStop {
+                background: transparent;
+                border: 1px solid rgba(220, 140, 140, 0.32);
+                border-radius: 6px;
+                color: rgba(224, 163, 163, 0.88);
+                padding: 3px 7px;
+                font-size: 9px;
+            }
+            QPushButton#chatThinkingStop:hover,
+            QPushButton#chatThinkingStop:focus {
+                background: rgba(220, 80, 80, 0.10);
+                border-color: rgba(220, 120, 120, 0.58);
+                color: #ffffff;
+            }
+            QFrame#chatInlinePermission {
+                background: rgba(196, 181, 245, 0.055);
+                border: 1px solid rgba(196, 181, 245, 0.24);
+                border-radius: 10px;
+            }
+            QLabel#chatInlinePermissionTitle {
+                color: #e8e6f0;
+                font-size: 11px;
+                font-weight: 600;
+                background: transparent;
+            }
+            QLabel#chatInlinePermissionText {
+                color: rgba(192, 189, 202, 0.82);
+                font-size: 10px;
+                background: transparent;
+            }
+            QLabel#chatInlinePermissionResult {
+                color: rgba(196, 181, 245, 0.96);
+                font-size: 10px;
+                font-weight: 600;
+                background: transparent;
+            }
+            QPushButton#chatInlinePermissionDecline,
+            QPushButton#chatInlinePermissionApprove {
+                border-radius: 7px;
+                padding: 4px 9px;
+                font-size: 10px;
+            }
+            QPushButton#chatInlinePermissionDecline {
+                background: transparent;
+                border: 1px solid rgba(192, 189, 202, 0.30);
+                color: rgba(232, 230, 240, 0.82);
+            }
+            QPushButton#chatInlinePermissionApprove {
+                background: rgba(196, 181, 245, 0.82);
+                border: 1px solid rgba(196, 181, 245, 0.82);
+                color: #0d0b12;
+            }
+            QPushButton#chatInlinePermissionDecline:disabled,
+            QPushButton#chatInlinePermissionApprove:disabled {
+                background: rgba(133, 130, 145, 0.10);
+                border-color: rgba(133, 130, 145, 0.20);
+                color: #858291;
             }
 
             /* WOR-48: lighter input frame — translucent fill, softer border. */

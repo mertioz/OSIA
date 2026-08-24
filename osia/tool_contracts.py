@@ -1020,7 +1020,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               real=RealValidationRequirement.USER_VISIBLE),
         _spec(
               "activate_desktop_surface",
-              "Activate one fresh opaque native desktop candidate/pattern pair through background-safe UIA Invoke/SelectionItem/Toggle/ExpandCollapse when that exact pattern is currently actionable, or use action_pattern=Window for an exact window when foreground is a proven downstream precondition; objective must exactly match its current safe accessible label. action_pattern must come from the candidate's fresh structured actuation patterns, never from name guessing. For a stateless Invoke, observable_effect must identify a different observed surface and the exact independently observable text expected after this one activation; invocation alone is never proof",
+              "Activate one fresh opaque native desktop candidate/pattern pair through background-safe UIA Invoke/SelectionItem/Toggle/ExpandCollapse when that exact pattern is currently actionable, or use action_pattern=Window for an exact window when foreground is a proven downstream precondition; objective must exactly match its current safe accessible label. action_pattern must come from the candidate's fresh structured actuation patterns, never from name guessing. For a stateless Invoke, observable_effect must identify a different observed surface and the exact independently observable text expected after this activation; invocation alone is never proof. Optionally provide semantic_batch as the complete 2-8 primitive sequence (including this primary first primitive) only when every item is branch-independent, reversible local work with no permission or transition boundary. Each item needs a unique exact post-primitive observable effect that is not already true before the batch; different items may use different observed witness surfaces. When a control leaves the primary display unchanged, use a fresh expression/status witness instead of claiming the unchanged display as its effect. The top-level observable_effect must equal the last item. OSIA journals and freshness-checks every primitive, stops at the first uncertainty/stale/transition, and performs one final semantic checkpoint",
               _object({
                   "surface_ref": IDENTIFIER,
                   "objective": _string(maximum=240),
@@ -1038,6 +1038,41 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
                       "surface_ref": IDENTIFIER,
                       "expected_text": _string(maximum=240),
                   }, required=("kind", "surface_ref", "expected_text")),
+                  "semantic_batch": {
+                      "type": "array",
+                      "minItems": 2,
+                      "maxItems": 8,
+                      "items": _object({
+                          "surface_ref": IDENTIFIER,
+                          "objective": _string(maximum=240),
+                          "action_pattern": _string(
+                              enum=("Invoke", "SelectionItem", "Toggle"),
+                              maximum=32,
+                          ),
+                          "observable_effect": _object({
+                              "kind": _string(
+                                  enum=("exact_surface_text",), maximum=48,
+                              ),
+                              "surface_ref": IDENTIFIER,
+                              "expected_text": _string(maximum=240),
+                          }, required=(
+                              "kind", "surface_ref", "expected_text",
+                          )),
+                          "branch_independent": {"type": "boolean", "const": True},
+                          "transition_boundary": _string(
+                              enum=("none",), maximum=16,
+                          ),
+                          "permission_boundary": {"type": "boolean", "const": False},
+                          "safety_class": _string(
+                              enum=("reversible_local",), maximum=32,
+                          ),
+                      }, required=(
+                          "surface_ref", "objective", "action_pattern",
+                          "observable_effect", "branch_independent",
+                          "transition_boundary", "permission_boundary",
+                          "safety_class",
+                      )),
+                  },
               }, required=("surface_ref", "objective", "action_pattern")),
               DY, D, FC, timeout=30.0,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
@@ -2073,6 +2108,11 @@ def effective_static_tool_specs() -> tuple[ToolSpec, ...]:
         return specs
     filtered = []
     for spec in specs:
+        if (
+            strategy.available_tools
+            and spec.name not in strategy.available_tools
+        ):
+            continue
         try:
             applicable, _reason = tool_applicability(
                 strategy, spec.name, {},

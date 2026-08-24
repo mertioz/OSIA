@@ -9,7 +9,7 @@ import math
 import queue
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -91,6 +91,9 @@ class AccountProviderError(RuntimeError):
         self.server_code = error.server_code
         self.capability_events = tuple(
             getattr(error, "capability_events", ()) or ()
+        )
+        self.public_reasoning_summary = str(
+            getattr(error, "public_reasoning_summary", "") or ""
         )
         self.native_turn_id = getattr(error, "native_turn_id", None)
         self.selected_model = str(selected_model) if selected_model else None
@@ -475,6 +478,7 @@ class ChatGPTAccountProvider:
         final_response_message_id: str | None = None,
         effort: str | None = None,
         on_delta=None,
+        on_reasoning_summary=None,
         timeout: float = 300.0,
         output_schema: dict | None = None,
         planning_only: bool = False,
@@ -495,6 +499,7 @@ class ChatGPTAccountProvider:
                 model=model,
                 effort=effort,
                 on_delta=on_delta,
+                on_reasoning_summary=on_reasoning_summary,
                 timeout=_bounded_turn_timeout(timeout),
                 output_schema=output_schema,
             )
@@ -526,7 +531,12 @@ class ChatGPTAccountProvider:
                     capability_events=tuple(
                         getattr(exc, "capability_events", ()) or ()
                     ),
+                    public_reasoning_summary=str(
+                        getattr(exc, "public_reasoning_summary", "") or ""
+                    ),
                 )
+                if on_reasoning_summary is not None and result.public_reasoning_summary:
+                    on_reasoning_summary(result.public_reasoning_summary)
                 with self._lock:
                     current = self._threads.get(conversation_id)
                     if current is state:
@@ -560,6 +570,12 @@ class ChatGPTAccountProvider:
         if state:
             self.client.cancel_turn(thread_id=state.thread_id)
 
+    def release_ephemeral_conversation(self, conversation_id: str) -> None:
+        """Forget local state for a completed one-shot observation turn."""
+
+        with self._lock:
+            self._threads.pop(str(conversation_id or ""), None)
+
     def shutdown(self) -> None:
         self.client.shutdown()
         with self._lock:
@@ -590,11 +606,21 @@ class _AccountCompletions:
                         self._owner.final_response_message_id
                     ),
                     effort=effort,
+                    on_reasoning_summary=(
+                        None
+                        if planning_only else
+                        self._owner._emit_public_reasoning_summary
+                    ),
                     timeout=timeout,
                     output_schema=output_schema,
                     planning_only=planning_only,
                 )
             except Exception as exc:
+                public_summary = str(
+                    getattr(exc, "public_reasoning_summary", "") or ""
+                )
+                if public_summary and not planning_only:
+                    self._owner._emit_public_reasoning_summary(public_summary)
                 self._owner._preserve_exception_state(exc)
                 raise
             self._owner._set_capability_events(
@@ -624,6 +650,13 @@ class _AccountCompletions:
                     ),
                     effort=effort,
                     on_delta=lambda delta: events.put(("delta", delta)),
+                    on_reasoning_summary=(
+                        None
+                        if planning_only else
+                        lambda summary: events.put(
+                            ("public_reasoning_summary", summary)
+                        )
+                    ),
                     timeout=timeout,
                     output_schema=output_schema,
                     planning_only=planning_only,
@@ -639,6 +672,11 @@ class _AccountCompletions:
                 })
                 events.put(("done", None))
             except Exception as exc:
+                public_summary = str(
+                    getattr(exc, "public_reasoning_summary", "") or ""
+                )
+                if public_summary and not planning_only:
+                    events.put(("public_reasoning_summary", public_summary))
                 self._owner._preserve_exception_state(exc)
                 events.put(("error", exc))
 
@@ -659,6 +697,8 @@ class _AccountCompletions:
                 if kind == "delta":
                     delta = SimpleNamespace(content=str(payload))
                     yield SimpleNamespace(choices=[SimpleNamespace(delta=delta)])
+                elif kind == "public_reasoning_summary":
+                    self._owner._emit_public_reasoning_summary(payload)
                 elif kind == "error":
                     raise payload
                 else:
@@ -678,6 +718,8 @@ class _AccountChatClient:
         self._capability_events_lock = threading.Lock()
         self._invocation_metadata: dict = {}
         self._invocation_metadata_lock = threading.Lock()
+        self._public_reasoning_summary_callback = None
+        self._public_reasoning_summary_lock = threading.Lock()
         self.chat = SimpleNamespace(completions=_AccountCompletions(self))
 
     def _set_capability_events(self, events) -> None:
@@ -713,6 +755,20 @@ class _AccountChatClient:
             metadata = dict(self._invocation_metadata)
             self._invocation_metadata = {}
         return metadata
+
+    def set_public_reasoning_summary_callback(self, callback) -> None:
+        """Bind the active Chat trace consumer; planning calls never invoke it."""
+
+        with self._public_reasoning_summary_lock:
+            self._public_reasoning_summary_callback = (
+                callback if callable(callback) else None
+            )
+
+    def _emit_public_reasoning_summary(self, payload) -> None:
+        with self._public_reasoning_summary_lock:
+            callback = self._public_reasoning_summary_callback
+        if callable(callback) and isinstance(payload, Mapping):
+            callback(dict(payload))
 
     def set_conversation_id(self, conversation_id: str | None) -> None:
         self.conversation_id = conversation_id

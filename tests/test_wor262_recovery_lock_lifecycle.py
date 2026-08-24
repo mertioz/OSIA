@@ -252,6 +252,7 @@ def test_02_restored_runtime_executes_only_verifier_callback(monkeypatch, tmp_pa
     agent._pending_tool_runtime = None
     agent._pending_tool_attached_existing = False
     agent.last_pending_tool_attempt_id = ""
+    agent._terminality_controller = None
     verified = object()
     agent._verify_local_reconciliation_probe = Mock(return_value=verified)
 
@@ -261,7 +262,7 @@ def test_02_restored_runtime_executes_only_verifier_callback(monkeypatch, tmp_pa
     assert callbacks["resume"](attempt["tool_attempt_id"], object()) == ""
     assert callbacks["verify"](attempt["tool_attempt_id"]) is verified
     agent._verify_local_reconciliation_probe.assert_called_once()
-    coordinator.activate.assert_called_once_with(attempt["tool_attempt_id"])
+    coordinator.activate.assert_not_called()
 
 
 def test_03_successful_recovered_reconciliation_clears_wait(monkeypatch, tmp_path):
@@ -570,8 +571,8 @@ def test_11_orphan_deadline_notifies_reattached_autonomous_runtime(
     ]
     assert notified.wait(2.0)
     terminal = store.get_attempt(attempt["tool_attempt_id"])
-    assert terminal["status"] == ToolAttemptStatus.UNKNOWN_AFTER_START.value
-    assert terminal["dispatch_state"] == "effect_unknown"
+    assert terminal["status"] == ToolAttemptStatus.FAILED_BEFORE_EFFECT.value
+    assert terminal["dispatch_state"] == "not_dispatched"
 
 
 def test_12_exact_live_wait_blocks_verification_and_replan(monkeypatch):

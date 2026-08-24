@@ -340,7 +340,9 @@ def test_model_supplied_tool_name_is_sanitized_in_logs_and_summary(capsys):
     assert "unknown_tool" in rendered
 
 
-def test_antiloop_finalization_keeps_one_sanitized_assistant_state(monkeypatch):
+def test_deduplicated_tool_finalization_keeps_one_sanitized_assistant_state(
+    monkeypatch,
+):
     monkeypatch.setitem(agent_module.TOOL_MAP, "fill", lambda **_kwargs: "Success")
     tool_call = (
         '<tool_call>{"tool":"fill","selector":"#private",'
@@ -357,9 +359,7 @@ def test_antiloop_finalization_keeps_one_sanitized_assistant_state(monkeypatch):
 
     response = osia.run("synthetic request")
     exported = osia.exported_history()
-    assert osia.last_run_diagnostic["error_category"] == (
-        "repeated_identical_call"
-    )
+    assert osia.last_run_diagnostic["error_category"] == "task_execution_failure"
     assert [item["role"] for item in exported] == ["user", "assistant"]
     assert exported[-1]["content"] == response
     assert SENSITIVE_MARKER not in repr(exported)

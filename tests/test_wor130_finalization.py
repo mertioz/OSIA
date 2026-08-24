@@ -35,6 +35,26 @@ _INFORMATIONAL_SENTENCE = (
 )
 
 
+def _chat_binding(suffix: str) -> dict:
+    return {
+        "conversation_id": "wor130-conversation",
+        "request_id": f"wor130-request-{suffix}",
+        "turn_id": f"wor130-turn-{suffix}",
+        "run_id": f"wor130-turn-{suffix}",
+        "provider_id": "chatgpt_account",
+        "model_id": "gpt-5.6-luna",
+        "effective_reasoning": "high",
+    }
+
+
+def _finish_reveal(controller: DesktopTextStreamController) -> None:
+    for _ in range(256):
+        if not controller.active:
+            return
+        controller._on_tick()
+    raise AssertionError("desktop presentation stream did not settle")
+
+
 def _chunk(text: str):
     return SimpleNamespace(
         choices=[SimpleNamespace(delta=SimpleNamespace(content=text))]
@@ -203,6 +223,7 @@ class DesktopFinalizationTests(unittest.TestCase):
         canonical = "Début progressif. Fin canonique exacte."
 
         controller.finalize(canonical)
+        _finish_reveal(controller)
 
         self.assertEqual(seen[-1][0], canonical)
         self.assertEqual(controller.target_text, canonical)
@@ -216,10 +237,13 @@ class DesktopFinalizationTests(unittest.TestCase):
         chat.show()
         self.app.processEvents()
         final = "Une réponse valide qui doit rester visible."
-        chat.append_assistant_stream_chunk(final)
+        binding = _chat_binding("late-status")
+        self.assertTrue(chat.begin_turn(binding))
+        chat.append_assistant_stream_chunk(final, binding)
         chat._stream._on_tick()
         bubble = chat._stream_bubble
-        chat.finalize_assistant_stream(final)
+        chat.finalize_assistant_stream(final, binding)
+        _finish_reveal(chat._stream)
 
         chat.set_busy(False)
         self.app.processEvents()
@@ -237,8 +261,10 @@ class DesktopFinalizationTests(unittest.TestCase):
         self.assertEqual(controller.displayed_text, "Réponse partielle ordonnée.")
         self.assertFalse(controller.active)
 
+        controller.begin()
         controller.append_chunk("Nouvelle réponse partielle.")
         controller.error("Error: arrêt contrôlé")
+        _finish_reveal(controller)
         self.assertEqual(controller.displayed_text, "Error: arrêt contrôlé")
         self.assertFalse(controller.active)
         self.assertFalse(controller.timer_active)
@@ -246,7 +272,11 @@ class DesktopFinalizationTests(unittest.TestCase):
     def test_conversation_switch_discards_only_the_old_pending_stream(self):
         chat = _ChatPage()
         chat.show()
-        chat.append_assistant_stream_chunk("Ancienne conversation en cours.")
+        binding = _chat_binding("switch")
+        self.assertTrue(chat.begin_turn(binding))
+        chat.append_assistant_stream_chunk(
+            "Ancienne conversation en cours.", binding,
+        )
         self.assertTrue(chat._stream.active)
 
         chat.set_messages([{"role": "user", "content": "Nouvelle conversation"}])

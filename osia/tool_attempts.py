@@ -24,6 +24,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from osia.action_truth import (
+    ActionState,
+    CanonicalEffectClass,
+    ReconciliationStatus,
+    action_identity,
+    canonical_effect_class,
+    evidence_reference,
+    new_action_truth,
+    normalize_action_truth,
+    semantic_effect_identity,
+    settle_policy_for,
+    transition_action_truth,
+)
 from osia.config import CONFIG_DIR
 
 
@@ -43,6 +56,39 @@ _OPAQUE_BROWSER_TOKEN = re.compile(r"^[A-Za-z0-9_-]{8,96}$")
 _SAFE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
 _PERSISTENCE_STATES = frozenset({"waiting", "reconciling", "stalled", "terminal"})
 _PERSISTENCE_FAMILIES = frozenset({"browser", "file", "api_mcp", "system", "generic"})
+_PRIMITIVE_LIFECYCLES = frozenset({
+    "prepared", "dispatch_started", "dispatch_returned", "receipt_bound",
+    "verified", "not_applied", "unknown",
+})
+_PRIMITIVE_EFFECT_CLASSES = frozenset({
+    "impossible", "effect_possible", "verified", "not_applied", "unknown",
+})
+# Compatibility defaults for journals created before action-level settle
+# policies existed. New actions persist an effect-aware policy in action_truth.
+_LEGACY_SEMANTIC_SETTLE_CHECKS = 3
+_LEGACY_SEMANTIC_SETTLE_INTERVAL_SECONDS = 1.0
+_SEMANTIC_SETTLE_STATES = frozenset({
+    "inactive", "active", "proof_observed", "exhausted", "cancelled",
+    "stale_target", "observation_failed", "evidence_unresolved", "aborted",
+})
+_SEMANTIC_SETTLE_PROBE_CLASSIFICATIONS = frozenset({
+    "completed_match", "completed_nonmatch", "completed_inconclusive",
+    "probe_failed", "stale_or_invalid",
+})
+_ATTEMPT_AUTHORITY_STATES = frozenset({
+    "active", "cancelled", "terminal", "superseded",
+})
+_PROVIDER_REFERENCE_KEYS = frozenset({
+    "provider_request_id", "provider_response_id", "tool_call_id", "call_id",
+    "function_call_id", "continuation_id", "session_id",
+    "external_operation_id", "status_id", "idempotency_key", "thread_id",
+    "turn_id", "item_id",
+})
+_PROVIDER_OPERATION_REFERENCE_PRIORITY = (
+    "external_operation_id", "status_id", "function_call_id", "call_id",
+    "provider_request_id", "provider_response_id", "tool_call_id", "item_id",
+    "continuation_id", "session_id",
+)
 
 
 def is_internal_tool_control_text(value: Any) -> bool:
@@ -77,6 +123,16 @@ class ToolAttemptStatus(str, Enum):
     CANCELLED_PROVEN = "cancelled_proven"
 
 
+class SemanticSettleProbeClassification(str, Enum):
+    """Typed outcome of one bounded read-only semantic settle probe."""
+
+    COMPLETED_MATCH = "completed_match"
+    COMPLETED_NONMATCH = "completed_nonmatch"
+    COMPLETED_INCONCLUSIVE = "completed_inconclusive"
+    PROBE_FAILED = "probe_failed"
+    STALE_OR_INVALID = "stale_or_invalid"
+
+
 TERMINAL_STATUSES = frozenset({
     ToolAttemptStatus.SUCCEEDED,
     ToolAttemptStatus.FAILED_BEFORE_EFFECT,
@@ -91,6 +147,18 @@ RECOVERABLE_STATUSES = frozenset({
     ToolAttemptStatus.WAITING_VERIFICATION,
     ToolAttemptStatus.CANCELLATION_REQUESTED,
 })
+
+# Stable, value-free wrapper results used only when the durable dispatch
+# boundary itself blocks the external callable.  The agent converts the
+# cancellation result into its typed CANCELLED_PROVEN outcome before anything
+# user-facing is committed.
+TOOL_DISPATCH_CANCELLED_RESULT = (
+    "ERROR: action cancelled before dispatch; no effect occurred"
+)
+TOOL_DISPATCH_BOUNDARY_UNAVAILABLE_RESULT = (
+    "ERROR: durable tool dispatch boundary unavailable; "
+    "the tool was not executed"
+)
 
 
 class RevisionConflict(RuntimeError):
@@ -110,6 +178,25 @@ class ToolAttemptEvent:
     attempt_id: str
     phase: str
     reason_code: str = ""
+
+
+@dataclass(frozen=True)
+class SemanticSettleProbeResult:
+    """Sanitized evidence contract returned by one settle observer invocation."""
+
+    classification: SemanticSettleProbeClassification
+    observer_mechanism: str
+    observation_started_at: float
+    observation_completed_at: float = 0.0
+    target_application: str = ""
+    surface_ref: str = ""
+    native_window_id: str = ""
+    window_generation: str = ""
+    exact_postcondition_match: bool | None = None
+    reason_code: str = ""
+    evidence_ref: str = ""
+    probe_invoked: bool = True
+    terminal_payload: Any = None
 
 
 @dataclass
@@ -179,6 +266,13 @@ def _now() -> float:
     return time.time()
 
 
+def _created_at_sort_key(item: Mapping[str, Any]) -> float:
+    try:
+        return max(0.0, float(item.get("created_at") or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
 def _pid_alive(value: Any) -> bool:
     """Best-effort live-owner check for restart-safe durable claims."""
 
@@ -214,6 +308,54 @@ def _pid_alive(value: Any) -> bool:
     return True
 
 
+def _live_process_identity(value: Any) -> tuple[bool, str]:
+    """Return liveness plus a PID-reuse-safe identity when available."""
+
+    try:
+        pid = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return False, ""
+    if pid <= 0:
+        return False, ""
+    try:
+        import psutil
+
+        process = psutil.Process(pid)
+        if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+            return False, ""
+        return True, f"{pid}:{process.create_time():.6f}"
+    except (ImportError, OSError):
+        return _pid_alive(pid), ""
+    except Exception as exc:
+        try:
+            import psutil
+
+            if isinstance(exc, psutil.NoSuchProcess):
+                return False, ""
+        except ImportError:
+            pass
+        # AccessDenied and indeterminate probes are not proof of death.
+        return True, ""
+
+
+def _continuation_owner_alive(record: Mapping[str, Any]) -> bool:
+    """Reject only the exact still-live owner of a continuation claim."""
+
+    alive, live_identity = _live_process_identity(
+        record.get("continuation_claimed_pid")
+    )
+    if not alive:
+        return False
+    claimed_identity = str(
+        record.get("continuation_claimed_process_identity") or ""
+    )
+    return bool(
+        not claimed_identity
+        or not live_identity
+        or claimed_identity == live_identity
+    )
+
+
 def _safe_token(value: Any, *, field: str, allow_empty: bool = False) -> str:
     token = str(value or "").strip()
     if not token and allow_empty:
@@ -232,6 +374,454 @@ def _safe_reason(value: Any) -> str:
     if not reason:
         return ""
     return reason if _SAFE_REASON.fullmatch(reason) else "private_reason_withheld"
+
+
+def _safe_primitive_text(value: Any, *, maximum: int = 160) -> str:
+    """Keep only bounded identifier-like primitive metadata, never UI text."""
+
+    text = str(value or "").strip()
+    if not text or len(text) > maximum or any(ord(char) < 32 for char in text):
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9_.:@!+/-]+", text):
+        return ""
+    return text
+
+
+def _safe_primitive_journal(value: Any) -> list[dict[str, Any]]:
+    entries = []
+    for raw in value if isinstance(value, list) else ():
+        if not isinstance(raw, Mapping):
+            continue
+        lifecycle = str(raw.get("lifecycle") or "prepared")
+        effect_class = str(raw.get("effect_classification") or "impossible")
+        if lifecycle not in _PRIMITIVE_LIFECYCLES:
+            lifecycle = "unknown"
+        if effect_class not in _PRIMITIVE_EFFECT_CLASSES:
+            effect_class = "unknown"
+        timestamps = {}
+        for name in (
+            "prepared_at", "dispatch_started_at", "dispatch_returned_at",
+            "receipt_bound_at", "verified_at", "not_applied_at",
+            "unknown_at",
+        ):
+            try:
+                number = max(0.0, float(raw.get(name) or 0.0))
+            except (TypeError, ValueError, OverflowError):
+                number = 0.0
+            if number:
+                timestamps[name] = number
+        entry = {
+            "schema_version": 1,
+            "primitive_id": _safe_primitive_text(raw.get("primitive_id")),
+            "effect_role": (
+                "preparatory"
+                if raw.get("effect_role") == "preparatory" else "semantic"
+            ),
+            "checkpoint_role": (
+                "intermediate"
+                if raw.get("checkpoint_role") == "intermediate" else "final"
+            ),
+            "semantic_batch_id": _safe_primitive_text(
+                raw.get("semantic_batch_id")
+            ),
+            "run_id": _safe_primitive_text(raw.get("run_id")),
+            "task_id": _safe_primitive_text(raw.get("task_id")),
+            "semantic_node_id": _safe_primitive_text(
+                raw.get("semantic_node_id")
+            ),
+            "semantic_substep_id": _safe_primitive_text(
+                raw.get("semantic_substep_id")
+            ),
+            "strategy_attempt_id": _safe_primitive_text(
+                raw.get("strategy_attempt_id")
+            ),
+            "operation_id": _safe_primitive_text(raw.get("operation_id")),
+            "tool_attempt_id": _safe_primitive_text(
+                raw.get("tool_attempt_id")
+            ),
+            "application_identity": _safe_primitive_text(
+                raw.get("application_identity")
+            ),
+            "surface_ref": _safe_primitive_text(raw.get("surface_ref")),
+            "native_window_id": _safe_primitive_text(
+                raw.get("native_window_id")
+            ),
+            "window_generation": _safe_primitive_text(
+                raw.get("window_generation")
+            ),
+            "runtime_identity": _safe_primitive_text(
+                raw.get("runtime_identity")
+            ),
+            "automation_id": _safe_primitive_text(raw.get("automation_id")),
+            "uia_pattern": _safe_primitive_text(raw.get("uia_pattern")),
+            "attempted_effect": _safe_primitive_text(
+                raw.get("attempted_effect")
+            ),
+            "semantic_postcondition": _safe_primitive_text(
+                raw.get("semantic_postcondition")
+            ),
+            "primitive_receipt_id": _safe_primitive_text(
+                raw.get("primitive_receipt_id")
+            ),
+            "dispatch_state": _safe_primitive_text(
+                raw.get("dispatch_state")
+            ),
+            "outcome": _safe_primitive_text(raw.get("outcome")),
+            "reason_code": _safe_reason(raw.get("reason_code")),
+            "failure_domain": _safe_reason(raw.get("failure_domain")),
+            "failure_class": _safe_reason(raw.get("failure_class")),
+            "stale_reason": _safe_reason(raw.get("stale_reason")),
+            "dispatch_preflight_result": _safe_reason(
+                raw.get("dispatch_preflight_result")
+            ),
+            "failed_before_effect_reason": _safe_reason(
+                raw.get("failed_before_effect_reason")
+            ),
+            "stale_rebind_status": _safe_reason(
+                raw.get("stale_rebind_status")
+            ),
+            "selected_pattern_available": (
+                raw.get("selected_pattern_available") is True
+            ),
+            "candidate_applicable": raw.get("candidate_applicable") is True,
+            "lifecycle": lifecycle,
+            "effect_classification": effect_class,
+            **timestamps,
+        }
+        try:
+            entry["batch_index"] = max(0, int(raw.get("batch_index") or 0))
+            entry["batch_size"] = max(0, int(raw.get("batch_size") or 0))
+        except (TypeError, ValueError, OverflowError):
+            entry["batch_index"] = 0
+            entry["batch_size"] = 0
+        if entry["primitive_id"]:
+            entries.append(entry)
+        if len(entries) >= 32:
+            break
+    return entries
+
+
+def _safe_semantic_settle_receipts(
+    value: Any, *, max_checks: int,
+) -> list[dict[str, Any]]:
+    receipts = []
+    seen_slots: set[int] = set()
+    for raw in (value if isinstance(value, list) else []):
+        if not isinstance(raw, Mapping):
+            continue
+        classification = str(raw.get("result_classification") or "")
+        if classification not in _SEMANTIC_SETTLE_PROBE_CLASSIFICATIONS:
+            continue
+        try:
+            slot_index = int(raw.get("slot_index") or 0)
+            started_at = max(
+                0.0, float(raw.get("observation_started_at") or 0.0),
+            )
+            completed_at = max(
+                0.0, float(raw.get("observation_completed_at") or 0.0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if (
+            not 1 <= slot_index <= max_checks
+            or slot_index in seen_slots
+            or not started_at
+        ):
+            continue
+        probe_invoked = raw.get("probe_invoked") is True
+        if (
+            classification in {
+                "completed_match", "completed_nonmatch",
+                "completed_inconclusive",
+            }
+            and (not probe_invoked or not completed_at)
+        ):
+            classification = "probe_failed"
+            completed_at = 0.0
+        evidence_ref = str(raw.get("evidence_ref") or "")
+        if evidence_ref and not re.fullmatch(r"sha256:[0-9a-f]{64}", evidence_ref):
+            evidence_ref = ""
+        exact_match = (
+            True
+            if classification == "completed_match" else
+            False
+            if classification == "completed_nonmatch" else
+            None
+        )
+        receipts.append({
+            "schema_version": 1,
+            "checkpoint_id": _safe_primitive_text(raw.get("checkpoint_id")),
+            "semantic_attempt_id": _safe_primitive_text(
+                raw.get("semantic_attempt_id")
+            ),
+            "semantic_substep_id": _safe_primitive_text(
+                raw.get("semantic_substep_id")
+            ),
+            "slot_index": slot_index,
+            "observer_mechanism": _safe_reason(raw.get("observer_mechanism")),
+            "probe_invoked": probe_invoked,
+            "observation_started_at": started_at,
+            "observation_completed_at": completed_at,
+            "target_application": _safe_primitive_text(
+                raw.get("target_application")
+            ),
+            "surface_ref": _safe_primitive_text(raw.get("surface_ref")),
+            "native_window_id": _safe_primitive_text(
+                raw.get("native_window_id")
+            ),
+            "window_generation": _safe_primitive_text(
+                raw.get("window_generation")
+            ),
+            "result_classification": classification,
+            "exact_postcondition_match": exact_match,
+            "reason_code": _safe_reason(raw.get("reason_code")),
+            "evidence_ref": evidence_ref,
+        })
+        seen_slots.add(slot_index)
+        if len(receipts) >= max_checks:
+            break
+    receipts.sort(key=lambda item: int(item["slot_index"]))
+    return receipts
+
+
+def _safe_semantic_settle(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    state = str(source.get("state") or "inactive")
+    if state not in _SEMANTIC_SETTLE_STATES:
+        state = "aborted"
+    try:
+        max_checks = max(1, min(
+            32,
+            int(
+                source.get("max_local_checks")
+                or _LEGACY_SEMANTIC_SETTLE_CHECKS
+            ),
+        ))
+    except (TypeError, ValueError, OverflowError):
+        max_checks = _LEGACY_SEMANTIC_SETTLE_CHECKS
+    probe_delays = []
+    for raw_delay in source.get("probe_delays_seconds") or ():
+        try:
+            delay = max(0.0, min(120.0, float(raw_delay)))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        probe_delays.append(delay)
+        if len(probe_delays) >= max_checks:
+            break
+    if not probe_delays:
+        probe_delays = [
+            _LEGACY_SEMANTIC_SETTLE_INTERVAL_SECONDS
+        ] * max_checks
+    elif len(probe_delays) < max_checks:
+        probe_delays.extend([probe_delays[-1]] * (max_checks - len(probe_delays)))
+    receipts = _safe_semantic_settle_receipts(
+        source.get("observation_receipts"), max_checks=max_checks,
+    )
+    try:
+        slot_count = max(0, min(
+            max_checks,
+            int(
+                source.get("settle_slot_count")
+                if source.get("settle_slot_count") is not None
+                else source.get("local_check_count") or 0
+            ),
+        ))
+        probe_attempt_count = max(0, min(
+            slot_count,
+            int(source.get("probe_attempt_count") or 0),
+        ))
+        completed_observation_count = max(0, min(
+            probe_attempt_count,
+            int(source.get("completed_observation_count") or 0),
+        ))
+        provider_checks = max(0, int(source.get("provider_check_count") or 0))
+        started_at = max(0.0, float(source.get("started_at") or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        state = "aborted"
+        slot_count = 0
+        probe_attempt_count = 0
+        completed_observation_count = 0
+        provider_checks = 0
+        started_at = 0.0
+    if receipts:
+        slot_count = max(
+            slot_count,
+            max(int(item["slot_index"]) for item in receipts),
+        )
+        probe_attempt_count = max(
+            probe_attempt_count,
+            sum(item["probe_invoked"] is True for item in receipts),
+        )
+        completed_observation_count = max(
+            completed_observation_count,
+            sum(
+                item["result_classification"] in {
+                    "completed_match", "completed_nonmatch",
+                    "completed_inconclusive",
+                }
+                for item in receipts
+            ),
+        )
+    check_times = []
+    for item in source.get("local_check_times") or ():
+        try:
+            timestamp = max(0.0, float(item))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if timestamp:
+            check_times.append(timestamp)
+        if len(check_times) >= max_checks:
+            break
+    return {
+        "schema_version": 2,
+        "checkpoint_id": _safe_primitive_text(source.get("checkpoint_id")),
+        "state": state,
+        "max_local_checks": max_checks,
+        "interval_seconds": probe_delays[0],
+        "probe_delays_seconds": probe_delays,
+        "settle_slot_count": slot_count,
+        "probe_attempt_count": probe_attempt_count,
+        "completed_observation_count": completed_observation_count,
+        # Compatibility aliases.  They describe bounded sleep slots, not proof
+        # that a valid observation completed; use the typed counters above.
+        "local_check_count": slot_count,
+        "provider_check_count": provider_checks,
+        "started_at": started_at,
+        "local_check_times": check_times,
+        "observation_receipts": receipts,
+    }
+
+
+def _safe_semantic_batch_record(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    state = str(source.get("state") or "inactive")
+    if state not in {
+        "inactive", "prepared", "dispatching", "checkpoint_pending",
+        "verified", "stopped", "resume_ready", "outcome_unknown",
+    }:
+        state = "outcome_unknown"
+    primitive_ids = [
+        safe for item in (source.get("primitive_ids") or [])[:32]
+        if (safe := _safe_primitive_text(item))
+    ]
+    partial_batch_state = str(source.get("partial_batch_state") or "")
+    if partial_batch_state not in {
+        "", "completed_batch", "partial_prefix_dispatched",
+        "ambiguous_in_batch", "failed_before_any_effect",
+    }:
+        partial_batch_state = "ambiguous_in_batch"
+    try:
+        checkpoint_count = max(0, min(1, int(
+            source.get("semantic_checkpoint_count") or 0
+        )))
+        dispatched_count = max(0, min(
+            len(primitive_ids), int(source.get("dispatched_count") or 0),
+        ))
+        completed_count = max(0, min(
+            dispatched_count, int(source.get("completed_dispatch_count") or 0),
+        ))
+        resume_from = source.get("resume_from_index")
+        resume_from = (
+            None if resume_from is None else
+            max(0, min(len(primitive_ids), int(resume_from)))
+        )
+        rejected_index = source.get("rejected_primitive_index")
+        rejected_index = (
+            None if rejected_index is None or not primitive_ids else
+            max(0, min(len(primitive_ids) - 1, int(rejected_index)))
+        )
+        checkpoint_prefix_length = max(0, min(
+            len(primitive_ids), int(source.get("checkpoint_prefix_length") or 0),
+        ))
+    except (TypeError, ValueError, OverflowError):
+        state = "outcome_unknown"
+        checkpoint_count = 0
+        dispatched_count = 0
+        completed_count = 0
+        resume_from = None
+        rejected_index = None
+        checkpoint_prefix_length = 0
+    return {
+        "schema_version": 1,
+        "semantic_batch_id": _safe_primitive_text(
+            source.get("semantic_batch_id")
+        ),
+        "state": state,
+        "partial_batch_state": partial_batch_state,
+        "semantic_checkpoint_count": checkpoint_count,
+        "primitive_ids": primitive_ids,
+        "dispatched_count": dispatched_count,
+        "completed_dispatch_count": completed_count,
+        "stop_reason": _safe_reason(source.get("stop_reason")),
+        "resume_from_index": resume_from,
+        "rejected_primitive_index": rejected_index,
+        "rejected_primitive_id": _safe_primitive_text(
+            source.get("rejected_primitive_id")
+        ),
+        "rejected_receipt_id": _safe_primitive_text(
+            source.get("rejected_receipt_id")
+        ),
+        "rejection_reason": _safe_reason(source.get("rejection_reason")),
+        "checkpoint_id": _safe_primitive_text(source.get("checkpoint_id")),
+        "checkpoint_prefix_length": checkpoint_prefix_length,
+        "checkpoint_postcondition": _safe_primitive_text(
+            source.get("checkpoint_postcondition")
+        ),
+    }
+
+
+def _semantic_settle_active(record: Mapping[str, Any]) -> bool:
+    settle = _safe_semantic_settle(record.get("semantic_settle"))
+    return bool(
+        settle["state"] == "active"
+        and settle["checkpoint_id"]
+        and settle["settle_slot_count"] < settle["max_local_checks"]
+    )
+
+
+def _semantic_settle_configuration(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    truth = record.get("action_truth")
+    truth = truth if isinstance(truth, Mapping) else {}
+    policy = truth.get("settle_policy")
+    policy = policy if isinstance(policy, Mapping) else {}
+    try:
+        max_checks = max(1, min(
+            32,
+            int(policy.get("max_probes") or _LEGACY_SEMANTIC_SETTLE_CHECKS),
+        ))
+    except (TypeError, ValueError, OverflowError):
+        max_checks = _LEGACY_SEMANTIC_SETTLE_CHECKS
+    delays = policy.get("probe_delays_seconds")
+    return {
+        "max_local_checks": max_checks,
+        "probe_delays_seconds": (
+            list(delays)[:max_checks]
+            if isinstance(delays, (list, tuple)) else []
+        ),
+    }
+
+
+def _semantic_dispatch_started(record: Mapping[str, Any]) -> bool:
+    return any(
+        item.get("effect_role") == "semantic"
+        and item.get("lifecycle") in {
+            "dispatch_started", "dispatch_returned", "receipt_bound",
+            "verified", "unknown",
+        }
+        for item in _safe_primitive_journal(record.get("primitive_journal"))
+    )
+
+
+def _any_primitive_dispatch_started(record: Mapping[str, Any]) -> bool:
+    return any(
+        item.get("lifecycle") in {
+            "dispatch_started", "dispatch_returned", "receipt_bound",
+            "verified", "unknown",
+        }
+        for item in _safe_primitive_journal(record.get("primitive_journal"))
+    )
 
 
 def _safe_turn_context(value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -276,6 +866,93 @@ def _safe_browser_state(value: Mapping[str, Any] | None) -> dict[str, Any] | Non
     if isinstance(created_at, (int, float)) and not isinstance(created_at, bool):
         result["created_at"] = float(created_at)
     return result
+
+
+def _safe_provider_references(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, str] = {}
+    for key in _PROVIDER_REFERENCE_KEYS:
+        text = _safe_primitive_text(value.get(key), maximum=256)
+        if text:
+            result[key] = text
+    return result
+
+
+def _safe_identity_receipts(value: Any, *, maximum: int = 128) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    result = []
+    seen = set()
+    for raw in value[-maximum:]:
+        if not isinstance(raw, Mapping):
+            continue
+        receipt_id = _safe_primitive_text(raw.get("receipt_id"), maximum=256)
+        if not receipt_id or receipt_id in seen:
+            continue
+        seen.add(receipt_id)
+        try:
+            received_at = max(0.0, float(raw.get("received_at") or 0.0))
+        except (TypeError, ValueError, OverflowError):
+            received_at = 0.0
+        result.append({
+            "receipt_id": receipt_id,
+            "classification": _safe_reason(raw.get("classification")),
+            "reason_code": _safe_reason(raw.get("reason_code")),
+            "failure_domain": _safe_reason(raw.get("failure_domain")),
+            "execution_epoch": _safe_primitive_text(
+                raw.get("execution_epoch"), maximum=256,
+            ),
+            "target_generation": _safe_primitive_text(
+                raw.get("target_generation"), maximum=256,
+            ),
+            "stale": raw.get("stale") is True,
+            "received_at": received_at,
+        })
+    return result
+
+
+def _action_outbox_event(record: Mapping[str, Any]) -> dict | None:
+    truth = record.get("action_truth")
+    if not isinstance(truth, Mapping) or not truth.get("action_id"):
+        return None
+    timeline = truth.get("timeline")
+    latest = timeline[-1] if isinstance(timeline, list) and timeline else {}
+    if not isinstance(latest, Mapping):
+        latest = {}
+    material = "\0".join((
+        str(record.get("tool_attempt_id") or ""),
+        str(truth.get("action_id") or ""),
+        str(latest.get("state") or truth.get("current_state") or ""),
+        str(latest.get("reason_code") or truth.get("current_reason") or ""),
+        str(latest.get("occurred_at") or record.get("updated_at") or ""),
+        str(len(timeline) if isinstance(timeline, list) else 0),
+    ))
+    event_id = "action_event_" + hashlib.sha256(
+        material.encode("utf-8", errors="replace")
+    ).hexdigest()[:40]
+    try:
+        created_at = max(
+            0.0,
+            float(latest.get("occurred_at") or record.get("updated_at") or 0.0),
+        )
+    except (TypeError, ValueError, OverflowError):
+        created_at = 0.0
+    return {
+        "event_id": event_id,
+        "action_id": str(truth.get("action_id") or ""),
+        "semantic_effect_id": str(truth.get("semantic_effect_id") or ""),
+        "attempt_id": str(record.get("tool_attempt_id") or ""),
+        "execution_epoch": str(record.get("execution_epoch") or ""),
+        "state": str(truth.get("current_state") or ""),
+        "effect_truth": str(truth.get("effect_truth") or ""),
+        "effect_class": str(truth.get("effect_class") or ""),
+        "reconciliation_status": str(
+            truth.get("reconciliation_status") or ""
+        ),
+        "reason_code": str(truth.get("current_reason") or "")[:96],
+        "created_at": created_at,
+    }
 
 
 def _safe_persistence_contract(value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -334,6 +1011,8 @@ class ToolAttemptStore:
         self.attempts_dir = self.root / "attempts"
         self.barriers_dir = self.root / "barriers"
         self._lock = threading.RLock()
+        self._lock_state = threading.local()
+        self._publish_transport_events = root is None
 
     def _ensure_dirs(self) -> None:
         self.attempts_dir.mkdir(parents=True, exist_ok=True)
@@ -357,9 +1036,20 @@ class ToolAttemptStore:
                 import fcntl
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            self._lock_state.depth = int(
+                getattr(self._lock_state, "depth", 0)
+            ) + 1
             try:
                 yield
             finally:
+                depth = int(getattr(self._lock_state, "depth", 1)) - 1
+                if depth > 0:
+                    self._lock_state.depth = depth
+                else:
+                    try:
+                        del self._lock_state.depth
+                    except AttributeError:
+                        pass
                 handle.seek(0)
                 if os.name == "nt":
                     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
@@ -367,14 +1057,222 @@ class ToolAttemptStore:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
-    def _write_atomic(path: Path, value: Mapping[str, Any]) -> None:
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    def _diagnostic_file_state(path: Path, *, validate_json: bool) -> dict:
+        state: dict[str, Any] = {
+            "exists": False,
+            "size": None,
+            "mode": None,
+            "file_attributes": None,
+            "readable": False,
+            "json_valid": None,
+            "open_errno": None,
+            "open_winerror": None,
+        }
+        try:
+            stat_result = path.stat()
+            state.update({
+                "exists": True,
+                "size": int(stat_result.st_size),
+                "mode": int(stat_result.st_mode),
+                "file_attributes": getattr(
+                    stat_result, "st_file_attributes", None,
+                ),
+            })
+            with path.open("rb") as handle:
+                if validate_json:
+                    json.load(handle)
+                else:
+                    handle.read(1)
+            state["readable"] = True
+            if validate_json:
+                state["json_valid"] = True
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            state["open_errno"] = getattr(exc, "errno", None)
+            state["open_winerror"] = getattr(exc, "winerror", None)
+            if validate_json:
+                state["json_valid"] = False
+        return state
+
+    def _replace_failure_diagnostic(
+        self,
+        *,
+        operation_id: str,
+        path: Path,
+        tmp: Path,
+        error: OSError,
+        closed_at: float,
+    ) -> dict:
+        normalized_path = os.path.normcase(str(path.resolve(strict=False)))
+        lock_path = self.root / ".store.lock"
+        lock_owned = getattr(self._lock, "_is_owned", None)
+        lock_depth = int(getattr(self._lock_state, "depth", 0))
+        path_kind = (
+            "attempts" if path.parent == self.attempts_dir else
+            "barriers" if path.parent == self.barriers_dir else
+            "store"
+        )
+        return {
+            "operation_id": operation_id,
+            "path_hash": hashlib.sha256(
+                normalized_path.encode("utf-8", errors="replace")
+            ).hexdigest(),
+            "path_kind": path_kind,
+            "timestamp_unix": time.time(),
+            "elapsed_since_close_ms": round(
+                max(0.0, time.perf_counter() - closed_at) * 1000.0, 3,
+            ),
+            "pid": os.getpid(),
+            "thread_id": threading.get_ident(),
+            "thread_lock_depth": lock_depth,
+            "thread_lock_owned": bool(lock_owned()) if lock_owned else None,
+            "interprocess_lock_file_exists": lock_path.exists(),
+            "interprocess_lock_held_by_thread": lock_depth > 0,
+            "errno": getattr(error, "errno", None),
+            "winerror": getattr(error, "winerror", None),
+            "temporary": self._diagnostic_file_state(
+                tmp, validate_json=True,
+            ),
+            "destination": self._diagnostic_file_state(
+                path, validate_json=False,
+            ),
+            "cleanup_policy": "delete_temporary_in_finally",
+        }
+
+    @staticmethod
+    def _prepare_action_outbox(value: Mapping[str, Any]) -> None:
+        if not isinstance(value, dict) or not value.get("tool_attempt_id"):
+            return
+        status = str(value.get("status") or "")
+        if status in {
+            ToolAttemptStatus.CANCELLATION_REQUESTED.value,
+            ToolAttemptStatus.CANCELLED_PROVEN.value,
+        }:
+            value["authority_state"] = "cancelled"
+            value["tombstoned_at"] = value.get("tombstoned_at") or _now()
+        elif status in {item.value for item in TERMINAL_STATUSES}:
+            if value.get("authority_state") not in {"cancelled", "superseded"}:
+                value["authority_state"] = "terminal"
+            value["tombstoned_at"] = value.get("tombstoned_at") or _now()
+        event = _action_outbox_event(value)
+        if event is None:
+            return
+        existing = value.get("action_outbox")
+        outbox = [
+            dict(item) for item in existing[-128:]
+            if isinstance(item, Mapping) and item.get("event_id")
+        ] if isinstance(existing, list) else []
+        if not any(item.get("event_id") == event["event_id"] for item in outbox):
+            outbox.append(event)
+        value["action_outbox"] = outbox[-128:]
+
+    def _publish_action_outbox(self, value: Mapping[str, Any]) -> None:
+        if not self._publish_transport_events:
+            return
+        from osia.durable_transport import get_durable_transport_store
+
+        transport = get_durable_transport_store()
+        attempt_id = str(value.get("tool_attempt_id") or "")
+        conversation_id = str(value.get("conversation_id") or "")
+        turn_id = str(value.get("turn_id") or "")
+        request_id = str(value.get("request_id") or "") or (
+            "request_" + hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:32]
+        )
+        run_id = str(value.get("autonomous_run_id") or turn_id)
+        if not all((attempt_id, conversation_id, turn_id, request_id, run_id)):
+            return
+        for event in value.get("action_outbox") or []:
+            if not isinstance(event, Mapping) or not event.get("event_id"):
+                continue
+            state = str(event.get("state") or "")
+            failure_domain = ""
+            if state == ActionState.OBSERVER_FAILED.value:
+                failure_domain = "observer_failure"
+            elif state == ActionState.TARGET_STALE.value:
+                failure_domain = "stale_target"
+            elif str(event.get("effect_truth") or "") in {"possible", "observed"}:
+                failure_domain = "semantic_effect_uncertainty"
+            elif state in {
+                ActionState.PRECONDITION_FAILED.value,
+                ActionState.FAILED_BEFORE_EFFECT.value,
+            }:
+                failure_domain = "semantic_precondition_failure"
+            transport.append_event(
+                conversation_id=conversation_id,
+                request_id=request_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                event_type="action_truth_changed",
+                payload={
+                    "action_state": state,
+                    "effect_truth": str(event.get("effect_truth") or ""),
+                    "effect_class": str(event.get("effect_class") or ""),
+                    "reconciliation_status": str(
+                        event.get("reconciliation_status") or ""
+                    ),
+                    "reason_code": str(event.get("reason_code") or ""),
+                    "failure_domain": failure_domain,
+                    "action_execution_epoch": str(
+                        event.get("execution_epoch") or ""
+                    ),
+                },
+                action_id=str(event.get("action_id") or ""),
+                attempt_id=attempt_id,
+                semantic_effect_id=str(event.get("semantic_effect_id") or ""),
+                idempotency_key=str(event.get("event_id") or ""),
+                state_updates={
+                    "action_state": state,
+                    "effect_truth": str(event.get("effect_truth") or ""),
+                },
+            )
+
+    def _write_atomic(self, path: Path, value: Mapping[str, Any]) -> None:
+        self._prepare_action_outbox(value)
+        operation_id = "atomic_replace_" + uuid.uuid4().hex
+        tmp = path.with_name(
+            f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
         try:
             with tmp.open("w", encoding="utf-8", newline="\n") as handle:
                 json.dump(value, handle, ensure_ascii=False, sort_keys=True, indent=2)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp, path)
+            closed_at = time.perf_counter()
+            try:
+                os.replace(tmp, path)
+            except OSError as exc:
+                try:
+                    diagnostic = self._replace_failure_diagnostic(
+                        operation_id=operation_id,
+                        path=path,
+                        tmp=tmp,
+                        error=exc,
+                        closed_at=closed_at,
+                    )
+                except Exception as diagnostic_error:
+                    # Diagnostic collection must never mask the durable write
+                    # failure it is meant to classify.
+                    diagnostic = {
+                        "operation_id": operation_id,
+                        "timestamp_unix": time.time(),
+                        "pid": os.getpid(),
+                        "thread_id": threading.get_ident(),
+                        "errno": getattr(exc, "errno", None),
+                        "winerror": getattr(exc, "winerror", None),
+                        "diagnostic_error": type(diagnostic_error).__name__,
+                    }
+                try:
+                    setattr(exc, "osia_durable_diagnostic", diagnostic)
+                except (AttributeError, TypeError):
+                    pass
+                try:
+                    print(
+                        "[OSIA Durable Store] atomic_replace_failure "
+                        + json.dumps(diagnostic, sort_keys=True),
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
+                raise
             if os.name != "nt":
                 try:
                     directory_fd = os.open(path.parent, os.O_RDONLY)
@@ -384,6 +1282,12 @@ class ToolAttemptStore:
                         os.close(directory_fd)
                 except OSError:
                     pass
+            try:
+                self._publish_action_outbox(value)
+            except Exception:
+                # The embedded outbox is already durable in the canonical
+                # attempt file; startup/live drains can publish it later.
+                pass
         finally:
             try:
                 tmp.unlink(missing_ok=True)
@@ -475,7 +1379,28 @@ class ToolAttemptStore:
             record[field] = value
         record.setdefault("continuation_claimed_at", None)
         record.setdefault("continuation_claimed_pid", None)
+        record.setdefault("continuation_claimed_process_identity", None)
+        continuation_identity = record.get(
+            "continuation_claimed_process_identity"
+        )
+        if continuation_identity is not None and (
+            not isinstance(continuation_identity, str)
+            or len(continuation_identity) > 192
+            or any(ord(char) < 32 for char in continuation_identity)
+        ):
+            raise CorruptAttemptError("invalid_continuation_process_identity")
         record.setdefault("reconciliation_claimed_pid", None)
+        record.setdefault("owner_dispatch_boundary_armed_at", None)
+        record.setdefault("owner_dispatch_claimed_at", None)
+        record.setdefault(
+            "owner_dispatch_timed_out_after_claim",
+            bool(
+                record.get("owner_dispatch_claimed_at")
+                and record.get("dispatch_state") == "worker_may_be_active"
+            ),
+        )
+        if type(record["owner_dispatch_timed_out_after_claim"]) is not bool:
+            raise CorruptAttemptError("invalid_owner_dispatch_timeout_state")
         policy = _safe_persistence_contract(record.get("persistence_contract"))
         record["persistence_contract"] = policy
         hard_deadline = record.get("hard_deadline_at", record.get("deadline_at"))
@@ -526,6 +1451,66 @@ class ToolAttemptStore:
             if candidate not in safe_attempted:
                 safe_attempted.append(candidate)
         record["attempted_safe_alternatives"] = safe_attempted
+        record["primitive_journal"] = _safe_primitive_journal(
+            record.get("primitive_journal")
+        )
+        record["semantic_settle"] = _safe_semantic_settle(
+            record.get("semantic_settle")
+        )
+        record["semantic_batch"] = _safe_semantic_batch_record(
+            record.get("semantic_batch")
+        )
+        record["action_truth"] = normalize_action_truth(
+            record.get("action_truth"), legacy_record=record,
+        )
+        execution_epoch = _safe_primitive_text(
+            record.get("execution_epoch"), maximum=256,
+        )
+        if not execution_epoch:
+            execution_epoch = "attempt_epoch_legacy_" + hashlib.sha256(
+                str(record.get("tool_attempt_id") or "legacy").encode("utf-8")
+            ).hexdigest()[:32]
+        record["execution_epoch"] = execution_epoch
+        authority_state = str(record.get("authority_state") or "")
+        if status in {
+            ToolAttemptStatus.CANCELLATION_REQUESTED,
+            ToolAttemptStatus.CANCELLED_PROVEN,
+        }:
+            authority_state = "cancelled"
+        elif status in TERMINAL_STATUSES and authority_state not in {
+            "cancelled", "superseded",
+        }:
+            authority_state = "terminal"
+        elif authority_state not in _ATTEMPT_AUTHORITY_STATES:
+            authority_state = "active"
+        record["authority_state"] = authority_state
+        try:
+            tombstoned_at = float(record.get("tombstoned_at") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            tombstoned_at = 0.0
+        record["tombstoned_at"] = tombstoned_at or None
+        refs = _safe_provider_references(record.get("provider_references"))
+        if not refs and record.get("tool_call_id"):
+            refs["tool_call_id"] = str(record["tool_call_id"])
+        record["provider_references"] = refs
+        callbacks = record.get("processed_provider_callbacks")
+        record["processed_provider_callbacks"] = [
+            item for raw in (callbacks if isinstance(callbacks, list) else [])[-128:]
+            if (item := _safe_primitive_text(raw, maximum=256))
+        ]
+        record["observer_receipts"] = _safe_identity_receipts(
+            record.get("observer_receipts")
+        )
+        history = record.get("continuation_history")
+        record["continuation_history"] = _safe_identity_receipts(
+            history, maximum=64,
+        )
+        outbox = record.get("action_outbox")
+        record["action_outbox"] = [
+            dict(item) for item in (outbox if isinstance(outbox, list) else [])[-128:]
+            if isinstance(item, Mapping)
+            and _safe_primitive_text(item.get("event_id"), maximum=256)
+        ]
         return dict(record)
 
     def _read_unlocked(self, attempt_id: str) -> dict[str, Any]:
@@ -584,6 +1569,9 @@ class ToolAttemptStore:
         operation_revision: int = 0,
         permission_epoch: int = 0,
         persistence_contract: Mapping[str, Any] | None = None,
+        primitive_binding: Mapping[str, Any] | None = None,
+        action_binding: Mapping[str, Any] | None = None,
+        provider_references: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         conversation_id = _safe_token(conversation_id, field="conversation_id")
         turn_id = _safe_token(turn_id, field="turn_id")
@@ -630,6 +1618,134 @@ class ToolAttemptStore:
             now + persistence["inactivity_timeout_seconds"],
         )
         attempt_id = "attempt_" + secrets.token_urlsafe(24)
+        action_source = (
+            dict(action_binding) if isinstance(action_binding, Mapping) else {}
+        )
+        idempotency_identity = str(
+            action_source.get("idempotency_identity")
+            or remote_operation_key
+            or ""
+        )
+        effect_class = canonical_effect_class(
+            side_effect,
+            idempotence,
+            idempotency_identity=idempotency_identity,
+        )
+        action_target = action_source.get("target")
+        action_target = (
+            dict(action_target) if isinstance(action_target, Mapping) else {}
+        )
+        semantic_effect_id = str(
+            action_source.get("semantic_effect_id") or ""
+        ) or semantic_effect_identity(
+            turn_id=turn_id,
+            semantic_node_id=str(action_source.get("semantic_node_id") or ""),
+            attempted_effect=str(action_source.get("attempted_effect") or ""),
+            operation=str(action_source.get("operation") or tool_name),
+            target=action_target,
+            equivalence_fingerprint=equivalence_fingerprint,
+            argument_fingerprint=argument_fingerprint,
+        )
+        durable_action_id = str(action_source.get("action_id") or "") or action_identity(
+            run_id=autonomous_run_id or turn_id,
+            turn_id=turn_id,
+            semantic_effect_id=semantic_effect_id,
+        )
+        action_truth = new_action_truth(
+            action_id=durable_action_id,
+            semantic_effect_id=semantic_effect_id,
+            effect_class=effect_class,
+            operation=str(action_source.get("operation") or tool_name),
+            target=action_target,
+            goal_contract_ref=str(action_source.get("goal_contract_ref") or ""),
+            semantic_node_id=str(action_source.get("semantic_node_id") or ""),
+            attempted_effect=str(action_source.get("attempted_effect") or ""),
+            idempotency_identity=idempotency_identity,
+            dependencies=(action_source.get("dependencies") or ()),
+            conflict_scope=str(action_source.get("conflict_scope") or ""),
+            expected_postcondition_ref=str(
+                action_source.get("expected_postcondition_ref") or ""
+            ),
+            effect_role=str(action_source.get("effect_role") or "semantic"),
+            settle_policy=settle_policy_for(
+                operation=str(action_source.get("operation") or tool_name),
+                family=str(persistence.get("family") or "generic"),
+                effect_class=effect_class,
+                effect_role=str(
+                    action_source.get("effect_role") or "semantic"
+                ),
+            ),
+            occurred_at=now,
+        )
+        safe_provider_references = _safe_provider_references(
+            provider_references
+        )
+        provider_operation_ref = next((
+            safe_provider_references.get(key)
+            for key in _PROVIDER_OPERATION_REFERENCE_PRIORITY
+            if safe_provider_references.get(key)
+        ), "")
+        if provider_operation_ref:
+            action_truth["provider_operation_ref"] = provider_operation_ref
+        primitive_journal = []
+        semantic_batch_record = _safe_semantic_batch_record(None)
+        if isinstance(primitive_binding, Mapping):
+            supplied_batch = primitive_binding.get("batch_primitives")
+            bindings = (
+                list(supplied_batch)[:32]
+                if isinstance(supplied_batch, list) else [primitive_binding]
+            )
+            batch_id = _safe_primitive_text(
+                primitive_binding.get("semantic_batch_id")
+            )
+            prepared_entries = []
+            for index, binding in enumerate(bindings):
+                if not isinstance(binding, Mapping):
+                    continue
+                effect_role = (
+                    "preparatory"
+                    if binding.get("effect_role") == "preparatory"
+                    else "semantic"
+                )
+                material = "|".join((
+                    attempt_id,
+                    str(binding.get("strategy_attempt_id") or ""),
+                    str(binding.get("semantic_substep_id") or ""),
+                    str(binding.get("surface_ref") or ""),
+                    str(index),
+                ))
+                primitive_id = "primitive_" + hashlib.sha256(
+                    material.encode("utf-8", errors="replace")
+                ).hexdigest()[:20]
+                prepared_entries.append({
+                    **dict(binding),
+                    "primitive_id": primitive_id,
+                    "effect_role": effect_role,
+                    "checkpoint_role": (
+                        "intermediate"
+                        if index < len(bindings) - 1 else "final"
+                    ),
+                    "semantic_batch_id": batch_id,
+                    "batch_index": index,
+                    "batch_size": len(bindings),
+                    "tool_attempt_id": attempt_id,
+                    "run_id": autonomous_run_id,
+                    "task_id": autonomous_task_id,
+                    "operation_id": autonomous_operation_id,
+                    "lifecycle": "prepared",
+                    "effect_classification": "impossible",
+                    "prepared_at": now,
+                })
+            primitive_journal = _safe_primitive_journal(prepared_entries)
+            if batch_id and len(primitive_journal) >= 2:
+                semantic_batch_record = _safe_semantic_batch_record({
+                    "semantic_batch_id": batch_id,
+                    "state": "prepared",
+                    "semantic_checkpoint_count": 1,
+                    "primitive_ids": [
+                        item["primitive_id"] for item in primitive_journal
+                    ],
+                })
         record = {
             "schema_version": SCHEMA_VERSION,
             "tool_attempt_id": attempt_id,
@@ -669,6 +1785,9 @@ class ToolAttemptStore:
             "postcondition_type": _safe_reason(postcondition_type),
             "browser_state_ref": _safe_browser_state(browser_state_ref),
             "dispatch_state": "not_dispatched",
+            "owner_dispatch_boundary_armed_at": None,
+            "owner_dispatch_claimed_at": None,
+            "owner_dispatch_timed_out_after_claim": False,
             "terminal_outcome": "",
             "reason_code": "",
             "repair_count": repair_count,
@@ -683,6 +1802,7 @@ class ToolAttemptStore:
             "continuation_state": "not_claimed",
             "continuation_claimed_at": None,
             "continuation_claimed_pid": None,
+            "continuation_claimed_process_identity": None,
             "reconciliation_claim": "",
             "reconciliation_claimed_at": None,
             "reconciliation_claimed_pid": None,
@@ -692,6 +1812,23 @@ class ToolAttemptStore:
             "autonomous_operation_id": str(autonomous_operation_id or ""),
             "operation_revision": operation_revision,
             "permission_epoch": permission_epoch,
+            "execution_epoch": "attempt_epoch_" + secrets.token_urlsafe(24),
+            "authority_state": "active",
+            "tombstoned_at": None,
+            "provider_references": {
+                **safe_provider_references,
+                "tool_call_id": tool_call_id,
+                **({"idempotency_key": str(remote_operation_key)}
+                   if remote_operation_key else {}),
+            },
+            "processed_provider_callbacks": [],
+            "observer_receipts": [],
+            "continuation_history": [],
+            "action_outbox": [],
+            "primitive_journal": primitive_journal,
+            "semantic_settle": _safe_semantic_settle(None),
+            "semantic_batch": semantic_batch_record,
+            "action_truth": action_truth,
         }
         with self._store_lock():
             if self._active_for_conversation_unlocked(conversation_id) is not None:
@@ -724,6 +1861,12 @@ class ToolAttemptStore:
             record["revision"] = int(record["revision"]) + 1
             if updates:
                 record.update(dict(updates))
+            if (
+                status is ToolAttemptStatus.PENDING
+                and record.get("owner_dispatch_claimed_at")
+                and record.get("dispatch_state") == "worker_may_be_active"
+            ):
+                record["owner_dispatch_timed_out_after_claim"] = True
             self._write_atomic(self._path(attempt_id), record)
             return dict(record)
 
@@ -733,6 +1876,32 @@ class ToolAttemptStore:
             expected_revision=expected_revision,
             updates={"accepted_at": _now()},
         )
+
+    def arm_owner_dispatch_boundary(self, attempt_id: str) -> dict:
+        """Bind an attempt to the guarded owner-dispatch handshake."""
+
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            current = ToolAttemptStatus(record["status"])
+            if current in TERMINAL_STATUSES:
+                return dict(record)
+            if current not in {
+                ToolAttemptStatus.ACCEPTED,
+                ToolAttemptStatus.RUNNING,
+            }:
+                raise IllegalTransition(
+                    f"owner_dispatch_boundary_not_armable:{current.value}"
+                )
+            if record.get("owner_dispatch_boundary_armed_at"):
+                return dict(record)
+            now = _now()
+            record.update({
+                "owner_dispatch_boundary_armed_at": now,
+                "updated_at": now,
+                "revision": int(record["revision"]) + 1,
+            })
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
 
     def mark_running(self, attempt_id: str, *, expected_revision: int | None = None) -> dict:
         # Dispatch and a pre-dispatch cancellation race on this boundary.  Keep
@@ -762,10 +1931,793 @@ class ToolAttemptStore:
                 "status": ToolAttemptStatus.RUNNING.value,
                 "started_at": now,
                 "last_progress_at": now,
-                "dispatch_state": "dispatch_started",
+                # RUNNING means the tool owner/wrapper started.  Semantic OS
+                # dispatch is recorded only by the primitive journal below.
+                "dispatch_state": "owner_started",
                 "updated_at": now,
                 "revision": int(record["revision"]) + 1,
             })
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
+
+    def claim_owner_dispatch(
+        self,
+        attempt_id: str,
+        *,
+        owner_settled: bool = False,
+    ) -> tuple[dict, bool]:
+        """Atomically choose cancellation or the external-call boundary.
+
+        ``RUNNING`` records initially mean only that the local owner/wrapper is
+        active.  This claim is made at the last boundary before the external
+        callable.  If cancellation already won while no primitive dispatch is
+        possible, it is durably proven under the same lock.  Otherwise the
+        boundary records ``dispatch_started`` before allowing the caller to
+        continue, so a later cancellation can never be misreported as a proven
+        pre-dispatch stop.
+        """
+
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            current = ToolAttemptStatus(record["status"])
+            if current is ToolAttemptStatus.CANCELLED_PROVEN:
+                return dict(record), False
+            if current is ToolAttemptStatus.CANCELLATION_REQUESTED:
+                dispatch_impossible = bool(
+                    record.get("owner_dispatch_boundary_armed_at")
+                    and not record.get("owner_dispatch_claimed_at")
+                    and not _any_primitive_dispatch_started(record)
+                    and (
+                        record.get("dispatch_state") in {
+                            "not_dispatched", "owner_started",
+                        }
+                        or owner_settled
+                    )
+                )
+                if dispatch_impossible:
+                    now = _now()
+                    record.update({
+                        "status": ToolAttemptStatus.CANCELLED_PROVEN.value,
+                        "terminal_outcome": "cancelled_proven",
+                        "dispatch_state": "cancelled_before_effect",
+                        "reason_code": (
+                            "cancellation_acknowledged_before_effect"
+                        ),
+                        "completed_at": now,
+                        "next_check_at": None,
+                        "reconciliation_claim": "",
+                        "reconciliation_claimed_at": None,
+                        "reconciliation_claimed_pid": None,
+                        "persistence_state": "terminal",
+                        "terminal_state": "terminal",
+                        "updated_at": now,
+                        "revision": int(record["revision"]) + 1,
+                    })
+                    record["action_truth"] = transition_action_truth(
+                        record["action_truth"],
+                        state=ActionState.CANCELLED,
+                        reason_code="cancellation_acknowledged_before_effect",
+                        occurred_at=now,
+                    )
+                    self._write_atomic(self._path(attempt_id), record)
+                return dict(record), False
+            if (
+                owner_settled
+                or not record.get("owner_dispatch_boundary_armed_at")
+                or current is not ToolAttemptStatus.RUNNING
+                or record.get("dispatch_state") != "owner_started"
+                or _any_primitive_dispatch_started(record)
+            ):
+                return dict(record), False
+            now = _now()
+            record.update({
+                "dispatch_state": "dispatch_started",
+                "owner_dispatch_claimed_at": now,
+                "updated_at": now,
+                "revision": int(record["revision"]) + 1,
+            })
+            # A primitive-bound Desktop action has a narrower semantic dispatch
+            # boundary below.  The owner/wrapper claim must not contaminate its
+            # effect truth (for example, a focus/preparation failure).
+            if not record.get("primitive_journal"):
+                record["action_truth"] = transition_action_truth(
+                    record["action_truth"],
+                    state=ActionState.DISPATCH_STARTED,
+                    reason_code="semantic_dispatch_started",
+                    occurred_at=now,
+                )
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record), True
+
+    @staticmethod
+    def _journal_entry_index(
+        record: Mapping[str, Any], primitive_id: str = "",
+    ) -> int:
+        journal = list(record.get("primitive_journal") or [])
+        if primitive_id:
+            for index in range(len(journal) - 1, -1, -1):
+                if journal[index].get("primitive_id") == primitive_id:
+                    return index
+            return -1
+        return len(journal) - 1
+
+    def record_primitive_dispatch_started(
+        self,
+        attempt_id: str,
+        *,
+        primitive_id: str = "",
+        application_identity: str = "",
+        surface_ref: str = "",
+        native_window_id: str = "",
+        window_generation: str = "",
+        runtime_identity: str = "",
+        automation_id: str = "",
+        uia_pattern: str = "",
+    ) -> dict:
+        """Atomically witness the narrow semantic OS/UIA call boundary."""
+
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            if ToolAttemptStatus(record["status"]) in TERMINAL_STATUSES:
+                return record
+            journal = list(record.get("primitive_journal") or [])
+            index = self._journal_entry_index(record, primitive_id)
+            if index < 0 or journal[index].get("lifecycle") != "prepared":
+                raise IllegalTransition("primitive_dispatch_not_prepared")
+            entry = dict(journal[index])
+            for name, value in (
+                ("application_identity", application_identity),
+                ("surface_ref", surface_ref),
+                ("native_window_id", native_window_id),
+                ("window_generation", window_generation),
+                ("runtime_identity", runtime_identity),
+                ("automation_id", automation_id),
+                ("uia_pattern", uia_pattern),
+            ):
+                safe = _safe_primitive_text(value)
+                if safe:
+                    entry[name] = safe
+            now = _now()
+            semantic_effect = entry.get("effect_role") == "semantic"
+            tracked_action_effect = bool(
+                semantic_effect
+                or (
+                    entry.get("effect_role") == "preparatory"
+                    and (record.get("action_truth") or {}).get("effect_role")
+                    == "preparatory"
+                )
+            )
+            entry.update({
+                "lifecycle": "dispatch_started",
+                "effect_classification": (
+                    "effect_possible" if tracked_action_effect else "impossible"
+                ),
+                "dispatch_started_at": now,
+            })
+            journal[index] = entry
+            record["primitive_journal"] = _safe_primitive_journal(journal)
+            batch = _safe_semantic_batch_record(record.get("semantic_batch"))
+            if batch["state"] != "inactive" and entry.get(
+                "semantic_batch_id"
+            ) == batch["semantic_batch_id"]:
+                batch.update({
+                    "state": "dispatching",
+                    "dispatched_count": max(
+                        batch["dispatched_count"],
+                        int(entry.get("batch_index") or 0) + 1,
+                    ),
+                })
+                record["semantic_batch"] = _safe_semantic_batch_record(batch)
+            if (
+                entry.get("effect_role") == "semantic"
+                and entry.get("checkpoint_role") != "intermediate"
+            ):
+                record["semantic_settle"] = _safe_semantic_settle({
+                    **_semantic_settle_configuration(record),
+                    "checkpoint_id": (
+                        entry.get("semantic_substep_id")
+                        or entry.get("primitive_id")
+                    ),
+                    "state": "active",
+                    "settle_slot_count": 0,
+                    "probe_attempt_count": 0,
+                    "completed_observation_count": 0,
+                    "local_check_count": 0,
+                    "provider_check_count": 0,
+                    "started_at": now,
+                    "local_check_times": [],
+                    "observation_receipts": [],
+                })
+            if tracked_action_effect:
+                record["action_truth"] = transition_action_truth(
+                    record["action_truth"],
+                    state=ActionState.DISPATCH_STARTED,
+                    reason_code="action_primitive_dispatch_started",
+                    evidence={
+                        "evidence_ref": evidence_reference({
+                            "primitive_id": entry.get("primitive_id"),
+                            "semantic_substep_id": entry.get(
+                                "semantic_substep_id"
+                            ),
+                        }),
+                    },
+                    occurred_at=now,
+                )
+            record["revision"] = int(record["revision"]) + 1
+            record["updated_at"] = now
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
+
+    def record_primitive_dispatch_returned(
+        self, attempt_id: str, *, primitive_id: str = "",
+    ) -> dict:
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            if ToolAttemptStatus(record["status"]) in TERMINAL_STATUSES:
+                return record
+            journal = list(record.get("primitive_journal") or [])
+            index = self._journal_entry_index(record, primitive_id)
+            if index < 0 or journal[index].get("lifecycle") not in {
+                "dispatch_started", "dispatch_returned",
+            }:
+                raise IllegalTransition("primitive_dispatch_not_started")
+            entry = dict(journal[index])
+            now = _now()
+            semantic_effect = entry.get("effect_role") == "semantic"
+            tracked_action_effect = bool(
+                semantic_effect
+                or (
+                    entry.get("effect_role") == "preparatory"
+                    and (record.get("action_truth") or {}).get("effect_role")
+                    == "preparatory"
+                )
+            )
+            entry.update({
+                "lifecycle": "dispatch_returned",
+                "effect_classification": (
+                    "effect_possible" if tracked_action_effect else "impossible"
+                ),
+                "dispatch_returned_at": now,
+            })
+            journal[index] = entry
+            record["primitive_journal"] = _safe_primitive_journal(journal)
+            batch = _safe_semantic_batch_record(record.get("semantic_batch"))
+            if batch["state"] != "inactive" and entry.get(
+                "semantic_batch_id"
+            ) == batch["semantic_batch_id"]:
+                batch.update({
+                    "completed_dispatch_count": max(
+                        batch["completed_dispatch_count"],
+                        int(entry.get("batch_index") or 0) + 1,
+                    ),
+                    "state": (
+                        "checkpoint_pending"
+                        if entry.get("checkpoint_role") == "final" else
+                        "dispatching"
+                    ),
+                })
+                record["semantic_batch"] = _safe_semantic_batch_record(batch)
+            if tracked_action_effect:
+                record["action_truth"] = transition_action_truth(
+                    record["action_truth"],
+                    state=ActionState.DISPATCH_RETURNED,
+                    reason_code="action_primitive_dispatch_returned",
+                    occurred_at=now,
+                )
+            record["revision"] = int(record["revision"]) + 1
+            record["updated_at"] = now
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
+
+    def bind_primitive_receipt(
+        self,
+        attempt_id: str,
+        *,
+        primitive_id: str = "",
+        outcome: str = "success_unverified",
+    ) -> dict:
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            if ToolAttemptStatus(record["status"]) in TERMINAL_STATUSES:
+                return record
+            journal = list(record.get("primitive_journal") or [])
+            index = self._journal_entry_index(record, primitive_id)
+            if index < 0 or journal[index].get("lifecycle") not in {
+                "dispatch_started", "dispatch_returned", "receipt_bound",
+            }:
+                raise IllegalTransition("primitive_receipt_without_dispatch")
+            entry = dict(journal[index])
+            now = _now()
+            semantic_effect = entry.get("effect_role") == "semantic"
+            tracked_action_effect = bool(
+                semantic_effect
+                or (
+                    entry.get("effect_role") == "preparatory"
+                    and (record.get("action_truth") or {}).get("effect_role")
+                    == "preparatory"
+                )
+            )
+            entry.update({
+                "lifecycle": "receipt_bound",
+                "effect_classification": (
+                    "unknown" if outcome == "outcome_unknown"
+                    else "effect_possible" if tracked_action_effect else "impossible"
+                ),
+                "receipt_bound_at": now,
+            })
+            journal[index] = entry
+            record["primitive_journal"] = _safe_primitive_journal(journal)
+            if tracked_action_effect:
+                state = (
+                    ActionState.EFFECT_POSSIBLE
+                    if outcome == "outcome_unknown"
+                    else ActionState.DISPATCH_RETURNED
+                )
+                record["action_truth"] = transition_action_truth(
+                    record["action_truth"],
+                    state=state,
+                    reason_code=(
+                        "primitive_receipt_outcome_unknown"
+                        if outcome == "outcome_unknown"
+                        else "action_primitive_receipt_bound"
+                    ),
+                    evidence={
+                        "evidence_ref": evidence_reference({
+                            "primitive_id": entry.get("primitive_id"),
+                            "outcome": outcome,
+                        }),
+                    },
+                    occurred_at=now,
+                )
+            record["revision"] = int(record["revision"]) + 1
+            record["updated_at"] = now
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
+
+    def record_semantic_batch_primitive_receipt(
+        self,
+        attempt_id: str,
+        *,
+        semantic_batch_id: str,
+        batch_index: int,
+        receipt: Mapping[str, Any],
+    ) -> dict:
+        """Persist one typed batch result before the batch is aggregated."""
+
+        if not isinstance(receipt, Mapping):
+            raise TypeError("typed_semantic_batch_primitive_receipt_required")
+        try:
+            item_index = int(batch_index)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise IllegalTransition("semantic_batch_primitive_index_invalid") from exc
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            if ToolAttemptStatus(record["status"]) in TERMINAL_STATUSES:
+                return record
+            batch = _safe_semantic_batch_record(record.get("semantic_batch"))
+            journal = list(record.get("primitive_journal") or [])
+            safe_batch_id = _safe_primitive_text(semantic_batch_id)
+            if (
+                not safe_batch_id
+                or batch["semantic_batch_id"] != safe_batch_id
+                or item_index < 0
+                or item_index >= len(journal)
+                or journal[item_index].get("semantic_batch_id") != safe_batch_id
+            ):
+                raise IllegalTransition("semantic_batch_primitive_identity_mismatch")
+
+            dispatch_state = _safe_primitive_text(
+                receipt.get("dispatch_state")
+            ) or "not_dispatched"
+            outcome = _safe_primitive_text(receipt.get("outcome"))
+            reason_code = _safe_reason(receipt.get("reason_code"))
+            failure_class = _safe_reason(receipt.get("failure_class"))
+            stale_reason = _safe_reason(receipt.get("stale_reason"))
+            actionability = receipt.get("actionability")
+            actionability = (
+                actionability if isinstance(actionability, Mapping) else {}
+            )
+            candidate_identity = actionability.get("candidate_identity")
+            candidate_identity = (
+                candidate_identity
+                if isinstance(candidate_identity, Mapping) else {}
+            )
+            receipt_projection = {
+                "semantic_batch_id": safe_batch_id,
+                "batch_index": item_index,
+                "dispatch_state": dispatch_state,
+                "outcome": outcome,
+                "reason_code": reason_code,
+                "failure_class": failure_class,
+                "stale_reason": stale_reason,
+                "application_identity": _safe_primitive_text(
+                    receipt.get("application_identity")
+                ),
+                "surface_ref": _safe_primitive_text(receipt.get("surface_ref")),
+                "native_window_id": _safe_primitive_text(
+                    receipt.get("native_window_id")
+                ),
+                "window_generation": _safe_primitive_text(
+                    receipt.get("window_generation")
+                ),
+                "runtime_identity": _safe_primitive_text(
+                    receipt.get("runtime_identity")
+                    or candidate_identity.get("runtime_signature")
+                ),
+                "automation_id": _safe_primitive_text(
+                    receipt.get("automation_id")
+                    or actionability.get("automation_id")
+                ),
+                "uia_pattern": _safe_primitive_text(
+                    receipt.get("uia_pattern")
+                    or actionability.get("selected_pattern")
+                ),
+                "structural_epoch": str(receipt.get("structural_epoch") or ""),
+                "dispatch_preflight_result": _safe_reason(
+                    actionability.get("dispatch_preflight_result")
+                ),
+                "failed_before_effect_reason": _safe_reason(
+                    actionability.get("failed_before_effect_reason")
+                ),
+                "stale_rebind_status": _safe_reason(
+                    actionability.get("stale_rebind_status")
+                ),
+                "selected_pattern_available": (
+                    actionability.get("selected_pattern_available") is True
+                ),
+                "candidate_applicable": (
+                    actionability.get("candidate_applicable") is True
+                ),
+            }
+            receipt_id = "receipt_" + hashlib.sha256(
+                json.dumps(
+                    receipt_projection,
+                    sort_keys=True,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("utf-8", errors="replace")
+            ).hexdigest()[:24]
+            entry = dict(journal[item_index])
+            entry.update({
+                "primitive_receipt_id": receipt_id,
+                "dispatch_state": dispatch_state,
+                "outcome": outcome,
+                "reason_code": reason_code,
+                "failure_class": failure_class,
+                "stale_reason": stale_reason,
+                "dispatch_preflight_result": receipt_projection[
+                    "dispatch_preflight_result"
+                ],
+                "failed_before_effect_reason": receipt_projection[
+                    "failed_before_effect_reason"
+                ],
+                "stale_rebind_status": receipt_projection[
+                    "stale_rebind_status"
+                ],
+                "selected_pattern_available": receipt_projection[
+                    "selected_pattern_available"
+                ],
+                "candidate_applicable": receipt_projection[
+                    "candidate_applicable"
+                ],
+            })
+            for identity_field in (
+                "application_identity", "surface_ref", "native_window_id",
+                "window_generation", "runtime_identity", "automation_id",
+                "uia_pattern",
+            ):
+                if receipt_projection[identity_field]:
+                    entry[identity_field] = receipt_projection[identity_field]
+            now = _now()
+            if dispatch_state == "not_dispatched":
+                if entry.get("lifecycle") not in {"prepared", "not_applied"}:
+                    raise IllegalTransition(
+                        "semantic_batch_not_dispatched_after_dispatch_start"
+                    )
+                entry.update({
+                    "lifecycle": "not_applied",
+                    "effect_classification": "not_applied",
+                    "not_applied_at": float(entry.get("not_applied_at") or now),
+                })
+            else:
+                if entry.get("lifecycle") not in {
+                    "dispatch_started", "dispatch_returned", "receipt_bound",
+                    "unknown", "verified",
+                }:
+                    raise IllegalTransition(
+                        "semantic_batch_receipt_without_dispatch"
+                    )
+                if entry.get("lifecycle") not in {"unknown", "verified"}:
+                    entry.update({
+                        "lifecycle": "receipt_bound",
+                        "effect_classification": (
+                            "unknown"
+                            if dispatch_state == "effect_unknown"
+                            or outcome == "outcome_unknown" else
+                            "effect_possible"
+                        ),
+                        "receipt_bound_at": float(
+                            entry.get("receipt_bound_at") or now
+                        ),
+                    })
+            journal[item_index] = entry
+
+            prefix_entries = journal[:item_index]
+            prefix_is_dispatched = bool(prefix_entries) and all(
+                item.get("lifecycle") in {"receipt_bound", "verified"}
+                and item.get("dispatch_state") in {
+                    "dispatched", "effect_confirmed",
+                }
+                and item.get("outcome") in {
+                    "success_unverified", "success_verified",
+                    "confirmed_success",
+                }
+                for item in prefix_entries
+            )
+            no_later_dispatch = all(
+                item.get("lifecycle") in {"prepared", "not_applied"}
+                for item in journal[item_index + 1:]
+            )
+            if dispatch_state == "not_dispatched":
+                batch.update({
+                    "state": (
+                        "checkpoint_pending"
+                        if prefix_is_dispatched and no_later_dispatch else "stopped"
+                    ),
+                    "partial_batch_state": (
+                        "partial_prefix_dispatched"
+                        if prefix_is_dispatched and no_later_dispatch else
+                        "failed_before_any_effect"
+                        if not prefix_entries else "ambiguous_in_batch"
+                    ),
+                    "stop_reason": (
+                        "semantic_batch_prefix_checkpoint_pending"
+                        if prefix_is_dispatched and no_later_dispatch else
+                        reason_code or "semantic_batch_dispatch_unavailable"
+                    ),
+                    "rejected_primitive_index": item_index,
+                    "rejected_primitive_id": entry.get("primitive_id"),
+                    "rejected_receipt_id": receipt_id,
+                    "rejection_reason": (
+                        reason_code or "semantic_batch_dispatch_unavailable"
+                    ),
+                    "resume_from_index": None,
+                })
+                if prefix_is_dispatched and no_later_dispatch:
+                    checkpoint_id = (
+                        f"{safe_batch_id}.prefix.{item_index}"
+                    )
+                    checkpoint_entry = journal[item_index - 1]
+                    batch.update({
+                        "checkpoint_id": checkpoint_id,
+                        "checkpoint_prefix_length": item_index,
+                        "checkpoint_postcondition": checkpoint_entry.get(
+                            "semantic_postcondition"
+                        ),
+                    })
+                    settle = _safe_semantic_settle(record.get("semantic_settle"))
+                    if settle["state"] == "inactive":
+                        record["semantic_settle"] = _safe_semantic_settle({
+                            **_semantic_settle_configuration(record),
+                            "checkpoint_id": checkpoint_id,
+                            "state": "active",
+                            "settle_slot_count": 0,
+                            "probe_attempt_count": 0,
+                            "completed_observation_count": 0,
+                            "local_check_count": 0,
+                            "provider_check_count": 0,
+                            "started_at": now,
+                            "local_check_times": [],
+                            "observation_receipts": [],
+                        })
+            elif dispatch_state == "effect_unknown" or outcome == "outcome_unknown":
+                batch.update({
+                    "state": "outcome_unknown",
+                    "partial_batch_state": "ambiguous_in_batch",
+                    "stop_reason": (
+                        reason_code or "semantic_batch_primitive_outcome_unknown"
+                    ),
+                    "resume_from_index": None,
+                })
+            elif item_index == len(journal) - 1 and all(
+                item.get("lifecycle") in {"receipt_bound", "verified"}
+                for item in journal
+            ):
+                batch.update({
+                    "state": "checkpoint_pending",
+                    "partial_batch_state": "completed_batch",
+                    "stop_reason": "semantic_batch_dispatched",
+                })
+
+            record["primitive_journal"] = _safe_primitive_journal(journal)
+            record["semantic_batch"] = _safe_semantic_batch_record(batch)
+            record["updated_at"] = now
+            record["revision"] = int(record["revision"]) + 1
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
+
+    def record_primitive_outcome(
+        self,
+        attempt_id: str,
+        *,
+        outcome: str,
+        primitive_id: str = "",
+    ) -> dict:
+        lifecycle, effect_class, timestamp = {
+            "verified": ("verified", "verified", "verified_at"),
+            "not_applied": ("not_applied", "not_applied", "not_applied_at"),
+            "unknown": ("unknown", "unknown", "unknown_at"),
+        }.get(str(outcome or ""), ("unknown", "unknown", "unknown_at"))
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            journal = list(record.get("primitive_journal") or [])
+            index = self._journal_entry_index(record, primitive_id)
+            if index < 0:
+                return record
+            entry = dict(journal[index])
+            if (
+                lifecycle in {"verified", "unknown"}
+                and entry.get("lifecycle") == "prepared"
+            ):
+                raise IllegalTransition("primitive_outcome_without_dispatch")
+            now = _now()
+            entry.update({
+                "lifecycle": lifecycle,
+                "effect_classification": effect_class,
+                timestamp: now,
+            })
+            journal[index] = entry
+            record["primitive_journal"] = _safe_primitive_journal(journal)
+            if (
+                entry.get("effect_role") == "semantic"
+                or (
+                    entry.get("effect_role") == "preparatory"
+                    and (record.get("action_truth") or {}).get("effect_role")
+                    == "preparatory"
+                )
+            ):
+                action_state = {
+                    "verified": ActionState.EFFECT_VERIFIED,
+                    "not_applied": ActionState.NOT_APPLIED_VERIFIED,
+                    "unknown": ActionState.EFFECT_POSSIBLE,
+                }[lifecycle]
+                record["action_truth"] = transition_action_truth(
+                    record["action_truth"],
+                    state=action_state,
+                    reason_code={
+                        "verified": "action_primitive_effect_verified",
+                        "not_applied": "action_primitive_not_applied_verified",
+                        "unknown": "action_primitive_outcome_unknown",
+                    }[lifecycle],
+                    evidence={
+                        "evidence_ref": evidence_reference({
+                            "primitive_id": entry.get("primitive_id"),
+                            "outcome": lifecycle,
+                        }),
+                    },
+                    exact=lifecycle in {"verified", "not_applied"},
+                    occurred_at=now,
+                )
+            record["revision"] = int(record["revision"]) + 1
+            record["updated_at"] = now
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
+
+    def reconcile_semantic_batch_prefix(
+        self,
+        attempt_id: str,
+        *,
+        semantic_batch_id: str,
+        applied_count: int | None,
+        exact_non_applied_suffix: bool,
+        applied_subset_ambiguous: bool = False,
+    ) -> dict:
+        """Bind exact read-only prefix evidence without replaying the batch."""
+
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            batch = _safe_semantic_batch_record(record.get("semantic_batch"))
+            journal = list(record.get("primitive_journal") or [])
+            if (
+                not batch["semantic_batch_id"]
+                or batch["semantic_batch_id"]
+                != _safe_primitive_text(semantic_batch_id)
+                or len(journal) != len(batch["primitive_ids"])
+            ):
+                raise IllegalTransition("semantic_batch_identity_mismatch")
+            if applied_subset_ambiguous or applied_count is None:
+                batch.update({
+                    "state": "outcome_unknown",
+                    "stop_reason": "semantic_batch_applied_prefix_ambiguous",
+                    "resume_from_index": None,
+                })
+                record["semantic_batch"] = _safe_semantic_batch_record(batch)
+                record["updated_at"] = _now()
+                record["revision"] = int(record["revision"]) + 1
+                self._write_atomic(self._path(attempt_id), record)
+                return dict(record)
+            try:
+                prefix_size = int(applied_count)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise IllegalTransition("semantic_batch_prefix_invalid") from exc
+            if (
+                prefix_size < 0
+                or prefix_size > len(journal)
+                or not exact_non_applied_suffix
+            ):
+                raise IllegalTransition("semantic_batch_prefix_invalid")
+            now = _now()
+            reconciled = []
+            for index, raw in enumerate(journal):
+                item = dict(raw)
+                if index < prefix_size:
+                    if item.get("lifecycle") == "prepared":
+                        raise IllegalTransition(
+                            "semantic_batch_prefix_without_dispatch"
+                        )
+                    item.update({
+                        "lifecycle": "verified",
+                        "effect_classification": "verified",
+                        "verified_at": now,
+                    })
+                else:
+                    if item.get("lifecycle") not in {
+                        "prepared", "not_applied",
+                    }:
+                        raise IllegalTransition(
+                            "semantic_batch_suffix_effect_possible"
+                        )
+                    item.update({
+                        "lifecycle": "not_applied",
+                        "effect_classification": "not_applied",
+                        "not_applied_at": now,
+                    })
+                reconciled.append(item)
+            record["primitive_journal"] = _safe_primitive_journal(reconciled)
+            batch.update({
+                "state": (
+                    "verified"
+                    if prefix_size == len(journal) else "resume_ready"
+                ),
+                "stop_reason": "semantic_batch_exact_prefix_reconciled",
+                "resume_from_index": prefix_size,
+            })
+            record["semantic_batch"] = _safe_semantic_batch_record(batch)
+            settle = _safe_semantic_settle(record.get("semantic_settle"))
+            if (
+                settle["state"] == "active"
+                and settle["checkpoint_id"] == batch.get("checkpoint_id")
+            ):
+                settle["state"] = "proof_observed"
+                record["semantic_settle"] = _safe_semantic_settle(settle)
+            prefix_evidence = {
+                "evidence_ref": evidence_reference({
+                    "semantic_batch_id": batch["semantic_batch_id"],
+                    "applied_count": prefix_size,
+                    "primitive_count": len(journal),
+                    "resume_from_index": prefix_size,
+                }),
+            }
+            if prefix_size == 0:
+                action_state = ActionState.NOT_APPLIED_VERIFIED
+                reconciliation_state = ReconciliationStatus.NOT_APPLIED
+            elif prefix_size == len(journal):
+                action_state = ActionState.EFFECT_VERIFIED
+                reconciliation_state = ReconciliationStatus.VERIFIED
+            else:
+                action_state = ActionState.EFFECT_OBSERVED
+                reconciliation_state = ReconciliationStatus.PENDING
+            record["action_truth"] = transition_action_truth(
+                record["action_truth"],
+                state=action_state,
+                reason_code="semantic_batch_exact_prefix_reconciled",
+                evidence=prefix_evidence,
+                reconciliation_status=reconciliation_state,
+                exact=True,
+                occurred_at=now,
+            )
+            record["updated_at"] = now
+            record["revision"] = int(record["revision"]) + 1
             self._write_atomic(self._path(attempt_id), record)
             return dict(record)
 
@@ -784,10 +2736,20 @@ class ToolAttemptStore:
         }
         if check_index is not None:
             updates["reconciliation_check_index"] = max(0, int(check_index))
-        return self._transition(
+        record = self._transition(
             attempt_id, ToolAttemptStatus.PENDING,
             updates=updates,
         )
+        if (record.get("action_truth") or {}).get("dispatch_started_at"):
+            record = self.update_action_truth(
+                attempt_id,
+                state=ActionState.STILL_RUNNING.value,
+                reason_code=_safe_reason(reason_code) or "owner_still_running",
+                reconciliation_status=(
+                    ReconciliationStatus.PROPAGATION_PENDING.value
+                ),
+            )
+        return record
 
     def mark_waiting_verification(
         self, attempt_id: str, *, next_check_at: float, deadline_at: float,
@@ -795,8 +2757,11 @@ class ToolAttemptStore:
         owner_settled: bool = False,
         check_index: int | None = None,
     ) -> dict:
+        semantic_next = self.semantic_settle_next_check_at(attempt_id)
         updates = {
-            "next_check_at": float(next_check_at),
+            "next_check_at": float(
+                semantic_next if semantic_next is not None else next_check_at
+            ),
             "deadline_at": float(deadline_at),
             "hard_deadline_at": float(deadline_at),
             "reason_code": _safe_reason(reason_code),
@@ -806,10 +2771,182 @@ class ToolAttemptStore:
             updates["dispatch_state"] = "owner_settled_unverified"
         if check_index is not None:
             updates["reconciliation_check_index"] = max(0, int(check_index))
-        return self._transition(
+        record = self._transition(
             attempt_id, ToolAttemptStatus.WAITING_VERIFICATION,
             updates=updates,
         )
+        if (record.get("action_truth") or {}).get("dispatch_started_at"):
+            record = self.update_action_truth(
+                attempt_id,
+                state=ActionState.RECONCILING.value,
+                reason_code=(
+                    _safe_reason(reason_code) or "reconciliation_pending"
+                ),
+                reconciliation_status=ReconciliationStatus.PENDING.value,
+            )
+        return record
+
+    def semantic_settle_next_check_at(
+        self, attempt_id: str, *, now: float | None = None,
+    ) -> float | None:
+        """Return the next exact local-check deadline for one checkpoint."""
+
+        record = self.get_attempt(attempt_id)
+        if not record or not _semantic_settle_active(record):
+            return None
+        settle = _safe_semantic_settle(record.get("semantic_settle"))
+        anchor = (
+            settle["local_check_times"][-1]
+            if settle["local_check_times"] else settle["started_at"]
+        )
+        current = _now() if now is None else float(now)
+        delay_index = min(
+            int(settle["settle_slot_count"]),
+            len(settle["probe_delays_seconds"]) - 1,
+        )
+        return max(
+            current + 0.05,
+            anchor + float(settle["probe_delays_seconds"][delay_index]),
+        )
+
+    def record_semantic_settle_probe_result(
+        self,
+        attempt_id: str,
+        *,
+        result: SemanticSettleProbeResult,
+    ) -> dict:
+        """Persist one typed probe receipt before advancing its settle slot."""
+
+        if not isinstance(result, SemanticSettleProbeResult):
+            raise TypeError("typed_semantic_settle_probe_result_required")
+
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            settle = _safe_semantic_settle(record.get("semantic_settle"))
+            if (
+                not settle["checkpoint_id"]
+                or settle["settle_slot_count"] >= settle["max_local_checks"]
+            ):
+                return record
+            classification = result.classification
+            if not isinstance(classification, SemanticSettleProbeClassification):
+                raise TypeError("typed_semantic_settle_classification_required")
+            timestamp = max(0.0, float(result.observation_started_at))
+            if not timestamp:
+                raise ValueError("semantic_settle_probe_start_required")
+            completed_at = max(0.0, float(result.observation_completed_at or 0.0))
+            completed = classification in {
+                SemanticSettleProbeClassification.COMPLETED_MATCH,
+                SemanticSettleProbeClassification.COMPLETED_NONMATCH,
+                SemanticSettleProbeClassification.COMPLETED_INCONCLUSIVE,
+            }
+            if completed and not completed_at:
+                raise ValueError("completed_settle_observation_time_required")
+            if completed and not result.probe_invoked:
+                raise ValueError("completed_settle_probe_must_be_invoked")
+            observer_mechanism = _safe_reason(result.observer_mechanism)
+            if not observer_mechanism:
+                raise ValueError("semantic_settle_observer_mechanism_required")
+            exact_match = (
+                True
+                if classification is SemanticSettleProbeClassification.COMPLETED_MATCH
+                else False
+                if classification is SemanticSettleProbeClassification.COMPLETED_NONMATCH
+                else None
+            )
+            slot_index = int(settle["settle_slot_count"]) + 1
+            journal_entry = next(
+                (
+                    item for item in reversed(record.get("primitive_journal") or [])
+                    if item.get("effect_role") == "semantic"
+                    and (
+                        item.get("semantic_substep_id") == settle["checkpoint_id"]
+                        or item.get("primitive_id") == settle["checkpoint_id"]
+                    )
+                ),
+                {},
+            )
+            if not journal_entry:
+                batch = _safe_semantic_batch_record(
+                    record.get("semantic_batch")
+                )
+                prefix_length = int(batch["checkpoint_prefix_length"] or 0)
+                journal = list(record.get("primitive_journal") or [])
+                if (
+                    settle["checkpoint_id"] == batch["checkpoint_id"]
+                    and 0 < prefix_length <= len(journal)
+                ):
+                    journal_entry = journal[prefix_length - 1]
+            receipt = {
+                "schema_version": 1,
+                "checkpoint_id": settle["checkpoint_id"],
+                "semantic_attempt_id": str(
+                    journal_entry.get("strategy_attempt_id") or ""
+                ),
+                "semantic_substep_id": str(
+                    journal_entry.get("semantic_substep_id") or ""
+                ),
+                "slot_index": slot_index,
+                "observer_mechanism": observer_mechanism,
+                "probe_invoked": result.probe_invoked is True,
+                "observation_started_at": timestamp,
+                "observation_completed_at": completed_at,
+                "target_application": (
+                    result.target_application
+                    or journal_entry.get("application_identity")
+                    or ""
+                ),
+                "surface_ref": (
+                    result.surface_ref or journal_entry.get("surface_ref") or ""
+                ),
+                "native_window_id": (
+                    result.native_window_id
+                    or journal_entry.get("native_window_id")
+                    or ""
+                ),
+                "window_generation": (
+                    result.window_generation
+                    or journal_entry.get("window_generation")
+                    or ""
+                ),
+                "result_classification": classification.value,
+                "exact_postcondition_match": exact_match,
+                "reason_code": (
+                    result.reason_code or "settle_probe_" + classification.value
+                ),
+                "evidence_ref": result.evidence_ref,
+            }
+            receipts = list(settle["observation_receipts"])
+            receipts.append(receipt)
+            checks = list(settle["local_check_times"])
+            checks.append(max(0.0, timestamp))
+            settle.update({
+                "settle_slot_count": slot_index,
+                "probe_attempt_count": min(
+                    settle["max_local_checks"],
+                    int(settle["probe_attempt_count"])
+                    + (1 if result.probe_invoked else 0),
+                ),
+                "completed_observation_count": min(
+                    settle["max_local_checks"],
+                    int(settle["completed_observation_count"])
+                    + (1 if completed else 0),
+                ),
+                "local_check_count": min(
+                    settle["max_local_checks"],
+                    slot_index,
+                ),
+                "local_check_times": checks[-settle["max_local_checks"]:],
+                "observation_receipts": receipts[-settle["max_local_checks"]:],
+            })
+            record["semantic_settle"] = _safe_semantic_settle(settle)
+            record["reconciliation_check_index"] = int(
+                record["semantic_settle"]["settle_slot_count"]
+            )
+            record["updated_at"] = max(timestamp, completed_at)
+            record["revision"] = int(record["revision"]) + 1
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
 
     def record_progress(
         self, attempt_id: str, *, phase: str = "running",
@@ -894,6 +3031,35 @@ class ToolAttemptStore:
             current = ToolAttemptStatus(record["status"])
             if current in TERMINAL_STATUSES:
                 return record, False
+            reported_status = status
+            reported_terminal_outcome = terminal_outcome
+            reported_dispatch_state = dispatch_state
+            reported_reason_code = reason_code
+            cancellation_authoritative = (
+                current is ToolAttemptStatus.CANCELLATION_REQUESTED
+            )
+            if cancellation_authoritative:
+                # A worker may settle after Stop won. Preserve its semantic
+                # evidence below, but terminalize orchestration as cancelled.
+                status = ToolAttemptStatus.CANCELLED_PROVEN
+                terminal_outcome = "cancelled_proven"
+                reason_code = "late_result_after_cancellation"
+            # Once the owner timed out after atomically claiming dispatch, a
+            # late callback can settle the worker but cannot rewind the durable
+            # boundary to "not_dispatched".  Keep ordinary synchronous
+            # pre-dispatch failures unchanged; this guard applies only after
+            # the explicit worker-may-still-be-active timeout was persisted.
+            if (
+                record.get("owner_dispatch_claimed_at")
+                and record.get("owner_dispatch_timed_out_after_claim") is True
+                and dispatch_state in {
+                    "not_dispatched", "cancelled_before_effect",
+                }
+            ):
+                status = ToolAttemptStatus.UNKNOWN_AFTER_START
+                terminal_outcome = "outcome_unknown"
+                dispatch_state = "effect_unknown"
+                reason_code = "owner_timeout_after_dispatch_claim"
             if expected_revision is not None and int(record["revision"]) != int(expected_revision):
                 raise RevisionConflict("stale_tool_attempt_revision")
             if status not in _TRANSITIONS.get(current, set()):
@@ -923,6 +3089,225 @@ class ToolAttemptStore:
                 "updated_at": now,
                 "revision": int(record["revision"]) + 1,
             })
+            settle = _safe_semantic_settle(record.get("semantic_settle"))
+            if settle["state"] == "active":
+                settle["state"] = (
+                    "proof_observed"
+                    if (
+                        status == ToolAttemptStatus.SUCCEEDED
+                        or safe_reason
+                        == "semantic_batch_exact_prefix_reconciled"
+                        or (
+                            status == ToolAttemptStatus.FAILED_BEFORE_EFFECT
+                            and safe_reason
+                            == "local_reconciliation_not_applied"
+                        )
+                    ) else
+                    "cancelled"
+                    if status == ToolAttemptStatus.CANCELLED_PROVEN else
+                    "stale_target"
+                    if safe_reason in {
+                        "semantic_settle_target_invalid",
+                        "stale_desktop_target",
+                    } else
+                    "observation_failed"
+                    if safe_reason == "semantic_settle_observation_failed" else
+                    "evidence_unresolved"
+                    if safe_reason == "semantic_settle_evidence_unresolved" else
+                    "exhausted"
+                    if (
+                        status == ToolAttemptStatus.UNKNOWN_AFTER_START
+                        and safe_reason == "semantic_settle_exhausted"
+                        and settle["completed_observation_count"]
+                        >= settle["max_local_checks"]
+                    ) else
+                    "aborted"
+                )
+                record["semantic_settle"] = _safe_semantic_settle(settle)
+            batch = _safe_semantic_batch_record(record.get("semantic_batch"))
+            if batch["state"] != "inactive":
+                batch_fully_dispatched = bool(
+                    record.get("primitive_journal")
+                ) and all(
+                    item.get("lifecycle") != "prepared"
+                    for item in record.get("primitive_journal") or []
+                )
+                if status == ToolAttemptStatus.SUCCEEDED and batch_fully_dispatched:
+                    verified_journal = []
+                    for raw in record.get("primitive_journal") or []:
+                        item = dict(raw)
+                        item.update({
+                            "lifecycle": "verified",
+                            "effect_classification": "verified",
+                            "verified_at": now,
+                        })
+                        verified_journal.append(item)
+                    record["primitive_journal"] = _safe_primitive_journal(
+                        verified_journal
+                    )
+                batch["state"] = (
+                    "resume_ready"
+                    if (
+                        batch["state"] == "resume_ready"
+                        and safe_reason
+                        == "semantic_batch_exact_prefix_reconciled"
+                    ) else
+                    "verified"
+                    if (
+                        status == ToolAttemptStatus.SUCCEEDED
+                        and batch_fully_dispatched
+                    ) else
+                    "outcome_unknown"
+                    if (
+                        status == ToolAttemptStatus.SUCCEEDED
+                        or status in {
+                        ToolAttemptStatus.UNKNOWN_AFTER_START,
+                        ToolAttemptStatus.FAILED_AFTER_EFFECT,
+                        }
+                    ) else
+                    "stopped"
+                )
+                batch["stop_reason"] = safe_reason
+                record["semantic_batch"] = _safe_semantic_batch_record(batch)
+            truth = normalize_action_truth(
+                record.get("action_truth"), legacy_record=record,
+            )
+            semantic_started = bool(truth.get("dispatch_started_at"))
+            if (
+                not semantic_started
+                and not record.get("primitive_journal")
+                and dispatch_state not in {
+                    "not_dispatched", "cancelled_before_effect",
+                }
+            ):
+                truth = transition_action_truth(
+                    truth,
+                    state=ActionState.DISPATCH_STARTED,
+                    reason_code="terminal_receipt_confirms_dispatch_started",
+                    occurred_at=now,
+                )
+                semantic_started = True
+            action_evidence = {
+                "evidence_ref": evidence_reference({
+                    "terminal_outcome": reported_terminal_outcome,
+                    "dispatch_state": reported_dispatch_state,
+                    "reason_code": reported_reason_code,
+                }),
+            }
+            if status is ToolAttemptStatus.CANCELLED_PROVEN:
+                if cancellation_authoritative:
+                    if reported_status is ToolAttemptStatus.SUCCEEDED:
+                        verified = reported_terminal_outcome in {
+                            "success_verified", "confirmed_success",
+                        } or truth.get("effect_class") == "read_only"
+                        truth = transition_action_truth(
+                            truth,
+                            state=(
+                                ActionState.EFFECT_VERIFIED
+                                if verified else ActionState.EFFECT_OBSERVED
+                            ),
+                            reason_code="late_result_evidence_after_cancellation",
+                            evidence=action_evidence,
+                            reconciliation_status=(
+                                ReconciliationStatus.VERIFIED
+                                if verified else ReconciliationStatus.PENDING
+                            ),
+                            exact=verified,
+                            occurred_at=now,
+                        )
+                    elif (
+                        reported_status is ToolAttemptStatus.FAILED_BEFORE_EFFECT
+                        and not semantic_started
+                    ):
+                        truth = transition_action_truth(
+                            truth,
+                            state=ActionState.FAILED_BEFORE_EFFECT,
+                            reason_code="late_non_application_after_cancellation",
+                            occurred_at=now,
+                        )
+                    elif semantic_started:
+                        truth = transition_action_truth(
+                            truth,
+                            state=ActionState.EFFECT_POSSIBLE,
+                            reason_code="late_uncertain_result_after_cancellation",
+                            evidence=action_evidence,
+                            reconciliation_status=ReconciliationStatus.PENDING,
+                            occurred_at=now,
+                        )
+                truth = transition_action_truth(
+                    truth,
+                    state=ActionState.CANCELLED,
+                    reason_code=safe_reason or "cancellation_proven",
+                    occurred_at=now,
+                )
+            elif truth.get("effect_truth") in {
+                "verified", "not_applied",
+            }:
+                # Exact child/reconciliation evidence dominates a later lossy
+                # parent callback or terminal summary.
+                pass
+            elif (
+                safe_reason == "local_reconciliation_not_applied"
+                and status is ToolAttemptStatus.FAILED_BEFORE_EFFECT
+            ):
+                truth = transition_action_truth(
+                    truth,
+                    state=ActionState.NOT_APPLIED_VERIFIED,
+                    reason_code="local_reconciliation_not_applied",
+                    evidence=action_evidence,
+                    reconciliation_status=ReconciliationStatus.NOT_APPLIED,
+                    exact=True,
+                    occurred_at=now,
+                )
+            elif (
+                status is ToolAttemptStatus.FAILED_BEFORE_EFFECT
+                and not semantic_started
+            ):
+                truth = transition_action_truth(
+                    truth,
+                    state=ActionState.FAILED_BEFORE_EFFECT,
+                    reason_code=safe_reason or "failed_before_effect",
+                    occurred_at=now,
+                )
+            elif safe_reason == "semantic_batch_exact_prefix_reconciled":
+                # reconcile_semantic_batch_prefix already persisted the exact
+                # applied prefix and resume frontier.  A parent terminal
+                # summary must not collapse that child truth back to generic
+                # effect_possible.
+                pass
+            elif status is ToolAttemptStatus.SUCCEEDED:
+                verified = terminal_outcome in {
+                    "success_verified", "confirmed_success",
+                } or truth.get("effect_class") == "read_only"
+                truth = transition_action_truth(
+                    truth,
+                    state=(
+                        ActionState.EFFECT_VERIFIED
+                        if verified else ActionState.EFFECT_OBSERVED
+                    ),
+                    reason_code=(
+                        safe_reason
+                        or "effect_verified" if verified
+                        else "effect_observed_unverified"
+                    ),
+                    evidence=action_evidence,
+                    reconciliation_status=(
+                        ReconciliationStatus.VERIFIED
+                        if verified else ReconciliationStatus.PENDING
+                    ),
+                    exact=verified,
+                    occurred_at=now,
+                )
+            else:
+                truth = transition_action_truth(
+                    truth,
+                    state=ActionState.EFFECT_POSSIBLE,
+                    reason_code=safe_reason or "effect_possible_after_dispatch",
+                    evidence=action_evidence,
+                    reconciliation_status=ReconciliationStatus.PENDING,
+                    occurred_at=now,
+                )
+            record["action_truth"] = truth
             self._write_atomic(self._path(attempt_id), record)
             return dict(record), True
 
@@ -952,6 +3337,12 @@ class ToolAttemptStore:
                     "updated_at": now,
                     "revision": int(record["revision"]) + 1,
                 })
+                record["action_truth"] = transition_action_truth(
+                    record["action_truth"],
+                    state=ActionState.CANCELLED,
+                    reason_code="cancellation_acknowledged_before_effect",
+                    occurred_at=now,
+                )
             else:
                 if (
                     current is not ToolAttemptStatus.CANCELLATION_REQUESTED
@@ -981,7 +3372,12 @@ class ToolAttemptStore:
             reason_code="cancellation_acknowledged_before_effect",
         )
 
-    def list_recoverable_attempts(self, *, now: float | None = None) -> list[dict]:
+    def list_recoverable_attempts(
+        self,
+        *,
+        now: float | None = None,
+        include_not_started: bool = False,
+    ) -> list[dict]:
         del now  # callers decide whether next_check_at/deadline_at is due
         recoverable: list[dict] = []
         with self._store_lock():
@@ -991,9 +3387,478 @@ class ToolAttemptStore:
                 except (OSError, json.JSONDecodeError, CorruptAttemptError):
                     # Corruption is never interpreted as permission to replay.
                     continue
-                if ToolAttemptStatus(record["status"]) in RECOVERABLE_STATUSES:
+                status = ToolAttemptStatus(record["status"])
+                if (
+                    status in RECOVERABLE_STATUSES
+                    or (
+                        include_not_started
+                        and status is ToolAttemptStatus.NOT_STARTED
+                    )
+                ):
                     recoverable.append(record)
-        return sorted(recoverable, key=lambda item: float(item.get("created_at") or 0))
+        return sorted(recoverable, key=_created_at_sort_key)
+
+    def list_action_attempts(self, action_id: str) -> list[dict[str, Any]]:
+        """Return every durable attempt/barrier for one semantic action."""
+
+        action_id = str(action_id or "")
+        if not action_id:
+            return []
+        found: list[dict[str, Any]] = []
+        with self._store_lock():
+            for directory in (self.attempts_dir, self.barriers_dir):
+                for path in directory.glob("*.json"):
+                    try:
+                        raw = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(raw, dict):
+                        continue
+                    truth = normalize_action_truth(
+                        raw.get("action_truth"), legacy_record=raw,
+                    )
+                    if truth.get("action_id") == action_id:
+                        item = dict(raw)
+                        item["action_truth"] = truth
+                        found.append(item)
+        return sorted(found, key=_created_at_sort_key)
+
+    def list_unresolved_action_attempts(
+        self, *, conversation_id: str = "", turn_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """Project possible effects without treating terminality as truth."""
+
+        found: list[dict[str, Any]] = []
+        with self._store_lock():
+            for directory in (self.attempts_dir, self.barriers_dir):
+                for path in directory.glob("*.json"):
+                    try:
+                        raw = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(raw, dict):
+                        continue
+                    if conversation_id and raw.get("conversation_id") != conversation_id:
+                        continue
+                    if turn_id and raw.get("turn_id") != turn_id:
+                        continue
+                    truth = normalize_action_truth(
+                        raw.get("action_truth"), legacy_record=raw,
+                    )
+                    if truth.get("effect_truth") not in {"possible", "observed"}:
+                        continue
+                    item = dict(raw)
+                    item["action_truth"] = truth
+                    found.append(item)
+        return sorted(found, key=_created_at_sort_key)
+
+    def update_action_truth(
+        self,
+        attempt_id: str,
+        *,
+        state: str,
+        reason_code: str,
+        evidence: Mapping[str, Any] | None = None,
+        observer: Mapping[str, Any] | None = None,
+        reconciliation_status: str = "",
+        exact: bool = False,
+        occurred_at: float | None = None,
+        observer_attempt_id: str = "",
+        execution_epoch: str = "",
+        target_generation: str = "",
+    ) -> dict[str, Any]:
+        """Persist an observer/action transition under the attempt lock."""
+
+        with self._store_lock():
+            attempt_path = self._path(attempt_id)
+            barrier_path = self.barriers_dir / f"{attempt_id}.json"
+            is_barrier = not attempt_path.exists() and barrier_path.exists()
+            if is_barrier:
+                try:
+                    record = json.loads(barrier_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise CorruptAttemptError(
+                        "attempt_barrier_unreadable"
+                    ) from exc
+                if not isinstance(record, dict):
+                    raise CorruptAttemptError("invalid_attempt_barrier")
+                record["action_truth"] = normalize_action_truth(
+                    record.get("action_truth"), legacy_record=record,
+                )
+            else:
+                record = self._read_unlocked(attempt_id)
+            observer_source = (
+                dict(observer) if isinstance(observer, Mapping) else {}
+            )
+            observer_attempt_id = _safe_primitive_text(
+                observer_attempt_id
+                or observer_source.get("observer_attempt_id"),
+                maximum=256,
+            )
+            execution_epoch = _safe_primitive_text(
+                execution_epoch or observer_source.get("execution_epoch"),
+                maximum=256,
+            )
+            target_generation = _safe_primitive_text(
+                target_generation
+                or observer_source.get("target_generation"),
+                maximum=256,
+            )
+            receipts = _safe_identity_receipts(record.get("observer_receipts"))
+            if observer_attempt_id and any(
+                item.get("receipt_id") == observer_attempt_id
+                for item in receipts
+            ):
+                return dict(record)
+            stale = bool(
+                execution_epoch
+                and execution_epoch != str(record.get("execution_epoch") or "")
+            )
+            expected_generation = str(
+                ((record.get("action_truth") or {}).get("target") or {}).get(
+                    "window_generation"
+                )
+                or ((record.get("action_truth") or {}).get("target") or {}).get(
+                    "page_generation"
+                )
+                or ""
+            )
+            if (
+                target_generation
+                and expected_generation
+                and target_generation != expected_generation
+            ):
+                stale = True
+            if observer_attempt_id:
+                receipts.append({
+                    "receipt_id": observer_attempt_id,
+                    "classification": str(
+                        observer_source.get("status") or state
+                    ),
+                    "reason_code": (
+                        "stale_observer_generation"
+                        if stale else reason_code
+                    ),
+                    "execution_epoch": execution_epoch,
+                    "target_generation": target_generation,
+                    "stale": stale,
+                    "received_at": (
+                        _now() if occurred_at is None else float(occurred_at)
+                    ),
+                })
+                record["observer_receipts"] = receipts[-128:]
+            if stale:
+                record["updated_at"] = (
+                    _now() if occurred_at is None else float(occurred_at)
+                )
+                record["revision"] = int(record.get("revision") or 0) + 1
+                self._write_atomic(
+                    barrier_path if is_barrier else attempt_path,
+                    record,
+                )
+                return dict(record)
+            current_truth = normalize_action_truth(
+                record.get("action_truth"), legacy_record=record,
+            )
+            authority_state = str(record.get("authority_state") or "active")
+            try:
+                target_state = ActionState(state)
+            except ValueError:
+                target_state = ActionState.EFFECT_POSSIBLE
+            definitive_state = target_state in {
+                ActionState.EFFECT_VERIFIED,
+                ActionState.NOT_APPLIED_VERIFIED,
+            }
+            current_effect = str(current_truth.get("effect_truth") or "")
+            incoming_effect = (
+                "verified"
+                if target_state is ActionState.EFFECT_VERIFIED else
+                "not_applied"
+                if target_state is ActionState.NOT_APPLIED_VERIFIED else ""
+            )
+            immutable_exact_conflict = bool(
+                current_effect in {"verified", "not_applied"}
+                and incoming_effect != current_effect
+            )
+            retain_only = bool(
+                authority_state == "superseded"
+                or (
+                    authority_state in {"cancelled", "terminal"}
+                    and not definitive_state
+                )
+                or immutable_exact_conflict
+            )
+            if retain_only:
+                record["updated_at"] = (
+                    _now() if occurred_at is None else float(occurred_at)
+                )
+                record["revision"] = int(record.get("revision") or 0) + 1
+                self._write_atomic(
+                    barrier_path if is_barrier else attempt_path,
+                    record,
+                )
+                return dict(record)
+            updated_truth = transition_action_truth(
+                current_truth,
+                state=state,
+                reason_code=reason_code,
+                evidence=evidence,
+                observer=observer,
+                reconciliation_status=(reconciliation_status or None),
+                exact=exact,
+                occurred_at=occurred_at,
+            )
+            if authority_state == "cancelled":
+                updated_truth = transition_action_truth(
+                    updated_truth,
+                    state=ActionState.CANCELLED,
+                    reason_code="authoritative_user_cancellation",
+                    occurred_at=occurred_at,
+                )
+            record["action_truth"] = updated_truth
+            record["updated_at"] = (
+                _now() if occurred_at is None else float(occurred_at)
+            )
+            record["revision"] = int(record.get("revision") or 0) + 1
+            self._write_atomic(
+                barrier_path if is_barrier else attempt_path,
+                record,
+            )
+            return dict(record)
+
+    def bind_provider_references(
+        self,
+        attempt_id: str,
+        references: Mapping[str, Any],
+        *,
+        expected_execution_epoch: str = "",
+    ) -> dict[str, Any]:
+        """Bind opaque native operation IDs without persisting provider content."""
+
+        safe = _safe_provider_references(references)
+        if not safe:
+            raise ValueError("provider_reference_missing")
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            if (
+                expected_execution_epoch
+                and expected_execution_epoch != record.get("execution_epoch")
+            ):
+                raise IllegalTransition("stale_execution_epoch")
+            current = dict(record.get("provider_references") or {})
+            for key, value in safe.items():
+                existing = current.get(key)
+                if existing and existing != value:
+                    raise IllegalTransition("provider_reference_conflict")
+                current[key] = value
+            record["provider_references"] = current
+            provider_operation_ref = next((
+                current.get(key)
+                for key in _PROVIDER_OPERATION_REFERENCE_PRIORITY
+                if current.get(key)
+            ), "")
+            if provider_operation_ref:
+                truth = dict(record.get("action_truth") or {})
+                truth["provider_operation_ref"] = provider_operation_ref
+                record["action_truth"] = normalize_action_truth(
+                    truth, legacy_record=record,
+                )
+            record["updated_at"] = _now()
+            record["revision"] = int(record.get("revision") or 0) + 1
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
+
+    def apply_provider_callback(
+        self,
+        attempt_id: str,
+        *,
+        callback_id: str,
+        execution_epoch: str,
+        outcome: str,
+        provider_references: Mapping[str, Any] | None = None,
+        reason_code: str = "provider_continuation",
+        evidence_ref: str = "",
+        failure_domain: str = "",
+    ) -> tuple[dict[str, Any], bool]:
+        """Apply one fenced provider receipt; return ``(record, authoritative)``.
+
+        A stale/duplicate/late receipt is retained diagnostically but never
+        regains execution authority.  Definitive evidence may strengthen
+        ActionTruth after cancellation without changing the cancelled attempt.
+        """
+
+        callback_id = _safe_primitive_text(callback_id, maximum=256)
+        execution_epoch = _safe_primitive_text(execution_epoch, maximum=256)
+        if not callback_id or not execution_epoch:
+            raise ValueError("provider_callback_identity_missing")
+        outcome = _safe_reason(outcome)
+        reason_code = _safe_reason(reason_code) or "provider_continuation"
+        failure_domain = _safe_reason(failure_domain)
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            processed = list(record.get("processed_provider_callbacks") or [])
+            if callback_id in processed:
+                return dict(record), False
+            processed.append(callback_id)
+            record["processed_provider_callbacks"] = processed[-128:]
+            stale_epoch = execution_epoch != record.get("execution_epoch")
+            authority_state = str(record.get("authority_state") or "active")
+            late = authority_state in {"cancelled", "terminal", "superseded"}
+            refs = dict(record.get("provider_references") or {})
+            supplied_refs = _safe_provider_references(provider_references)
+            for key, value in supplied_refs.items():
+                existing = refs.get(key)
+                if not existing or existing == value:
+                    refs[key] = value
+            record["provider_references"] = refs
+            history = _safe_identity_receipts(
+                record.get("continuation_history"), maximum=64,
+            )
+            history.append({
+                "receipt_id": callback_id,
+                "classification": outcome,
+                "reason_code": (
+                    "stale_execution_epoch" if stale_epoch
+                    else "late_provider_evidence" if late
+                    else reason_code
+                ),
+                "failure_domain": failure_domain,
+                "execution_epoch": execution_epoch,
+                "target_generation": "",
+                "stale": stale_epoch,
+                "received_at": _now(),
+            })
+            record["continuation_history"] = history[-64:]
+            definitive = outcome in {
+                "completed_with_receipt", "explicit_not_applied",
+                "failed_before_effect",
+            }
+            authoritative = not stale_epoch and not late
+            current_truth = normalize_action_truth(
+                record.get("action_truth"), legacy_record=record,
+            )
+            current_effect = str(current_truth.get("effect_truth") or "")
+            incoming_effect = (
+                "verified" if outcome == "completed_with_receipt" else
+                "not_applied" if outcome in {
+                    "explicit_not_applied", "failed_before_effect",
+                } else ""
+            )
+            should_apply = not stale_epoch and (
+                authoritative or definitive
+            ) and not (
+                current_effect in {"verified", "not_applied"}
+                and incoming_effect != current_effect
+            )
+            if should_apply:
+                evidence = {
+                    "evidence_ref": evidence_ref or (
+                        "provider_receipt:" + hashlib.sha256(
+                            callback_id.encode("utf-8")
+                        ).hexdigest()[:32]
+                    ),
+                    "provider_operation_ref": next((
+                        refs.get(key)
+                        for key in _PROVIDER_OPERATION_REFERENCE_PRIORITY
+                        if refs.get(key)
+                    ), ""),
+                }
+                dispatch_started = bool(current_truth.get("dispatch_started_at"))
+                if outcome == "completed_with_receipt":
+                    target_state = ActionState.EFFECT_VERIFIED
+                    exact = True
+                elif outcome == "explicit_not_applied" or (
+                    outcome == "failed_before_effect" and dispatch_started
+                ):
+                    target_state = ActionState.NOT_APPLIED_VERIFIED
+                    exact = True
+                elif outcome == "failed_before_effect":
+                    target_state = ActionState.FAILED_BEFORE_EFFECT
+                    exact = True
+                elif outcome == "still_running" and dispatch_started:
+                    target_state = ActionState.STILL_RUNNING
+                    exact = False
+                elif dispatch_started:
+                    target_state = ActionState.RECONCILING
+                    exact = False
+                else:
+                    # A missing/unsupported provider lookup is transport
+                    # evidence only.  Without the exact semantic dispatch
+                    # boundary it cannot manufacture action uncertainty.
+                    should_apply = False
+                    target_state = ActionState.FAILED_BEFORE_EFFECT
+                    exact = False
+                if late and target_state not in {
+                    ActionState.EFFECT_VERIFIED,
+                    ActionState.NOT_APPLIED_VERIFIED,
+                }:
+                    should_apply = False
+                if should_apply:
+                    updated_truth = transition_action_truth(
+                        current_truth,
+                        state=target_state,
+                        reason_code=reason_code,
+                        evidence=(evidence if definitive else None),
+                        reconciliation_status=(
+                            ReconciliationStatus.VERIFIED
+                            if target_state is ActionState.EFFECT_VERIFIED else
+                            ReconciliationStatus.NOT_APPLIED
+                            if target_state is ActionState.NOT_APPLIED_VERIFIED else
+                            ReconciliationStatus.RUNNING
+                        ),
+                        exact=exact,
+                    )
+                    if authority_state == "cancelled":
+                        updated_truth = transition_action_truth(
+                            updated_truth,
+                            state=ActionState.CANCELLED,
+                            reason_code="authoritative_user_cancellation",
+                        )
+                    record["action_truth"] = updated_truth
+            record["updated_at"] = _now()
+            record["revision"] = int(record.get("revision") or 0) + 1
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record), authoritative
+
+    def supersede_attempt(
+        self, attempt_id: str, *, execution_epoch: str,
+    ) -> dict[str, Any]:
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            if execution_epoch != record.get("execution_epoch"):
+                raise IllegalTransition("stale_execution_epoch")
+            if record.get("authority_state") == "cancelled":
+                return dict(record)
+            record["authority_state"] = "superseded"
+            record["tombstoned_at"] = _now()
+            record["updated_at"] = _now()
+            record["revision"] = int(record.get("revision") or 0) + 1
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
+
+    def drain_action_outbox(self) -> int:
+        """Publish embedded state+event transactions after a prior crash."""
+
+        published = 0
+        with self._store_lock():
+            records = []
+            for directory in (self.attempts_dir, self.barriers_dir):
+                for path in directory.glob("*.json"):
+                    try:
+                        raw = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if isinstance(raw, dict) and raw.get("action_truth"):
+                        self._prepare_action_outbox(raw)
+                        records.append(raw)
+        for record in records:
+            before = len(record.get("action_outbox") or [])
+            try:
+                self._publish_action_outbox(record)
+            except Exception:
+                continue
+            published += before
+        return published
 
     def list_unfinished_terminal_continuations(self) -> list[dict]:
         """Return terminal receipts that still need one correlated final."""
@@ -1010,11 +3875,11 @@ class ToolAttemptStore:
                     and record.get("continuation_state") != "complete"
                     and (
                         record.get("continuation_state") == "not_claimed"
-                        or not _pid_alive(record.get("continuation_claimed_pid"))
+                        or not _continuation_owner_alive(record)
                     )
                 ):
                     unfinished.append(record)
-        return sorted(unfinished, key=lambda item: float(item.get("created_at") or 0))
+        return sorted(unfinished, key=_created_at_sort_key)
 
     def claim_reconciliation(self, attempt_id: str) -> str | None:
         with self._store_lock():
@@ -1060,13 +3925,17 @@ class ToolAttemptStore:
                 return None
             if (
                 continuation != "not_claimed"
-                and _pid_alive(record.get("continuation_claimed_pid"))
+                and _continuation_owner_alive(record)
             ):
                 return None
             claim = "continue_" + secrets.token_urlsafe(18)
+            _alive, process_identity = _live_process_identity(os.getpid())
             record["continuation_state"] = claim
             record["continuation_claimed_at"] = _now()
             record["continuation_claimed_pid"] = os.getpid()
+            record["continuation_claimed_process_identity"] = (
+                process_identity or None
+            )
             record["revision"] = int(record["revision"]) + 1
             record["updated_at"] = _now()
             self._write_atomic(self._path(attempt_id), record)
@@ -1088,6 +3957,7 @@ class ToolAttemptStore:
             record["continuation_state"] = "complete"
             record["continuation_claimed_at"] = None
             record["continuation_claimed_pid"] = None
+            record["continuation_claimed_process_identity"] = None
             record["final_response_message_id"] = final_id
             record["revision"] = int(record["revision"]) + 1
             record["updated_at"] = _now()
@@ -1104,6 +3974,7 @@ class ToolAttemptStore:
             record["continuation_state"] = "not_claimed"
             record["continuation_claimed_at"] = None
             record["continuation_claimed_pid"] = None
+            record["continuation_claimed_process_identity"] = None
             record["revision"] = int(record["revision"]) + 1
             record["updated_at"] = _now()
             self._write_atomic(self._path(attempt_id), record)
@@ -1113,6 +3984,45 @@ class ToolAttemptStore:
         conversation_id = _safe_token(conversation_id, field="conversation_id")
         with self._store_lock():
             return self._active_for_conversation_unlocked(conversation_id)
+
+    def find_resumable_chat_turn(self, conversation_id: str) -> dict | None:
+        """Return one exact Chat receipt that an owner may safely reattach.
+
+        Normal suspended attempts remain eligible.  A terminal receipt is also
+        eligible only while its correlated continuation is unfinished and no
+        live process owns that continuation claim.  Multiple candidates are
+        contradictory durable state, so recovery fails closed instead of
+        choosing one by filesystem order or recency.
+        """
+
+        conversation_id = _safe_token(conversation_id, field="conversation_id")
+        candidates: list[dict] = []
+        with self._store_lock():
+            for path in self.attempts_dir.glob("attempt_*.json"):
+                try:
+                    record = self._validate(
+                        json.loads(path.read_text(encoding="utf-8"))
+                    )
+                except (OSError, json.JSONDecodeError, CorruptAttemptError):
+                    continue
+                if (
+                    record.get("conversation_id") != conversation_id
+                    or str(record.get("owner_scope") or "chat") != "chat"
+                ):
+                    continue
+                status = ToolAttemptStatus(record["status"])
+                if status in RECOVERABLE_STATUSES:
+                    candidates.append(record)
+                    continue
+                if status in TERMINAL_STATUSES and (
+                    record.get("continuation_state") != "complete"
+                    and (
+                        record.get("continuation_state") == "not_claimed"
+                        or not _continuation_owner_alive(record)
+                    )
+                ):
+                    candidates.append(record)
+        return candidates[0] if len(candidates) == 1 else None
 
     def bind_autonomous(
         self,
@@ -1189,7 +4099,11 @@ class ToolAttemptStore:
                     str(record.get("argument_fingerprint") or ""),
                     str(argument_fingerprint or ""),
                 )
-                and record.get("dispatch_state") != "not_dispatched"
+                and (
+                    _any_primitive_dispatch_started(record)
+                    if record.get("tool_name") == "activate_desktop_surface"
+                    else record.get("dispatch_state") != "not_dispatched"
+                )
             ):
                 return True
         return False
@@ -1205,23 +4119,34 @@ class ToolAttemptStore:
             if (
                 record.get("conversation_id") != conversation_id
                 or record.get("turn_id") != turn_id
-                or record.get("dispatch_state") == "not_dispatched"
             ):
                 continue
+            semantic_started = (
+                _semantic_dispatch_started(record)
+                if record.get("tool_name") == "activate_desktop_surface"
+                else record.get("dispatch_state") != "not_dispatched"
+            )
+            exact_started = (
+                _any_primitive_dispatch_started(record)
+                if record.get("tool_name") == "activate_desktop_surface"
+                else record.get("dispatch_state") != "not_dispatched"
+            )
             if (
                 block_unknown_effect
                 and record.get("terminal_outcome") == "outcome_unknown"
+                and semantic_started
             ):
                 return True
             if (
                 record.get("tool_name") == tool_name
+                and exact_started
                 and hmac.compare_digest(
                     str(record.get("argument_fingerprint") or ""),
                     str(argument_fingerprint or ""),
                 )
             ):
                 return True
-            if equivalence_fingerprint and hmac.compare_digest(
+            if semantic_started and equivalence_fingerprint and hmac.compare_digest(
                 str(record.get("equivalence_fingerprint") or ""),
                 equivalence_fingerprint,
             ):
@@ -1244,7 +4169,11 @@ class ToolAttemptStore:
                     str(record.get("equivalence_fingerprint") or ""),
                     equivalence_fingerprint,
                 )
-                and record.get("dispatch_state") != "not_dispatched"
+                and (
+                    _semantic_dispatch_started(record)
+                    if record.get("tool_name") == "activate_desktop_surface"
+                    else record.get("dispatch_state") != "not_dispatched"
+                )
             ):
                 return True
         return False
@@ -1259,7 +4188,11 @@ class ToolAttemptStore:
                 record.get("conversation_id") == conversation_id
                 and record.get("turn_id") == turn_id
                 and record.get("terminal_outcome") == "outcome_unknown"
-                and record.get("dispatch_state") != "not_dispatched"
+                and (
+                    _semantic_dispatch_started(record)
+                    if record.get("tool_name") == "activate_desktop_surface"
+                    else record.get("dispatch_state") != "not_dispatched"
+                )
             ):
                 return True
         return False
@@ -1309,7 +4242,13 @@ class ToolAttemptStore:
                     ),
                     "dispatch_state": record["dispatch_state"],
                     "terminal_outcome": record["terminal_outcome"],
+                    "action_truth": record.get("action_truth"),
+                    "primitive_journal": record.get("primitive_journal", []),
+                    "semantic_batch": record.get("semantic_batch", {}),
+                    "request_id": record.get("request_id", ""),
+                    "autonomous_run_id": record.get("autonomous_run_id", ""),
                     "completed_at": completed,
+                    "created_at": record.get("created_at", completed),
                     "retain_until": completed + barrier_retention_seconds,
                 }
                 self._write_atomic(
@@ -1503,7 +4442,106 @@ class ToolAttemptCoordinator:
         return inactivity, "reconciliation_stalled"
 
     @staticmethod
+    def _coerce_settle_probe_result(
+        payload: Any,
+        *,
+        record: Mapping[str, Any],
+        started_at: float,
+        probe_invoked: bool,
+        failure_reason: str = "",
+    ) -> SemanticSettleProbeResult:
+        if isinstance(payload, SemanticSettleProbeResult):
+            return payload
+        journal_entry = next(
+            (
+                item for item in reversed(record.get("primitive_journal") or [])
+                if item.get("effect_role") == "semantic"
+            ),
+            {},
+        )
+        batch = _safe_semantic_batch_record(record.get("semantic_batch"))
+        journal = list(record.get("primitive_journal") or [])
+        prefix_length = int(batch["checkpoint_prefix_length"] or 0)
+        settle = _safe_semantic_settle(record.get("semantic_settle"))
+        if (
+            settle["checkpoint_id"] == batch["checkpoint_id"]
+            and 0 < prefix_length <= len(journal)
+        ):
+            journal_entry = journal[prefix_length - 1]
+        status = str(record.get("status") or "")
+        reason_code = str(record.get("reason_code") or failure_reason or "")
+        if payload is None:
+            classification = SemanticSettleProbeClassification.PROBE_FAILED
+            reason_code = failure_reason or "settle_probe_result_missing"
+            completed_at = 0.0
+            exact_match = None
+        elif status == ToolAttemptStatus.SUCCEEDED.value:
+            classification = SemanticSettleProbeClassification.COMPLETED_MATCH
+            completed_at = _now()
+            exact_match = True
+        elif reason_code in {
+            "semantic_settle_target_invalid", "stale_desktop_target",
+        }:
+            classification = SemanticSettleProbeClassification.STALE_OR_INVALID
+            completed_at = _now()
+            exact_match = None
+        elif status == ToolAttemptStatus.FAILED_BEFORE_EFFECT.value:
+            classification = SemanticSettleProbeClassification.COMPLETED_NONMATCH
+            completed_at = _now()
+            exact_match = False
+        else:
+            classification = (
+                SemanticSettleProbeClassification.COMPLETED_INCONCLUSIVE
+            )
+            completed_at = _now()
+            exact_match = None
+        evidence_ref = ""
+        if payload is not None:
+            projection = {
+                "status": status,
+                "reason_code": reason_code,
+                "dispatch_state": str(record.get("dispatch_state") or ""),
+                "terminal_outcome": str(record.get("terminal_outcome") or ""),
+            }
+            evidence_ref = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    projection, sort_keys=True, separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        return SemanticSettleProbeResult(
+            classification=classification,
+            observer_mechanism="legacy_local_verifier",
+            observation_started_at=started_at,
+            observation_completed_at=completed_at,
+            target_application=str(
+                journal_entry.get("application_identity") or ""
+            ),
+            surface_ref=str(journal_entry.get("surface_ref") or ""),
+            native_window_id=str(
+                journal_entry.get("native_window_id") or ""
+            ),
+            window_generation=str(
+                journal_entry.get("window_generation") or ""
+            ),
+            exact_postcondition_match=exact_match,
+            reason_code=reason_code,
+            evidence_ref=evidence_ref,
+            probe_invoked=probe_invoked,
+            terminal_payload=payload,
+        )
+
+    @staticmethod
     def _next_progressive_check(record: Mapping[str, Any], now: float) -> tuple[float, int]:
+        if _semantic_settle_active(record):
+            settle = _safe_semantic_settle(record.get("semantic_settle"))
+            delay_index = min(
+                int(settle["settle_slot_count"]),
+                len(settle["probe_delays_seconds"]) - 1,
+            )
+            return (
+                now + float(settle["probe_delays_seconds"][delay_index]),
+                int(settle["local_check_count"]),
+            )
         policy = record.get("persistence_contract") or {}
         delays = list(policy.get("check_delays_seconds") or (2.0, 5.0))
         index = max(0, int(record.get("reconciliation_check_index") or 0))
@@ -1522,7 +4560,13 @@ class ToolAttemptCoordinator:
                 runtime is not None and runtime.activated and not runtime.running
             )
         if usable:
-            self._schedule_timer(attempt_id, immediate=True)
+            try:
+                record = self.store.get_attempt(attempt_id) or {}
+            except CorruptAttemptError:
+                record = {}
+            self._schedule_timer(
+                attempt_id, immediate=not _semantic_settle_active(record),
+            )
         return usable
 
     def _timer_fired(self, attempt_id: str) -> None:
@@ -1545,8 +4589,89 @@ class ToolAttemptCoordinator:
             return
         try:
             self._emit(runtime, attempt_id, "verifying_tool_result")
+            settle_due = bool(
+                _semantic_settle_active(record)
+                and str(record.get("dispatch_state") or "") not in {
+                    "owner_started", "dispatch_started",
+                    "worker_may_be_active",
+                }
+            )
             progress_before = int(record.get("useful_progress_count") or 0)
-            if runtime.verify is not None:
+            if settle_due:
+                probe_started_at = _now()
+                if runtime.verify is None:
+                    probe_result = self._coerce_settle_probe_result(
+                        None,
+                        record=record,
+                        started_at=probe_started_at,
+                        probe_invoked=False,
+                        failure_reason="settle_probe_callback_missing",
+                    )
+                else:
+                    try:
+                        payload = runtime.verify(attempt_id)
+                        latest = self.store.get_attempt(attempt_id) or record
+                        probe_result = self._coerce_settle_probe_result(
+                            payload,
+                            record=latest,
+                            started_at=probe_started_at,
+                            probe_invoked=True,
+                        )
+                    except Exception:
+                        probe_result = self._coerce_settle_probe_result(
+                            None,
+                            record=record,
+                            started_at=probe_started_at,
+                            probe_invoked=True,
+                            failure_reason="settle_probe_callback_failed",
+                        )
+                try:
+                    record = self.store.record_semantic_settle_probe_result(
+                        attempt_id,
+                        result=probe_result,
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    probe_result = self._coerce_settle_probe_result(
+                        None,
+                        record=record,
+                        started_at=probe_started_at,
+                        probe_invoked=runtime.verify is not None,
+                        failure_reason="settle_probe_result_invalid",
+                    )
+                    record = self.store.record_semantic_settle_probe_result(
+                        attempt_id,
+                        result=probe_result,
+                    )
+                if probe_result.terminal_payload is not None:
+                    self.notify_terminal(
+                        attempt_id, probe_result.terminal_payload,
+                    )
+                    return
+                classification = probe_result.classification
+                if classification is SemanticSettleProbeClassification.COMPLETED_MATCH:
+                    self.store.record_primitive_outcome(
+                        attempt_id, outcome="verified",
+                    )
+                    terminal, _created = self.store.record_terminal_result(
+                        attempt_id,
+                        status=ToolAttemptStatus.SUCCEEDED,
+                        terminal_outcome="success_verified",
+                        dispatch_state="effect_confirmed",
+                        reason_code="postcondition_verified_read_only",
+                    )
+                    self.notify_terminal(attempt_id, terminal)
+                    return
+                if classification is SemanticSettleProbeClassification.STALE_OR_INVALID:
+                    terminal, _created = self.store.record_terminal_result(
+                        attempt_id,
+                        status=ToolAttemptStatus.UNKNOWN_AFTER_START,
+                        terminal_outcome="outcome_unknown",
+                        dispatch_state="effect_unknown",
+                        reason_code="semantic_settle_target_invalid",
+                    )
+                    self.notify_terminal(attempt_id, terminal)
+                    return
+            elif runtime.verify is not None:
                 try:
                     payload = runtime.verify(attempt_id)
                 except Exception:
@@ -1562,6 +4687,42 @@ class ToolAttemptCoordinator:
             if ToolAttemptStatus(current_record["status"]) in TERMINAL_STATUSES:
                 self.notify_terminal(attempt_id, current_record)
                 return
+            settle = _safe_semantic_settle(
+                current_record.get("semantic_settle")
+            )
+            if (
+                settle["state"] == "active"
+                and settle["settle_slot_count"] >= settle["max_local_checks"]
+            ):
+                for item in current_record.get("primitive_journal") or []:
+                    if (
+                        item.get("effect_role") == "semantic"
+                        and item.get("lifecycle") in {
+                            "dispatch_started", "dispatch_returned",
+                            "receipt_bound",
+                        }
+                    ):
+                        self.store.record_primitive_outcome(
+                            attempt_id,
+                            primitive_id=str(item.get("primitive_id") or ""),
+                            outcome="unknown",
+                        )
+                terminal, _created = self.store.record_terminal_result(
+                    attempt_id,
+                    status=ToolAttemptStatus.UNKNOWN_AFTER_START,
+                    terminal_outcome="outcome_unknown",
+                    dispatch_state="effect_unknown",
+                    reason_code=(
+                        "semantic_settle_exhausted"
+                        if settle["completed_observation_count"]
+                        >= settle["max_local_checks"]
+                        else "semantic_settle_evidence_unresolved"
+                        if settle["completed_observation_count"] > 0
+                        else "semantic_settle_observation_failed"
+                    ),
+                )
+                self.notify_terminal(attempt_id, terminal)
+                return
             effective_deadline, deadline_reason = self._effective_deadline(
                 current_record, now,
             )
@@ -1572,9 +4733,14 @@ class ToolAttemptCoordinator:
                 )
                 effect_possible = bool(
                     side_effect != "read_only"
-                    and dispatch_state not in {
-                        "not_dispatched", "cancelled_before_effect",
-                    }
+                    and (
+                        _semantic_dispatch_started(current_record)
+                        if current_record.get("tool_name")
+                        == "activate_desktop_surface"
+                        else dispatch_state not in {
+                            "not_dispatched", "cancelled_before_effect",
+                        }
+                    )
                 )
                 terminal, _created = self.store.record_terminal_result(
                     attempt_id,
@@ -1598,7 +4764,10 @@ class ToolAttemptCoordinator:
             progress_after = int(
                 current_record.get("useful_progress_count") or 0
             )
-            if progress_after > progress_before:
+            if (
+                progress_after > progress_before
+                and not _semantic_settle_active(current_record)
+            ):
                 current_record["reconciliation_check_index"] = 0
             next_check, check_index = self._next_progressive_check(
                 current_record, now,
@@ -1837,12 +5006,18 @@ class ToolAttemptCoordinator:
 
         now = _now() if now is None else float(now)
         recovered = []
-        for record in self.store.list_recoverable_attempts():
+        for record in self.store.list_recoverable_attempts(
+            include_not_started=True,
+        ):
             attempt_id = record["tool_attempt_id"]
             claim = self.store.claim_reconciliation(attempt_id)
             if claim is None:
                 continue
-            dispatch_started = record.get("dispatch_state") != "not_dispatched"
+            dispatch_started = (
+                _semantic_dispatch_started(record)
+                if record.get("tool_name") == "activate_desktop_surface"
+                else record.get("dispatch_state") != "not_dispatched"
+            )
             if (
                 dispatch_started
                 and (record.get("persistence_contract") or {}).get(
@@ -1932,6 +5107,9 @@ class ToolAttemptCoordinator:
 _ACTIVE_ATTEMPT_ID: ContextVar[str] = ContextVar(
     "osia_active_tool_attempt_id", default="",
 )
+_ACTIVE_ATTEMPT_STORE: ContextVar[ToolAttemptStore | None] = ContextVar(
+    "osia_active_tool_attempt_store", default=None,
+)
 _EVENT_SINK: ContextVar[Callable[[ToolAttemptEvent], None] | None] = ContextVar(
     "osia_tool_attempt_event_sink", default=None,
 )
@@ -1941,18 +5119,25 @@ _EVENT_SINK: ContextVar[Callable[[ToolAttemptEvent], None] | None] = ContextVar(
 def tool_attempt_scope(
     attempt_id: str,
     event_sink: Callable[[ToolAttemptEvent], None] | None = None,
+    store: ToolAttemptStore | None = None,
 ):
     attempt_token = _ACTIVE_ATTEMPT_ID.set(str(attempt_id or ""))
+    store_token = _ACTIVE_ATTEMPT_STORE.set(store)
     sink_token = _EVENT_SINK.set(event_sink)
     try:
         yield
     finally:
         _EVENT_SINK.reset(sink_token)
+        _ACTIVE_ATTEMPT_STORE.reset(store_token)
         _ACTIVE_ATTEMPT_ID.reset(attempt_token)
 
 
 def current_tool_attempt_id() -> str:
     return _ACTIVE_ATTEMPT_ID.get()
+
+
+def current_tool_attempt_store() -> ToolAttemptStore | None:
+    return _ACTIVE_ATTEMPT_STORE.get()
 
 
 def publish_tool_attempt_event(phase: str, reason_code: str = "") -> None:
@@ -2037,6 +5222,85 @@ def recover_orphaned_tool_attempts() -> list[dict]:
         return []
     from osia import conversations
 
+    def _canonical_chat_binding(
+        record: Mapping[str, Any],
+    ) -> tuple[bool, dict | None]:
+        if str(record.get("owner_scope") or "chat") != "chat":
+            return False, None
+        try:
+            from osia.turn_terminality import (
+                load_persisted_execution_binding,
+                persisted_turn_state_exists,
+            )
+
+            turn_id = str(record.get("turn_id") or "")
+            canonical_state_exists = persisted_turn_state_exists(turn_id)
+            binding = (
+                load_persisted_execution_binding(turn_id)
+                if canonical_state_exists else None
+            )
+        except Exception:
+            # An indeterminate durable-state probe is canonical and fail-closed;
+            # it must never enter the legacy direct-commit path.
+            return True, None
+        if not canonical_state_exists:
+            return False, None
+        expected = {
+            "conversation_id": str(record.get("conversation_id") or ""),
+            "request_id": str(record.get("request_id") or ""),
+            "turn_id": str(record.get("turn_id") or ""),
+            "provider_id": str(record.get("provider_id") or ""),
+            "model_id": str(record.get("model_id") or ""),
+        }
+        if (
+            not isinstance(binding, dict)
+            or any(not value for value in expected.values())
+            or any(
+                str(binding.get(key) or "") != value
+                for key, value in expected.items()
+            )
+            or not str(binding.get("run_id") or "")
+            or not str(binding.get("effective_reasoning") or "")
+        ):
+            return True, None
+        return True, dict(binding)
+
+    def _canonical_final_already_committed(
+        record: Mapping[str, Any], binding: Mapping[str, Any],
+    ) -> bool:
+        message_id = str(record.get("final_response_message_id") or "")
+        turn_id = str(record.get("turn_id") or "")
+        if not message_id or not turn_id:
+            return False
+        try:
+            from osia.turn_terminality import load_persisted_terminal_result
+
+            terminal = load_persisted_terminal_result(turn_id)
+            conversation = conversations.get_conversation(
+                str(record.get("conversation_id") or "")
+            )
+        except Exception:
+            return False
+        if (
+            not isinstance(terminal, dict)
+            or terminal.get("execution_binding") != dict(binding)
+        ):
+            return False
+        reserved_text = str(terminal.get("final_text") or "")
+        for message in list((conversation or {}).get("messages") or []):
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and str(message.get("_message_id") or "") == message_id
+                and str(message.get("content") or "") == reserved_text
+                and all(
+                    str(message.get("_" + key) or "") == str(value or "")
+                    for key, value in binding.items()
+                )
+            ):
+                return True
+        return False
+
     for record in recovered:
         if record.get("owner_scope") == "autonomous":
             # The Autonomous checkpoint owns its exact task continuation.  A
@@ -2048,6 +5312,42 @@ def recover_orphaned_tool_attempts() -> list[dict]:
             get_tool_attempt_coordinator().notify_terminal(
                 str(record.get("tool_attempt_id") or ""), record,
             )
+            continue
+        canonical_state_exists, canonical_binding = _canonical_chat_binding(record)
+        if canonical_state_exists:
+            if canonical_binding is None:
+                # A partial, corrupt, or mismatched canonical receipt is never
+                # downgraded to legacy recovery metadata.
+                continue
+            # Unified Chat finals belong to the exact desktop/server owner,
+            # because only that owner can reserve terminality and persist the
+            # seven-field route. Feed the receipt back through the coordinator
+            # instead of writing a parallel assistant message here.
+            attempt_id = str(record.get("tool_attempt_id") or "")
+            if _canonical_final_already_committed(record, canonical_binding):
+                claim = get_tool_attempt_store().claim_continuation(attempt_id)
+                if claim is not None:
+                    try:
+                        completed = get_tool_attempt_store().complete_continuation(
+                            attempt_id,
+                            claim,
+                            final_response_message_id=str(
+                                record.get("final_response_message_id") or ""
+                            ),
+                        )
+                    except Exception:
+                        completed = False
+                    if not completed:
+                        try:
+                            get_tool_attempt_store().release_continuation(
+                                attempt_id, claim,
+                            )
+                        except Exception:
+                            pass
+            else:
+                get_tool_attempt_coordinator().notify_terminal(
+                    attempt_id, record,
+                )
             continue
         language = str((record.get("turn_context") or {}).get("language") or "en")
         status = ToolAttemptStatus(record["status"])
@@ -2065,7 +5365,7 @@ def recover_orphaned_tool_attempts() -> list[dict]:
             "session_lost_after_terminal_receipt" if confirmed_effect else
             "session_lost_before_dispatch"
         )
-        text = (
+        recovery_text = (
             "La v\u00e9rification en lecture seule n'a montr\u00e9 aucun nouveau "
             "progr\u00e8s avant sa limite d'inactivit\u00e9. OSIA n'a pas relanc\u00e9 l'action."
             if language == "fr" and recovery_reason == "reconciliation_stalled" else
@@ -2098,6 +5398,35 @@ def recover_orphaned_tool_attempts() -> list[dict]:
         request_id = str(record.get("request_id") or "")
         turn_id = str(record.get("turn_id") or "")
         message_id = str(record.get("final_response_message_id") or "")
+        try:
+            from osia.turn_terminality import load_persisted_terminal_result
+
+            persisted_terminal = load_persisted_terminal_result(turn_id)
+        except Exception:
+            persisted_terminal = None
+        terminal_binding = (
+            persisted_terminal.get("execution_binding")
+            if isinstance(persisted_terminal, dict) else None
+        )
+        exact_terminal_binding = bool(
+            isinstance(terminal_binding, dict)
+            and str(terminal_binding.get("conversation_id") or "")
+            == str(record.get("conversation_id") or "")
+            and str(terminal_binding.get("request_id") or "") == request_id
+            and str(terminal_binding.get("turn_id") or "") == turn_id
+            and str(terminal_binding.get("run_id") or "") == turn_id
+            and str(terminal_binding.get("provider_id") or "")
+            == str(record.get("provider_id") or "")
+            and str(terminal_binding.get("model_id") or "")
+            == str(record.get("model_id") or "")
+        )
+        reserved_final = (
+            str(persisted_terminal.get("final_text") or "")
+            if exact_terminal_binding else ""
+        )
+        if is_internal_tool_control_text(reserved_final):
+            reserved_final = ""
+        text = reserved_final or recovery_text
         attempt_id = record["tool_attempt_id"]
         claim = get_tool_attempt_store().claim_continuation(attempt_id)
         if claim is None:
@@ -2108,28 +5437,80 @@ def recover_orphaned_tool_attempts() -> list[dict]:
         event_id = "event_" + secrets.token_hex(16)
         terminal_id = "event_" + secrets.token_hex(16)
         try:
+            from osia.execution_trace import (
+                ExecutionTraceLedger,
+                terminal_display_key,
+                validate_persisted_trace,
+            )
+            from osia.turn_terminality import load_persisted_execution_binding
+
+            exact_binding = load_persisted_execution_binding(turn_id)
+            expected = {
+                "conversation_id": str(record.get("conversation_id") or ""),
+                "request_id": request_id,
+                "turn_id": turn_id,
+                "run_id": turn_id,
+                "provider_id": str(record.get("provider_id") or ""),
+                "model_id": str(record.get("model_id") or ""),
+            }
+            if not isinstance(exact_binding, dict) or any(
+                str(exact_binding.get(key) or "") != value
+                for key, value in expected.items()
+            ):
+                exact_binding = {
+                    **expected,
+                    "effective_reasoning": "unknown",
+                }
+            recovery_trace = ExecutionTraceLedger(
+                **exact_binding,
+            )
+            terminal_key = terminal_display_key(
+                str(persisted_terminal.get("terminal_state") or "")
+                if reserved_final else
+                "blocked_verified"
+            )
+            if not terminal_key:
+                raise ValueError("terminal recovery trace key is unavailable")
+            recovery_trace.record(
+                kind="terminal",
+                display_key=terminal_key,
+                terminal=True,
+                dedupe_key="terminal",
+            )
+            safe_recovery_trace = validate_persisted_trace(
+                recovery_trace.snapshot()
+            )
+        except Exception:
+            safe_recovery_trace = None
+        try:
+            recovery_metadata = {
+                "_conversation_id": record.get("conversation_id"),
+                "_request_id": request_id,
+                "_client_request_id": request_id,
+                "_turn_id": turn_id,
+                "_run_id": turn_id,
+                "_message_id": message_id,
+                "_operation_id": message_id,
+                "_response_event_id": event_id,
+                "_response_sequence": 1,
+                "_terminal_event_id": terminal_id,
+                "_terminal_sequence": 2,
+                "_terminal": True,
+                "_language": language,
+                "_terminal_status": "done" if reserved_final else "error",
+                "_stage": (
+                    "terminal_recovery" if reserved_final else "tool_recovery"
+                ),
+                "_error_category": "" if reserved_final else recovery_reason,
+                "_reason_code": "" if reserved_final else recovery_reason,
+            }
+            if safe_recovery_trace is not None:
+                recovery_metadata["_execution_trace_v1"] = safe_recovery_trace
             receipt = conversations.commit_message(
                 str(record.get("conversation_id") or ""),
                 "assistant",
                 text,
-                metadata={
-                    "_conversation_id": record.get("conversation_id"),
-                    "_request_id": request_id,
-                    "_client_request_id": request_id,
-                    "_turn_id": turn_id,
-                    "_message_id": message_id,
-                    "_operation_id": message_id,
-                    "_response_event_id": event_id,
-                    "_response_sequence": 1,
-                    "_terminal_event_id": terminal_id,
-                    "_terminal_sequence": 2,
-                    "_terminal": True,
-                    "_language": language,
-                    "_terminal_status": "error",
-                    "_stage": "tool_recovery",
-                    "_error_category": recovery_reason,
-                    "_reason_code": recovery_reason,
-                },
+                metadata=recovery_metadata,
             )
         except (OSError, RuntimeError, ValueError):
             get_tool_attempt_store().release_continuation(attempt_id, claim)
@@ -2152,9 +5533,13 @@ def recover_orphaned_tool_attempts() -> list[dict]:
 __all__ = [
     "ANTI_REPLAY_RETENTION_SECONDS", "CorruptAttemptError", "IllegalTransition",
     "RECOVERABLE_STATUSES", "RevisionConflict", "TERMINAL_STATUSES",
+    "TOOL_DISPATCH_BOUNDARY_UNAVAILABLE_RESULT",
+    "TOOL_DISPATCH_CANCELLED_RESULT",
+    "SemanticSettleProbeClassification", "SemanticSettleProbeResult",
     "ToolAttemptCoordinator", "ToolAttemptEvent", "ToolAttemptStatus",
     "ToolAttemptStore",
-    "WAITING_TOOL_RESULT", "current_tool_attempt_id", "get_tool_attempt_store",
+    "WAITING_TOOL_RESULT", "current_tool_attempt_id",
+    "current_tool_attempt_store", "get_tool_attempt_store",
     "get_tool_attempt_coordinator", "publish_tool_attempt_event",
     "is_internal_tool_control_text", "recover_orphaned_tool_attempts",
     "tool_attempt_scope",

@@ -370,6 +370,17 @@ def test_crash_after_acceptance_replays_without_duplicate_then_completes(isolate
         ],
         turn_context=None,
         last_run_artifacts=[],
+        terminality_result=lambda _turn_id: {
+            "terminal_state": "success_verified",
+            "reservation_id": "reservation-crash-replay",
+            **{
+                key: meta[key]
+                for key in (
+                    "conversation_id", "request_id", "turn_id", "run_id",
+                    "provider_id", "model_id", "effective_reasoning",
+                )
+            },
+        },
     )
     desktop._persist_agent_delta(conv["id"], agent, 0, turn_meta=meta)
     stored = conversations.get_conversation(conv["id"])
@@ -392,6 +403,17 @@ def test_assistant_completion_preserves_concurrent_rename(isolated_store):
         ],
         turn_context=None,
         last_run_artifacts=[],
+        terminality_result=lambda _turn_id: {
+            "terminal_state": "success_verified",
+            "reservation_id": "reservation-concurrent-rename",
+            **{
+                key: meta[key]
+                for key in (
+                    "conversation_id", "request_id", "turn_id", "run_id",
+                    "provider_id", "model_id", "effective_reasoning",
+                )
+            },
+        },
     )
 
     desktop._persist_agent_delta(conv["id"], agent, 0, turn_meta=meta)

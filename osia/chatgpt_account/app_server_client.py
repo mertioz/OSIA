@@ -42,6 +42,9 @@ from .rate_limits import (
 SUPPORTED_MIN_VERSION = (0, 144, 1)
 SUPPORTED_MAX_VERSION = (0, 145, 0)
 CLIENT_VERSION = "1.0.0"
+_MAX_PUBLIC_REASONING_SUMMARY_PARTS = 32
+_MAX_PUBLIC_REASONING_SUMMARY_INPUT_CHARS = 8_192
+_PUBLIC_REASONING_SUMMARY_EMIT_STEP = 160
 
 _SAFE_CONFIG = """# Managed by OSIA for the isolated ChatGPT-account provider.
 check_for_update_on_startup = false
@@ -306,6 +309,7 @@ class TurnResult:
     status: str
     output_started: bool = False
     capability_events: tuple[CapabilityEvent, ...] = ()
+    public_reasoning_summary: str = ""
 
 
 @dataclass
@@ -355,6 +359,10 @@ class _TurnAttempt:
     outcome_unknown: bool = False
     terminal_permission_outcome: str = ""
     execution_strategy: Any = None
+    public_reasoning_summary_parts: dict[str, dict] = field(default_factory=dict)
+    public_reasoning_summary_order: list[str] = field(default_factory=list)
+    public_reasoning_summary: str = ""
+    public_reasoning_summary_emitted: str = ""
 
 
 def _runtime_base_dir() -> Path:
@@ -899,6 +907,154 @@ class AppServerClient:
                 return next(iter(self._attempts.values()))
         return None
 
+    def _reasoning_attempt_for(self, params: dict) -> _TurnAttempt | None:
+        """Return only an explicitly thread-bound matching public-summary turn."""
+
+        thread_id = self._thread_id(params)
+        if not thread_id:
+            return None
+        with self._state_lock:
+            attempt = self._attempts.get(thread_id)
+        if attempt is None:
+            return None
+        native_turn_id = str(params.get("turnId") or "")
+        if (
+            not native_turn_id
+            or not attempt.turn_id
+            or str(attempt.turn_id) != native_turn_id
+        ):
+            return None
+        return attempt
+
+    @staticmethod
+    def _reasoning_summary_part_key(params: dict) -> str:
+        item_id = str(params.get("itemId") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", item_id):
+            return ""
+        index = params.get("summaryIndex")
+        if index is None:
+            index = params.get("partIndex", 0)
+        if isinstance(index, bool):
+            return ""
+        try:
+            part_index = int(index)
+        except (TypeError, ValueError):
+            return ""
+        if part_index < 0 or part_index >= _MAX_PUBLIC_REASONING_SUMMARY_PARTS:
+            return ""
+        return f"{item_id}:{part_index}"
+
+    @staticmethod
+    def _sanitize_public_reasoning_summary(value: object) -> str:
+        from osia.execution_trace import sanitize_public_reasoning_summary
+
+        return sanitize_public_reasoning_summary(value)
+
+    @staticmethod
+    def _public_reasoning_summary_payload(
+        attempt: _TurnAttempt,
+        summary: str,
+    ) -> dict:
+        """Carry the provider summary with its already-bound OSIA/native turn."""
+
+        return {
+            "summary": summary,
+            "conversation_id": attempt.conversation_id,
+            "request_id": attempt.client_request_id,
+            "turn_id": attempt.osia_turn_id,
+            "run_id": attempt.osia_turn_id,
+            "provider_id": "chatgpt_account",
+            "model_id": attempt.model_id,
+            "native_thread_id": attempt.thread_id,
+            "native_turn_id": str(attempt.turn_id or ""),
+        }
+
+    def _public_reasoning_summary(self, attempt: _TurnAttempt) -> str:
+        parts = []
+        for key in attempt.public_reasoning_summary_order:
+            part = attempt.public_reasoning_summary_parts.get(key) or {}
+            text = str(part.get("delta") or part.get("seed") or "")
+            if text:
+                parts.append(text)
+        return self._sanitize_public_reasoning_summary("\n".join(parts))
+
+    @staticmethod
+    def _public_reasoning_input_size(attempt: _TurnAttempt) -> int:
+        return sum(
+            len(str(part.get("raw_delta") or part.get("seed") or ""))
+            for part in attempt.public_reasoning_summary_parts.values()
+        )
+
+    def _capture_public_reasoning_summary(
+        self,
+        attempt: _TurnAttempt,
+        method: str,
+        params: dict,
+    ) -> None:
+        key = self._reasoning_summary_part_key(params)
+        if not key:
+            return
+        part = attempt.public_reasoning_summary_parts.get(key)
+        if part is None:
+            if len(attempt.public_reasoning_summary_order) >= (
+                _MAX_PUBLIC_REASONING_SUMMARY_PARTS
+            ):
+                return
+            part = {"seed": "", "raw_delta": "", "delta": ""}
+            attempt.public_reasoning_summary_parts[key] = part
+            attempt.public_reasoning_summary_order.append(key)
+
+        if method == "item/reasoning/summaryPartAdded":
+            raw_part = params.get("part")
+            if (
+                not isinstance(raw_part, dict)
+                or raw_part.get("type") != "summary_text"
+            ):
+                return
+            raw_part = raw_part.get("text")
+            seed = self._sanitize_public_reasoning_summary(raw_part)
+            if seed and not part.get("delta"):
+                used = self._public_reasoning_input_size(attempt) - len(
+                    str(part.get("seed") or "")
+                )
+                part["seed"] = seed[:max(
+                    0, _MAX_PUBLIC_REASONING_SUMMARY_INPUT_CHARS - used,
+                )]
+            return
+
+        delta = params.get("delta")
+        if not isinstance(delta, str) or not delta:
+            return
+        used = self._public_reasoning_input_size(attempt) - len(
+            str(part.get("raw_delta") or "")
+        )
+        remaining = max(0, _MAX_PUBLIC_REASONING_SUMMARY_INPUT_CHARS - used)
+        raw_delta = (str(part.get("raw_delta") or "") + delta)[:remaining]
+        part["raw_delta"] = raw_delta
+        combined = self._sanitize_public_reasoning_summary(raw_delta)
+        if not combined or combined == part.get("delta"):
+            return
+        part["delta"] = combined
+        aggregate = self._public_reasoning_summary(attempt)
+        emitted = attempt.public_reasoning_summary_emitted
+        should_emit = bool(
+            aggregate
+            and aggregate != emitted
+            and (
+                not emitted
+                or len(aggregate) >= len(emitted) + (
+                    _PUBLIC_REASONING_SUMMARY_EMIT_STEP
+                )
+            )
+        )
+        if should_emit:
+            attempt.public_reasoning_summary = aggregate
+            attempt.public_reasoning_summary_emitted = aggregate
+            attempt.events.put((
+                "public_reasoning_summary",
+                self._public_reasoning_summary_payload(attempt, aggregate),
+            ))
+
     def _mark_unsafe(
         self,
         params: dict,
@@ -1327,10 +1483,23 @@ class AppServerClient:
                         "safe_alternatives": [],
                         "restart_reconciliation": True,
                     },
+                    provider_references={
+                        "provider_request_id": str(request_id or ""),
+                        "thread_id": str(attempt.thread_id or ""),
+                        "turn_id": str(attempt.turn_id or ""),
+                        "item_id": item_id,
+                        "tool_call_id": item_id,
+                    },
                 )
                 dispatch.tool_attempt_id = str(receipt["tool_attempt_id"])
                 store.mark_accepted(dispatch.tool_attempt_id)
+                store.arm_owner_dispatch_boundary(dispatch.tool_attempt_id)
                 store.mark_running(dispatch.tool_attempt_id)
+                _dispatch_record, dispatch_claimed = store.claim_owner_dispatch(
+                    dispatch.tool_attempt_id,
+                )
+                if not dispatch_claimed:
+                    raise RuntimeError("native_dispatch_boundary_unavailable")
                 dispatch.started = True
                 attempt.native_effect_started = True
                 if dispatch.equivalence_fingerprint:
@@ -1525,7 +1694,55 @@ class AppServerClient:
             try:
                 from osia.tool_attempts import ToolAttemptStatus
 
-                self._attempt_store().record_terminal_result(
+                attempt_store = self._attempt_store()
+                durable_attempt = (
+                    attempt_store.get_attempt(dispatch.tool_attempt_id)
+                    if hasattr(attempt_store, "get_attempt") else None
+                )
+                if isinstance(durable_attempt, dict) and hasattr(
+                    attempt_store, "apply_provider_callback",
+                ):
+                    callback_outcome = (
+                        "completed_with_receipt"
+                        if outcome == "success_verified" else
+                        "explicit_not_applied"
+                        if outcome == "cancelled_proven" else
+                        "reconciliation_required"
+                    )
+                    callback_identity = hashlib.sha256(
+                        json.dumps(
+                            {
+                                "item_id": item_id,
+                                "status": status,
+                                "exit_code": item.get("exitCode"),
+                                "outcome": callback_outcome,
+                            },
+                            ensure_ascii=True,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()[:32]
+                    attempt_store.apply_provider_callback(
+                        dispatch.tool_attempt_id,
+                        callback_id=f"native_callback_{callback_identity}",
+                        execution_epoch=str(
+                            durable_attempt.get("execution_epoch") or ""
+                        ),
+                        outcome=callback_outcome,
+                        provider_references={
+                            "thread_id": str(attempt.thread_id or ""),
+                            "turn_id": str(attempt.turn_id or ""),
+                            "item_id": item_id,
+                            "tool_call_id": item_id,
+                        },
+                        reason_code=reason,
+                        evidence_ref=(
+                            f"provider_native_item:{item_id}"
+                            if callback_outcome == "completed_with_receipt"
+                            else ""
+                        ),
+                    )
+                attempt_store.record_terminal_result(
                     dispatch.tool_attempt_id,
                     status=ToolAttemptStatus(terminal_status),
                     terminal_outcome=outcome,
@@ -1679,6 +1896,20 @@ class AppServerClient:
                     self._rate_limits_pending_update = merge_rate_limit_payload(
                         self._rate_limits_pending_update, update
                     )
+            return
+
+        if method == "item/reasoning/textDelta":
+            # Raw chain-of-thought is never a display or persistence source.
+            return
+        if method in {
+            "item/reasoning/summaryPartAdded",
+            "item/reasoning/summaryTextDelta",
+        }:
+            reasoning_attempt = self._reasoning_attempt_for(params)
+            if reasoning_attempt is not None:
+                self._capture_public_reasoning_summary(
+                    reasoning_attempt, method, params,
+                )
             return
 
         attempt = self._attempt_for(params)
@@ -2133,6 +2364,7 @@ class AppServerClient:
         final_response_message_id: str | None = None,
         effort: str | None = None,
         on_delta: Callable[[str], None] | None = None,
+        on_reasoning_summary: Callable[[dict], None] | None = None,
         timeout: float = 300.0,
         output_schema: dict | None = None,
     ) -> TurnResult:
@@ -2177,6 +2409,8 @@ class AppServerClient:
             }
             if effort:
                 params["effort"] = effort
+            if on_reasoning_summary is not None:
+                params["summary"] = "concise"
             if output_schema is not None:
                 if not isinstance(output_schema, dict):
                     raise AppServerError(
@@ -2224,6 +2458,9 @@ class AppServerClient:
                 if kind == "delta":
                     if on_delta is not None:
                         on_delta(str(payload))
+                elif kind == "public_reasoning_summary":
+                    if on_reasoning_summary is not None:
+                        on_reasoning_summary(payload)
                 elif kind == "provider_error":
                     provider_error = str(payload)
                 elif kind == "native_approval" and isinstance(payload, dict):
@@ -2259,6 +2496,20 @@ class AppServerClient:
                 elif kind == "done":
                     status = str(payload.get("status") or "failed")
                     turn_id = payload.get("turnId") or attempt.turn_id
+                    public_summary = self._public_reasoning_summary(attempt)
+                    if (
+                        public_summary
+                        and public_summary
+                        != attempt.public_reasoning_summary_emitted
+                    ):
+                        attempt.public_reasoning_summary = public_summary
+                        attempt.public_reasoning_summary_emitted = public_summary
+                        if on_reasoning_summary is not None:
+                            on_reasoning_summary(
+                                self._public_reasoning_summary_payload(
+                                    attempt, public_summary,
+                                )
+                            )
                     for dispatch in tuple(attempt.native_dispatches.values()):
                         if dispatch.started and not dispatch.terminal:
                             self._complete_native_item(attempt, {
@@ -2317,11 +2568,13 @@ class AppServerClient:
                         status=status,
                         output_started=attempt.output_started,
                         capability_events=tuple(attempt.capability_events),
+                        public_reasoning_summary=public_summary,
                     )
                     return result
         except AppServerError as exc:
             exc.capability_events = tuple(attempt.capability_events)
             exc.native_turn_id = attempt.turn_id
+            exc.public_reasoning_summary = self._public_reasoning_summary(attempt)
             raise
         finally:
             with self._state_lock:

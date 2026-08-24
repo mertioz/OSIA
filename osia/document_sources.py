@@ -488,6 +488,62 @@ class DocumentSourceStore:
                 removed += int(not directory.exists())
         return removed
 
+    def release_owned_confirmed(
+        self,
+        source_refs,
+        *,
+        owner_id: str,
+    ) -> tuple[str, ...]:
+        """Return only exact owned refs whose deletion remains indeterminate."""
+
+        expected_owner = owner_hash(owner_id)
+        refs = [valid_source_ref(value) for value in source_refs]
+        if len(refs) > 10 or len(set(refs)) != len(refs):
+            raise DocumentSourceError("duplicate_source")
+        pending: list[str] = []
+        with self._lock:
+            for ref in refs:
+                directory = self.root / ref
+                try:
+                    metadata = json.loads(
+                        (directory / "private.json").read_text("utf-8")
+                    )
+                except FileNotFoundError:
+                    try:
+                        directory.stat()
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        pending.append(ref)
+                    else:
+                        pending.append(ref)
+                    continue
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    pending.append(ref)
+                    continue
+                if metadata.get("owner_hash") != expected_owner:
+                    raise DocumentSourceError("unauthorized_source")
+                if metadata.get("bound_run_hash"):
+                    continue
+                tombstone = self.root / (
+                    f".{ref}.{secrets.token_hex(8)}.delete"
+                )
+                try:
+                    os.replace(directory, tombstone)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    pending.append(ref)
+                    continue
+                try:
+                    shutil.rmtree(tombstone)
+                except OSError:
+                    # The verified capability is already atomically detached
+                    # from its public source_ref and no longer counts toward
+                    # MAX_SOURCES. Generic cleanup retries hidden tombstones.
+                    pass
+        return tuple(pending)
+
     def link_artifact(
         self,
         source_ref: str,

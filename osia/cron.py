@@ -350,7 +350,7 @@ class CronManager:
             return True
         except Exception as e:
             print(f"[CRON] owner lock unavailable: {e}")
-            return True
+            return False
 
     def _release_owner_lock(self) -> None:
         fh = self._lock_handle
@@ -573,11 +573,6 @@ class CronManager:
         if self._busy.is_set():
             print(f"[CRON] busy — deferring '{task[:60]}' to the next tick")
             return False
-        self._busy.set()
-
-        # Commit the timing state only now that we are actually launching. The
-        # scheduler loop is single-threaded, so this completes before any later
-        # tick and cannot double-fire.
         scheduled_for = st.get("next_run") or now
         execution_context = _scheduled_execution_context(
             task_id=task_id,
@@ -588,10 +583,39 @@ class CronManager:
             original_request_id=original_request_id,
             authorization=current_job if isinstance(current_job, dict) else None,
         )
+        conversation_lease_claimed = False
+        if conversation_id:
+            try:
+                from osia.conversations import claim_background_execution
+
+                conversation_lease_claimed = claim_background_execution(
+                    conversation_id,
+                    execution_context["occurrence_id"],
+                )
+            except Exception:
+                conversation_lease_claimed = False
+            if not conversation_lease_claimed:
+                print(
+                    f"[CRON] conversation busy — deferring '{task[:60]}' "
+                    "to the next tick"
+                )
+                return False
+        self._busy.set()
+
+        # Commit the timing state only now that we are actually launching. The
+        # scheduler loop is single-threaded, so this completes before any later
+        # tick and cannot double-fire.
         try:
             from osia.scheduled_tasks import mark_scheduled_task_running
 
             if not mark_scheduled_task_running(execution_context):
+                if conversation_lease_claimed:
+                    from osia.conversations import release_background_execution
+
+                    release_background_execution(
+                        conversation_id,
+                        execution_context["occurrence_id"],
+                    )
                 self._busy.clear()
                 self._update_job_status(
                     job_index, signature, task_id,
@@ -600,6 +624,16 @@ class CronManager:
                 )
                 return False
         except Exception:
+            if conversation_lease_claimed:
+                try:
+                    from osia.conversations import release_background_execution
+
+                    release_background_execution(
+                        conversation_id,
+                        execution_context["occurrence_id"],
+                    )
+                except Exception:
+                    pass
             self._busy.clear()
             return False
         st["last_run"] = now
@@ -661,6 +695,18 @@ class CronManager:
                 last_error = str(e)[:240]
                 print(f"[CRON] task failed: {e}")
             finally:
+                if conversation_lease_claimed:
+                    try:
+                        from osia.conversations import (
+                            release_background_execution,
+                        )
+
+                        release_background_execution(
+                            conversation_id,
+                            execution_context["occurrence_id"],
+                        )
+                    except Exception:
+                        pass
                 try:
                     from osia.scheduled_tasks import (
                         mark_scheduled_task_finished,
@@ -706,7 +752,23 @@ class CronManager:
                 )
                 self._busy.clear()
 
-        threading.Thread(target=_worker, name="osia-cron-task", daemon=True).start()
+        try:
+            threading.Thread(
+                target=_worker, name="osia-cron-task", daemon=True,
+            ).start()
+        except Exception:
+            if conversation_lease_claimed:
+                try:
+                    from osia.conversations import release_background_execution
+
+                    release_background_execution(
+                        conversation_id,
+                        execution_context["occurrence_id"],
+                    )
+                except Exception:
+                    pass
+            self._busy.clear()
+            raise
         return True
 
     @staticmethod

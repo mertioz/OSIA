@@ -101,7 +101,7 @@ def test_model_selected_normal_tool_is_replaced_before_dispatch(monkeypatch):
 
     final = agent.run(text, history=[], on_sentence=lambda _text: None)
 
-    assert "Autonomous mission" in final
+    assert "controls stay in this chat" in final
     assert len(calls) == 1
     assert len(launches) == 1
     assert ordinary_dispatches == []
@@ -152,8 +152,7 @@ def test_one_route_call_binds_and_waits_for_one_exact_run():
     assert [item["status"] for item in progress] == ["planning", "verifying"]
 
 
-def test_agent_returns_durable_result_in_same_chat_without_second_provider_round():
-    calls = []
+def test_legacy_route_adapter_returns_durable_result_without_provider_round():
     agent = OSIAAgent(lang="en")
     context = _context(
         "Open Calculator and calculate 5+23.",
@@ -178,76 +177,36 @@ def test_agent_returns_durable_result_in_same_chat_without_second_provider_round
             result, request,
         ),
     })
-    agent._chat_autonomous_context = context
-    tool_content = (
-        '<tool_call>{"tool":"start_autonomous_mission",'
-        '"reason_code":"sustained_computer_work","confidence":0.99,'
-        '"explicit_request":false}</tool_call>'
+    result = chat_routing.execute_route_request(
+        context,
+        reason_code="sustained_computer_work",
+        confidence=0.99,
+        explicit_request=False,
     )
 
-    def create(**_kwargs):
-        calls.append(tool_content)
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
-            content=tool_content,
-            tool_calls=None,
-        ))])
-
-    agent.client.chat.completions.create = create
-
-    with tempfile.TemporaryDirectory() as tmp, patch(
-        "osia.turn_terminality.CONFIG_DIR", tmp,
-    ):
-        final = agent.run_terminal_turn(
-            "Open Calculator and calculate 5+23.",
-            turn_id="turn_wor265_1234",
-            history=[],
-        )
-
-    assert final == "28"
-    assert len(calls) == 1
-    assert agent.terminality_result("turn_wor265_1234")[
-        "terminal_state"
-    ] == "success_verified"
+    assert result["status"] == "completed"
+    assert result["final_text"] == "28"
+    assert chat_routing.handoff_response_text(result, "en") == "28"
+    assert agent._chat_durable_binding["run_id"] == "run_wor265"
 
 
-def test_unavailable_durable_runner_blocks_without_normal_chat_fallback():
-    calls = []
-    agent = OSIAAgent(lang="en")
-    agent._chat_autonomous_context = _context(
+def test_legacy_route_adapter_reports_unavailable_without_provider_fallback():
+    context = _context(
         "Open Calculator and calculate 5+23.",
         lambda _request: {
             "status": "unavailable",
             "error_code": "runner_transport_unavailable",
         },
     )
-    tool_content = (
-        '<tool_call>{"tool":"start_autonomous_mission",'
-        '"reason_code":"sustained_computer_work","confidence":0.99,'
-        '"explicit_request":false}</tool_call>'
+    result = chat_routing.execute_route_request(
+        context,
+        reason_code="sustained_computer_work",
+        confidence=0.99,
+        explicit_request=False,
     )
 
-    def create(**_kwargs):
-        calls.append(tool_content)
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
-            content=tool_content,
-            tool_calls=None,
-        ))])
-
-    agent.client.chat.completions.create = create
-    with tempfile.TemporaryDirectory() as tmp, patch(
-        "osia.turn_terminality.CONFIG_DIR", tmp,
-    ):
-        final = agent.run_terminal_turn(
-            "Open Calculator and calculate 5+23.",
-            turn_id="turn_wor265_unavailable",
-            history=[],
-        )
-
-    assert "could not reach" in final
-    assert len(calls) == 1
-    assert agent.terminality_result("turn_wor265_unavailable")[
-        "terminal_state"
-    ] == "blocked_verified"
+    assert result["status"] == "unavailable"
+    assert "could not reach" in chat_routing.handoff_response_text(result, "en")
 
 
 @pytest.mark.parametrize(

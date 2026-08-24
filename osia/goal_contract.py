@@ -1,8 +1,8 @@
-"""Immutable WOR-260 GoalContract sidecar derived from semantic missions.
+"""Immutable GoalContract authority derived from one semantic Chat mission.
 
-The active runtime authority remains :class:`SemanticMission`.  This module is
-deliberately unregistered and has no persistence or prompt integration; it
-provides a deterministic, validation-oriented projection for later phases.
+The contract is a deterministic, serialization-safe projection: execution can
+update evidence and world state without rewriting the user's semantic target or
+negative constraints.
 """
 
 from __future__ import annotations
@@ -13,7 +13,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable
 
-from osia.execution_strategy import SemanticActionNode, SemanticMission
+from osia.execution_strategy import (
+    SemanticActionNode,
+    SemanticMission,
+    explicit_negative_constraints,
+)
 from osia.tool_contracts import SideEffectClass
 
 
@@ -91,6 +95,30 @@ class ObservablePostcondition:
 
 
 @dataclass(frozen=True)
+class GoalExecutionBinding:
+    """Immutable Chat turn and selected provider identity."""
+
+    conversation_id: str = NOT_SPECIFIED
+    request_id: str = NOT_SPECIFIED
+    turn_id: str = NOT_SPECIFIED
+    run_id: str = NOT_SPECIFIED
+    provider_id: str = NOT_SPECIFIED
+    model_id: str = NOT_SPECIFIED
+    effective_reasoning: str = NOT_SPECIFIED
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "conversation_id": self.conversation_id,
+            "request_id": self.request_id,
+            "turn_id": self.turn_id,
+            "run_id": self.run_id,
+            "provider_id": self.provider_id,
+            "model_id": self.model_id,
+            "effective_reasoning": self.effective_reasoning,
+        }
+
+
+@dataclass(frozen=True)
 class GoalNodeContract:
     node_id: str
     objective: str
@@ -103,6 +131,8 @@ class GoalNodeContract:
     forbidden_false_success_states: tuple[StateCondition, ...]
     observable_postconditions: tuple[ObservablePostcondition, ...]
     side_effect_class: str
+    read_only: bool
+    mutation: bool
     source_semantic_node_fingerprint: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -122,6 +152,8 @@ class GoalNodeContract:
                 item.to_dict() for item in self.observable_postconditions
             ],
             "side_effect_class": self.side_effect_class,
+            "read_only": self.read_only,
+            "mutation": self.mutation,
             "source_semantic_node_fingerprint": (
                 self.source_semantic_node_fingerprint
             ),
@@ -143,6 +175,7 @@ class GoalContract:
     legacy_fingerprint: str
     nodes: tuple[GoalNodeContract, ...]
     global_constraints: tuple[GoalConstraint, ...]
+    execution_binding: GoalExecutionBinding
     fingerprint: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -154,6 +187,7 @@ class GoalContract:
             "global_constraints": [
                 item.to_dict() for item in self.global_constraints
             ],
+            "execution_binding": self.execution_binding.to_dict(),
             "fingerprint": self.fingerprint,
         }
 
@@ -167,6 +201,7 @@ class GoalContract:
             "global_constraints": [
                 item.to_dict() for item in self.global_constraints
             ],
+            "execution_binding": self.execution_binding.to_dict(),
         }
 
 
@@ -223,6 +258,40 @@ def _node_postconditions(
     )
 
 
+def _state_contracts(
+    postconditions: tuple[ObservablePostcondition, ...],
+    *,
+    scope: str,
+) -> tuple[tuple[StateCondition, ...], tuple[StateCondition, ...]]:
+    desired = tuple(
+        StateCondition(
+            attribute="observable_postcondition",
+            operator=ConditionOperator.EQUALS.value,
+            value=item.description,
+            scope=scope,
+        )
+        for item in postconditions
+    )
+    forbidden = tuple(
+        StateCondition(
+            attribute="observable_postcondition",
+            operator=ConditionOperator.NOT_EQUALS.value,
+            value=item.description,
+            scope=scope,
+        )
+        for item in postconditions
+    )
+    return desired, forbidden
+
+
+def _execution_binding(value: dict | None) -> GoalExecutionBinding:
+    raw = value if isinstance(value, dict) else {}
+    return GoalExecutionBinding(**{
+        key: _clean(raw.get(key))
+        for key in GoalExecutionBinding.__dataclass_fields__
+    })
+
+
 def _stable_node_id(node: SemanticActionNode, index: int) -> str:
     existing = _clean(node.node_id, fallback="")
     if existing:
@@ -250,12 +319,25 @@ def _contract_fingerprint(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def goal_contract_from_semantic_mission(mission: SemanticMission) -> GoalContract:
-    """Purely project one canonical semantic mission into an immutable sidecar."""
+def goal_contract_from_semantic_mission(
+    mission: SemanticMission,
+    *,
+    execution_binding: dict | None = None,
+) -> GoalContract:
+    """Project one canonical semantic mission into immutable runtime authority."""
 
     if not isinstance(mission, SemanticMission):
         raise TypeError("mission_must_be_semantic_mission")
 
+    global_constraints = tuple(
+        GoalConstraint(
+            name=str(item.get("name") or ""),
+            value=str(item.get("value") or ""),
+            source=str(item.get("source") or "user_objective"),
+        )
+        for item in explicit_negative_constraints(mission.objective)
+        if str(item.get("name") or "") and str(item.get("value") or "")
+    )
     nodes: list[GoalNodeContract] = []
     for index, source in enumerate(mission.action_nodes):
         target = _clean(source.target_object)
@@ -263,9 +345,19 @@ def goal_contract_from_semantic_mission(mission: SemanticMission) -> GoalContrac
         surface = _clean(source.required_surface)
         account = _clean(source.required_account)
         objective = _clean(source.source_clause, fallback=mission.objective)
-        forbidden = ()
+        postconditions = _node_postconditions(
+            source,
+            target=target,
+            application=application,
+            surface=surface,
+            account=account,
+        )
+        desired, forbidden = _state_contracts(
+            postconditions,
+            scope=_stable_node_id(source, index),
+        )
         if surface != NOT_SPECIFIED:
-            forbidden = (
+            forbidden = (*forbidden,
                 StateCondition(
                     attribute="surface",
                     operator=ConditionOperator.NOT_EQUALS.value,
@@ -273,6 +365,7 @@ def goal_contract_from_semantic_mission(mission: SemanticMission) -> GoalContrac
                     scope=application,
                 ),
             )
+        side_effect_class = _node_side_effect(source)
         nodes.append(GoalNodeContract(
             node_id=_stable_node_id(source, index),
             objective=objective,
@@ -280,17 +373,13 @@ def goal_contract_from_semantic_mission(mission: SemanticMission) -> GoalContrac
             application=application,
             required_surface=surface,
             required_account_profile=account,
-            constraints=(),
-            desired_state=(),
+            constraints=global_constraints,
+            desired_state=desired,
             forbidden_false_success_states=forbidden,
-            observable_postconditions=_node_postconditions(
-                source,
-                target=target,
-                application=application,
-                surface=surface,
-                account=account,
-            ),
-            side_effect_class=_node_side_effect(source),
+            observable_postconditions=postconditions,
+            side_effect_class=side_effect_class,
+            read_only=side_effect_class == SideEffectClass.READ_ONLY.value,
+            mutation=side_effect_class != SideEffectClass.READ_ONLY.value,
             source_semantic_node_fingerprint=_clean(
                 source.fingerprint, fallback=""
             ),
@@ -302,7 +391,8 @@ def goal_contract_from_semantic_mission(mission: SemanticMission) -> GoalContrac
         root_objective=root_objective,
         legacy_fingerprint=_clean(mission.fingerprint, fallback=""),
         nodes=tuple(nodes),
-        global_constraints=(),
+        global_constraints=global_constraints,
+        execution_binding=_execution_binding(execution_binding),
         fingerprint="",
     )
     contract = GoalContract(
@@ -311,6 +401,7 @@ def goal_contract_from_semantic_mission(mission: SemanticMission) -> GoalContrac
         legacy_fingerprint=provisional.legacy_fingerprint,
         nodes=provisional.nodes,
         global_constraints=provisional.global_constraints,
+        execution_binding=provisional.execution_binding,
         fingerprint=_contract_fingerprint(provisional.semantic_dict()),
     )
     return validate_goal_contract(contract)
@@ -326,6 +417,14 @@ def goal_contract_errors(contract: GoalContract) -> tuple[str, ...]:
         errors.append("missing_root_objective")
     if not contract.nodes:
         errors.append("missing_goal_nodes")
+    binding_values = tuple(contract.execution_binding.to_dict().values())
+    binding_is_unspecified = all(
+        value == NOT_SPECIFIED for value in binding_values
+    )
+    if not binding_is_unspecified and any(
+        value == NOT_SPECIFIED or not value for value in binding_values
+    ):
+        errors.append("incomplete_execution_binding")
 
     node_ids: set[str] = set()
     valid_effects = {item.value for item in SideEffectClass}
@@ -338,6 +437,12 @@ def goal_contract_errors(contract: GoalContract) -> tuple[str, ...]:
         node_ids.add(node.node_id)
         if node.side_effect_class not in valid_effects:
             errors.append("invalid_side_effect_class")
+        if node.read_only == node.mutation:
+            errors.append("invalid_read_only_mutation_state")
+        if node.read_only != (
+            node.side_effect_class == SideEffectClass.READ_ONLY.value
+        ):
+            errors.append("side_effect_read_only_mismatch")
 
         desired = {item.semantic_key() for item in node.desired_state}
         forbidden = {
@@ -370,6 +475,97 @@ def goal_contract_errors(contract: GoalContract) -> tuple[str, ...]:
     return tuple(dict.fromkeys(errors))
 
 
+def goal_contract_from_dict(value: dict) -> GoalContract:
+    """Restore and validate one exact serialized canonical GoalContract."""
+
+    if not isinstance(value, dict):
+        raise GoalContractValidationError(("invalid_contract_payload",))
+
+    def constraints(raw) -> tuple[GoalConstraint, ...]:
+        return tuple(
+            GoalConstraint(
+                name=_clean(item.get("name"), fallback=""),
+                value=_clean(item.get("value"), fallback=""),
+                source=_clean(item.get("source"), fallback=""),
+            )
+            for item in (raw if isinstance(raw, list) else [])
+            if isinstance(item, dict)
+        )
+
+    def states(raw) -> tuple[StateCondition, ...]:
+        return tuple(
+            StateCondition(
+                attribute=_clean(item.get("attribute"), fallback=""),
+                operator=_clean(item.get("operator"), fallback=""),
+                value=_clean(item.get("value"), fallback=""),
+                scope=_clean(item.get("scope")),
+            )
+            for item in (raw if isinstance(raw, list) else [])
+            if isinstance(item, dict)
+        )
+
+    def postconditions(raw) -> tuple[ObservablePostcondition, ...]:
+        return tuple(
+            ObservablePostcondition(
+                description=_clean(item.get("description"), fallback=""),
+                target=_clean(item.get("target")),
+                application=_clean(item.get("application")),
+                surface=_clean(item.get("surface")),
+                account_profile=_clean(item.get("account_profile")),
+                source=_clean(item.get("source"), fallback=""),
+            )
+            for item in (raw if isinstance(raw, list) else [])
+            if isinstance(item, dict)
+        )
+
+    nodes = []
+    for item in value.get("nodes") or []:
+        if not isinstance(item, dict):
+            continue
+        side_effect_class = _clean(
+            item.get("side_effect_class"), fallback=""
+        )
+        nodes.append(GoalNodeContract(
+            node_id=_clean(item.get("node_id"), fallback=""),
+            objective=_clean(item.get("objective"), fallback=""),
+            target=_clean(item.get("target")),
+            application=_clean(item.get("application")),
+            required_surface=_clean(item.get("required_surface")),
+            required_account_profile=_clean(
+                item.get("required_account_profile")
+            ),
+            constraints=constraints(item.get("constraints")),
+            desired_state=states(item.get("desired_state")),
+            forbidden_false_success_states=states(
+                item.get("forbidden_false_success_states")
+            ),
+            observable_postconditions=postconditions(
+                item.get("observable_postconditions")
+            ),
+            side_effect_class=side_effect_class,
+            read_only=item.get("read_only") is True,
+            mutation=item.get("mutation") is True,
+            source_semantic_node_fingerprint=_clean(
+                item.get("source_semantic_node_fingerprint"), fallback=""
+            ),
+        ))
+    binding_raw = value.get("execution_binding")
+    contract = GoalContract(
+        schema_version=_clean(value.get("schema_version"), fallback=""),
+        root_objective=_clean(value.get("root_objective"), fallback=""),
+        legacy_fingerprint=_clean(
+            value.get("legacy_fingerprint"), fallback=""
+        ),
+        nodes=tuple(nodes),
+        global_constraints=constraints(value.get("global_constraints")),
+        execution_binding=_execution_binding(
+            binding_raw if isinstance(binding_raw, dict) else None
+        ),
+        fingerprint=_clean(value.get("fingerprint"), fallback=""),
+    )
+    return validate_goal_contract(contract)
+
+
 def validate_goal_contract(contract: GoalContract) -> GoalContract:
     errors = goal_contract_errors(contract)
     if errors:
@@ -382,12 +578,14 @@ __all__ = [
     "GOAL_CONTRACT_SCHEMA_VERSION",
     "GoalConstraint",
     "GoalContract",
+    "GoalExecutionBinding",
     "GoalContractValidationError",
     "GoalNodeContract",
     "NOT_SPECIFIED",
     "ObservablePostcondition",
     "StateCondition",
     "goal_contract_errors",
+    "goal_contract_from_dict",
     "goal_contract_from_semantic_mission",
     "validate_goal_contract",
 ]

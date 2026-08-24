@@ -59,6 +59,7 @@ def _candidate(
     signature: str | None = None,
     label: str = "Multiply",
     patterns: list[str] | None = None,
+    automation_id: str = "",
 ) -> dict:
     supported_patterns = list(patterns or ["Invoke"])
     return {
@@ -66,6 +67,7 @@ def _candidate(
         "window_generation": generation,
         "structural_epoch": epoch,
         "runtime_signature": signature or "runtime-" + surface_ref,
+        "automation_id": automation_id,
         "surface_kind": "control",
         "role": "ButtonControl",
         "label": label,
@@ -94,6 +96,7 @@ def _observe(
     epoch: int = 1,
     expression: str = "347",
     observed_at: float | None = None,
+    additional_surfaces: list[dict] | None = None,
 ) -> None:
     scene = {
         "application": "calculator",
@@ -135,6 +138,7 @@ def _observe(
                 "patterns": [],
                 "actuation": {"available": False},
             },
+            *(additional_surfaces or []),
             *candidates,
         ],
     }
@@ -1145,3 +1149,87 @@ def test_25_lower_tiers_stay_hidden_while_actionable_pair_remains():
         "take_screenshot",
         "request_visual_observation",
     }.isdisjoint(frontier)
+
+
+def test_26_repeated_native_literal_family_keeps_verified_witness_after_restore():
+    strategy = _strategy()
+    first = _candidate(
+        "surface-five",
+        label="Five",
+        automation_id="num5Button",
+    )
+    _observe(strategy, [first], expression="0")
+    first_decision = es.tool_preflight(
+        "activate_desktop_surface",
+        _arguments(
+            first["surface_ref"],
+            text="5",
+            objective="Five",
+            action_pattern="Invoke",
+        ),
+        strategy=strategy,
+    )
+    assert first_decision is not None and first_decision.allowed
+    _reconcile_selected(
+        strategy,
+        first_decision,
+        surface_ref=first["surface_ref"],
+        label="Five",
+        before_text="0",
+        effect=_effect("5"),
+    )
+
+    second = _candidate(
+        "surface-two",
+        label="Two",
+        automation_id="num2Button",
+    )
+    history = {
+        "surface_ref": "surface-history",
+        "window_generation": "generation-1",
+        "structural_epoch": 1,
+        "runtime_signature": "runtime-history",
+        "surface_kind": "control",
+        "role": "TextControl",
+        "label": "5 +",
+        "parent_surface_ref": WINDOW_REF,
+        "enabled": True,
+        "patterns": [],
+        "actuation": {"available": False},
+    }
+    _observe(
+        strategy,
+        [second],
+        expression="5",
+        additional_surfaces=[history],
+    )
+    restored = es.ExecutionStrategy.from_snapshot(strategy.snapshot())
+
+    rejected = es.tool_preflight(
+        "activate_desktop_surface",
+        {
+            "surface_ref": second["surface_ref"],
+            "objective": "Two",
+            "action_pattern": "Invoke",
+            "observable_effect": {
+                "kind": "exact_surface_text",
+                "surface_ref": history["surface_ref"],
+                "expected_text": "5 + 2",
+            },
+        },
+        strategy=restored,
+    )
+    accepted = es.tool_preflight(
+        "activate_desktop_surface",
+        _arguments(
+            second["surface_ref"],
+            text="2",
+            objective="Two",
+            action_pattern="Invoke",
+        ),
+        strategy=restored,
+    )
+
+    assert rejected is not None and rejected.allowed is False
+    assert rejected.reason_code == "uia_literal_family_witness_conflict"
+    assert accepted is not None and accepted.allowed is True

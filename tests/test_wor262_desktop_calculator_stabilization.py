@@ -2485,6 +2485,7 @@ def _local_open_probe_harness(
     observed_at: float | None = None,
     probe_payload: dict | None = None,
     unrelated_unknowns: tuple[str, ...] = (),
+    semantic_settle: bool = False,
 ):
     from osia import agent as agent_module
     from osia.tool_contracts import (
@@ -2567,6 +2568,20 @@ def _local_open_probe_harness(
         "hard_deadline_at": time.time() + 30.0,
         "inactivity_deadline_at": time.time() + 20.0,
     }
+    if semantic_settle:
+        durable.update({
+            "semantic_settle": {
+                "state": "active",
+                "checkpoint_id": "substep-local-probe",
+            },
+            "primitive_journal": [{
+                "effect_role": "semantic",
+                "application_identity": "calculator",
+                "surface_ref": "surface-local-probe",
+                "native_window_id": "592338",
+                "window_generation": "calculator-generation-1",
+            }],
+        })
     store = _LocalProbeStore(durable)
     foreground = _named_scene(
         "robloxplayerbeta",
@@ -2636,6 +2651,30 @@ def test_local_reconciliation_01_executes_without_provider_request(tmp_path):
         item.get("phase") == "local_reconciliation_probe_dispatched"
         for item in store.progress
     )
+
+
+def test_local_reconciliation_01b_settle_probe_returns_typed_local_receipt(
+    tmp_path,
+):
+    from osia.tool_attempts import (
+        SemanticSettleProbeClassification,
+        SemanticSettleProbeResult,
+    )
+
+    agent, _strategy_state, _controller, _decision, _store, result = (
+        _local_open_probe_harness(tmp_path, semantic_settle=True)
+    )
+
+    assert isinstance(result, SemanticSettleProbeResult)
+    assert result.classification is (
+        SemanticSettleProbeClassification.COMPLETED_MATCH
+    )
+    assert result.observer_mechanism == "inspect_desktop_surfaces"
+    assert result.probe_invoked is True
+    assert result.observation_completed_at >= result.observation_started_at
+    assert result.evidence_ref.startswith("sha256:")
+    assert result.terminal_payload.outcome.value == "success_verified"
+    assert agent.client.mock_calls == []
 
 
 def test_local_reconciliation_02_selector_uses_semantic_application_open_relation():
@@ -3179,7 +3218,15 @@ def test_stepwise_05_second_primitive_becomes_eligible_after_first_proof():
     _observe_stepwise_primitive(strategy, "3")
     second = tool_preflight(
         "activate_desktop_surface",
-        {"surface_ref": "calculator-button-1", "objective": BUTTON_LABELS[1]},
+        {
+            "surface_ref": "calculator-button-1",
+            "objective": BUTTON_LABELS[1],
+            "observable_effect": {
+                "kind": "exact_surface_text",
+                "surface_ref": "calculator-display",
+                "expected_text": "34",
+            },
+        },
         strategy=strategy,
     )
     assert second is not None and second.allowed
@@ -3242,7 +3289,15 @@ def test_stepwise_09_two_completed_primitives_make_third_ordered():
     _observe_stepwise_primitive(strategy, "34")
     third = tool_preflight(
         "activate_desktop_surface",
-        {"surface_ref": "calculator-button-2", "objective": BUTTON_LABELS[2]},
+        {
+            "surface_ref": "calculator-button-2",
+            "objective": BUTTON_LABELS[2],
+            "observable_effect": {
+                "kind": "exact_surface_text",
+                "surface_ref": "calculator-display",
+                "expected_text": "347",
+            },
+        },
         strategy=strategy,
     )
     assert third.allowed
@@ -3828,6 +3883,11 @@ def test_reacquisition_07_verified_focus_makes_uia_eligible():
         {
             "surface_ref": focused.surfaces[1].ref_id,
             "objective": focused.surfaces[1].accessible_label,
+            "observable_effect": {
+                "kind": "exact_surface_text",
+                "surface_ref": "calculator-target-calculator-display",
+                "expected_text": "3",
+            },
         },
         strategy=strategy,
     )
@@ -5234,6 +5294,11 @@ def test_final_activation_03_verified_focus_immediately_unlocks_uia(tmp_path):
         {
             "surface_ref": focused.surfaces[1].ref_id,
             "objective": focused.surfaces[1].accessible_label,
+            "observable_effect": {
+                "kind": "exact_surface_text",
+                "surface_ref": "calculator-target-calculator-display",
+                "expected_text": "3",
+            },
         },
         strategy=strategy,
     )
@@ -5344,6 +5409,11 @@ def test_final_activation_08_rich_focus_keeps_uia_ahead_of_all_fallbacks():
         {
             "surface_ref": focused.surfaces[1].ref_id,
             "objective": focused.surfaces[1].accessible_label,
+            "observable_effect": {
+                "kind": "exact_surface_text",
+                "surface_ref": "calculator-target-calculator-display",
+                "expected_text": "3",
+            },
         },
         strategy=strategy,
     )
@@ -5478,6 +5548,38 @@ def test_uia_reconciliation_04_fresh_exact_evidence_resolves_only_primitive():
     assert strategy.succeeded is False
 
 
+def test_uia_reconciliation_04b_exact_no_op_retries_the_same_substep_safely():
+    strategy = _stepwise_strategy()
+    _decision, attempt, arguments = _start_stepwise_primitive(
+        strategy, BUTTON_LABELS[0],
+    )
+    result = _uia_reconciliation_observation(
+        strategy,
+        "0",
+        observed_at=attempt.dispatched_at + 6.0,
+    )
+
+    assert record_tool_observation(
+        "inspect_desktop_surfaces",
+        result,
+        is_error=False,
+        strategy=strategy,
+    ) is True
+    retry = tool_preflight(
+        "activate_desktop_surface",
+        arguments,
+        strategy=strategy,
+    )
+
+    assert attempt.status == "blocked"
+    assert retry is not None and retry.allowed
+    retry_attempt = strategy.attempt_by_id(retry.attempt_id)
+    assert retry_attempt is not None
+    assert retry_attempt.substep_id == attempt.substep_id
+    assert retry_attempt.substep_index == attempt.substep_index
+    assert retry_attempt.attempt_id != attempt.attempt_id
+
+
 def test_uia_reconciliation_05_wrong_substep_cannot_resolve_primitive():
     strategy = _stepwise_strategy()
     _decision, attempt, _arguments = _start_stepwise_primitive(
@@ -5585,7 +5687,15 @@ def test_uia_reconciliation_08_no_replay_and_repeated_composite_progression():
     ]
     third = tool_preflight(
         "activate_desktop_surface",
-        {"surface_ref": "calculator-button-2", "objective": BUTTON_LABELS[2]},
+        {
+            "surface_ref": "calculator-button-2",
+            "objective": BUTTON_LABELS[2],
+            "observable_effect": {
+                "kind": "exact_surface_text",
+                "surface_ref": "calculator-display",
+                "expected_text": "347",
+            },
+        },
         strategy=strategy,
     )
     assert third is not None and third.allowed
@@ -5720,7 +5830,15 @@ def test_uia_reconciliation_09_waiting_tool_dispatches_read_only_probe(
     restored = agent._pending_tool_runtime["reconciliation_strategy"]
     second = tool_preflight(
         "activate_desktop_surface",
-        {"surface_ref": "calculator-button-1", "objective": BUTTON_LABELS[1]},
+        {
+            "surface_ref": "calculator-button-1",
+            "objective": BUTTON_LABELS[1],
+            "observable_effect": {
+                "kind": "exact_surface_text",
+                "surface_ref": "calculator-display",
+                "expected_text": "34",
+            },
+        },
         strategy=restored,
     )
 

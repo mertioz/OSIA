@@ -114,6 +114,7 @@ class DesktopSurfaceRef:
     patterns: tuple[str, ...] = ()
     structural_epoch: int = 0
     observed_at: float = field(default_factory=time.time)
+    automation_id: str = ""
 
     def to_safe_dict(self) -> dict:
         payload = {
@@ -135,6 +136,8 @@ class DesktopSurfaceRef:
             payload["bounds"] = self.bounds.to_safe_dict()
         if self.runtime_signature:
             payload["runtime_signature"] = self.runtime_signature
+        if self.automation_id:
+            payload["automation_id"] = self.automation_id
         if self.patterns:
             payload["patterns"] = list(self.patterns)
         return payload
@@ -258,6 +261,7 @@ class DesktopSurfaceRegistry:
         native: NativeSurfaceIdentity,
         stable_identity: str,
         patterns: Iterable[str] = (),
+        automation_id: str = "",
     ) -> DesktopSurfaceRef:
         stable_parent = "" if runtime_signature else parent_ref
         stable_key = _digest(
@@ -292,6 +296,7 @@ class DesktopSurfaceRegistry:
                         enabled=bool(enabled),
                         parent_ref=parent_ref,
                         bounds=bounds,
+                        automation_id=str(automation_id or "")[:160],
                         patterns=tuple(str(item) for item in patterns)[:16],
                         observed_at=time.time(),
                     )
@@ -315,6 +320,7 @@ class DesktopSurfaceRegistry:
                 parent_ref=parent_ref,
                 bounds=bounds,
                 runtime_signature=runtime_signature,
+                automation_id=str(automation_id or "")[:160],
                 patterns=tuple(str(item) for item in patterns)[:16],
                 structural_epoch=int(structural_epoch),
             )

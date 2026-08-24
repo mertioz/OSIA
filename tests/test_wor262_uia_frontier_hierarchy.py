@@ -239,7 +239,15 @@ def test_06_background_safe_uia_does_not_require_window_activation():
     assert es.tool_applicability(
         strategy,
         "activate_desktop_surface",
-        {"surface_ref": CONTROL_REF, "objective": "Three"},
+        {
+            "surface_ref": CONTROL_REF,
+            "objective": "Three",
+            "observable_effect": {
+                "kind": "exact_surface_text",
+                "surface_ref": DISPLAY_REF,
+                "expected_text": "3",
+            },
+        },
     ) == (True, "")
     assert strategy.effect_is_completed(
         "application_foreground",
@@ -260,7 +268,15 @@ def test_07_foreground_required_uia_waits_for_fresh_verified_activation():
     assert es.tool_applicability(
         strategy,
         "activate_desktop_surface",
-        {"surface_ref": CONTROL_REF, "objective": "Three"},
+        {
+            "surface_ref": CONTROL_REF,
+            "objective": "Three",
+            "observable_effect": {
+                "kind": "exact_surface_text",
+                "surface_ref": DISPLAY_REF,
+                "expected_text": "3",
+            },
+        },
     ) == (False, "exact_target_activation_required")
     assert es.tool_applicability(
         strategy,
@@ -285,7 +301,15 @@ def test_07_foreground_required_uia_waits_for_fresh_verified_activation():
     assert es.tool_applicability(
         strategy,
         "activate_desktop_surface",
-        {"surface_ref": CONTROL_REF, "objective": "Three"},
+        {
+            "surface_ref": CONTROL_REF,
+            "objective": "Three",
+            "observable_effect": {
+                "kind": "exact_surface_text",
+                "surface_ref": DISPLAY_REF,
+                "expected_text": "3",
+            },
+        },
     ) == (True, "")
 
 

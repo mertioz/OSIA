@@ -553,7 +553,8 @@ def test_cancellation_planning_and_after_possible_effect_are_authoritative():
         effect = _controller(tmp, turn="cancel-effect")
         effect.request_cancellation(effect_possible=True)
         reconcile = effect.evaluate(provider_route="p:m")
-        assert reconcile.next_strategy == "reconcile_unknown_read_only"
+        assert reconcile.terminal_state == "user_cancelled"
+        assert effect.snapshot()["unknown_effects"]
         effect.reconcile_unknown(
             "cancellation_possible_effect",
             outcome="cancelled_proven",
@@ -613,7 +614,8 @@ def test_late_provider_result_after_planning_cancellation_is_ignored():
             on_sentence=streamed.append,
         )
         assert final != "late provider final"
-        assert streamed == [final]
+        assert final == ""
+        assert streamed == []
         assert agent.terminality_result("cancel-late")["terminal_state"] == (
             "user_cancelled"
         )
@@ -830,6 +832,7 @@ def test_multiple_internal_invocations_emit_one_mobile_persistence_and_tts_final
                 self.finished = []
                 self.marked = 0
                 self.cancelled = False
+                self.task = types.SimpleNamespace(done=lambda: False)
                 tts.append(self)
 
             def start(self):

@@ -1,15 +1,18 @@
 """Bounded public execution-status projection for Mobile (WOR-254).
 
-This module never accepts model prose, tool arguments/results, paths, provider
-payloads, or exception text.  Producers select one deterministic display key
-from the allowlist below; only the resulting safe projection may be persisted
-or sent to a client.
+This module never accepts raw reasoning, ordinary model prose, tool
+arguments/results, paths, provider payloads, or exception text. Producers select
+one deterministic display key from the allowlist below. The sole bounded-text
+exception is a provider-designated public reasoning summary, ingested through a
+dedicated sanitizer rather than the general event API.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Mapping
@@ -22,6 +25,7 @@ MAX_LIVE_FRAMES = 32
 MAX_SERIALIZED_BYTES = 12 * 1024
 MAX_RELAY_SNAPSHOT_EVENTS = 8
 MAX_RELAY_SNAPSHOT_BYTES = 4 * 1024
+MAX_PUBLIC_REASONING_SUMMARY_CHARS = 1_600
 
 EVENT_KINDS = frozenset({
     "goal",
@@ -30,6 +34,7 @@ EVENT_KINDS = frozenset({
     "result",
     "continuation",
     "reconciliation",
+    "public_reasoning_summary",
     "terminal",
 })
 
@@ -53,13 +58,14 @@ DISPLAY_SPECS: dict[str, tuple[str, frozenset[str]]] = {
     "execution.result.cancelled": ("result", frozenset()),
     "execution.continuation.new_strategy": ("continuation", frozenset()),
     "execution.reconciliation.verifying": ("reconciliation", frozenset()),
+    "execution.reasoning.summary": ("public_reasoning_summary", frozenset()),
     "execution.terminal.success": ("terminal", frozenset()),
     "execution.terminal.blocked": ("terminal", frozenset()),
     "execution.terminal.cancelled": ("terminal", frozenset()),
     "execution.terminal.safety_block": ("terminal", frozenset()),
 }
 
-_EVENT_REQUIRED_FIELDS = frozenset({
+_LEGACY_EVENT_REQUIRED_FIELDS = frozenset({
     "schema_version",
     "event_id",
     "conversation_id",
@@ -73,10 +79,26 @@ _EVENT_REQUIRED_FIELDS = frozenset({
     "terminal",
     "redaction_class",
 })
+_TRACE_BINDING_FIELDS = frozenset({
+    "run_id",
+    "provider_id",
+    "model_id",
+    "effective_reasoning",
+})
+_EVENT_REQUIRED_FIELDS = _LEGACY_EVENT_REQUIRED_FIELDS | _TRACE_BINDING_FIELDS
 _EVENT_OPTIONAL_FIELDS = frozenset({
     "invocation_id",
     "tool_attempt_id",
     "permission_request_id",
+    "summary",
+})
+_LEGACY_SNAPSHOT_FIELDS = frozenset({
+    "schema_version",
+    "conversation_id",
+    "request_id",
+    "turn_id",
+    "redaction_class",
+    "events",
 })
 
 _ID_CHARS = frozenset(
@@ -85,9 +107,10 @@ _ID_CHARS = frozenset(
 _PRIORITY = {
     "terminal": 0,
     "goal": 1,
-    "waiting_permission": 2,
-    "reconciliation": 3,
-    "result": 4,
+    "public_reasoning_summary": 2,
+    "waiting_permission": 3,
+    "reconciliation": 4,
+    "result": 5,
     "continuation": 5,
     "action": 6,
 }
@@ -106,6 +129,61 @@ def _safe_id(value: object, *, maximum: int = 256, required: bool = True) -> str
     ):
         raise ValueError("invalid execution trace correlation identifier")
     return text
+
+
+def _safe_binding_label(
+    value: object,
+    *,
+    maximum: int,
+    fallback: str,
+) -> str:
+    text = str(value or fallback).strip()
+    if not text:
+        text = fallback
+    if len(text) > maximum or any(ord(char) < 32 or ord(char) == 127 for char in text):
+        raise ValueError("invalid execution trace binding label")
+    return text
+
+
+def sanitize_public_reasoning_summary(value: object) -> str:
+    """Return one bounded provider-designated public summary, never raw CoT."""
+
+    if not isinstance(value, str):
+        return ""
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    text = "".join(
+        char
+        for char in text
+        if char in "\n\t" or (ord(char) >= 32 and ord(char) != 127)
+    )
+    if re.search(
+        r"<\s*/?\s*(?:think(?:ing)?|reasoning|analysis|"
+        r"tool(?:[_-]?(?:call|result|code))?|function_calls)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return ""
+    # Directional overrides/isolates can make a benign-looking UI string render
+    # differently from its stored value. They are never needed in a summary.
+    text = text.translate({
+        codepoint: None
+        for codepoint in (
+            0x061C, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C,
+            0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069,
+        )
+    })
+    lines = [line.rstrip() for line in text.split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    compacted = []
+    for line in lines:
+        if not line and (not compacted or not compacted[-1]):
+            continue
+        compacted.append(line)
+    text = "\n".join(compacted)
+    return text[:MAX_PUBLIC_REASONING_SUMMARY_CHARS].rstrip()
 
 
 def _safe_args(display_key: str, value: object) -> dict:
@@ -160,6 +238,10 @@ class SafeExecutionTraceEvent:
     conversation_id: str
     request_id: str
     turn_id: str
+    run_id: str
+    provider_id: str
+    model_id: str
+    effective_reasoning: str
     sequence: int
     revision: int
     kind: str
@@ -170,6 +252,7 @@ class SafeExecutionTraceEvent:
     invocation_id: str = ""
     tool_attempt_id: str = ""
     permission_request_id: str = ""
+    summary: str = ""
 
     def public_dict(self) -> dict:
         value = {
@@ -178,6 +261,10 @@ class SafeExecutionTraceEvent:
             "conversation_id": self.conversation_id,
             "request_id": self.request_id,
             "turn_id": self.turn_id,
+            "run_id": self.run_id,
+            "provider_id": self.provider_id,
+            "model_id": self.model_id,
+            "effective_reasoning": self.effective_reasoning,
             "sequence": self.sequence,
             "revision": self.revision,
             "kind": self.kind,
@@ -193,6 +280,8 @@ class SafeExecutionTraceEvent:
         ):
             if item:
                 value[key] = item
+        if self.kind == "public_reasoning_summary" and self.summary:
+            value["summary"] = self.summary
         return value
 
 
@@ -205,21 +294,52 @@ class ExecutionTraceLedger:
         conversation_id: str,
         request_id: str,
         turn_id: str,
+        run_id: str = "",
+        provider_id: str = "unknown",
+        model_id: str = "unknown",
+        effective_reasoning: str = "auto",
         callback: Callable[[dict], None] | None = None,
     ) -> None:
         self.conversation_id = _safe_id(conversation_id)
         self.request_id = _safe_id(request_id)
         self.turn_id = _safe_id(turn_id)
+        self.run_id = _safe_id(run_id or turn_id)
+        self.provider_id = _safe_binding_label(
+            provider_id, maximum=64, fallback="unknown",
+        )
+        self.model_id = _safe_binding_label(
+            model_id, maximum=160, fallback="unknown",
+        )
+        self.effective_reasoning = _safe_binding_label(
+            effective_reasoning, maximum=64, fallback="auto",
+        )
         self._callback = callback if callable(callback) else None
         self._events: list[SafeExecutionTraceEvent] = []
         self._by_slot: dict[str, int] = {}
         self._sequence = 0
         self._live_frames = 0
         self._terminal = False
+        self._lock = threading.RLock()
 
     @property
-    def key(self) -> tuple[str, str, str]:
-        return self.conversation_id, self.request_id, self.turn_id
+    def key(self) -> tuple[str, str, str, str]:
+        return (
+            self.conversation_id,
+            self.request_id,
+            self.turn_id,
+            self.run_id,
+        )
+
+    def binding_dict(self) -> dict:
+        return {
+            "conversation_id": self.conversation_id,
+            "request_id": self.request_id,
+            "turn_id": self.turn_id,
+            "run_id": self.run_id,
+            "provider_id": self.provider_id,
+            "model_id": self.model_id,
+            "effective_reasoning": self.effective_reasoning,
+        }
 
     def record(
         self,
@@ -232,84 +352,119 @@ class ExecutionTraceLedger:
         tool_attempt_id: str = "",
         permission_request_id: str = "",
         dedupe_key: str = "",
+        _public_reasoning_summary: str = "",
     ) -> SafeExecutionTraceEvent | None:
-        if self._terminal:
-            return None
-        spec = DISPLAY_SPECS.get(display_key)
-        if kind not in EVENT_KINDS or spec is None or spec[0] != kind:
-            return None
-        try:
-            safe_args = _safe_args(display_key, display_args or {})
-            invocation = _safe_id(invocation_id, maximum=256, required=False)
-            attempt = _safe_id(tool_attempt_id, maximum=256, required=False)
-            permission = _safe_id(
-                permission_request_id, maximum=256, required=False,
-            )
-        except ValueError:
-            return None
-        if terminal != (kind == "terminal"):
-            return None
+        with self._lock:
+            if self._terminal:
+                return None
+            spec = DISPLAY_SPECS.get(display_key)
+            if kind not in EVENT_KINDS or spec is None or spec[0] != kind:
+                return None
+            try:
+                safe_args = _safe_args(display_key, display_args or {})
+                invocation = _safe_id(invocation_id, maximum=256, required=False)
+                attempt = _safe_id(tool_attempt_id, maximum=256, required=False)
+                permission = _safe_id(
+                    permission_request_id, maximum=256, required=False,
+                )
+            except ValueError:
+                return None
+            if terminal != (kind == "terminal"):
+                return None
+            summary = ""
+            if kind == "public_reasoning_summary":
+                summary = sanitize_public_reasoning_summary(
+                    _public_reasoning_summary
+                )
+                if not summary:
+                    return None
+            elif _public_reasoning_summary:
+                return None
 
-        slot = str(dedupe_key or "")
-        existing_index = self._by_slot.get(slot) if slot else None
-        if existing_index is not None:
-            previous = self._events[existing_index]
-            if (
-                previous.kind == kind
-                and previous.display_key == display_key
-                and previous.display_args == safe_args
-                and previous.invocation_id == invocation
-                and previous.tool_attempt_id == attempt
-                and previous.permission_request_id == permission
-            ):
-                return previous
-            event = SafeExecutionTraceEvent(
-                event_id=previous.event_id,
-                conversation_id=self.conversation_id,
-                request_id=self.request_id,
-                turn_id=self.turn_id,
-                sequence=previous.sequence,
-                revision=previous.revision + 1,
-                kind=kind,
-                display_key=display_key,
-                display_args=safe_args,
-                timestamp=_now(),
-                terminal=terminal,
-                invocation_id=invocation,
-                tool_attempt_id=attempt,
-                permission_request_id=permission,
-            )
-            self._events[existing_index] = event
-        else:
-            self._sequence += 1
-            stable_slot = slot or f"sequence:{self._sequence}"
-            digest = hashlib.sha256(
-                "\0".join((*self.key, stable_slot)).encode("utf-8")
-            ).hexdigest()[:32]
-            event = SafeExecutionTraceEvent(
-                event_id="trace_" + digest,
-                conversation_id=self.conversation_id,
-                request_id=self.request_id,
-                turn_id=self.turn_id,
-                sequence=self._sequence,
-                revision=1,
-                kind=kind,
-                display_key=display_key,
-                display_args=safe_args,
-                timestamp=_now(),
-                terminal=terminal,
-                invocation_id=invocation,
-                tool_attempt_id=attempt,
-                permission_request_id=permission,
-            )
-            self._events.append(event)
-            if slot:
-                self._by_slot[slot] = len(self._events) - 1
+            slot = str(dedupe_key or "")
+            existing_index = self._by_slot.get(slot) if slot else None
+            if existing_index is not None:
+                previous = self._events[existing_index]
+                if (
+                    previous.kind == kind
+                    and previous.display_key == display_key
+                    and previous.display_args == safe_args
+                    and previous.invocation_id == invocation
+                    and previous.tool_attempt_id == attempt
+                    and previous.permission_request_id == permission
+                    and previous.summary == summary
+                ):
+                    return previous
+                event = SafeExecutionTraceEvent(
+                    event_id=previous.event_id,
+                    conversation_id=self.conversation_id,
+                    request_id=self.request_id,
+                    turn_id=self.turn_id,
+                    run_id=self.run_id,
+                    provider_id=self.provider_id,
+                    model_id=self.model_id,
+                    effective_reasoning=self.effective_reasoning,
+                    sequence=previous.sequence,
+                    revision=previous.revision + 1,
+                    kind=kind,
+                    display_key=display_key,
+                    display_args=safe_args,
+                    timestamp=_now(),
+                    terminal=terminal,
+                    invocation_id=invocation,
+                    tool_attempt_id=attempt,
+                    permission_request_id=permission,
+                    summary=summary,
+                )
+                self._events[existing_index] = event
+            else:
+                self._sequence += 1
+                stable_slot = slot or f"sequence:{self._sequence}"
+                digest = hashlib.sha256(
+                    "\0".join((*self.key, stable_slot)).encode("utf-8")
+                ).hexdigest()[:32]
+                event = SafeExecutionTraceEvent(
+                    event_id="trace_" + digest,
+                    conversation_id=self.conversation_id,
+                    request_id=self.request_id,
+                    turn_id=self.turn_id,
+                    run_id=self.run_id,
+                    provider_id=self.provider_id,
+                    model_id=self.model_id,
+                    effective_reasoning=self.effective_reasoning,
+                    sequence=self._sequence,
+                    revision=1,
+                    kind=kind,
+                    display_key=display_key,
+                    display_args=safe_args,
+                    timestamp=_now(),
+                    terminal=terminal,
+                    invocation_id=invocation,
+                    tool_attempt_id=attempt,
+                    permission_request_id=permission,
+                    summary=summary,
+                )
+                self._events.append(event)
+                if slot:
+                    self._by_slot[slot] = len(self._events) - 1
 
-        if terminal:
-            self._terminal = True
-        self._publish(event)
-        return event
+            if terminal:
+                self._terminal = True
+            self._publish(event)
+            return event
+
+    def record_public_reasoning_summary(
+        self,
+        summary: str,
+    ) -> SafeExecutionTraceEvent | None:
+        """Record only an explicit provider public-summary aggregate."""
+
+        return self.record(
+            kind="public_reasoning_summary",
+            display_key="execution.reasoning.summary",
+            dedupe_key="provider_public_reasoning_summary",
+            _public_reasoning_summary=summary,
+        )
 
     def _publish(self, event: SafeExecutionTraceEvent) -> None:
         if self._callback is None:
@@ -345,6 +500,10 @@ class ExecutionTraceLedger:
                 "conversation_id": self.conversation_id,
                 "request_id": self.request_id,
                 "turn_id": self.turn_id,
+                "run_id": self.run_id,
+                "provider_id": self.provider_id,
+                "model_id": self.model_id,
+                "effective_reasoning": self.effective_reasoning,
                 "redaction_class": REDACTION_CLASS,
                 "events": [item.public_dict() for item in events],
             }
@@ -361,26 +520,32 @@ class ExecutionTraceLedger:
         return []
 
     def snapshot(self) -> dict:
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "conversation_id": self.conversation_id,
-            "request_id": self.request_id,
-            "turn_id": self.turn_id,
-            "redaction_class": REDACTION_CLASS,
-            "events": [item.public_dict() for item in self._compacted_events()],
-        }
+        with self._lock:
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "conversation_id": self.conversation_id,
+                "request_id": self.request_id,
+                "turn_id": self.turn_id,
+                "run_id": self.run_id,
+                "provider_id": self.provider_id,
+                "model_id": self.model_id,
+                "effective_reasoning": self.effective_reasoning,
+                "redaction_class": REDACTION_CLASS,
+                "events": [
+                    item.public_dict() for item in self._compacted_events()
+                ],
+            }
 
 
 def validate_persisted_trace(value: object) -> dict | None:
     """Fail-closed validator used before exposing stored trace metadata."""
 
-    if not isinstance(value, Mapping) or set(value) != {
-        "schema_version",
-        "conversation_id",
-        "request_id",
-        "turn_id",
-        "redaction_class",
-        "events",
+    if not isinstance(value, Mapping):
+        return None
+    value_keys = set(value)
+    if value_keys not in {
+        _LEGACY_SNAPSHOT_FIELDS,
+        _LEGACY_SNAPSHOT_FIELDS | _TRACE_BINDING_FIELDS,
     }:
         return None
     if (
@@ -395,25 +560,51 @@ def validate_persisted_trace(value: object) -> dict | None:
     encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     if len(encoded) > MAX_SERIALIZED_BYTES:
         return None
+    extended_envelope = _TRACE_BINDING_FIELDS.issubset(value_keys)
     try:
-        ledger = ExecutionTraceLedger(
-            conversation_id=value.get("conversation_id"),
-            request_id=value.get("request_id"),
-            turn_id=value.get("turn_id"),
-        )
+        conversation_id = _safe_id(value.get("conversation_id"))
+        request_id = _safe_id(value.get("request_id"))
+        turn_id = _safe_id(value.get("turn_id"))
+        envelope_binding = None
+        if extended_envelope:
+            envelope_binding = {
+                "run_id": _safe_id(value.get("run_id")),
+                "provider_id": _safe_binding_label(
+                    value.get("provider_id"), maximum=64, fallback="unknown",
+                ),
+                "model_id": _safe_binding_label(
+                    value.get("model_id"), maximum=160, fallback="unknown",
+                ),
+                "effective_reasoning": _safe_binding_label(
+                    value.get("effective_reasoning"), maximum=64, fallback="auto",
+                ),
+            }
+            if any(
+                value.get(key) != item
+                for key, item in envelope_binding.items()
+            ):
+                return None
     except ValueError:
         return None
     last_sequence = 0
     terminal_seen = False
     validated: list[dict] = []
+    inferred_binding = None
     for raw in events:
         if not isinstance(raw, Mapping):
             return None
         raw_keys = set(raw)
-        if (
-            not _EVENT_REQUIRED_FIELDS.issubset(raw_keys)
-            or raw_keys - _EVENT_REQUIRED_FIELDS - _EVENT_OPTIONAL_FIELDS
+        extended_event = _TRACE_BINDING_FIELDS.issubset(raw_keys)
+        required_fields = (
+            _EVENT_REQUIRED_FIELDS
+            if extended_event else
+            _LEGACY_EVENT_REQUIRED_FIELDS
+        )
+        if not required_fields.issubset(raw_keys) or (
+            raw_keys - required_fields - _EVENT_OPTIONAL_FIELDS
         ):
+            return None
+        if extended_envelope and not extended_event:
             return None
         display = raw.get("display")
         kind = raw.get("kind")
@@ -428,9 +619,9 @@ def validate_persisted_trace(value: object) -> dict | None:
             type(raw.get("schema_version")) is not int
             or raw.get("schema_version") != SCHEMA_VERSION
             or raw.get("redaction_class") != REDACTION_CLASS
-            or raw.get("conversation_id") != ledger.conversation_id
-            or raw.get("request_id") != ledger.request_id
-            or raw.get("turn_id") != ledger.turn_id
+            or raw.get("conversation_id") != conversation_id
+            or raw.get("request_id") != request_id
+            or raw.get("turn_id") != turn_id
             or spec is None
             or spec[0] != kind
             or type(sequence) is not int
@@ -451,7 +642,46 @@ def validate_persisted_trace(value: object) -> dict | None:
                 "invocation_id", "tool_attempt_id", "permission_request_id",
             ):
                 _safe_id(raw.get(optional), maximum=256, required=False)
+            event_binding = None
+            if extended_event:
+                event_binding = {
+                    "run_id": _safe_id(raw.get("run_id")),
+                    "provider_id": _safe_binding_label(
+                        raw.get("provider_id"), maximum=64, fallback="unknown",
+                    ),
+                    "model_id": _safe_binding_label(
+                        raw.get("model_id"), maximum=160, fallback="unknown",
+                    ),
+                    "effective_reasoning": _safe_binding_label(
+                        raw.get("effective_reasoning"), maximum=64, fallback="auto",
+                    ),
+                }
+                if any(
+                    raw.get(binding_key) != item
+                    for binding_key, item in event_binding.items()
+                ):
+                    return None
         except ValueError:
+            return None
+        if event_binding is not None:
+            if envelope_binding is not None and event_binding != envelope_binding:
+                return None
+            if inferred_binding is None:
+                inferred_binding = event_binding
+            elif event_binding != inferred_binding:
+                return None
+        elif inferred_binding is not None:
+            return None
+        if kind == "public_reasoning_summary":
+            summary = raw.get("summary")
+            if (
+                not extended_event
+                or not isinstance(summary, str)
+                or sanitize_public_reasoning_summary(summary) != summary
+                or not summary
+            ):
+                return None
+        elif "summary" in raw:
             return None
         is_terminal = raw.get("terminal") is True
         if is_terminal != (kind == "terminal"):
@@ -459,11 +689,15 @@ def validate_persisted_trace(value: object) -> dict | None:
         terminal_seen = is_terminal
         last_sequence = sequence
         validated.append(dict(raw))
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
-        "conversation_id": ledger.conversation_id,
-        "request_id": ledger.request_id,
-        "turn_id": ledger.turn_id,
+        "conversation_id": conversation_id,
+        "request_id": request_id,
+        "turn_id": turn_id,
         "redaction_class": REDACTION_CLASS,
         "events": validated,
     }
+    binding = envelope_binding or inferred_binding
+    if binding is not None:
+        result.update(binding)
+    return result

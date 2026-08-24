@@ -131,6 +131,7 @@ DEFAULT_MAX_REPLANS = 2
 
 # Re-entrant so a future caller can save() while already holding the lock.
 _lock = threading.RLock()
+_USER_CANCELLED_TERMINAL_KIND = "user_cancelled"
 _DOCUMENT_PATH_RE = re.compile(
     r"(?i)(?:(?P<quote>[\"'`])(?:[A-Z]:[\\/]|/)[^\"'`\r\n]+?"
     r"\.(?:pdf|png|jpe?g)(?P=quote)|(?:[A-Z]:[\\/]|/)"
@@ -175,6 +176,88 @@ def _write_atomic(path: Path, data: dict) -> None:
         encoding="utf-8",
     )
     os.replace(tmp, path)
+
+
+def _user_cancelled_terminal_authority(value, subject: dict) -> dict | None:
+    """Validate an immutable cancellation terminal for this exact durable run."""
+
+    if not isinstance(value, dict):
+        return None
+    try:
+        revision = int(value.get("revision", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    identity = {
+        "run_id": str(subject.get("run_id") or ""),
+        "task_id": str(subject.get("task_id") or ""),
+        "source_turn_id": str(subject.get("source_turn_id") or ""),
+    }
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != _USER_CANCELLED_TERMINAL_KIND
+        or revision < 1
+        or not identity["run_id"]
+        or any(str(value.get(key) or "") != expected
+               for key, expected in identity.items())
+    ):
+        return None
+    diagnostic = diagnostics.normalize_diagnostic(value.get("failure_diagnostic"))
+    return {
+        "schema_version": 1,
+        "kind": _USER_CANCELLED_TERMINAL_KIND,
+        "revision": revision,
+        **identity,
+        "established_at": str(value.get("established_at") or "")[:64],
+        "failure_diagnostic": diagnostic,
+    }
+
+
+def _persisted_terminal_authority(subject: dict) -> dict | None:
+    try:
+        raw = json.loads(TASK_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return _user_cancelled_terminal_authority(
+        raw.get("terminal_authority"), subject,
+    )
+
+
+def _apply_user_cancelled_terminal_authority(
+    subject: dict,
+    authority: dict,
+) -> None:
+    subject["terminal_authority"] = dict(authority)
+    subject["status"] = "aborted"
+    subject["run_state"] = "cancelled"
+    subject["abandon_state"] = "abandoned_proven"
+    if authority.get("failure_diagnostic") is not None:
+        subject["failure_diagnostic"] = dict(authority["failure_diagnostic"])
+
+
+def establish_user_cancelled_terminal(state: dict) -> None:
+    """Make exact user cancellation authoritative over later stale callbacks."""
+
+    if not isinstance(state, dict) or not str(state.get("run_id") or ""):
+        raise ValueError("invalid_user_cancelled_terminal")
+    existing = _user_cancelled_terminal_authority(
+        state.get("terminal_authority"), state,
+    )
+    revision = int((existing or {}).get("revision", 0) or 0) + 1
+    authority = {
+        "schema_version": 1,
+        "kind": _USER_CANCELLED_TERMINAL_KIND,
+        "revision": revision,
+        "run_id": str(state.get("run_id") or ""),
+        "task_id": str(state.get("task_id") or ""),
+        "source_turn_id": str(state.get("source_turn_id") or ""),
+        "established_at": _now_iso(),
+        "failure_diagnostic": diagnostics.normalize_diagnostic(
+            state.get("failure_diagnostic")
+        ),
+    }
+    _apply_user_cancelled_terminal_authority(state, authority)
 
 
 def redact_document_paths(value) -> str:
@@ -1646,6 +1729,19 @@ def save_task_state(state: dict) -> None:
     """
     with _lock:
         TASK_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        candidates = [
+            candidate for candidate in (
+                _user_cancelled_terminal_authority(
+                    state.get("terminal_authority"), state,
+                ),
+                _persisted_terminal_authority(state),
+            ) if candidate is not None
+        ]
+        if candidates:
+            _apply_user_cancelled_terminal_authority(
+                state,
+                max(candidates, key=lambda item: item["revision"]),
+            )
         state["updated_at"] = _now_iso()
         _write_atomic(TASK_STATE_FILE, state)
         if state.get("status") in {"done", "aborted"} or state.get(

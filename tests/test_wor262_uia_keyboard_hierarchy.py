@@ -283,7 +283,15 @@ def test_08_background_safe_uia_does_not_need_focus_or_activation():
     assert es.tool_applicability(
         strategy,
         "activate_desktop_surface",
-        {"surface_ref": CONTROL_REF, "objective": "Three"},
+        {
+            "surface_ref": CONTROL_REF,
+            "objective": "Three",
+            "observable_effect": {
+                "kind": "exact_surface_text",
+                "surface_ref": DISPLAY_REF,
+                "expected_text": "3",
+            },
+        },
     ) == (True, "")
     assert "desktop_type" not in _frontier(strategy)
 

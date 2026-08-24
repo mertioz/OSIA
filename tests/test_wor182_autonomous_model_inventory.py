@@ -345,7 +345,7 @@ class PcSelectorTests(unittest.TestCase):
         )
         panel.deleteLater()
 
-    def test_key_and_account_changes_refresh_both_pc_selectors(self):
+    def test_key_and_account_changes_refresh_the_single_pc_chat_selector(self):
         from osia.config import DEFAULT_SETTINGS
         from osia.gui import main_popup
 
@@ -388,10 +388,7 @@ class PcSelectorTests(unittest.TestCase):
                 },
                 {("openai", "api-model")},
             )
-            self.assertEqual(
-                popup._models._inventory,
-                popup._autonomous._inventory,
-            )
+            self.assertFalse(hasattr(popup, "_autonomous"))
 
             popup._on_chatgpt_status_changed(
                 _account(models=[account_model])
@@ -399,7 +396,7 @@ class PcSelectorTests(unittest.TestCase):
             self.assertEqual(
                 {
                     (entry["provider_id"], entry["model_id"])
-                    for entry in popup._autonomous._inventory
+                    for entry in popup._models._inventory
                 },
                 {
                     ("chatgpt_account", "account-model"),
@@ -424,7 +421,6 @@ class PcSelectorTests(unittest.TestCase):
             key_state.clear()
             popup._on_api_keys_saved({})
             self.assertEqual(popup._models._inventory, [])
-            self.assertEqual(popup._autonomous._inventory, [])
             popup.deleteLater()
 
 

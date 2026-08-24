@@ -142,6 +142,10 @@ def _meta(suffix):
         "request_id": f"wor177-request-{suffix}",
         "client_request_id": f"wor177-request-{suffix}",
         "turn_id": f"wor177-turn-{suffix}",
+        "run_id": f"wor177-run-{suffix}",
+        "provider_id": "provider-wor177",
+        "model_id": "model-wor177",
+        "effective_reasoning": "medium",
         "user_message_id": f"wor177-user-{suffix}",
         "assistant_message_id": f"wor177-assistant-{suffix}",
         "_event_sequence": 0,
@@ -220,7 +224,13 @@ def test_reconnect_replays_exact_persisted_final_and_failure_type():
     channel = _Channel()
     final = localized_text("empty_completion", "fr")
     persisted = {
+        "conversation_id": "conv-replay",
+        "request_id": "request-replay",
         "turn_id": "turn-replay",
+        "run_id": "run-replay",
+        "provider_id": "provider-wor177",
+        "model_id": "model-wor177",
+        "effective_reasoning": "medium",
         "user_message_id": "user-replay",
         "assistant_message_id": "assistant-replay",
         "response_event_id": "event-response-replay",

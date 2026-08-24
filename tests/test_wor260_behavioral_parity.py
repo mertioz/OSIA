@@ -25,7 +25,7 @@ from osia.turn_terminality import TurnTerminalityController
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PHASE0_PROMPT_SHA256 = (
-    "7bc8974fe969caedfb5a48387c0326d5b1d021be60442f77ac4f51ed4769170a"
+    "23d7c1c90388759c45486b4762f07eb78b1a0ee23159d65df71941ad7451419e"
 )
 
 
@@ -114,7 +114,7 @@ def test_current_chat_and_chatgpt_account_identity_universes_are_unchanged():
 def test_phase0_prompt_tool_block_is_byte_for_byte_identical():
     prompt = static_tool_prompt_block().encode("utf-8")
 
-    assert len(prompt) == 11_609
+    assert len(prompt) == 13_016
     assert len(prompt.decode("utf-8").splitlines()) == 97
     assert hashlib.sha256(prompt).hexdigest() == _PHASE0_PROMPT_SHA256
 
@@ -141,12 +141,14 @@ def test_legacy_descriptor_dataclass_serialization_shape_is_unchanged():
 def test_strategy_and_terminality_signatures_receive_no_phase1_inputs():
     assert str(inspect.signature(build_execution_strategy)) == (
         "(request: 'str', available_tools: 'Iterable[str]' = (), *, "
-        "postcondition: 'str' = '', postconditions: 'Iterable[str]' = ()) "
+        "postcondition: 'str' = '', postconditions: 'Iterable[str]' = (), "
+        "semantic_context: 'str' = '') "
         "-> 'ExecutionStrategy'"
     )
     assert str(inspect.signature(ExecutionStrategy)) == (
         "(mission: 'SemanticMission | SemanticActionNode', "
-        "mechanisms: 'Iterable[StrategyMechanism]' = ())"
+        "mechanisms: 'Iterable[StrategyMechanism]' = (), *, "
+        "available_tools: 'Iterable[str]' = ())"
     )
     assert str(inspect.signature(TurnTerminalityController)) == (
         "(*, turn_id: 'str', objective: 'str', required_postconditions: "

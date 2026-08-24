@@ -1,10 +1,13 @@
 import asyncio
 import base64
+from pathlib import Path
+import tempfile
 import threading
 import time
 import unittest
 from unittest.mock import patch
 
+from osia.durable_transport import DurableTransportStore
 from osia.server import server
 
 
@@ -14,6 +17,10 @@ def _meta(suffix: str = "one", *, tts_enabled: bool = True) -> dict:
         "request_id": f"wor55-request-{suffix}",
         "client_request_id": f"wor55-request-{suffix}",
         "turn_id": f"wor55-turn-{suffix}",
+        "run_id": f"wor55-run-{suffix}",
+        "provider_id": "provider-wor55",
+        "model_id": "model-wor55",
+        "effective_reasoning": "medium",
         "user_message_id": f"wor55-user-{suffix}",
         "assistant_message_id": f"wor55-assistant-{suffix}",
         "_event_sequence": 0,
@@ -55,6 +62,21 @@ class _Agent:
 
 
 class ProgressiveTTSSessionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._transport_tempdir = tempfile.TemporaryDirectory(
+            prefix="osia-wor55-transport-"
+        )
+        self._transport_patch = patch.object(
+            server,
+            "_DURABLE_TRANSPORT",
+            DurableTransportStore(Path(self._transport_tempdir.name) / "transport"),
+        )
+        self._transport_patch.start()
+
+    def tearDown(self) -> None:
+        self._transport_patch.stop()
+        self._transport_tempdir.cleanup()
+
     async def asyncTearDown(self) -> None:
         tasks = list(server._POST_TURN_MEDIA_TASKS)
         for task in tasks:
@@ -320,6 +342,21 @@ class ProgressiveTTSSessionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProgressiveTTSTurnIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._transport_tempdir = tempfile.TemporaryDirectory(
+            prefix="osia-wor55-transport-"
+        )
+        self._transport_patch = patch.object(
+            server,
+            "_DURABLE_TRANSPORT",
+            DurableTransportStore(Path(self._transport_tempdir.name) / "transport"),
+        )
+        self._transport_patch.start()
+
+    def tearDown(self) -> None:
+        self._transport_patch.stop()
+        self._transport_tempdir.cleanup()
+
     async def asyncTearDown(self) -> None:
         tasks = list(server._POST_TURN_MEDIA_TASKS)
         for task in tasks:

@@ -1,9 +1,8 @@
-"""Bounded Chat-to-Autonomous routing contract for WOR-223.
+"""Unified Chat routing plus the legacy Autonomous compatibility contract.
 
-The chat model makes the semantic decision inside its existing provider turn.
-This module validates only the small structured decision, preserves the exact
-user-authored objective, and delegates the actual start to the canonical host
-launcher supplied by the PC or Mobile server entry point.
+New Chat turns keep one execution owner and iterate through the terminal-turn
+runtime.  The legacy launcher validators remain available for already-persisted
+Autonomous records and older integration callers.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ AUTONOMOUS_REASON_CODES = (
     "sustained_computer_work",
     "bounded_turn_infeasible",
 )
+ROUTING_CONTRACT_SCHEMA_VERSION = "2"
 _SOURCE_REF_RE = re.compile(r"\b(?:src|doc|web)_[0-9a-f]{32}\b")
 _EXPLICIT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -81,26 +81,19 @@ _SCHEDULE_ROUTE_RE = re.compile(
 
 
 def routing_prompt(language: str = "en") -> str:
-    """Return the single canonical provider-only routing policy."""
+    """Return the unified Chat execution policy for provider turns."""
 
     del language
     return (
-        "## Chat / Autonomous routing\n"
-        "Before any normal tool call, choose exactly one route for the current "
-        "request: normal chat, Autonomous, Scheduled Tasks, or clarification. "
-        "Do not add a classification request. Answer simple questions directly "
-        "only when no tool or computer action is needed. Every future or recurring "
-        "request uses only the Scheduled Tasks tools. For every request that needs "
-        "a tool, computer action, or multiple dependent steps, call "
-        "start_autonomous_mission BEFORE every other tool. Use reason_code "
-        "sustained_computer_work for tool or computer actions, whether bounded "
-        "or long; use the other reason codes for dependent phases, extended "
-        "research, iterative artifact work, or work that cannot reasonably fit "
-        "one turn. Supply "
-        "only reason_code, confidence, and explicit_request; never "
-        "reveal private reasoning. Never combine this handoff with another tool "
-        "in the same batch. If the essential objective is missing, ask one "
-        "clarifying question."
+        "## Unified Chat execution\n"
+        "Use this Chat as the single execution surface. Answer informational "
+        "questions directly. For requests requiring tools, computer actions, or "
+        "multiple dependent actions, execute the next safe action with the "
+        "available tools, observe its result, and then choose the next action. "
+        "Do not generate a mandatory task list or launch a second execution mode. "
+        "Future or recurring requests still use only the Scheduled Tasks tools. "
+        "If the essential objective is missing, ask one clarifying question. "
+        "Never reveal private reasoning."
     )
 
 
@@ -173,6 +166,86 @@ def looks_like_schedule_route(text: str) -> bool:
     return scheduled_tasks.looks_like_schedule_request(text) or bool(
         _SCHEDULE_ROUTE_RE.search(text)
     )
+
+
+def canonical_route_contract(
+    context: Mapping[str, Any] | None,
+    *,
+    strategy: Any,
+) -> dict[str, Any]:
+    """Return the deterministic pre-provider route for one Chat message.
+
+    The existing semantic mission and immutable GoalContract are the routing
+    authority. Provider prose or tool choice can refine a direct answer, but a
+    request requiring execution remains owned by this Chat turn instead of
+    choosing a second executor. Only bounded identities are returned.
+    """
+
+    ctx = dict(context or {})
+    original = str(ctx.get("original_user_text") or "").strip()
+    explicit = explicit_autonomous_request(original)
+    objective = exact_objective(original, ctx.get("history") or ())
+    mission = getattr(strategy, "mission", None)
+    semantic_fingerprint = str(getattr(mission, "fingerprint", "") or "")[:64]
+    goal_fingerprint = ""
+    if mission is not None:
+        try:
+            from osia.goal_contract import goal_contract_from_semantic_mission
+
+            goal_fingerprint = str(
+                goal_contract_from_semantic_mission(mission).fingerprint
+            )[:64]
+        except (AttributeError, TypeError, ValueError):
+            goal_fingerprint = ""
+
+    base = {
+        "schema_version": ROUTING_CONTRACT_SCHEMA_VERSION,
+        "classification_source": "semantic_mission_goal_contract",
+        "semantic_fingerprint": semantic_fingerprint,
+        "goal_contract_fingerprint": goal_fingerprint,
+    }
+    if looks_like_schedule_route(original):
+        return {
+            **base,
+            "route": "scheduled",
+            "execution_required": False,
+            "reason_code": "scheduled_request",
+        }
+    if explicit and not objective:
+        return {
+            **base,
+            "route": "clarification",
+            "execution_required": False,
+            "reason_code": "missing_objective",
+        }
+
+    structured_execution = bool(getattr(strategy, "requires_execution", False))
+    dependent_work = bool(
+        objective and _looks_genuinely_long(objective, "dependent_phases")
+    )
+    execution_required = bool(
+        objective and (explicit or structured_execution or dependent_work)
+    )
+    if not execution_required:
+        return {
+            **base,
+            "route": "normal",
+            "execution_required": False,
+            "reason_code": "direct_answer",
+        }
+
+    reason_code = (
+        "dependent_phases"
+        if dependent_work
+        else "sustained_computer_work"
+    )
+    return {
+        **base,
+        "route": "durable_chat",
+        "execution_required": True,
+        "reason_code": reason_code,
+        "explicit_request": explicit,
+    }
 
 
 def canonicalize_handoff_arguments(
@@ -481,6 +554,7 @@ def durable_progress_from_state(st: Mapping[str, Any] | None) -> dict[str, Any]:
         "progress_status": progress_status,
         "terminal": terminal,
         "outcome_unknown": outcome_unknown,
+        "cancel_requested": run_state == "cancellation_requested",
         "conversation_id": str(st.get("source_conversation_id") or "")[:160],
         "request_id": str(st.get("source_request_id") or "")[:160],
         "turn_id": str(st.get("source_turn_id") or "")[:160],
@@ -491,6 +565,14 @@ def durable_progress_from_state(st: Mapping[str, Any] | None) -> dict[str, Any]:
         "run_id": str(st.get("run_id") or "")[:160],
         "provider_id": str(st.get("provider") or "")[:48],
         "model_id": str(st.get("model") or "")[:160],
+        # Legacy checkpoints predate the Chat reasoning binding.  Project it
+        # only when a persisted source actually exists; callers must route an
+        # empty value through the legacy adapter instead of inventing one.
+        "effective_reasoning": str(
+            st.get("effective_reasoning")
+            or st.get("source_effective_reasoning")
+            or ""
+        )[:64],
         "tasks_done": sum(task.get("status") == "done" for task in tasks),
         "tasks_total": len(tasks),
     }
@@ -498,76 +580,76 @@ def durable_progress_from_state(st: Mapping[str, Any] | None) -> dict[str, Any]:
 
 _RESPONSES = {
     "en": {
-        "running": "I started this as an Autonomous mission. Progress and controls are available in Autonomous.",
-        "starting": "The Autonomous mission is starting. Progress and controls are available in Autonomous.",
-        "authorization_pending": "I prepared the Autonomous mission, but it is waiting for your authorization before it can run.",
-        "busy": "I could not start this mission because another Autonomous mission is already active. I did not run it in normal chat.",
-        "unavailable": "I could not reach the canonical Autonomous runner, so I did not start or execute the mission in normal chat.",
-        "transport_unavailable": "I could not reach the canonical Autonomous runner, so I did not start or execute the mission in normal chat.",
-        "chat_model_unavailable": "The model used for this chat turn is not available for Autonomous, so I did not start the mission or run it in normal chat.",
-        "failed": "The Autonomous mission could not be started. I did not execute it in normal chat.",
-        "outcome_unknown": "The Autonomous start outcome could not be confirmed. Check Autonomous before retrying; I did not execute it in normal chat.",
-        "objective_required": "What exact objective should I run in Autonomous mode?",
+        "running": "I started working on this request. Progress and controls stay in this chat.",
+        "starting": "The agent execution is starting in this chat.",
+        "authorization_pending": "This request is waiting for your authorization in this chat before it can run.",
+        "busy": "Another agent execution is already active. I did not run this request twice.",
+        "unavailable": "I could not reach the durable execution engine, so I did not start or duplicate this request.",
+        "transport_unavailable": "I could not reach the durable execution engine, so I did not start or duplicate this request.",
+        "chat_model_unavailable": "The model selected for this chat turn is unavailable for durable execution, so I did not switch models or run the request.",
+        "failed": "The agent execution could not be started. I did not duplicate the request.",
+        "outcome_unknown": "The execution start could not be confirmed. I will not retry it automatically.",
+        "objective_required": "What exact objective should I execute?",
     },
     "fr": {
-        "running": "J’ai lancé cette demande comme mission Autonomous. La progression et les contrôles sont disponibles dans Autonomous.",
-        "starting": "La mission Autonomous démarre. La progression et les contrôles sont disponibles dans Autonomous.",
-        "authorization_pending": "J’ai préparé la mission Autonomous, mais elle attend votre autorisation avant de pouvoir s’exécuter.",
-        "busy": "Je n’ai pas pu lancer cette mission, car une autre mission Autonomous est déjà active. Je ne l’ai pas exécutée dans le chat normal.",
-        "unavailable": "Je n’ai pas pu joindre le runner Autonomous canonique ; la mission n’a été ni lancée ni exécutée dans le chat normal.",
-        "transport_unavailable": "Je n’ai pas pu joindre le runner Autonomous canonique ; la mission n’a été ni lancée ni exécutée dans le chat normal.",
-        "chat_model_unavailable": "Le modèle utilisé pour ce tour de chat n’est pas disponible pour Autonomous ; la mission n’a été ni lancée ni exécutée dans le chat normal.",
-        "failed": "La mission Autonomous n’a pas pu démarrer. Je ne l’ai pas exécutée dans le chat normal.",
-        "outcome_unknown": "Le résultat du démarrage Autonomous n’a pas pu être confirmé. Vérifiez Autonomous avant de réessayer ; je ne l’ai pas exécutée dans le chat normal.",
-        "objective_required": "Quel objectif exact dois-je exécuter en mode Autonomous ?",
+        "running": "J’ai commencé cette demande. La progression et les contrôles restent dans ce Chat.",
+        "starting": "L’exécution agent démarre dans ce Chat.",
+        "authorization_pending": "Cette demande attend votre autorisation dans ce Chat avant de pouvoir s’exécuter.",
+        "busy": "Une autre exécution agent est déjà active. Je n’ai pas exécuté cette demande deux fois.",
+        "unavailable": "Je n’ai pas pu joindre le moteur d’exécution durable ; cette demande n’a été ni lancée ni dupliquée.",
+        "transport_unavailable": "Je n’ai pas pu joindre le moteur d’exécution durable ; cette demande n’a été ni lancée ni dupliquée.",
+        "chat_model_unavailable": "Le modèle sélectionné pour ce tour de Chat est indisponible pour l’exécution durable ; je n’ai ni changé de modèle ni exécuté la demande.",
+        "failed": "L’exécution agent n’a pas pu démarrer. Je n’ai pas dupliqué la demande.",
+        "outcome_unknown": "Le démarrage de l’exécution n’a pas pu être confirmé. Je ne la relancerai pas automatiquement.",
+        "objective_required": "Quel objectif exact dois-je exécuter ?",
     },
     "es": {
-        "running": "He iniciado esta solicitud como misión Autonomous. El progreso y los controles están disponibles en Autonomous.",
-        "starting": "La misión Autonomous se está iniciando. El progreso y los controles están disponibles en Autonomous.",
-        "authorization_pending": "He preparado la misión Autonomous, pero espera tu autorización antes de ejecutarse.",
-        "busy": "No pude iniciar esta misión porque ya hay otra misión Autonomous activa. No la ejecuté en el chat normal.",
-        "unavailable": "No pude acceder al ejecutor Autonomous canónico, así que no inicié ni ejecuté la misión en el chat normal.",
-        "transport_unavailable": "No pude acceder al ejecutor Autonomous canónico, así que no inicié ni ejecuté la misión en el chat normal.",
-        "chat_model_unavailable": "El modelo usado en este turno de chat no está disponible para Autonomous, así que no inicié ni ejecuté la misión en el chat normal.",
-        "failed": "No se pudo iniciar la misión Autonomous. No la ejecuté en el chat normal.",
-        "outcome_unknown": "No se pudo confirmar el inicio de Autonomous. Comprueba Autonomous antes de reintentar; no lo ejecuté en el chat normal.",
-        "objective_required": "¿Qué objetivo exacto debo ejecutar en modo Autonomous?",
+        "running": "He empezado esta solicitud. El progreso y los controles permanecen en este chat.",
+        "starting": "La ejecución del agente se está iniciando en este chat.",
+        "authorization_pending": "Esta solicitud espera tu autorización en este chat antes de ejecutarse.",
+        "busy": "Ya hay otra ejecución del agente activa. No ejecuté esta solicitud dos veces.",
+        "unavailable": "No pude acceder al motor de ejecución duradera; no inicié ni dupliqué esta solicitud.",
+        "transport_unavailable": "No pude acceder al motor de ejecución duradera; no inicié ni dupliqué esta solicitud.",
+        "chat_model_unavailable": "El modelo seleccionado para este turno no está disponible para la ejecución duradera; no cambié de modelo ni ejecuté la solicitud.",
+        "failed": "No se pudo iniciar la ejecución del agente. No dupliqué la solicitud.",
+        "outcome_unknown": "No se pudo confirmar el inicio de la ejecución. No la reintentaré automáticamente.",
+        "objective_required": "¿Qué objetivo exacto debo ejecutar?",
     },
     "de": {
-        "running": "Ich habe diese Anfrage als Autonomous-Mission gestartet. Fortschritt und Steuerung sind in Autonomous verfügbar.",
-        "starting": "Die Autonomous-Mission wird gestartet. Fortschritt und Steuerung sind in Autonomous verfügbar.",
-        "authorization_pending": "Ich habe die Autonomous-Mission vorbereitet; sie wartet vor der Ausführung auf deine Autorisierung.",
-        "busy": "Ich konnte die Mission nicht starten, weil bereits eine Autonomous-Mission aktiv ist. Im normalen Chat wurde sie nicht ausgeführt.",
-        "unavailable": "Der kanonische Autonomous-Runner war nicht erreichbar; die Mission wurde weder gestartet noch im normalen Chat ausgeführt.",
-        "transport_unavailable": "Der kanonische Autonomous-Runner war nicht erreichbar; die Mission wurde weder gestartet noch im normalen Chat ausgeführt.",
-        "chat_model_unavailable": "Das in diesem Chat verwendete Modell ist für Autonomous nicht verfügbar; die Mission wurde weder gestartet noch im normalen Chat ausgeführt.",
-        "failed": "Die Autonomous-Mission konnte nicht gestartet werden. Im normalen Chat wurde sie nicht ausgeführt.",
-        "outcome_unknown": "Der Autonomous-Start konnte nicht bestätigt werden. Prüfe Autonomous vor einem neuen Versuch; im normalen Chat wurde nichts ausgeführt.",
-        "objective_required": "Welches genaue Ziel soll ich im Autonomous-Modus ausführen?",
+        "running": "Ich habe diese Anfrage gestartet. Fortschritt und Steuerung bleiben in diesem Chat.",
+        "starting": "Die Agentenausführung wird in diesem Chat gestartet.",
+        "authorization_pending": "Diese Anfrage wartet vor der Ausführung in diesem Chat auf deine Autorisierung.",
+        "busy": "Eine andere Agentenausführung ist bereits aktiv. Ich habe diese Anfrage nicht doppelt ausgeführt.",
+        "unavailable": "Die dauerhafte Ausführungsengine war nicht erreichbar; die Anfrage wurde weder gestartet noch dupliziert.",
+        "transport_unavailable": "Die dauerhafte Ausführungsengine war nicht erreichbar; die Anfrage wurde weder gestartet noch dupliziert.",
+        "chat_model_unavailable": "Das für diesen Chat gewählte Modell ist für die dauerhafte Ausführung nicht verfügbar; ich habe weder das Modell gewechselt noch die Anfrage ausgeführt.",
+        "failed": "Die Agentenausführung konnte nicht gestartet werden. Ich habe die Anfrage nicht dupliziert.",
+        "outcome_unknown": "Der Start der Ausführung konnte nicht bestätigt werden. Ich werde ihn nicht automatisch wiederholen.",
+        "objective_required": "Welches genaue Ziel soll ich ausführen?",
     },
     "zh": {
-        "running": "我已将此请求作为 Autonomous 任务启动。你可以在 Autonomous 中查看进度和控制任务。",
-        "starting": "Autonomous 任务正在启动。你可以在 Autonomous 中查看进度和控制任务。",
-        "authorization_pending": "Autonomous 任务已准备好，但需要你的授权才能运行。",
-        "busy": "当前已有一个 Autonomous 任务在运行，因此无法启动此任务。我没有在普通聊天中执行它。",
-        "unavailable": "无法连接规范的 Autonomous 运行器，因此任务未启动，也没有在普通聊天中执行。",
-        "transport_unavailable": "无法连接规范的 Autonomous 运行器，因此任务未启动，也没有在普通聊天中执行。",
-        "chat_model_unavailable": "此聊天轮次使用的模型无法用于 Autonomous，因此任务未启动，也没有在普通聊天中执行。",
-        "failed": "Autonomous 任务无法启动。我没有在普通聊天中执行它。",
-        "outcome_unknown": "无法确认 Autonomous 是否启动。重试前请先检查 Autonomous；我没有在普通聊天中执行它。",
-        "objective_required": "你希望 Autonomous 模式执行的确切目标是什么？",
+        "running": "我已开始处理此请求。进度和控制都保留在此聊天中。",
+        "starting": "代理执行正在此聊天中启动。",
+        "authorization_pending": "此请求正在此聊天中等待你的授权。",
+        "busy": "另一个代理执行已在运行。我没有重复执行此请求。",
+        "unavailable": "无法连接持久执行引擎，因此未启动或重复此请求。",
+        "transport_unavailable": "无法连接持久执行引擎，因此未启动或重复此请求。",
+        "chat_model_unavailable": "此聊天轮次所选模型无法用于持久执行；我没有切换模型或执行请求。",
+        "failed": "代理执行无法启动。我没有重复此请求。",
+        "outcome_unknown": "无法确认执行是否启动。我不会自动重试。",
+        "objective_required": "你希望执行的确切目标是什么？",
     },
     "ja": {
-        "running": "この依頼を Autonomous ミッションとして開始しました。進行状況と操作は Autonomous で確認できます。",
-        "starting": "Autonomous ミッションを開始しています。進行状況と操作は Autonomous で確認できます。",
-        "authorization_pending": "Autonomous ミッションを準備しましたが、実行前に承認が必要です。",
-        "busy": "別の Autonomous ミッションが実行中のため開始できませんでした。通常チャットでは実行していません。",
-        "unavailable": "正規の Autonomous ランナーに接続できなかったため、ミッションは開始せず、通常チャットでも実行していません。",
-        "transport_unavailable": "正規の Autonomous ランナーに接続できなかったため、ミッションは開始せず、通常チャットでも実行していません。",
-        "chat_model_unavailable": "このチャットターンで使用したモデルは Autonomous では利用できないため、ミッションは開始せず、通常チャットでも実行していません。",
-        "failed": "Autonomous ミッションを開始できませんでした。通常チャットでは実行していません。",
-        "outcome_unknown": "Autonomous の開始結果を確認できませんでした。再試行前に Autonomous を確認してください。通常チャットでは実行していません。",
-        "objective_required": "Autonomous モードで実行する正確な目的を教えてください。",
+        "running": "この依頼の処理を開始しました。進行状況と操作はこのチャット内に表示されます。",
+        "starting": "エージェントの実行をこのチャットで開始しています。",
+        "authorization_pending": "この依頼は実行前の承認をこのチャットで待っています。",
+        "busy": "別のエージェント実行がすでに進行中です。この依頼は重複実行していません。",
+        "unavailable": "永続実行エンジンに接続できなかったため、この依頼は開始も重複もしていません。",
+        "transport_unavailable": "永続実行エンジンに接続できなかったため、この依頼は開始も重複もしていません。",
+        "chat_model_unavailable": "このチャットで選択されたモデルは永続実行に利用できません。モデル変更も依頼の実行もしていません。",
+        "failed": "エージェントの実行を開始できませんでした。この依頼は重複していません。",
+        "outcome_unknown": "実行開始を確認できませんでした。自動で再試行しません。",
+        "objective_required": "実行する正確な目的を教えてください。",
     },
 }
 
@@ -649,7 +731,9 @@ def handoff_response_text(result: Mapping[str, Any], language: str = "en") -> st
 
 __all__ = [
     "AUTONOMOUS_REASON_CODES",
+    "ROUTING_CONTRACT_SCHEMA_VERSION",
     "ROUTING_TOOL_NAME",
+    "canonical_route_contract",
     "durable_progress_from_state",
     "evaluate_route_request",
     "exact_objective",

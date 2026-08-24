@@ -94,6 +94,193 @@ _ACTION_PATTERNS = (
     ("delete", r"\b(delete|remove|supprime|supprimer|efface|effacer)\b"),
 )
 
+_NEGATIVE_PREFIX_RE = re.compile(
+    r"\b(?:without|sans|do\s+not|don['’]?t|dont|never)\b"
+    r"(?:[^\r\n.;!?]|\.(?=[A-Za-z0-9_-])){0,240}",
+    re.IGNORECASE,
+)
+_FRENCH_NEGATIVE_RE = re.compile(
+    r"\bne\b(?:[^\r\n.;!?]|\.(?=[A-Za-z0-9_-])){0,120}"
+    r"\b(?:pas|jamais)\b"
+    r"(?:[^\r\n.;!?]|\.(?=[A-Za-z0-9_-])){0,120}",
+    re.IGNORECASE,
+)
+_NEGATED_ACTION_ALIASES = (
+    (
+        "activate",
+        r"\b(?:click(?:s|ed|ing)?|select(?:s|ed|ing)?|"
+        r"press(?:es|ed|ing)?|"
+        r"activat(?:e|es|ed|ing)|cliqu(?:e|es|er|ez|ant)|"
+        r"appui(?:e|es|er|ez|ant)|selectionn(?:e|es|er|ez|ant)|"
+        r"activ(?:e|es|er|ez|ant))\b",
+    ),
+    (
+        "type",
+        r"\b(?:typ(?:e|es|ed|ing)|enter(?:s|ed|ing)?|"
+        r"fill(?:s|ed|ing)?|saisi(?:s|r|ssant)?|"
+        r"tap(?:e|es|er|ez|ant))\b",
+    ),
+    (
+        "write",
+        r"\b(?:writ(?:e|es|ing|ten)|overwrit(?:e|es|ing|ten)|"
+        r"edit(?:s|ed|ing)?|updat(?:e|es|ed|ing)|sav(?:e|es|ed|ing)|"
+        r"modif(?:y|ies|ied|ying)|chang(?:e|es|ed|ing)|"
+        r"replac(?:e|es|ed|ing)|ecri(?:s|re|vant)|"
+        r"modifi(?:e|es|er|ez|ant)|remplac(?:e|es|er|ez|ant)|"
+        r"enregistr(?:e|es|er|ez|ant)|mets?|mettre\s+a\s+jour)\b",
+    ),
+    (
+        "move",
+        r"\b(?:mov(?:e|es|ed|ing)|renam(?:e|es|ed|ing)|"
+        r"deplac(?:e|es|er|ez|ant)|renomm(?:e|es|er|ez|ant))\b",
+    ),
+    (
+        "send",
+        r"\b(?:send(?:s|ing)?|sent|submit(?:s|ted|ting)?|"
+        r"publish(?:es|ed|ing)?|shar(?:e|es|ed|ing)|"
+        r"envoi(?:e|es|er|ez|ant)|soumet(?:s|tre|tez|tant)|"
+        r"publi(?:e|es|er|ez|ant)|partag(?:e|es|er|ez|ant))\b",
+    ),
+    (
+        "create",
+        r"\b(?:creat(?:e|es|ed|ing)|add(?:s|ed|ing)?|"
+        r"cre(?:e|es|er|ez|ant)|ajout(?:e|es|er|ez|ant))\b",
+    ),
+    (
+        "delete",
+        r"\b(?:delet(?:e|es|ed|ing)|remov(?:e|es|ed|ing)|"
+        r"clos(?:e|es|ed|ing)|kill(?:s|ed|ing)?|"
+        r"terminat(?:e|es|ed|ing)|supprim(?:e|es|er|ez|ant)|"
+        r"effac(?:e|es|er|ez|ant)|ferm(?:e|es|er|ez|ant))\b",
+    ),
+    (
+        "open",
+        r"\b(?:open(?:s|ed|ing)?|launch(?:es|ed|ing)?|"
+        r"ouvr(?:e|es|ir|ez|ant)|lanc(?:e|es|er|ez|ant))\b",
+    ),
+    (
+        "navigate",
+        r"\b(?:navigat(?:e|es|ed|ing)|visit(?:s|ed|ing)?|"
+        r"aller|navigu(?:e|es|er|ez|ant)|visit(?:e|es|er|ez|ant))\b",
+    ),
+    (
+        "search",
+        r"\b(?:search(?:es|ed|ing)?|find(?:s|ing)?|found|"
+        r"cherch(?:e|es|er|ez|ant)|recherch(?:e|es|er|ez|ant))\b",
+    ),
+)
+
+_OPAQUE_NEGATIVE_TARGET_KEYS = frozenset({
+    "it", "this", "that", "these", "those", "them", "itself",
+    "ca", "cela", "ceci", "celui", "celle", "ceux", "celles",
+    "lui", "eux", "elles",
+    "any", "all", "every", "each", "anyfile", "anyfiles",
+    "allfiles", "everyfile", "everyfiles", "aucun", "aucune",
+    "aucunfichier", "aucunefichier", "aucunsfichiers",
+    "aucunesfichiers", "tout", "tous", "toute", "toutes",
+    "toutfichier", "touslesfichiers", "nimportequel", "nimportequoi",
+})
+
+
+def _explicit_negative_clauses(value: object) -> tuple[tuple[int, int, str], ...]:
+    """Return bounded explicit user-negation spans without inventing intent."""
+
+    normalized = _normalized(_bounded(value, 32_000))
+    found: list[tuple[int, int, str]] = []
+    for pattern in (_NEGATIVE_PREFIX_RE, _FRENCH_NEGATIVE_RE):
+        for match in pattern.finditer(normalized):
+            clause = _bounded(match.group(0), 240)
+            if clause:
+                found.append((match.start(), match.end(), clause))
+    found.sort(key=lambda item: (item[0], item[1]))
+    deduped: list[tuple[int, int, str]] = []
+    for item in found:
+        if any(
+            item[0] >= existing[0]
+            and item[1] <= existing[1]
+            for existing in deduped
+        ):
+            continue
+        deduped.append(item)
+    return tuple(deduped)
+
+
+def explicit_negative_constraints(value: object) -> tuple[dict[str, str], ...]:
+    """Project literal negative clauses and only unambiguous action bans.
+
+    A target-specific clause remains preserved as authoritative model context,
+    but is not widened into a global capability ban.  Clauses such as
+    ``without clicking or sending anything`` have no target residue and can be
+    enforced structurally before dispatch.
+    """
+
+    constraints: list[dict[str, str]] = []
+    for _start, _end, clause in _explicit_negative_clauses(value):
+        constraints.append({
+            "name": "explicit_negative_constraint",
+            "value": clause,
+            "source": "user_objective",
+        })
+        content = re.sub(
+            r"^\s*(?:without|sans|do\s+not|don['’]?t|dont|never)\b",
+            "",
+            clause,
+            flags=re.IGNORECASE,
+        ).strip()
+        mentioned: list[str] = []
+        residual = content
+        for action, pattern in _NEGATED_ACTION_ALIASES:
+            if re.search(pattern, content, flags=re.IGNORECASE):
+                mentioned.append(action)
+                residual = re.sub(
+                    pattern, " ", residual, flags=re.IGNORECASE,
+                )
+        if not mentioned:
+            constraints.append({
+                "name": "unresolved_negative_constraint",
+                "value": clause,
+                "source": "user_objective",
+            })
+        residual = re.sub(
+            r"\b(?:and|or|nor|any|all|every|each|anything\s+else|"
+            r"anything|nothing|"
+            r"et|ou|ni|rien|quoi\s+que\s+ce\s+soit|pas|jamais|"
+            r"aucun(?:e|s|es)?|tout(?:e|s|es)?|n['’]?importe\s+quel(?:le|s|les)?|"
+            r"ne|n|de|du|des|la|le|les|un|une)\b",
+            " ",
+            residual,
+            flags=re.IGNORECASE,
+        )
+        target = _bounded(residual.strip(" \t\r\n,.:;!?"), 240)
+        residual_key = re.sub(r"[^a-z0-9]+", "", target)
+        if residual_key in _OPAQUE_NEGATIVE_TARGET_KEYS:
+            # A pronoun/deictic target cannot be proven different from the
+            # concrete object later supplied to a tool. Preserve the explicit
+            # user ban as global for that action class instead of letting the
+            # unresolved reference weaken it.
+            target = ""
+            residual_key = ""
+        if residual_key:
+            for action in dict.fromkeys(mentioned):
+                constraints.append({
+                    "name": "forbidden_action_target",
+                    "value": json.dumps(
+                        {"action": action, "target": target},
+                        sort_keys=True,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ),
+                    "source": "user_objective",
+                })
+            continue
+        for action in dict.fromkeys(mentioned):
+            constraints.append({
+                "name": "forbidden_action",
+                "value": action,
+                "source": "user_objective",
+            })
+    return tuple(constraints)
+
 _KNOWN_APPLICATIONS = (
     "steam", "spotify", "vscode", "visual studio code", "discord",
     "brave", "chrome", "firefox", "edge", "outlook", "gmail",
@@ -162,6 +349,41 @@ def _primitive_proves_calculation_result(
         return False
     expected = _simple_calculation_result(node.requested_content)
     effect = normalize_desktop_observable_effect(attempt.observable_effect)
+    if not expected or not effect:
+        return False
+    observed = re.sub(
+        r"(?<=\d)[\s\u00a0\u202f'](?=\d)",
+        "",
+        _normalized(effect.get("expected_text")).replace(",", "."),
+    )
+    return bool(re.search(
+        rf"(?<![\d.]){re.escape(expected)}(?![\d.])",
+        observed,
+    ))
+
+
+def _semantic_batch_proves_calculation_result(
+    node: SemanticActionNode | None,
+    batch_plan: object,
+) -> bool:
+    """Return whether a typed batch ends in the node's exact calculation result."""
+
+    if node is None or node.requested_action != "calculate":
+        return True
+    plan = batch_plan if isinstance(batch_plan, dict) else {}
+    items = plan.get("items") if isinstance(plan.get("items"), list) else []
+    if not items:
+        return False
+    final_item = items[-1] if isinstance(items[-1], dict) else {}
+    target_label = _normalized(final_item.get("objective"))
+    if target_label != "=" and not any(
+        token in target_label for token in ("equal", "egal")
+    ):
+        return False
+    expected = _simple_calculation_result(node.requested_content)
+    effect = normalize_desktop_observable_effect(
+        final_item.get("observable_effect")
+    )
     if not expected or not effect:
         return False
     observed = re.sub(
@@ -244,8 +466,12 @@ def _derive_semantic_node(
     never invents a native-vs-web requirement merely from an application name.
     """
 
-    source = _bounded(request, 4000)
+    source = _bounded(request, 32_000)
     norm = _normalized(source)
+    negative_spans = tuple(
+        (start, end)
+        for start, end, _clause in _explicit_negative_clauses(norm)
+    )
 
     application = ""
     for candidate in _KNOWN_APPLICATIONS:
@@ -272,6 +498,10 @@ def _derive_semantic_node(
             if (
                 (match.start() > 0 and norm[match.start() - 1] in "-_")
                 or (match.end() < len(norm) and norm[match.end()] in "-_")
+                or any(
+                    start <= match.start() < end
+                    for start, end in negative_spans
+                )
             ):
                 continue
             if action_match is None or match.start() > action_match.start():
@@ -562,7 +792,7 @@ def derive_semantic_mission(
 ) -> SemanticMission:
     """Build an ordered mission without merging independent requested work."""
 
-    source = _bounded(request, 4000)
+    source = _bounded(request, 32_000)
     explicit_postconditions = tuple(
         _bounded(item, 320) for item in postconditions if _bounded(item, 320)
     )
@@ -740,6 +970,10 @@ class StrategyAttempt:
     primitive_receipt: dict = field(default_factory=dict)
     action_pattern: str = ""
     actionability_evidence: dict = field(default_factory=dict)
+    semantic_batch_id: str = ""
+    semantic_batch_effects: list[dict] = field(default_factory=list)
+    semantic_checkpoint_count: int = 0
+    semantic_batch_resume_from_index: int | None = None
 
     def public_dict(self) -> dict:
         return asdict(self)
@@ -816,6 +1050,7 @@ class ExecutionStrategy:
         self._completed_primitive_signatures: set[str] = set()
         self._retry_substeps: dict[str, dict] = {}
         self._latest_desktop_observation: dict[str, object] = {}
+        self._goal_contract: dict = {}
         self._frozen_node_id = ""
         self._frozen_mechanism_id = ""
         self._frozen_attempt_id = ""
@@ -852,6 +1087,31 @@ class ExecutionStrategy:
         if not any(node.requires_execution for node in self.mission.action_nodes):
             self.mission.action_nodes[0].requires_execution = True
 
+    def bind_goal_contract(self, contract) -> None:
+        """Bind one validated canonical authority for every later decision."""
+
+        from osia.goal_contract import GoalContract, validate_goal_contract
+
+        if not isinstance(contract, GoalContract):
+            raise TypeError("goal contract is required")
+        validated = validate_goal_contract(contract)
+        if _bounded(validated.root_objective, 32_000) != _bounded(
+            self.mission.objective, 32_000,
+        ):
+            raise ValueError("goal contract objective does not match mission")
+        safe = json.loads(json.dumps(
+            validated.to_dict(),
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ))
+        if self._goal_contract and self._goal_contract != safe:
+            raise ValueError("execution strategy goal contract is immutable")
+        self._goal_contract = safe
+
+    def goal_contract_dict(self) -> dict:
+        return json.loads(json.dumps(self._goal_contract)) if self._goal_contract else {}
+
     def pending_nodes(self) -> list[SemanticActionNode]:
         return [
             node for node in self.mission.action_nodes
@@ -874,6 +1134,16 @@ class ExecutionStrategy:
                 if item.attempt_id == str(attempt_id or "")
             ),
             None,
+        )
+
+    def preparatory_effect_is_frozen(self) -> bool:
+        attempt = self.attempt_by_id(self._frozen_attempt_id)
+        return bool(
+            self.frozen_reason
+            and attempt is not None
+            and attempt.attempted_effect in {
+                "application_foreground", "window_focus", "surface_rebound",
+            }
         )
 
     def primitive_postcondition_for_attempt(self, attempt_id: str) -> str:
@@ -1528,7 +1798,18 @@ class ExecutionStrategy:
                     False, semantic_error, node_id=(node.node_id if node else ""),
                 )
             node_id = node.node_id if node is not None else mechanism.node_id
-            if self.frozen_reason and mechanism.mutation:
+            if (
+                self.frozen_reason
+                and mechanism.mutation
+                and not (
+                    self.preparatory_effect_is_frozen()
+                    and mechanism.attempted_effect
+                    not in {
+                        "application_foreground", "window_focus",
+                        "surface_rebound",
+                    }
+                )
+            ):
                 return StrategyDecision(
                     False,
                     "ambiguous_effect_requires_reconciliation",
@@ -1625,9 +1906,22 @@ class ExecutionStrategy:
                 primitive_arguments
                 if isinstance(primitive_arguments, dict) else action_payload
             )
+            preparatory_activation = bool(
+                primitive_tool == "activate_desktop_surface"
+                and _normalized(primitive_arguments.get("action_pattern"))
+                in {"", "window"}
+                and _bounded(primitive_arguments.get("surface_ref"), 160)
+                == _bounded(
+                    self._latest_desktop_observation.get(
+                        "window_surface_ref"
+                    ),
+                    160,
+                )
+            )
             primitive_key = f"{preview.node_id}|{signature}"
             if (
                 primitive_tool == "activate_desktop_surface"
+                and not preparatory_activation
                 and primitive_key in self._completed_primitive_signatures
             ):
                 return StrategyDecision(
@@ -1637,7 +1931,10 @@ class ExecutionStrategy:
                     node_id=preview.node_id,
                 )
             observable_effect = {}
-            if primitive_tool == "activate_desktop_surface":
+            if (
+                primitive_tool == "activate_desktop_surface"
+                and not preparatory_activation
+            ):
                 observable_effect = normalize_desktop_observable_effect(
                     primitive_arguments.get("observable_effect")
                 )
@@ -1673,6 +1970,7 @@ class ExecutionStrategy:
             pending_substep = _pending_uia_substep(self, preview.node_id)
             if (
                 primitive_tool == "activate_desktop_surface"
+                and not preparatory_activation
                 and pending_substep
                 and _uia_effects_match_substep(
                     pending_substep.get("observable_effect"),
@@ -1684,7 +1982,10 @@ class ExecutionStrategy:
             substep_id = ""
             substep_index = 0
             primitive_postcondition = ""
-            if primitive_tool == "activate_desktop_surface":
+            if (
+                primitive_tool == "activate_desktop_surface"
+                and not preparatory_activation
+            ):
                 composite_id = preview.node_id
                 if isinstance(retry_identity, dict):
                     substep_id = str(retry_identity.get("substep_id") or "")
@@ -1811,6 +2112,7 @@ class ExecutionStrategy:
         failure_reason: str = "",
         postcondition_evidence: str = "",
         primitive_receipt: dict | None = None,
+        semantic_barrier: bool = True,
     ) -> StrategyAttempt | None:
         with self._lock:
             attempt = next(
@@ -1837,14 +2139,32 @@ class ExecutionStrategy:
                 attempt.failure_or_stagnation_reason = (
                     _bounded(failure_reason, 120) or "effect_possible_postcondition_unknown"
                 )
-                self.frozen_reason = attempt.failure_or_stagnation_reason
-                self._frozen_node_id = node.node_id
-                self._frozen_mechanism_id = attempt.mechanism_id
-                self._frozen_attempt_id = attempt.attempt_id
                 self._retired_effect_mechanisms[
                     self._effect_scope(attempt.mechanism_id, node.node_id)
                 ] = "outcome_unknown"
-                node.status = "unknown"
+                if semantic_barrier:
+                    self.frozen_reason = attempt.failure_or_stagnation_reason
+                    self._frozen_node_id = node.node_id
+                    self._frozen_mechanism_id = attempt.mechanism_id
+                    self._frozen_attempt_id = attempt.attempt_id
+                    node.status = "unknown"
+                else:
+                    # Preparatory activation/focus has its own effect identity.
+                    # Its uncertainty retires only that exact preparatory
+                    # mechanism; it cannot freeze the pending semantic mutation.
+                    self.frozen_reason = attempt.failure_or_stagnation_reason
+                    self._frozen_node_id = node.node_id
+                    self._frozen_mechanism_id = attempt.mechanism_id
+                    self._frozen_attempt_id = attempt.attempt_id
+                    node.status = "pending"
+            elif normalized_outcome == "failed_before_effect":
+                attempt.status = AttemptStatus.FAILED.value
+                attempt.failure_or_stagnation_reason = (
+                    _bounded(failure_reason, 120) or "failed_before_effect"
+                )
+                # No semantic actuation began, so the exact semantic candidate
+                # remains eligible. Do not consume its evidence-gated retry.
+                node.status = "pending"
             elif normalized_outcome == "stale":
                 attempt.status = AttemptStatus.STALE.value
                 attempt.failure_or_stagnation_reason = (
@@ -2340,6 +2660,73 @@ class ExecutionStrategy:
             self._evidence_revision += 1
             return True
 
+    def reconcile_semantic_batch_prefix(
+        self,
+        *,
+        attempt_id: str,
+        semantic_batch_id: str,
+        applied_count: int,
+        evidence: str,
+    ) -> bool:
+        """Advance only to an exactly observed, non-replayable batch prefix."""
+
+        with self._lock:
+            attempt = self.attempt_by_id(attempt_id)
+            bounded = _bounded(evidence, 180)
+            try:
+                prefix_size = int(applied_count)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if (
+                attempt is None
+                or attempt.attempt_id != self._frozen_attempt_id
+                or not self.frozen_reason
+                or not bounded
+                or not semantic_batch_id
+                or attempt.semantic_batch_id != semantic_batch_id
+                or prefix_size <= 0
+                or prefix_size >= len(attempt.semantic_batch_effects)
+            ):
+                return False
+            attempt.status = AttemptStatus.PROGRESSED.value
+            attempt.postcondition_evidence = bounded
+            attempt.observations_gained.append(bounded)
+            attempt.semantic_batch_resume_from_index = prefix_size
+            node = self.node_by_id(attempt.node_id)
+            if node is not None:
+                node.status = "pending"
+                node.evidence_links = tuple(
+                    (*node.evidence_links, bounded)[-16:]
+                )
+            self._reconciliation_events.append({
+                "attempt_id": attempt.attempt_id,
+                "node_id": attempt.node_id,
+                "mechanism_id": attempt.mechanism_id,
+                "resolution": "semantic_batch_exact_prefix",
+                "evidence": bounded,
+                "reason_code": "semantic_batch_exact_prefix_reconciled",
+                "semantic_batch_id": semantic_batch_id,
+                "applied_count": prefix_size,
+                "resume_from_index": prefix_size,
+                "postcondition": attempt.attempted_effect,
+                "composite_id": attempt.composite_id,
+                "substep_id": attempt.substep_id,
+                "substep_index": attempt.substep_index,
+                "target_application": attempt.target_application,
+                "target_surface": attempt.target_surface,
+            })
+            self._reconciliation_events = self._reconciliation_events[-16:]
+            self._retired_effect_mechanisms.pop(
+                self._effect_scope(attempt.mechanism_id, attempt.node_id),
+                None,
+            )
+            self.frozen_reason = ""
+            self._frozen_node_id = ""
+            self._frozen_mechanism_id = ""
+            self._frozen_attempt_id = ""
+            self._evidence_revision += 1
+            return True
+
     def verify_postcondition(
         self,
         evidence: str,
@@ -2409,6 +2796,7 @@ class ExecutionStrategy:
         with self._lock:
             return {
                 "mission": self.mission.public_dict(),
+                "goal_contract": self.goal_contract_dict(),
                 # Kept for restoring pre-WOR-256 ledgers and focused callers.
                 "goal": self.goal.public_dict(),
                 "current_mechanism": self.current_mechanism,
@@ -2511,6 +2899,13 @@ class ExecutionStrategy:
             mechanisms,
             available_tools=snapshot.get("available_tools") or (),
         )
+        serialized_goal_contract = snapshot.get("goal_contract")
+        if isinstance(serialized_goal_contract, dict) and serialized_goal_contract:
+            from osia.goal_contract import goal_contract_from_dict
+
+            strategy.bind_goal_contract(
+                goal_contract_from_dict(serialized_goal_contract)
+            )
         strategy.attempts = [
             StrategyAttempt(**dict(item))
             for item in snapshot.get("attempts") or []
@@ -2602,7 +2997,18 @@ class ExecutionStrategy:
             }
             for item in self.remaining_mechanisms()
         ]
+        goal_contract = self.goal_contract_dict()
+        if not goal_contract:
+            try:
+                from osia.goal_contract import goal_contract_from_semantic_mission
+
+                goal_contract = goal_contract_from_semantic_mission(
+                    self.mission
+                ).to_dict()
+            except (AttributeError, TypeError, ValueError):
+                goal_contract = {}
         payload = {
+            "goal_contract": goal_contract,
             "semantic_mission": self.mission.public_dict(),
             "available_strategy_layers": available,
             "completed_verified_effects": [
@@ -2642,7 +3048,10 @@ class ExecutionStrategy:
             "reconcile that exact primitive before choosing the next. For a stateless "
             "Invoke control, declare its independent exact surface-text effect using "
             "the observed effect surface ref and expected post-dispatch text; control "
-            "invocation itself is never proof. A failed-before-effect UIA candidate "
+            "invocation itself is never proof. Repeated native literal controls in "
+            "one composite must keep the same previously verified text witness; if "
+            "a witness-family conflict is rejected, re-observe and use that proven "
+            "current witness. A failed-before-effect UIA candidate "
             "retires only that exact identity/generation. Re-observe read-only and "
             "exhaust the fresh candidate set for the same pending substep before "
             "keyboard; a keyboard fallback may perform only that substep. Document tools "
@@ -2704,7 +3113,7 @@ _OBSERVATION_TOOLS = frozenset({
     "take_screenshot", "inspect_desktop_surfaces", "request_visual_observation",
     "is_running", "is_installed", "has_window",
     "steam_game_state", "web_state", "get_current_url", "read_page",
-    "get_page_text", "inspect_browser_page", "inspect_form_fields",
+    "get_page_text", "get_browser_state", "inspect_browser_page", "inspect_form_fields",
     "list_browser_tabs", "get_browser_download", "read_file", "list_files",
     "search_files",
 })
@@ -2789,6 +3198,18 @@ def _reconciliation_observer_relation(attempt: StrategyAttempt) -> str:
     receipt_effect = normalize_desktop_observable_effect(
         primitive.get("observable_effect"),
     )
+    batch_effects = [
+        effect for raw in attempt.semantic_batch_effects
+        if (effect := normalize_desktop_observable_effect(raw))
+    ]
+    receipt_is_batch_prefix = bool(
+        attempt.semantic_batch_id
+        and receipt_effect
+        and receipt_effect in batch_effects
+    )
+    dispatch_effect = (
+        receipt_effect if receipt_is_batch_prefix else declared_effect
+    )
     try:
         attempt_dispatched_at = float(attempt.dispatched_at or 0.0)
         primitive_dispatched_at = float(primitive.get("dispatched_at") or 0.0)
@@ -2797,10 +3218,10 @@ def _reconciliation_observer_relation(attempt: StrategyAttempt) -> str:
         return ""
     declared_effect_observable = any(
         isinstance(item, dict)
-        and item.get("surface_ref") == declared_effect.get("surface_ref")
+        and item.get("surface_ref") == dispatch_effect.get("surface_ref")
         and bool(item.get("identity"))
         and _normalized(item.get("label"))
-        != _normalized(declared_effect.get("expected_text"))
+        != _normalized(dispatch_effect.get("expected_text"))
         for item in state_rows
     )
     target_state_observable = bool(
@@ -2829,7 +3250,10 @@ def _reconciliation_observer_relation(attempt: StrategyAttempt) -> str:
                     "invoke", "selectionitem", "toggle", "expandcollapse",
                 }
                 and declared_effect
-                and receipt_effect == declared_effect
+                and (
+                    receipt_effect == declared_effect
+                    or receipt_is_batch_prefix
+                )
                 and declared_effect_observable
             )
             or (
@@ -3056,6 +3480,9 @@ def _normalize_desktop_uia_frontier(value: object) -> list[dict]:
                 "runtime_signature": _bounded(
                     raw.get("runtime_signature"), 160,
                 ),
+                "automation_id": _bounded(
+                    raw.get("automation_id"), 160,
+                ),
                 "surface_kind": _bounded(raw.get("surface_kind"), 40),
                 "role": _bounded(raw.get("role"), 80),
                 "label": _bounded(raw.get("label"), 240),
@@ -3141,6 +3568,7 @@ def _desktop_uia_frontier_from_scene(scene: object) -> list[dict]:
             "runtime_signature": _bounded(
                 item.get("runtime_signature"), 160,
             ),
+            "automation_id": _bounded(item.get("automation_id"), 160),
             "surface_kind": _bounded(item.get("surface_kind"), 40),
             "role": _bounded(item.get("role"), 80),
             "label": _bounded(item.get("label"), 240),
@@ -3303,6 +3731,7 @@ def _observed_uia_candidate_identity(
         "surface_kind": candidate.get("surface_kind"),
         "role": candidate.get("role"),
         "runtime_signature": candidate.get("runtime_signature"),
+        "automation_id": candidate.get("automation_id"),
         "parent_surface_ref": candidate.get("parent_surface_ref"),
         "patterns": candidate.get("patterns"),
         "observed_at": observation.get("observed_at"),
@@ -3496,10 +3925,15 @@ def _structured_uia_frontier_state(
         and observed_application != _normalized(node.required_application)
     ):
         return "unavailable"
-    mechanism = strategy.mechanism_for_layer(
-        StrategyLayer.NATIVE_ACCESSIBILITY,
-        node_id=node.node_id,
-    )
+    mechanism = next((
+        item
+        for item in strategy._mechanisms.values()
+        if item.layer == StrategyLayer.NATIVE_ACCESSIBILITY
+        and item.node_id == node.node_id
+        and item.attempted_effect != "application_foreground"
+        and item.mechanism_id
+        != "native_accessibility:preparatory_focus"
+    ), None)
     if mechanism is not None and strategy._scope_retirement_reason(
         mechanism.mechanism_id, node.node_id,
     ):
@@ -3694,6 +4128,121 @@ def _single_character_text_delta(before: object, after: object) -> str:
             prefix += 1
         delta = right[prefix:].strip()
     return delta if len(delta) == 1 else ""
+
+
+def _single_digit_automation_family(value: object) -> tuple[str, str]:
+    """Return one native literal-control family and its exact digit."""
+
+    automation_id = _normalized(value).replace(" ", "")
+    digits = list(re.finditer(r"\d", automation_id))
+    if len(digits) != 1:
+        return "", ""
+    match = digits[0]
+    return (
+        automation_id[:match.start()] + "#" + automation_id[match.end():],
+        match.group(0),
+    )
+
+
+def _effect_witness_identity(
+    effect: object,
+    rows: object,
+) -> tuple[str, str]:
+    """Return one exact witness identity and its currently observed text."""
+
+    normalized = normalize_desktop_observable_effect(effect)
+    surface_ref = normalized.get("surface_ref")
+    if not surface_ref:
+        return "", ""
+    for item in rows if isinstance(rows, list) else []:
+        if (
+            isinstance(item, dict)
+            and _bounded(item.get("surface_ref"), 160) == surface_ref
+        ):
+            return (
+                _bounded(
+                    item.get("runtime_signature") or item.get("identity"),
+                    160,
+                ),
+                _bounded(item.get("label"), 240),
+            )
+    return "", ""
+
+
+def _uia_literal_family_preserves_verified_witness(
+    strategy: ExecutionStrategy,
+    node: SemanticActionNode,
+    candidate: dict,
+    arguments: dict,
+) -> tuple[bool, str]:
+    """Keep repeated native literal controls on their proven text witness."""
+
+    family, literal = _single_digit_automation_family(
+        candidate.get("automation_id"),
+    )
+    effect = normalize_desktop_observable_effect(
+        arguments.get("observable_effect"),
+    )
+    current_identity, current_text = _effect_witness_identity(
+        effect,
+        _normalize_desktop_text_surfaces(
+            strategy._latest_desktop_observation.get("uia_text_surfaces"),
+        ),
+    )
+    if (
+        not family
+        or not current_identity
+        or _single_character_text_delta(
+            current_text,
+            effect.get("expected_text"),
+        ) != literal
+    ):
+        return True, ""
+    for attempt in strategy.attempts:
+        if (
+            attempt.node_id != node.node_id
+            or attempt.layer != int(StrategyLayer.NATIVE_ACCESSIBILITY)
+            or attempt.status not in {
+                AttemptStatus.PROGRESSED.value,
+                AttemptStatus.SUCCEEDED.value,
+            }
+        ):
+            continue
+        prior_automation_id = (
+            attempt.target_surface_identity.get("automation_id")
+            if isinstance(attempt.target_surface_identity, dict) else ""
+        ) or (
+            attempt.actionability_evidence.get("automation_id")
+            if isinstance(attempt.actionability_evidence, dict) else ""
+        )
+        prior_family, prior_literal = _single_digit_automation_family(
+            prior_automation_id,
+        )
+        if prior_family != family:
+            continue
+        receipt = (
+            attempt.primitive_receipt
+            if isinstance(attempt.primitive_receipt, dict) else {}
+        )
+        before = receipt.get("before")
+        before = before if isinstance(before, dict) else {}
+        prior_effect = normalize_desktop_observable_effect(
+            attempt.observable_effect,
+        )
+        prior_identity, prior_text = _effect_witness_identity(
+            prior_effect,
+            before.get("state_rows"),
+        )
+        if (
+            prior_identity
+            and _single_character_text_delta(
+                prior_text,
+                prior_effect.get("expected_text"),
+            ) == prior_literal
+            and prior_identity != current_identity
+        ):
+            return False, "uia_literal_family_witness_conflict"
+    return True, ""
 
 
 def _uia_candidate_preserves_verified_text_delta(
@@ -3942,14 +4491,54 @@ def _reconcile_observed_keyboard_substep(
     return True
 
 
+def _nodes_provably_independent(
+    first: SemanticActionNode | None,
+    second: SemanticActionNode | None,
+) -> bool:
+    """Return only an explicit, disjoint application-level independence."""
+
+    if first is None or second is None or first.node_id == second.node_id:
+        return False
+    first_application = _canonical_application(first.required_application)
+    second_application = _canonical_application(second.required_application)
+    return bool(
+        first_application
+        and second_application
+        and first_application != second_application
+    )
+
+
 def _tool_is_structurally_applicable(
     strategy: ExecutionStrategy,
     tool_name: str,
     arguments: dict,
 ) -> tuple[bool, str]:
-    if strategy.frozen_reason and tool_name not in _OBSERVATION_TOOLS:
-        return False, "ambiguous_effect_requires_reconciliation"
     matched_node = strategy.match_action_node(tool_name, arguments)
+    if strategy.frozen_reason and tool_name not in _OBSERVATION_TOOLS:
+        frozen_surface = _bounded(arguments.get("surface_ref"), 160)
+        frozen_attempt = strategy.attempt_by_id(
+            strategy._frozen_attempt_id
+        )
+        frozen_window = _bounded(
+            strategy._latest_desktop_observation.get("window_surface_ref")
+            or (
+                frozen_attempt.target_surface
+                if frozen_attempt is not None else ""
+            ),
+            160,
+        )
+        preparatory_bypass = bool(
+            strategy.preparatory_effect_is_frozen()
+            and tool_name == "activate_desktop_surface"
+            and frozen_surface
+            and frozen_surface != frozen_window
+        )
+        frozen_node = strategy.node_by_id(strategy._frozen_node_id)
+        independent_branch = _nodes_provably_independent(
+            frozen_node, matched_node,
+        )
+        if not preparatory_bypass and not independent_branch:
+            return False, "ambiguous_effect_requires_reconciliation"
     if matched_node is not None:
         pending_nodes = [
             item for item in strategy.pending_nodes() if item.requires_execution
@@ -3957,6 +4546,9 @@ def _tool_is_structurally_applicable(
         if (
             pending_nodes
             and matched_node.order != pending_nodes[0].order
+            and not _nodes_provably_independent(
+                pending_nodes[0], matched_node,
+            )
         ):
             return False, "earlier_action_node_pending"
     node = matched_node or strategy.goal
@@ -4049,6 +4641,151 @@ def _tool_is_structurally_applicable(
     ):
         return False, "prerequisite_effect_already_completed"
     if tool_name == "activate_desktop_surface":
+        resume_effects: list[dict] = []
+        resume_from_index: int | None = None
+        for prior_index in range(len(strategy.attempts) - 1, -1, -1):
+            prior_attempt = strategy.attempts[prior_index]
+            if (
+                prior_attempt.node_id != node.node_id
+                or prior_attempt.status != AttemptStatus.PROGRESSED.value
+                or prior_attempt.semantic_batch_resume_from_index is None
+                or not prior_attempt.semantic_batch_effects
+            ):
+                continue
+            resume_effects = [
+                effect for raw in prior_attempt.semantic_batch_effects
+                if (effect := normalize_desktop_observable_effect(raw))
+            ]
+            resume_from_index = max(
+                0, int(prior_attempt.semantic_batch_resume_from_index),
+            )
+            for later_attempt in strategy.attempts[prior_index + 1:]:
+                if (
+                    later_attempt.node_id != node.node_id
+                    or later_attempt.status not in {
+                        AttemptStatus.PROGRESSED.value,
+                        AttemptStatus.SUCCEEDED.value,
+                    }
+                ):
+                    continue
+                later_effects = [
+                    effect for raw in later_attempt.semantic_batch_effects
+                    if (effect := normalize_desktop_observable_effect(raw))
+                ] or [normalize_desktop_observable_effect(
+                    later_attempt.observable_effect
+                )]
+                later_effects = [effect for effect in later_effects if effect]
+                if later_effects == resume_effects[
+                    resume_from_index:resume_from_index + len(later_effects)
+                ]:
+                    resume_from_index += len(later_effects)
+            break
+        if resume_from_index is not None and resume_from_index >= len(
+            resume_effects
+        ):
+            return False, "semantic_batch_resume_already_completed"
+        semantic_batch = arguments.get("semantic_batch")
+        if semantic_batch is not None:
+            try:
+                from osia.semantic_batch import normalize_semantic_batch
+
+                batch_plan, batch_reason = normalize_semantic_batch(
+                    surface_ref=arguments.get("surface_ref"),
+                    objective=arguments.get("objective"),
+                    action_pattern=arguments.get("action_pattern"),
+                    observable_effect=arguments.get("observable_effect"),
+                    semantic_batch=semantic_batch,
+                )
+            except Exception:
+                batch_plan, batch_reason = (
+                    {}, "semantic_batch_preflight_unavailable",
+                )
+            if not batch_plan:
+                return False, batch_reason
+            batch_effects = [
+                dict(item.get("observable_effect") or {})
+                for item in batch_plan.get("items") or []
+            ]
+            if resume_from_index is not None and batch_effects != resume_effects[
+                resume_from_index:
+            ]:
+                return False, "semantic_batch_resume_frontier_mismatch"
+            if resume_from_index is None and not _semantic_batch_proves_calculation_result(
+                node, batch_plan,
+            ):
+                return False, "semantic_batch_incomplete_semantic_goal"
+            expected_window = _bounded(
+                strategy._latest_desktop_observation.get(
+                    "window_surface_ref"
+                ), 160,
+            )
+            expected_generation = _bounded(
+                strategy._latest_desktop_observation.get(
+                    "window_generation"
+                ), 160,
+            )
+            expected_epoch = None
+            current_text_by_ref = {
+                item["surface_ref"]: item["label"]
+                for item in _normalize_desktop_text_surfaces(
+                    strategy._latest_desktop_observation.get(
+                        "uia_text_surfaces"
+                    )
+                )
+            }
+            for item in batch_plan["items"]:
+                candidate = _structured_uia_surface(
+                    strategy,
+                    item["surface_ref"],
+                    action_pattern=item["action_pattern"],
+                )
+                if not candidate:
+                    return False, "semantic_batch_stale_primitive"
+                if _normalized(candidate.get("label")) != _normalized(
+                    item["objective"]
+                ):
+                    return False, "semantic_batch_target_identity_invalid"
+                if (
+                    _bounded(candidate.get("window_surface_ref"), 160)
+                    != expected_window
+                    or _bounded(candidate.get("window_generation"), 160)
+                    != expected_generation
+                ):
+                    return False, "semantic_batch_target_identity_invalid"
+                try:
+                    candidate_epoch = int(
+                        candidate.get("structural_epoch") or 0
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    return False, "semantic_batch_target_identity_invalid"
+                if expected_epoch is None:
+                    expected_epoch = candidate_epoch
+                elif candidate_epoch != expected_epoch:
+                    return False, "semantic_batch_structural_transition"
+                effect_ref = item["observable_effect"]["surface_ref"]
+                if (
+                    item["action_pattern"] == "Invoke"
+                    and effect_ref not in candidate.get(
+                        "observable_effect_surface_refs", []
+                    )
+                ):
+                    return False, "semantic_batch_final_checkpoint_unobservable"
+                if _normalized(current_text_by_ref.get(effect_ref)) == _normalized(
+                    item["observable_effect"]["expected_text"]
+                ):
+                    return False, "semantic_batch_effect_already_observed"
+                if (
+                    candidate.get("foreground_required") is True
+                    and candidate.get("background_safe") is not True
+                    and strategy._latest_desktop_observation.get(
+                        "target_foreground"
+                    ) is not True
+                ):
+                    return False, "semantic_batch_unresolved_focus_requirement"
+        elif resume_from_index is not None and normalize_desktop_observable_effect(
+            arguments.get("observable_effect")
+        ) != resume_effects[resume_from_index]:
+            return False, "semantic_batch_resume_frontier_mismatch"
         surface_ref = _bounded(arguments.get("surface_ref"), 160)
         window_ref = _bounded(
             strategy._latest_desktop_observation.get("window_surface_ref"),
@@ -4059,8 +4796,15 @@ def _tool_is_structurally_applicable(
         )
         window_pattern = (
             surface_ref == window_ref
-            and _normalized(arguments.get("action_pattern")) == "window"
+            and _normalized(arguments.get("action_pattern")) in {"", "window"}
         )
+        if (
+            window_pattern
+            and strategy._latest_desktop_observation.get(
+                "target_foreground"
+            ) is True
+        ):
+            return False, "prerequisite_effect_already_completed"
         if (
             arguments.get("action_pattern")
             and not requested_pattern
@@ -4092,6 +4836,13 @@ def _tool_is_structurally_applicable(
                 # Bind legacy/provider-omitted calls to the deterministic exact
                 # pair from the fresh structured frontier before signature.
                 arguments["action_pattern"] = selected_pattern
+                if (
+                    selected_pattern == "Invoke"
+                    and not normalize_desktop_observable_effect(
+                        arguments.get("observable_effect"),
+                    )
+                ):
+                    return False, "uia_invoke_observable_effect_required"
         preserves_substep, substep_reason = (
             _uia_action_preserves_pending_substep(
                 strategy, node, arguments,
@@ -4106,6 +4857,13 @@ def _tool_is_structurally_applicable(
         )
         if not preserves_delta:
             return False, delta_reason
+        preserves_witness, witness_reason = (
+            _uia_literal_family_preserves_verified_witness(
+                strategy, node, surface, arguments,
+            )
+        )
+        if not preserves_witness:
+            return False, witness_reason
         if (
             surface.get("foreground_required") is True
             and surface.get("background_safe") is not True
@@ -4312,6 +5070,9 @@ def _normalize_desktop_surface_identity(value: object) -> dict:
         "observed_at": observed_at,
         "dispatched_at": dispatched_at,
     }
+    automation_id = _bounded(raw.get("automation_id"), 160)
+    if automation_id:
+        identity["automation_id"] = automation_id
     if not identity["surface_ref"]:
         return {}
     return identity
@@ -4372,6 +5133,9 @@ def _normalize_primitive_receipt(value: object) -> dict:
             if _bounded(item, 80)
         ],
     }
+    target_automation_id = _bounded(target.get("automation_id"), 160)
+    if target_automation_id:
+        normalized_target["automation_id"] = target_automation_id
     normalized = {
         "kind": _bounded(raw.get("kind"), 80),
         "mechanism": _bounded(raw.get("mechanism"), 80),
@@ -4436,6 +5200,7 @@ def _capture_desktop_surface_identity(
                     "surface_kind": surface.surface_kind.value,
                     "role": surface.role,
                     "runtime_signature": surface.runtime_signature,
+                    "automation_id": surface.automation_id,
                     "parent_surface_ref": surface.parent_ref or "",
                     "patterns": list(surface.patterns),
                     "observed_at": surface.observed_at,
@@ -4486,6 +5251,9 @@ def _capture_desktop_surface_identity(
             "role": target.get("role") or identity.get("role", ""),
             "runtime_signature": target.get("runtime_signature") or identity.get(
                 "runtime_signature", "",
+            ),
+            "automation_id": target.get("automation_id") or identity.get(
+                "automation_id", "",
             ),
             "parent_surface_ref": target.get("parent_surface_ref") or identity.get(
                 "parent_surface_ref", "",
@@ -4542,6 +5310,18 @@ def normalize_execution_memory(value: object) -> dict:
                 )
                 substep_index = max(
                     0, int(attempt.get("substep_index", 0) or 0),
+                )
+                semantic_checkpoint_count = min(
+                    1, max(0, int(
+                        attempt.get("semantic_checkpoint_count", 0) or 0
+                    )),
+                )
+                raw_batch_resume = attempt.get(
+                    "semantic_batch_resume_from_index"
+                )
+                semantic_batch_resume = (
+                    None if raw_batch_resume is None else
+                    max(0, int(raw_batch_resume))
                 )
             except (TypeError, ValueError, OverflowError):
                 continue
@@ -4647,6 +5427,22 @@ def normalize_execution_memory(value: object) -> dict:
                         if (pattern := _canonical_uia_action_pattern(item))
                     ],
                 },
+                "semantic_batch_id": _bounded(
+                    attempt.get("semantic_batch_id"), 160,
+                ),
+                "semantic_batch_effects": [
+                    effect
+                    for raw_effect in (
+                        attempt.get("semantic_batch_effects") or []
+                    )[:8]
+                    if (effect := normalize_desktop_observable_effect(
+                        raw_effect
+                    ))
+                ],
+                "semantic_checkpoint_count": (
+                    semantic_checkpoint_count
+                ),
+                "semantic_batch_resume_from_index": semantic_batch_resume,
             })
         mechanisms = []
         for mechanism in (item.get("mechanisms") or [])[:16]:
@@ -5162,6 +5958,25 @@ def rebind_execution_memory(
                     actionability_evidence=dict(
                         raw_attempt.get("actionability_evidence") or {}
                     ),
+                    semantic_batch_id=str(
+                        raw_attempt.get("semantic_batch_id") or ""
+                    ),
+                    semantic_batch_effects=[
+                        dict(item)
+                        for item in (
+                            raw_attempt.get("semantic_batch_effects") or []
+                        )
+                        if isinstance(item, dict)
+                    ],
+                    semantic_checkpoint_count=int(
+                        raw_attempt.get("semantic_checkpoint_count") or 0
+                    ),
+                    semantic_batch_resume_from_index=(
+                        int(raw_attempt["semantic_batch_resume_from_index"])
+                        if raw_attempt.get(
+                            "semantic_batch_resume_from_index"
+                        ) is not None else None
+                    ),
                 )
                 strategy.attempts.append(restored_attempt)
                 if (
@@ -5315,6 +6130,51 @@ def select_local_reconciliation_probe(
     observer_relation = _reconciliation_observer_relation(attempt)
     target_application = str(attempt.target_application or "")
     target_surface = str(attempt.target_surface or "")
+    available = {str(item or "") for item in available_tools}
+    if _semantic_domain(node) == "web" and semantic_effect:
+        tool_name = "get_browser_state"
+        if tool_name not in available:
+            return None
+        arguments: dict = {}
+        try:
+            from osia.tool_contracts import (
+                SideEffectClass,
+                effective_contract,
+                get_tool_spec,
+            )
+
+            spec = get_tool_spec(tool_name)
+            if spec is None:
+                return None
+            contract = effective_contract(
+                spec,
+                arguments,
+                user_request or strategy.mission.objective,
+            )
+        except Exception:
+            return None
+        if (
+            spec.side_effect is not SideEffectClass.READ_ONLY
+            or contract.side_effect is not SideEffectClass.READ_ONLY
+        ):
+            return None
+        return {
+            "tool": tool_name,
+            "arguments": arguments,
+            "semantic_effect": semantic_effect,
+            "postcondition": semantic_effect,
+            "strategy_attempt_id": attempt.attempt_id,
+            "semantic_node_id": node.node_id,
+            "mechanism_id": attempt.mechanism_id,
+            "target_application": target_application,
+            "target_surface": target_surface,
+            "observer_relation": "browser_state_after_action",
+            "composite_id": attempt.composite_id,
+            "substep_id": attempt.substep_id,
+            "substep_index": attempt.substep_index,
+            "primitive_postcondition": attempt.primitive_postcondition,
+            "observable_effect": dict(attempt.observable_effect),
+        }
     if (
         _semantic_domain(node) != "desktop"
         or not semantic_effect
@@ -5324,7 +6184,6 @@ def select_local_reconciliation_probe(
     ):
         return None
     candidates = _RECONCILIATION_OBSERVERS.get(observer_relation, ())
-    available = {str(item or "") for item in available_tools}
     for tool_name in candidates:
         if tool_name not in available:
             continue
@@ -5666,10 +6525,38 @@ def mechanism_for_tool(
         # The composite owns DOM/UIA/keyboard/local/global selection internally.
         return None
     if tool_name == "activate_desktop_surface":
-        return strategy.mechanism_for_layer(
-            StrategyLayer.NATIVE_ACCESSIBILITY,
-            node_id=node_id,
-        ) or StrategyMechanism(
+        surface_ref = _bounded(arguments.get("surface_ref"), 160)
+        window_ref = _bounded(
+            strategy._latest_desktop_observation.get("window_surface_ref"),
+            160,
+        )
+        if (
+            surface_ref
+            and surface_ref == window_ref
+            and _normalized(arguments.get("action_pattern")) in {"", "window"}
+        ):
+            return StrategyMechanism(
+                "native_accessibility:preparatory_focus",
+                StrategyLayer.NATIVE_ACCESSIBILITY,
+                "exact target foreground acquisition",
+                application=goal.required_application,
+                surface=surface_ref,
+                account=goal.required_account,
+                covers_goal=False,
+                mutation=True,
+                node_id=node_id,
+                attempted_effect="application_foreground",
+            )
+        semantic_native = next((
+            item
+            for item in strategy._mechanisms.values()
+            if item.layer == StrategyLayer.NATIVE_ACCESSIBILITY
+            and item.node_id == node_id
+            and item.attempted_effect != "application_foreground"
+            and item.mechanism_id
+            != "native_accessibility:preparatory_focus"
+        ), None)
+        return semantic_native or StrategyMechanism(
             "native_accessibility", StrategyLayer.NATIVE_ACCESSIBILITY,
             "fresh opaque native accessibility target",
             application=goal.required_application, surface=goal.required_surface,
@@ -5717,6 +6604,215 @@ def mechanism_for_tool(
     )
 
 
+def _tool_semantic_actions(tool_name: object, arguments: dict) -> frozenset[str]:
+    """Return only coarse action classes needed by explicit user prohibitions."""
+
+    name = str(tool_name or "").strip().lower()
+    actions: set[str] = set()
+    if name in {
+        "click", "find_and_click", "desktop_click",
+        "activate_browser_element", "open_search_result", "paginate_browser",
+    }:
+        actions.add("activate")
+    if name == "desktop_uia_action" and str(
+        (arguments or {}).get("action_pattern") or ""
+    ).strip().lower() in {
+        "invoke", "selectionitem", "toggle", "expandcollapse",
+    }:
+        actions.add("activate")
+    if name == "activate_desktop_surface":
+        values = arguments if isinstance(arguments, dict) else {}
+        semantic_batch = values.get("semantic_batch")
+        batch_items = (
+            semantic_batch if isinstance(semantic_batch, list) else []
+        )
+        if (
+            _canonical_uia_action_pattern(values.get("action_pattern"))
+            or batch_items
+        ):
+            actions.add("activate")
+        objectives = [values.get("objective")]
+        objectives.extend(
+            item.get("objective")
+            for item in batch_items
+            if isinstance(item, dict)
+        )
+        for objective in objectives:
+            normalized_objective = _normalized(objective)
+            for action, pattern in _ACTION_PATTERNS:
+                if re.search(pattern, normalized_objective):
+                    actions.add(action)
+    if name in {"fill", "fill_form_field", "type_text", "desktop_type"}:
+        actions.update({"type", "write"})
+    if name in {"press_key", "desktop_press"}:
+        key = _normalized((arguments or {}).get("key")).replace(" ", "")
+        if key in {
+            "enter", "return", "ctrl+enter", "control+enter",
+            "cmd+enter", "command+enter", "meta+enter",
+        }:
+            # Enter is a commit/activation boundary and commonly sends forms
+            # or messages. An explicit no-send/no-activate constraint wins.
+            actions.update({"activate", "send"})
+        if key in {"delete", "del"}:
+            actions.add("delete")
+    if re.search(r"(?:^|_)(?:send|submit|publish|share)(?:_|$)", name):
+        actions.add("send")
+    if re.search(r"(?:^|_)(?:create|add)(?:_|$)", name) or name in {
+        "write_file", "save_memory", "gmail_create_draft",
+    }:
+        actions.add("create")
+    if (
+        re.search(
+            r"(?:^|_)(?:write|save|edit|update|modify|replace|overwrite)"
+            r"(?:_|$)",
+            name,
+        )
+        or name in {"gmail_create_draft"}
+    ):
+        actions.add("write")
+    if re.search(r"(?:^|_)(?:move|rename)(?:_|$)", name):
+        actions.add("move")
+    if re.search(r"(?:^|_)(?:delete|remove)(?:_|$)", name) or name in {
+        "kill_process", "close_browser_tab",
+    }:
+        actions.add("delete")
+    if name in {
+        "open_application", "open_uri", "open_in_editor", "open_browser",
+        "open_new_tab", "open_new_browser_tab", "open_search_result",
+    }:
+        actions.add("open")
+    if name in {
+        "navigate", "navigate_browser", "go_back", "go_forward",
+        "browser_back", "browser_forward", "select_browser_tab",
+        "return_to_browser_opener",
+    }:
+        actions.add("navigate")
+    if "search" in name or name in {"find_and_click"}:
+        actions.add("search")
+    return frozenset(actions)
+
+
+def _constraint_target_key(value: object) -> str:
+    normalized = _normalized(value)
+    for _action, pattern in _NEGATED_ACTION_ALIASES:
+        normalized = re.sub(pattern, " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(
+        r"\b(?:the|a|an|this|that|these|those|le|la|les|un|une|des|"
+        r"ce|cet|cette|ces|file|files|folder|folders|fichier|fichiers|"
+        r"dossier|dossiers)\b",
+        " ",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"[^a-z0-9._:/\\-]+", "", normalized)
+
+
+def _tool_semantic_target_values(tool_name: object, arguments: dict) -> tuple[str, ...]:
+    name = str(tool_name or "").strip().lower()
+    values = arguments if isinstance(arguments, dict) else {}
+    preferred_keys = {
+        "path", "paths", "file", "filename", "directory", "target",
+        "target_path", "selector", "description", "objective", "label",
+        "name", "url", "uri", "query", "recipient", "destination",
+    }
+    targets: list[str] = []
+
+    def append(value) -> None:
+        if isinstance(value, str) and value.strip():
+            targets.append(value)
+        elif isinstance(value, list):
+            for item in value[:32]:
+                append(item)
+
+    for key in preferred_keys:
+        append(values.get(key))
+    if name == "activate_desktop_surface":
+        for item in (
+            values.get("semantic_batch")
+            if isinstance(values.get("semantic_batch"), list) else []
+        )[:8]:
+            if isinstance(item, dict):
+                append(item.get("objective"))
+    return tuple(dict.fromkeys(
+        target for target in targets if _constraint_target_key(target)
+    ))
+
+
+def _explicitly_forbidden_tool_action(
+    strategy: ExecutionStrategy,
+    tool_name: object,
+    arguments: dict,
+) -> str:
+    contract = strategy.goal_contract_dict()
+    constraints = (
+        contract.get("global_constraints")
+        if isinstance(contract, dict) else None
+    )
+    if not isinstance(constraints, list):
+        constraints = list(
+            explicit_negative_constraints(strategy.mission.objective)
+        )
+    forbidden = {
+        str(item.get("value") or "")
+        for item in constraints
+        if isinstance(item, dict) and item.get("name") == "forbidden_action"
+    }
+    tool_actions = _tool_semantic_actions(tool_name, arguments)
+    if any(
+        isinstance(item, dict)
+        and item.get("name") == "unresolved_negative_constraint"
+        for item in constraints
+    ):
+        mechanism = mechanism_for_tool(strategy, str(tool_name or ""), arguments)
+        if (
+            str(tool_name or "").strip().lower() not in _OBSERVATION_TOOLS
+            and (mechanism is None or mechanism.mutation)
+        ):
+            return "unresolved"
+    global_match = next(iter(sorted(
+        forbidden.intersection(tool_actions)
+    )), "")
+    if global_match:
+        return global_match
+    targeted = []
+    for item in constraints:
+        if not isinstance(item, dict) or item.get("name") != "forbidden_action_target":
+            continue
+        try:
+            value = json.loads(str(item.get("value") or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        action = str((value or {}).get("action") or "")
+        target = str((value or {}).get("target") or "")
+        if action in tool_actions and _constraint_target_key(target):
+            targeted.append((action, target))
+    if not targeted:
+        return ""
+    candidate_keys = tuple(
+        _constraint_target_key(value)
+        for value in _tool_semantic_target_values(tool_name, arguments)
+        if _constraint_target_key(value)
+    )
+    if not candidate_keys:
+        # An opaque keyboard/ref action cannot prove that it excludes a
+        # specifically forbidden target, so explicit user intent wins.
+        return sorted(action for action, _target in targeted)[0]
+    for action, target in sorted(targeted):
+        target_key = _constraint_target_key(target)
+        if any(
+            target_key == candidate
+            or (
+                min(len(target_key), len(candidate)) >= 3
+                and (target_key in candidate or candidate in target_key)
+            )
+            for candidate in candidate_keys
+        ):
+            return action
+    return ""
+
+
 def tool_preflight(
     tool_name: str,
     arguments: dict,
@@ -5726,6 +6822,15 @@ def tool_preflight(
     strategy = strategy or current_execution_strategy()
     if strategy is None:
         return None
+    forbidden_action = _explicitly_forbidden_tool_action(
+        strategy, tool_name, arguments,
+    )
+    if forbidden_action:
+        return StrategyDecision(
+            False,
+            "explicit_negative_constraint_forbids_" + forbidden_action,
+            node_id=strategy.goal.node_id,
+        )
     applicable, reason_code = _tool_is_structurally_applicable(
         strategy, tool_name, arguments,
     )
@@ -5810,7 +6915,38 @@ def tool_preflight(
     mechanism = mechanism_for_tool(strategy, tool_name, arguments)
     if mechanism is None:
         return None
-    return strategy.select(mechanism, {"tool": tool_name, "arguments": arguments})
+    decision = strategy.select(
+        mechanism, {"tool": tool_name, "arguments": arguments},
+    )
+    if (
+        tool_name == "activate_desktop_surface"
+        and arguments.get("semantic_batch") is not None
+        and decision.allowed
+        and decision.attempt_id
+    ):
+        try:
+            from osia.semantic_batch import normalize_semantic_batch
+
+            batch_plan, _reason = normalize_semantic_batch(
+                surface_ref=arguments.get("surface_ref"),
+                objective=arguments.get("objective"),
+                action_pattern=arguments.get("action_pattern"),
+                observable_effect=arguments.get("observable_effect"),
+                semantic_batch=arguments.get("semantic_batch"),
+            )
+        except Exception:
+            batch_plan = {}
+        attempt = strategy.attempt_by_id(decision.attempt_id)
+        if attempt is not None and batch_plan:
+            attempt.semantic_batch_id = str(
+                batch_plan.get("semantic_batch_id") or ""
+            )
+            attempt.semantic_batch_effects = [
+                dict(item.get("observable_effect") or {})
+                for item in batch_plan.get("items") or []
+            ]
+            attempt.semantic_checkpoint_count = 1
+    return decision
 
 
 def record_tool_observation(
@@ -6006,6 +7142,64 @@ def record_tool_observation(
                         "rebound_target_surface_ref"
                     ),
                     "no_partial_effect": False,
+                },
+            )
+        if (
+            tool_name == "inspect_desktop_surfaces"
+            and safe_outcome == "confirmed_absence"
+            and safe_reason
+            == "exact_desktop_primitive_absent_no_partial_effect"
+            and exact_postcondition
+            and receipt.get("no_partial_effect") is True
+            and strategy.frozen_reason
+        ):
+            return strategy.reconcile(
+                succeeded=False,
+                evidence=token,
+                primitive_only=True,
+                evidence_details={
+                    "evidence_kind": "exact_independent_desktop_state",
+                    "evidence_source": tool_name,
+                    "evidence_outcome": safe_outcome,
+                    "reason_code": safe_reason,
+                    "postcondition": exact_postcondition,
+                    "strategy_attempt_id": receipt.get(
+                        "strategy_attempt_id"
+                    ),
+                    "semantic_node_id": receipt.get("semantic_node_id"),
+                    "mechanism_id": receipt.get("mechanism_id"),
+                    "attempted_effect": receipt.get("attempted_effect"),
+                    "primitive_postcondition": receipt.get(
+                        "primitive_postcondition"
+                    ),
+                    "observable_effect": receipt.get("observable_effect"),
+                    "composite_id": receipt.get("composite_id"),
+                    "substep_id": receipt.get("substep_id"),
+                    "substep_index": receipt.get("substep_index"),
+                    "observed_application": scene.get("application"),
+                    "observed_surface": scene.get("window_surface_ref"),
+                    "window_generation": scene.get("window_generation"),
+                    "structural_epoch": scene.get("structural_epoch"),
+                    "observed_at": receipt.get("observed_at"),
+                    "surface_continuity": receipt.get(
+                        "surface_continuity"
+                    ),
+                    "previous_window_surface_ref": receipt.get(
+                        "previous_window_surface_ref"
+                    ),
+                    "previous_window_generation": receipt.get(
+                        "previous_window_generation"
+                    ),
+                    "rebound_window_surface_ref": receipt.get(
+                        "rebound_window_surface_ref"
+                    ),
+                    "rebound_window_generation": receipt.get(
+                        "rebound_window_generation"
+                    ),
+                    "rebound_target_surface_ref": receipt.get(
+                        "rebound_target_surface_ref"
+                    ),
+                    "no_partial_effect": True,
                 },
             )
         if (
@@ -6253,6 +7447,7 @@ def record_tool_outcome(
     reason_code: str,
     result: object,
     strategy: ExecutionStrategy | None = None,
+    durable_attempt_id: str = "",
 ) -> None:
     strategy = strategy or current_execution_strategy()
     if strategy is None:
@@ -6262,6 +7457,11 @@ def record_tool_outcome(
     )
     if decision is None or not decision.allowed or not decision.attempt_id:
         if tool_name in _OBSERVATION_TOOLS:
+            return
+        if tool_name == "activate_desktop_surface":
+            # A wrapper/owner state without the already-bound strategy decision
+            # is operation-level evidence only. Never synthesize a semantic
+            # UIA mutation or anti-replay barrier from it.
             return
         if _normalized(outcome) in {"pending", "outcome_unknown", "unknown_after_start"}:
             synthetic = StrategyMechanism(
@@ -6343,12 +7543,79 @@ def record_tool_outcome(
             receipt.get("primitive")
             if receipt else None
         )
+        attempt = strategy.attempt_by_id(decision.attempt_id)
+        if (
+            tool_name == "activate_desktop_surface"
+            and not isinstance(primitive_receipt, dict)
+            and durable_attempt_id
+            and attempt is not None
+        ):
+            try:
+                from osia.tool_attempts import get_tool_attempt_store
+
+                durable = (
+                    get_tool_attempt_store().get_attempt(durable_attempt_id)
+                    or {}
+                )
+                journal_entry = next((
+                    item
+                    for item in reversed(
+                        durable.get("primitive_journal") or []
+                    )
+                    if item.get("effect_role") == "semantic"
+                    and item.get("lifecycle") in {
+                        "dispatch_started", "dispatch_returned",
+                        "receipt_bound", "verified", "unknown",
+                    }
+                ), None)
+            except Exception:
+                journal_entry = None
+            if isinstance(journal_entry, dict):
+                identity = (
+                    attempt.target_surface_identity
+                    if isinstance(attempt.target_surface_identity, dict)
+                    else {}
+                )
+                primitive_receipt = {
+                    "kind": "desktop_uia_primitive",
+                    "mechanism": str(
+                        journal_entry.get("uia_pattern") or ""
+                    ).casefold(),
+                    "observable_effect": dict(attempt.observable_effect),
+                    "dispatched_at": float(
+                        journal_entry.get("dispatch_started_at") or 0.0
+                    ),
+                    "before": {
+                        "application": (
+                            identity.get("application")
+                            or attempt.target_application
+                        ),
+                        "window_surface_ref": identity.get(
+                            "window_surface_ref"
+                        ),
+                        "window_generation": identity.get(
+                            "window_generation"
+                        ),
+                        "structural_epoch": identity.get(
+                            "structural_epoch", 0
+                        ),
+                        "observed_at": identity.get("observed_at", 0.0),
+                        "target": dict(identity),
+                    },
+                }
         if (
             tool_name == "activate_desktop_surface"
             and isinstance(primitive_receipt, dict)
         ):
-            attempt = strategy.attempt_by_id(decision.attempt_id)
             if attempt is not None:
+                try:
+                    dispatched_at = float(
+                        primitive_receipt.get("dispatched_at") or 0.0
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    dispatched_at = 0.0
+                if dispatched_at > 0.0:
+                    attempt.dispatched_at = dispatched_at
                 primitive_mechanism = _normalized(
                     primitive_receipt.get("mechanism"),
                 )
@@ -6403,6 +7670,27 @@ def record_tool_outcome(
                 attempt.target_surface = _bounded(
                     receipt.get("surface_ref"), 160,
                 ) or attempt.target_surface
+            strategy.record(
+                decision,
+                "ambiguous",
+                failure_reason=(reason_code or "preparatory_effect_possible"),
+                primitive_receipt=primitive_receipt,
+                semantic_barrier=False,
+            )
+            return
+        if (
+            tool_name == "activate_desktop_surface"
+            and not (
+                isinstance(primitive_receipt, dict)
+                and primitive_receipt.get("kind") == "desktop_uia_primitive"
+            )
+        ):
+            strategy.record(
+                decision,
+                "failed_before_effect",
+                failure_reason="semantic_dispatch_witness_missing",
+            )
+            return
         strategy.record(
             decision,
             "ambiguous",

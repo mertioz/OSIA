@@ -151,10 +151,10 @@ def test_explicit_request_without_objective_requires_clarification():
 @pytest.mark.parametrize(
     "status,fragment",
     (
-        ("running", "Autonomous mission"),
+        ("running", "controls stay in this chat"),
         ("authorization_pending", "waiting for your authorization"),
-        ("busy", "another Autonomous mission"),
-        ("unavailable", "canonical Autonomous runner"),
+        ("busy", "Another agent execution"),
+        ("unavailable", "durable execution engine"),
         ("failed", "could not be started"),
         ("outcome_unknown", "could not be confirmed"),
     ),
@@ -194,8 +194,8 @@ def test_agent_handoff_short_circuits_sibling_tools_and_second_model_round(monke
         '"confidence":0.99,"explicit_request":true}</tool_call>'
     ], rounds)
     final = agent.run(text, history=[], on_sentence=lambda _text: None)
-    assert "started this as an Autonomous mission" in final
-    assert len(rounds) == 1
+    assert "controls stay in this chat" in final
+    assert rounds == []
     assert len(launches) == 1
     assert writes == []
     assert "tool_call" not in str(agent.exported_history())
@@ -225,7 +225,7 @@ def test_explicit_request_discards_normal_tool_then_retries_handoff(monkeypatch)
     ], rounds)
     final = agent.run(text, history=[], on_sentence=lambda _text: None)
     assert "waiting for your authorization" in final
-    assert len(rounds) == 2
+    assert rounds == []
     assert len(launches) == 1
     assert dispatches == []
 
@@ -246,11 +246,11 @@ def test_explicit_handoff_repairs_metadata_and_discards_provider_extras():
         '<tool_call>{"tool":"bash","command":"echo must-not-run"}</tool_call>',
     ], rounds)
     final = agent.run(text, history=[], on_sentence=lambda _text: None)
-    assert "started this as an Autonomous mission" in final
-    assert len(rounds) == 1
+    assert "controls stay in this chat" in final
+    assert rounds == []
     assert len(launches) == 1
     assert launches[0]["objective"] == text
-    assert launches[0]["reason_code"] == "dependent_phases"
+    assert launches[0]["reason_code"] == "sustained_computer_work"
     assert launches[0]["confidence"] == 1.0
 
 
@@ -271,13 +271,13 @@ def test_automatic_handoff_repairs_metadata_but_keeps_long_work_guard():
         '"reason_code":"provider_specific","confidence":"high"}</tool_call>'
     ], rounds)
     final = agent.run(text, history=[], on_sentence=lambda _text: None)
-    assert "started this as an Autonomous mission" in final
+    assert "controls stay in this chat" in final
     assert len(launches) == 1
     assert launches[0]["explicit_request"] is False
     assert launches[0]["reason_code"] == "dependent_phases"
 
 
-def test_accidental_handoff_with_malformed_metadata_keeps_short_action_normal():
+def test_short_execution_routes_before_malformed_provider_handoff():
     launches = []
     text = "Open Calculator."
     agent = OSIAAgent(lang="en")
@@ -291,8 +291,9 @@ def test_accidental_handoff_with_malformed_metadata_keeps_short_action_normal():
         "I can handle that in normal chat.",
     ], rounds)
     final = agent.run(text, history=[], on_sentence=lambda _text: None)
-    assert final == "I can handle that in normal chat."
-    assert launches == []
+    assert "controls stay in this chat" in final
+    assert rounds == []
+    assert len(launches) == 1
 
 
 def test_simple_chat_uses_one_provider_round_and_never_launches():

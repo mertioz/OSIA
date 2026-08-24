@@ -53,6 +53,9 @@ _PRIMITIVE_STATE_ROLES = frozenset({
     "DocumentControl", "EditControl", "PaneControl", "TextControl",
 })
 _MAX_PRIMITIVE_STATE_ROWS = 32
+_PRIMITIVE_ABSENCE_SETTLE_SECONDS = 5.0
+_UIA_ACTION_DISPATCH_TIMEOUT_SECONDS = 0.75
+_UIA_ACTION_CANCEL_SETTLE_SECONDS = 0.1
 _SECURE_DESKTOP_PROCESS_NAMES = frozenset({
     "consent", "credentialuibroker", "lockapp", "logonui", "winlogon",
 })
@@ -660,6 +663,245 @@ def _fresh_uia_action_methods(control) -> dict[str, object]:
     return available
 
 
+def _dispatch_fresh_uia_action_bounded(
+    auto,
+    *,
+    native_window_id: int,
+    runtime_id: tuple[int, ...],
+    action_pattern: str,
+    observed_patterns: Iterable[str],
+    invoke_preflight_reason: str = "",
+    journal_dispatch_started=None,
+    journal_dispatch_returned=None,
+) -> dict:
+    """Bound one UIA provider call while preserving its exact dispatch state."""
+
+    done = threading.Event()
+    cancel_before_dispatch = threading.Event()
+    dispatch_gate = threading.Lock()
+    state = {
+        "dispatch_started": False,
+        "dispatched_at": 0.0,
+        "completed": False,
+        "reason_code": "",
+        "worker_may_be_active": False,
+        "worker_native_id": 0,
+        "automation_id": "",
+        "fresh_supported_patterns": [],
+        "selected_pattern": action_pattern,
+        "selected_pattern_available": False,
+    }
+
+    def _worker() -> None:
+        cancellation_enabled = False
+        try:
+            with auto.UIAutomationInitializerInThread():
+                root = auto.ControlFromHandle(int(native_window_id))
+                control = _find_runtime_control(root, runtime_id)
+                if control is None:
+                    state["reason_code"] = "stale_semantic_reference"
+                    return
+                try:
+                    state["automation_id"] = _safe_label(control.AutomationId)
+                except Exception:
+                    pass
+                fresh_actions = _fresh_uia_action_methods(control)
+                state["fresh_supported_patterns"] = list(fresh_actions)
+                allowed_patterns = set(observed_patterns)
+                selected_pattern = action_pattern or next((
+                    pattern_name
+                    for pattern_name, _getter_name, _method_name
+                    in _UIA_ACTION_PATTERN_METHODS
+                    if pattern_name in fresh_actions
+                    and pattern_name in allowed_patterns
+                ), "")
+                state["selected_pattern"] = selected_pattern
+                method = (
+                    fresh_actions.get(selected_pattern)
+                    if selected_pattern in allowed_patterns else
+                    None
+                )
+                state["selected_pattern_available"] = callable(method)
+                if not callable(method):
+                    state["reason_code"] = "uia_action_pattern_unavailable"
+                    return
+                if selected_pattern == "Invoke" and invoke_preflight_reason:
+                    state["reason_code"] = invoke_preflight_reason
+                    return
+                with dispatch_gate:
+                    if cancel_before_dispatch.is_set():
+                        state["reason_code"] = "uia_action_dispatch_timed_out_before_effect"
+                        return
+                    if (
+                        callable(journal_dispatch_started)
+                        and not journal_dispatch_started(
+                            automation_id=state["automation_id"],
+                            uia_pattern=selected_pattern,
+                        )
+                    ):
+                        state["reason_code"] = "primitive_journal_unavailable"
+                        return
+                    state["dispatched_at"] = time.time()
+                    state["dispatch_started"] = True
+                    state["worker_native_id"] = threading.get_native_id()
+                try:
+                    import ctypes
+
+                    cancellation_enabled = (
+                        ctypes.windll.ole32.CoEnableCallCancellation(None) >= 0
+                    )
+                except Exception:
+                    cancellation_enabled = False
+                method()
+                if (
+                    callable(journal_dispatch_returned)
+                    and not journal_dispatch_returned()
+                ):
+                    state["reason_code"] = (
+                        "primitive_journal_return_unavailable"
+                    )
+                    return
+                state["completed"] = True
+        except Exception:
+            state["reason_code"] = (
+                "uia_activation_outcome_unknown"
+                if state["dispatch_started"] else
+                "native_accessibility_invocation_unavailable"
+            )
+        finally:
+            if cancellation_enabled:
+                try:
+                    import ctypes
+
+                    ctypes.windll.ole32.CoDisableCallCancellation(None)
+                except Exception:
+                    pass
+            done.set()
+
+    worker = threading.Thread(
+        target=_worker,
+        name="osia-uia-action",
+        daemon=True,
+    )
+    worker.start()
+    if not done.wait(_UIA_ACTION_DISPATCH_TIMEOUT_SECONDS):
+        with dispatch_gate:
+            if not state["dispatch_started"]:
+                cancel_before_dispatch.set()
+                state["reason_code"] = (
+                    "uia_action_dispatch_timed_out_before_effect"
+                )
+            else:
+                state["reason_code"] = "uia_action_dispatch_timed_out"
+                try:
+                    import ctypes
+
+                    ctypes.windll.ole32.CoCancelCall(
+                        int(state["worker_native_id"]),
+                        0,
+                    )
+                except Exception:
+                    pass
+        done.wait(_UIA_ACTION_CANCEL_SETTLE_SECONDS)
+        state["worker_may_be_active"] = not done.is_set()
+    return dict(state)
+
+
+def _durable_primitive_journal_callbacks(
+    *,
+    application_identity: str,
+    surface_ref: str,
+    native_window_id: object,
+    window_generation: str,
+    runtime_identity: str,
+):
+    """Bind the current durable attempt without creating another state store."""
+
+    try:
+        from osia.tool_attempts import (
+            current_tool_attempt_id,
+            current_tool_attempt_store,
+        )
+
+        attempt_id = current_tool_attempt_id()
+        store = current_tool_attempt_store()
+    except Exception:
+        attempt_id = ""
+        store = None
+    if not attempt_id:
+        return None, None
+    if store is None:
+        return (lambda **_kwargs: False), (lambda: False)
+    try:
+        durable = store.get_attempt(attempt_id) or {}
+        journal = list(durable.get("primitive_journal") or [])
+        prepared = next((
+            item for item in journal
+            if item.get("lifecycle") == "prepared"
+            and (
+                item.get("surface_ref") == str(surface_ref or "")
+                or (
+                    runtime_identity
+                    and item.get("runtime_identity") == runtime_identity
+                )
+            )
+        ), None)
+        if prepared is None and len(journal) == 1:
+            prepared = journal[0]
+        primitive_id = str(
+            prepared.get("primitive_id") if isinstance(prepared, dict) else ""
+        )
+    except Exception:
+        primitive_id = ""
+
+    def _started(*, automation_id: str = "", uia_pattern: str = "") -> bool:
+        if not primitive_id:
+            return False
+        try:
+            updated = store.record_primitive_dispatch_started(
+                attempt_id,
+                primitive_id=primitive_id,
+                application_identity=application_identity,
+                surface_ref=surface_ref,
+                native_window_id=str(native_window_id or ""),
+                window_generation=window_generation,
+                runtime_identity=runtime_identity,
+                automation_id=automation_id,
+                uia_pattern=uia_pattern,
+            )
+            entry = next(
+                (
+                    item for item in updated.get("primitive_journal") or []
+                    if item.get("primitive_id") == primitive_id
+                ),
+                {},
+            )
+            return entry.get("lifecycle") == "dispatch_started"
+        except Exception:
+            return False
+
+    def _returned() -> bool:
+        if not primitive_id:
+            return False
+        try:
+            updated = store.record_primitive_dispatch_returned(
+                attempt_id,
+                primitive_id=primitive_id,
+            )
+            entry = next(
+                (
+                    item for item in updated.get("primitive_journal") or []
+                    if item.get("primitive_id") == primitive_id
+                ),
+                {},
+            )
+            return entry.get("lifecycle") == "dispatch_returned"
+        except Exception:
+            return False
+
+    return _started, _returned
+
+
 def _surface_kind(role: str, *, modal: bool = False) -> SurfaceKind:
     if modal or role == "WindowControl":
         return SurfaceKind.DIALOG if modal else SurfaceKind.WINDOW
@@ -969,6 +1211,7 @@ def _observe_window_scene(
             native=native,
             stable_identity=stable_identity,
             patterns=item["patterns"],
+            automation_id=item["automation_id"],
         )
         refs.append(ref)
         ref_by_index[index] = ref.ref_id
@@ -1901,10 +2144,13 @@ def _exact_primitive_reconciliation(
     )
     if (
         attempt is None
-        or not attempt.substep_id
         or primitive.get("kind") not in {
             "desktop_uia_primitive", "desktop_window_focus",
         }
+        or (
+            primitive.get("kind") == "desktop_uia_primitive"
+            and not attempt.substep_id
+        )
     ):
         return {}
     before = primitive.get("before")
@@ -2055,6 +2301,68 @@ def _exact_primitive_reconciliation(
         )
     )
     if not exact_local_effect:
+        before_signature = str(before.get("state_signature") or "")
+        target_unchanged = bool(
+            target_now is not None
+            and str(target_before.get("label") or "")
+            == target_now.accessible_label
+            and target_before.get("selected") is target_now.selected
+            and target_before.get("focused") is target_now.focused
+            and target_before.get("enabled") is target_now.enabled
+            and tuple(target_before.get("patterns") or ())
+            == tuple(target_now.patterns)
+        )
+        exact_no_partial_effect = bool(
+            primitive_kind == "desktop_uia_primitive"
+            and mechanism in {
+                "invoke", "selectionitem", "toggle", "expandcollapse",
+            }
+            and declared_effect
+            and receipt_effect == declared_effect
+            and primitive.get("worker_may_be_active") is not True
+            and continuity.get("surface_continuity")
+            == "exact_same_generation"
+            and scene.observed_at - dispatched_at
+            >= _PRIMITIVE_ABSENCE_SETTLE_SECONDS
+            and before.get("target_foreground") is scene.foreground
+            and before.get("structural_epoch") == scene.structural_epoch
+            and before_signature
+            and after.get("state_signature") == before_signature
+            and not changed_state
+            and target_unchanged
+        )
+        if exact_no_partial_effect:
+            return {
+                "schema_version": 1,
+                "evidence_kind": "exact_independent_desktop_state",
+                "evidence_source": "inspect_desktop_surfaces",
+                "dispatch_state": "effect_absent",
+                "outcome": "confirmed_absence",
+                "reason_code": (
+                    "exact_desktop_primitive_absent_no_partial_effect"
+                ),
+                "semantic_postcondition": "desktop_uia_primitive_absent",
+                "postcondition": attempt.primitive_postcondition,
+                "composite_id": attempt.composite_id,
+                "substep_id": attempt.substep_id,
+                "substep_index": attempt.substep_index,
+                "strategy_attempt_id": attempt.attempt_id,
+                "semantic_node_id": attempt.node_id,
+                "mechanism_id": attempt.mechanism_id,
+                "attempted_effect": attempt.attempted_effect,
+                "primitive_postcondition": attempt.primitive_postcondition,
+                "observable_effect": dict(declared_effect),
+                "observed_application": scene.application_id,
+                "observed_window_surface_ref": scene.window_ref.ref_id,
+                "window_generation": scene.window_ref.window_generation,
+                "structural_epoch": scene.structural_epoch,
+                "observed_at": scene.observed_at,
+                "changed_state_count": 0,
+                "target_state_changed": False,
+                "target_foreground": bool(scene.foreground),
+                "no_partial_effect": True,
+                **continuity,
+            }
         return {}
     return {
         "schema_version": 1,
@@ -2587,6 +2895,11 @@ def activate_desktop_surface(
     *,
     observable_effect: dict | None = None,
     action_pattern: str = "",
+    semantic_batch: list[dict] | None = None,
+    _batch_internal: bool = False,
+    _batch_application: str = "",
+    _batch_window_generation: str = "",
+    _batch_structural_epoch: int | None = None,
 ) -> dict:
     """Re-resolve an opaque ref and invoke/select it through UIA, never coordinates."""
 
@@ -2595,6 +2908,79 @@ def activate_desktop_surface(
             "ERROR: native semantic activation is unavailable on this platform.",
             "native_accessibility_unavailable",
         )
+
+    if semantic_batch is not None and not _batch_internal:
+        try:
+            from osia.semantic_batch import (
+                execute_semantic_batch,
+                normalize_semantic_batch,
+            )
+
+            plan, reason_code = normalize_semantic_batch(
+                surface_ref=surface_ref,
+                objective=objective,
+                action_pattern=action_pattern,
+                observable_effect=observable_effect,
+                semantic_batch=semantic_batch,
+            )
+        except Exception:
+            plan, reason_code = {}, "semantic_batch_preflight_unavailable"
+        if not plan:
+            return _pre_dispatch_failure(
+                "ERROR: semantic batch rejected before dispatch.",
+                reason_code,
+            )
+        anchor_resolution = DESKTOP_SURFACE_REGISTRY.resolve(surface_ref)
+        anchor = anchor_resolution.surface
+        if not anchor_resolution.resolved or anchor is None:
+            return _pre_dispatch_failure(
+                "ERROR: stale semantic batch anchor.",
+                "semantic_batch_stale_primitive",
+            )
+
+        def _dispatch_batch_item(item: dict) -> dict:
+            item_result = activate_desktop_surface(
+                str(item.get("surface_ref") or ""),
+                str(item.get("objective") or ""),
+                observable_effect=item.get("observable_effect"),
+                action_pattern=str(item.get("action_pattern") or ""),
+                _batch_internal=True,
+                _batch_application=anchor.application_id,
+                _batch_window_generation=anchor.window_generation,
+                _batch_structural_epoch=anchor.structural_epoch,
+            )
+            try:
+                from osia.tool_attempts import (
+                    current_tool_attempt_id,
+                    current_tool_attempt_store,
+                )
+
+                attempt_id = current_tool_attempt_id()
+                store = current_tool_attempt_store()
+                item_receipt = (
+                    item_result.get("receipt")
+                    if isinstance(item_result, dict) else None
+                )
+                if attempt_id and store is not None and isinstance(
+                    item_receipt, dict
+                ):
+                    store.record_semantic_batch_primitive_receipt(
+                        attempt_id,
+                        semantic_batch_id=str(
+                            plan.get("semantic_batch_id") or ""
+                        ),
+                        batch_index=int(item.get("index") or 0),
+                        receipt=item_receipt,
+                    )
+            except Exception:
+                # Dispatch lifecycle evidence remains fail-closed in the
+                # canonical journal; the aggregate binder gets one final
+                # chance to attach this exact typed receipt.
+                pass
+            return item_result
+
+        return execute_semantic_batch(plan, _dispatch_batch_item)
+
     prior_resolution = DESKTOP_SURFACE_REGISTRY.resolve(surface_ref)
     prior_surface = prior_resolution.surface
     if prior_surface is None:
@@ -2609,6 +2995,24 @@ def activate_desktop_surface(
             "ERROR: exact requested desktop surface is unavailable or ambiguous.",
             "semantic_target_surface_unavailable",
             failure_class="surface_unavailable",
+        )
+    if _batch_internal and (
+        (_batch_application and scene.application_id != _batch_application)
+        or (
+            _batch_window_generation
+            and scene.window_ref.window_generation
+            != _batch_window_generation
+        )
+        or (
+            _batch_structural_epoch is not None
+            and scene.structural_epoch != int(_batch_structural_epoch)
+        )
+    ):
+        return _pre_dispatch_failure(
+            "ERROR: semantic batch target structure changed before dispatch.",
+            "semantic_batch_structural_transition",
+            scene=scene,
+            target=str(objective or ""),
         )
     runtime_ids = {
         DESKTOP_SURFACE_REGISTRY.native_identity(item.ref_id).runtime_id
@@ -2716,6 +3120,24 @@ def activate_desktop_surface(
             )
         from osia.tools import desktop_control as dc
 
+        journal_started, journal_returned = (
+            _durable_primitive_journal_callbacks(
+                application_identity=scene.application_id,
+                surface_ref=surface_ref,
+                native_window_id=resolution.native.native_window_id,
+                window_generation=scene.window_ref.window_generation,
+                runtime_identity=resolution.surface.runtime_signature,
+            )
+        )
+        if callable(journal_started) and not journal_started(
+            uia_pattern="Window",
+        ):
+            return _pre_dispatch_failure(
+                "ERROR: durable primitive journal unavailable before focus dispatch.",
+                "primitive_journal_unavailable",
+                scene=scene,
+                target=str(objective or ""),
+            )
         dispatched_at = time.time()
         try:
             focus_status, _focus_detail = dc.focus_app_window((
@@ -2724,6 +3146,8 @@ def activate_desktop_surface(
                 resolution.native.pid,
             ))
         except Exception:
+            focus_status = "outcome_unknown"
+        if callable(journal_returned) and not journal_returned():
             focus_status = "outcome_unknown"
         if focus_status != "ready":
             return {
@@ -2832,6 +3256,7 @@ def activate_desktop_surface(
     )
     dispatch_started = False
     dispatch_started_at = 0.0
+    dispatch_worker_may_be_active = False
     attempted_mechanism = ""
     pre_dispatch_failure = None
     actionability = {
@@ -2862,110 +3287,118 @@ def activate_desktop_surface(
         ),
         "retirement_state": "active",
     }
+    invoke_preflight_reason = ""
+    if declared_effect:
+        effect_surface = next((
+            item for item in scene.surfaces
+            if item.ref_id == declared_effect["surface_ref"]
+            and item.role in _PRIMITIVE_STATE_ROLES
+        ), None)
+        if (
+            effect_surface is None
+            or effect_surface.ref_id == resolution.surface.ref_id
+            or _surface_text_matches(
+                effect_surface.accessible_label,
+                declared_effect["expected_text"],
+            )
+        ):
+            invoke_preflight_reason = (
+                "observable_effect_precondition_unverified"
+            )
     try:
-        with auto.UIAutomationInitializerInThread():
-            root = auto.ControlFromHandle(int(resolution.native.native_window_id))
-            control = _find_runtime_control(root, resolution.native.runtime_id)
-            if control is None:
+        journal_started, journal_returned = (
+            _durable_primitive_journal_callbacks(
+                application_identity=scene.application_id,
+                surface_ref=surface_ref,
+                native_window_id=resolution.native.native_window_id,
+                window_generation=scene.window_ref.window_generation,
+                runtime_identity=resolution.surface.runtime_signature,
+            )
+        )
+        dispatch = _dispatch_fresh_uia_action_bounded(
+            auto,
+            native_window_id=resolution.native.native_window_id,
+            runtime_id=resolution.native.runtime_id,
+            action_pattern=selected_pattern,
+            observed_patterns=resolution.surface.patterns,
+            invoke_preflight_reason=invoke_preflight_reason,
+            journal_dispatch_started=journal_started,
+            journal_dispatch_returned=journal_returned,
+        )
+        selected_pattern = str(dispatch.get("selected_pattern") or "")
+        actionability.update({
+            "automation_id": str(dispatch.get("automation_id") or ""),
+            "fresh_supported_patterns": list(
+                dispatch.get("fresh_supported_patterns") or []
+            ),
+            "selected_pattern": selected_pattern,
+            "selected_pattern_available": bool(
+                dispatch.get("selected_pattern_available")
+            ),
+            "actionable_match": bool(
+                dispatch.get("selected_pattern_available")
+            ),
+            "candidate_applicable": bool(
+                dispatch.get("selected_pattern_available")
+            ),
+        })
+        attempted_mechanism = selected_pattern.casefold()
+        dispatch_started_at = float(dispatch.get("dispatched_at") or 0.0)
+        dispatch_started = bool(dispatch.get("dispatch_started"))
+        dispatch_worker_may_be_active = bool(
+            dispatch.get("worker_may_be_active")
+        )
+        if not dispatch_started:
+            reason_code = str(dispatch.get("reason_code") or (
+                "native_accessibility_invocation_unavailable"
+            ))
+            if reason_code == "stale_semantic_reference":
                 DESKTOP_SURFACE_REGISTRY.mark_stale(
                     surface_ref, "accessibility_runtime_id_disappeared",
                 )
-                pre_dispatch_failure = (
-                    "ERROR: stale_reference; accessibility target disappeared.",
-                    "stale_semantic_reference",
-                    "accessibility_runtime_id_disappeared",
+                failure_text = (
+                    "ERROR: stale_reference; accessibility target disappeared."
                 )
-                actionability.update({
-                    "dispatch_preflight_result": "failed_before_effect",
-                    "failed_before_effect_reason": "stale_semantic_reference",
-                    "stale_rebind_status": "fresh_runtime_reference_missing",
-                    "retirement_state": "eligible_for_exact_pair_retirement",
-                })
-                mechanism = ""
+                stale_reason = "accessibility_runtime_id_disappeared"
+                actionability["stale_rebind_status"] = (
+                    "fresh_runtime_reference_missing"
+                )
+            elif reason_code == "observable_effect_precondition_unverified":
+                failure_text = (
+                    "ERROR: declared observable effect is not a fresh exact "
+                    "surface transition."
+                )
+                stale_reason = ""
+            elif reason_code == "uia_action_pattern_unavailable":
+                failure_text = (
+                    "ERROR: accessibility control has no safe actionable pattern."
+                )
+                stale_reason = ""
             else:
-                try:
-                    actionability["automation_id"] = _safe_label(
-                        control.AutomationId,
-                    )
-                except Exception:
-                    pass
-                fresh_actions = _fresh_uia_action_methods(control)
-                actionability["fresh_supported_patterns"] = list(
-                    fresh_actions,
+                failure_text = (
+                    "ERROR: native accessibility invocation was unavailable "
+                    "before dispatch."
                 )
-                if not selected_pattern:
-                    selected_pattern = next((
-                        pattern_name
-                        for pattern_name, _getter_name, _method_name
-                        in _UIA_ACTION_PATTERN_METHODS
-                        if pattern_name in fresh_actions
-                        and pattern_name in resolution.surface.patterns
-                    ), "")
-                    actionability["selected_pattern"] = selected_pattern
-                method = (
-                    fresh_actions.get(selected_pattern)
-                    if selected_pattern in resolution.surface.patterns else
-                    None
-                )
-                actionability["selected_pattern_available"] = bool(method)
-                actionability["actionable_match"] = bool(method)
-                actionability["candidate_applicable"] = bool(method)
-                if not callable(method):
-                    pre_dispatch_failure = (
-                        "ERROR: accessibility control has no safe actionable pattern.",
-                        "uia_action_pattern_unavailable",
-                        "",
-                    )
-                    actionability.update({
-                        "dispatch_preflight_result": "failed_before_effect",
-                        "failed_before_effect_reason": (
-                            "uia_action_pattern_unavailable"
-                        ),
-                        "retirement_state": (
-                            "eligible_for_exact_pair_retirement"
-                        ),
-                    })
-                    mechanism = ""
-                else:
-                    attempted_mechanism = selected_pattern.casefold()
-                    if selected_pattern == "Invoke" and declared_effect:
-                        effect_surface = next((
-                            item for item in scene.surfaces
-                            if item.ref_id == declared_effect["surface_ref"]
-                            and item.role in _PRIMITIVE_STATE_ROLES
-                        ), None)
-                        if (
-                            effect_surface is None
-                            or effect_surface.ref_id == resolution.surface.ref_id
-                            or _surface_text_matches(
-                                effect_surface.accessible_label,
-                                declared_effect["expected_text"],
-                            )
-                        ):
-                            pre_dispatch_failure = (
-                                "ERROR: declared observable effect is not a fresh exact surface transition.",
-                                "observable_effect_precondition_unverified",
-                                "",
-                            )
-                            actionability.update({
-                                "dispatch_preflight_result": "failed_before_effect",
-                                "failed_before_effect_reason": (
-                                    "observable_effect_precondition_unverified"
-                                ),
-                                "retirement_state": (
-                                    "eligible_for_exact_pair_retirement"
-                                ),
-                            })
-                            mechanism = ""
-                        else:
-                            mechanism = attempted_mechanism
-                    else:
-                        mechanism = attempted_mechanism
-                    if mechanism:
-                        actionability["dispatch_preflight_result"] = "eligible"
-                        dispatch_started_at = time.time()
-                        dispatch_started = True
-                        method()
+                stale_reason = ""
+            pre_dispatch_failure = (
+                failure_text,
+                reason_code,
+                stale_reason,
+            )
+            actionability.update({
+                "dispatch_preflight_result": "failed_before_effect",
+                "failed_before_effect_reason": reason_code,
+                "retirement_state": "eligible_for_exact_pair_retirement",
+            })
+            mechanism = ""
+        elif not dispatch.get("completed"):
+            raise RuntimeError(
+                str(dispatch.get("reason_code") or (
+                    "uia_activation_outcome_unknown"
+                ))
+            )
+        else:
+            mechanism = attempted_mechanism
     except Exception:
         if not dispatch_started:
             return _pre_dispatch_failure(
@@ -2995,6 +3428,9 @@ def activate_desktop_surface(
                     "mechanism": attempted_mechanism,
                     "observable_effect": dict(declared_effect),
                     "dispatched_at": dispatch_started_at,
+                    "worker_may_be_active": (
+                        dispatch_worker_may_be_active
+                    ),
                     "before": primitive_before,
                 },
             },
@@ -3009,6 +3445,14 @@ def activate_desktop_surface(
         )
         if stale_reason:
             failure["receipt"]["stale_reason"] = stale_reason
+        failure["receipt"].update({
+            "surface_ref": surface_ref,
+            "runtime_identity": resolution.surface.runtime_signature,
+            "automation_id": str(actionability.get("automation_id") or ""),
+            "uia_pattern": str(
+                actionability.get("selected_pattern") or selected_pattern or ""
+            ),
+        })
         failure["receipt"]["actionability"] = actionability
         return failure
     actionability["dispatch_preflight_result"] = "dispatched"
@@ -3036,6 +3480,7 @@ def activate_desktop_surface(
                 "mechanism": mechanism,
                 "observable_effect": dict(declared_effect),
                 "dispatched_at": dispatch_started_at,
+                "worker_may_be_active": dispatch_worker_may_be_active,
                 "before": primitive_before,
             },
         },

@@ -283,6 +283,7 @@ class CommittedAttachment:
             "logical_order": self.logical_order,
             "display_name": self.display_name,
             "byte_size": self.byte_size,
+            "sha256": self.sha256,
             "category": self.detected_category,
             "mime": self.detected_mime,
         }
@@ -1051,6 +1052,7 @@ def build_agent_input(
     *,
     owner_id: str | None = None,
     permission_epoch: int | None = None,
+    source_refs_out: list[str] | None = None,
 ) -> str | list[dict]:
     """Create opaque local sources before any provider input."""
 
@@ -1080,6 +1082,8 @@ def build_agent_input(
                     permission_epoch=permission_epoch,
                 )
             capabilities.append(capability)
+            if source_refs_out is not None:
+                source_refs_out.append(str(capability["source_ref"]))
         bullets = "\n".join(
             f"{index}. source_ref={item['source_ref']} type={item['type_label']} "
             f"state={item['state']}"

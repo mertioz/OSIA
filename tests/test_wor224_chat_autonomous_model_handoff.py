@@ -72,7 +72,7 @@ def test_chat_handoff_snapshots_the_effective_turn_pair(provider, model):
 
     final = agent.run(text, history=[], on_sentence=lambda _text: None)
 
-    assert "Autonomous mission" in final
+    assert "controls stay in this chat" in final
     assert len(launches) == 1
     assert (launches[0]["provider_id"], launches[0]["model_id"]) == (
         provider,

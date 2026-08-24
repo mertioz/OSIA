@@ -188,6 +188,279 @@ def _path_for(conv_id: str) -> Path:
     return CONVERSATIONS_DIR / f"{conv_id}.json"
 
 
+_CANONICAL_CHAT_BINDING_FIELDS = (
+    "conversation_id", "request_id", "turn_id", "run_id",
+    "provider_id", "model_id", "effective_reasoning",
+)
+
+
+def _has_exact_user_cancelled_terminal(user_message: dict) -> bool:
+    """Return whether the exact accepted turn has a durable Stop tombstone."""
+
+    expected = {
+        field: str(user_message.get("_" + field) or "")
+        for field in _CANONICAL_CHAT_BINDING_FIELDS
+    }
+    turn_id = expected["turn_id"]
+    if not turn_id or any(not value for value in expected.values()):
+        return False
+    try:
+        from osia.turn_terminality import load_persisted_terminal_result
+
+        terminal = load_persisted_terminal_result(turn_id)
+    except Exception:
+        return False
+    binding = (
+        terminal.get("execution_binding")
+        if isinstance(terminal, dict) else None
+    )
+    return bool(
+        isinstance(binding, dict)
+        and terminal.get("terminal_state") == "user_cancelled"
+        and str(terminal.get("reservation_id") or "")
+        and all(str(binding.get(field) or "") == value
+                for field, value in expected.items())
+    )
+
+
+def _assistant_targets_exact_user_cancelled_terminal(
+    messages: list,
+    *,
+    request_id: str,
+    turn_id: str,
+) -> bool:
+    """Fence late assistant output for an exact durably cancelled turn."""
+
+    return any(
+        isinstance(item, dict)
+        and item.get("role") == "user"
+        and str(item.get("_turn_id") or "") == turn_id
+        and str(
+            item.get("_request_id")
+            or item.get("_client_request_id")
+            or ""
+        ) == request_id
+        and _has_exact_user_cancelled_terminal(item)
+        for item in messages
+    )
+
+
+def _has_active_canonical_chat_lease(conversation: dict) -> bool:
+    """Protect accepted canonical turns until their exact final is durable."""
+
+    messages = list((conversation or {}).get("messages") or [])
+    for index, user_message in enumerate(messages):
+        if not isinstance(user_message, dict) or user_message.get("role") != "user":
+            continue
+        assistant_message_id = str(
+            user_message.get("_assistant_message_id") or ""
+        )
+        objective = str(user_message.get("_terminality_objective") or "")
+        binding = {
+            field: str(user_message.get("_" + field) or "")
+            for field in _CANONICAL_CHAT_BINDING_FIELDS
+        }
+        if (
+            not assistant_message_id
+            or not objective
+            or any(not value for value in binding.values())
+        ):
+            continue
+        final_committed = any(
+            isinstance(candidate, dict)
+            and candidate.get("role") == "assistant"
+            and str(candidate.get("_message_id") or "")
+            == assistant_message_id
+            and all(
+                str(candidate.get("_" + field) or "") == value
+                for field, value in binding.items()
+            )
+            and (
+                candidate.get("_terminal") is True
+                or (
+                    str(candidate.get("_terminal_state") or "")
+                    and str(candidate.get("_terminal_reservation_id") or "")
+                )
+            )
+            for candidate in messages[index + 1:]
+        )
+        if (
+            not final_committed
+            and not _has_exact_user_cancelled_terminal(user_message)
+        ):
+            return True
+    return False
+
+
+def _background_execution_lease_active(conversation: dict) -> bool:
+    lease = (conversation or {}).get("_background_execution_lease")
+    if not isinstance(lease, dict) or not str(lease.get("lease_id") or ""):
+        return False
+    try:
+        owner_pid = int(lease.get("owner_pid") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if owner_pid <= 0:
+        return False
+    try:
+        from osia.turn_terminality import live_process_identity
+
+        alive, current_identity = live_process_identity(owner_pid)
+    except Exception:
+        return True
+    expected_identity = str(lease.get("owner_process_identity") or "")
+    return bool(
+        alive
+        and (
+            not expected_identity
+            or not current_identity
+            or expected_identity == current_identity
+        )
+    )
+
+
+def _post_turn_media_lease_active(conversation: dict) -> bool:
+    """Keep one conversation exclusive until its correlated media is done."""
+
+    lease = (conversation or {}).get("_post_turn_media_lease")
+    if not isinstance(lease, dict) or not str(lease.get("lease_id") or ""):
+        return False
+    try:
+        owner_pid = int(lease.get("owner_pid") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if owner_pid <= 0:
+        return False
+    try:
+        from osia.turn_terminality import live_process_identity
+
+        alive, current_identity = live_process_identity(owner_pid)
+    except Exception:
+        return True
+    expected_identity = str(lease.get("owner_process_identity") or "")
+    return bool(
+        alive
+        and (
+            not expected_identity
+            or not current_identity
+            or expected_identity == current_identity
+        )
+    )
+
+
+def claim_background_execution(conv_id: str, lease_id: str) -> bool:
+    """Reserve one linked background run against canonical Chat admission."""
+
+    stable_lease_id = str(lease_id or "").strip()[:256]
+    if not conv_id or not stable_lease_id:
+        return False
+    with _store_lock():
+        conv = get_conversation(conv_id)
+        if (
+            conv is None
+            or _has_active_canonical_chat_lease(conv)
+            or _post_turn_media_lease_active(conv)
+        ):
+            return False
+        conv.pop("_post_turn_media_lease", None)
+        existing = conv.get("_background_execution_lease")
+        if _background_execution_lease_active(conv):
+            return bool(
+                isinstance(existing, dict)
+                and str(existing.get("lease_id") or "") == stable_lease_id
+                and int(existing.get("owner_pid") or 0) == os.getpid()
+            )
+        from osia.turn_terminality import live_process_identity
+
+        _owner_alive, owner_identity = live_process_identity(os.getpid())
+        conv["_background_execution_lease"] = {
+            "lease_id": stable_lease_id,
+            "owner_pid": os.getpid(),
+            "owner_process_identity": owner_identity,
+            "claimed_at": _now_iso(),
+        }
+        _write_atomic(_path_for(conv_id), conv)
+        return True
+
+
+def release_background_execution(conv_id: str, lease_id: str) -> bool:
+    """Release only the exact linked background-run lease."""
+
+    stable_lease_id = str(lease_id or "").strip()[:256]
+    if not conv_id or not stable_lease_id:
+        return False
+    with _store_lock():
+        conv = get_conversation(conv_id)
+        lease = (
+            conv.get("_background_execution_lease")
+            if isinstance(conv, dict) else None
+        )
+        if (
+            not isinstance(lease, dict)
+            or str(lease.get("lease_id") or "") != stable_lease_id
+        ):
+            return False
+        conv.pop("_background_execution_lease", None)
+        _write_atomic(_path_for(conv_id), conv)
+        return True
+
+
+def release_post_turn_media_cas(conv_id: str, lease_id: str) -> str:
+    """Release one exact media lease with an unambiguous durable result."""
+
+    stable_lease_id = str(lease_id or "").strip()[:256]
+    if not conv_id or not stable_lease_id:
+        return "indeterminate"
+    with _store_lock():
+        path = _path_for(conv_id)
+        try:
+            conv = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return "confirmed_absent_or_different"
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return "indeterminate"
+        if (
+            not isinstance(conv, dict)
+            or str(conv.get("id") or "") != conv_id
+            or not isinstance(conv.get("messages"), list)
+        ):
+            return "indeterminate"
+        lease = conv.get("_post_turn_media_lease")
+        if (
+            not isinstance(lease, dict)
+            or str(lease.get("lease_id") or "") != stable_lease_id
+        ):
+            return "confirmed_absent_or_different"
+        conv.pop("_post_turn_media_lease", None)
+        try:
+            _write_atomic(path, conv)
+        except (OSError, TypeError, ValueError):
+            return "indeterminate"
+        return "released"
+
+
+def release_post_turn_media(conv_id: str, lease_id: str) -> bool:
+    """Backward-compatible bool wrapper for the exact media-lease CAS."""
+
+    return release_post_turn_media_cas(conv_id, lease_id) == "released"
+
+
+def _path_has_active_canonical_chat_lease(path: Path) -> bool:
+    try:
+        conversation = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        # Destructive operations fail closed when an existing conversation is
+        # unreadable; they must not erase the only durable recovery authority.
+        return True
+    return (
+        True
+        if not isinstance(conversation, dict) else
+        _has_active_canonical_chat_lease(conversation)
+        or _background_execution_lease_active(conversation)
+        or _post_turn_media_lease_active(conversation)
+    )
+
+
 def _folder_state_path() -> Path:
     """Return the metadata path relative to the active conversation store.
 
@@ -663,6 +936,81 @@ def create_conversation(title: str | None = None) -> dict:
         }
         _write_atomic(_path_for(conv_id), conv)
         return conv
+
+
+def resolve_request_conversation(
+    request_id: str,
+    title: str | None = None,
+) -> tuple[dict, bool]:
+    """Resolve or reserve the one durable first-chat conversation for a request."""
+
+    stable_request_id = str(request_id or "").strip()
+    if not stable_request_id:
+        raise ValueError("request id is required")
+    with _store_lock():
+        matches: list[dict] = []
+        for path in CONVERSATIONS_DIR.glob("*.json"):
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("conversation store is unreadable") from exc
+            if not isinstance(candidate, dict):
+                raise RuntimeError("conversation store is unreadable")
+            messages = candidate.get("messages")
+            if not isinstance(messages, list):
+                raise RuntimeError("conversation messages are unreadable")
+            if any(
+                isinstance(message, dict)
+                and message.get("role") == "user"
+                and str(
+                    message.get("_request_id")
+                    or message.get("_client_request_id")
+                    or ""
+                ) == stable_request_id
+                for message in messages
+            ):
+                matches.append(candidate)
+        if len(matches) > 1:
+            raise ValueError("request id is bound to multiple conversations")
+        if matches:
+            return matches[0], False
+
+        conv_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"osia:first-chat-request:v1:{stable_request_id}",
+        ).hex
+        path = _path_for(conv_id)
+        try:
+            reserved = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            reserved = None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("conversation reservation is unreadable") from exc
+        if reserved is not None:
+            if (
+                not isinstance(reserved, dict)
+                or str(reserved.get("id") or "") != conv_id
+                or not isinstance(reserved.get("messages"), list)
+                or str(reserved.get("_first_request_id") or "")
+                != stable_request_id
+            ):
+                raise ValueError("request conversation reservation conflict")
+            return reserved, False
+
+        now = _now_iso()
+        operation_id = f"op_{uuid.uuid4().hex}"
+        conv = {
+            "id": conv_id,
+            "title": title or DEFAULT_TITLE,
+            "created_at": now,
+            "updated_at": now,
+            "revision": 1,
+            "last_operation_id": operation_id,
+            "messages": [],
+            "_first_request_id": stable_request_id,
+        }
+        _write_atomic(path, conv)
+        return conv, True
 
 
 def get_conversation(conv_id: str) -> dict | None:
@@ -1170,6 +1518,21 @@ def delete_folder_with_conversations(
                 },
                 replayed=False,
             )
+        busy_ids = [
+            conv_id for conv_id, path in candidates
+            if _path_has_active_canonical_chat_lease(path)
+        ]
+        if busy_ids:
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result={
+                    "success": False,
+                    "error": "conversation_busy",
+                    "busy_ids": busy_ids,
+                },
+                replayed=False,
+            )
 
         transaction = (
             _folder_state_path().parent / f"project-delete-{uuid.uuid4().hex}"
@@ -1309,6 +1672,21 @@ def _delete_all_ungrouped_conversations(
                 },
                 replayed=False,
             )
+        busy_ids = [
+            conv_id for conv_id, path in candidates
+            if _path_has_active_canonical_chat_lease(path)
+        ]
+        if busy_ids:
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result={
+                    "success": False,
+                    "error": "conversation_busy",
+                    "busy_ids": busy_ids,
+                },
+                replayed=False,
+            )
 
         trash = _folder_state_path().parent / f"bulk-{uuid.uuid4().hex}"
         moved: list[tuple[Path, Path]] = []
@@ -1445,6 +1823,130 @@ def commit_message(
         if not operation_id:
             operation_id = message_id
         correlation["_operation_id"] = operation_id
+        canonical_user_binding = {
+            field: str(correlation.get("_" + field) or "")
+            for field in _CANONICAL_CHAT_BINDING_FIELDS
+        }
+        is_canonical_user_turn = bool(
+            role == "user"
+            and str(correlation.get("_assistant_message_id") or "")
+            and str(correlation.get("_terminality_objective") or "")
+            and all(canonical_user_binding.values())
+        )
+        if is_canonical_user_turn:
+            messages = conv.setdefault("messages", [])
+            same_request_users = [
+                item for item in messages
+                if isinstance(item, dict)
+                and item.get("role") == "user"
+                and str(
+                    item.get("_request_id")
+                    or item.get("_client_request_id")
+                    or ""
+                ) == request_id
+            ]
+            if len(same_request_users) > 1:
+                raise ValueError("duplicate canonical request id")
+            if same_request_users:
+                existing = same_request_users[0]
+                existing_message_id = str(
+                    existing.get("_message_id") or ""
+                )
+                existing_operation_id = str(
+                    existing.get("_operation_id")
+                    or existing_message_id
+                    or ""
+                )
+                incoming_hash = str(
+                    correlation.get("_client_content_hash") or ""
+                )
+                existing_hash = str(
+                    existing.get("_client_content_hash") or ""
+                )
+                if (
+                    (
+                        existing.get("content") != content
+                        and not (
+                            incoming_hash
+                            and existing_hash
+                            and incoming_hash == existing_hash
+                        )
+                    )
+                    or (
+                        incoming_hash
+                        and existing_hash
+                        and incoming_hash != existing_hash
+                    )
+                ):
+                    raise ValueError(
+                        "request id was already used with different content"
+                    )
+                if existing_message_id == message_id and (
+                    existing_operation_id != operation_id
+                    or any(
+                        str(existing.get("_" + field) or "") != value
+                        for field, value in canonical_user_binding.items()
+                    )
+                    or str(existing.get("_assistant_message_id") or "")
+                    != str(correlation.get("_assistant_message_id") or "")
+                    or str(existing.get("_terminality_objective") or "")
+                    != str(correlation.get("_terminality_objective") or "")
+                ):
+                    raise ValueError("canonical request correlation conflict")
+                return _commit_receipt(
+                    conv,
+                    committed=False,
+                    operation_id=existing_operation_id,
+                    message_id=existing_message_id,
+                )
+            if _background_execution_lease_active(conv):
+                raise ValueError(
+                    "conversation has an active background execution"
+                )
+            conv.pop("_background_execution_lease", None)
+            if _post_turn_media_lease_active(conv):
+                raise ValueError(
+                    "conversation has active post-turn media"
+                )
+            conv.pop("_post_turn_media_lease", None)
+            if _has_active_canonical_chat_lease(conv):
+                raise ValueError("conversation has an active canonical turn")
+        elif (
+            role == "assistant"
+            and _assistant_targets_exact_user_cancelled_terminal(
+                conv.get("messages") or [],
+                request_id=request_id,
+                turn_id=turn_id,
+            )
+        ):
+            raise ValueError("cancelled canonical turn rejects assistant output")
+        elif _has_active_canonical_chat_lease(conv):
+            exact_canonical_assistant = bool(
+                role == "assistant"
+                and (
+                    correlation.get("_terminal") is True
+                    or (
+                        str(correlation.get("_terminal_state") or "")
+                        and str(
+                            correlation.get("_terminal_reservation_id") or ""
+                        )
+                    )
+                )
+                and any(
+                    isinstance(item, dict)
+                    and item.get("role") == "user"
+                    and str(item.get("_assistant_message_id") or "")
+                    == message_id
+                    and all(
+                        str(item.get("_" + field) or "")
+                        == str(correlation.get("_" + field) or "")
+                        for field in _CANONICAL_CHAT_BINDING_FIELDS
+                    )
+                    for item in conv.get("messages") or []
+                )
+            )
+            if not exact_canonical_assistant:
+                raise ValueError("conversation has an active canonical turn")
         if message_id or turn_id or request_id:
             is_correlated_turn = bool(turn_id or request_id)
             if is_correlated_turn and role not in {"user", "assistant"}:
@@ -1536,6 +2038,30 @@ def commit_message(
         revision = _next_revision(conv)
         entry["_sequence"] = revision
         conv.setdefault("messages", []).append(entry)
+        post_turn_media_lease_id = str(
+            correlation.get("_post_turn_media_lease_id") or ""
+        ).strip()[:256]
+        if role == "assistant" and post_turn_media_lease_id:
+            try:
+                media_owner_pid = int(
+                    correlation.get("_post_turn_media_owner_pid") or 0
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("invalid post-turn media owner") from exc
+            if media_owner_pid <= 0:
+                raise ValueError("invalid post-turn media owner")
+            conv["_post_turn_media_lease"] = {
+                "lease_id": post_turn_media_lease_id,
+                "turn_id": turn_id,
+                "request_id": request_id,
+                "message_id": message_id,
+                "owner_pid": media_owner_pid,
+                "owner_process_identity": str(
+                    correlation.get("_post_turn_media_owner_process_identity")
+                    or ""
+                ),
+                "claimed_at": _now_iso(),
+            }
         conv["updated_at"] = _now_iso()
         conv["revision"] = revision
         conv["last_operation_id"] = operation_id
@@ -1700,8 +2226,8 @@ def find_correlated_turn(conv_id: str, request_id: str) -> dict | None:
         conv = get_conversation(conv_id)
         if conv is None:
             return None
-        user_message = None
-        assistant_message = None
+        user_messages = []
+        assistant_messages = []
         for item in conv.get("messages") or []:
             if not isinstance(item, dict):
                 continue
@@ -1713,11 +2239,17 @@ def find_correlated_turn(conv_id: str, request_id: str) -> dict | None:
             if item_request_id != request_id:
                 continue
             if item.get("role") == "user":
-                user_message = item
+                user_messages.append(item)
             elif item.get("role") == "assistant":
-                assistant_message = item
-        if user_message is None:
+                assistant_messages.append(item)
+        if not user_messages:
             return None
+        if len(user_messages) != 1 or len(assistant_messages) > 1:
+            raise ValueError("persisted turn correlation conflict")
+        user_message = user_messages[0]
+        assistant_message = (
+            assistant_messages[0] if assistant_messages else None
+        )
         turn_id = str(user_message.get("_turn_id") or "")
         if not turn_id:
             return None
@@ -1725,17 +2257,55 @@ def find_correlated_turn(conv_id: str, request_id: str) -> dict | None:
             assistant_message.get("_turn_id") or ""
         ) != turn_id:
             raise ValueError("persisted turn correlation conflict")
+        route = {}
+        for public_key, metadata_key in (
+            ("run_id", "_run_id"),
+            ("provider_id", "_provider_id"),
+            ("model_id", "_model_id"),
+            ("effective_reasoning", "_effective_reasoning"),
+        ):
+            user_value = str(user_message.get(metadata_key) or "")
+            assistant_value = str(
+                (assistant_message or {}).get(metadata_key) or ""
+            )
+            if user_value and assistant_value and user_value != assistant_value:
+                raise ValueError("persisted turn route binding conflict")
+            route[public_key] = assistant_value or user_value
         return {
             "conversation_id": conv_id,
             "request_id": request_id,
             "turn_id": turn_id,
+            **route,
             "user_message_id": str(user_message.get("_message_id") or ""),
             "assistant_message_id": str(
                 (assistant_message or {}).get("_message_id") or ""
             ),
             "user_content": user_message.get("content"),
+            "terminality_objective": str(
+                user_message.get("_terminality_objective") or ""
+            ),
             "client_content_hash": str(
                 user_message.get("_client_content_hash") or ""
+            ),
+            "client_base_content_hash": str(
+                user_message.get("_client_base_content_hash") or ""
+            ),
+            "attachment_manifest_hash": str(
+                user_message.get("_attachment_manifest_hash") or ""
+            ),
+            "input_identity_version": str(
+                user_message.get("_input_identity_version") or ""
+            ),
+            "input_kind": str(user_message.get("_input_kind") or ""),
+            "attachments": list(user_message.get("_attachments") or []),
+            "execution_owner": str(
+                user_message.get("_execution_owner") or ""
+            ),
+            "execution_owner_pid": user_message.get(
+                "_execution_owner_pid"
+            ),
+            "execution_owner_process_identity": str(
+                user_message.get("_execution_owner_process_identity") or ""
             ),
             "response_event_id": str(
                 (assistant_message or {}).get("_response_event_id") or ""
@@ -1796,6 +2366,8 @@ def delete_conversation(conv_id: str) -> bool:
     with _store_lock():
         path = _path_for(conv_id)
         if not path.exists():
+            return False
+        if _path_has_active_canonical_chat_lease(path):
             return False
         state = _load_folder_state_unlocked()
         memberships = state.get("memberships") or {}

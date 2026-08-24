@@ -9,8 +9,11 @@ import time
 import types
 from unittest.mock import patch
 
+import pytest
+
 from osia import agent as agent_module
 from osia.agent import OSIAAgent, _sanitize_persisted_history_message
+from osia.durable_transport import DurableTransportStore
 from osia.server import server
 from osia.tool_attempts import (
     ToolAttemptCoordinator,
@@ -18,6 +21,15 @@ from osia.tool_attempts import (
     is_internal_tool_control_text,
 )
 from osia.turn_context import ValidatedLiveAssistantChunk, fixed_turn_context
+
+
+@pytest.fixture(autouse=True)
+def _isolated_durable_transport(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_DURABLE_TRANSPORT",
+        DurableTransportStore(tmp_path / "transport"),
+    )
 
 
 class _Channel:
@@ -34,6 +46,10 @@ def _meta(suffix: str, *, language: str = "fr") -> dict:
         "request_id": f"wor247-request-{suffix}",
         "client_request_id": f"wor247-request-{suffix}",
         "turn_id": f"wor247-turn-{suffix}",
+        "run_id": f"wor247-run-{suffix}",
+        "provider_id": "wor247-provider",
+        "model_id": "wor247-model",
+        "effective_reasoning": "auto",
         "user_message_id": f"wor247-user-{suffix}",
         "assistant_message_id": f"wor247-assistant-{suffix}",
         "client_locale": f"{language}-{language.upper()}",
@@ -75,7 +91,7 @@ class _StreamingAgent:
         return []
 
 
-def test_server_forwards_safe_chunks_before_provider_completion_once():
+def test_server_reveals_only_verified_canonical_text_after_provider_completion():
     async def exercise():
         release = threading.Event()
         agent = _StreamingAgent(release)
@@ -112,9 +128,7 @@ def test_server_forwards_safe_chunks_before_provider_completion_once():
                 frame["content"] for frame in channel.frames
                 if frame.get("type") == "response_chunk"
             ]
-            assert early == [
-                "Première phrase visible avant la fin du fournisseur."
-            ]
+            assert early == []
             assert not any(frame.get("type") == "response" for frame in channel.frames)
             release.set()
             await task
@@ -127,11 +141,12 @@ def test_server_forwards_safe_chunks_before_provider_completion_once():
             frame["content"] for frame in channel.frames
             if frame.get("type") == "response"
         ]
-        assert chunks == [
-            "Première phrase visible avant la fin du fournisseur.",
-            "Deuxième phrase diffusée progressivement.",
-        ]
-        assert finals == persisted == [" ".join(chunks)]
+        expected = (
+            "Première phrase visible avant la fin du fournisseur. "
+            "Deuxième phrase diffusée progressivement."
+        )
+        assert chunks == [expected]
+        assert finals == persisted == [expected]
 
     asyncio.run(exercise())
 
@@ -187,6 +202,7 @@ class _PendingAgent:
 
     def __init__(self) -> None:
         self.callbacks = None
+        self.terminal = None
 
     def configure_tool_attempts(self, **kwargs):
         self.callbacks = kwargs
@@ -199,6 +215,9 @@ class _PendingAgent:
     def activate_pending_tool_attempt(self):
         return True
 
+    def terminality_result(self, _turn_id):
+        return self.terminal
+
     def exported_history(self):
         return [
             {"role": "assistant", "content": WAITING_TOOL_RESULT},
@@ -208,7 +227,29 @@ class _PendingAgent:
         return None
 
 
-def test_wait_sentinel_never_streams_persists_or_terminalizes_chat():
+def _complete_pending_fixture(agent: _PendingAgent, cancelled: bool) -> bool:
+    final_text = (
+        "" if cancelled else "Résultat canonique après reprise."
+    )
+    agent.terminal = {
+        "terminal_state": (
+            "user_cancelled" if cancelled else "success_verified"
+        ),
+        "reason_code": (
+            "authoritative_user_cancellation" if cancelled else "verified"
+        ),
+        "final_text": final_text,
+    }
+    return agent.callbacks["final_callback"](
+        "wor247-attempt-waiting",
+        "Résultat tardif qui ne doit pas remplacer Stop."
+        if cancelled else final_text,
+        None,
+    )
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_wait_sentinel_never_streams_persists_or_terminalizes_chat(cancelled):
     async def exercise():
         channel = _Channel()
         agent = _PendingAgent()
@@ -295,7 +336,7 @@ def test_wait_sentinel_never_streams_persists_or_terminalizes_chat():
                 assert [
                     frame.get("content") for frame in channel.frames
                     if frame.get("type") == "response_chunk"
-                ] == ["Vérification en cours."]
+                ] == []
                 assert any(
                     frame.get("type") == "turn_status"
                     and frame.get("status") == "waiting_tool_result"
@@ -314,22 +355,30 @@ def test_wait_sentinel_never_streams_persists_or_terminalizes_chat():
                 )
 
                 finalized = await asyncio.to_thread(
-                    agent.callbacks["final_callback"],
-                    "wor247-attempt-waiting",
-                    "Résultat canonique après reprise.",
-                    None,
+                    _complete_pending_fixture,
+                    agent,
+                    cancelled,
                 )
                 assert finalized is True
                 assert all(
                     WAITING_TOOL_RESULT not in session.inputs
                     for session in tts_sessions
                 )
-                assert tts_sessions[-1].inputs == [persisted[0], persisted[0]]
-                assert len([
+                responses = [
                     frame for frame in channel.frames
                     if frame.get("type") == "response"
-                ]) == 1
-                assert persisted == ["Résultat canonique après reprise."]
+                ]
+                if cancelled:
+                    assert persisted == []
+                    assert responses == []
+                else:
+                    assert tts_sessions[-1].inputs == [
+                        persisted[0], persisted[0],
+                    ]
+                    assert len(responses) == 1
+                    assert persisted == [
+                        "Résultat canonique après reprise."
+                    ]
                 assert server._is_conversation_busy(meta["conversation_id"]) is False
         finally:
             pending = server._ACTIVE_TURNS_BY_CONV.pop(

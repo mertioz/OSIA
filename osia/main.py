@@ -125,14 +125,17 @@ _SERVER_CRON_NOTIFICATION_URL = "http://127.0.0.1:8765/internal/cron_notificatio
 _SERVER_AUTONOMOUS_PC_STATE_URL = (
     "http://127.0.0.1:8765/internal/autonomous_authorization_state"
 )
-_SERVER_AUTONOMOUS_PC_ACTION_URL = (
-    "http://127.0.0.1:8765/internal/autonomous_authorization_action"
-)
 _SERVER_CHAT_AUTONOMOUS_START_URL = (
     "http://127.0.0.1:8765/internal/chat_autonomous_start"
 )
 _SERVER_CHAT_AUTONOMOUS_CANCEL_URL = (
     "http://127.0.0.1:8765/internal/chat_autonomous_cancel"
+)
+_SERVER_LEGACY_EXECUTION_CANCEL_URL = (
+    "http://127.0.0.1:8765/internal/legacy_execution_cancel"
+)
+_SERVER_LEGACY_EXECUTION_RESUME_URL = (
+    "http://127.0.0.1:8765/internal/legacy_execution_resume"
 )
 
 
@@ -229,6 +232,67 @@ def _cancel_server_autonomous_from_chat(binding: dict) -> dict:
     }
 
 
+def _post_server_legacy_execution_control(url: str, binding: dict) -> dict:
+    """Submit one exact legacy checkpoint control to the loopback server."""
+
+    import json
+    import urllib.request
+
+    raw = binding if isinstance(binding, dict) else {}
+    run_id = str(raw.get("run_id") or "")
+    task_id = str(raw.get("task_id") or "")
+    plan_revision = raw.get("plan_revision")
+    authorization_revision = raw.get("authorization_revision")
+    if (
+        raw.get("schema_version") != 1
+        or raw.get("compatibility_mode") != "legacy_autonomous_checkpoint"
+        or raw.get("legacy_compatibility") is not True
+        or not run_id
+        or len(run_id) > 256
+        or not task_id
+        or len(task_id) > 160
+        or type(plan_revision) is not int
+        or plan_revision < 0
+        or type(authorization_revision) is not int
+        or authorization_revision < 0
+    ):
+        return {"accepted": False, "error_code": "invalid_target"}
+    encoded = json.dumps({
+        "schema_version": 1,
+        "run_id": run_id,
+        "task_id": task_id,
+        "plan_revision": plan_revision,
+        "authorization_revision": authorization_revision,
+    }).encode("utf-8")
+    try:
+        request = urllib.request.Request(
+            url,
+            data=encoded,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=5.0) as response:
+            decoded = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return {"accepted": False, "outcome_unknown": True}
+    return decoded if isinstance(decoded, dict) else {
+        "accepted": False,
+        "outcome_unknown": True,
+    }
+
+
+def _cancel_server_legacy_execution(binding: dict) -> dict:
+    return _post_server_legacy_execution_control(
+        _SERVER_LEGACY_EXECUTION_CANCEL_URL, binding,
+    )
+
+
+def _resume_server_legacy_execution(binding: dict) -> dict:
+    return _post_server_legacy_execution_control(
+        _SERVER_LEGACY_EXECUTION_RESUME_URL, binding,
+    )
+
+
 def _wait_server_autonomous_from_chat(
     initial_result: dict,
     request: dict,
@@ -300,27 +364,6 @@ def _wait_server_autonomous_from_chat(
                 "final_text": str(persisted.get("assistant_content") or "")[:32_000],
             }
         time.sleep(0.25)
-
-
-def _send_server_autonomous_pc_action(action: str) -> dict | None:
-    """Send one explicit PC-panel action to the canonical server run."""
-
-    import json
-    import urllib.request
-
-    payload = json.dumps({"action": str(action or "")}).encode("utf-8")
-    try:
-        request = urllib.request.Request(
-            _SERVER_AUTONOMOUS_PC_ACTION_URL,
-            data=payload,
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=5.0) as response:
-            decoded = json.loads(response.read().decode("utf-8"))
-    except Exception:
-        return None
-    return decoded if isinstance(decoded, dict) else None
 
 
 def _notify_mobile_new_chat() -> None:
@@ -407,16 +450,69 @@ def _notify_mobile_conversation_changed(
     ).start()
 
 
-def _new_desktop_turn_meta(conv_id: str) -> dict:
+def _resolve_desktop_chat_route_binding(turn_directives=None) -> dict[str, str]:
+    from osia.agent import MODEL as DEFAULT_MODEL
+    from osia.config import load_settings
+    from osia.models import provider_for_model_cached
+    from osia.reasoning import resolve_reasoning_option_id
+
+    settings = load_settings()
+    model_override = getattr(turn_directives, "model_override", None)
+    if model_override is not None:
+        provider_id = str(model_override.provider_id or "").strip().lower()
+        model_id = str(model_override.model_id or "").strip()
+    else:
+        model_id = str(settings.get("selected_model") or DEFAULT_MODEL).strip()
+        provider_id = str(
+            settings.get("selected_model_provider") or ""
+        ).strip().lower()
+        if not provider_id and model_id:
+            provider_id = str(
+                provider_for_model_cached(model_id) or ""
+            ).strip().lower()
+    reasoning_override = getattr(turn_directives, "reasoning_override", None)
+    effective_reasoning = str(
+        reasoning_override
+        if reasoning_override is not None else
+        resolve_reasoning_option_id(provider_id, model_id, settings)
+    ).strip().lower()
+    binding = {
+        "provider_id": provider_id,
+        "model_id": model_id,
+        "effective_reasoning": effective_reasoning,
+    }
+    if any(not value for value in binding.values()):
+        raise RuntimeError("desktop Chat route binding is incomplete")
+    return binding
+
+
+def _new_desktop_turn_meta(
+    conv_id: str,
+    *,
+    turn_directives=None,
+) -> dict:
     request_id = f"desktop_req_{uuid.uuid4().hex}"
     turn_id = f"desktop_turn_{uuid.uuid4().hex}"
+    route = _resolve_desktop_chat_route_binding(turn_directives)
+    from osia.turn_terminality import live_process_identity
+
+    _owner_alive, owner_process_identity = live_process_identity(os.getpid())
     return {
         "conversation_id": conv_id,
         "request_id": request_id,
         "client_request_id": request_id,
         "turn_id": turn_id,
+        "run_id": turn_id,
+        **route,
         "user_message_id": f"desktop_msg_{uuid.uuid4().hex}",
         "assistant_message_id": f"desktop_msg_{uuid.uuid4().hex}",
+        "_pinned_provider_id": route["provider_id"],
+        "_pinned_model_id": route["model_id"],
+        "_pinned_effective_reasoning": route["effective_reasoning"],
+        "_route_bound_at_accept": True,
+        "_execution_owner": "desktop",
+        "_execution_owner_pid": os.getpid(),
+        "_execution_owner_process_identity": owner_process_identity,
     }
 
 
@@ -426,6 +522,7 @@ def _run_turn_to_terminality(agent, user_input: str, *, turn_id: str, **kwargs):
     runner = getattr(agent, "run_terminal_turn", None)
     if callable(runner):
         return runner(user_input, turn_id=turn_id, **kwargs)
+    kwargs.pop("semantic_objective", None)
     return agent.run(user_input, **kwargs)
 
 
@@ -452,10 +549,72 @@ def _turn_persistence_metadata(
         "_request_id": str(turn_meta.get("request_id") or ""),
         "_client_request_id": str(turn_meta.get("request_id") or ""),
         "_turn_id": str(turn_meta.get("turn_id") or ""),
+        "_run_id": str(
+            turn_meta.get("run_id") or turn_meta.get("turn_id") or ""
+        ),
+        "_provider_id": str(turn_meta.get("provider_id") or ""),
+        "_model_id": str(turn_meta.get("model_id") or ""),
+        "_effective_reasoning": str(
+            turn_meta.get("effective_reasoning") or ""
+        ),
         "_message_id": str(turn_meta.get(message_key) or ""),
         "_operation_id": str(turn_meta.get(message_key) or ""),
+        "_execution_owner": str(
+            turn_meta.get("_execution_owner") or "desktop"
+        ),
+        "_execution_owner_pid": int(
+            turn_meta.get("_execution_owner_pid") or os.getpid()
+        ),
+        "_execution_owner_process_identity": str(
+            turn_meta.get("_execution_owner_process_identity") or ""
+        ),
     })
     return metadata
+
+
+_DESKTOP_CHAT_BINDING_KEYS = (
+    "conversation_id", "request_id", "turn_id", "run_id",
+    "provider_id", "model_id", "effective_reasoning",
+)
+
+
+def _desktop_reserved_assistant_state(
+    messages: list[dict],
+    *,
+    binding: dict,
+    assistant_message_id: str,
+    final_text: str,
+) -> str:
+    """Classify the exact reserved assistant as absent, exact, or conflicting."""
+
+    exact_found = False
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        same_message_id = (
+            str(message.get("_message_id") or "") == assistant_message_id
+        )
+        same_turn = all(
+            str(message.get("_" + key) or "") == str(binding.get(key) or "")
+            for key in (
+                "conversation_id", "request_id", "turn_id", "run_id",
+            )
+        )
+        if not same_message_id and not same_turn:
+            continue
+        exact = bool(
+            same_message_id
+            and str(message.get("content") or "") == final_text
+            and all(
+                str(message.get("_" + key) or "")
+                == str(binding.get(key) or "")
+                for key in _DESKTOP_CHAT_BINDING_KEYS
+            )
+        )
+        if not exact or exact_found:
+            return "conflict"
+        exact_found = True
+    return "exact" if exact_found else "absent"
 
 
 def _persist_desktop_user_turn(
@@ -464,15 +623,30 @@ def _persist_desktop_user_turn(
     *,
     turn_meta: dict | None = None,
     metadata: dict | None = None,
+    turn_directives=None,
 ) -> dict:
     """Durably accept a desktop user turn before any agent/tool callback."""
 
-    meta = turn_meta or _new_desktop_turn_meta(conv_id)
+    meta = turn_meta or _new_desktop_turn_meta(
+        conv_id,
+        turn_directives=turn_directives,
+    )
+    semantic_objective = str(content or "")[:32_000]
+    user_metadata = dict(metadata or {})
+    user_metadata.update({
+        "_assistant_message_id": str(
+            meta.get("assistant_message_id") or ""
+        ),
+        "_terminality_objective": semantic_objective,
+    })
+    meta["_terminality_objective"] = semantic_objective
     receipt = conversations.commit_message(
         conv_id,
         "user",
         content,
-        metadata=_turn_persistence_metadata(meta, role="user", extra=metadata),
+        metadata=_turn_persistence_metadata(
+            meta, role="user", extra=user_metadata,
+        ),
     )
     if receipt is None:
         raise RuntimeError("conversation persistence unavailable")
@@ -484,6 +658,554 @@ def _persist_desktop_user_turn(
             operation_id=receipt.get("operation_id", ""),
         )
     return meta
+
+
+def _incomplete_desktop_chat_turns() -> list[dict]:
+    """Return only exact, non-replaying desktop Chat recovery attachments."""
+
+    from osia.tool_attempts import (
+        RECOVERABLE_STATUSES,
+        TERMINAL_STATUSES,
+        ToolAttemptStatus,
+        get_tool_attempt_store,
+    )
+    from osia.turn_terminality import (
+        TurnTerminalityController,
+        live_process_identity,
+        load_persisted_terminal_result,
+    )
+
+    store = get_tool_attempt_store()
+    candidates_by_conversation: dict[str, list[dict]] = {}
+    for summary in conversations.list_conversations():
+        conv_id = str((summary or {}).get("id") or "")
+        conversation = conversations.get_conversation(conv_id)
+        messages = list((conversation or {}).get("messages") or [])
+        if not conv_id or not messages:
+            continue
+        try:
+            suspended = store.find_resumable_chat_turn(conv_id)
+        except Exception:
+            suspended = None
+        suspended_status = None
+        try:
+            if isinstance(suspended, dict):
+                suspended_status = ToolAttemptStatus(suspended.get("status"))
+        except (TypeError, ValueError):
+            suspended_status = None
+
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            request_id = str(
+                message.get("_request_id")
+                or message.get("_client_request_id")
+                or ""
+            )
+            turn_id = str(message.get("_turn_id") or "")
+            run_id = str(message.get("_run_id") or "")
+            assistant_message_id = str(
+                message.get("_assistant_message_id") or ""
+            )
+            objective = message.get("_terminality_objective")
+            if not isinstance(objective, str) or not objective.strip():
+                continue
+            if not all((request_id, turn_id, run_id, assistant_message_id)):
+                continue
+            if str(message.get("_conversation_id") or conv_id) != conv_id:
+                continue
+            execution_owner = str(message.get("_execution_owner") or "")
+            if execution_owner != "desktop" and not (
+                not execution_owner
+                and request_id.startswith("desktop_req_")
+                and turn_id.startswith("desktop_turn_")
+            ):
+                continue
+            try:
+                owner_pid = int(message.get("_execution_owner_pid") or 0)
+            except (TypeError, ValueError, OverflowError):
+                owner_pid = 0
+            owner_identity = str(
+                message.get("_execution_owner_process_identity") or ""
+            )
+            if owner_pid > 0:
+                owner_alive, live_identity = live_process_identity(owner_pid)
+                if owner_alive and (
+                    not owner_identity
+                    or not live_identity
+                    or owner_identity == live_identity
+                ):
+                    # Another live desktop process still owns this accepted
+                    # turn. Inventory is read-only with respect to that owner.
+                    continue
+            turn_directives = None
+            raw_directives = message.get("_turn_directives_v1")
+            if raw_directives is not None:
+                try:
+                    from osia.slash_commands import SlashTurnDirectivesV1
+
+                    turn_directives = SlashTurnDirectivesV1.from_wire(
+                        raw_directives
+                    )
+                except Exception:
+                    continue
+            persisted_terminal = load_persisted_terminal_result(turn_id)
+            message_route = {
+                "provider_id": str(message.get("_provider_id") or ""),
+                "model_id": str(message.get("_model_id") or ""),
+                "effective_reasoning": str(
+                    message.get("_effective_reasoning") or ""
+                ),
+            }
+            if any(not value for value in message_route.values()):
+                continue
+            message_binding = {
+                "conversation_id": conv_id,
+                "request_id": request_id,
+                "turn_id": turn_id,
+                "run_id": run_id,
+                **message_route,
+            }
+            assistant_state = _desktop_reserved_assistant_state(
+                messages[index + 1:],
+                binding=message_binding,
+                assistant_message_id=assistant_message_id,
+                final_text=str(
+                    (persisted_terminal or {}).get("final_text") or ""
+                ).strip(),
+            )
+            terminal_binding = (
+                persisted_terminal.get("execution_binding")
+                if isinstance(persisted_terminal, dict) else None
+            )
+            terminal_binding_exact = bool(
+                isinstance(terminal_binding, dict) and all(
+                    str(terminal_binding.get(key) or "") == expected
+                    for key, expected in (
+                        ("conversation_id", conv_id),
+                        ("request_id", request_id),
+                        ("turn_id", turn_id),
+                        ("run_id", run_id),
+                    )
+                ) and all(
+                    str(terminal_binding.get(key) or "")
+                    for key in (
+                        "provider_id", "model_id", "effective_reasoning",
+                    )
+                ) and all(
+                    str(terminal_binding.get(key) or "") == value
+                    for key, value in message_route.items()
+                )
+            )
+            if terminal_binding_exact:
+                continuation_attempt_id = ""
+                if isinstance(suspended, dict):
+                    if (
+                        suspended_status not in TERMINAL_STATUSES
+                        or suspended.get("continuation_state") == "complete"
+                        or str(suspended.get("owner_scope") or "chat") != "chat"
+                        or any(
+                            str(suspended.get(key) or "")
+                            != str(terminal_binding.get(key) or "")
+                            for key in (
+                                "conversation_id", "request_id", "turn_id",
+                                "provider_id", "model_id",
+                            )
+                        )
+                        or str(
+                            suspended.get("final_response_message_id") or ""
+                        ) != assistant_message_id
+                        or not str(suspended.get("tool_attempt_id") or "")
+                    ):
+                        continue
+                    continuation_attempt_id = str(
+                        suspended.get("tool_attempt_id") or ""
+                    )
+                if assistant_state == "conflict" or (
+                    assistant_state == "exact" and not continuation_attempt_id
+                ):
+                    continue
+                candidates_by_conversation.setdefault(conv_id, []).append({
+                    "conversation_id": conv_id,
+                    "objective": objective,
+                    "history": messages[:index],
+                    "turn_directives": turn_directives,
+                    "persisted_terminal": dict(persisted_terminal),
+                    "continuation_attempt_id": continuation_attempt_id,
+                    "turn_meta": {
+                        "conversation_id": conv_id,
+                        "request_id": request_id,
+                        "client_request_id": request_id,
+                        "turn_id": turn_id,
+                        "run_id": run_id,
+                        "provider_id": str(terminal_binding["provider_id"]),
+                        "model_id": str(terminal_binding["model_id"]),
+                        "effective_reasoning": str(
+                            terminal_binding["effective_reasoning"]
+                        ),
+                        "user_message_id": str(message.get("_message_id") or ""),
+                        "assistant_message_id": assistant_message_id,
+                        "_pinned_provider_id": str(
+                            terminal_binding["provider_id"]
+                        ),
+                        "_pinned_model_id": str(terminal_binding["model_id"]),
+                        "_pinned_effective_reasoning": str(
+                            terminal_binding["effective_reasoning"]
+                        ),
+                        "_terminality_objective": objective,
+                        "_accepted_user_already_persisted": True,
+                        "_execution_owner": "desktop",
+                        "_execution_owner_pid": owner_pid,
+                        "_execution_owner_process_identity": owner_identity,
+                    },
+                })
+                continue
+            if assistant_state != "absent":
+                # A correlated assistant without the exact durable reservation
+                # is contradictory state; never replay or overwrite it.
+                continue
+            try:
+                controller = TurnTerminalityController(
+                    turn_id=turn_id,
+                    objective=objective,
+                    execution_required=True,
+                )
+                terminality = controller.snapshot()
+            except Exception:
+                continue
+            setup_binding = terminality.get("execution_binding") or {}
+            setup_binding_safe = bool(
+                not setup_binding
+                or (
+                    isinstance(setup_binding, dict)
+                    and all(
+                        str(setup_binding.get(key) or "") == value
+                        for key, value in message_binding.items()
+                    )
+                )
+            )
+            if (
+                not isinstance(suspended, dict)
+                and setup_binding_safe
+                and not terminality.get("invocations")
+                and not terminality.get("active_attempts")
+                and not terminality.get("unknown_effects")
+                and terminality.get("permission_state") != "pending"
+                and not terminality.get("final_reservation")
+                and not terminality.get("terminal_state")
+            ):
+                candidates_by_conversation.setdefault(conv_id, []).append({
+                    "conversation_id": conv_id,
+                    "objective": objective,
+                    "history": messages[:index],
+                    "turn_directives": turn_directives,
+                    "needs_terminal_reservation": True,
+                    "turn_meta": {
+                        "conversation_id": conv_id,
+                        "request_id": request_id,
+                        "client_request_id": request_id,
+                        "turn_id": turn_id,
+                        "run_id": run_id,
+                        **message_route,
+                        "user_message_id": str(
+                            message.get("_message_id") or ""
+                        ),
+                        "assistant_message_id": assistant_message_id,
+                        "_pinned_provider_id": message_route["provider_id"],
+                        "_pinned_model_id": message_route["model_id"],
+                        "_pinned_effective_reasoning": message_route[
+                            "effective_reasoning"
+                        ],
+                        "_terminality_objective": objective,
+                        "_accepted_user_already_persisted": True,
+                        "_execution_owner": "desktop",
+                        "_execution_owner_pid": owner_pid,
+                        "_execution_owner_process_identity": owner_identity,
+                    },
+                })
+                continue
+            binding = terminality.get("execution_binding") or {}
+            if (
+                not isinstance(suspended, dict)
+                or (
+                    suspended_status not in RECOVERABLE_STATUSES
+                    and not (
+                        suspended_status in TERMINAL_STATUSES
+                        and suspended.get("continuation_state") != "complete"
+                    )
+                )
+                or str(suspended.get("owner_scope") or "chat") != "chat"
+                or not isinstance(binding, dict)
+                or terminality.get("terminal_state")
+                or terminality.get("final_reservation")
+                or not isinstance(terminality.get("strategy_snapshot"), dict)
+                or not terminality.get("strategy_snapshot")
+                or any(
+                    str(binding.get(key) or "") != expected
+                    for key, expected in (
+                        ("conversation_id", conv_id),
+                        ("request_id", request_id),
+                        ("turn_id", turn_id),
+                        ("run_id", run_id),
+                    )
+                )
+                or any(
+                    not str(binding.get(key) or "")
+                    for key in (
+                        "provider_id", "model_id", "effective_reasoning",
+                    )
+                )
+                or any(
+                    str(suspended.get(key) or "") != expected
+                    for key, expected in (
+                        ("conversation_id", conv_id),
+                        ("request_id", request_id),
+                        ("turn_id", turn_id),
+                        ("provider_id", str(binding["provider_id"])),
+                        ("model_id", str(binding["model_id"])),
+                        ("final_response_message_id", assistant_message_id),
+                    )
+                )
+                or not str(suspended.get("tool_attempt_id") or "")
+            ):
+                continue
+            candidates_by_conversation.setdefault(conv_id, []).append({
+                "conversation_id": conv_id,
+                "objective": objective,
+                "history": messages[:index],
+                "turn_directives": turn_directives,
+                "turn_meta": {
+                    "conversation_id": conv_id,
+                    "request_id": request_id,
+                    "client_request_id": request_id,
+                    "turn_id": turn_id,
+                    "run_id": run_id,
+                    "provider_id": str(binding["provider_id"]),
+                    "model_id": str(binding["model_id"]),
+                    "effective_reasoning": str(
+                        binding["effective_reasoning"]
+                    ),
+                    "user_message_id": str(message.get("_message_id") or ""),
+                    "assistant_message_id": assistant_message_id,
+                    "_pinned_provider_id": str(binding["provider_id"]),
+                    "_pinned_model_id": str(binding["model_id"]),
+                    "_pinned_effective_reasoning": str(
+                        binding["effective_reasoning"]
+                    ),
+                    "_existing_tool_attempt_id": str(
+                        suspended.get("tool_attempt_id") or ""
+                    ),
+                    "_terminality_objective": objective,
+                    "_accepted_user_already_persisted": True,
+                    "_execution_owner": "desktop",
+                    "_execution_owner_pid": owner_pid,
+                    "_execution_owner_process_identity": owner_identity,
+                },
+            })
+
+    # More than one candidate for a conversation is contradictory state. Never
+    # guess by recency: the exact one-active-turn invariant fails closed.
+    return [
+        items[0]
+        for items in candidates_by_conversation.values()
+        if len(items) == 1
+    ]
+
+
+def _persist_desktop_reserved_final(candidate: dict) -> dict | None:
+    """Commit one already-reserved exact final without provider/action replay."""
+
+    from osia.agent import strip_tool_artifacts
+
+    persisted = (candidate or {}).get("persisted_terminal")
+    turn_meta = dict((candidate or {}).get("turn_meta") or {})
+    binding = (
+        persisted.get("execution_binding")
+        if isinstance(persisted, dict) else None
+    )
+    if not isinstance(binding, dict) or any(
+        str(binding.get(key) or "") != str(turn_meta.get(key) or "")
+        for key in (
+            "conversation_id", "request_id", "turn_id", "run_id",
+            "provider_id", "model_id", "effective_reasoning",
+        )
+    ):
+        return None
+    reserved_text = str(persisted.get("final_text") or "")
+    display = strip_tool_artifacts(reserved_text).strip()
+    if not display or display != reserved_text.strip():
+        return None
+    continuation_id = str(
+        (candidate or {}).get("continuation_attempt_id") or ""
+    )
+    continuation_store = None
+    continuation_claim = None
+    try:
+        from osia.execution_trace import (
+            ExecutionTraceLedger,
+            terminal_display_key,
+            validate_persisted_trace,
+        )
+        from osia.tool_attempts import is_internal_tool_control_text
+
+        if is_internal_tool_control_text(display):
+            return None
+        display_key = terminal_display_key(persisted.get("terminal_state"))
+        if not display_key:
+            return None
+        trace = validate_persisted_trace(
+            (candidate or {}).get("execution_trace")
+            or turn_meta.get("_execution_trace_v1")
+            or persisted.get("execution_trace")
+        )
+        if trace is not None and (
+            any(
+                str(trace.get(key) or "") != str(binding.get(key) or "")
+                for key in (
+                    "conversation_id", "request_id", "turn_id", "run_id",
+                    "provider_id", "model_id", "effective_reasoning",
+                )
+            )
+            or not any(
+                isinstance(event, dict) and event.get("terminal") is True
+                for event in trace.get("events") or ()
+            )
+        ):
+            trace = None
+        if trace is None:
+            ledger = ExecutionTraceLedger(**binding)
+            ledger.record(
+                kind="terminal",
+                display_key=display_key,
+                terminal=True,
+                dedupe_key="terminal",
+            )
+            trace = validate_persisted_trace(ledger.snapshot())
+        if trace is None:
+            return None
+        from osia.document_artifacts import normalize_references
+
+        artifact_refs = normalize_references(
+            (candidate or {}).get("artifact_refs")
+            or turn_meta.get("_artifact_refs")
+            or persisted.get("artifact_refs")
+        )
+        extra_metadata = {
+            "_execution_trace_v1": trace,
+            "_terminal_state": str(
+                persisted.get("terminal_state") or ""
+            ),
+            "_terminal_reservation_id": str(
+                persisted.get("reservation_id") or ""
+            ),
+        }
+        if artifact_refs:
+            extra_metadata["_artifact_refs"] = artifact_refs
+        metadata = _turn_persistence_metadata(
+            turn_meta,
+            role="assistant",
+            extra=extra_metadata,
+        )
+        if continuation_id:
+            from osia.tool_attempts import (
+                TERMINAL_STATUSES,
+                ToolAttemptStatus,
+                get_tool_attempt_store,
+            )
+
+            continuation_store = get_tool_attempt_store()
+            attempt = continuation_store.get_attempt(continuation_id)
+            if (
+                not isinstance(attempt, dict)
+                or ToolAttemptStatus(attempt.get("status"))
+                not in TERMINAL_STATUSES
+                or str(attempt.get("owner_scope") or "chat") != "chat"
+                or any(
+                    str(attempt.get(key) or "") != str(binding.get(key) or "")
+                    for key in (
+                        "conversation_id", "request_id", "turn_id",
+                        "provider_id", "model_id",
+                    )
+                )
+                or str(attempt.get("final_response_message_id") or "")
+                != str(turn_meta.get("assistant_message_id") or "")
+            ):
+                return None
+            continuation_claim = continuation_store.claim_continuation(
+                continuation_id
+            )
+            if continuation_claim is None:
+                return None
+        receipt = conversations.commit_message(
+            str(turn_meta.get("conversation_id") or ""),
+            "assistant",
+            display,
+            metadata=metadata,
+        )
+        committed_conversation = (
+            receipt.get("conversation")
+            if isinstance(receipt, dict) else None
+        )
+        if receipt is not None and _desktop_reserved_assistant_state(
+            list((committed_conversation or {}).get("messages") or []),
+            binding=binding,
+            assistant_message_id=str(
+                turn_meta.get("assistant_message_id") or ""
+            ),
+            final_text=display,
+        ) != "exact":
+            raise ValueError("reserved assistant correlation conflict")
+    except Exception:
+        if continuation_store is not None and continuation_claim is not None:
+            try:
+                continuation_store.release_continuation(
+                    continuation_id, continuation_claim,
+                )
+            except Exception:
+                pass
+        return None
+    if receipt is None:
+        if continuation_store is not None and continuation_claim is not None:
+            try:
+                continuation_store.release_continuation(
+                    continuation_id, continuation_claim,
+                )
+            except Exception:
+                pass
+        return None
+    if continuation_store is not None and continuation_claim is not None:
+        try:
+            completed = continuation_store.complete_continuation(
+                continuation_id,
+                continuation_claim,
+                final_response_message_id=str(
+                    turn_meta.get("assistant_message_id") or ""
+                ),
+            )
+        except Exception:
+            completed = False
+        if not completed:
+            try:
+                continuation_store.release_continuation(
+                    continuation_id, continuation_claim,
+                )
+            except Exception:
+                pass
+            return None
+    if receipt.get("committed"):
+        _notify_mobile_conversation_changed(
+            str(turn_meta.get("conversation_id") or ""),
+            revision=receipt.get("revision", 0),
+            operation_id=receipt.get("operation_id", ""),
+        )
+    return {
+        "binding": {**binding, "assistant_message_id": str(
+            turn_meta.get("assistant_message_id") or ""
+        )},
+        "display": display,
+        "trace": trace,
+        "receipt": receipt,
+    }
 
 
 def _dispatch_after_persisted_user(
@@ -713,18 +1435,19 @@ def _persist_agent_delta(
     *,
     user_display_text: str | None = None,
     turn_meta: dict | None = None,
-):
+) -> bool:
     """Persist messages added to ``agent.messages`` during the most recent
     ``agent.run()`` call. ``prev_history_len`` is the length of the
     non-system message list (``agent.messages[1:]``) before that call.
 
-    Errors are logged but never raised — persistence must never crash
-    the interactive loop.
+    Return True only when the canonical assistant delta was durably committed.
+    Callers must not project a terminal answer or clear its busy state on False.
     """
     if not conv_id:
-        return
+        return False
     try:
         new_msgs = agent.messages[1:][prev_history_len:]
+        canonical_assistant_committed = False
         pending_user_display = user_display_text
         final_assistant_index = next(
             (
@@ -790,6 +1513,53 @@ def _persist_agent_delta(
                 metadata = dict(metadata or {})
                 metadata["_artifact_refs"] = artifact_refs
             if turn_meta is not None and clean.get("role") == "assistant":
+                terminal = _terminality_result(
+                    agent,
+                    str(turn_meta.get("turn_id") or ""),
+                )
+                terminal_state = str(
+                    (terminal or {}).get("terminal_state") or ""
+                )
+                terminal_reservation_id = str(
+                    (terminal or {}).get("reservation_id") or ""
+                )
+                if (
+                    not isinstance(terminal, dict)
+                    or not terminal_state
+                    or not terminal_reservation_id
+                    or any(
+                        str(terminal.get(key) or "")
+                        != str(turn_meta.get(key) or "")
+                        for key in _DESKTOP_CHAT_BINDING_KEYS
+                    )
+                ):
+                    raise ValueError(
+                        "desktop assistant has no exact terminal reservation"
+                    )
+                trace_snapshot = None
+                trace_getter = getattr(agent, "execution_trace_snapshot", None)
+                if callable(trace_getter):
+                    try:
+                        trace_snapshot = trace_getter(
+                            str(turn_meta.get("turn_id") or "")
+                        )
+                    except Exception:
+                        trace_snapshot = None
+                if isinstance(trace_snapshot, dict):
+                    try:
+                        from osia.execution_trace import validate_persisted_trace
+
+                        trace_snapshot = validate_persisted_trace(trace_snapshot)
+                    except Exception:
+                        trace_snapshot = None
+                if trace_snapshot is not None:
+                    metadata = dict(metadata or {})
+                    metadata["_execution_trace_v1"] = trace_snapshot
+                metadata = dict(metadata or {})
+                metadata.update({
+                    "_terminal_state": terminal_state,
+                    "_terminal_reservation_id": terminal_reservation_id,
+                })
                 metadata = _turn_persistence_metadata(
                     turn_meta,
                     role="assistant",
@@ -813,17 +1583,57 @@ def _persist_agent_delta(
                     conv_id, clean.get("role"), clean.get("content", ""),
                     **persistence_kwargs,
                 )
+            if receipt is not None and clean.get("role") == "assistant":
+                if turn_meta is None:
+                    canonical_assistant_committed = True
+                else:
+                    committed_conversation = (
+                        receipt.get("conversation")
+                        if isinstance(receipt, dict) else None
+                    )
+                    committed_messages = list(
+                        (committed_conversation or {}).get("messages") or []
+                    )
+                    assistant_message_id = str(
+                        turn_meta.get("assistant_message_id") or ""
+                    )
+                    exact_assistants = [
+                        item for item in committed_messages
+                        if isinstance(item, dict)
+                        and item.get("role") == "assistant"
+                        and str(item.get("_message_id") or "")
+                        == assistant_message_id
+                    ]
+                    canonical_assistant_committed = bool(
+                        len(exact_assistants) == 1
+                        and _desktop_reserved_assistant_state(
+                            committed_messages,
+                            binding=turn_meta,
+                            assistant_message_id=assistant_message_id,
+                            final_text=str(clean.get("content") or ""),
+                        ) == "exact"
+                        and str(
+                            exact_assistants[0].get("_terminal_state") or ""
+                        ) == terminal_state
+                        and str(
+                            exact_assistants[0].get(
+                                "_terminal_reservation_id"
+                            ) or ""
+                        ) == terminal_reservation_id
+                    )
             if receipt and receipt.get("committed"):
                 _notify_mobile_conversation_changed(
                     conv_id,
                     revision=receipt.get("revision", 0),
                     operation_id=receipt.get("operation_id", ""),
                 )
+        return canonical_assistant_committed
     except Exception as e:
         print(
             "[OSIA] failed to persist conversation: "
             f"{type(e).__name__}"
         )
+        return False
 
 
 def _finalize_controlled_refusal(
@@ -848,15 +1658,16 @@ def _finalize_controlled_refusal(
     persistence_kwargs = {"user_display_text": user_display_text}
     if turn_meta is not None:
         persistence_kwargs["turn_meta"] = turn_meta
-    _persist_agent_delta(
+    if not _persist_agent_delta(
         conv_id,
         agent,
         prev_history_len,
         **persistence_kwargs,
-    )
-    from osia.agent import clean_response
+    ):
+        return None
+    from osia.agent import strip_tool_artifacts
 
-    display = clean_response(text)
+    display = strip_tool_artifacts(text)
     emit_final(conv_id, display)
     return display
 
@@ -1062,12 +1873,13 @@ def text_mode():
             ):
                 raise RuntimeError("turn did not reach verified terminality")
             print(f"\nOSIA: {response}")
-            _persist_agent_delta(
+            if not _persist_agent_delta(
                 active_conv["id"],
                 agent,
                 prev_history_len,
                 turn_meta=turn_meta,
-            )
+            ):
+                raise RuntimeError("canonical assistant persistence failed")
         except Exception as e:
             print(f"\n[ERROR] {type(e).__name__}")
 
@@ -1183,13 +1995,15 @@ def voice_mode():
             continue
         print(f"[voice] assistant response accepted ({len(response)} chars).")
 
-        _persist_agent_delta(
+        if not _persist_agent_delta(
             active_conv["id"],
             turn_agent,
             len(history),
             user_display_text=user_text,
             turn_meta=turn_meta,
-        )
+        ):
+            print("[voice] canonical assistant persistence failed")
+            continue
         print(f"[TTS] main.voice_mode: calling speak() ({len(response)} chars)", flush=True)
         speak(response, language=turn_context.language)
         print("[TTS] main.voice_mode: speak() returned", flush=True)
@@ -1224,12 +2038,10 @@ def wake_mode():
         stop as tts_stop,
         wait_for_playback_complete,
     )
-    from osia.agent import clean_response
+    from osia.agent import clean_response, strip_tool_artifacts
     from osia import i18n
     from osia.turn_context import (
-        fixed_turn_context,
         localized_text,
-        normalize_locale,
         resolve_turn_context,
     )
     from osia import scheduled_tasks
@@ -1240,26 +2052,8 @@ def wake_mode():
         set_setting,
     )
     from osia.models import discover_models_async
-    from osia.mobile_model_catalogue import (
-        apply_autonomous_agent_model,
-        resolve_current_autonomous_selection,
-    )
     from osia.cron import CronManager
     from osia.heartbeat import HeartbeatMonitor
-    # WOR-45 Phase 4 — wire the autonomous engine (consumed as black boxes).
-    from osia.autonomous.orchestrator import Orchestrator
-    from osia.autonomous import (
-        authorization as autonomous_authorization,
-        diagnostics as autonomous_diagnostics,
-        planner,
-    )
-    from osia.autonomous.state import (
-        clear_task_state,
-        count_progress,
-        new_failed_task_state,
-        resume_state_is_valid,
-        save_task_state,
-    )
     perf_mark("wake_mode: heavy imports done")
 
     class Bridge(QObject):
@@ -1271,14 +2065,16 @@ def wake_mode():
         chat_message_for_conversation = pyqtSignal(str, str, str)
         # Presentation-only desktop assistant streaming. Sentence chunks extend
         # one bounded typewriter target; final/error frames flush it exactly.
-        assistant_stream_chunk = pyqtSignal(str, str)
-        assistant_stream_final = pyqtSignal(str, str)
-        assistant_stream_error = pyqtSignal(str, str)
+        assistant_stream_chunk = pyqtSignal(dict, str)
+        assistant_stream_final = pyqtSignal(dict, str)
+        assistant_stream_error = pyqtSignal(dict, str)
+        chat_turn_started = pyqtSignal(dict)
+        execution_trace = pyqtSignal(dict)
         # Drive the island's visual state from a worker thread.
         island_state = pyqtSignal(str)
         # Per-conversation desktop busy state for the popup input controls.
         conversation_busy_changed = pyqtSignal(str, bool)
-        tool_attempt_status = pyqtSignal(str, str)
+        tool_attempt_status = pyqtSignal(dict, str)
         # Refresh the conversations panel (new active id) from a worker thread.
         conversations_changed = pyqtSignal(str)
         # Reset chat (agent + GUI) from a worker thread — "nouveau chat" voice
@@ -1287,11 +2083,10 @@ def wake_mode():
         # Toggle the popup from the global Ctrl+Alt+O hotkey thread (WOR-22).
         # Marshalled onto the GUI thread so popup.toggle() is Qt-safe.
         toggle_popup = pyqtSignal()
-        # Autonomous-agent progress (WOR-45 Phase 4). The Orchestrator's
-        # progress_cb runs on its daemon thread; it only ever emits this signal
-        # (never touches a widget). Carries the event dict + a state snapshot.
-        autonomous_progress = pyqtSignal(dict)
-        autonomous_resume_ready = pyqtSignal(dict)
+        # Sanitized durable execution state projected into its originating Chat.
+        chat_execution_activity = pyqtSignal(dict)
+        # Persisted pre-Chat checkpoint shown as a separate, non-busy banner.
+        legacy_execution_activity = pyqtSignal(dict)
 
     bridge = Bridge()
 
@@ -1466,6 +2261,7 @@ def wake_mode():
     # conversation below so different conversations can run independently.
     handler_lock = threading.Lock()
     busy_conversations: set[str] = set()
+    busy_turn_keys: dict[str, tuple[str, str, str, str]] = {}
     busy_lock = threading.Lock()
 
     def _any_conversation_busy() -> bool:
@@ -1497,7 +2293,12 @@ def wake_mode():
         with voice_worker_lock:
             return active_voice_worker[0]
 
-    def _start_voice_worker(target, *, name: str) -> None:
+    def _start_voice_worker(
+        target,
+        *,
+        name: str,
+        on_start_failure=None,
+    ) -> None:
         def run() -> None:
             try:
                 target()
@@ -1510,7 +2311,26 @@ def wake_mode():
         worker = threading.Thread(target=run, daemon=True, name=name)
         with voice_worker_lock:
             active_voice_worker[0] = worker
+        try:
             worker.start()
+        except Exception as exc:
+            with voice_worker_lock:
+                if active_voice_worker[0] is worker:
+                    active_voice_worker[0] = None
+            print(
+                "[wake] voice worker could not start: "
+                f"{type(exc).__name__}",
+                flush=True,
+            )
+            if callable(on_start_failure):
+                try:
+                    on_start_failure()
+                except Exception as finalize_error:
+                    print(
+                        "[wake] voice start-failure cleanup failed: "
+                        f"{type(finalize_error).__name__}",
+                        flush=True,
+                    )
 
     def _manual_wake() -> None:
         if not manual_activation_open.is_set():
@@ -1523,6 +2343,26 @@ def wake_mode():
         bridge.wake_detected.emit(0)
 
     stop_manual_hotkey = _start_ctrl_alt_p_listener(_manual_wake)
+
+    active_chat_turns: dict[tuple[str, str, str, str], dict] = {}
+    active_chat_turns_lock = threading.Lock()
+
+    def _chat_turn_key(binding: dict | None) -> tuple[str, str, str, str] | None:
+        raw = binding if isinstance(binding, dict) else {}
+        values = tuple(
+            str(raw.get(name) or "")
+            for name in ("conversation_id", "request_id", "turn_id", "run_id")
+        )
+        return values if all(values) else None
+
+    def _active_chat_turn_for_conversation(conv_id: str) -> dict:
+        with active_chat_turns_lock:
+            matches = [
+                dict(value)
+                for key, value in active_chat_turns.items()
+                if key[0] == str(conv_id or "") and isinstance(value, dict)
+            ]
+        return matches[0] if len(matches) == 1 else {}
 
     def _desktop_busy_message() -> str:
         return "OSIA is still working in this conversation."
@@ -1548,7 +2388,22 @@ def wake_mode():
             "cancel", "cancel action", "stop action", "annule", "annuler",
             "annule l action", "arrete l action",
         }:
-            return coordinator.request_cancellation(conv_id)
+            active = _active_chat_turn_for_conversation(conv_id)
+            request_cancel = getattr(active.get("agent"), "request_turn_cancellation", None)
+            binding = active.get("binding") if isinstance(active, dict) else None
+            if (
+                callable(request_cancel)
+                and isinstance(binding, dict)
+                and all(
+                    str(binding.get(key) or "")
+                    for key in (
+                        "conversation_id", "request_id", "turn_id", "run_id",
+                        "provider_id", "model_id", "effective_reasoning",
+                    )
+                )
+            ):
+                return bool(request_cancel(str(binding.get("turn_id") or "")))
+            return False
         resume_verbs = {
             "continue", "continuer", "relaunch", "relance", "relancer",
             "reprendre", "reprends", "resume",
@@ -1576,9 +2431,12 @@ def wake_mode():
             ("verifie", "l", "action", "en", "cours"),
             ("verifier", "l", "action", "en", "cours"),
         }:
-            bridge.tool_attempt_status.emit(
-                conv_id, "waiting_tool_result",
-            )
+            active = _active_chat_turn_for_conversation(conv_id)
+            binding = active.get("binding") if isinstance(active, dict) else None
+            if isinstance(binding, dict):
+                bridge.tool_attempt_status.emit(
+                    dict(binding), "waiting_tool_result",
+                )
             return True
         return False
 
@@ -1588,14 +2446,32 @@ def wake_mode():
         with busy_lock:
             return conv_id in busy_conversations
 
-    def _set_conversation_busy(conv_id: str | None, busy: bool) -> None:
+    def _set_conversation_busy(
+        conv_id: str | None,
+        busy: bool,
+        *,
+        owner: dict | None = None,
+    ) -> bool:
         if not conv_id:
-            return
+            return False
+        owner_key = _chat_turn_key(owner)
         with busy_lock:
             if busy:
                 busy_conversations.add(conv_id)
+                if owner_key is not None:
+                    busy_turn_keys[conv_id] = owner_key
+                elif conv_id not in busy_turn_keys:
+                    busy_turn_keys.pop(conv_id, None)
             else:
+                current_owner = busy_turn_keys.get(conv_id)
+                if (
+                    owner_key is not None
+                    and current_owner is not None
+                    and current_owner != owner_key
+                ):
+                    return False
                 busy_conversations.discard(conv_id)
+                busy_turn_keys.pop(conv_id, None)
             any_busy = bool(busy_conversations)
         bridge.conversation_busy_changed.emit(conv_id, busy)
         voice_ui_lifecycle.emit_when_inactive(
@@ -1603,6 +2479,7 @@ def wake_mode():
                 "thinking" if any_busy else "idle"
             )
         )
+        return True
 
     def _ensure_active_conversation(seed_text: str | None = None) -> dict:
         nonlocal active_conv
@@ -1627,7 +2504,310 @@ def wake_mode():
 
     # ── Agent run helpers ────────────────────────────────────────────────
 
-    def _run_agent(
+    def _register_chat_turn(binding: dict, turn_agent) -> None:
+        key = _chat_turn_key(binding)
+        if key is None:
+            return
+        with active_chat_turns_lock:
+            active_chat_turns[key] = {
+                "agent": turn_agent,
+                "binding": dict(binding),
+            }
+
+    def _release_chat_turn(binding: dict, turn_agent) -> None:
+        key = _chat_turn_key(binding)
+        if key is None:
+            return
+        with active_chat_turns_lock:
+            current = active_chat_turns.get(key)
+            if isinstance(current, dict) and current.get("agent") is turn_agent:
+                active_chat_turns.pop(key, None)
+
+    def _start_or_run_durable_worker(
+        target,
+        *,
+        name: str,
+        allow_inline: bool = True,
+    ) -> bool:
+        """Never leave a durable Chat holder without its recovery worker."""
+
+        try:
+            threading.Thread(
+                target=target,
+                name=name,
+                daemon=True,
+            ).start()
+            return True
+        except Exception as start_error:
+            if not allow_inline:
+                print(
+                    "[OSIA] durable worker thread start deferred: "
+                    f"{type(start_error).__name__}"
+                )
+                retry_delay_ms = [250]
+
+                def _retry_thread_start() -> None:
+                    try:
+                        threading.Thread(
+                            target=target,
+                            name=name,
+                            daemon=True,
+                        ).start()
+                        return
+                    except Exception as retry_error:
+                        print(
+                            "[OSIA] durable worker thread retry deferred: "
+                            f"{type(retry_error).__name__}"
+                        )
+                    retry_delay_ms[0] = min(
+                        30_000, retry_delay_ms[0] * 2,
+                    )
+                    QTimer.singleShot(
+                        retry_delay_ms[0], _retry_thread_start,
+                    )
+
+                try:
+                    QTimer.singleShot(
+                        retry_delay_ms[0], _retry_thread_start,
+                    )
+                    return True
+                except Exception as timer_error:
+                    print(
+                        "[OSIA] durable worker retry timer unavailable: "
+                        f"{type(timer_error).__name__}"
+                    )
+                    return False
+            print(
+                "[OSIA] durable worker thread start failed; running inline: "
+                f"{type(start_error).__name__}"
+            )
+        try:
+            target()
+            return True
+        except Exception as inline_error:
+            print(
+                "[OSIA] inline durable worker failed closed: "
+                f"{type(inline_error).__name__}"
+            )
+            return False
+
+    def _schedule_desktop_final_persistence_retry(
+        turn_agent,
+        lifecycle: dict,
+        *,
+        conv_id: str,
+        turn_meta: dict,
+        voice_response: bool,
+        language_text: str | None,
+        user_display_text: str | None,
+        tts_session_id: int | None,
+        voice_cancelled,
+        emit_voice_state,
+        continuation_attempt_id: str = "",
+    ) -> bool:
+        """Retry only the reserved final commit; never replay provider/action work."""
+
+        if lifecycle.get("persistence_retry_scheduled"):
+            return True
+        turn_id = str(turn_meta.get("turn_id") or "")
+        binding = dict(lifecycle.get("binding") or {})
+        if not turn_id:
+            return False
+        lifecycle["persistence_retry_scheduled"] = True
+        lifecycle["durable_wait"] = True
+        if turn_agent is not None:
+            trace_getter = getattr(turn_agent, "execution_trace_snapshot", None)
+            if callable(trace_getter):
+                try:
+                    from osia.execution_trace import validate_persisted_trace
+
+                    trace = validate_persisted_trace(trace_getter(turn_id))
+                except Exception:
+                    trace = None
+                if isinstance(trace, dict):
+                    turn_meta["_execution_trace_v1"] = trace
+            try:
+                from osia.document_artifacts import normalize_references
+
+                artifact_refs = normalize_references(
+                    getattr(turn_agent, "last_run_artifacts", None)
+                )
+            except Exception:
+                artifact_refs = []
+            if artifact_refs:
+                turn_meta["_artifact_refs"] = artifact_refs
+
+        def _retry() -> None:
+            from osia.turn_terminality import load_persisted_terminal_result
+
+            delay = 0.25
+            while lifecycle.get("durable_wait"):
+                time.sleep(delay)
+                persisted = load_persisted_terminal_result(turn_id)
+                if not isinstance(persisted, dict):
+                    delay = min(30.0, delay * 2.0)
+                    continue
+                recovered = _persist_desktop_reserved_final({
+                    "persisted_terminal": persisted,
+                    "turn_meta": turn_meta,
+                    "continuation_attempt_id": continuation_attempt_id,
+                })
+                if not isinstance(recovered, dict):
+                    delay = min(30.0, delay * 2.0)
+                    continue
+                projected_binding = dict(recovered["binding"])
+                try:
+                    lifecycle["binding"] = dict(projected_binding)
+                    if not lifecycle.get("registered"):
+                        bridge.chat_turn_started.emit(projected_binding)
+                    events = list(
+                        (recovered.get("trace") or {}).get("events") or []
+                    )
+                    if events:
+                        bridge.execution_trace.emit({
+                            "type": "execution_trace",
+                            **dict(events[-1]),
+                            "snapshot": events,
+                        })
+                    display = str(recovered.get("display") or "")
+                    bridge.assistant_stream_final.emit(
+                        projected_binding, display,
+                    )
+                    if voice_response and not (
+                        voice_cancelled is not None and voice_cancelled()
+                    ):
+                        context = resolve_turn_context(
+                            language_text or user_display_text or display,
+                            history=_history_for_conversation(conv_id),
+                            saved_language=i18n.get_language(),
+                            reference=conv_id,
+                        )
+                        if emit_voice_state is not None:
+                            emit_voice_state("speaking")
+                        speak_streaming(
+                            clean_response(display),
+                            session_id=tts_session_id,
+                            language=context.language,
+                        )
+                except Exception as presentation_error:
+                    print(
+                        "[OSIA] durable retried final projection failed: "
+                        f"{type(presentation_error).__name__}"
+                    )
+                finally:
+                    lifecycle["durable_wait"] = False
+                    _release_chat_turn(
+                        projected_binding or binding, turn_agent,
+                    )
+                    if turn_agent is not None:
+                        try:
+                            turn_agent.clear_tool_attempts()
+                        except Exception:
+                            pass
+                    _set_conversation_busy(
+                        conv_id,
+                        False,
+                        owner=projected_binding or binding,
+                    )
+                    bridge.conversations_changed.emit(
+                        active_conv["id"] if active_conv else ""
+                    )
+                return
+
+        return _start_or_run_durable_worker(
+            _retry,
+            name=f"osia-final-persist-{turn_id[-8:]}",
+        )
+
+    def _schedule_desktop_terminal_recovery_retry(
+        turn_agent,
+        lifecycle: dict,
+        *,
+        user_input,
+        conv_id: str,
+        history: list[dict],
+        turn_meta: dict,
+        voice_response: bool,
+        user_display_text: str | None,
+        language_text: str | None,
+        tts_session_id: int | None,
+        voice_cancelled,
+        emit_voice_state,
+        failed_attempt_id: str = "",
+        allow_inline_worker: bool = True,
+    ) -> bool:
+        """Retry reservation plus commit without replaying provider/tool work."""
+
+        if lifecycle.get("terminal_recovery_retry_scheduled"):
+            return True
+        turn_id = str(turn_meta.get("turn_id") or "")
+        if not turn_id:
+            return False
+        lifecycle["terminal_recovery_retry_scheduled"] = True
+        lifecycle["durable_wait"] = True
+        receipt_recorded = [not bool(str(failed_attempt_id or ""))]
+
+        def _retry() -> None:
+            delay = 0.25
+            while _is_conversation_busy(conv_id):
+                time.sleep(delay)
+                finalized = False
+                try:
+                    if not receipt_recorded[0] and turn_agent is not None:
+                        recorder = getattr(
+                            turn_agent,
+                            "record_failed_tool_continuation_receipt",
+                            None,
+                        )
+                        if callable(recorder):
+                            receipt_recorded[0] = bool(
+                                recorder(str(failed_attempt_id or ""))
+                            )
+                    finalized = _finalize_failed_desktop_turn(
+                        turn_agent,
+                        lifecycle,
+                        user_input=user_input,
+                        conv_id=conv_id,
+                        history=history,
+                        turn_meta=turn_meta,
+                        voice_response=voice_response,
+                        user_display_text=user_display_text,
+                        language_text=language_text,
+                        tts_session_id=tts_session_id,
+                        voice_cancelled=voice_cancelled,
+                        emit_voice_state=emit_voice_state,
+                    )
+                except Exception as recovery_error:
+                    print(
+                        "[OSIA] durable terminal reservation retry failed: "
+                        f"{type(recovery_error).__name__}"
+                    )
+                if not finalized:
+                    delay = min(30.0, delay * 2.0)
+                    continue
+                lifecycle["durable_wait"] = False
+                binding = dict(lifecycle.get("binding") or turn_meta)
+                if turn_agent is not None:
+                    _release_chat_turn(binding, turn_agent)
+                    try:
+                        turn_agent.clear_tool_attempts()
+                    except Exception:
+                        pass
+                _set_conversation_busy(conv_id, False, owner=binding)
+                bridge.conversations_changed.emit(
+                    active_conv["id"] if active_conv else ""
+                )
+                return
+
+        return _start_or_run_durable_worker(
+            _retry,
+            name=f"osia-terminal-recovery-{turn_id[-8:]}",
+            allow_inline=allow_inline_worker,
+        )
+
+    def _run_agent_impl(
+        turn_agent,
+        lifecycle: dict,
         user_input,
         conv_id: str,
         history: list[dict],
@@ -1649,7 +2829,6 @@ def wake_mode():
         sentences are streamed to TTS as they arrive.
         """
         nonlocal active_conv
-        turn_agent = OSIAAgent()
         if lock_provider:
             # Attachment capability was preflighted against this selected path;
             # automatic hierarchy routing must not silently swap it mid-turn.
@@ -1659,7 +2838,42 @@ def wake_mode():
         settings = load_settings()
         selected_model = settings.get("selected_model")
         selected_provider = settings.get("selected_model_provider") or None
-        if selected_model and not (
+        pinned_provider = str(
+            turn_meta.get("_pinned_provider_id") or ""
+        ).strip().lower()
+        pinned_model = str(turn_meta.get("_pinned_model_id") or "").strip()
+        pinned_reasoning = str(
+            turn_meta.get("_pinned_effective_reasoning") or ""
+        ).strip().lower()
+        pinned_route = bool(pinned_provider or pinned_model or pinned_reasoning)
+        if pinned_route and not all(
+            (pinned_provider, pinned_model, pinned_reasoning)
+        ):
+            raise RuntimeError("incomplete persisted desktop Chat route")
+        if pinned_route:
+            from osia.models import PROVIDERS
+            from osia.reasoning import resolve_reasoning_option_id
+
+            if pinned_provider not in PROVIDERS:
+                raise RuntimeError("persisted desktop Chat provider unavailable")
+            turn_agent.set_model(pinned_model, provider=pinned_provider)
+            if (
+                turn_agent.provider != pinned_provider
+                or turn_agent.model != pinned_model
+            ):
+                raise RuntimeError("persisted desktop Chat route not restored")
+            if resolve_reasoning_option_id(
+                pinned_provider,
+                pinned_model,
+                settings={
+                    "default": pinned_reasoning,
+                    "providers": {},
+                    "models": {},
+                },
+            ) != pinned_reasoning:
+                raise RuntimeError("persisted desktop Chat reasoning unavailable")
+            turn_agent._reasoning_override_for_turn = pinned_reasoning
+        elif selected_model and not (
             turn_directives is not None
             and turn_directives.model_override is not None
         ):
@@ -1685,25 +2899,33 @@ def wake_mode():
             saved_language=i18n.get_language(),
             reference=conv_id,
         )
-        turn_agent._chat_autonomous_context = {
-            "launcher": _launch_server_autonomous_from_chat,
-            "original_user_text": str(authoritative_text or ""),
-            "provider_input": user_input,
-            "history": history,
+        turn_binding = {
             "conversation_id": conv_id,
-            "request_id": str(turn_meta.get("turn_id") or ""),
-            "source_request_id": str(turn_meta.get("request_id") or ""),
-            "source_turn_id": str(turn_meta.get("turn_id") or ""),
-            "source_assistant_message_id": str(
+            "request_id": str(turn_meta.get("request_id") or ""),
+            "turn_id": str(turn_meta.get("turn_id") or ""),
+            "run_id": str(
+                turn_meta.get("run_id") or turn_meta.get("turn_id") or ""
+            ),
+            "assistant_message_id": str(
                 turn_meta.get("assistant_message_id") or ""
             ),
-            "origin_ref": "desktop",
-            "device_id": "",
-            "turn_context": turn_context,
+            "provider_id": str(getattr(turn_agent, "provider", "") or ""),
+            "model_id": str(getattr(turn_agent, "model", "") or ""),
+            "effective_reasoning": pinned_reasoning,
         }
-
+        if any(
+            str(turn_meta.get(key) or "") != str(turn_binding.get(key) or "")
+            for key in (
+                "conversation_id", "request_id", "turn_id", "run_id",
+                "provider_id", "model_id", "effective_reasoning",
+            )
+        ):
+            raise RuntimeError("desktop Chat route changed after acceptance")
+        lifecycle["binding"] = dict(turn_binding)
         prev_history_len = len(history)
         suspended_tool_turn = [False]
+        canonical_committed = [False]
+        canonical_projected = [False]
 
         def _voice_tts_allowed() -> bool:
             return voice_response and not (
@@ -1716,10 +2938,25 @@ def wake_mode():
             return None
 
         def on_stream_sentence(sentence: str) -> None:
-            bridge.assistant_stream_chunk.emit(conv_id, sentence)
+            # The agent's live callback is sentence-oriented and intentionally
+            # normalizes whitespace for speech. It is not a lossless Markdown
+            # transport. The canonical final is revealed progressively by the
+            # presentation-only UI buffer once terminality is verified.
+            del sentence
+
+        def on_execution_trace(frame: dict) -> None:
+            if isinstance(frame, dict) and frame.get("type") == "execution_trace":
+                bridge.execution_trace.emit(dict(frame))
 
         def on_tool_attempt_status(status: str, attempt_id: str) -> None:
             del attempt_id
+            cancellation_committed = getattr(
+                turn_agent, "turn_cancellation_committed", None,
+            )
+            if callable(cancellation_committed) and cancellation_committed(
+                str(turn_meta.get("turn_id") or "")
+            ):
+                return
             print(f"[OSIA] normal chat tool status: {status}")
             safe_status = {
                 "action_starting": "action_starting",
@@ -1730,7 +2967,7 @@ def wake_mode():
                 "cancellation_requested": "cancellation_requested",
                 "blocked_unknown_effect": "blocked_unknown_effect",
             }.get(str(status), "action_in_progress")
-            bridge.tool_attempt_status.emit(conv_id, safe_status)
+            bridge.tool_attempt_status.emit(dict(turn_binding), safe_status)
             bridge.island_state.emit("thinking")
 
         def on_tool_attempt_final(
@@ -1738,6 +2975,7 @@ def wake_mode():
             final_text: str,
             error,
         ) -> bool:
+            canonical_committed = False
             try:
                 terminal = _terminality_result(
                     turn_agent,
@@ -1745,71 +2983,126 @@ def wake_mode():
                     final_text,
                 )
                 if not terminal:
-                    print(
-                        "[TERMINALITY] desktop pending callback held without "
-                        "a verified terminal reservation"
+                    receipt_recorded = False
+                    recorder = getattr(
+                        turn_agent,
+                        "record_failed_tool_continuation_receipt",
+                        None,
                     )
-                    return False
+                    if callable(recorder):
+                        try:
+                            receipt_recorded = bool(recorder(attempt_id))
+                        except Exception:
+                            receipt_recorded = False
+                    try:
+                        finalized = _finalize_failed_desktop_turn(
+                            turn_agent,
+                            lifecycle,
+                            user_input=user_input,
+                            conv_id=conv_id,
+                            history=history,
+                            turn_meta=turn_meta,
+                            voice_response=voice_response,
+                            user_display_text=user_display_text,
+                            language_text=language_text,
+                            tts_session_id=tts_session_id,
+                            voice_cancelled=voice_cancelled,
+                            emit_voice_state=emit_voice_state,
+                        )
+                    except Exception:
+                        finalized = False
+                    if finalized:
+                        canonical_committed = True
+                        return True
+                    print(
+                        "[TERMINALITY] desktop pending continuation retained; "
+                        "durable terminal reservation retry scheduled"
+                    )
+                    return _schedule_desktop_terminal_recovery_retry(
+                        turn_agent,
+                        lifecycle,
+                        user_input=user_input,
+                        conv_id=conv_id,
+                        history=history,
+                        turn_meta=turn_meta,
+                        voice_response=voice_response,
+                        user_display_text=user_display_text,
+                        language_text=language_text,
+                        tts_session_id=tts_session_id,
+                        voice_cancelled=voice_cancelled,
+                        emit_voice_state=emit_voice_state,
+                        failed_attempt_id=(
+                            "" if receipt_recorded else str(attempt_id or "")
+                        ),
+                    )
+                if terminal.get("terminal_state") == "user_cancelled":
+                    canonical_committed = True
+                    return True
                 if error is not None:
                     final_text = str(terminal.get("final_text") or final_text or "")
-                _persist_agent_delta(
+                if not _persist_agent_delta(
                     conv_id,
                     turn_agent,
                     prev_history_len,
                     user_display_text=user_display_text,
                     turn_meta=turn_meta,
-                )
-                display = clean_response(final_text or "")
-                if error is None:
-                    bridge.assistant_stream_final.emit(conv_id, display)
-                else:
-                    bridge.assistant_stream_error.emit(conv_id, display)
-                if _voice_tts_allowed():
-                    if emit_voice_state is not None:
-                        emit_voice_state("speaking")
+                ):
+                    print(
+                        "[TERMINALITY] desktop pending final retained until "
+                        "canonical persistence succeeds"
+                    )
+                    return _schedule_desktop_final_persistence_retry(
+                        turn_agent,
+                        lifecycle,
+                        conv_id=conv_id,
+                        turn_meta=turn_meta,
+                        voice_response=voice_response,
+                        language_text=language_text,
+                        user_display_text=user_display_text,
+                        tts_session_id=tts_session_id,
+                        voice_cancelled=voice_cancelled,
+                        emit_voice_state=emit_voice_state,
+                    )
+                canonical_committed = True
+                try:
+                    display = strip_tool_artifacts(final_text or "")
+                    if error is None:
+                        bridge.assistant_stream_final.emit(
+                            dict(turn_binding), display,
+                        )
                     else:
-                        bridge.island_state.emit("speaking")
-                    speak_streaming(
-                        display,
-                        session_id=tts_session_id,
-                        language=turn_context.language,
+                        bridge.assistant_stream_error.emit(
+                            dict(turn_binding), display,
+                        )
+                    if _voice_tts_allowed():
+                        if emit_voice_state is not None:
+                            emit_voice_state("speaking")
+                        else:
+                            bridge.island_state.emit("speaking")
+                        speak_streaming(
+                            clean_response(display),
+                            session_id=tts_session_id,
+                            language=turn_context.language,
+                        )
+                except Exception as presentation_error:
+                    print(
+                        "[OSIA] durable pending final projection failed: "
+                        f"{type(presentation_error).__name__}"
                     )
                 return True
             finally:
-                turn_agent.clear_tool_attempts()
-                _set_conversation_busy(conv_id, False)
-                bridge.conversations_changed.emit(
-                    active_conv["id"] if active_conv else ""
-                )
-
-        def _bind_chat_durable(result: dict, request: dict) -> bool:
-            return turn_agent.bind_chat_durable_execution(
-                result,
-                request,
-                cancel_callback=_cancel_server_autonomous_from_chat,
-            )
-
-        def _chat_durable_progress(payload: dict) -> None:
-            status = str(payload.get("status") or "executing")
-            attempt_status = {
-                "planning": "action_starting",
-                "executing": "action_in_progress",
-                "waiting": "waiting_tool_result",
-                "verifying": "verifying_tool_result",
-                "recovering": "resuming_tool_turn",
-                "cancelled": "cancellation_requested",
-                "blocked": "blocked_unknown_effect",
-            }.get(status, "action_in_progress")
-            on_tool_attempt_status(
-                attempt_status,
-                str(payload.get("run_id") or "durable_chat"),
-            )
-
-        turn_agent._chat_autonomous_context.update({
-            "waiter": _wait_server_autonomous_from_chat,
-            "bind_execution": _bind_chat_durable,
-            "progress_callback": _chat_durable_progress,
-        })
+                if canonical_committed:
+                    _release_chat_turn(turn_binding, turn_agent)
+                    try:
+                        turn_agent.clear_tool_attempts()
+                    except Exception:
+                        pass
+                    _set_conversation_busy(
+                        conv_id, False, owner=turn_binding,
+                    )
+                    bridge.conversations_changed.emit(
+                        active_conv["id"] if active_conv else ""
+                    )
 
         turn_agent.configure_tool_attempts(
             conversation_id=conv_id,
@@ -1822,7 +3115,50 @@ def wake_mode():
             final_callback=on_tool_attempt_final,
             on_sentence=on_stream_sentence,
             on_first_token=on_first_token,
+            existing_attempt_id=str(
+                turn_meta.get("_existing_tool_attempt_id") or ""
+            ),
         )
+        configure_trace = getattr(turn_agent, "configure_execution_trace", None)
+        if callable(configure_trace):
+            configure_trace(
+                conversation_id=conv_id,
+                request_id=str(turn_meta.get("request_id") or ""),
+                turn_id=str(turn_meta.get("turn_id") or ""),
+                run_id=str(
+                    turn_meta.get("run_id") or turn_meta.get("turn_id") or ""
+                ),
+                provider_id=str(getattr(turn_agent, "provider", "") or ""),
+                model_id=str(getattr(turn_agent, "model", "") or ""),
+                effective_reasoning=pinned_reasoning,
+                callback=on_execution_trace,
+            )
+            trace_binding = turn_agent.execution_trace_binding(
+                str(turn_meta.get("turn_id") or "")
+            )
+            if isinstance(trace_binding, dict):
+                turn_binding.update(trace_binding)
+                turn_meta.update({
+                    key: str(trace_binding.get(key) or "")
+                    for key in (
+                        "conversation_id", "request_id", "turn_id", "run_id",
+                        "provider_id", "model_id", "effective_reasoning",
+                    )
+                })
+                lifecycle["binding"] = dict(turn_binding)
+
+        configure_intent = getattr(
+            turn_agent, "configure_turn_terminality_intent", None,
+        )
+        if callable(configure_intent):
+            configure_intent(
+                objective=str(turn_meta.get("_terminality_objective") or ""),
+                execution_binding=turn_binding,
+            )
+
+        _register_chat_turn(turn_binding, turn_agent)
+        lifecycle["registered"] = True
+        bridge.chat_turn_started.emit(dict(turn_binding))
 
         try:
             if voice_response:
@@ -1836,10 +3172,14 @@ def wake_mode():
                     "[TTS] main.wake_mode: TTS disabled for this turn (text-only)",
                     flush=True,
                 )
+            lifecycle["provider_started"] = True
             reply = _run_turn_to_terminality(
                 turn_agent,
                 user_input,
                 turn_id=str(turn_meta.get("turn_id") or ""),
+                semantic_objective=str(
+                    turn_meta.get("_terminality_objective") or ""
+                ),
                 history=history,
                 on_sentence=on_stream_sentence,
                 on_first_token=on_first_token,
@@ -1849,78 +3189,743 @@ def wake_mode():
             from osia.tool_attempts import WAITING_TOOL_RESULT
 
             if reply == WAITING_TOOL_RESULT:
-                suspended_tool_turn[0] = True
                 bridge.island_state.emit("thinking")
                 if not turn_agent.activate_pending_tool_attempt():
                     raise RuntimeError("pending tool attempt could not be activated")
+                suspended_tool_turn[0] = True
+                lifecycle["durable_wait"] = True
                 return
-            if not _terminality_result(
+            terminal = _terminality_result(
                 turn_agent,
                 str(turn_meta.get("turn_id") or ""),
                 reply,
-            ):
+            )
+            if not terminal:
                 raise RuntimeError(
                     "agent returned without a verified terminal reservation"
                 )
+            if terminal.get("terminal_state") == "user_cancelled":
+                canonical_committed[0] = True
+                return
             if voice_response:
                 print(
                     f"[TTS] main.wake_mode: agent.run() returned "
                     f"({len(reply or '')} chars) — sentences were streamed during the run",
                     flush=True,
                 )
-            _persist_agent_delta(
+            if not _persist_agent_delta(
                 conv_id,
                 turn_agent,
                 prev_history_len,
                 user_display_text=user_display_text,
                 turn_meta=turn_meta,
-            )
-            display = clean_response(reply or "")
-            bridge.assistant_stream_final.emit(conv_id, display)
+            ):
+                print(
+                    "[TERMINALITY] desktop final retained until canonical "
+                    "persistence succeeds"
+                )
+                _schedule_desktop_final_persistence_retry(
+                    turn_agent,
+                    lifecycle,
+                    conv_id=conv_id,
+                    turn_meta=turn_meta,
+                    voice_response=voice_response,
+                    language_text=language_text,
+                    user_display_text=user_display_text,
+                    tts_session_id=tts_session_id,
+                    voice_cancelled=voice_cancelled,
+                    emit_voice_state=emit_voice_state,
+                )
+                return
+            canonical_committed[0] = True
+            display = strip_tool_artifacts(reply or "")
+            bridge.assistant_stream_final.emit(dict(turn_binding), display)
+            canonical_projected[0] = True
             if _voice_tts_allowed():
                 if emit_voice_state is not None:
                     emit_voice_state("speaking")
                 else:
                     bridge.island_state.emit("speaking")
                 speak_streaming(
-                    display,
+                    clean_response(display),
                     session_id=tts_session_id,
                     language=turn_context.language,
                 )
         except Exception as e:
+            if canonical_committed[0]:
+                if not canonical_projected[0]:
+                    display = strip_tool_artifacts(reply or "")
+                    bridge.assistant_stream_final.emit(
+                        dict(turn_binding), display,
+                    )
+                    canonical_projected[0] = True
+                return
             terminal = _terminality_result(
                 turn_agent,
                 str(turn_meta.get("turn_id") or ""),
             )
             if not terminal:
-                suspended_tool_turn[0] = True
-                print(
-                    "[TERMINALITY] desktop turn retained after a non-terminal "
-                    f"error: {type(e).__name__}"
-                )
+                if lifecycle.get("durable_wait"):
+                    return
+                raise
+            if terminal.get("terminal_state") == "user_cancelled":
+                canonical_committed[0] = True
                 return
-            display = clean_response(str(terminal.get("final_text") or ""))
-            _persist_agent_delta(
+            display = strip_tool_artifacts(
+                str(terminal.get("final_text") or "")
+            )
+            if not _persist_agent_delta(
                 conv_id,
                 turn_agent,
                 prev_history_len,
                 user_display_text=user_display_text,
                 turn_meta=turn_meta,
-            )
-            bridge.assistant_stream_final.emit(conv_id, display)
+            ):
+                print(
+                    "[TERMINALITY] desktop recovered final retained until "
+                    "canonical persistence succeeds"
+                )
+                _schedule_desktop_final_persistence_retry(
+                    turn_agent,
+                    lifecycle,
+                    conv_id=conv_id,
+                    turn_meta=turn_meta,
+                    voice_response=voice_response,
+                    language_text=language_text,
+                    user_display_text=user_display_text,
+                    tts_session_id=tts_session_id,
+                    voice_cancelled=voice_cancelled,
+                    emit_voice_state=emit_voice_state,
+                )
+                return
+            bridge.assistant_stream_final.emit(dict(turn_binding), display)
             if _voice_tts_allowed():
                 speak_streaming(
-                    display,
+                    clean_response(display),
                     session_id=tts_session_id,
                     language=turn_context.language,
                 )
             return
         finally:
-            if not suspended_tool_turn[0]:
-                turn_agent.clear_tool_attempts()
-                _set_conversation_busy(conv_id, False)
+            if (
+                not suspended_tool_turn[0]
+                and not lifecycle.get("durable_wait")
+            ):
+                _release_chat_turn(turn_binding, turn_agent)
+                try:
+                    turn_agent.clear_tool_attempts()
+                except Exception:
+                    pass
+                _set_conversation_busy(
+                    conv_id, False, owner=turn_binding,
+                )
                 bridge.conversations_changed.emit(
                     active_conv["id"] if active_conv else ""
+                )
+
+    def _finalize_failed_desktop_turn(
+        turn_agent,
+        lifecycle: dict,
+        *,
+        user_input,
+        conv_id: str,
+        history: list[dict],
+        turn_meta: dict,
+        voice_response: bool,
+        user_display_text: str | None,
+        language_text: str | None,
+        tts_session_id: int | None,
+        voice_cancelled,
+        emit_voice_state,
+    ) -> bool:
+        """Reserve one safe setup failure or project an existing final receipt."""
+
+        from osia.turn_terminality import (
+            TerminalState,
+            TurnTerminalityController,
+            live_process_identity,
+            load_persisted_execution_binding,
+            load_persisted_terminal_result,
+        )
+
+        turn_id = str(turn_meta.get("turn_id") or "")
+        run_id = str(turn_meta.get("run_id") or turn_id)
+        objective = str(
+            turn_meta.get("_terminality_objective")
+            or language_text
+            or user_display_text
+            or (user_input if isinstance(user_input, str) else "")
+        ).strip()
+        if not all((turn_id, run_id, objective)):
+            return False
+
+        binding = load_persisted_execution_binding(turn_id)
+        if binding is None and turn_agent is not None:
+            trace_getter = getattr(turn_agent, "execution_trace_binding", None)
+            if callable(trace_getter):
+                try:
+                    binding = trace_getter(turn_id)
+                except Exception:
+                    binding = None
+        if binding is None and turn_agent is not None:
+            configure_trace = getattr(turn_agent, "configure_execution_trace", None)
+            if callable(configure_trace):
+                try:
+                    configure_trace(
+                        conversation_id=conv_id,
+                        request_id=str(turn_meta.get("request_id") or ""),
+                        turn_id=turn_id,
+                        run_id=run_id,
+                        provider_id=str(
+                            turn_meta.get("_pinned_provider_id")
+                            or getattr(turn_agent, "provider", "")
+                            or ""
+                        ),
+                        model_id=str(
+                            turn_meta.get("_pinned_model_id")
+                            or getattr(turn_agent, "model", "")
+                            or ""
+                        ),
+                        effective_reasoning=str(
+                            turn_meta.get("_pinned_effective_reasoning") or ""
+                        ),
+                    )
+                    binding = turn_agent.execution_trace_binding(turn_id)
+                except Exception:
+                    binding = None
+        expected = {
+            "conversation_id": conv_id,
+            "request_id": str(turn_meta.get("request_id") or ""),
+            "turn_id": turn_id,
+            "run_id": run_id,
+        }
+        if binding is None:
+            binding = {
+                **expected,
+                "provider_id": str(
+                    turn_meta.get("provider_id")
+                    or turn_meta.get("_pinned_provider_id")
+                    or ""
+                ),
+                "model_id": str(
+                    turn_meta.get("model_id")
+                    or turn_meta.get("_pinned_model_id")
+                    or ""
+                ),
+                "effective_reasoning": str(
+                    turn_meta.get("effective_reasoning")
+                    or turn_meta.get("_pinned_effective_reasoning")
+                    or ""
+                ),
+            }
+        if not isinstance(binding, dict) or any(
+            str(binding.get(key) or "") != value
+            for key, value in expected.items()
+        ) or any(
+            not str(binding.get(key) or "")
+            for key in ("provider_id", "model_id", "effective_reasoning")
+        ):
+            return False
+
+        persisted = load_persisted_terminal_result(turn_id)
+        if persisted is None:
+            controller = getattr(turn_agent, "_terminality_controller", None)
+            if controller is None:
+                try:
+                    from osia.execution_strategy import derive_semantic_mission
+                    from osia.goal_contract import (
+                        goal_contract_from_dict,
+                        goal_contract_from_semantic_mission,
+                    )
+
+                    controller = TurnTerminalityController(
+                        turn_id=turn_id,
+                        objective=objective,
+                        execution_required=True,
+                    )
+                    controller_snapshot = controller.snapshot()
+                    persisted_contract = controller_snapshot.get("goal_contract")
+                    contract = (
+                        goal_contract_from_dict(persisted_contract)
+                        if isinstance(persisted_contract, dict)
+                        and persisted_contract else
+                        goal_contract_from_semantic_mission(
+                            derive_semantic_mission(objective),
+                            execution_binding=binding,
+                        )
+                    )
+                    controller.set_execution_binding(binding)
+                    controller.set_goal_contract(contract)
+                except Exception:
+                    return False
+            snapshot = controller.snapshot()
+            invocations = snapshot.get("invocations") or []
+            active_invocations = [
+                item for item in invocations
+                if isinstance(item, dict) and item.get("status") == "active"
+            ]
+            if active_invocations:
+                owns_controller = bool(
+                    turn_agent is not None
+                    and controller
+                    is getattr(turn_agent, "_terminality_controller", None)
+                    and str(getattr(controller, "turn_id", "") or "")
+                    == turn_id
+                )
+                _alive, current_identity = live_process_identity(os.getpid())
+                if not owns_controller or any(
+                    item.get("owner_pid") not in (None, os.getpid())
+                    or (
+                        str(item.get("owner_process_identity") or "")
+                        and current_identity
+                        and str(item.get("owner_process_identity") or "")
+                        != current_identity
+                    )
+                    for item in active_invocations
+                ):
+                    return False
+                for item in active_invocations:
+                    invocation_id = str(item.get("invocation_id") or "")
+                    if not invocation_id:
+                        continue
+                    controller.record_provider_invocation_completed(
+                        invocation_id,
+                        native_status="failed",
+                    )
+                    controller.record_typed_evidence(
+                        outcome="failed_before_effect",
+                        evidence="desktop_turn_worker_failed",
+                        reason_code="durable_turn_setup_failed",
+                    )
+                snapshot = controller.snapshot()
+            if (
+                snapshot.get("active_attempts")
+                or snapshot.get("permission_state") == "pending"
+                or any(
+                    isinstance(item, dict) and item.get("status") == "active"
+                    for item in snapshot.get("invocations") or []
+                )
+            ):
+                return False
+            controller.set_strategy_frontier(())
+            context = resolve_turn_context(
+                language_text or user_display_text or objective,
+                history=history,
+                saved_language=i18n.get_language(),
+                reference=conv_id,
+            )
+            cancellation = snapshot.get("cancellation") or {}
+            hard_safety_reason = str(
+                snapshot.get("hard_safety_reason") or ""
+            )
+            if (
+                cancellation.get("requested")
+                and not cancellation.get("effect_possible")
+                and not snapshot.get("unknown_effects")
+            ):
+                terminal_state = TerminalState.USER_CANCELLED.value
+                reason_code = "authoritative_user_cancellation"
+                final_text = localized_text(
+                    "autonomous.status_cancelled_proven", context.language,
+                )
+            elif (
+                cancellation.get("requested")
+                and snapshot.get("unknown_effects")
+            ):
+                terminal_state = TerminalState.BLOCKED_VERIFIED.value
+                reason_code = "durable_outcome_unknown"
+                final_text = localized_text(
+                    "autonomous.status_outcome_unknown", context.language,
+                )
+            elif hard_safety_reason:
+                terminal_state = TerminalState.HARD_SAFETY_BLOCK.value
+                reason_code = hard_safety_reason
+                final_text = (
+                    "Cette action est bloquée par une barrière de sécurité "
+                    "absolue."
+                    if context.language == "fr" else
+                    "This action is blocked by an absolute safety barrier."
+                )
+            elif snapshot.get("unknown_effects"):
+                terminal_state = TerminalState.BLOCKED_VERIFIED.value
+                reason_code = "durable_outcome_unknown"
+                final_text = localized_text(
+                    "autonomous.status_outcome_unknown", context.language,
+                )
+            else:
+                terminal_state = TerminalState.BLOCKED_VERIFIED.value
+                reason_code = "durable_turn_setup_failed"
+                final_text = localized_text(
+                    "provider_failure", context.language,
+                )
+            controller.reserve_final(
+                terminal_state,
+                reason_code=reason_code,
+                provider_route=(
+                    f"{binding['provider_id']}:{binding['model_id']}"
+                ),
+                final_text=final_text,
+            )
+            persisted = load_persisted_terminal_result(turn_id)
+        if not isinstance(persisted, dict):
+            return False
+
+        recovered = _persist_desktop_reserved_final({
+            "persisted_terminal": persisted,
+            "turn_meta": turn_meta,
+        })
+        if not isinstance(recovered, dict):
+            return False
+        projected_binding = dict(recovered["binding"])
+        bridge.chat_turn_started.emit(projected_binding)
+        events = list((recovered.get("trace") or {}).get("events") or [])
+        if events:
+            bridge.execution_trace.emit({
+                "type": "execution_trace",
+                **dict(events[-1]),
+                "snapshot": events,
+            })
+        display = str(recovered.get("display") or "")
+        bridge.assistant_stream_final.emit(projected_binding, display)
+        if voice_response and not (
+            voice_cancelled is not None and voice_cancelled()
+        ):
+            context = resolve_turn_context(
+                language_text or user_display_text or objective,
+                history=history,
+                saved_language=i18n.get_language(),
+                reference=conv_id,
+            )
+            if emit_voice_state is not None:
+                emit_voice_state("speaking")
+            speak_streaming(
+                clean_response(display),
+                session_id=tts_session_id,
+                language=context.language,
+            )
+        return True
+
+    def _finalize_desktop_worker_start_failure(
+        *,
+        user_input,
+        conv_id: str,
+        history: list[dict],
+        turn_meta: dict,
+        user_display_text: str | None,
+        language_text: str | None,
+    ) -> None:
+        """Close one accepted desktop turn when its provider worker cannot start."""
+
+        lifecycle = {
+            "binding": {
+                key: str(
+                    turn_meta.get(key)
+                    or turn_meta.get("_pinned_" + key)
+                    or ""
+                )
+                for key in (
+                    "conversation_id", "request_id", "turn_id", "run_id",
+                    "provider_id", "model_id", "effective_reasoning",
+                )
+            },
+            "registered": False,
+            "provider_started": False,
+            "durable_wait": False,
+        }
+        try:
+            finalized = _finalize_failed_desktop_turn(
+                None,
+                lifecycle,
+                user_input=user_input,
+                conv_id=conv_id,
+                history=history,
+                turn_meta=turn_meta,
+                voice_response=False,
+                user_display_text=user_display_text,
+                language_text=language_text,
+                tts_session_id=None,
+                voice_cancelled=None,
+                emit_voice_state=None,
+            )
+        except Exception as recovery_error:
+            print(
+                "[OSIA] desktop worker-start finalization deferred: "
+                f"{type(recovery_error).__name__}"
+            )
+            finalized = False
+        if not finalized:
+            if _schedule_desktop_terminal_recovery_retry(
+                None,
+                lifecycle,
+                user_input=user_input,
+                conv_id=conv_id,
+                history=history,
+                turn_meta=turn_meta,
+                voice_response=False,
+                user_display_text=user_display_text,
+                language_text=language_text,
+                tts_session_id=None,
+                voice_cancelled=None,
+                emit_voice_state=None,
+                allow_inline_worker=False,
+            ):
+                return
+            print(
+                "[OSIA] desktop worker-start failure remains durably recoverable"
+            )
+            return
+        _set_conversation_busy(conv_id, False, owner=turn_meta)
+        bridge.conversations_changed.emit(
+            active_conv["id"] if active_conv else ""
+        )
+
+    def _run_agent(
+        user_input,
+        conv_id: str,
+        history: list[dict],
+        *,
+        turn_meta: dict,
+        voice_response: bool,
+        user_display_text: str | None = None,
+        language_text: str | None = None,
+        lock_provider: bool = False,
+        tts_session_id: int | None = None,
+        voice_cancelled=None,
+        emit_voice_state=None,
+        turn_directives=None,
+    ) -> None:
+        lifecycle = {
+            "binding": {},
+            "registered": False,
+            "provider_started": False,
+            "durable_wait": False,
+        }
+        turn_agent = None
+        try:
+            turn_agent = OSIAAgent()
+            _run_agent_impl(
+                turn_agent,
+                lifecycle,
+                user_input,
+                conv_id,
+                history,
+                turn_meta=turn_meta,
+                voice_response=voice_response,
+                user_display_text=user_display_text,
+                language_text=language_text,
+                lock_provider=lock_provider,
+                tts_session_id=tts_session_id,
+                voice_cancelled=voice_cancelled,
+                emit_voice_state=emit_voice_state,
+                turn_directives=turn_directives,
+            )
+            return
+        except Exception as exc:
+            print(
+                "[OSIA] desktop Chat lifecycle failed closed: "
+                f"{type(exc).__name__}"
+            )
+            finalized = False
+            try:
+                finalized = _finalize_failed_desktop_turn(
+                    turn_agent,
+                    lifecycle,
+                    user_input=user_input,
+                    conv_id=conv_id,
+                    history=history,
+                    turn_meta=turn_meta,
+                    voice_response=voice_response,
+                    user_display_text=user_display_text,
+                    language_text=language_text,
+                    tts_session_id=tts_session_id,
+                    voice_cancelled=voice_cancelled,
+                    emit_voice_state=emit_voice_state,
+                )
+            except Exception as recovery_exc:
+                print(
+                    "[OSIA] desktop Chat terminal recovery failed closed: "
+                    f"{type(recovery_exc).__name__}"
+                )
+            if not finalized:
+                _schedule_desktop_terminal_recovery_retry(
+                    turn_agent,
+                    lifecycle,
+                    user_input=user_input,
+                    conv_id=conv_id,
+                    history=history,
+                    turn_meta=turn_meta,
+                    voice_response=voice_response,
+                    user_display_text=user_display_text,
+                    language_text=language_text,
+                    tts_session_id=tts_session_id,
+                    voice_cancelled=voice_cancelled,
+                    emit_voice_state=emit_voice_state,
+                )
+                return
+        binding = dict(lifecycle.get("binding") or {})
+        if turn_agent is not None:
+            _release_chat_turn(binding, turn_agent)
+            try:
+                turn_agent.clear_tool_attempts()
+            except Exception:
+                pass
+        _set_conversation_busy(conv_id, False, owner=binding or turn_meta)
+        bridge.conversations_changed.emit(active_conv["id"] if active_conv else "")
+
+    def _restore_incomplete_desktop_chat_turns() -> None:
+        """Reattach exact durable Chat state; never replay by recency."""
+
+        try:
+            candidates = _incomplete_desktop_chat_turns()
+        except Exception as exc:
+            print(
+                "[OSIA] desktop Chat recovery inventory unavailable: "
+                f"{type(exc).__name__}"
+            )
+            return
+        for candidate in candidates:
+            conv_id = str(candidate.get("conversation_id") or "")
+            turn_meta = dict(candidate.get("turn_meta") or {})
+            if not conv_id or _is_conversation_busy(conv_id):
+                continue
+            _set_conversation_busy(conv_id, True, owner=turn_meta)
+
+            if candidate.get("needs_terminal_reservation") is True:
+                lifecycle = {
+                    "binding": dict(turn_meta),
+                    "registered": False,
+                    "provider_started": False,
+                    "durable_wait": True,
+                }
+                _schedule_desktop_terminal_recovery_retry(
+                    None,
+                    lifecycle,
+                    user_input=str(candidate.get("objective") or ""),
+                    conv_id=conv_id,
+                    history=list(candidate.get("history") or []),
+                    turn_meta=turn_meta,
+                    voice_response=False,
+                    user_display_text=str(candidate.get("objective") or ""),
+                    language_text=str(candidate.get("objective") or ""),
+                    tts_session_id=None,
+                    voice_cancelled=None,
+                    emit_voice_state=None,
+                    allow_inline_worker=False,
+                )
+                continue
+
+            if isinstance(candidate.get("persisted_terminal"), dict):
+                def _project_reserved(
+                    exact_candidate=dict(candidate), exact_conv_id=conv_id,
+                ) -> None:
+                    durable_retry_scheduled = False
+                    try:
+                        recovered = _persist_desktop_reserved_final(exact_candidate)
+                        if not isinstance(recovered, dict):
+                            recovery_lifecycle = {
+                                "binding": dict(
+                                    exact_candidate.get("turn_meta") or {}
+                                ),
+                                "registered": False,
+                                "provider_started": False,
+                                "durable_wait": True,
+                            }
+                            durable_retry_scheduled = (
+                                _schedule_desktop_final_persistence_retry(
+                                    None,
+                                    recovery_lifecycle,
+                                    conv_id=exact_conv_id,
+                                    turn_meta=dict(
+                                        exact_candidate.get("turn_meta") or {}
+                                    ),
+                                    voice_response=False,
+                                    language_text=str(
+                                        exact_candidate.get("objective") or ""
+                                    ),
+                                    user_display_text=str(
+                                        exact_candidate.get("objective") or ""
+                                    ),
+                                    tts_session_id=None,
+                                    voice_cancelled=None,
+                                    emit_voice_state=None,
+                                    continuation_attempt_id=str(
+                                        exact_candidate.get(
+                                            "continuation_attempt_id"
+                                        ) or ""
+                                    ),
+                                )
+                            )
+                            return
+                        binding = dict(recovered["binding"])
+                        bridge.chat_turn_started.emit(binding)
+                        events = list(
+                            (recovered.get("trace") or {}).get("events") or []
+                        )
+                        if events:
+                            bridge.execution_trace.emit({
+                                "type": "execution_trace",
+                                **dict(events[-1]),
+                                "snapshot": events,
+                            })
+                        bridge.assistant_stream_final.emit(
+                            binding, str(recovered.get("display") or ""),
+                        )
+                    finally:
+                        if not durable_retry_scheduled:
+                            _set_conversation_busy(
+                                exact_conv_id,
+                                False,
+                                owner=exact_candidate.get("turn_meta") or {},
+                            )
+                            bridge.conversations_changed.emit(
+                                active_conv["id"] if active_conv else ""
+                            )
+
+                _start_or_run_durable_worker(
+                    _project_reserved,
+                    name="osia-desktop-final-recovery",
+                    allow_inline=False,
+                )
+                continue
+
+            def _resume(
+                exact_candidate=dict(candidate),
+                exact_conv_id=conv_id,
+                exact_turn_meta=turn_meta,
+            ) -> None:
+                _run_agent(
+                    str(exact_candidate.get("objective") or ""),
+                    exact_conv_id,
+                    list(exact_candidate.get("history") or []),
+                    turn_meta=exact_turn_meta,
+                    voice_response=False,
+                    user_display_text=str(
+                        exact_candidate.get("objective") or ""
+                    ),
+                    language_text=str(
+                        exact_candidate.get("objective") or ""
+                    ),
+                    turn_directives=exact_candidate.get("turn_directives"),
+                )
+
+            try:
+                threading.Thread(
+                    target=_resume,
+                    name="osia-desktop-chat-recovery",
+                    daemon=True,
+                ).start()
+            except Exception as start_error:
+                print(
+                    "[OSIA] desktop recovery worker could not start: "
+                    f"{type(start_error).__name__}"
+                )
+                _finalize_desktop_worker_start_failure(
+                    user_input=str(candidate.get("objective") or ""),
+                    conv_id=conv_id,
+                    history=list(candidate.get("history") or []),
+                    turn_meta=turn_meta,
+                    user_display_text=str(candidate.get("objective") or ""),
+                    language_text=str(candidate.get("objective") or ""),
                 )
 
     # ── Manual activation handler (voice path) ──────────────────────────
@@ -2001,7 +4006,11 @@ def wake_mode():
                 finally:
                     _finish_wake_turn()
 
-            _start_voice_worker(live_process, name="osia-live-voice")
+            _start_voice_worker(
+                live_process,
+                name="osia-live-voice",
+                on_start_failure=_finish_wake_turn,
+            )
             return
 
         if voice_shutdown_requested.is_set():
@@ -2103,7 +4112,7 @@ def wake_mode():
                         f"{type(exc).__name__}"
                     )
                     return
-                _set_conversation_busy(conv_id, True)
+                _set_conversation_busy(conv_id, True, owner=turn_meta)
                 _emit_voice_state("thinking")
                 bridge.chat_message_for_conversation.emit(conv_id, "user", user_text)
                 _run_agent(user_text, conv_id, history,
@@ -2116,7 +4125,11 @@ def wake_mode():
             finally:
                 _finish_wake_turn()
 
-        _start_voice_worker(process, name="osia-voice-turn")
+        _start_voice_worker(
+            process,
+            name="osia-voice-turn",
+            on_start_failure=_finish_wake_turn,
+        )
 
     # ── Text handler (typed message in popup) ────────────────────────────
 
@@ -2162,6 +4175,7 @@ def wake_mode():
                 conv_id,
                 display_text,
                 metadata=persistence_metadata,
+                turn_directives=turn_directives,
             )
         except Exception as exc:
             if isinstance(exc, SlashDirectiveError):
@@ -2171,7 +4185,7 @@ def wake_mode():
                 f"{type(exc).__name__}"
             )
             return False
-        _set_conversation_busy(conv_id, True)
+        _set_conversation_busy(conv_id, True, owner=turn_meta)
         bridge.chat_message_for_conversation.emit(conv_id, "user", display_text)
 
         def process():
@@ -2187,7 +4201,21 @@ def wake_mode():
                 turn_directives=turn_directives,
             )
 
-        threading.Thread(target=process, daemon=True).start()
+        try:
+            threading.Thread(target=process, daemon=True).start()
+        except Exception as start_error:
+            print(
+                "[OSIA] desktop Chat worker could not start: "
+                f"{type(start_error).__name__}"
+            )
+            _finalize_desktop_worker_start_failure(
+                user_input=user_input,
+                conv_id=conv_id,
+                history=history,
+                turn_meta=turn_meta,
+                user_display_text=display_text,
+                language_text=language_text,
+            )
         return True
 
     def handle_send_text(text: str):
@@ -2202,30 +4230,59 @@ def wake_mode():
         if active_conv and active_conv.get("id") == conv_id:
             popup.append_message(role, text)
 
-    def handle_assistant_stream_chunk(conv_id: str, text: str):
-        if active_conv and active_conv.get("id") == conv_id:
-            popup.append_assistant_stream_chunk(text)
+    def handle_chat_turn_started(binding: dict):
+        popup.begin_chat_turn(binding)
 
-    def handle_assistant_stream_final(conv_id: str, text: str):
+    def handle_assistant_stream_chunk(binding: dict, text: str):
+        conv_id = str((binding or {}).get("conversation_id") or "")
         if active_conv and active_conv.get("id") == conv_id:
-            popup.finalize_assistant_stream(text)
+            popup.append_assistant_stream_chunk(text, binding)
 
-    def handle_assistant_stream_error(conv_id: str, text: str):
+    def handle_assistant_stream_final(binding: dict, text: str):
+        conv_id = str((binding or {}).get("conversation_id") or "")
         if active_conv and active_conv.get("id") == conv_id:
-            popup.fail_assistant_stream(text)
+            popup.finalize_assistant_stream(text, binding)
+
+    def handle_assistant_stream_error(binding: dict, text: str):
+        conv_id = str((binding or {}).get("conversation_id") or "")
+        if active_conv and active_conv.get("id") == conv_id:
+            popup.fail_assistant_stream(text, binding)
 
     def handle_conversation_busy_changed(conv_id: str, busy: bool):
         popup.set_conversation_busy(conv_id, busy)
 
-    def handle_tool_attempt_status(conv_id: str, status: str):
-        popup.set_conversation_tool_status(conv_id, status)
+    def handle_tool_attempt_status(binding: dict, status: str):
+        popup.set_conversation_tool_status_for_turn(binding, status)
 
     def handle_island_state(state: str):
         island.set_state(state)
 
-    def handle_autonomous_progress(payload: dict):
-        # GUI thread (queued from the Bridge signal) — safe to touch widgets.
-        popup.update_autonomous_progress(payload)
+    def handle_chat_execution_activity(payload: dict):
+        # GUI thread (queued from workers) — the popup performs a second
+        # bounded-field validation before rendering anything.
+        if not isinstance(payload, dict):
+            return
+        if payload.get("legacy_compatibility") is True or payload.get(
+            "compatibility_mode"
+        ) == "legacy_autonomous_checkpoint":
+            return
+        if not all(str(payload.get(field) or "").strip() for field in (
+            "conversation_id", "request_id", "turn_id", "run_id",
+            "provider_id", "model_id", "effective_reasoning",
+        )):
+            return
+        if not popup.update_chat_execution_activity(payload) and not bool(
+            (payload or {}).get("terminal")
+        ):
+            popup.restore_chat_execution_activity(payload)
+
+    def handle_legacy_execution_activity(payload: dict):
+        # This projection is deliberately global to the Chat page: it never
+        # allocates a turn, assistant stream, or per-conversation busy state.
+        popup.update_legacy_execution_activity(payload)
+
+    def handle_execution_trace(payload: dict):
+        popup.update_chat_execution_activity(payload)
 
     # ── Conversation management ──────────────────────────────────────────
 
@@ -2239,8 +4296,8 @@ def wake_mode():
             revision=active_conv.get("revision", 0),
             operation_id=active_conv.get("last_operation_id", ""),
         )
-        popup.set_messages([])
         popup.refresh_conversations(active_conv["id"])
+        popup.set_messages([])
         print(f"🆕 New conversation: {active_conv['id']}")
 
     def handle_voice_new_chat():
@@ -2256,8 +4313,8 @@ def wake_mode():
             revision=active_conv.get("revision", 0),
             operation_id=active_conv.get("last_operation_id", ""),
         )
-        popup.reset_conversation()
         popup.refresh_conversations(active_conv["id"])
+        popup.reset_conversation()
         print(f"🆕 New conversation (voice): {active_conv['id']}")
 
     def handle_open_conversation(conv_id: str):
@@ -2275,27 +4332,40 @@ def wake_mode():
             if isinstance(m, dict) and m.get("role") in ("user", "assistant")
         ]
         active_conv = conv
-        popup.set_messages(msgs)
         popup.refresh_conversations(active_conv["id"])
+        popup.set_messages(msgs)
         print(f"📂 Loaded conversation: {conv_id}")
 
     def handle_delete_conversation(conv_id: str):
         nonlocal active_conv
-        _set_conversation_busy(conv_id, False)
+        if _is_conversation_busy(conv_id):
+            popup.show_conversation_busy_notice()
+            print(
+                f"Delete rejected while conversation {conv_id} is active."
+            )
+            return
+        existed_before_delete = conversations.get_conversation(conv_id) is not None
+        ok = conversations.delete_conversation(conv_id)
+        if not ok:
+            if existed_before_delete:
+                popup.show_conversation_busy_notice()
+            print(f"Delete rejected for conversation {conv_id}.")
+            popup.refresh_conversations(
+                active_conv["id"] if active_conv else None
+            )
+            return
+        _notify_mobile_conversation_changed(conv_id, action="delete")
+        popup.discard_conversation_draft(conv_id)
+        print(f"🗑  Deleted conversation {conv_id}: ok")
         if active_conv and conv_id == active_conv.get("id"):
             tts_stop()
-        ok = conversations.delete_conversation(conv_id)
-        if ok:
-            _notify_mobile_conversation_changed(conv_id, action="delete")
-            popup.discard_conversation_draft(conv_id)
-        print(f"🗑  Deleted conversation {conv_id}: {'ok' if ok else 'not found'}")
-        if active_conv and conv_id == active_conv.get("id"):
             agent.reset()
             # Do NOT auto-create a replacement — the list may go (and stay)
             # empty. A new conversation is created only when the user clicks
             # "New chat" or sends a first message.
             active_conv = None
             try:
+                popup.refresh_conversations(None)
                 popup.set_messages([])
             except RuntimeError:
                 # A chat widget was already deleted on the Qt side — the
@@ -2367,22 +4437,38 @@ def wake_mode():
                 tts_stop()
                 agent.reset()
                 active_conv = result.get("conversation") or None
+                popup.refresh_conversations(
+                    active_conv["id"] if active_conv else None
+                )
                 popup.set_messages([])
         elif action == "delete":
+            folder_id = str(request.get("folder_id") or "")
+            snapshot = conversations.conversation_snapshot()
+            deleting_ids = {
+                str(item.get("id") or "")
+                for item in snapshot.get("items") or []
+                if str(item.get("folder_id") or "") == folder_id
+            }
+            if any(_is_conversation_busy(conv_id) for conv_id in deleting_ids):
+                popup.show_conversation_busy_notice()
+                print(
+                    f"Project delete rejected while {folder_id} has active work."
+                )
+                return
             result = conversations.delete_folder_with_conversations(
-                str(request.get("folder_id") or ""),
+                folder_id,
                 request.get("expected_count"),
                 operation_id=operation_id,
             )
             if result.get("success"):
                 deleted_ids = set(result.get("deleted_ids") or [])
                 for conv_id in deleted_ids:
-                    _set_conversation_busy(conv_id, False)
                     popup.discard_conversation_draft(conv_id)
                 if active_conv and active_conv.get("id") in deleted_ids:
                     tts_stop()
                     agent.reset()
                     active_conv = None
+                    popup.refresh_conversations(None)
                     popup.set_messages([])
         else:
             return
@@ -2406,6 +4492,16 @@ def wake_mode():
 
     def handle_bulk_delete_ungrouped(expected_count: int):
         nonlocal active_conv
+        snapshot = conversations.conversation_snapshot()
+        deleting_ids = {
+            str(item.get("id") or "")
+            for item in snapshot.get("items") or []
+            if not str(item.get("folder_id") or "")
+        }
+        if any(_is_conversation_busy(conv_id) for conv_id in deleting_ids):
+            popup.show_conversation_busy_notice()
+            print("Bulk delete rejected while an ungrouped chat is active.")
+            return
         result = conversations.delete_confirmed_ungrouped_conversations(
             expected_count,
             operation_id=f"desktop_bulk_{uuid.uuid4().hex}",
@@ -2414,12 +4510,12 @@ def wake_mode():
             return
         deleted_ids = set(result.get("deleted_ids") or [])
         for conv_id in deleted_ids:
-            _set_conversation_busy(conv_id, False)
             popup.discard_conversation_draft(conv_id)
         if active_conv and active_conv.get("id") in deleted_ids:
             tts_stop()
             agent.reset()
             active_conv = None
+            popup.refresh_conversations(None)
             popup.set_messages([])
         _notify_mobile_conversation_changed(
             "",
@@ -2634,14 +4730,16 @@ def wake_mode():
     bridge.wake_detected.connect(handle_wake)
     bridge.chat_message.connect(handle_chat_message)
     bridge.chat_message_for_conversation.connect(handle_chat_message_for_conversation)
+    bridge.chat_turn_started.connect(handle_chat_turn_started)
     bridge.assistant_stream_chunk.connect(handle_assistant_stream_chunk)
     bridge.assistant_stream_final.connect(handle_assistant_stream_final)
     bridge.assistant_stream_error.connect(handle_assistant_stream_error)
     bridge.island_state.connect(handle_island_state)
     bridge.conversation_busy_changed.connect(handle_conversation_busy_changed)
     bridge.tool_attempt_status.connect(handle_tool_attempt_status)
-    bridge.autonomous_progress.connect(handle_autonomous_progress)
-    bridge.autonomous_resume_ready.connect(popup.show_autonomous)
+    bridge.chat_execution_activity.connect(handle_chat_execution_activity)
+    bridge.legacy_execution_activity.connect(handle_legacy_execution_activity)
+    bridge.execution_trace.connect(handle_execution_trace)
     bridge.remote_models_signal.connect(handle_remote_models)
     bridge.conversations_changed.connect(popup.refresh_conversations)
     bridge.new_chat.connect(handle_voice_new_chat)
@@ -2860,587 +4958,221 @@ def wake_mode():
     cron_manager.start()
     heartbeat_monitor.start()
 
-    # ── Autonomous agent (WOR-45 Phase 4) ────────────────────────────────
-    # A DEDICATED agent (never shared with the chat) drives the orchestrator;
-    # the planner + orchestrator + state layer are consumed as black boxes. The
-    # engine is created but NOT started — it runs only on an explicit "Start"
-    # from the panel, or on a user-confirmed "Resume" at startup (below). The
-    # popup signal handlers below reference `orchestrator` / `autonomous_state`,
-    # which are bound in this same scope before the Qt event loop starts, so the
-    # handlers (only ever invoked via signals after app.exec()) resolve them.
-    autonomous_agent = OSIAAgent()
-    # Autonomous owns one immutable run-scoped provider/model identity. Normal
-    # chat hierarchy routing must never replace it during planning or execution.
-    autonomous_agent._disable_hierarchy_for_turn = True
-    # Mutable holder for the live task_state dict so the progress closure (run on
-    # the orchestrator's daemon thread) and the abort/interrupt workers can read
-    # the same reference the orchestrator mutates in place.
-    autonomous_state = {"st": None, "mobile_snapshot_key": ""}
+    restored_chat_runs: set[str] = set()
+    chat_execution_poll = {"key": ""}
+    legacy_execution_poll = {"key": None}
 
-    def _is_server_mobile_state(st) -> bool:
-        return isinstance(st, dict) and st.get("_server_mobile_run") is True
+    def _detach_restored_chat_execution(execution: dict) -> None:
+        """Remove only a poll-restored legacy/incomplete Chat projection."""
 
-    def _apply_server_mobile_action(action: str) -> bool:
-        result = _send_server_autonomous_pc_action(action)
-        if not isinstance(result, dict):
-            return False
-        st = result.get("state")
-        if not isinstance(st, dict):
-            return False
-        autonomous_state["st"] = st
-        bridge.autonomous_progress.emit({
-            "event": result.get("event") or (
-                "authorization_error" if result.get("ok") is not True else ""
-            ),
-            "reason_code": result.get("error") or "",
-            **st,
-        })
-        return result.get("ok") is True
-
-    def _orch_snapshot(st) -> dict:
-        """Plain-dict snapshot (done/total tasks + current phase name) computed
-        from a task_state dict. Pure reads — safe inside progress_cb, which runs
-        on the orchestrator thread (the same thread that mutates `st`)."""
-        if not isinstance(st, dict):
-            return {}
-        done, total, phase_name = count_progress(st)
-        return {
-            "done": done,
-            "total": total,
-            "phase_name": phase_name,
-            "objective": st.get("objective", "") or "",
-            "status": st.get("status", "") or "",
-            "run_state": str(st.get("run_state") or ""),
-            "provider": str(st.get("provider") or ""),
-            "model": str(st.get("model") or ""),
-            "language": normalize_locale(st.get("language")) or i18n.DEFAULT_LANG,
-            "plan_summary": [
-                {
-                    "name": str(phase.get("name") or ""),
-                    "tasks": [
-                        str(task.get("objective") or "")
-                        for task in phase.get("tasks") or []
-                        if isinstance(task, dict)
-                    ],
-                }
-                for phase in st.get("phases") or []
-                if isinstance(phase, dict)
-            ],
-            **autonomous_authorization.pc_projection(st),
-            **autonomous_diagnostics.projection(st),
-        }
-
-    def _on_orch_progress(payload):
-        # Runs on the orchestrator daemon thread. ONLY compute a plain-dict
-        # snapshot and emit via the Bridge — NEVER touch a Qt widget here.
-        snap = _orch_snapshot(autonomous_state.get("st"))
-        bridge.autonomous_progress.emit({**payload, **snap})
-
-    orchestrator = Orchestrator(autonomous_agent, progress_cb=_on_orch_progress)
-
-    def handle_autonomous_start(objective: str, provider: str, model: str):
-        # Plan OFF the GUI thread (create_plan_state blocks on an LLM run), then
-        # persist + start the orchestrator. Mirrors the chat worker pattern.
-        def _plan_and_run():
-            autonomous_context = resolve_turn_context(
-                objective,
-                saved_language=i18n.get_language(),
-                reference="desktop-autonomous",
-            )
-            autonomous_agent.set_turn_context(autonomous_context)
-            resolution = resolve_current_autonomous_selection(
-                provider_id=provider,
-                model_id=model,
-                refresh_account=True,
-            )
-            resolved_provider = resolution.get("provider_id") or ""
-            resolved_model = resolution.get("model_id") or ""
-            if resolution.get("fallback_occurred"):
-                print(
-                    "[WOR-182] Autonomous model fallback: "
-                    f"{resolution.get('reason') or 'unavailable'}"
-                )
-            model_setup_failed = False
-            if resolved_model and resolved_provider:
-                try:
-                    apply_autonomous_agent_model(
-                        autonomous_agent, resolved_provider, resolved_model
-                    )
-                except Exception:
-                    model_setup_failed = True
-                    autonomous_diagnostics.emit_diagnostic_log(
-                        autonomous_diagnostics.make_diagnostic(
-                            None,
-                            stage=autonomous_diagnostics.AutonomousStage.PLANNING,
-                            category=(
-                                autonomous_diagnostics.FailureCategory
-                                .PLANNING_PROVIDER_FAILURE
-                            ),
-                            reason_code="model_setup_failure",
-                            provider=resolved_provider,
-                            model=resolved_model,
-                            resumable=False,
-                            checkpoint_present=False,
-                        )
-                    )
-            if resolved_provider and resolved_model and not model_setup_failed:
-                actual_provider, actual_model = (
-                    autonomous_diagnostics.actual_provider_model(
-                        autonomous_agent, resolved_provider, resolved_model,
-                    )
-                )
-            else:
-                actual_provider, actual_model = "", ""
-            planning_failures = []
-            if resolved_provider and resolved_model and not model_setup_failed:
-                try:
-                    st = planner.create_plan_state(
-                        objective, actual_provider, actual_model, autonomous_agent,
-                        failure_cb=planning_failures.append,
-                        language=autonomous_context.language,
-                        turn_context=autonomous_context,
-                        origin_ref="desktop",
-                    )
-                except Exception:
-                    st = None
-            else:
-                st = None
-            if not st:
-                planning_output_category = ""
-                if planning_failures:
-                    failure = planning_failures[-1]
-                    category = failure.error_category
-                    reason_code = failure.reason
-                    planning_output_category = failure.output_category
-                else:
-                    category = (
-                        autonomous_diagnostics.FailureCategory
-                        .PLANNING_PROVIDER_FAILURE
-                    )
-                    if model_setup_failed:
-                        reason_code = "model_setup_failure"
-                    elif not resolved_provider or not resolved_model:
-                        reason_code = "no_configured_model"
-                    else:
-                        reason_code = "planning_internal_failure"
-                diagnostic = autonomous_diagnostics.make_diagnostic(
-                    None,
-                    stage=autonomous_diagnostics.AutonomousStage.PLANNING,
-                    category=category,
-                    reason_code=reason_code,
-                    provider=actual_provider,
-                    model=actual_model,
-                    resumable=False,
-                    checkpoint_present=True,
-                    planning_output_category=planning_output_category,
-                )
-                failed_state = new_failed_task_state(
-                    actual_provider, actual_model, diagnostic,
-                    language=autonomous_context.language,
-                )
-                try:
-                    save_task_state(failed_state)
-                except Exception:
-                    autonomous_diagnostics.set_checkpoint_present(
-                        failed_state, False,
-                    )
-                autonomous_diagnostics.emit_diagnostic_log(
-                    failed_state.get("failure_diagnostic")
-                )
-                autonomous_state["st"] = failed_state
-                bridge.autonomous_progress.emit(
-                    {"event": "plan_failed", **_orch_snapshot(failed_state)}
-                )
-                return
-            try:
-                save_task_state(st)
-            except Exception:
-                st["status"] = "failed"
-                diagnostic = autonomous_diagnostics.make_diagnostic(
-                    st,
-                    stage=autonomous_diagnostics.AutonomousStage.PERSISTENCE,
-                    category=(
-                        autonomous_diagnostics.FailureCategory.CHECKPOINT_FAILURE
-                    ),
-                    reason_code="checkpoint_failure",
-                    provider=actual_provider,
-                    model=actual_model,
-                    resumable=False,
-                    checkpoint_present=False,
-                )
-                autonomous_diagnostics.record_diagnostic(st, diagnostic)
-                autonomous_state["st"] = st
-                bridge.autonomous_progress.emit(
-                    {"event": "failed", **_orch_snapshot(st)}
-                )
-                return
-            autonomous_state["st"] = st
-            if st.get("run_state") != "ready":
-                bridge.autonomous_progress.emit({
-                    "event": "autonomous_plan_ready",
-                    **_orch_snapshot(st),
-                })
-                return
-            try:
-                orchestrator.start(st)
-            except Exception:
-                st["status"] = "failed"
-                diagnostic = autonomous_diagnostics.make_diagnostic(
-                    st,
-                    stage=autonomous_diagnostics.AutonomousStage.ORCHESTRATOR,
-                    category=(
-                        autonomous_diagnostics.FailureCategory.ORCHESTRATOR_FAILURE
-                    ),
-                    reason_code="start_worker_failure",
-                    provider=actual_provider,
-                    model=actual_model,
-                    resumable=False,
-                    checkpoint_present=True,
-                )
-                autonomous_diagnostics.record_diagnostic(st, diagnostic)
-                try:
-                    save_task_state(st)
-                except Exception:
-                    autonomous_diagnostics.set_checkpoint_present(st, False)
-                bridge.autonomous_progress.emit(
-                    {"event": "failed", **_orch_snapshot(st)}
-                )
-                return
-            # Flip the panel "Planning…" → "Running…" with the first snapshot, and
-            # ONLY now (after start() has spawned the loop) — this is what enables
-            # the panel's Interrupt/Abort, so a cancel can never race a start() that
-            # would clear the stop signal. The orchestrator emits its own events
-            # only on task transitions, never on start, so this won't double-fire.
-            bridge.autonomous_progress.emit({"event": "running", **_orch_snapshot(st)})
-
-        threading.Thread(target=_plan_and_run, daemon=True).start()
-
-    def _ensure_autonomous_agent_for_state(st: dict) -> bool:
-        provider = str(st.get("provider_id") or st.get("provider") or "")
-        model = str(st.get("model_id") or st.get("model") or "")
-        if not provider or not model:
-            return False
-        try:
-            apply_autonomous_agent_model(autonomous_agent, provider, model)
-        except Exception:
-            return False
-        actual_provider, actual_model = autonomous_diagnostics.actual_provider_model(
-            autonomous_agent, provider, model,
-        )
-        return actual_provider == provider and actual_model == model
-
-    def handle_autonomous_authorize():
-        def _authorize():
-            st = autonomous_state.get("st")
-            if not isinstance(st, dict):
-                return
-            if _is_server_mobile_state(st):
-                if not _apply_server_mobile_action("authorize"):
-                    bridge.autonomous_progress.emit({
-                        "event": "authorization_error",
-                        "reason_code": "server_authorization_failure",
-                        **st,
-                    })
-                return
-            try:
-                if not _ensure_autonomous_agent_for_state(st):
-                    raise autonomous_authorization.AuthorizationError(
-                        "model_identity_unavailable"
-                    )
-                response = autonomous_authorization.response_for_current_request(
-                    st, action="approve", origin_ref="desktop",
-                )
-                autonomous_authorization.authorize_and_start(
-                    st, response, origin_ref="desktop",
-                )
-                save_task_state(st)
-                orchestrator.start(st)
-            except autonomous_authorization.AuthorizationError as exc:
-                bridge.autonomous_progress.emit({
-                    "event": "authorization_error",
-                    "reason_code": exc.code,
-                    **_orch_snapshot(st),
-                })
-                return
-            except Exception:
-                bridge.autonomous_progress.emit({
-                    "event": "authorization_error",
-                    "reason_code": "authorization_start_failure",
-                    **_orch_snapshot(st),
-                })
-                return
-            bridge.autonomous_progress.emit({"event": "running", **_orch_snapshot(st)})
-
-        threading.Thread(target=_authorize, daemon=True).start()
-
-    def handle_autonomous_scope_extension(action: str):
-        def _respond():
-            st = autonomous_state.get("st")
-            if not isinstance(st, dict):
-                return
-            if _is_server_mobile_state(st):
-                mapped = {
-                    "approve_exact": "scope_approve",
-                    "deny": "scope_deny",
-                    "cancel": "cancel",
-                }.get(action)
-                if not mapped or not _apply_server_mobile_action(mapped):
-                    bridge.autonomous_progress.emit({
-                        "event": "authorization_error",
-                        "reason_code": "server_scope_extension_failure",
-                        **st,
-                    })
-                return
-            try:
-                if action == "approve_exact" and not _ensure_autonomous_agent_for_state(st):
-                    raise autonomous_authorization.AuthorizationError(
-                        "model_identity_unavailable"
-                    )
-                response = autonomous_authorization.response_for_current_request(
-                    st, action=action, origin_ref="desktop",
-                )
-                autonomous_authorization.approve_scope_extension(
-                    st, response, origin_ref="desktop",
-                )
-                save_task_state(st)
-                if action == "approve_exact":
-                    orchestrator.resume(st)
-                    event = "running"
-                else:
-                    event = "scope_extension_denied"
-            except autonomous_authorization.AuthorizationError as exc:
-                bridge.autonomous_progress.emit({
-                    "event": "authorization_error",
-                    "reason_code": exc.code,
-                    **_orch_snapshot(st),
-                })
-                return
-            except Exception:
-                bridge.autonomous_progress.emit({
-                    "event": "authorization_error",
-                    "reason_code": "scope_extension_failure",
-                    **_orch_snapshot(st),
-                })
-                return
-            bridge.autonomous_progress.emit({"event": event, **_orch_snapshot(st)})
-
-        threading.Thread(target=_respond, daemon=True).start()
-
-    def handle_autonomous_revoke():
-        def _revoke():
-            st = autonomous_state.get("st")
-            if not isinstance(st, dict):
-                return
-            if _is_server_mobile_state(st):
-                if not _apply_server_mobile_action("revoke"):
-                    bridge.autonomous_progress.emit({
-                        "event": "authorization_error",
-                        "reason_code": "server_revocation_failure",
-                        **st,
-                    })
-                return
-            try:
-                autonomous_authorization.revoke_run_authorization(st)
-                orchestrator.stop()
-                save_task_state(st)
-            except Exception:
-                bridge.autonomous_progress.emit({
-                    "event": "authorization_error",
-                    "reason_code": "revocation_failure",
-                    **_orch_snapshot(st),
-                })
-                return
-            bridge.autonomous_progress.emit({
-                "event": "autonomous_authorization_revoked",
-                **_orch_snapshot(st),
-            })
-
-        threading.Thread(target=_revoke, daemon=True).start()
-
-    def handle_autonomous_interrupt():
-        # Pause: stop() joins ≤2s, so run it off the GUI thread. The persisted
-        # state stays "in_progress" → the task is resumable on the next launch.
-        def _pause():
-            st = autonomous_state.get("st")
-            try:
-                orchestrator.stop()
-            except Exception:
-                autonomous_diagnostics.emit_diagnostic_log(
-                    autonomous_diagnostics.make_diagnostic(
-                        st,
-                        stage=autonomous_diagnostics.AutonomousStage.CONTROL,
-                        category=(
-                            autonomous_diagnostics.FailureCategory
-                            .ORCHESTRATOR_FAILURE
-                        ),
-                        reason_code="interrupt_stop_failure",
-                        resumable=resume_state_is_valid(st),
-                        checkpoint_present=True,
-                    )
-                )
-            if isinstance(st, dict):
-                provider_now, model_now = autonomous_diagnostics.actual_provider_model(
-                    autonomous_agent, st.get("provider", ""), st.get("model", ""),
-                )
-                diagnostic = autonomous_diagnostics.make_diagnostic(
-                    st,
-                    stage=autonomous_diagnostics.AutonomousStage.CONTROL,
-                    category=autonomous_diagnostics.FailureCategory.INTERRUPTED,
-                    reason_code="user_interrupted",
-                    provider=provider_now,
-                    model=model_now,
-                    resumable=resume_state_is_valid(st),
-                    checkpoint_present=True,
-                )
-                autonomous_diagnostics.record_diagnostic(st, diagnostic)
-                try:
-                    save_task_state(st)
-                except Exception:
-                    autonomous_diagnostics.set_checkpoint_present(st, False)
-            bridge.autonomous_progress.emit(
-                {"event": "interrupted", **_orch_snapshot(st)}
-            )
-
-        threading.Thread(target=_pause, daemon=True).start()
-
-    def handle_autonomous_abort():
-        # Discard. Mark the SHARED state dict aborted FIRST — before stop() — so
-        # that if the engine daemon outlives stop()'s 2s join (mid agent.run) and
-        # checkpoints once more on its way out, it persists status="aborted"
-        # (never "in_progress"), which _offer_resume_if_pending ignores. Then stop
-        # the loop and delete the checkpoint (a late daemon re-save would only
-        # re-create it as "aborted", still not resumable).
-        def _abort():
-            st = autonomous_state.get("st")
-            if _is_server_mobile_state(st):
-                if not _apply_server_mobile_action("cancel"):
-                    bridge.autonomous_progress.emit({
-                        "event": "authorization_error",
-                        "reason_code": "server_cancel_failure",
-                        **st,
-                    })
-                return
-            if (
-                isinstance(st, dict)
-                and st.get("run_state") in {
-                    "waiting_tool", "verifying_tool",
-                    "cancellation_requested",
-                }
-                and orchestrator.request_tool_cancellation()
+        nonlocal active_conv
+        run_id = str(execution.get("run_id") or "")
+        conv_id = str(execution.get("conversation_id") or "")
+        if not run_id or run_id not in restored_chat_runs:
+            return
+        restored_chat_runs.discard(run_id)
+        if conv_id:
+            conv = conversations.get_conversation(conv_id)
+            if isinstance(conv, dict) and active_conv and (
+                active_conv.get("id") == conv_id
             ):
-                bridge.autonomous_progress.emit({
-                    "event": "cancellation_requested",
-                    **_orch_snapshot(st),
-                })
-                return
-            if isinstance(st, dict):
-                st["status"] = "aborted"
-                st["run_state"] = "cancelled"
-                try:
-                    autonomous_authorization.revoke_run_authorization(st)
-                    st["status"] = "aborted"
-                    st["run_state"] = "cancelled"
-                except Exception:
-                    pass
-                provider_now, model_now = autonomous_diagnostics.actual_provider_model(
-                    autonomous_agent, st.get("provider", ""), st.get("model", ""),
-                )
-                diagnostic = autonomous_diagnostics.make_diagnostic(
-                    st,
-                    stage=autonomous_diagnostics.AutonomousStage.CONTROL,
-                    category=autonomous_diagnostics.FailureCategory.ABORTED,
-                    reason_code="user_aborted",
-                    provider=provider_now,
-                    model=model_now,
-                    resumable=False,
-                    checkpoint_present=False,
-                )
-                autonomous_diagnostics.record_diagnostic(st, diagnostic)
-            try:
-                orchestrator.stop()
-            except Exception:
-                autonomous_diagnostics.emit_diagnostic_log(
-                    autonomous_diagnostics.make_diagnostic(
-                        st,
-                        stage=autonomous_diagnostics.AutonomousStage.CONTROL,
-                        category=(
-                            autonomous_diagnostics.FailureCategory
-                            .ORCHESTRATOR_FAILURE
-                        ),
-                        reason_code="abort_stop_failure",
-                        resumable=False,
-                        checkpoint_present=False,
-                    )
-                )
-            clear_task_state()
-            bridge.autonomous_progress.emit({"event": "aborted", **_orch_snapshot(st)})
+                active_conv = conv
+                popup.set_messages(conv.get("messages") or [])
+            _set_conversation_busy(conv_id, False, owner=execution)
 
-        threading.Thread(target=_abort, daemon=True).start()
+    def _poll_chat_execution_activity() -> bool:
+        """Poll correlated Chat activity and the distinct legacy banner."""
 
-    def _poll_server_mobile_authorization() -> bool:
-        """Mirror the canonical server run into the local PC panel."""
-
+        nonlocal active_conv
         st = _load_server_autonomous_pc_state()
-        if not isinstance(st, dict) or not st.get("run_id"):
-            return False
-        current = autonomous_state.get("st")
-        same_mobile_run = (
-            _is_server_mobile_state(current)
-            and current.get("run_id") == st.get("run_id")
+        legacy_execution = (
+            st.get("legacy_execution") if isinstance(st, dict) else None
         )
-        run_state = str(st.get("run_state") or "")
-        if run_state in {"completed", "failed", "cancelled"} and not same_mobile_run:
+        if isinstance(legacy_execution, dict):
+            legacy_key = tuple(
+                legacy_execution.get(name) for name in (
+                    "schema_version", "compatibility_mode",
+                    "legacy_compatibility", "run_id", "task_id",
+                    "plan_revision", "authorization_revision", "status",
+                    "run_state", "terminal", "outcome_unknown",
+                    "cancel_requested", "cancellable", "resumable",
+                )
+            )
+            if legacy_key != legacy_execution_poll["key"]:
+                legacy_execution_poll["key"] = legacy_key
+                bridge.legacy_execution_activity.emit(dict(legacy_execution))
+        elif legacy_execution_poll["key"] is not None:
+            legacy_execution_poll["key"] = None
+            bridge.legacy_execution_activity.emit({})
+
+        execution = st.get("chat_execution") if isinstance(st, dict) else None
+        if not isinstance(execution, dict):
+            return isinstance(legacy_execution, dict)
+        if execution.get("legacy_compatibility") is True or (
+            execution.get("compatibility_mode")
+            == "legacy_autonomous_checkpoint"
+        ):
+            chat_execution_poll["key"] = ""
+            _detach_restored_chat_execution(execution)
+            return isinstance(legacy_execution, dict)
+        if not all(str(execution.get(field) or "").strip() for field in (
+            "conversation_id", "request_id", "turn_id", "run_id",
+            "provider_id", "model_id", "effective_reasoning",
+        )):
+            chat_execution_poll["key"] = ""
+            _detach_restored_chat_execution(execution)
             return False
-        key = "|".join((
-            str(st.get("run_id") or ""),
-            str(st.get("updated_at") or ""),
-            run_state,
-            str(st.get("plan_revision") or ""),
-            str(st.get("authorization_revision") or ""),
-            str((st.get("pending_scope_extension") or {}).get("request_id") or ""),
-            str((st.get("pending_scope_extension") or {}).get("responded") or ""),
+        key = "|".join(str(execution.get(name) or "") for name in (
+            "run_id", "status", "terminal", "outcome_unknown",
+            "tasks_done", "tasks_total", "cancel_requested",
         ))
-        if key == autonomous_state.get("mobile_snapshot_key"):
-            return True
-        autonomous_state["mobile_snapshot_key"] = key
-        autonomous_state["st"] = st
-        event = {
-            "authorization_pending": "autonomous_plan_ready",
-            "ready": "running",
-            "running": "running",
-            "waiting_tool": "waiting_tool",
-            "verifying_tool": "verifying_tool",
-            "resuming": "resuming",
-            "blocked_unknown_effect": "blocked_unknown_effect",
-            "cancellation_requested": "cancellation_requested",
-            "cancelled_proven": "cancelled_proven",
-            "suspended_scope_extension": "suspended_scope_extension",
-            "suspended_authorization_revoked": "suspended_authorization_revoked",
-            "blocked_outcome_unknown": "blocked_outcome_unknown",
-            "completed": "done",
-            "failed": "failed",
-            "cancelled": "aborted",
-        }.get(run_state, run_state)
-        is_chat_owned_run = st.get("chat_route_type") == "autonomous"
-        if not same_mobile_run and not is_chat_owned_run:
-            popup.show_autonomous(st)
-        else:
-            popup.update_autonomous_progress({"event": event, **st})
+        if key != chat_execution_poll["key"]:
+            chat_execution_poll["key"] = key
+            bridge.chat_execution_activity.emit(dict(execution))
+
+        conv_id = str(execution["conversation_id"])
+        run_id = str(execution["run_id"])
+        terminal = bool(execution.get("terminal"))
+        if not terminal and not _is_conversation_busy(conv_id):
+            restored_chat_runs.add(run_id)
+            _set_conversation_busy(conv_id, True, owner=execution)
+        elif terminal and run_id in restored_chat_runs:
+            restored_chat_runs.discard(run_id)
+            conv = conversations.get_conversation(conv_id)
+            if isinstance(conv, dict) and active_conv and (
+                active_conv.get("id") == conv_id
+            ):
+                active_conv = conv
+                popup.set_messages(conv.get("messages") or [])
+            _set_conversation_busy(conv_id, False, owner=execution)
         return True
 
-    popup.autonomous_start_requested.connect(handle_autonomous_start)
-    popup.autonomous_authorize_requested.connect(handle_autonomous_authorize)
-    popup.autonomous_scope_extension_response.connect(
-        handle_autonomous_scope_extension
-    )
-    popup.autonomous_revoke_requested.connect(handle_autonomous_revoke)
-    popup.autonomous_interrupt_requested.connect(handle_autonomous_interrupt)
-    popup.autonomous_abort_requested.connect(handle_autonomous_abort)
+    def handle_chat_execution_cancel(binding: dict) -> None:
+        """Cancel only the exact active Chat run, or a correlated legacy run."""
 
-    mobile_authorization_timer = QTimer()
-    mobile_authorization_timer.setInterval(1000)
-    mobile_authorization_timer.timeout.connect(_poll_server_mobile_authorization)
-    mobile_authorization_timer.start()
+        key = _chat_turn_key(binding)
+        with active_chat_turns_lock:
+            direct = (
+                dict(active_chat_turns.get(key) or {})
+                if key is not None else {}
+            )
+        if direct:
+            turn_agent = direct.get("agent")
+            record_intent = getattr(
+                turn_agent, "request_turn_cancellation_intent", None,
+            )
+            if not callable(record_intent) or not record_intent(
+                str((binding or {}).get("turn_id") or "")
+            ):
+                return
+            # Durable user_cancelled is now authoritative.  The cancelled turn
+            # remains in history, but it no longer owns Chat admission or the
+            # composer while its fenced worker/provider callbacks drain.
+            _release_chat_turn(binding, turn_agent)
+            _set_conversation_busy(
+                str((binding or {}).get("conversation_id") or ""),
+                False,
+                owner=binding,
+            )
+            # This signal originated from the currently rendered exact-key
+            # Thinking row, so discarding the presentation buffer cannot touch
+            # another conversation/turn. The durable Stop/final CAS has already
+            # won synchronously above.
+            popup.confirm_chat_execution_cancellation(binding)
+            popup.cancel_assistant_stream(flush=False)
+            bridge.island_state.emit("idle")
+
+            def _cancel_direct() -> None:
+                request_cancel = getattr(
+                    turn_agent, "request_turn_cancellation", None,
+                )
+                if callable(request_cancel):
+                    request_cancel(str((binding or {}).get("turn_id") or ""))
+
+            threading.Thread(
+                target=_cancel_direct,
+                name="osia-chat-turn-cancel",
+                daemon=True,
+            ).start()
+            return
+
+        def _cancel() -> None:
+            result = _cancel_server_autonomous_from_chat(dict(binding or {}))
+            raw_status = str(result.get("status") or "")
+            status = (
+                raw_status
+                if raw_status in {"completed", "blocked", "cancelled"}
+                else "waiting"
+                if result.get("accepted")
+                else "recovering"
+            )
+            bridge.chat_execution_activity.emit({
+                **dict(binding or {}),
+                "status": status,
+                "terminal": bool(result.get("terminal")),
+                "cancel_requested": bool(result.get("accepted")),
+                "outcome_unknown": bool(result.get("outcome_unknown")),
+            })
+
+        threading.Thread(
+            target=_cancel,
+            name="osia-legacy-execution-cancel",
+            daemon=True,
+        ).start()
+
+    def _publish_legacy_control_result(result: dict) -> None:
+        state = result.get("state") if isinstance(result, dict) else None
+        projection = (
+            state.get("legacy_execution") if isinstance(state, dict) else None
+        )
+        if isinstance(state, dict):
+            bridge.legacy_execution_activity.emit(
+                dict(projection) if isinstance(projection, dict) else {}
+            )
+        else:
+            # A transport timeout proves neither acceptance nor rejection.
+            # Keep the controls fail-closed until the regular poll obtains a
+            # fresh server projection, but do not let its unchanged identity be
+            # suppressed by the previous de-duplication key forever.
+            legacy_execution_poll["key"] = None
+            bridge.legacy_execution_activity.emit({})
+
+    def handle_legacy_execution_cancel(binding: dict) -> None:
+        def _cancel() -> None:
+            _publish_legacy_control_result(
+                _cancel_server_legacy_execution(dict(binding or {}))
+            )
+
+        threading.Thread(
+            target=_cancel,
+            name="osia-legacy-banner-cancel",
+            daemon=True,
+        ).start()
+
+    def handle_legacy_execution_resume(binding: dict) -> None:
+        def _resume() -> None:
+            _publish_legacy_control_result(
+                _resume_server_legacy_execution(dict(binding or {}))
+            )
+
+        threading.Thread(
+            target=_resume,
+            name="osia-legacy-banner-resume",
+            daemon=True,
+        ).start()
+
+    popup.chat_execution_cancel_requested.connect(handle_chat_execution_cancel)
+    popup.legacy_execution_cancel_requested.connect(
+        handle_legacy_execution_cancel
+    )
+    popup.legacy_execution_resume_requested.connect(
+        handle_legacy_execution_resume
+    )
+
+    chat_execution_timer = QTimer()
+    chat_execution_timer.setInterval(1000)
+    chat_execution_timer.timeout.connect(_poll_chat_execution_activity)
+    chat_execution_timer.start()
 
     trigger_label = "Press Ctrl+Alt+P to talk to OSIA"
 
@@ -3457,8 +5189,6 @@ def wake_mode():
             cron_manager.stop,
             unsubscribe_cron_wake,
             heartbeat_monitor.stop,
-            # WOR-45 Phase 4 — safe if the autonomous loop never started.
-            orchestrator.stop,
         ]
         if stop_manual_hotkey:
             owned_stops.append(stop_manual_hotkey)
@@ -3499,301 +5229,10 @@ def wake_mode():
 
     app.aboutToQuit.connect(on_quit)
 
-    # ── WOR-45 Phase 1: resume a previously interrupted autonomous task ──
-    # DETECTION ONLY (non-blocking). If a persisted autonomous task is still
-    # "in_progress" — the process died / was restarted mid-run — offer the user
-    # Resume / Abort once the event loop is live. Phase 1 has no orchestrator
-    # yet, so "Resume" only LOGS what it *would* do; "Abort" marks the task
-    # aborted and atomically checkpoints it. The whole check is deferred via
-    # QTimer.singleShot(0, ...) so it NEVER blocks GUI startup (the modal prompt
-    # only appears after app.exec() has started the event loop).
-    def _offer_resume_if_pending() -> None:
-        if _poll_server_mobile_authorization():
-            return
-        try:
-            from osia.autonomous.state import load_task_state, save_task_state
-        except Exception:
-            print("[WOR-45] resume check skipped (import failed)")
-            return
-        state = load_task_state()
-        if not isinstance(state, dict) or state.get("status") != "in_progress":
-            return  # no pending task — normal startup
-        try:
-            autonomous_authorization.revalidate_loaded_authorization(
-                state, origin_ref="desktop",
-            )
-            save_task_state(state)
-        except Exception:
-            state["run_state"] = "authorization_pending"
-            state["authorization_status"] = "corrupt"
-            state["grant_refs"] = []
-        if state.get("run_state") in {
-            "authorization_pending",
-            "suspended_scope_extension",
-            "suspended_authorization_revoked",
-            "blocked_outcome_unknown",
-        }:
-            autonomous_state["st"] = state
-            popup.show_autonomous(state)
-            bridge.autonomous_progress.emit({
-                "event": (
-                    "autonomous_plan_ready"
-                    if state.get("run_state") == "authorization_pending"
-                    else state.get("run_state")
-                ),
-                **_orch_snapshot(state),
-            })
-            return
-        if state.get("run_state") in {
-            "waiting_tool", "verifying_tool", "resuming",
-            "cancellation_requested",
-        }:
-            autonomous_state["st"] = state
-            popup.show_autonomous(state)
-            bridge.autonomous_progress.emit({
-                "event": state.get("run_state"),
-                **_orch_snapshot(state),
-            })
-
-            def _resume_durable_tool() -> None:
-                resume_context = fixed_turn_context(
-                    state.get("language"),
-                    source="autonomous_tool_recovery",
-                    reference=str(state.get("task_id") or "autonomous"),
-                    mode=str(state.get("language_mode") or "single-language"),
-                    allowed_languages=state.get("allowed_languages") or (),
-                    source_language=state.get("source_language"),
-                    target_language=state.get("target_language"),
-                )
-                autonomous_agent.set_turn_context(resume_context)
-                if not _ensure_autonomous_agent_for_state(state):
-                    orchestrator.block_tool_recovery(
-                        state, "tool_recovery_model_mismatch",
-                    )
-                    return
-                orchestrator.resume(state)
-
-            threading.Thread(
-                target=_resume_durable_tool,
-                name="osia-autonomous-tool-recovery",
-                daemon=True,
-            ).start()
-            return
-        if state.get("run_state") in {
-            "blocked_unknown_effect", "cancelled_proven",
-        }:
-            autonomous_state["st"] = state
-            popup.show_autonomous(state)
-            bridge.autonomous_progress.emit({
-                "event": state.get("run_state"),
-                **_orch_snapshot(state),
-            })
-            return
-        if not resume_state_is_valid(state):
-            state["status"] = "failed"
-            diagnostic = autonomous_diagnostics.make_diagnostic(
-                state,
-                stage=autonomous_diagnostics.AutonomousStage.RESUME,
-                category=(
-                    autonomous_diagnostics.FailureCategory.INVALID_RESUME_STATE
-                ),
-                reason_code="invalid_resume_state",
-                resumable=False,
-                checkpoint_present=True,
-            )
-            autonomous_diagnostics.record_diagnostic(state, diagnostic)
-            try:
-                save_task_state(state)
-            except Exception:
-                autonomous_diagnostics.set_checkpoint_present(state, False)
-            autonomous_state["st"] = state
-            popup.show_autonomous(state)
-            bridge.autonomous_progress.emit(
-                {"event": "failed", **_orch_snapshot(state)}
-            )
-            return
-        task_id = state.get("task_id", "?")
-        cursor = state.get("cursor") or {}
-        phase = cursor.get("phase", 0)
-        task = cursor.get("task", 0)
-        objective = (state.get("objective") or "")[:200]
-        from PyQt6.QtWidgets import QMessageBox
-        box = QMessageBox()
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle("OSIA")
-        box.setText("Une tâche autonome a été interrompue.")
-        box.setInformativeText(
-            (f"« {objective} »\n\n" if objective else "")
-            + f"Reprendre là où elle s'est arrêtée (phase {phase}, tâche {task}) ?"
-        )
-        resume_btn = box.addButton("Reprendre", QMessageBox.ButtonRole.AcceptRole)
-        abort_btn = box.addButton("Abandonner", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(resume_btn)
-        box.exec()
-        if box.clickedButton() is abort_btn:
-            state["status"] = "aborted"
-            diagnostic = autonomous_diagnostics.make_diagnostic(
-                state,
-                stage=autonomous_diagnostics.AutonomousStage.CONTROL,
-                category=autonomous_diagnostics.FailureCategory.ABORTED,
-                reason_code="user_aborted",
-                resumable=False,
-                checkpoint_present=True,
-            )
-            autonomous_diagnostics.record_diagnostic(state, diagnostic)
-            try:
-                save_task_state(state)
-            except Exception:
-                autonomous_diagnostics.set_checkpoint_present(state, False)
-        else:
-            def _resume_pending() -> None:
-                resume_resolution = resolve_current_autonomous_selection(
-                    provider_id=state.get("provider", ""),
-                    model_id=state.get("model", ""),
-                    refresh_account=True,
-                    strict=True,
-                    persist=False,
-                )
-                resume_provider = resume_resolution.get("provider_id") or ""
-                resume_model = resume_resolution.get("model_id") or ""
-                if resume_resolution.get("fallback_occurred"):
-                    print(
-                        "[WOR-182] Autonomous resume model fallback: "
-                        f"{resume_resolution.get('reason') or 'unavailable'}"
-                    )
-                resume_context = fixed_turn_context(
-                    state.get("language"),
-                    source="autonomous_resume",
-                    reference=str(state.get("task_id") or "autonomous"),
-                    mode=str(state.get("language_mode") or "single-language"),
-                    allowed_languages=state.get("allowed_languages") or (),
-                    source_language=state.get("source_language"),
-                    target_language=state.get("target_language"),
-                )
-                autonomous_agent.set_turn_context(resume_context)
-                if not resume_provider or not resume_model:
-                    state["status"] = "failed"
-                    diagnostic = autonomous_diagnostics.make_diagnostic(
-                        state,
-                        stage=autonomous_diagnostics.AutonomousStage.RESUME,
-                        category=(
-                            autonomous_diagnostics.FailureCategory
-                            .PLANNING_PROVIDER_FAILURE
-                        ),
-                        reason_code="no_configured_model",
-                        resumable=False,
-                        checkpoint_present=True,
-                    )
-                    autonomous_diagnostics.record_diagnostic(state, diagnostic)
-                    try:
-                        save_task_state(state)
-                    except Exception:
-                        autonomous_diagnostics.set_checkpoint_present(state, False)
-                    autonomous_state["st"] = state
-                    bridge.autonomous_resume_ready.emit(state)
-                    bridge.autonomous_progress.emit(
-                        {"event": "failed", **_orch_snapshot(state)}
-                    )
-                    return
-                try:
-                    apply_autonomous_agent_model(
-                        autonomous_agent, resume_provider, resume_model
-                    )
-                except Exception:
-                    state["status"] = "failed"
-                    diagnostic = autonomous_diagnostics.make_diagnostic(
-                        state,
-                        stage=autonomous_diagnostics.AutonomousStage.RESUME,
-                        category=(
-                            autonomous_diagnostics.FailureCategory
-                            .PLANNING_PROVIDER_FAILURE
-                        ),
-                        reason_code="model_setup_failure",
-                        provider=resume_provider,
-                        model=resume_model,
-                        resumable=False,
-                        checkpoint_present=True,
-                    )
-                    autonomous_diagnostics.record_diagnostic(state, diagnostic)
-                    try:
-                        save_task_state(state)
-                    except Exception:
-                        autonomous_diagnostics.set_checkpoint_present(state, False)
-                    autonomous_state["st"] = state
-                    bridge.autonomous_resume_ready.emit(state)
-                    bridge.autonomous_progress.emit(
-                        {"event": "failed", **_orch_snapshot(state)}
-                    )
-                    return
-                provider_now, model_now = (
-                    autonomous_diagnostics.actual_provider_model(
-                        autonomous_agent, resume_provider, resume_model,
-                    )
-                )
-                state["provider"] = provider_now
-                state["model"] = model_now
-                try:
-                    save_task_state(state)
-                except Exception:
-                    autonomous_diagnostics.set_checkpoint_present(state, False)
-                autonomous_state["st"] = state
-                bridge.autonomous_resume_ready.emit(state)
-                try:
-                    orchestrator.resume(state)
-                except Exception:
-                    state["status"] = "failed"
-                    diagnostic = autonomous_diagnostics.make_diagnostic(
-                        state,
-                        stage=autonomous_diagnostics.AutonomousStage.RESUME,
-                        category=(
-                            autonomous_diagnostics.FailureCategory
-                            .ORCHESTRATOR_FAILURE
-                        ),
-                        reason_code="resume_worker_failure",
-                        provider=provider_now,
-                        model=model_now,
-                        resumable=False,
-                        checkpoint_present=True,
-                    )
-                    autonomous_diagnostics.record_diagnostic(state, diagnostic)
-                    try:
-                        save_task_state(state)
-                    except Exception:
-                        autonomous_diagnostics.set_checkpoint_present(state, False)
-                    bridge.autonomous_progress.emit(
-                        {"event": "failed", **_orch_snapshot(state)}
-                    )
-
-            def _resume_pending_safe() -> None:
-                try:
-                    _resume_pending()
-                except Exception:
-                    state["status"] = "failed"
-                    diagnostic = autonomous_diagnostics.make_diagnostic(
-                        state,
-                        stage=autonomous_diagnostics.AutonomousStage.RESUME,
-                        category=(
-                            autonomous_diagnostics.FailureCategory
-                            .ORCHESTRATOR_FAILURE
-                        ),
-                        reason_code="resume_worker_failure",
-                        resumable=False,
-                        checkpoint_present=True,
-                    )
-                    autonomous_diagnostics.record_diagnostic(state, diagnostic)
-                    try:
-                        save_task_state(state)
-                    except Exception:
-                        autonomous_diagnostics.set_checkpoint_present(state, False)
-                    autonomous_state["st"] = state
-                    bridge.autonomous_resume_ready.emit(state)
-                    bridge.autonomous_progress.emit(
-                        {"event": "failed", **_orch_snapshot(state)}
-                    )
-
-            threading.Thread(target=_resume_pending_safe, daemon=True).start()
-
-    QTimer.singleShot(0, _offer_resume_if_pending)
+    # Reattach exact local direct-Chat receipts and project any persisted legacy
+    # server checkpoint through the separate non-busy Chat banner.
+    QTimer.singleShot(0, _restore_incomplete_desktop_chat_turns)
+    QTimer.singleShot(0, _poll_chat_execution_activity)
 
     perf_mark("wake_mode: entering app.exec() (GUI now interactive)")
     sys.exit(app.exec())

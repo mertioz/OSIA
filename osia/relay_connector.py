@@ -293,29 +293,36 @@ class RelayBridge:
         self._chunk_tombstone_order: deque[tuple] = deque()
         self._outbound_chunk_ids: dict[str, float] = {}
         self._outbound_chunk_order: deque[str] = deque()
-        self._relay_trace_state: dict[tuple[str, str, str], dict] = {}
-        self._relay_trace_tombstones: set[tuple[str, str, str]] = set()
-        self._relay_trace_tombstone_order: deque[tuple[str, str, str]] = deque()
+        self._relay_trace_state: dict[tuple[str, str, str, str], dict] = {}
+        self._relay_trace_tombstones: set[tuple[str, str, str, str]] = set()
+        self._relay_trace_tombstone_order: deque[
+            tuple[str, str, str, str]
+        ] = deque()
 
     @staticmethod
-    def _execution_trace_key(frame: dict) -> tuple[str, str, str] | None:
+    def _execution_trace_key(
+        frame: dict,
+    ) -> tuple[str, str, str, str] | None:
         if (
             frame.get("type") != "execution_trace"
             or frame.get("schema_version") != 1
             or frame.get("redaction_class") != "public_ui"
         ):
             return None
-        values = tuple(
+        legacy_values = tuple(
             str(frame.get(name) or "")
             for name in ("conversation_id", "request_id", "turn_id")
         )
-        if any(not value or len(value) > 256 for value in values):
+        if any(not value or len(value) > 256 for value in legacy_values):
             return None
-        return values
+        run_id = str(frame.get("run_id") or legacy_values[2])
+        if not run_id or len(run_id) > 256:
+            return None
+        return (*legacy_values, run_id)
 
     def _remember_relay_trace_tombstone(
         self,
-        key: tuple[str, str, str],
+        key: tuple[str, str, str, str],
     ) -> None:
         if key in self._relay_trace_tombstones:
             return
@@ -333,9 +340,10 @@ class RelayBridge:
         priority = {
             "terminal": 0,
             "goal": 1,
-            "waiting_permission": 2,
-            "reconciliation": 3,
-            "result": 4,
+            "public_reasoning_summary": 2,
+            "waiting_permission": 3,
+            "reconciliation": 4,
+            "result": 5,
             "continuation": 5,
             "action": 6,
         }

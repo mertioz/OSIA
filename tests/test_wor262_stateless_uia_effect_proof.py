@@ -297,6 +297,116 @@ def _dispatch_through_real_uia_path(strategy: ExecutionStrategy):
     return decision, strategy.attempt_by_id(decision.attempt_id), arguments, invocations
 
 
+def test_uia_provider_stall_returns_typed_unknown_before_common_release():
+    invocations = []
+
+    class InvokePattern:
+        def Invoke(self):
+            invocations.append("invoke")
+            time.sleep(0.4)
+
+    control = SimpleNamespace(GetInvokePattern=lambda: InvokePattern())
+    auto = SimpleNamespace(
+        UIAutomationInitializerInThread=lambda: nullcontext(),
+        ControlFromHandle=lambda _hwnd: object(),
+    )
+    started = time.monotonic()
+    with (
+        patch.object(
+            desktop_scene,
+            "_UIA_ACTION_DISPATCH_TIMEOUT_SECONDS",
+            0.02,
+        ),
+        patch("osia.desktop_scene._find_runtime_control", return_value=control),
+    ):
+        dispatch = desktop_scene._dispatch_fresh_uia_action_bounded(
+            auto,
+            native_window_id=9090,
+            runtime_id=(42, 3),
+            action_pattern="Invoke",
+            observed_patterns=("Invoke",),
+        )
+
+    assert time.monotonic() - started < 0.3
+    assert invocations == ["invoke"]
+    assert dispatch["dispatch_started"] is True
+    assert dispatch["completed"] is False
+    assert dispatch["dispatched_at"] > 0.0
+    assert dispatch["reason_code"] == "uia_action_dispatch_timed_out"
+    assert dispatch["worker_may_be_active"] is True
+
+
+def test_uia_pre_dispatch_stall_cannot_invoke_after_timeout():
+    invocations = []
+
+    class InvokePattern:
+        def Invoke(self):
+            invocations.append("invoke")
+
+    control = SimpleNamespace(GetInvokePattern=lambda: InvokePattern())
+
+    def delayed_root(_hwnd):
+        time.sleep(0.08)
+        return object()
+
+    auto = SimpleNamespace(
+        UIAutomationInitializerInThread=lambda: nullcontext(),
+        ControlFromHandle=delayed_root,
+    )
+    with (
+        patch.object(
+            desktop_scene,
+            "_UIA_ACTION_DISPATCH_TIMEOUT_SECONDS",
+            0.02,
+        ),
+        patch("osia.desktop_scene._find_runtime_control", return_value=control),
+    ):
+        dispatch = desktop_scene._dispatch_fresh_uia_action_bounded(
+            auto,
+            native_window_id=9090,
+            runtime_id=(42, 3),
+            action_pattern="Invoke",
+            observed_patterns=("Invoke",),
+        )
+        time.sleep(0.1)
+
+    assert dispatch["dispatch_started"] is False
+    assert dispatch["completed"] is False
+    assert dispatch["reason_code"] == (
+        "uia_action_dispatch_timed_out_before_effect"
+    )
+    assert invocations == []
+
+
+def test_timed_out_uia_dispatch_preserves_typed_primitive_receipt():
+    strategy = _strategy()
+    with patch(
+        "osia.desktop_scene._dispatch_fresh_uia_action_bounded",
+        return_value={
+            "dispatch_started": True,
+            "dispatched_at": time.time(),
+            "completed": False,
+            "reason_code": "uia_action_dispatch_timed_out",
+            "worker_may_be_active": True,
+            "selected_pattern": "Invoke",
+            "selected_pattern_available": True,
+            "fresh_supported_patterns": ["Invoke"],
+        },
+    ):
+        _decision, attempt, _arguments, invocations = (
+            _dispatch_through_real_uia_path(strategy)
+        )
+
+    assert invocations == []
+    assert attempt.primitive_receipt["kind"] == "desktop_uia_primitive"
+    assert attempt.primitive_receipt["mechanism"] == "invoke"
+    assert attempt.primitive_receipt["observable_effect"] == _effect()
+    assert attempt.primitive_receipt["worker_may_be_active"] is True
+    assert attempt.actionability_evidence["dispatch_preflight_result"] == (
+        "effect_unknown"
+    )
+
+
 def test_stateless_invoke_without_observable_postcondition_remains_unresolved():
     strategy = _strategy()
     _decision, attempt, _arguments = _dispatch(strategy)
@@ -306,6 +416,27 @@ def test_stateless_invoke_without_observable_postcondition_remains_unresolved():
         strategy, {"inspect_desktop_surfaces"}, user_request=TASK,
     ) is None
     assert strategy._completed_substeps == []
+
+
+def test_fresh_structured_invoke_without_observable_postcondition_is_rejected():
+    strategy = _strategy()
+    _result, reconciled = _observe(
+        strategy,
+        _scene("0", observed_at=time.time()),
+    )
+    decision = tool_preflight(
+        "activate_desktop_surface",
+        {
+            "surface_ref": "button-three",
+            "objective": "Three",
+            "action_pattern": "Invoke",
+        },
+        strategy=strategy,
+    )
+
+    assert reconciled is False
+    assert decision is not None and decision.allowed is False
+    assert decision.reason_code == "uia_invoke_observable_effect_required"
 
 
 def test_exact_observable_surface_postcondition_reconciles_stateless_invoke():
@@ -321,6 +452,87 @@ def test_exact_observable_surface_postcondition_reconciles_stateless_invoke():
         "exact_desktop_observable_effect_change"
     )
     assert result["receipt"]["observable_effect"] == _effect()
+
+
+def test_settled_exact_unchanged_state_reconciles_primitive_not_applied():
+    from osia.turn_terminality import TurnTerminalityController
+
+    strategy = _strategy()
+    _decision, attempt, _arguments = _dispatch(
+        strategy,
+        effect=_effect(),
+    )
+    attempt_id = attempt.attempt_id
+    strategy = ExecutionStrategy.from_snapshot(json.loads(json.dumps(
+        strategy.snapshot()
+    )))
+    attempt = strategy.attempt_by_id(attempt_id)
+    assert attempt is not None
+    result, reconciled = _observe(
+        strategy,
+        _scene("0", observed_at=attempt.dispatched_at + 6.0),
+    )
+    event = strategy.snapshot()["reconciliation_events"][-1]
+
+    assert reconciled is True
+    assert result["receipt"]["outcome"] == "confirmed_absence"
+    assert result["receipt"]["reason_code"] == (
+        "exact_desktop_primitive_absent_no_partial_effect"
+    )
+    assert result["receipt"]["no_partial_effect"] is True
+    assert event["resolution"] == "primitive_not_applied"
+    assert TurnTerminalityController._desktop_resolution_kind(event) == (
+        "primitive_not_applied"
+    )
+    assert strategy.attempt_by_id(attempt.attempt_id).status == "blocked"
+    assert strategy.frozen_reason == ""
+
+
+def test_active_uia_worker_cannot_be_reconciled_as_not_applied():
+    strategy = _strategy()
+    _decision, attempt, _arguments = _dispatch(
+        strategy,
+        effect=_effect(),
+    )
+    attempt.primitive_receipt["worker_may_be_active"] = True
+    result, reconciled = _observe(
+        strategy,
+        _scene("0", observed_at=attempt.dispatched_at + 6.0),
+    )
+
+    assert reconciled is False
+    assert result["receipt"].get("reason_code") != (
+        "exact_desktop_primitive_absent_no_partial_effect"
+    )
+    assert strategy._frozen_attempt_id == attempt.attempt_id
+
+
+@pytest.mark.parametrize("case", ("settling", "structural_epoch"))
+def test_unsettled_or_structurally_changed_state_cannot_prove_not_applied(
+    case: str,
+):
+    strategy = _strategy()
+    _decision, attempt, _arguments = _dispatch(
+        strategy,
+        effect=_effect(),
+    )
+    scene = _scene(
+        "0",
+        observed_at=(
+            attempt.dispatched_at + 1.0
+            if case == "settling" else
+            attempt.dispatched_at + 6.0
+        ),
+    )
+    if case == "structural_epoch":
+        scene = replace(scene, structural_epoch=scene.structural_epoch + 1)
+    result, reconciled = _observe(strategy, scene)
+
+    assert reconciled is False
+    assert result["receipt"].get("reason_code") != (
+        "exact_desktop_primitive_absent_no_partial_effect"
+    )
+    assert strategy._frozen_attempt_id == attempt.attempt_id
 
 
 def test_durable_probe_preserves_primitive_completion_for_projection():

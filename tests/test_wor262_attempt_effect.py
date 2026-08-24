@@ -495,9 +495,12 @@ def test_exact_uia_resume_preserves_strategy_effect_identity():
 
     attempt = strategy.attempt_by_id(decision.attempt_id)
     assert attempt is not None
-    assert attempt.status == "ambiguous_effect"
+    assert attempt.status == "failed"
     assert attempt.attempted_effect == original_effect
-    assert strategy._frozen_attempt_id == decision.attempt_id
+    assert attempt.failure_or_stagnation_reason == (
+        "semantic_dispatch_witness_missing"
+    )
+    assert strategy._frozen_attempt_id == ""
     assert all(
         item.mechanism_id != "tool:activate_desktop_surface"
         for item in strategy.attempts
